@@ -1,0 +1,126 @@
+@import "tailwindcss";
+
+/* Leaflet CSS */
+@import "leaflet/dist/leaflet.css";
+
+/* Dark theme base */
+:root {
+  --color-bg-primary: #1a1a2e;
+  --color-bg-card: #16213e;
+  --color-bg-accent: #0f3460;
+  --color-highlight: #e94560;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background-color: #1a1a2e;
+  color: #e0e0e0;
+  font-family:
+    "Pretendard Variable",
+    Pretendard,
+    -apple-system,
+    BlinkMacSystemFont,
+    system-ui,
+    "Segoe UI",
+    Roboto,
+    "Noto Sans KR",
+    sans-serif;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Leaflet popup overrides for dark theme */
+.leaflet-popup-content-wrapper {
+  background: #16213e;
+  color: #e0e0e0;
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+.leaflet-popup-tip {
+  background: #16213e;
+}
+.leaflet-popup-content {
+  margin: 8px 12px;
+}
+
+/* Leaflet controls dark theme */
+.leaflet-control-zoom a {
+  background-color: #16213e !important;
+  color: #e0e0e0 !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+.leaflet-control-zoom a:hover {
+  background-color: #0f3460 !important;
+}
+.leaflet-control-attribution {
+  background: rgba(22, 33, 62, 0.8) !important;
+  color: #888 !important;
+  font-size: 10px !important;
+}
+.leaflet-control-attribution a {
+  color: #aaa !important;
+}
+
+/* Range input styling */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #e94560;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid #1a1a2e;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: #e94560;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid #1a1a2e;
+}
+
+/* Select styling for dark theme */
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 28px;
+}
+
+/* Leaflet container fix */
+.leaflet-container {
+  background: #0d1b2a;
+}
