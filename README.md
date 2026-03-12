@@ -1,10 +1,10 @@
 # AirMove Analyzer
 
-NEC 레이더 비행검사기 분석체계 - Tauri 기반 Windows 데스크톱 애플리케이션
+레이더 비행검사기 분석체계 - Tauri 기반 Windows 데스크톱 애플리케이션
 
 ## 주요 기능
 
-- **ASS 파일 파싱**: NEC RDRS 녹화 파일(ASTERIX CAT048) 바이너리 파싱
+- **ASS 파일 파싱**: RDRS 녹화 파일(ASTERIX CAT048) 바이너리 파싱
 - **항적 시각화**: Leaflet 지도 위 비행검사기 항적 표시 (재생/필터링)
 - **Loss 구간 탐지**: Mode-S 코드별 항적 Loss 자동 탐지 및 분석
 - **비행검사기 관리**: 최대 10대 기체 등록 (Mode-S 코드 기반)
@@ -49,9 +49,9 @@ src-tauri/src/          # Rust 백엔드
 
 ## ASS 파일 포맷
 
-NEC RDRS 녹화 파일은 EUROCONTROL ASTERIX 형식의 데이터 블록을 포함합니다.
+RDRS 녹화 파일은 EUROCONTROL ASTERIX 형식의 데이터 블록을 포함합니다.
 
-- **NEC 프레임 헤더**: `[월][일][시][분]` 4바이트 + 카운터 1바이트
+- **프레임 헤더**: `[월][일][시][분]` 4바이트 + 카운터 1바이트
 - **ASTERIX CAT048**: 모노레이더 타겟 보고 (좌표, 고도, 속도, Mode-S)
 - **좌표 변환**: 극좌표(RHO/THETA) → 김포 레이더 기준 WGS-84
 

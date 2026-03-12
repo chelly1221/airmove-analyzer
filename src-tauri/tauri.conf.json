@@ -40,9 +40,6 @@
     ]
   },
   "plugins": {
-    "opener": {
-      "openUrl": false,
-      "openPath": false
-    }
+    "opener": {}
   }
 }
