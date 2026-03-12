@@ -1,9 +1,7 @@
-import { useState, useMemo, useEffect, useRef } from "react";
-import {
-  MapContainer,
-  TileLayer,
-  useMap,
-} from "react-leaflet";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
+import MapGL, { NavigationControl } from "react-map-gl/maplibre";
+import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
+import { PathLayer, ScatterplotLayer, LineLayer } from "@deck.gl/layers";
 import {
   Filter,
   Play,
@@ -11,61 +9,40 @@ import {
   SkipBack,
   SkipForward,
   Info,
+  Layers,
 } from "lucide-react";
 import { format } from "date-fns";
-import TrackLayer from "../components/Map/TrackLayer";
-import LossMarkers from "../components/Map/LossMarkers";
-import MapStyleToggle, {
-  MAP_TILE_URLS,
-  type MapStyle,
-} from "../components/Map/MapStyleToggle";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment } from "../types";
+import "maplibre-gl/dist/maplibre-gl.css";
 
-/** 지도 타일 교체 컴포넌트 */
-function TileUpdater({ style }: { style: MapStyle }) {
-  const map = useMap();
-  const tile = MAP_TILE_URLS[style];
+/** 트랙 색상 팔레트 (Mode-S별 구분) */
+const TRACK_COLORS: [number, number, number][] = [
+  [59, 130, 246],   // blue
+  [16, 185, 129],   // emerald
+  [245, 158, 11],   // amber
+  [139, 92, 246],   // violet
+  [236, 72, 153],   // pink
+  [6, 182, 212],    // cyan
+  [132, 204, 22],   // lime
+  [249, 115, 22],   // orange
+  [99, 102, 241],   // indigo
+  [20, 184, 166],   // teal
+];
 
-  useEffect(() => {
-    // react-leaflet 의 TileLayer 는 key 교체로 처리
-    map.invalidateSize();
-  }, [map, style]);
+type MapStyle = "carto-dark" | "osm";
 
-  return (
-    <TileLayer
-      key={style}
-      url={tile.url}
-      attribution={tile.attribution}
-    />
-  );
-}
+const MAP_STYLES: Record<MapStyle, string> = {
+  "carto-dark":
+    "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+  osm:
+    "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+};
 
-/** 데이터에 맞춰 지도 범위 자동 조정 */
-function FitBounds({ points }: { points: TrackPoint[] }) {
-  const map = useMap();
-  const fitted = useRef(false);
-
-  useEffect(() => {
-    if (points.length > 0 && !fitted.current) {
-      let minLat = Infinity, maxLat = -Infinity;
-      let minLon = Infinity, maxLon = -Infinity;
-      for (const p of points) {
-        if (p.latitude < minLat) minLat = p.latitude;
-        if (p.latitude > maxLat) maxLat = p.latitude;
-        if (p.longitude < minLon) minLon = p.longitude;
-        if (p.longitude > maxLon) maxLon = p.longitude;
-      }
-      map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [40, 40] });
-      fitted.current = true;
-    }
-  }, [map, points]);
-
-  useEffect(() => {
-    fitted.current = false;
-  }, [points.length]);
-
-  return null;
+interface TrackPath {
+  modeS: string;
+  path: [number, number][];
+  color: [number, number, number];
 }
 
 export default function TrackMap() {
@@ -75,10 +52,18 @@ export default function TrackMap() {
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
 
   const [mapStyle, setMapStyle] = useState<MapStyle>("carto-dark");
+  const [styleOpen, setStyleOpen] = useState(false);
   const [sliderValue, setSliderValue] = useState(100);
   const [playing, setPlaying] = useState(false);
   const [showLegend, setShowLegend] = useState(true);
+  const [hoverInfo, setHoverInfo] = useState<{
+    x: number;
+    y: number;
+    text: string;
+  } | null>(null);
   const playRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fittedRef = useRef(false);
+  const prevPointsLen = useRef(0);
 
   // 전체 포인트/Loss 합산
   const { allPoints, allLoss } = useMemo(() => {
@@ -102,7 +87,7 @@ export default function TrackMap() {
     return { allPoints: pts, allLoss: loss };
   }, [analysisResults, selectedModeS]);
 
-  // 고유 Mode-S 목록 (포인트 수 기준으로 정렬, 최소 10개 이상만)
+  // 고유 Mode-S 목록
   const uniqueModeS = useMemo(() => {
     const counts = new Map<string, number>();
     for (const r of analysisResults) {
@@ -110,7 +95,6 @@ export default function TrackMap() {
         counts.set(p.mode_s, (counts.get(p.mode_s) ?? 0) + 1);
       }
     }
-    // Show registered aircraft first, then top Mode-S codes by point count
     const registered = new Set(aircraft.map((a) => a.mode_s_code.toUpperCase()));
     return Array.from(counts.entries())
       .filter(([, count]) => count >= 10)
@@ -120,7 +104,7 @@ export default function TrackMap() {
         if (aReg !== bReg) return bReg - aReg;
         return cb - ca;
       })
-      .slice(0, 200) // Limit dropdown to top 200
+      .slice(0, 200)
       .map(([ms]) => ms);
   }, [analysisResults, aircraft]);
 
@@ -162,22 +146,212 @@ export default function TrackMap() {
     };
   }, [playing]);
 
-  // Aircraft name lookup
-  const getAircraftName = (modeS: string): string => {
-    const a = aircraft.find(
-      (ac) => ac.mode_s_code.toLowerCase() === modeS.toLowerCase()
-    );
-    return a ? `${a.name} (${modeS})` : modeS;
-  };
+  // Auto fit bounds
+  const [viewState, setViewState] = useState({
+    longitude: 127.0,
+    latitude: 36.5,
+    zoom: 6,
+    pitch: 0,
+    bearing: 0,
+  });
 
-  // 한국 중심 기본 좌표
-  const defaultCenter: [number, number] = [36.5, 127.0];
+  useEffect(() => {
+    if (allPoints.length > 0 && allPoints.length !== prevPointsLen.current) {
+      prevPointsLen.current = allPoints.length;
+      fittedRef.current = false;
+    }
+    if (allPoints.length > 0 && !fittedRef.current) {
+      let minLat = Infinity,
+        maxLat = -Infinity,
+        minLon = Infinity,
+        maxLon = -Infinity;
+      for (const p of allPoints) {
+        if (p.latitude < minLat) minLat = p.latitude;
+        if (p.latitude > maxLat) maxLat = p.latitude;
+        if (p.longitude < minLon) minLon = p.longitude;
+        if (p.longitude > maxLon) maxLon = p.longitude;
+      }
+      const cLat = (minLat + maxLat) / 2;
+      const cLon = (minLon + maxLon) / 2;
+      const latSpan = maxLat - minLat;
+      const lonSpan = maxLon - minLon;
+      const span = Math.max(latSpan, lonSpan, 0.01);
+      const zoom = Math.max(2, Math.min(15, Math.log2(360 / span) - 0.5));
+      setViewState((v) => ({ ...v, latitude: cLat, longitude: cLon, zoom }));
+      fittedRef.current = true;
+    }
+  }, [allPoints]);
+
+  // Mode-S별 트랙 패스 데이터 (GPU용 - 다운샘플링 없음)
+  const trackPaths: TrackPath[] = useMemo(() => {
+    const groups = new Map<string, TrackPoint[]>();
+    const maxTs = sliderValue < 100 ? currentTimestamp : Infinity;
+
+    for (const p of allPoints) {
+      if (p.timestamp > maxTs) continue;
+      let arr = groups.get(p.mode_s);
+      if (!arr) {
+        arr = [];
+        groups.set(p.mode_s, arr);
+      }
+      arr.push(p);
+    }
+
+    const paths: TrackPath[] = [];
+    let colorIdx = 0;
+    for (const [modeS, pts] of groups) {
+      if (pts.length < 2) continue;
+      paths.push({
+        modeS,
+        path: pts.map((p) => [p.longitude, p.latitude]),
+        color: TRACK_COLORS[colorIdx % TRACK_COLORS.length],
+      });
+      colorIdx++;
+    }
+    return paths;
+  }, [allPoints, sliderValue, currentTimestamp]);
+
+  // Loss 데이터
+  const filteredLoss = useMemo(() => {
+    if (sliderValue >= 100) return allLoss;
+    return allLoss.filter((s) => s.start_time <= currentTimestamp);
+  }, [allLoss, sliderValue, currentTimestamp]);
+
+  // deck.gl 레이어
+  const deckLayers = useMemo(() => {
+    const layers = [];
+
+    // 항적 경로 (PathLayer - GPU)
+    layers.push(
+      new PathLayer<TrackPath>({
+        id: "track-paths",
+        data: trackPaths,
+        getPath: (d) => d.path,
+        getColor: (d) => [...d.color, 200],
+        getWidth: 2,
+        widthMinPixels: 1.5,
+        widthMaxPixels: 4,
+        widthUnits: "pixels",
+        jointRounded: true,
+        capRounded: true,
+        pickable: true,
+        autoHighlight: true,
+        highlightColor: [255, 255, 255, 80],
+        onHover: (info) => {
+          if (info.object) {
+            setHoverInfo({
+              x: info.x,
+              y: info.y,
+              text: `Mode-S: ${info.object.modeS} (${
+                info.object.path.length
+              } pts)`,
+            });
+          } else {
+            setHoverInfo(null);
+          }
+        },
+      })
+    );
+
+    // Loss 구간 라인 (LineLayer - GPU)
+    if (filteredLoss.length > 0) {
+      layers.push(
+        new LineLayer<LossSegment>({
+          id: "loss-lines",
+          data: filteredLoss,
+          getSourcePosition: (d) => [d.start_lon, d.start_lat],
+          getTargetPosition: (d) => [d.end_lon, d.end_lat],
+          getColor: [233, 69, 96, 220],
+          getWidth: 3,
+          widthMinPixels: 2,
+          widthUnits: "pixels",
+          pickable: true,
+          onHover: (info) => {
+            if (info.object) {
+              const s = info.object;
+              setHoverInfo({
+                x: info.x,
+                y: info.y,
+                text: `Loss: ${s.duration_secs.toFixed(1)}s / ${s.distance_km.toFixed(2)}km / ${s.last_altitude.toFixed(0)}m`,
+              });
+            } else {
+              setHoverInfo(null);
+            }
+          },
+        })
+      );
+
+      // Loss 시작점 (ScatterplotLayer - GPU)
+      layers.push(
+        new ScatterplotLayer<LossSegment>({
+          id: "loss-start",
+          data: filteredLoss,
+          getPosition: (d) => [d.start_lon, d.start_lat],
+          getFillColor: [233, 69, 96, 230],
+          getLineColor: [255, 255, 255, 180],
+          getRadius: 5,
+          radiusMinPixels: 4,
+          radiusMaxPixels: 12,
+          radiusUnits: "pixels",
+          lineWidthMinPixels: 1,
+          stroked: true,
+          pickable: true,
+          onHover: (info) => {
+            if (info.object) {
+              const s = info.object;
+              setHoverInfo({
+                x: info.x,
+                y: info.y,
+                text: `Loss 시작 ${format(new Date(s.start_time * 1000), "HH:mm:ss")} / ${s.duration_secs.toFixed(1)}s`,
+              });
+            } else {
+              setHoverInfo(null);
+            }
+          },
+        })
+      );
+
+      // Loss 종료점
+      layers.push(
+        new ScatterplotLayer<LossSegment>({
+          id: "loss-end",
+          data: filteredLoss,
+          getPosition: (d) => [d.end_lon, d.end_lat],
+          getFillColor: [255, 138, 128, 200],
+          getLineColor: [255, 255, 255, 150],
+          getRadius: 4,
+          radiusMinPixels: 3,
+          radiusMaxPixels: 10,
+          radiusUnits: "pixels",
+          lineWidthMinPixels: 1,
+          stroked: true,
+          pickable: false,
+        })
+      );
+    }
+
+    return layers;
+  }, [trackPaths, filteredLoss]);
+
+  // Aircraft name lookup
+  const getAircraftName = useCallback(
+    (modeS: string): string => {
+      const a = aircraft.find(
+        (ac) => ac.mode_s_code.toLowerCase() === modeS.toLowerCase()
+      );
+      return a ? `${a.name} (${modeS})` : modeS;
+    },
+    [aircraft]
+  );
 
   return (
     <div className="flex h-full flex-col">
       {/* Top toolbar */}
       <div className="flex items-center gap-3 border-b border-white/10 bg-[#0d1b2a] px-4 py-3">
         <h1 className="text-lg font-bold text-white">항적 지도</h1>
+        <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-400">
+          GPU
+        </span>
         <div className="h-5 w-px bg-white/10" />
 
         {/* Aircraft filter */}
@@ -185,9 +359,7 @@ export default function TrackMap() {
           <Filter size={14} className="text-gray-400" />
           <select
             value={selectedModeS ?? ""}
-            onChange={(e) =>
-              setSelectedModeS(e.target.value || null)
-            }
+            onChange={(e) => setSelectedModeS(e.target.value || null)}
             className="rounded-lg border border-white/10 bg-[#16213e] px-3 py-1.5 text-sm text-white outline-none focus:border-[#e94560]/50"
           >
             <option value="">전체 항적</option>
@@ -219,26 +391,57 @@ export default function TrackMap() {
 
       {/* Map container */}
       <div className="relative flex-1">
-        <MapContainer
-          center={defaultCenter}
-          zoom={7}
-          className="h-full w-full"
-          zoomControl={true}
+        <MapGL
+          {...viewState}
+          onMove={(evt) => setViewState(evt.viewState)}
+          mapStyle={MAP_STYLES[mapStyle]}
+          style={{ width: "100%", height: "100%" }}
+          attributionControl={{}}
         >
-          <TileUpdater style={mapStyle} />
-          <FitBounds points={allPoints} />
-          <TrackLayer
-            points={allPoints}
-            maxTimestamp={sliderValue < 100 ? currentTimestamp : undefined}
-          />
-          <LossMarkers
-            segments={allLoss}
-            maxTimestamp={sliderValue < 100 ? currentTimestamp : undefined}
-          />
-        </MapContainer>
+          <DeckGLOverlay layers={deckLayers} />
+          <NavigationControl position="top-left" />
+        </MapGL>
+
+        {/* Hover tooltip */}
+        {hoverInfo && (
+          <div
+            className="pointer-events-none absolute z-[1000] rounded-lg border border-white/20 bg-[#16213e]/95 px-3 py-2 text-xs text-white shadow-lg backdrop-blur"
+            style={{ left: hoverInfo.x + 12, top: hoverInfo.y - 12 }}
+          >
+            {hoverInfo.text}
+          </div>
+        )}
 
         {/* Map style toggle */}
-        <MapStyleToggle style={mapStyle} onChange={setMapStyle} />
+        <div
+          className="absolute right-3 top-3 z-[1000]"
+        >
+          <div className="relative">
+            <button
+              onClick={() => setStyleOpen(!styleOpen)}
+              className="flex items-center gap-2 rounded-lg border border-white/20 bg-[#16213e]/95 px-3 py-2 text-sm text-white shadow-lg backdrop-blur hover:bg-[#16213e] transition-colors"
+            >
+              <Layers size={16} />
+              <span>{mapStyle === "osm" ? "표준" : "다크"}</span>
+            </button>
+            {styleOpen && (
+              <div className="absolute right-0 top-full mt-1 w-36 overflow-hidden rounded-lg border border-white/20 bg-[#16213e]/95 shadow-xl backdrop-blur">
+                <button
+                  onClick={() => { setMapStyle("osm"); setStyleOpen(false); }}
+                  className={`flex w-full items-center px-3 py-2 text-sm transition-colors ${mapStyle === "osm" ? "bg-[#e94560]/20 text-[#e94560]" : "text-gray-300 hover:bg-white/10"}`}
+                >
+                  표준 (밝은)
+                </button>
+                <button
+                  onClick={() => { setMapStyle("carto-dark"); setStyleOpen(false); }}
+                  className={`flex w-full items-center px-3 py-2 text-sm transition-colors ${mapStyle === "carto-dark" ? "bg-[#e94560]/20 text-[#e94560]" : "text-gray-300 hover:bg-white/10"}`}
+                >
+                  다크
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
 
         {/* Legend */}
         {showLegend && (
@@ -250,13 +453,7 @@ export default function TrackMap() {
                 <span className="text-gray-300">정상 항적</span>
               </div>
               <div className="flex items-center gap-2">
-                <div
-                  className="h-0.5 w-5"
-                  style={{
-                    backgroundImage:
-                      "repeating-linear-gradient(90deg, #e94560 0, #e94560 4px, transparent 4px, transparent 7px)",
-                  }}
-                />
+                <div className="h-0.5 w-5 bg-[#e94560]" />
                 <span className="text-gray-300">Loss 구간</span>
               </div>
               <div className="flex items-center gap-2">
@@ -289,7 +486,6 @@ export default function TrackMap() {
       {/* Time slider / playback controls */}
       {allPoints.length > 0 && (
         <div className="flex items-center gap-3 border-t border-white/10 bg-[#0d1b2a] px-4 py-3">
-          {/* Playback buttons */}
           <button
             onClick={() => setSliderValue(0)}
             className="rounded p-1 text-gray-400 hover:text-white transition-colors"
@@ -302,7 +498,11 @@ export default function TrackMap() {
             className="flex h-8 w-8 items-center justify-center rounded-full bg-[#e94560] text-white hover:bg-[#d63851] transition-colors"
             title={playing ? "일시정지" : "재생"}
           >
-            {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
+            {playing ? (
+              <Pause size={14} />
+            ) : (
+              <Play size={14} className="ml-0.5" />
+            )}
           </button>
           <button
             onClick={() => setSliderValue(100)}
@@ -312,14 +512,12 @@ export default function TrackMap() {
             <SkipForward size={16} />
           </button>
 
-          {/* Time display */}
           <span className="min-w-[70px] text-center font-mono text-xs text-gray-400">
             {timeRange.min > 0
               ? format(new Date(currentTimestamp * 1000), "HH:mm:ss")
               : "--:--:--"}
           </span>
 
-          {/* Slider */}
           <input
             type="range"
             min={0}
@@ -333,14 +531,12 @@ export default function TrackMap() {
             className="flex-1 accent-[#e94560]"
           />
 
-          {/* End time */}
           <span className="min-w-[70px] text-center font-mono text-xs text-gray-400">
             {timeRange.max > 0
               ? format(new Date(timeRange.max * 1000), "HH:mm:ss")
               : "--:--:--"}
           </span>
 
-          {/* Percentage */}
           <span className="min-w-[40px] text-right font-mono text-xs text-gray-500">
             {sliderValue.toFixed(0)}%
           </span>

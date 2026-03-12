@@ -1,7 +1,10 @@
 @import "tailwindcss";
 
-/* Leaflet CSS */
+/* Leaflet CSS (LossAnalysis 미니맵) */
 @import "leaflet/dist/leaflet.css";
+
+/* MapLibre GL CSS (항적 지도 GPU) */
+@import "maplibre-gl/dist/maplibre-gl.css";
 
 /* Dark theme base */
 :root {
