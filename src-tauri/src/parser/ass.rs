@@ -5,9 +5,9 @@ use log::{debug, info, warn};
 use crate::models::{ParsedFile, TrackPoint};
 use crate::parser::ParseError;
 
-/// Gimpo Airport radar reference point (WGS-84)
-const RADAR_LAT: f64 = 37.5585;
-const RADAR_LON: f64 = 126.7906;
+/// Default radar reference point: Gimpo Airport (WGS-84)
+pub const DEFAULT_RADAR_LAT: f64 = 37.5585;
+pub const DEFAULT_RADAR_LON: f64 = 126.7906;
 
 /// Known ASTERIX category bytes
 const CAT048: u8 = 0x30; // 48 - Monoradar Target Reports
@@ -71,7 +71,8 @@ struct Cat048Record {
 }
 
 /// Parse an ASS file (NEC RDRS recording containing ASTERIX data).
-pub fn parse_ass_file(path: &str) -> Result<ParsedFile, ParseError> {
+/// `radar_lat`/`radar_lon` specify the radar reference point for coordinate conversion.
+pub fn parse_ass_file(path: &str, radar_lat: f64, radar_lon: f64) -> Result<ParsedFile, ParseError> {
     let file_path = Path::new(path);
     let filename = file_path
         .file_name()
@@ -90,11 +91,8 @@ pub fn parse_ass_file(path: &str) -> Result<ParsedFile, ParseError> {
     info!("File size: {} bytes", data.len());
 
     let nec_frame = detect_nec_frame(&data);
-    if let Some(ref frame) = nec_frame {
-        info!(
-            "Detected NEC frame: {:02x} {:02x} {:02x} {:02x}",
-            frame[0], frame[1], frame[2], frame[3]
-        );
+    if let Some((month, day)) = nec_frame {
+        info!("Detected NEC frame: month={}, day={}", month, day);
     }
 
     let mut track_points = Vec::with_capacity(100_000);
@@ -107,16 +105,16 @@ pub fn parse_ass_file(path: &str) -> Result<ParsedFile, ParseError> {
     let base_date_secs = extract_base_date_from_filename(&filename);
 
     while offset < data.len() {
-        // Check for NEC framing header (4 bytes + 1 counter byte)
-        if let Some(ref frame) = nec_frame {
-            if offset + 5 <= data.len() && data[offset..offset + 4] == *frame {
+        // Check for NEC framing header (5 bytes: month, day, hour, minute, counter)
+        if let Some((month, day)) = nec_frame {
+            if is_nec_frame(&data, offset, month, day) {
                 offset += 5;
                 continue;
             }
         }
 
         // Try to parse an ASTERIX block with chain validation
-        if let Some(block_len) = try_asterix_block(&data, offset, &nec_frame) {
+        if let Some(block_len) = try_asterix_block(&data, offset, nec_frame) {
             let cat = data[offset];
 
             if cat == CAT048 {
@@ -132,6 +130,8 @@ pub fn parse_ass_file(path: &str) -> Result<ParsedFile, ParseError> {
                                 &record,
                                 base_date_secs,
                                 point_index,
+                                radar_lat,
+                                radar_lon,
                             ) {
                                 track_points.push(tp);
                                 point_index += 1;
@@ -196,7 +196,7 @@ pub fn parse_ass_file(path: &str) -> Result<ParsedFile, ParseError> {
 /// Check if there's a valid ASTERIX block at `offset`.
 /// Validates by checking if the block chains to another valid block or NEC frame.
 /// Returns the block length if valid, None otherwise.
-fn try_asterix_block(data: &[u8], offset: usize, nec_frame: &Option<[u8; 4]>) -> Option<usize> {
+fn try_asterix_block(data: &[u8], offset: usize, nec_frame: Option<(u8, u8)>) -> Option<usize> {
     if offset + 3 > data.len() {
         return None;
     }
@@ -227,14 +227,8 @@ fn try_asterix_block(data: &[u8], offset: usize, nec_frame: &Option<[u8; 4]>) ->
     }
 
     // Check if next position is a NEC frame
-    if let Some(ref frame) = nec_frame {
-        if next_offset + 5 <= data.len() && data[next_offset..next_offset + 4] == *frame {
-            // After the NEC frame, should be another ASTERIX block
-            let after_frame = next_offset + 5;
-            if after_frame < data.len() && is_valid_block_start(data, after_frame) {
-                return Some(block_len);
-            }
-            // NEC frame at end of file or followed by another NEC frame
+    if let Some((month, day)) = nec_frame {
+        if is_nec_frame(data, next_offset, month, day) {
             return Some(block_len);
         }
     }
@@ -256,17 +250,17 @@ fn is_valid_block_start(data: &[u8], offset: usize) -> bool {
     len >= 3 && len <= MAX_BLOCK_LEN && offset + len <= data.len()
 }
 
-/// Detect the 4-byte NEC framing pattern from the file data.
-/// Requires confirmation: the same pattern must appear at least twice.
-fn detect_nec_frame(data: &[u8]) -> Option<[u8; 4]> {
+/// Detect the NEC framing pattern from the file data.
+/// Returns (month, day) — hour and minute vary across frames so we only lock on the date.
+/// Requires confirmation: the same month/day must appear at least twice with valid time bytes.
+fn detect_nec_frame(data: &[u8]) -> Option<(u8, u8)> {
     let scan_len = data.len().min(50_000);
 
     for i in 0..scan_len.saturating_sub(8) {
-        let b0 = data[i];
-        let b1 = data[i + 1];
-        let b2 = data[i + 2];
-        let b3 = data[i + 3];
-        let b5 = data[i + 5];
+        let b0 = data[i];     // month
+        let b1 = data[i + 1]; // day
+        let b2 = data[i + 2]; // hour
+        let b3 = data[i + 3]; // minute
 
         // Validate as date/time: month (1-12), day (1-31), hour (0-23), minute (0-59)
         if !(b0 >= 1 && b0 <= 12 && b1 >= 1 && b1 <= 31 && b2 <= 23 && b3 <= 59) {
@@ -274,6 +268,10 @@ fn detect_nec_frame(data: &[u8]) -> Option<[u8; 4]> {
         }
 
         // Check if byte at +5 is a known ASTERIX category
+        if i + 5 >= data.len() {
+            continue;
+        }
+        let b5 = data[i + 5];
         if b5 != CAT048 && b5 != CAT034 && b5 != CAT008 {
             continue;
         }
@@ -287,19 +285,41 @@ fn detect_nec_frame(data: &[u8]) -> Option<[u8; 4]> {
             continue;
         }
 
-        // REQUIRE confirmation: same frame pattern must appear again after this block
+        // REQUIRE confirmation: another NEC frame (same month+day, valid hour+minute)
+        // must appear after this ASTERIX block
         let next_pos = i + 5 + block_len;
         if next_pos + 4 < scan_len
             && data[next_pos] == b0
             && data[next_pos + 1] == b1
-            && data[next_pos + 2] == b2
-            && data[next_pos + 3] == b3
+            && data[next_pos + 2] <= 23
+            && data[next_pos + 3] <= 59
         {
-            return Some([b0, b1, b2, b3]);
+            return Some((b0, b1));
         }
     }
 
     None
+}
+
+/// Check if the data at `offset` looks like a NEC frame header.
+/// Matches on the detected month+day, with valid hour (0-23) and minute (0-59),
+/// and verifies the byte after the 5-byte frame is a known ASTERIX category or another frame.
+fn is_nec_frame(data: &[u8], offset: usize, month: u8, day: u8) -> bool {
+    if offset + 5 > data.len() {
+        return false;
+    }
+    if data[offset] != month || data[offset + 1] != day {
+        return false;
+    }
+    if data[offset + 2] > 23 || data[offset + 3] > 59 {
+        return false;
+    }
+    // Validate what follows the 5-byte frame
+    if offset + 5 >= data.len() {
+        return true; // Frame at EOF
+    }
+    let after = data[offset + 5];
+    after == CAT048 || after == CAT034 || after == CAT008 || after == month
 }
 
 /// Extract a base Unix timestamp from a filename like "gimpo_260304_0415.ass".
@@ -691,15 +711,17 @@ fn record_to_track_point(
     record: &Cat048Record,
     base_date_secs: f64,
     _index: u64,
+    radar_lat: f64,
+    radar_lon: f64,
 ) -> Option<TrackPoint> {
     // Require time
     let tod = record.time_of_day?;
 
     // Convert position from polar or Cartesian to lat/lon
     let (lat, lon) = if let (Some(rho), Some(theta)) = (record.rho_nm, record.theta_deg) {
-        polar_to_latlon(rho, theta)
+        polar_to_latlon(rho, theta, radar_lat, radar_lon)
     } else if let (Some(x_nm), Some(y_nm)) = (record.cart_x_nm, record.cart_y_nm) {
-        cartesian_to_latlon(x_nm, y_nm)
+        cartesian_to_latlon(x_nm, y_nm, radar_lat, radar_lon)
     } else {
         return None;
     };
@@ -744,24 +766,24 @@ fn record_to_track_point(
     })
 }
 
-fn polar_to_latlon(rho_nm: f64, theta_deg: f64) -> (f64, f64) {
+fn polar_to_latlon(rho_nm: f64, theta_deg: f64, radar_lat: f64, radar_lon: f64) -> (f64, f64) {
     let rng_km = rho_nm * 1.852;
     let az_rad = theta_deg.to_radians();
 
     let lat_offset = rng_km * az_rad.cos() / 111.32;
-    let lon_offset = rng_km * az_rad.sin() / (111.32 * RADAR_LAT.to_radians().cos());
+    let lon_offset = rng_km * az_rad.sin() / (111.32 * radar_lat.to_radians().cos());
 
-    (RADAR_LAT + lat_offset, RADAR_LON + lon_offset)
+    (radar_lat + lat_offset, radar_lon + lon_offset)
 }
 
-fn cartesian_to_latlon(x_nm: f64, y_nm: f64) -> (f64, f64) {
+fn cartesian_to_latlon(x_nm: f64, y_nm: f64, radar_lat: f64, radar_lon: f64) -> (f64, f64) {
     let x_km = x_nm * 1.852;
     let y_km = y_nm * 1.852;
 
     let lat_offset = y_km / 111.32;
-    let lon_offset = x_km / (111.32 * RADAR_LAT.to_radians().cos());
+    let lon_offset = x_km / (111.32 * radar_lat.to_radians().cos());
 
-    (RADAR_LAT + lat_offset, RADAR_LON + lon_offset)
+    (radar_lat + lat_offset, radar_lon + lon_offset)
 }
 
 fn make_err(offset: usize, msg: &str) -> ParseError {
@@ -777,23 +799,23 @@ mod tests {
 
     #[test]
     fn test_polar_to_latlon_north() {
-        let (lat, lon) = polar_to_latlon(30.0, 0.0);
-        assert!((lat - (RADAR_LAT + 30.0 * 1.852 / 111.32)).abs() < 0.001);
-        assert!((lon - RADAR_LON).abs() < 0.001);
+        let (lat, lon) = polar_to_latlon(30.0, 0.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON);
+        assert!((lat - (DEFAULT_RADAR_LAT + 30.0 * 1.852 / 111.32)).abs() < 0.001);
+        assert!((lon - DEFAULT_RADAR_LON).abs() < 0.001);
     }
 
     #[test]
     fn test_polar_to_latlon_east() {
-        let (lat, lon) = polar_to_latlon(20.0, 90.0);
-        assert!((lat - RADAR_LAT).abs() < 0.01);
-        assert!(lon > RADAR_LON);
+        let (lat, lon) = polar_to_latlon(20.0, 90.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON);
+        assert!((lat - DEFAULT_RADAR_LAT).abs() < 0.01);
+        assert!(lon > DEFAULT_RADAR_LON);
     }
 
     #[test]
     fn test_cartesian_to_latlon() {
-        let (lat, lon) = cartesian_to_latlon(10.0, 10.0);
-        assert!(lat > RADAR_LAT);
-        assert!(lon > RADAR_LON);
+        let (lat, lon) = cartesian_to_latlon(10.0, 10.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON);
+        assert!(lat > DEFAULT_RADAR_LAT);
+        assert!(lon > DEFAULT_RADAR_LON);
     }
 
     #[test]
@@ -858,14 +880,14 @@ mod tests {
         data.push(0x30); // CAT048
         data.extend_from_slice(&[0x00, 0x1a]); // LEN=26
         data.extend(vec![0x00; 23]); // record data
-        // Second frame (must match for confirmation)
-        data.extend_from_slice(&[0x03, 0x04, 0x04, 0x0f, 0x0d]);
+        // Second frame (same month/day, can differ hour/minute)
+        data.extend_from_slice(&[0x03, 0x04, 0x04, 0x10, 0x0d]); // minute changed 0x0f->0x10
         data.push(0x22); // CAT034
         data.extend_from_slice(&[0x00, 0x0b]); // LEN=11
         data.extend(vec![0x00; 8]);
 
         let frame = detect_nec_frame(&data);
-        assert_eq!(frame, Some([0x03, 0x04, 0x04, 0x0f]));
+        assert_eq!(frame, Some((0x03, 0x04))); // Returns (month, day)
     }
 
     #[test]
@@ -878,6 +900,24 @@ mod tests {
 
         let frame = detect_nec_frame(&data);
         assert_eq!(frame, None); // Should NOT detect without confirmation
+    }
+
+    #[test]
+    fn test_is_nec_frame() {
+        // Valid NEC frame followed by CAT048
+        let data = vec![0x03, 0x0c, 0x09, 0x06, 0x17, 0x30, 0x00, 0x10];
+        assert!(is_nec_frame(&data, 0, 0x03, 0x0c));
+
+        // Same month/day but different hour/minute — should still match
+        let data2 = vec![0x03, 0x0c, 0x0a, 0x15, 0x20, 0x22, 0x00, 0x10];
+        assert!(is_nec_frame(&data2, 0, 0x03, 0x0c));
+
+        // Wrong month — should not match
+        assert!(!is_nec_frame(&data, 0, 0x04, 0x0c));
+
+        // Invalid hour (24) — should not match
+        let data3 = vec![0x03, 0x0c, 0x18, 0x06, 0x17, 0x30];
+        assert!(!is_nec_frame(&data3, 0, 0x03, 0x0c));
     }
 
     #[test]
@@ -894,11 +934,11 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x00]);
 
         // Block 1 should be valid because block 2 follows
-        assert!(try_asterix_block(&data, 0, &None).is_some());
+        assert!(try_asterix_block(&data, 0, None).is_some());
 
         // Single block with no valid successor should fail
         let solo = vec![0x30, 0x00, 0x05, 0x00, 0x00, 0xAA, 0xBB];
-        assert!(try_asterix_block(&solo, 0, &None).is_none());
+        assert!(try_asterix_block(&solo, 0, None).is_none());
     }
 
     #[test]
@@ -924,7 +964,60 @@ mod tests {
             ..Default::default()
         };
         // rho_nm > 256 won't be set by parser (validation), but test coords filter
-        let (lat, lon) = polar_to_latlon(500.0, 0.0);
+        let (lat, _lon) = polar_to_latlon(500.0, 0.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON);
         assert!(lat > 45.0); // Out of Korean bounds
+    }
+
+    #[test]
+    #[ignore] // Requires actual ASS file in ass/ directory
+    fn test_parse_real_ass_file() {
+        let test_file = std::path::Path::new("../ass/gimpo_260312_0906.ass");
+        if !test_file.exists() {
+            eprintln!("Skipping: test file not found");
+            return;
+        }
+        let result = parse_ass_file(
+            test_file.to_str().unwrap(),
+            DEFAULT_RADAR_LAT,
+            DEFAULT_RADAR_LON,
+        )
+        .expect("Failed to parse ASS file");
+
+        println!("Total records: {}", result.total_records);
+        println!("Track points: {}", result.track_points.len());
+        println!("Parse errors: {}", result.parse_errors.len());
+
+        // Should have substantial data
+        assert!(result.total_records > 10_000, "Expected >10K records, got {}", result.total_records);
+        assert!(result.track_points.len() > 5_000, "Expected >5K track points, got {}", result.track_points.len());
+
+        // Error rate should be very low
+        let error_rate = result.parse_errors.len() as f64 / result.total_records as f64;
+        assert!(error_rate < 0.01, "Error rate {:.2}% too high", error_rate * 100.0);
+
+        // All track points should be in Korean airspace
+        for tp in &result.track_points {
+            assert!(tp.latitude >= 30.0 && tp.latitude <= 45.0,
+                "Latitude {} out of range", tp.latitude);
+            assert!(tp.longitude >= 120.0 && tp.longitude <= 135.0,
+                "Longitude {} out of range", tp.longitude);
+        }
+
+        // Time should be within 24 hours
+        if let (Some(start), Some(end)) = (result.start_time, result.end_time) {
+            let duration = end - start;
+            assert!(duration > 0.0 && duration < 86400.0,
+                "Duration {} seconds unreasonable", duration);
+        }
+
+        // Check unique Mode-S codes (should be reasonable, not tens of thousands of garbage)
+        let mut mode_s_codes: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for tp in &result.track_points {
+            mode_s_codes.insert(&tp.mode_s);
+        }
+        println!("Unique Mode-S codes: {}", mode_s_codes.len());
+        // Gimpo radar near Seoul sees thousands of targets; >10K would indicate garbage
+        assert!(mode_s_codes.len() < 10_000,
+            "Too many unique Mode-S codes ({}), likely parsing garbage", mode_s_codes.len());
     }
 }

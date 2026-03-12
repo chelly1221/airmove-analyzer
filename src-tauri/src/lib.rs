@@ -62,9 +62,9 @@ fn save_aircraft_to_file(path: &PathBuf, aircraft: &[Aircraft]) -> Result<(), St
 
 /// Parse an ASS binary file and return structured track data.
 #[tauri::command]
-fn parse_ass_file(path: String) -> Result<ParsedFile, String> {
-    info!("Command: parse_ass_file({})", path);
-    parser::ass::parse_ass_file(&path).map_err(|e| e.to_string())
+fn parse_ass_file(path: String, radar_lat: f64, radar_lon: f64) -> Result<ParsedFile, String> {
+    info!("Command: parse_ass_file({}, radar={},{})", path, radar_lat, radar_lon);
+    parser::ass::parse_ass_file(&path, radar_lat, radar_lon).map_err(|e| e.to_string())
 }
 
 /// Analyze parsed track data: detect loss segments and compute statistics.
@@ -136,9 +136,9 @@ fn delete_aircraft(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
 
 /// Parse an ASS file and immediately analyze it (combined command for convenience).
 #[tauri::command]
-fn parse_and_analyze(file_path: String) -> Result<AnalysisResult, String> {
-    info!("Command: parse_and_analyze({})", file_path);
-    let parsed = parser::ass::parse_ass_file(&file_path).map_err(|e| e.to_string())?;
+fn parse_and_analyze(file_path: String, radar_lat: f64, radar_lon: f64) -> Result<AnalysisResult, String> {
+    info!("Command: parse_and_analyze({}, radar={},{})", file_path, radar_lat, radar_lon);
+    let parsed = parser::ass::parse_ass_file(&file_path, radar_lat, radar_lon).map_err(|e| e.to_string())?;
     Ok(analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS))
 }
 

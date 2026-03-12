@@ -36,7 +36,7 @@ const MAP_STYLES: Record<MapStyle, string> = {
   "carto-dark":
     "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
   osm:
-    "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+    "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
 };
 
 interface TrackPath {

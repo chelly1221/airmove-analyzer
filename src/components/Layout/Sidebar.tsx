@@ -52,7 +52,7 @@ export default function Sidebar() {
         </div>
         <div>
           <h1 className="text-sm font-bold text-white leading-tight">
-            NEC 레이더
+            레이더 항적
           </h1>
           <p className="text-xs text-gray-400">분석체계</p>
         </div>

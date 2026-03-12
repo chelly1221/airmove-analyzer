@@ -9,11 +9,26 @@ import {
   Loader2,
   FolderOpen,
   AlertCircle,
+  Radio,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store";
-import type { AnalysisResult, UploadedFile } from "../types";
+import type { AnalysisResult, RadarSite, UploadedFile } from "../types";
+
+/** 주요 레이더 사이트 프리셋 */
+const RADAR_PRESETS: RadarSite[] = [
+  { name: "김포", latitude: 37.5585, longitude: 126.7906, altitude: 18, antenna_height: 30 },
+  { name: "인천", latitude: 37.4692, longitude: 126.5514, altitude: 53, antenna_height: 30 },
+  { name: "관악산", latitude: 37.4419, longitude: 126.9639, altitude: 632, antenna_height: 25 },
+  { name: "오성산", latitude: 36.9500, longitude: 127.0167, altitude: 791, antenna_height: 25 },
+  { name: "광덕산", latitude: 36.6833, longitude: 127.0500, altitude: 699, antenna_height: 25 },
+  { name: "면봉산", latitude: 35.6500, longitude: 128.7333, altitude: 650, antenna_height: 25 },
+  { name: "고산", latitude: 33.2942, longitude: 126.1628, altitude: 286, antenna_height: 25 },
+  { name: "진도", latitude: 34.4667, longitude: 126.3167, altitude: 484, antenna_height: 25 },
+  { name: "백령도", latitude: 37.9667, longitude: 124.7167, altitude: 136, antenna_height: 25 },
+  { name: "강릉", latitude: 37.7556, longitude: 128.8961, altitude: 15, antenna_height: 25 },
+];
 
 export default function FileUpload() {
   const uploadedFiles = useAppStore((s) => s.uploadedFiles);
@@ -22,6 +37,8 @@ export default function FileUpload() {
   const removeUploadedFile = useAppStore((s) => s.removeUploadedFile);
   const clearUploadedFiles = useAppStore((s) => s.clearUploadedFiles);
   const addAnalysisResult = useAppStore((s) => s.addAnalysisResult);
+  const radarSite = useAppStore((s) => s.radarSite);
+  const setRadarSite = useAppStore((s) => s.setRadarSite);
   const setLoading = useAppStore((s) => s.setLoading);
   const setLoadingMessage = useAppStore((s) => s.setLoadingMessage);
 
@@ -81,6 +98,8 @@ export default function FileUpload() {
     try {
       const result: AnalysisResult = await invoke("parse_and_analyze", {
         filePath: file.path,
+        radarLat: radarSite.latitude,
+        radarLon: radarSite.longitude,
       });
       updateUploadedFile(file.path, {
         status: "done",
@@ -155,8 +174,34 @@ export default function FileUpload() {
       <div>
         <h1 className="text-2xl font-bold text-white">자료 업로드</h1>
         <p className="mt-1 text-sm text-gray-400">
-          NEC RDRS ASS 파일을 업로드하여 파싱합니다
+          RDRS ASS 파일을 업로드하여 파싱합니다
         </p>
+      </div>
+
+      {/* Radar Site Selector */}
+      <div className="rounded-xl border border-white/10 bg-[#16213e] p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Radio size={16} className="text-[#e94560]" />
+          <h2 className="text-sm font-semibold text-white">레이더 사이트</h2>
+          <span className="text-xs text-gray-500">
+            ({radarSite.latitude.toFixed(4)}°N, {radarSite.longitude.toFixed(4)}°E)
+          </span>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {RADAR_PRESETS.map((preset) => (
+            <button
+              key={preset.name}
+              onClick={() => setRadarSite(preset)}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                radarSite.name === preset.name
+                  ? "bg-[#e94560] text-white"
+                  : "border border-white/10 text-gray-400 hover:border-white/30 hover:text-white"
+              }`}
+            >
+              {preset.name}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Drop Zone */}

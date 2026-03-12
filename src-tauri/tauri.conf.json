@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "NEC Radar Analyzer",
+  "productName": "AirMove Analyzer",
   "version": "0.1.0",
-  "identifier": "com.nec.radar-analyzer",
+  "identifier": "com.airmove.analyzer",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,11 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "NEC 레이더 비행검사기 분석체계",
+        "title": "AirMove Analyzer",
         "width": 1400,
         "height": 900,
         "minWidth": 1024,
-        "minHeight": 768
+        "minHeight": 768,
+        "decorations": false
       }
     ],
     "security": {

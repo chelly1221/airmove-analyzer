@@ -3,6 +3,7 @@ import type {
   Aircraft,
   AnalysisResult,
   PageId,
+  RadarSite,
   UploadedFile,
 } from "../types";
 
@@ -24,6 +25,10 @@ interface AppState {
   analysisResults: AnalysisResult[];
   addAnalysisResult: (r: AnalysisResult) => void;
   clearAnalysisResults: () => void;
+
+  // 레이더 사이트
+  radarSite: RadarSite;
+  setRadarSite: (site: RadarSite) => void;
 
   // 필터
   selectedModeS: string | null;
@@ -79,6 +84,16 @@ export const useAppStore = create<AppState>((set) => ({
   addAnalysisResult: (r) =>
     set((state) => ({ analysisResults: [...state.analysisResults, r] })),
   clearAnalysisResults: () => set({ analysisResults: [] }),
+
+  // 레이더 사이트 (기본: 김포)
+  radarSite: {
+    name: "김포",
+    latitude: 37.5585,
+    longitude: 126.7906,
+    altitude: 0,
+    antenna_height: 0,
+  },
+  setRadarSite: (site) => set({ radarSite: site }),
 
   // 필터
   selectedModeS: null,

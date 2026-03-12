@@ -121,7 +121,7 @@ export default function ReportGeneration() {
       }
 
       const now = format(new Date(), "yyyyMMdd_HHmmss");
-      pdf.save(`NEC_레이더분석_보고서_${now}.pdf`);
+      pdf.save(`레이더분석_보고서_${now}.pdf`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("PDF 생성 오류:", msg);
@@ -247,7 +247,7 @@ export default function ReportGeneration() {
             {/* Report Title */}
             <div className="border-b border-white/20 pb-6 mb-6">
               <h1 className="text-xl font-bold text-white">
-                NEC 레이더 비행검사기 분석 보고서
+                레이더 비행검사기 분석 보고서
               </h1>
               <p className="mt-2 text-sm text-gray-400">
                 생성 일시: {format(new Date(), "yyyy년 MM월 dd일 HH:mm:ss")}
@@ -459,7 +459,7 @@ export default function ReportGeneration() {
             {/* Footer */}
             <div className="border-t border-white/20 pt-4 text-center">
               <p className="text-xs text-gray-600">
-                NEC 레이더 비행검사기 분석체계 (AirMove Analyzer) - 자동 생성
+                레이더 비행검사기 분석체계 (AirMove Analyzer) - 자동 생성
                 보고서
               </p>
             </div>

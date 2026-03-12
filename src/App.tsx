@@ -1,4 +1,5 @@
 import { Routes, Route } from "react-router-dom";
+import Titlebar from "./components/Layout/Titlebar";
 import Sidebar from "./components/Layout/Sidebar";
 import Dashboard from "./pages/Dashboard";
 import AircraftManagement from "./pages/AircraftManagement";
@@ -14,55 +15,58 @@ export default function App() {
   const loadingMessage = useAppStore((s) => s.loadingMessage);
 
   return (
-    <div className="flex h-full bg-[#1a1a2e]">
-      <Sidebar />
-      <main className="flex-1 overflow-auto">
-        <div className="h-full">
-          <Routes>
-            <Route
-              path="/"
-              element={
-                <PageWrapper>
-                  <Dashboard />
-                </PageWrapper>
-              }
-            />
-            <Route
-              path="/aircraft"
-              element={
-                <PageWrapper>
-                  <AircraftManagement />
-                </PageWrapper>
-              }
-            />
-            <Route
-              path="/upload"
-              element={
-                <PageWrapper>
-                  <FileUpload />
-                </PageWrapper>
-              }
-            />
-            <Route path="/map" element={<TrackMap />} />
-            <Route
-              path="/analysis"
-              element={
-                <PageWrapper>
-                  <LossAnalysis />
-                </PageWrapper>
-              }
-            />
-            <Route
-              path="/report"
-              element={
-                <PageWrapper>
-                  <ReportGeneration />
-                </PageWrapper>
-              }
-            />
-          </Routes>
-        </div>
-      </main>
+    <div className="flex h-full flex-col bg-[#1a1a2e]">
+      <Titlebar />
+      <div className="flex flex-1 overflow-hidden">
+        <Sidebar />
+        <main className="flex-1 overflow-auto">
+          <div className="h-full">
+            <Routes>
+              <Route
+                path="/"
+                element={
+                  <PageWrapper>
+                    <Dashboard />
+                  </PageWrapper>
+                }
+              />
+              <Route
+                path="/aircraft"
+                element={
+                  <PageWrapper>
+                    <AircraftManagement />
+                  </PageWrapper>
+                }
+              />
+              <Route
+                path="/upload"
+                element={
+                  <PageWrapper>
+                    <FileUpload />
+                  </PageWrapper>
+                }
+              />
+              <Route path="/map" element={<TrackMap />} />
+              <Route
+                path="/analysis"
+                element={
+                  <PageWrapper>
+                    <LossAnalysis />
+                  </PageWrapper>
+                }
+              />
+              <Route
+                path="/report"
+                element={
+                  <PageWrapper>
+                    <ReportGeneration />
+                  </PageWrapper>
+                }
+              />
+            </Routes>
+          </div>
+        </main>
+      </div>
 
       {/* Global loading overlay */}
       {loading && (

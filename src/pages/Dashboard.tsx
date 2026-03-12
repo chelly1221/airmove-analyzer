@@ -45,7 +45,7 @@ export default function Dashboard() {
       <div>
         <h1 className="text-2xl font-bold text-white">대시보드</h1>
         <p className="mt-1 text-sm text-gray-400">
-          NEC 레이더 비행검사기 분석체계 현황
+          레이더 비행검사기 분석체계 현황
         </p>
       </div>
 
