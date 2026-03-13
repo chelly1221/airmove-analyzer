@@ -1,9 +1,20 @@
 use std::path::Path;
 
 use log::{debug, info, warn};
+use serde::Serialize;
 
 use crate::models::{ParsedFile, TrackPoint};
 use crate::parser::ParseError;
+
+/// 파싱 진행 상황 이벤트
+#[derive(Clone, Serialize)]
+pub struct ParseProgress {
+    pub filename: String,
+    pub percent: f64,
+    pub records: usize,
+    pub track_points: usize,
+    pub errors: usize,
+}
 
 /// Default radar reference point: Gimpo Airport (WGS-84)
 pub const DEFAULT_RADAR_LAT: f64 = 37.5585;
@@ -68,11 +79,23 @@ struct Cat048Record {
     heading_deg: Option<f64>,
     track_number: Option<u16>,
     mode3a: Option<u16>,
+    /// I020 TYP: 0=none, 1=PSR, 2=SSR, 3=combined, 4=ModeS All-Call,
+    /// 5=ModeS Roll-Call, 6=ModeS All-Call+PSR, 7=ModeS Roll-Call+PSR
+    radar_typ: u8,
 }
 
 /// Parse an ASS file (NEC RDRS recording containing ASTERIX data).
 /// `radar_lat`/`radar_lon` specify the radar reference point for coordinate conversion.
-pub fn parse_ass_file(path: &str, radar_lat: f64, radar_lon: f64) -> Result<ParsedFile, ParseError> {
+/// `on_progress` is called periodically with progress info.
+pub fn parse_ass_file<F>(
+    path: &str,
+    radar_lat: f64,
+    radar_lon: f64,
+    mut on_progress: F,
+) -> Result<ParsedFile, ParseError>
+where
+    F: FnMut(&ParseProgress),
+{
     let file_path = Path::new(path);
     let filename = file_path
         .file_name()
@@ -103,8 +126,23 @@ pub fn parse_ass_file(path: &str, radar_lat: f64, radar_lon: f64) -> Result<Pars
     let mut skipped_bytes = 0usize;
 
     let base_date_secs = extract_base_date_from_filename(&filename);
+    let data_len = data.len();
+    let mut last_reported_pct = 0u32; // 마지막으로 보고한 퍼센트
 
     while offset < data.len() {
+        // 진행률 보고 (1% 단위)
+        let pct = ((offset as f64 / data_len as f64) * 100.0) as u32;
+        if pct > last_reported_pct {
+            last_reported_pct = pct;
+            on_progress(&ParseProgress {
+                filename: filename.clone(),
+                percent: pct as f64,
+                records: total_records,
+                track_points: track_points.len(),
+                errors: parse_errors.len(),
+            });
+        }
+
         // Check for NEC framing header (5 bytes: month, day, hour, minute, counter)
         if let Some((month, day)) = nec_frame {
             if is_nec_frame(&data, offset, month, day) {
@@ -161,12 +199,24 @@ pub fn parse_ass_file(path: &str, radar_lat: f64, radar_lon: f64) -> Result<Pars
         }
     }
 
+    // 100% 완료 보고
+    on_progress(&ParseProgress {
+        filename: filename.clone(),
+        percent: 100.0,
+        records: total_records,
+        track_points: track_points.len(),
+        errors: parse_errors.len(),
+    });
+
     // Sort by timestamp
     track_points.sort_by(|a, b| {
         a.timestamp
             .partial_cmp(&b.timestamp)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // 고도 보간: FL 미검증/garbled로 altitude=0인 포인트에 직전 유효 고도 적용
+    interpolate_missing_altitudes(&mut track_points);
 
     let start_time = track_points.first().map(|p| p.timestamp);
     let end_time = track_points.last().map(|p| p.timestamp);
@@ -190,6 +240,8 @@ pub fn parse_ass_file(path: &str, radar_lat: f64, radar_lon: f64) -> Result<Pars
         parse_errors,
         start_time,
         end_time,
+        radar_lat,
+        radar_lon,
     })
 }
 
@@ -412,17 +464,15 @@ fn parse_cat048_record(
         }
 
         match item_idx {
+            // 모든 필드에서 truncation 발생 시 break로 처리하여
+            // 이미 파싱된 데이터를 보존 (블록 경계 truncation 대응)
             UAP_I010 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I010 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 pos += 2;
             }
 
             UAP_I140 => {
-                if pos + 3 > block.len() {
-                    return Err(make_err(pos, "I140 truncated"));
-                }
+                if pos + 3 > block.len() { break; }
                 let raw = ((block[pos] as u32) << 16)
                     | ((block[pos + 1] as u32) << 8)
                     | (block[pos + 2] as u32);
@@ -434,17 +484,18 @@ fn parse_cat048_record(
             }
 
             UAP_I020 => {
+                // I020 Target Report Descriptor (FX-extended)
+                // 첫 바이트 bits 8-6: TYP (레이더 탐지 유형)
+                if pos >= block.len() { break; }
+                let first_byte = block[pos];
+                record.radar_typ = (first_byte >> 5) & 0x07;
                 let consumed = skip_fx_extended(block, pos);
-                if consumed == 0 {
-                    return Err(make_err(pos, "I020 truncated"));
-                }
+                if consumed == 0 { break; }
                 pos += consumed;
             }
 
             UAP_I040 => {
-                if pos + 4 > block.len() {
-                    return Err(make_err(pos, "I040 truncated"));
-                }
+                if pos + 4 > block.len() { break; }
                 let rho_raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
                 let theta_raw = u16::from_be_bytes([block[pos + 2], block[pos + 3]]);
                 let rho_nm = rho_raw as f64 / 256.0;
@@ -457,46 +508,42 @@ fn parse_cat048_record(
             }
 
             UAP_I070 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I070 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 let raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
                 record.mode3a = Some(raw & 0x0FFF);
                 pos += 2;
             }
 
             UAP_I090 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I090 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 let raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
-                let fl = (raw & 0x3FFF) as f64 / 4.0;
-                if fl <= MAX_FLIGHT_LEVEL {
-                    record.flight_level = Some(fl);
+                let v_flag = (raw >> 15) & 1; // 0=validated, 1=not validated
+                let g_flag = (raw >> 14) & 1; // 0=ok, 1=garbled
+                if v_flag == 0 && g_flag == 0 {
+                    let fl = (raw & 0x3FFF) as f64 / 4.0;
+                    if fl <= MAX_FLIGHT_LEVEL {
+                        record.flight_level = Some(fl);
+                    }
                 }
                 pos += 2;
             }
 
             UAP_I130 => {
-                if pos >= block.len() {
-                    return Err(make_err(pos, "I130 truncated"));
-                }
+                if pos >= block.len() { break; }
                 let sub_fspec = block[pos];
                 pos += 1;
+                let mut i130_ok = true;
                 for bit in (1..=7).rev() {
                     if (sub_fspec >> bit) & 1 == 1 {
-                        if pos >= block.len() {
-                            return Err(make_err(pos, "I130 subfield truncated"));
-                        }
+                        if pos >= block.len() { i130_ok = false; break; }
                         pos += 1;
                     }
                 }
+                if !i130_ok { break; }
             }
 
             UAP_I220 => {
-                if pos + 3 > block.len() {
-                    return Err(make_err(pos, "I220 truncated"));
-                }
+                if pos + 3 > block.len() { break; }
                 let addr = ((block[pos] as u32) << 16)
                     | ((block[pos + 1] as u32) << 8)
                     | (block[pos + 2] as u32);
@@ -508,38 +555,28 @@ fn parse_cat048_record(
             }
 
             UAP_I240 => {
-                if pos + 6 > block.len() {
-                    return Err(make_err(pos, "I240 truncated"));
-                }
+                if pos + 6 > block.len() { break; }
                 pos += 6;
             }
 
             UAP_I250 => {
-                if pos >= block.len() {
-                    return Err(make_err(pos, "I250 truncated"));
-                }
+                if pos >= block.len() { break; }
                 let rep = block[pos] as usize;
                 pos += 1;
                 let mb_size = rep.saturating_mul(8);
-                if pos + mb_size > block.len() {
-                    return Err(make_err(pos, "I250 data truncated"));
-                }
+                if pos + mb_size > block.len() { break; }
                 pos += mb_size;
             }
 
             UAP_I161 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I161 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 let raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
                 record.track_number = Some(raw & 0x0FFF);
                 pos += 2;
             }
 
             UAP_I042 => {
-                if pos + 4 > block.len() {
-                    return Err(make_err(pos, "I042 truncated"));
-                }
+                if pos + 4 > block.len() { break; }
                 let x_raw = i16::from_be_bytes([block[pos], block[pos + 1]]);
                 let y_raw = i16::from_be_bytes([block[pos + 2], block[pos + 3]]);
                 record.cart_x_nm = Some(x_raw as f64 / 128.0);
@@ -548,9 +585,7 @@ fn parse_cat048_record(
             }
 
             UAP_I200 => {
-                if pos + 4 > block.len() {
-                    return Err(make_err(pos, "I200 truncated"));
-                }
+                if pos + 4 > block.len() { break; }
                 let gsp_raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
                 let hdg_raw = u16::from_be_bytes([block[pos + 2], block[pos + 3]]);
                 let speed_kts = (gsp_raw as f64 * 3600.0) / 16384.0;
@@ -563,135 +598,99 @@ fn parse_cat048_record(
 
             UAP_I170 => {
                 let consumed = skip_fx_extended(block, pos);
-                if consumed == 0 {
-                    return Err(make_err(pos, "I170 truncated"));
-                }
+                if consumed == 0 { break; }
                 pos += consumed;
             }
 
             UAP_I210 => {
-                if pos + 4 > block.len() {
-                    return Err(make_err(pos, "I210 truncated"));
-                }
+                if pos + 4 > block.len() { break; }
                 pos += 4;
             }
 
             UAP_I030 => {
                 let consumed = skip_fx_extended(block, pos);
-                if consumed == 0 {
-                    return Err(make_err(pos, "I030 truncated"));
-                }
+                if consumed == 0 { break; }
                 pos += consumed;
             }
 
             UAP_I080 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I080 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 pos += 2;
             }
 
             UAP_I100 => {
-                if pos + 4 > block.len() {
-                    return Err(make_err(pos, "I100 truncated"));
-                }
+                if pos + 4 > block.len() { break; }
                 pos += 4;
             }
 
             UAP_I110 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I110 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 pos += 2;
             }
 
             UAP_I120 => {
-                if pos >= block.len() {
-                    return Err(make_err(pos, "I120 truncated"));
-                }
+                if pos >= block.len() { break; }
                 let sub_fspec = block[pos];
                 pos += 1;
+                let mut i120_ok = true;
                 if (sub_fspec >> 7) & 1 == 1 {
-                    if pos + 2 > block.len() {
-                        return Err(make_err(pos, "I120 sub1 truncated"));
-                    }
-                    pos += 2;
+                    if pos + 2 > block.len() { i120_ok = false; }
+                    else { pos += 2; }
                 }
-                if (sub_fspec >> 6) & 1 == 1 {
-                    if pos >= block.len() {
-                        return Err(make_err(pos, "I120 sub2 truncated"));
+                if i120_ok && (sub_fspec >> 6) & 1 == 1 {
+                    if pos >= block.len() { i120_ok = false; }
+                    else {
+                        let rep = block[pos] as usize;
+                        pos += 1;
+                        let sz = rep.saturating_mul(6);
+                        if pos + sz > block.len() { i120_ok = false; }
+                        else { pos += sz; }
                     }
-                    let rep = block[pos] as usize;
-                    pos += 1;
-                    let sz = rep.saturating_mul(6);
-                    if pos + sz > block.len() {
-                        return Err(make_err(pos, "I120 sub2 data truncated"));
-                    }
-                    pos += sz;
                 }
+                if !i120_ok { break; }
             }
 
             UAP_I230 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I230 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 pos += 2;
             }
 
             UAP_I260 => {
-                if pos + 7 > block.len() {
-                    return Err(make_err(pos, "I260 truncated"));
-                }
+                if pos + 7 > block.len() { break; }
                 pos += 7;
             }
 
             UAP_I055 => {
-                if pos + 1 > block.len() {
-                    return Err(make_err(pos, "I055 truncated"));
-                }
+                if pos + 1 > block.len() { break; }
                 pos += 1;
             }
 
             UAP_I050 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I050 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 pos += 2;
             }
 
             UAP_I065 => {
-                if pos + 1 > block.len() {
-                    return Err(make_err(pos, "I065 truncated"));
-                }
+                if pos + 1 > block.len() { break; }
                 pos += 1;
             }
 
             UAP_I060 => {
-                if pos + 2 > block.len() {
-                    return Err(make_err(pos, "I060 truncated"));
-                }
+                if pos + 2 > block.len() { break; }
                 pos += 2;
             }
 
             UAP_SP => {
-                if pos >= block.len() {
-                    return Err(make_err(pos, "SP truncated"));
-                }
+                if pos >= block.len() { break; }
                 let sp_len = block[pos] as usize;
-                if sp_len < 1 || pos + sp_len > block.len() {
-                    return Err(make_err(pos, "SP data truncated"));
-                }
+                if sp_len < 1 || pos + sp_len > block.len() { break; }
                 pos += sp_len;
             }
 
             UAP_RE => {
-                if pos >= block.len() {
-                    return Err(make_err(pos, "RE truncated"));
-                }
+                if pos >= block.len() { break; }
                 let re_len = block[pos] as usize;
-                if re_len < 1 || pos + re_len > block.len() {
-                    return Err(make_err(pos, "RE data truncated"));
-                }
+                if re_len < 1 || pos + re_len > block.len() { break; }
                 pos += re_len;
             }
 
@@ -703,6 +702,38 @@ fn parse_cat048_record(
     }
 
     Ok((record, pos))
+}
+
+/// 고도 보간: Mode-S별로 altitude=0인 포인트에 직전/직후 유효 고도를 적용
+fn interpolate_missing_altitudes(points: &mut [TrackPoint]) {
+    use std::collections::HashMap;
+
+    // Mode-S별로 인덱스 그룹화 (owned String으로 borrow 회피)
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, p) in points.iter().enumerate() {
+        groups.entry(p.mode_s.clone()).or_default().push(i);
+    }
+
+    for indices in groups.values() {
+        // Forward pass: 직전 유효 고도로 채움
+        let mut last_alt: Option<f64> = None;
+        for &i in indices {
+            if points[i].altitude > 0.0 {
+                last_alt = Some(points[i].altitude);
+            } else if let Some(alt) = last_alt {
+                points[i].altitude = alt;
+            }
+        }
+        // Backward pass: 앞에서 못 채운 포인트를 직후 유효 고도로 채움
+        let mut next_alt: Option<f64> = None;
+        for &i in indices.iter().rev() {
+            if points[i].altitude > 0.0 {
+                next_alt = Some(points[i].altitude);
+            } else if let Some(alt) = next_alt {
+                points[i].altitude = alt;
+            }
+        }
+    }
 }
 
 /// Convert a parsed CAT048 record into a TrackPoint.
@@ -754,6 +785,15 @@ fn record_to_track_point(
     let speed = record.ground_speed_kts.unwrap_or(0.0);
     let heading = record.heading_deg.unwrap_or(0.0);
 
+    // I020 TYP → radar_type 문자열
+    let radar_type = match record.radar_typ {
+        1 => "psr",
+        2 => "ssr",
+        3 => "combined",
+        4 | 5 | 6 | 7 => "modes",
+        _ => "ssr", // 기본값
+    }.to_string();
+
     Some(TrackPoint {
         timestamp,
         mode_s,
@@ -762,6 +802,7 @@ fn record_to_track_point(
         altitude,
         speed,
         heading,
+        radar_type,
         raw_data: Vec::new(),
     })
 }
@@ -784,13 +825,6 @@ fn cartesian_to_latlon(x_nm: f64, y_nm: f64, radar_lat: f64, radar_lon: f64) -> 
     let lon_offset = x_km / (111.32 * radar_lat.to_radians().cos());
 
     (radar_lat + lat_offset, radar_lon + lon_offset)
-}
-
-fn make_err(offset: usize, msg: &str) -> ParseError {
-    ParseError::RecordError {
-        offset,
-        message: msg.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -980,6 +1014,7 @@ mod tests {
             test_file.to_str().unwrap(),
             DEFAULT_RADAR_LAT,
             DEFAULT_RADAR_LON,
+            |_| {},
         )
         .expect("Failed to parse ASS file");
 

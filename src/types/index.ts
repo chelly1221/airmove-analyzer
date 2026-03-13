@@ -28,6 +28,8 @@ export interface TrackPoint {
   speed: number;
   /** Heading in degrees */
   heading: number;
+  /** 레이더 탐지 유형: "combined"(SSR+PSR), "ssr"(SSR only), "psr"(PSR only), "modes"(Mode-S) */
+  radar_type: string;
   /** Original bytes as number array */
   raw_data: number[];
 }
@@ -44,6 +46,12 @@ export interface LossSegment {
   duration_secs: number;
   distance_km: number;
   last_altitude: number;
+  start_altitude: number;
+  end_altitude: number;
+  /** "signal_loss" = 실제 Loss, "out_of_range" = 레이더 범위 이탈 */
+  loss_type: string;
+  start_radar_dist_km: number;
+  end_radar_dist_km: number;
 }
 
 /** 파싱 결과 (Parse Result) */
@@ -54,6 +62,8 @@ export interface ParsedFile {
   parse_errors: string[];
   start_time: number | null;
   end_time: number | null;
+  radar_lat: number;
+  radar_lon: number;
 }
 
 /** 분석 결과 (Analysis Result) */
@@ -63,6 +73,8 @@ export interface AnalysisResult {
   total_loss_time: number;
   total_track_time: number;
   loss_percentage: number;
+  /** 추정된 레이더 최대 탐지거리 (km) */
+  max_radar_range_km: number;
 }
 
 /** 레이더 사이트 설정 (Radar Site Configuration) */
@@ -76,6 +88,8 @@ export interface RadarSite {
   altitude: number;
   /** Antenna height in meters */
   antenna_height: number;
+  /** 제원상 지원범위 (NM) */
+  range_nm: number;
 }
 
 /** Line of Sight 계산 결과 */
@@ -93,6 +107,7 @@ export type PageId =
   | "aircraft"
   | "upload"
   | "map"
+  | "tracks"
   | "analysis"
   | "report";
 

@@ -4,24 +4,40 @@ use log::info;
 
 use crate::models::{AnalysisResult, LossSegment, ParsedFile, TrackPoint};
 
-/// Default loss detection threshold in seconds.
-/// Typical radar rotation period is ~4-6 seconds for terminal radars,
-/// so a gap significantly larger than that indicates a loss.
-pub const DEFAULT_THRESHOLD_SECS: f64 = 12.0;
+/// 자동 임계값: 추정된 스캔 주기의 이 배수 이상이면 Loss
+const AUTO_THRESHOLD_MULTIPLIER: f64 = 1.8;
+
+/// 자동 추정 불가 시 기본 임계값
+pub const DEFAULT_THRESHOLD_SECS: f64 = 8.0;
 
 /// Minimum points per Mode-S to be considered for loss analysis.
 const MIN_POINTS_FOR_ANALYSIS: usize = 5;
+
+/// 레이더 최대 탐지거리의 몇 % 이상이면 범위이탈로 판단
+const OUT_OF_RANGE_THRESHOLD: f64 = 0.88;
+
+/// 이 횟수 이상 연속 스캔 미탐지면 범위이탈로 간주
+/// (레이더 범위 내에서 이렇게 오래 Loss가 지속되기 어려움)
+const MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS: f64 = 8.0;
+
+/// 이 시간(초) 이상의 gap은 Loss가 아님 → 정상 출발/도착 (다른 공항 경유 등)
+const MAX_LOSS_DURATION_SECS: f64 = 3600.0;
 
 /// Detect loss segments within a single aircraft's track (sorted points).
 fn detect_loss_for_track(
     mode_s: &str,
     points: &[&TrackPoint],
     threshold_secs: f64,
+    scan_interval_secs: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+    max_radar_range_km: f64,
 ) -> Vec<LossSegment> {
     if points.len() < 2 {
         return Vec::new();
     }
 
+    let boundary_km = max_radar_range_km * OUT_OF_RANGE_THRESHOLD;
     let mut segments = Vec::new();
 
     for window in points.windows(2) {
@@ -30,13 +46,41 @@ fn detect_loss_for_track(
 
         let gap = next.timestamp - prev.timestamp;
 
-        if gap > threshold_secs {
+        if gap > threshold_secs && gap <= MAX_LOSS_DURATION_SECS {
             let distance_km = calculate_haversine_distance(
                 prev.latitude,
                 prev.longitude,
                 next.latitude,
                 next.longitude,
             );
+
+            let start_radar_dist = calculate_haversine_distance(
+                radar_lat, radar_lon, prev.latitude, prev.longitude,
+            );
+            let end_radar_dist = calculate_haversine_distance(
+                radar_lat, radar_lon, next.latitude, next.longitude,
+            );
+
+            // 놓친 스캔 횟수 추정
+            let missed_scans = gap / scan_interval_secs;
+
+            // 범위이탈 판단:
+            // 1) 시작/끝점 중 하나라도 레이더 경계 근처
+            // 2) 연속 미탐지 횟수가 너무 많으면 범위이탈로 간주
+            //    (레이더 범위 내에서 8스캔 이상 연속 Loss는 비현실적)
+            // 3) 장시간 Loss + 경계의 70% 이상이면 범위이탈 가능성 높음
+            let loss_type = if start_radar_dist >= boundary_km || end_radar_dist >= boundary_km {
+                "out_of_range"
+            } else if missed_scans >= MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS {
+                "out_of_range"
+            } else if missed_scans >= 4.0
+                && (start_radar_dist >= boundary_km * 0.75
+                    || end_radar_dist >= boundary_km * 0.75)
+            {
+                "out_of_range"
+            } else {
+                "signal_loss"
+            };
 
             segments.push(LossSegment {
                 mode_s: mode_s.to_string(),
@@ -49,6 +93,11 @@ fn detect_loss_for_track(
                 duration_secs: gap,
                 distance_km,
                 last_altitude: prev.altitude,
+                start_altitude: prev.altitude,
+                end_altitude: next.altitude,
+                loss_type: loss_type.to_string(),
+                start_radar_dist_km: start_radar_dist,
+                end_radar_dist_km: end_radar_dist,
             });
         }
     }
@@ -72,8 +121,31 @@ pub fn calculate_haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) 
     EARTH_RADIUS_KM * c
 }
 
+/// 트랙의 중앙값 스캔 간격 추정
+fn estimate_scan_interval(points: &[&TrackPoint]) -> Option<f64> {
+    if points.len() < 10 {
+        return None;
+    }
+    let mut gaps: Vec<f64> = points.windows(2)
+        .map(|w| w[1].timestamp - w[0].timestamp)
+        .filter(|&g| g > 0.5 && g < 30.0) // 비정상적 gap 제외
+        .collect();
+    if gaps.len() < 5 {
+        return None;
+    }
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(gaps[gaps.len() / 2]) // median
+}
+
 /// Perform full analysis: group by Mode-S, detect per-aircraft losses, downsample for display.
 pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult {
+    let radar_lat = parsed.radar_lat;
+    let radar_lon = parsed.radar_lon;
+
+    // 레이더 최대 탐지거리 추정 (전체 포인트의 95th percentile 거리)
+    let max_radar_range_km = estimate_max_radar_range(&parsed.track_points, radar_lat, radar_lon);
+    info!("Estimated max radar range: {:.1} km", max_radar_range_km);
+
     // Group track points by Mode-S
     let mut groups: HashMap<&str, Vec<&TrackPoint>> = HashMap::new();
     for point in &parsed.track_points {
@@ -99,14 +171,42 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let segments = detect_loss_for_track(mode_s, &points, threshold_secs);
+        // 트랙별 스캔 간격 추정 → 자동 임계값 계산
+        let estimated_interval = estimate_scan_interval(&points);
+        let (effective_threshold, scan_interval) = if threshold_secs > 0.0 {
+            // 수동 임계값: 스캔 간격은 추정값 사용, 없으면 임계값/1.8로 추정
+            let si = estimated_interval.unwrap_or(threshold_secs / AUTO_THRESHOLD_MULTIPLIER);
+            (threshold_secs, si)
+        } else {
+            // 자동: 중앙값 스캔 간격 * 1.8
+            match estimated_interval {
+                Some(interval) => {
+                    let t = interval * AUTO_THRESHOLD_MULTIPLIER;
+                    info!("  {} scan interval={:.1}s → threshold={:.1}s", mode_s, interval, t);
+                    (t, interval)
+                }
+                None => (DEFAULT_THRESHOLD_SECS, DEFAULT_THRESHOLD_SECS / AUTO_THRESHOLD_MULTIPLIER)
+            }
+        };
+
+        let segments = detect_loss_for_track(
+            mode_s, &points, effective_threshold, scan_interval,
+            radar_lat, radar_lon, max_radar_range_km,
+        );
         all_loss_segments.extend(segments);
     }
 
+    let signal_loss_count = all_loss_segments.iter()
+        .filter(|s| s.loss_type == "signal_loss").count();
+    let out_of_range_count = all_loss_segments.iter()
+        .filter(|s| s.loss_type == "out_of_range").count();
+
     info!(
-        "Analyzed {} Mode-S tracks, found {} loss segments",
+        "Analyzed {} Mode-S tracks, found {} loss segments (signal_loss: {}, out_of_range: {})",
         analyzed_count,
-        all_loss_segments.len()
+        all_loss_segments.len(),
+        signal_loss_count,
+        out_of_range_count
     );
 
     // Sort loss segments by time
@@ -116,7 +216,11 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let total_loss_time: f64 = all_loss_segments.iter().map(|s| s.duration_secs).sum();
+    // Loss 시간은 실제 signal_loss만 합산
+    let total_loss_time: f64 = all_loss_segments.iter()
+        .filter(|s| s.loss_type == "signal_loss")
+        .map(|s| s.duration_secs)
+        .sum();
 
     let total_track_time = match (parsed.start_time, parsed.end_time) {
         (Some(start), Some(end)) => end - start,
@@ -135,7 +239,26 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
         total_loss_time,
         total_track_time,
         loss_percentage,
+        max_radar_range_km,
     }
+}
+
+/// 레이더 최대 탐지거리 추정 (전체 포인트의 95th percentile 거리)
+fn estimate_max_radar_range(points: &[TrackPoint], radar_lat: f64, radar_lon: f64) -> f64 {
+    if points.is_empty() {
+        return 150.0; // 기본값 150km
+    }
+
+    let mut distances: Vec<f64> = points
+        .iter()
+        .map(|p| calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude))
+        .collect();
+    distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 95th percentile
+    let idx = (distances.len() as f64 * 0.95) as usize;
+    let idx = idx.min(distances.len() - 1);
+    distances[idx].max(50.0) // 최소 50km
 }
 
 #[cfg(test)]
@@ -151,6 +274,7 @@ mod tests {
             altitude: alt,
             speed: 200.0,
             heading: 90.0,
+            radar_type: "combined".to_string(),
             raw_data: vec![],
         }
     }
@@ -164,6 +288,7 @@ mod tests {
             altitude: alt,
             speed: 200.0,
             heading: 90.0,
+            radar_type: "combined".to_string(),
             raw_data: vec![],
         }
     }
@@ -176,7 +301,7 @@ mod tests {
             make_point(1010.0, 37.52, 126.82, 3000.0),
         ];
         let refs: Vec<&TrackPoint> = points.iter().collect();
-        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0);
+        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0, 5.0, 37.5585, 126.7906, 150.0);
         assert!(segments.is_empty());
     }
 
@@ -188,7 +313,7 @@ mod tests {
             make_point(1020.0, 37.52, 126.82, 3000.0), // 15-second gap
         ];
         let refs: Vec<&TrackPoint> = points.iter().collect();
-        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0);
+        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0, 5.0, 37.5585, 126.7906, 150.0);
         assert_eq!(segments.len(), 1);
         assert!((segments[0].duration_secs - 15.0).abs() < 0.001);
         assert_eq!(segments[0].mode_s, "ABCDEF");
@@ -203,13 +328,13 @@ mod tests {
             make_point(1050.0, 37.53, 126.83, 3000.0), // 25-second gap
         ];
         let refs: Vec<&TrackPoint> = points.iter().collect();
-        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0);
+        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0, 5.0, 37.5585, 126.7906, 150.0);
         assert_eq!(segments.len(), 2);
     }
 
     #[test]
     fn test_empty_points() {
-        let segments = detect_loss_for_track("ABCDEF", &[], 12.0);
+        let segments = detect_loss_for_track("ABCDEF", &[], 12.0, 5.0, 37.5585, 126.7906, 150.0);
         assert!(segments.is_empty());
     }
 
@@ -217,7 +342,7 @@ mod tests {
     fn test_single_point() {
         let points = vec![make_point(1000.0, 37.5, 126.8, 3000.0)];
         let refs: Vec<&TrackPoint> = points.iter().collect();
-        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0);
+        let segments = detect_loss_for_track("ABCDEF", &refs, 12.0, 5.0, 37.5585, 126.7906, 150.0);
         assert!(segments.is_empty());
     }
 
@@ -255,6 +380,8 @@ mod tests {
             parse_errors: vec![],
             start_time: Some(1000.0),
             end_time: Some(1030.0),
+            radar_lat: 37.5585,
+            radar_lon: 126.7906,
         };
 
         let result = analyze_tracks(parsed, 12.0);

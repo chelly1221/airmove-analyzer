@@ -29,6 +29,10 @@ interface AppState {
   // 레이더 사이트
   radarSite: RadarSite;
   setRadarSite: (site: RadarSite) => void;
+  customRadarSites: RadarSite[];
+  addCustomRadarSite: (site: RadarSite) => void;
+  updateCustomRadarSite: (name: string, site: RadarSite) => void;
+  removeCustomRadarSite: (name: string) => void;
 
   // 필터
   selectedModeS: string | null;
@@ -90,10 +94,24 @@ export const useAppStore = create<AppState>((set) => ({
     name: "김포",
     latitude: 37.5585,
     longitude: 126.7906,
-    altitude: 0,
-    antenna_height: 0,
+    altitude: 18,
+    antenna_height: 30,
+    range_nm: 60,
   },
   setRadarSite: (site) => set({ radarSite: site }),
+  customRadarSites: [],
+  addCustomRadarSite: (site) =>
+    set((state) => ({ customRadarSites: [...state.customRadarSites, site] })),
+  updateCustomRadarSite: (name, site) =>
+    set((state) => ({
+      customRadarSites: state.customRadarSites.map((s) =>
+        s.name === name ? site : s
+      ),
+    })),
+  removeCustomRadarSite: (name) =>
+    set((state) => ({
+      customRadarSites: state.customRadarSites.filter((s) => s.name !== name),
+    })),
 
   // 필터
   selectedModeS: null,

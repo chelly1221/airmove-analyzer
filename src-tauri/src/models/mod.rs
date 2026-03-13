@@ -32,6 +32,8 @@ pub struct TrackPoint {
     pub speed: f64,
     /// Heading in degrees
     pub heading: f64,
+    /// 레이더 탐지 유형: "combined"(SSR+PSR), "ssr"(SSR only), "psr"(PSR only), "modes"(Mode-S)
+    pub radar_type: String,
     /// Original bytes for debugging
     #[serde(with = "serde_bytes_base64")]
     pub raw_data: Vec<u8>,
@@ -50,6 +52,14 @@ pub struct LossSegment {
     pub duration_secs: f64,
     pub distance_km: f64,
     pub last_altitude: f64,
+    pub start_altitude: f64,
+    pub end_altitude: f64,
+    /// "signal_loss" = 실제 Loss, "out_of_range" = 레이더 범위 이탈
+    pub loss_type: String,
+    /// Loss 시작점의 레이더로부터 거리 (km)
+    pub start_radar_dist_km: f64,
+    /// Loss 종료점의 레이더로부터 거리 (km)
+    pub end_radar_dist_km: f64,
 }
 
 /// 파싱 결과 (Parse Result)
@@ -61,6 +71,9 @@ pub struct ParsedFile {
     pub parse_errors: Vec<String>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    /// 파싱 시 사용된 레이더 좌표
+    pub radar_lat: f64,
+    pub radar_lon: f64,
 }
 
 /// 분석 결과 (Analysis Result)
@@ -71,6 +84,8 @@ pub struct AnalysisResult {
     pub total_loss_time: f64,
     pub total_track_time: f64,
     pub loss_percentage: f64,
+    /// 추정된 레이더 최대 탐지거리 (km)
+    pub max_radar_range_km: f64,
 }
 
 /// 레이더 사이트 설정 (Radar Site Configuration)
