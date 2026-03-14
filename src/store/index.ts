@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   Aircraft,
   AnalysisResult,
+  LOSProfileData,
   PageId,
   RadarSite,
   UploadedFile,
@@ -24,6 +25,7 @@ interface AppState {
   // 분석 결과
   analysisResults: AnalysisResult[];
   addAnalysisResult: (r: AnalysisResult) => void;
+  appendTrackPoints: (filePath: string, points: import("../types").TrackPoint[]) => void;
   clearAnalysisResults: () => void;
 
   // 레이더 사이트
@@ -38,6 +40,12 @@ interface AppState {
   selectedModeS: string | null;
   setSelectedModeS: (modeS: string | null) => void;
 
+  // LOS 분석
+  losResults: LOSProfileData[];
+  addLOSResult: (r: LOSProfileData) => void;
+  removeLOSResult: (id: string) => void;
+  clearLOSResults: () => void;
+
   // UI
   activePage: PageId;
   setActivePage: (page: PageId) => void;
@@ -48,8 +56,27 @@ interface AppState {
 }
 
 export const useAppStore = create<AppState>((set) => ({
-  // 비행검사기
-  aircraft: [],
+  // 비행검사기 (프리셋)
+  aircraft: [
+    {
+      id: "preset-1",
+      name: "1호기",
+      model: "Embraer Praetor 600",
+      mode_s_code: "71BF79",
+      organization: "비행점검센터",
+      memo: "",
+      active: true,
+    },
+    {
+      id: "preset-2",
+      name: "2호기",
+      model: "Hawker 750",
+      mode_s_code: "71BF78",
+      organization: "비행점검센터",
+      memo: "",
+      active: true,
+    },
+  ],
   addAircraft: (a) =>
     set((state) => {
       if (state.aircraft.length >= 10) return state;
@@ -87,19 +114,51 @@ export const useAppStore = create<AppState>((set) => ({
   analysisResults: [],
   addAnalysisResult: (r) =>
     set((state) => ({ analysisResults: [...state.analysisResults, r] })),
+  appendTrackPoints: (filePath, points) =>
+    set((state) => ({
+      analysisResults: state.analysisResults.map((r) => {
+        // file_info.filename 또는 file_path의 파일명으로 매칭
+        const fname = filePath.split(/[/\\]/).pop() ?? filePath;
+        if (r.file_info.filename !== fname) return r;
+        return {
+          ...r,
+          file_info: {
+            ...r.file_info,
+            track_points: [...r.file_info.track_points, ...points],
+          },
+        };
+      }),
+    })),
   clearAnalysisResults: () => set({ analysisResults: [] }),
 
-  // 레이더 사이트 (기본: 김포)
+  // 레이더 사이트 (기본: 김포 #1)
   radarSite: {
-    name: "김포",
-    latitude: 37.5585,
-    longitude: 126.7906,
-    altitude: 18,
-    antenna_height: 30,
-    range_nm: 60,
+    name: "김포 #1",
+    latitude: 37.5490,
+    longitude: 126.7937,
+    altitude: 9.11,
+    antenna_height: 19.8,
+    range_nm: 200,
   },
   setRadarSite: (site) => set({ radarSite: site }),
-  customRadarSites: [],
+  customRadarSites: [
+    {
+      name: "김포 #1",
+      latitude: 37.5490,
+      longitude: 126.7937,
+      altitude: 9.11,
+      antenna_height: 19.8,
+      range_nm: 200,
+    },
+    {
+      name: "김포 #2",
+      latitude: 37.5480,
+      longitude: 126.7946,
+      altitude: 9.12,
+      antenna_height: 24,
+      range_nm: 200,
+    },
+  ],
   addCustomRadarSite: (site) =>
     set((state) => ({ customRadarSites: [...state.customRadarSites, site] })),
   updateCustomRadarSite: (name, site) =>
@@ -117,8 +176,18 @@ export const useAppStore = create<AppState>((set) => ({
   selectedModeS: null,
   setSelectedModeS: (modeS) => set({ selectedModeS: modeS }),
 
+  // LOS 분석
+  losResults: [],
+  addLOSResult: (r) =>
+    set((state) => ({ losResults: [...state.losResults, r] })),
+  removeLOSResult: (id) =>
+    set((state) => ({
+      losResults: state.losResults.filter((r) => r.id !== id),
+    })),
+  clearLOSResults: () => set({ losResults: [] }),
+
   // UI
-  activePage: "dashboard",
+  activePage: "upload",
   setActivePage: (page) => set({ activePage: page }),
   loading: false,
   setLoading: (loading) => set({ loading }),

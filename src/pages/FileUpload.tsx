@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { useState, useCallback, useRef } from "react";
 import {
   Upload,
   FileUp,
@@ -9,213 +9,14 @@ import {
   Loader2,
   FolderOpen,
   AlertCircle,
-  Radio,
-  Plus,
-  Pencil,
-  X,
-  MapPin,
+  Radar,
+  Plane,
+  Globe,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import maplibregl from "maplibre-gl";
 import { useAppStore } from "../store";
-import type { AnalysisResult, RadarSite, UploadedFile } from "../types";
-
-/** 기본 레이더 사이트 */
-const DEFAULT_RADAR_SITE: RadarSite = {
-  name: "김포", latitude: 37.5585, longitude: 126.7906, altitude: 18, antenna_height: 30, range_nm: 60,
-};
-
-/** 레이더 사이트 편집 폼 */
-function RadarSiteEditor({
-  initial,
-  onSave,
-  onCancel,
-}: {
-  initial?: RadarSite;
-  onSave: (site: RadarSite) => void;
-  onCancel: () => void;
-}) {
-  const [name, setName] = useState(initial?.name ?? "");
-  const [lat, setLat] = useState(initial?.latitude.toString() ?? "");
-  const [lon, setLon] = useState(initial?.longitude.toString() ?? "");
-  const [alt, setAlt] = useState(initial?.altitude.toString() ?? "0");
-  const [antH, setAntH] = useState(initial?.antenna_height.toString() ?? "25");
-  const [rangeNm, setRangeNm] = useState(initial?.range_nm?.toString() ?? "60");
-  const [pickMode, setPickMode] = useState(false);
-  const mapContainerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<maplibregl.Map | null>(null);
-  const markerRef = useRef<maplibregl.Marker | null>(null);
-
-  // 미니맵 초기화
-  useEffect(() => {
-    if (!pickMode || !mapContainerRef.current) return;
-
-    const map = new maplibregl.Map({
-      container: mapContainerRef.current,
-      style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-      center: [
-        parseFloat(lon) || 127.0,
-        parseFloat(lat) || 36.5,
-      ],
-      zoom: 6,
-    });
-
-    // 기존 좌표에 마커 표시
-    const initLat = parseFloat(lat);
-    const initLon = parseFloat(lon);
-    if (!isNaN(initLat) && !isNaN(initLon)) {
-      markerRef.current = new maplibregl.Marker({ color: "#e94560" })
-        .setLngLat([initLon, initLat])
-        .addTo(map);
-    }
-
-    map.on("click", (e) => {
-      const { lng, lat: clickLat } = e.lngLat;
-      setLat(clickLat.toFixed(4));
-      setLon(lng.toFixed(4));
-
-      if (markerRef.current) {
-        markerRef.current.setLngLat([lng, clickLat]);
-      } else {
-        markerRef.current = new maplibregl.Marker({ color: "#e94560" })
-          .setLngLat([lng, clickLat])
-          .addTo(map);
-      }
-    });
-
-    mapRef.current = map;
-    return () => {
-      markerRef.current = null;
-      map.remove();
-    };
-  }, [pickMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const handleSave = () => {
-    const latitude = parseFloat(lat);
-    const longitude = parseFloat(lon);
-    const altitude = parseFloat(alt) || 0;
-    const antenna_height = parseFloat(antH) || 25;
-    const range_nm = parseFloat(rangeNm) || 60;
-    if (!name.trim() || isNaN(latitude) || isNaN(longitude)) return;
-    onSave({ name: name.trim(), latitude, longitude, altitude, antenna_height, range_nm });
-  };
-
-  return (
-    <div className="rounded-xl border border-white/10 bg-[#0d1b2a] p-4 space-y-3">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-white">
-          {initial ? "레이더 사이트 수정" : "새 레이더 사이트 등록"}
-        </h3>
-        <button onClick={onCancel} className="text-gray-400 hover:text-white">
-          <X size={16} />
-        </button>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div className="col-span-2">
-          <label className="block text-xs text-gray-400 mb-1">사이트 이름</label>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="예: 서울레이더"
-            className="w-full rounded-lg border border-white/10 bg-[#16213e] px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-[#e94560] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">위도 (°N)</label>
-          <input
-            value={lat}
-            onChange={(e) => setLat(e.target.value)}
-            placeholder="37.5585"
-            type="number"
-            step="0.0001"
-            className="w-full rounded-lg border border-white/10 bg-[#16213e] px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-[#e94560] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">경도 (°E)</label>
-          <input
-            value={lon}
-            onChange={(e) => setLon(e.target.value)}
-            placeholder="126.7906"
-            type="number"
-            step="0.0001"
-            className="w-full rounded-lg border border-white/10 bg-[#16213e] px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-[#e94560] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">해발 고도 (m)</label>
-          <input
-            value={alt}
-            onChange={(e) => setAlt(e.target.value)}
-            placeholder="0"
-            type="number"
-            className="w-full rounded-lg border border-white/10 bg-[#16213e] px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-[#e94560] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-400 mb-1">안테나 높이 (m)</label>
-          <input
-            value={antH}
-            onChange={(e) => setAntH(e.target.value)}
-            placeholder="25"
-            type="number"
-            className="w-full rounded-lg border border-white/10 bg-[#16213e] px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-[#e94560] focus:outline-none"
-          />
-        </div>
-        <div className="col-span-2">
-          <label className="block text-xs text-gray-400 mb-1">제원상 지원범위 (NM)</label>
-          <input
-            value={rangeNm}
-            onChange={(e) => setRangeNm(e.target.value)}
-            placeholder="60"
-            type="number"
-            step="1"
-            className="w-full rounded-lg border border-white/10 bg-[#16213e] px-3 py-2 text-sm text-white placeholder-gray-500 focus:border-[#e94560] focus:outline-none"
-          />
-        </div>
-      </div>
-
-      {/* 지도에서 좌표 선택 */}
-      <button
-        onClick={() => setPickMode(!pickMode)}
-        className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
-          pickMode
-            ? "bg-[#e94560] text-white"
-            : "border border-white/10 text-gray-400 hover:border-white/30 hover:text-white"
-        }`}
-      >
-        <MapPin size={14} />
-        {pickMode ? "지도 닫기" : "지도에서 클릭하여 좌표 선택"}
-      </button>
-
-      {pickMode && (
-        <div
-          ref={mapContainerRef}
-          className="h-64 w-full rounded-lg overflow-hidden border border-white/10"
-        />
-      )}
-
-      <div className="flex justify-end gap-2">
-        <button
-          onClick={onCancel}
-          className="rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-400 hover:bg-white/5"
-        >
-          취소
-        </button>
-        <button
-          onClick={handleSave}
-          disabled={!name.trim() || !lat || !lon}
-          className="rounded-lg bg-[#e94560] px-4 py-2 text-sm font-medium text-white hover:bg-[#d63851] disabled:opacity-40"
-        >
-          {initial ? "수정" : "등록"}
-        </button>
-      </div>
-    </div>
-  );
-}
+import type { AnalysisResult, UploadedFile } from "../types";
 
 export default function FileUpload() {
   const uploadedFiles = useAppStore((s) => s.uploadedFiles);
@@ -224,49 +25,23 @@ export default function FileUpload() {
   const removeUploadedFile = useAppStore((s) => s.removeUploadedFile);
   const clearUploadedFiles = useAppStore((s) => s.clearUploadedFiles);
   const addAnalysisResult = useAppStore((s) => s.addAnalysisResult);
+  const aircraft = useAppStore((s) => s.aircraft);
   const radarSite = useAppStore((s) => s.radarSite);
   const setRadarSite = useAppStore((s) => s.setRadarSite);
   const customRadarSites = useAppStore((s) => s.customRadarSites);
-  const addCustomRadarSite = useAppStore((s) => s.addCustomRadarSite);
-  const updateCustomRadarSite = useAppStore((s) => s.updateCustomRadarSite);
-  const removeCustomRadarSite = useAppStore((s) => s.removeCustomRadarSite);
-  const setLoading = useAppStore((s) => s.setLoading);
-  const setLoadingMessage = useAppStore((s) => s.setLoadingMessage);
-
   const [dragOver, setDragOver] = useState(false);
   const [errorLog, setErrorLog] = useState<string[]>([]);
-  const [showEditor, setShowEditor] = useState(false);
-  const [editingSite, setEditingSite] = useState<RadarSite | undefined>();
+  // 파싱 모드: "aircraft" = 등록 비행검사기만, "all" = 전체 데이터
+  const [parseMode, setParseMode] = useState<"aircraft" | "all">("aircraft");
 
-  /** 파싱 진행률 상태 { filename -> { percent, records, trackPoints, errors } } */
-  const [parseProgress, setParseProgress] = useState<
-    Record<string, { percent: number; records: number; trackPoints: number; errors: number }>
-  >({});
+  // 레이더 선택 모달 상태
+  const [showRadarModal, setShowRadarModal] = useState(false);
+  const [radarModalAction, setRadarModalAction] = useState<"single" | "all">("all");
+  const [modalSelectedSite, setModalSelectedSite] = useState(radarSite);
+  const pendingParseFileRef = useRef<UploadedFile | null>(null);
 
-  // 파싱 진행률 이벤트 리스너
-  useEffect(() => {
-    const unlisten = listen<{
-      filename: string;
-      percent: number;
-      records: number;
-      track_points: number;
-      errors: number;
-    }>("parse-progress", (event) => {
-      const p = event.payload;
-      setParseProgress((prev) => ({
-        ...prev,
-        [p.filename]: {
-          percent: p.percent,
-          records: p.records,
-          trackPoints: p.track_points,
-          errors: p.errors,
-        },
-      }));
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
+  // 모달에 표시할 전체 레이더 사이트 목록
+  const allRadarSites = customRadarSites;
 
   const handleFilePick = async () => {
     try {
@@ -312,21 +87,57 @@ export default function FileUpload() {
     []
   );
 
+  // 파싱 전 레이더 선택 모달 표시
+  const requestParseSingle = (file: UploadedFile) => {
+    pendingParseFileRef.current = file;
+    setRadarModalAction("single");
+    setModalSelectedSite(radarSite);
+    setShowRadarModal(true);
+  };
+
+  const requestParseAll = () => {
+    pendingParseFileRef.current = null;
+    setRadarModalAction("all");
+    setModalSelectedSite(radarSite);
+    setShowRadarModal(true);
+  };
+
+  const handleRadarConfirm = () => {
+    setShowRadarModal(false);
+    // 선택한 사이트를 store에 반영 후 파싱 시작
+    setRadarSite(modalSelectedSite);
+    if (radarModalAction === "single" && pendingParseFileRef.current) {
+      parseFile(pendingParseFileRef.current);
+    } else {
+      parseAllInternal();
+    }
+  };
+
+  // Mode-S 필터 생성: "aircraft" 모드면 등록된 활성 기체의 Mode-S 코드 목록
+  const getModeSFilter = (): string[] => {
+    if (parseMode === "all") return [];
+    const activeAircraft = useAppStore.getState().aircraft.filter((a) => a.active);
+    if (activeAircraft.length === 0) return []; // 등록 기체 없으면 전체 파싱
+    return activeAircraft.map((a) => a.mode_s_code.toUpperCase());
+  };
+
   const parseFile = async (file: UploadedFile) => {
     updateUploadedFile(file.path, { status: "parsing" });
-    setLoading(false);
-    setLoadingMessage("");
+
     try {
+      const currentSite = useAppStore.getState().radarSite;
+      const modeSFilter = getModeSFilter();
       const result: AnalysisResult = await invoke("parse_and_analyze", {
         filePath: file.path,
-        radarLat: radarSite.latitude,
-        radarLon: radarSite.longitude,
+        radarLat: currentSite.latitude,
+        radarLon: currentSite.longitude,
+        modeSFilter,
       });
+      addAnalysisResult(result);
       updateUploadedFile(file.path, {
         status: "done",
         parsedFile: result.file_info,
       });
-      addAnalysisResult(result);
 
       if (result.file_info.parse_errors.length > 0) {
         setErrorLog((prev) => [
@@ -338,57 +149,17 @@ export default function FileUpload() {
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      updateUploadedFile(file.path, {
-        status: "error",
-        error: errMsg,
-      });
+      updateUploadedFile(file.path, { status: "error", error: errMsg });
       setErrorLog((prev) => [...prev, `[${file.name}] 파싱 오류: ${errMsg}`]);
-    } finally {
-      setLoading(false);
-      setLoadingMessage("");
-      // 진행률 정리
-      setParseProgress((prev) => {
-        const next = { ...prev };
-        delete next[file.name];
-        return next;
-      });
     }
   };
 
-  const parseAll = async () => {
-    const pending = uploadedFiles.filter((f) => f.status === "pending");
+  const parseAllInternal = async () => {
+    const pending = useAppStore.getState().uploadedFiles.filter((f) => f.status === "pending");
+    if (pending.length === 0) return;
+
     for (const file of pending) {
       await parseFile(file);
-    }
-  };
-
-  const handleSaveCustomSite = (site: RadarSite) => {
-    if (editingSite) {
-      updateCustomRadarSite(editingSite.name, site);
-      if (radarSite.name === editingSite.name) {
-        setRadarSite(site);
-      }
-    } else {
-      addCustomRadarSite(site);
-    }
-    setRadarSite(site);
-    setShowEditor(false);
-    setEditingSite(undefined);
-  };
-
-  const handleEditSite = (site: RadarSite) => {
-    // 프리셋이 아직 커스텀에 없으면 먼저 추가
-    if (!customRadarSites.some((s) => s.name === site.name)) {
-      addCustomRadarSite(site);
-    }
-    setEditingSite(site);
-    setShowEditor(true);
-  };
-
-  const handleDeleteSite = (site: RadarSite) => {
-    removeCustomRadarSite(site.name);
-    if (radarSite.name === site.name) {
-      setRadarSite(DEFAULT_RADAR_SITE);
     }
   };
 
@@ -425,13 +196,6 @@ export default function FileUpload() {
     }
   };
 
-  // 김포 기본값 + 커스텀 사이트 (커스텀에 김포가 있으면 그걸 사용)
-  const allSites = useMemo(() => {
-    const hasDefault = customRadarSites.some((s) => s.name === DEFAULT_RADAR_SITE.name);
-    if (hasDefault) return customRadarSites;
-    return [DEFAULT_RADAR_SITE, ...customRadarSites];
-  }, [customRadarSites]);
-
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -440,87 +204,6 @@ export default function FileUpload() {
         <p className="mt-1 text-sm text-gray-400">
           NEC ASS 파일을 업로드하여 파싱합니다
         </p>
-      </div>
-
-      {/* Radar Site Selector */}
-      <div className="rounded-xl border border-white/10 bg-[#16213e] p-4">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <Radio size={16} className="text-[#e94560]" />
-            <h2 className="text-sm font-semibold text-white">레이더 사이트</h2>
-            <span className="text-xs text-gray-500">
-              {radarSite.name} ({radarSite.latitude.toFixed(4)}°N, {radarSite.longitude.toFixed(4)}°E
-              {radarSite.altitude > 0 ? `, ${radarSite.altitude}m` : ""})
-            </span>
-          </div>
-          <button
-            onClick={() => {
-              setEditingSite(undefined);
-              setShowEditor(!showEditor);
-            }}
-            className="flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-gray-400 hover:border-white/30 hover:text-white transition-colors"
-          >
-            <Plus size={14} />
-            직접 등록
-          </button>
-        </div>
-
-        {/* 프리셋 + 커스텀 사이트 버튼 */}
-        <div className="flex flex-wrap gap-2">
-          {allSites.map((site) => (
-            <div key={site.name} className="relative group">
-              <button
-                onClick={() => setRadarSite(site)}
-                className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                  radarSite.name === site.name
-                    ? "bg-[#e94560] text-white"
-                    : "border border-white/10 text-gray-400 hover:border-white/30 hover:text-white"
-                }`}
-              >
-                {site.name}
-              </button>
-              {/* 수정/삭제 버튼 */}
-              <div className="absolute -top-1 -right-1 hidden group-hover:flex gap-0.5">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleEditSite(site);
-                  }}
-                  className="rounded-full bg-blue-500 p-0.5 text-white hover:bg-blue-400"
-                  title="수정"
-                >
-                  <Pencil size={10} />
-                </button>
-                {allSites.length > 1 && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteSite(site);
-                    }}
-                    className="rounded-full bg-red-500 p-0.5 text-white hover:bg-red-400"
-                    title="삭제"
-                  >
-                    <X size={10} />
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {/* 사이트 편집 폼 */}
-        {showEditor && (
-          <div className="mt-3">
-            <RadarSiteEditor
-              initial={editingSite}
-              onSave={handleSaveCustomSite}
-              onCancel={() => {
-                setShowEditor(false);
-                setEditingSite(undefined);
-              }}
-            />
-          </div>
-        )}
       </div>
 
       {/* Drop Zone */}
@@ -564,7 +247,7 @@ export default function FileUpload() {
             <div className="flex items-center gap-2">
               {pendingCount > 0 && (
                 <button
-                  onClick={parseAll}
+                  onClick={requestParseAll}
                   disabled={parsingCount > 0}
                   className="flex items-center gap-2 rounded-lg bg-[#e94560] px-3 py-2 text-sm font-medium text-white hover:bg-[#d63851] disabled:opacity-50 transition-colors"
                 >
@@ -583,75 +266,155 @@ export default function FileUpload() {
           </div>
 
           <div className="divide-y divide-white/5 overflow-hidden rounded-xl border border-white/10 bg-[#16213e]">
-            {uploadedFiles.map((file) => {
-              const prog = parseProgress[file.name];
-              const isParsing = file.status === "parsing";
-              return (
-                <div key={file.path} className="px-4 py-3">
-                  <div className="flex items-center gap-3">
-                    {statusIcon(file.status)}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <FolderOpen size={12} className="text-gray-500 shrink-0" />
-                        <p className="truncate text-sm text-white">{file.name}</p>
-                      </div>
-                      <p className="text-xs text-gray-500 truncate">{file.path}</p>
+            {uploadedFiles.map((file) => (
+              <div key={file.path} className="px-4 py-3">
+                <div className="flex items-center gap-3">
+                  {statusIcon(file.status)}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <FolderOpen size={12} className="text-gray-500 shrink-0" />
+                      <p className="truncate text-sm text-white">{file.name}</p>
                     </div>
-                    <span
-                      className={`shrink-0 text-xs ${
-                        file.status === "done"
-                          ? "text-green-400"
-                          : file.status === "error"
-                            ? "text-red-400"
-                            : isParsing
-                              ? "text-blue-400"
-                              : "text-gray-500"
-                      }`}
-                    >
-                      {isParsing && prog
-                        ? `파싱 중... ${prog.percent.toFixed(0)}%`
-                        : statusText(file)}
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      {file.status === "pending" && (
-                        <button
-                          onClick={() => parseFile(file)}
-                          className="rounded p-1.5 text-gray-400 hover:bg-white/10 hover:text-white transition-colors"
-                          title="파싱"
-                        >
-                          <Play size={14} />
-                        </button>
-                      )}
-                      <button
-                        onClick={() => removeUploadedFile(file.path)}
-                        className="rounded p-1.5 text-gray-400 hover:bg-red-500/20 hover:text-red-400 transition-colors"
-                        title="제거"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
+                    <p className="text-xs text-gray-500 truncate">{file.path}</p>
                   </div>
-                  {/* 프로그레스 바 */}
-                  {isParsing && prog && (
-                    <div className="mt-2 space-y-1">
-                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
-                        <div
-                          className="h-full rounded-full bg-blue-500 transition-all duration-200"
-                          style={{ width: `${prog.percent}%` }}
-                        />
-                      </div>
-                      <div className="flex items-center justify-between text-[10px] text-gray-500">
-                        <span>레코드: {prog.records.toLocaleString()}</span>
-                        <span>항적포인트: {prog.trackPoints.toLocaleString()}</span>
-                        {prog.errors > 0 && (
-                          <span className="text-yellow-500">오류: {prog.errors}</span>
-                        )}
-                      </div>
-                    </div>
-                  )}
+                  <span
+                    className={`shrink-0 text-xs ${
+                      file.status === "done"
+                        ? "text-green-400"
+                        : file.status === "error"
+                          ? "text-red-400"
+                          : file.status === "parsing"
+                            ? "text-blue-400"
+                            : "text-gray-500"
+                    }`}
+                  >
+                    {statusText(file)}
+                  </span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {file.status === "pending" && (
+                      <button
+                        onClick={() => requestParseSingle(file)}
+                        className="rounded p-1.5 text-gray-400 hover:bg-white/10 hover:text-white transition-colors"
+                        title="파싱"
+                      >
+                        <Play size={14} />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => removeUploadedFile(file.path)}
+                      className="rounded p-1.5 text-gray-400 hover:bg-red-500/20 hover:text-red-400 transition-colors"
+                      title="제거"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
                 </div>
-              );
-            })}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 레이더 사이트 선택 모달 */}
+      {showRadarModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-[#1a1a2e] p-6 shadow-2xl">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#0f3460]">
+                <Radar size={20} className="text-blue-400" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-white">
+                  레이더 사이트 선택
+                </h3>
+                <p className="text-xs text-gray-400">
+                  파싱에 사용할 레이더 사이트를 확인하세요
+                </p>
+              </div>
+            </div>
+
+            {/* 파싱 대상 선택 */}
+            <div className="mb-4">
+              <p className="text-xs text-gray-400 mb-2">파싱 대상</p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setParseMode("aircraft")}
+                  className={`flex-1 flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-sm transition-all ${
+                    parseMode === "aircraft"
+                      ? "border-blue-500 bg-blue-500/10 text-white"
+                      : "border-white/10 bg-white/5 text-gray-400 hover:border-white/20"
+                  }`}
+                >
+                  <Plane size={14} />
+                  <span>비행검사기만</span>
+                  {parseMode === "aircraft" && (
+                    <span className="text-[10px] text-blue-400">
+                      ({aircraft.filter((a) => a.active).length}대)
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={() => setParseMode("all")}
+                  className={`flex-1 flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-sm transition-all ${
+                    parseMode === "all"
+                      ? "border-blue-500 bg-blue-500/10 text-white"
+                      : "border-white/10 bg-white/5 text-gray-400 hover:border-white/20"
+                  }`}
+                >
+                  <Globe size={14} />
+                  <span>전체 데이터</span>
+                </button>
+              </div>
+              {parseMode === "aircraft" && aircraft.filter((a) => a.active).length === 0 && (
+                <p className="mt-1.5 text-xs text-yellow-400">
+                  등록된 활성 비행검사기가 없어 전체 데이터를 파싱합니다
+                </p>
+              )}
+            </div>
+
+            {/* 레이더 사이트 목록 */}
+            <div className="space-y-2 mb-5 max-h-60 overflow-auto">
+              {allRadarSites.map((site) => (
+                <button
+                  key={site.name}
+                  onClick={() => setModalSelectedSite(site)}
+                  className={`w-full rounded-lg border px-4 py-3 text-left transition-all ${
+                    site.name === modalSelectedSite.name
+                      ? "border-blue-500 bg-blue-500/10"
+                      : "border-white/10 bg-white/5 hover:border-white/20 hover:bg-white/10"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-white">
+                      {site.name}
+                    </span>
+                    {site.name === modalSelectedSite.name && (
+                      <span className="text-xs text-blue-400">선택됨</span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-xs text-gray-500">
+                    {site.latitude.toFixed(4)}°N, {site.longitude.toFixed(4)}°E
+                    {site.range_nm ? ` · ${site.range_nm}NM` : ""}
+                  </p>
+                </button>
+              ))}
+            </div>
+
+            {/* 버튼 */}
+            <div className="flex items-center justify-end gap-2">
+              <button
+                onClick={() => setShowRadarModal(false)}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-400 hover:bg-white/5 transition-colors"
+              >
+                취소
+              </button>
+              <button
+                onClick={handleRadarConfirm}
+                className="rounded-lg bg-[#e94560] px-4 py-2 text-sm font-medium text-white hover:bg-[#d63851] transition-colors"
+              >
+                파싱 시작
+              </button>
+            </div>
           </div>
         </div>
       )}

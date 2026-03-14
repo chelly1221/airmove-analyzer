@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use log::{debug, info, warn};
 use serde::Serialize;
 
-use crate::models::{ParsedFile, TrackPoint};
+use crate::models::{ParsedFile, ParseStatistics, RadarDetectionType, TrackPoint};
 use crate::parser::ParseError;
 
 /// 파싱 진행 상황 이벤트
@@ -65,6 +66,25 @@ const MAX_FLIGHT_LEVEL: f64 = 600.0;
 /// Maximum valid ASTERIX block length
 const MAX_BLOCK_LEN: usize = 8192;
 
+/// 최대 허용 속도 (km/s): 1200kts ≈ 0.617 km/s
+const MAX_GARBLE_SPEED_KMS: f64 = 0.617;
+/// 동일 스캔 중복 판단 임계값 (초)
+const SAME_SCAN_DT: f64 = 2.0;
+/// 최소 유효 시간 차이 (초)
+const MIN_DT: f64 = 0.5;
+/// ATCRBS 병합: 최대 시간차 (초) — 5초 스캔 + 1초 마진
+const ATCRBS_MERGE_TIME_GAP: f64 = 6.0;
+/// ATCRBS 병합: 거리 마진 (km)
+const ATCRBS_MERGE_MARGIN_KM: f64 = 2.0;
+/// ATCRBS 병합: 최대 속도 (km/s) — ~500kts
+const ATCRBS_MERGE_MAX_SPEED_KMS: f64 = 0.257;
+/// SSR 포인트와 기준 항적 간 최대 허용 거리 (km)
+const MAX_ATCRBS_DEVIATION_KM: f64 = 1.5;
+/// 최대 고도 변화율 (m/s): 20 m/s ≈ 3900 ft/min (비정상적 고도 점프 감지)
+const MAX_ALT_RATE_MS: f64 = 20.0;
+/// 고도 검사 최대 시간 윈도우 (초)
+const ALT_CHECK_MAX_DT: f64 = 60.0;
+
 /// Extracted data from a single ASTERIX CAT048 record
 #[derive(Debug, Default)]
 struct Cat048Record {
@@ -82,15 +102,573 @@ struct Cat048Record {
     /// I020 TYP: 0=none, 1=PSR, 2=SSR, 3=combined, 4=ModeS All-Call,
     /// 5=ModeS Roll-Call, 6=ModeS All-Call+PSR, 7=ModeS Roll-Call+PSR
     radar_typ: u8,
+    /// I020 SIM bit: 0=actual, 1=simulated
+    sim_flag: bool,
+}
+
+/// classify_and_convert 결과
+enum RecordOutcome {
+    Discard,
+    ModesSPoint(TrackPoint, Option<u16>),   // Mode-S 주소 있음 + mode3a
+    AtcrbsPoint(TrackPoint, Option<u16>),   // Mode-S 없음 + mode3a → ATCRBS 풀
+}
+
+/// TrackAssembler: 삽입 시 실시간 garble 검증
+struct TrackAssembler {
+    tracks: HashMap<String, Vec<TrackPoint>>,  // Mode-S → 시간순 포인트
+    atcrbs_pool: Vec<(TrackPoint, Option<u16>)>, // (포인트, mode3a)
+    /// Mode-3/A → Mode-S 매핑 (Mode-S 탐지에서 학습)
+    mode3a_to_modes: HashMap<u16, String>,
+    stats: ParseStatistics,
+}
+
+impl TrackAssembler {
+    fn new() -> Self {
+        Self {
+            tracks: HashMap::new(),
+            atcrbs_pool: Vec::new(),
+            mode3a_to_modes: HashMap::new(),
+            stats: ParseStatistics::default(),
+        }
+    }
+
+    /// Mode-S 포인트 삽입 (인라인 garble 검출)
+    /// mode3a가 있으면 mode3a→Mode-S 매핑을 학습
+    fn insert(&mut self, point: TrackPoint, mode3a: Option<u16>) {
+        // Mode-3/A → Mode-S 매핑 학습
+        if let Some(m3a) = mode3a {
+            self.mode3a_to_modes.insert(m3a, point.mode_s.clone());
+        }
+        let track = self.tracks.entry(point.mode_s.clone()).or_default();
+
+        if let Some(prev) = track.last() {
+            let dt = point.timestamp - prev.timestamp;
+
+            // 역순 도착 (dt < 0): 같은 스캔 내 순서 차이로 취급
+            let dt_abs = dt.abs();
+
+            // 동일 스캔 중복 제거 (|dt| < 2초)
+            if dt_abs < SAME_SCAN_DT {
+                if point.radar_type.priority() > prev.radar_type.priority() {
+                    // 새 포인트가 우선순위 높음 → 이전 것 교체
+                    *track.last_mut().unwrap() = point;
+                }
+                // 아니면 새 포인트 폐기 (이전 것이 더 좋거나 같음)
+                return;
+            }
+
+            // garble 검사: 물리적으로 불가능한 속도
+            if dt_abs >= MIN_DT {
+                let dist = quick_dist_km(
+                    prev.latitude, prev.longitude,
+                    point.latitude, point.longitude,
+                );
+                let speed = dist / dt_abs;
+                if speed > MAX_GARBLE_SPEED_KMS {
+                    self.stats.garbled_removed += 1;
+                    return;
+                }
+            }
+
+            // 고도 급변 검사: 다른 항공기의 garbled Mode-S 감지
+            // 짧은 시간(<60s)에 고도가 20m/s(≈3900ft/min) 이상 변하면 거부
+            if dt_abs >= MIN_DT && dt_abs < ALT_CHECK_MAX_DT {
+                let alt_rate = (point.altitude - prev.altitude).abs() / dt_abs;
+                if alt_rate > MAX_ALT_RATE_MS {
+                    self.stats.garbled_removed += 1;
+                    return;
+                }
+            }
+
+            // 갭 후 위치+고도 일관성 검사: 예상 위치와 크게 다르고 고도도 다르면 거부
+            // (다른 항공기의 garbled Mode-S가 긴 갭 후에 끼어든 경우)
+            if dt_abs > 30.0 && track.len() >= 2 {
+                let hdg_rad = prev.heading.to_radians();
+                let spd_kms = prev.speed * 1.852 / 3600.0; // kts → km/s
+                let travel = spd_kms * dt_abs;
+
+                let pred_lat = prev.latitude + hdg_rad.cos() * travel / 111.0;
+                let pred_lon = prev.longitude + hdg_rad.sin() * travel
+                    / (111.0 * prev.latitude.to_radians().cos());
+
+                let pos_err = quick_dist_km(pred_lat, pred_lon, point.latitude, point.longitude);
+                let alt_diff = (point.altitude - prev.altitude).abs();
+
+                // 위치 오차가 크고(>5km) 고도도 다르면(>100m) → 다른 항공기
+                if pos_err > 5.0 && alt_diff > 100.0 {
+                    self.stats.garbled_removed += 1;
+                    return;
+                }
+                // 위치 오차가 매우 크면(>30km) 고도 무관하게 거부
+                if pos_err > 30.0 {
+                    self.stats.garbled_removed += 1;
+                    return;
+                }
+            }
+        }
+
+        // 타입별 통계
+        match &point.radar_type {
+            RadarDetectionType::Atcrbs => self.stats.points_by_type[0] += 1,
+            RadarDetectionType::AtcrbsPsr => self.stats.points_by_type[1] += 1,
+            RadarDetectionType::Modes => self.stats.points_by_type[2] += 1,
+            RadarDetectionType::ModesPsr => self.stats.points_by_type[3] += 1,
+        }
+
+        track.push(point);
+    }
+
+    /// ATCRBS 포인트 삽입 (별도 풀에 수집, mode3a 포함)
+    fn insert_atcrbs(&mut self, point: TrackPoint, mode3a: Option<u16>) {
+        self.atcrbs_pool.push((point, mode3a));
+    }
+
+    /// ATCRBS 풀을 기존 Mode-S 항적에 병합 (Mode-3/A 코드 매칭)
+    ///
+    /// Mode-S 탐지에서 학습한 mode3a→Mode-S 매핑을 사용하여,
+    /// ATCRBS 포인트의 Mode-3/A(squawk)가 일치하는 Mode-S 항적에만 병합.
+    /// 거리 검증은 보조적으로 사용 (오매칭 방지).
+    fn merge_atcrbs(&mut self, filter_set: &std::collections::HashSet<String>) {
+        if self.atcrbs_pool.is_empty() || self.tracks.is_empty() {
+            return;
+        }
+
+        info!(
+            "ATCRBS merge: {} pool points, {} mode3a mappings learned",
+            self.atcrbs_pool.len(),
+            self.mode3a_to_modes.len()
+        );
+
+        // 병합 대상 Mode-S 결정
+        let target_modes: std::collections::HashSet<String> = if filter_set.is_empty() {
+            self.tracks.iter()
+                .filter(|(_, pts)| pts.len() >= 10)
+                .map(|(ms, _)| ms.clone())
+                .collect()
+        } else {
+            filter_set.clone()
+        };
+
+        if target_modes.is_empty() {
+            self.stats.atcrbs_unmatched += self.atcrbs_pool.len();
+            return;
+        }
+
+        // 각 대상 Mode-S의 포인트를 시간순 참조 (거리 검증용)
+        let mut ms_timestamps: HashMap<&str, Vec<(f64, f64, f64)>> = HashMap::new();
+        for ms in &target_modes {
+            if let Some(pts) = self.tracks.get(ms.as_str()) {
+                ms_timestamps.insert(ms.as_str(), pts.iter()
+                    .map(|p| (p.timestamp, p.latitude, p.longitude))
+                    .collect());
+            }
+        }
+
+        let pool = std::mem::take(&mut self.atcrbs_pool);
+        let mut merged_points: Vec<(String, TrackPoint)> = Vec::new();
+        let mut unmatched = 0usize;
+        let mut no_mode3a = 0usize;
+
+        for (point, mode3a) in pool {
+            // 1차: Mode-3/A 코드로 Mode-S 매핑 조회
+            let matched_ms = match mode3a {
+                Some(m3a) => self.mode3a_to_modes.get(&m3a).cloned(),
+                None => {
+                    no_mode3a += 1;
+                    None
+                }
+            };
+
+            let matched_ms = match matched_ms {
+                Some(ms) if target_modes.contains(&ms) => ms,
+                _ => {
+                    unmatched += 1;
+                    continue;
+                }
+            };
+
+            // 2차: 거리 검증 (오매칭 방지)
+            let distance_ok = if let Some(ref_pts) = ms_timestamps.get(matched_ms.as_str()) {
+                let search_ts = point.timestamp;
+                let pos = ref_pts.partition_point(|&(ts, _, _)| ts < search_ts);
+
+                let candidate_indices = [pos.checked_sub(1), Some(pos)];
+                let candidates: Vec<usize> = candidate_indices
+                    .iter()
+                    .filter_map(|x| *x)
+                    .filter(|&idx| idx < ref_pts.len())
+                    .collect();
+
+                candidates.iter().any(|&idx| {
+                    let (ts, lat, lon) = ref_pts[idx];
+                    let dt = (point.timestamp - ts).abs();
+                    if dt > ATCRBS_MERGE_TIME_GAP { return false; }
+                    let dist = quick_dist_km(point.latitude, point.longitude, lat, lon);
+                    let max_dist = ATCRBS_MERGE_MAX_SPEED_KMS * dt + ATCRBS_MERGE_MARGIN_KM;
+                    dist <= max_dist
+                })
+            } else {
+                false
+            };
+
+            if distance_ok {
+                merged_points.push((matched_ms, point));
+            } else {
+                unmatched += 1;
+            }
+        }
+
+        // 실제 병합
+        for (ms, mut np) in merged_points {
+            np.mode_s = ms.clone();
+            // radar_type은 원래 값 보존 (atcrbs 또는 atcrbs_psr)
+            match &np.radar_type {
+                RadarDetectionType::Atcrbs => self.stats.points_by_type[0] += 1,
+                RadarDetectionType::AtcrbsPsr => self.stats.points_by_type[1] += 1,
+                _ => {}
+            }
+            self.stats.atcrbs_merged += 1;
+            self.tracks.entry(ms).or_default().push(np);
+        }
+
+        self.stats.atcrbs_unmatched += unmatched;
+        info!(
+            "ATCRBS merge result: merged={}, unmatched={}, no_mode3a={}",
+            self.stats.atcrbs_merged, unmatched, no_mode3a
+        );
+    }
+
+    /// ATCRBS 포인트 중 기준 항적에서 이탈한 것 제거
+    fn filter_deviated_atcrbs(&mut self) {
+        let mut total_removed = 0usize;
+
+        for (_, track) in &mut self.tracks {
+            if track.len() < 3 { continue; }
+
+            // modes 기준 포인트 수집 (인덱스, timestamp, lat, lon)
+            let modes_refs: Vec<(usize, f64, f64, f64)> = track.iter()
+                .enumerate()
+                .filter(|(_, p)| p.radar_type.has_modes())
+                .map(|(i, p)| (i, p.timestamp, p.latitude, p.longitude))
+                .collect();
+
+            if modes_refs.len() < 2 { continue; }
+
+            let mut remove_indices: Vec<usize> = Vec::new();
+
+            for (i, p) in track.iter().enumerate() {
+                if !p.radar_type.is_atcrbs() { continue; }
+
+                let ts = p.timestamp;
+                let pos = modes_refs.partition_point(|&(_, t, _, _)| t < ts);
+
+                let expected = if pos == 0 {
+                    let (_, t, lat, lon) = modes_refs[0];
+                    if (ts - t).abs() > 30.0 { continue; }
+                    (lat, lon)
+                } else if pos >= modes_refs.len() {
+                    let (_, t, lat, lon) = modes_refs[modes_refs.len() - 1];
+                    if (ts - t).abs() > 30.0 { continue; }
+                    (lat, lon)
+                } else {
+                    let (_, t0, lat0, lon0) = modes_refs[pos - 1];
+                    let (_, t1, lat1, lon1) = modes_refs[pos];
+                    let dt_span = t1 - t0;
+                    if dt_span < MIN_DT || dt_span > 60.0 { continue; }
+                    let ratio = (ts - t0) / dt_span;
+                    (lat0 + (lat1 - lat0) * ratio, lon0 + (lon1 - lon0) * ratio)
+                };
+
+                let deviation = quick_dist_km(p.latitude, p.longitude, expected.0, expected.1);
+                if deviation > MAX_ATCRBS_DEVIATION_KM {
+                    remove_indices.push(i);
+                }
+            }
+
+            if !remove_indices.is_empty() {
+                total_removed += remove_indices.len();
+                let remove_set: std::collections::HashSet<usize> = remove_indices.into_iter().collect();
+                let mut idx = 0;
+                track.retain(|_| {
+                    let keep = !remove_set.contains(&idx);
+                    idx += 1;
+                    keep
+                });
+            }
+        }
+
+        if total_removed > 0 {
+            self.stats.garbled_removed += total_removed;
+            info!("Removed {} deviated ATCRBS points", total_removed);
+        }
+    }
+
+    /// 양방향 이웃 과속 outlier 제거 (multi-pass)
+    /// 양쪽 이웃 모두와 물리적으로 불가능한 속도인 포인트를 제거.
+    /// garbled Mode-S로 다른 항공기 트랙에 끼어든 포인트를 잡아냄.
+    fn filter_bidirectional_outliers(&mut self) {
+        let mut total_removed = 0usize;
+
+        for (_, track) in &mut self.tracks {
+            if track.len() < 3 { continue; }
+
+            // multi-pass: 한 번 제거 후 새로운 outlier가 드러날 수 있음
+            loop {
+                let mut remove_set = vec![false; track.len()];
+                let mut removed_this_pass = 0usize;
+
+                for w in 1..track.len() - 1 {
+                    if remove_set[w] { continue; }
+
+                    let dt_prev = track[w].timestamp - track[w - 1].timestamp;
+                    let dt_next = track[w + 1].timestamp - track[w].timestamp;
+                    if dt_prev < MIN_DT || dt_next < MIN_DT { continue; }
+
+                    let speed_prev = quick_dist_km(
+                        track[w].latitude, track[w].longitude,
+                        track[w - 1].latitude, track[w - 1].longitude,
+                    ) / dt_prev;
+
+                    let speed_next = quick_dist_km(
+                        track[w].latitude, track[w].longitude,
+                        track[w + 1].latitude, track[w + 1].longitude,
+                    ) / dt_next;
+
+                    if speed_prev > MAX_GARBLE_SPEED_KMS && speed_next > MAX_GARBLE_SPEED_KMS {
+                        remove_set[w] = true;
+                        removed_this_pass += 1;
+                    }
+                }
+
+                if removed_this_pass == 0 { break; }
+                total_removed += removed_this_pass;
+
+                let mut idx = 0;
+                track.retain(|_| {
+                    let keep = !remove_set[idx];
+                    idx += 1;
+                    keep
+                });
+            }
+        }
+
+        if total_removed > 0 {
+            self.stats.garbled_removed += total_removed;
+            info!("Removed {} bidirectional outlier points (multi-pass)", total_removed);
+        }
+    }
+
+    /// 이종 항적 세그먼트 제거: 갭으로 구분된 짧은 세그먼트 중
+    /// 트랙 전체의 대표 고도와 크게 다른 것을 제거.
+    /// (다른 항공기의 garbled Mode-S가 연속으로 끼어든 경우)
+    fn filter_foreign_segments(&mut self) {
+        const GAP_THRESHOLD: f64 = 8.0;
+        const ALT_MISMATCH_M: f64 = 150.0;
+
+        let mut total_removed = 0usize;
+
+        for (ms, track) in &mut self.tracks {
+            if track.len() < 30 { continue; }
+
+            // 갭 기준으로 세그먼트 분할
+            let mut segments: Vec<(usize, usize)> = Vec::new();
+            let mut seg_start = 0;
+            for i in 1..track.len() {
+                if track[i].timestamp - track[i - 1].timestamp > GAP_THRESHOLD {
+                    segments.push((seg_start, i - 1));
+                    seg_start = i;
+                }
+            }
+            segments.push((seg_start, track.len() - 1));
+
+            if segments.len() < 3 { continue; }
+
+            // 각 세그먼트: 길이, 중앙값 고도
+            let seg_infos: Vec<(usize, usize, usize, f64)> = segments.iter().map(|&(s, e)| {
+                let mut alts: Vec<f64> = (s..=e).map(|i| track[i].altitude).collect();
+                alts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                (s, e, e - s + 1, alts[alts.len() / 2])
+            }).collect();
+
+            // 대표 고도: 세그먼트 길이 가중 중앙값
+            let total_pts: usize = seg_infos.iter().map(|s| s.2).sum();
+            let mut weighted: Vec<(f64, usize)> = seg_infos.iter()
+                .map(|s| (s.3, s.2))
+                .collect();
+            weighted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let half = total_pts / 2;
+            let mut cum = 0usize;
+            let main_alt = weighted.iter()
+                .find(|&&(_, w)| { cum += w; cum >= half })
+                .map(|&(a, _)| a)
+                .unwrap_or(0.0);
+
+            // 최장 세그먼트 기준 최소 유지 크기
+            let max_seg_len = seg_infos.iter().map(|s| s.2).max().unwrap_or(0);
+            let min_keep = (max_seg_len / 4).max(40);
+
+            let mut remove_flags = vec![false; track.len()];
+
+            for (i, &(s, e, len, median_alt)) in seg_infos.iter().enumerate() {
+                if len >= min_keep { continue; } // 충분히 긴 세그먼트는 유지
+
+                let deviation = (median_alt - main_alt).abs();
+                if deviation <= ALT_MISMATCH_M { continue; } // 대표 고도와 비슷하면 유지
+
+                // 이웃 중 하나라도 대표 고도와 비슷하면 → 이 세그먼트는 이종
+                let prev_ok = i > 0 && (seg_infos[i - 1].3 - main_alt).abs() < ALT_MISMATCH_M * 2.0;
+                let next_ok = i + 1 < seg_infos.len() && (seg_infos[i + 1].3 - main_alt).abs() < ALT_MISMATCH_M * 2.0;
+
+                if prev_ok || next_ok {
+                    for j in s..=e {
+                        remove_flags[j] = true;
+                    }
+                }
+            }
+
+            let removed: usize = remove_flags.iter().filter(|&&f| f).count();
+            if removed > 0 {
+                total_removed += removed;
+                let mut idx = 0;
+                track.retain(|_| {
+                    let keep = !remove_flags[idx];
+                    idx += 1;
+                    keep
+                });
+                info!("Removed {} foreign segment points from {}", removed, ms);
+            }
+        }
+
+        if total_removed > 0 {
+            self.stats.garbled_removed += total_removed;
+        }
+    }
+
+    /// 최종화: 모든 트랙 병합 → 시간순 정렬 → 고도 보간
+    fn finalize(mut self) -> (Vec<TrackPoint>, ParseStatistics) {
+        // ★ 필터 실행 전에 각 트랙을 시간순 정렬 (merge_atcrbs 후 순서가 깨짐)
+        for (_, pts) in &mut self.tracks {
+            pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // ATCRBS 이탈 검사 (modes 기준 항적 대비)
+        self.filter_deviated_atcrbs();
+
+        // 양방향 outlier 제거 (multi-pass, garbled Mode-S로 다른 트랙에 끼어든 포인트)
+        self.filter_bidirectional_outliers();
+
+        // 이종 항적 세그먼트 제거 (garbled Mode-S로 끼어든 다른 항공기의 연속 포인트)
+        self.filter_foreign_segments();
+
+        let mut all_points: Vec<TrackPoint> = Vec::new();
+        for (_, mut pts) in self.tracks {
+            all_points.append(&mut pts); // 이미 정렬됨
+        }
+
+        // 전체 시간순 정렬
+        all_points.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 고도 보간
+        interpolate_missing_altitudes(&mut all_points);
+
+        (all_points, self.stats)
+    }
+}
+
+/// I020 TYP 값을 RadarDetectionType으로 분류하고, TrackPoint 변환
+fn classify_and_convert(
+    record: &Cat048Record,
+    base_date_secs: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> RecordOutcome {
+    // TYP=0,1 → Discard
+    match record.radar_typ {
+        0 | 1 => return RecordOutcome::Discard,
+        _ => {}
+    }
+
+    // Require time
+    let tod = match record.time_of_day {
+        Some(t) => t,
+        None => return RecordOutcome::Discard,
+    };
+
+    // Convert position from polar or Cartesian to lat/lon
+    let (lat, lon) = if let (Some(rho), Some(theta)) = (record.rho_nm, record.theta_deg) {
+        polar_to_latlon(rho, theta, radar_lat, radar_lon)
+    } else if let (Some(x_nm), Some(y_nm)) = (record.cart_x_nm, record.cart_y_nm) {
+        cartesian_to_latlon(x_nm, y_nm, radar_lat, radar_lon)
+    } else {
+        return RecordOutcome::Discard;
+    };
+
+    // Validate coordinates (Korean airspace)
+    if lat < 30.0 || lat > 45.0 || lon < 120.0 || lon > 135.0 {
+        return RecordOutcome::Discard;
+    }
+
+    // Compute timestamp
+    let timestamp = if base_date_secs > 0.0 {
+        base_date_secs + tod
+    } else {
+        1700000000.0 + tod
+    };
+
+    // Altitude from flight level (1 FL = 100 ft → meters)
+    let altitude = record
+        .flight_level
+        .map(|fl| fl * 100.0 * 0.3048)
+        .unwrap_or(0.0);
+
+    // I020 TYP → RadarDetectionType
+    let radar_type = match record.radar_typ {
+        2 => RadarDetectionType::Atcrbs,
+        3 => RadarDetectionType::AtcrbsPsr,
+        4 | 5 => RadarDetectionType::Modes,
+        6 | 7 => RadarDetectionType::ModesPsr,
+        _ => return RecordOutcome::Discard,
+    };
+
+    let speed = record.ground_speed_kts.unwrap_or(0.0);
+    let heading = record.heading_deg.unwrap_or(0.0);
+
+    // Mode-S address 기반 식별
+    let mode_s = match record.mode_s_address {
+        Some(addr) if addr > 0 => format!("{:06X}", addr),
+        _ => String::new(), // Mode-S 없는 ATCRBS 레코드
+    };
+
+    let point = TrackPoint {
+        timestamp,
+        mode_s: if mode_s.is_empty() { "NO_MODES".to_string() } else { mode_s.clone() },
+        latitude: lat,
+        longitude: lon,
+        altitude,
+        speed,
+        heading,
+        radar_type,
+        raw_data: Vec::new(),
+    };
+
+    let mode3a = record.mode3a;
+
+    if mode_s.is_empty() {
+        RecordOutcome::AtcrbsPoint(point, mode3a)
+    } else {
+        RecordOutcome::ModesSPoint(point, mode3a)
+    }
 }
 
 /// Parse an ASS file (NEC RDRS recording containing ASTERIX data).
 /// `radar_lat`/`radar_lon` specify the radar reference point for coordinate conversion.
+/// `mode_s_filter` — 빈 벡터이면 전체 데이터 파싱, 값이 있으면 해당 Mode-S만 포함.
 /// `on_progress` is called periodically with progress info.
 pub fn parse_ass_file<F>(
     path: &str,
     radar_lat: f64,
     radar_lon: f64,
+    mode_s_filter: &[String],
     mut on_progress: F,
 ) -> Result<ParsedFile, ParseError>
 where
@@ -118,16 +696,28 @@ where
         info!("Detected NEC frame: month={}, day={}", month, day);
     }
 
-    let mut track_points = Vec::with_capacity(100_000);
+    // Mode-S 필터 셋 (대문자 정규화)
+    let filter_set: std::collections::HashSet<String> = mode_s_filter
+        .iter()
+        .map(|s| s.to_uppercase())
+        .collect();
+    let filtering = !filter_set.is_empty();
+    if filtering {
+        info!("Mode-S filter active: {:?}", filter_set);
+    }
+
+    let mut assembler = TrackAssembler::new();
     let mut parse_errors = Vec::new();
     let mut total_records = 0usize;
     let mut offset = 0usize;
-    let mut point_index = 0u64;
     let mut skipped_bytes = 0usize;
 
     let base_date_secs = extract_base_date_from_filename(&filename);
+    let mut day_offset_secs: f64 = 0.0; // 자정 넘김 보정용
+    let mut prev_tod: f64 = 0.0; // 이전 레코드의 time_of_day
     let data_len = data.len();
-    let mut last_reported_pct = 0u32; // 마지막으로 보고한 퍼센트
+    let mut last_reported_pct = 0u32;
+    let mut point_count = 0usize; // 진행률 보고용
 
     while offset < data.len() {
         // 진행률 보고 (1% 단위)
@@ -138,7 +728,7 @@ where
                 filename: filename.clone(),
                 percent: pct as f64,
                 records: total_records,
-                track_points: track_points.len(),
+                track_points: point_count,
                 errors: parse_errors.len(),
             });
         }
@@ -163,16 +753,36 @@ where
                     match parse_cat048_record(block_data, rec_offset) {
                         Ok((record, next_offset)) => {
                             total_records += 1;
+                            assembler.stats.total_asterix_records += 1;
 
-                            if let Some(tp) = record_to_track_point(
+                            // 자정 넘김 감지: tod가 이전보다 크게 줄어들면 날짜 변경
+                            if let Some(tod) = record.time_of_day {
+                                if prev_tod > 70000.0 && tod < 16000.0 {
+                                    day_offset_secs += 86400.0;
+                                    info!("Midnight wrap detected: prev_tod={:.0}, tod={:.0}, day_offset=+{:.0}s", prev_tod, tod, day_offset_secs);
+                                }
+                                prev_tod = tod;
+                            }
+
+                            match classify_and_convert(
                                 &record,
-                                base_date_secs,
-                                point_index,
+                                base_date_secs + day_offset_secs,
                                 radar_lat,
                                 radar_lon,
                             ) {
-                                track_points.push(tp);
-                                point_index += 1;
+                                RecordOutcome::Discard => {
+                                    assembler.stats.discarded_psr_none += 1;
+                                }
+                                RecordOutcome::ModesSPoint(tp, mode3a) => {
+                                    // Mode-S 필터 적용
+                                    if !filtering || filter_set.contains(&tp.mode_s.to_uppercase()) {
+                                        assembler.insert(tp, mode3a);
+                                        point_count += 1;
+                                    }
+                                }
+                                RecordOutcome::AtcrbsPoint(tp, mode3a) => {
+                                    assembler.insert_atcrbs(tp, mode3a);
+                                }
                             }
 
                             rec_offset = next_offset;
@@ -204,19 +814,20 @@ where
         filename: filename.clone(),
         percent: 100.0,
         records: total_records,
-        track_points: track_points.len(),
+        track_points: point_count,
         errors: parse_errors.len(),
     });
 
-    // Sort by timestamp
-    track_points.sort_by(|a, b| {
-        a.timestamp
-            .partial_cmp(&b.timestamp)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // ATCRBS 병합
+    assembler.merge_atcrbs(&filter_set);
 
-    // 고도 보간: FL 미검증/garbled로 altitude=0인 포인트에 직전 유효 고도 적용
-    interpolate_missing_altitudes(&mut track_points);
+    // Mode-S 필터 적용 (ATCRBS 병합 후)
+    if filtering {
+        assembler.tracks.retain(|ms, _| filter_set.contains(&ms.to_uppercase()));
+    }
+
+    // 최종화
+    let (track_points, stats) = assembler.finalize();
 
     let start_time = track_points.first().map(|p| p.timestamp);
     let end_time = track_points.last().map(|p| p.timestamp);
@@ -232,6 +843,11 @@ where
         parse_errors.len(),
         skipped_bytes
     );
+    info!(
+        "Stats: discarded={}, garbled={}, atcrbs_merged={}, unmatched={}, by_type={:?}",
+        stats.discarded_psr_none, stats.garbled_removed,
+        stats.atcrbs_merged, stats.atcrbs_unmatched, stats.points_by_type
+    );
 
     Ok(ParsedFile {
         filename,
@@ -242,8 +858,11 @@ where
         end_time,
         radar_lat,
         radar_lon,
+        parse_stats: Some(stats),
     })
 }
+
+// ─── Preserved validated functions ───
 
 /// Check if there's a valid ASTERIX block at `offset`.
 /// Validates by checking if the block chains to another valid block or NEC frame.
@@ -374,25 +993,56 @@ fn is_nec_frame(data: &[u8], offset: usize, month: u8, day: u8) -> bool {
     after == CAT048 || after == CAT034 || after == CAT008 || after == month
 }
 
-/// Extract a base Unix timestamp from a filename like "gimpo_260304_0415.ass".
+/// Extract a base Unix timestamp (UTC midnight) from a filename like "gimpo_260304_0415.ass".
+///
+/// 파일명의 날짜는 KST(UTC+9) 기준. ASTERIX I140 TOD는 UTC 자정 기준이므로,
+/// KST 시각이 09:00 미만이면 UTC 날짜가 하루 전이다.
+/// 예: gimpo_260311_0829.ass → 08:29 KST = 23:29 UTC (March 10) → base = March 10 00:00 UTC
 fn extract_base_date_from_filename(filename: &str) -> f64 {
-    let parts: Vec<&str> = filename.split('_').collect();
+    // 확장자 제거 후 '_' 분리
+    let stem = filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(filename);
+    let parts: Vec<&str> = stem.split('_').collect();
+
+    let mut date_ymd: Option<(i64, u32, u32)> = None;
+    let mut time_hm: Option<u32> = None; // KST hour
+
     for part in &parts {
-        if part.len() == 6 {
+        if part.len() == 6 && date_ymd.is_none() {
             if let (Ok(yy), Ok(mm), Ok(dd)) = (
                 part[0..2].parse::<i64>(),
                 part[2..4].parse::<u32>(),
                 part[4..6].parse::<u32>(),
             ) {
                 if mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 {
-                    let year = 2000 + yy;
-                    let days = days_from_epoch(year, mm, dd);
-                    return (days as f64) * 86400.0;
+                    date_ymd = Some((2000 + yy, mm, dd));
+                }
+            }
+        } else if part.len() == 4 && time_hm.is_none() {
+            if let (Ok(hh), Ok(mm)) = (
+                part[0..2].parse::<u32>(),
+                part[2..4].parse::<u32>(),
+            ) {
+                if hh <= 23 && mm <= 59 {
+                    time_hm = Some(hh);
                 }
             }
         }
     }
-    0.0
+
+    if let Some((year, month, day)) = date_ymd {
+        let base = days_from_epoch(year, month, day) as f64 * 86400.0;
+
+        // KST→UTC 보정: KST hour < 9이면 UTC 날짜는 하루 전
+        // (09:00 KST = 00:00 UTC 이므로, 그 전은 전날 UTC)
+        if let Some(kst_hour) = time_hm {
+            if kst_hour < 9 {
+                return base - 86400.0;
+            }
+        }
+        base
+    } else {
+        0.0
+    }
 }
 
 fn days_from_epoch(year: i64, month: u32, day: u32) -> i64 {
@@ -486,9 +1136,11 @@ fn parse_cat048_record(
             UAP_I020 => {
                 // I020 Target Report Descriptor (FX-extended)
                 // 첫 바이트 bits 8-6: TYP (레이더 탐지 유형)
+                // 첫 바이트 bit 5: SIM (0=actual, 1=simulated)
                 if pos >= block.len() { break; }
                 let first_byte = block[pos];
                 record.radar_typ = (first_byte >> 5) & 0x07;
+                record.sim_flag = (first_byte >> 4) & 0x01 == 1;
                 let consumed = skip_fx_extended(block, pos);
                 if consumed == 0 { break; }
                 pos += consumed;
@@ -706,9 +1358,6 @@ fn parse_cat048_record(
 
 /// 고도 보간: Mode-S별로 altitude=0인 포인트에 직전/직후 유효 고도를 적용
 fn interpolate_missing_altitudes(points: &mut [TrackPoint]) {
-    use std::collections::HashMap;
-
-    // Mode-S별로 인덱스 그룹화 (owned String으로 borrow 회피)
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, p) in points.iter().enumerate() {
         groups.entry(p.mode_s.clone()).or_default().push(i);
@@ -736,75 +1385,13 @@ fn interpolate_missing_altitudes(points: &mut [TrackPoint]) {
     }
 }
 
-/// Convert a parsed CAT048 record into a TrackPoint.
-/// Returns None if essential fields are missing or values are unreasonable.
-fn record_to_track_point(
-    record: &Cat048Record,
-    base_date_secs: f64,
-    _index: u64,
-    radar_lat: f64,
-    radar_lon: f64,
-) -> Option<TrackPoint> {
-    // Require time
-    let tod = record.time_of_day?;
-
-    // Convert position from polar or Cartesian to lat/lon
-    let (lat, lon) = if let (Some(rho), Some(theta)) = (record.rho_nm, record.theta_deg) {
-        polar_to_latlon(rho, theta, radar_lat, radar_lon)
-    } else if let (Some(x_nm), Some(y_nm)) = (record.cart_x_nm, record.cart_y_nm) {
-        cartesian_to_latlon(x_nm, y_nm, radar_lat, radar_lon)
-    } else {
-        return None;
-    };
-
-    // Validate coordinates (Korean airspace)
-    if lat < 30.0 || lat > 45.0 || lon < 120.0 || lon > 135.0 {
-        return None;
-    }
-
-    // Compute timestamp
-    let timestamp = if base_date_secs > 0.0 {
-        base_date_secs + tod
-    } else {
-        1700000000.0 + tod
-    };
-
-    // Altitude from flight level (1 FL = 100 ft → meters)
-    let altitude = record
-        .flight_level
-        .map(|fl| fl * 100.0 * 0.3048)
-        .unwrap_or(0.0);
-
-    // Mode-S address
-    let mode_s = record
-        .mode_s_address
-        .map(|addr| format!("{:06X}", addr))
-        .or_else(|| record.track_number.map(|tn| format!("TN{:04}", tn)))
-        .unwrap_or_else(|| "UNKNOWN".to_string());
-
-    let speed = record.ground_speed_kts.unwrap_or(0.0);
-    let heading = record.heading_deg.unwrap_or(0.0);
-
-    // I020 TYP → radar_type 문자열
-    let radar_type = match record.radar_typ {
-        1 => "psr",
-        2 => "ssr",
-        3 => "combined",
-        4 | 5 | 6 | 7 => "modes",
-        _ => "ssr", // 기본값
-    }.to_string();
-
-    Some(TrackPoint {
-        timestamp,
-        mode_s,
-        latitude: lat,
-        longitude: lon,
-        altitude,
-        speed,
-        heading,
-        radar_type,
-        raw_data: Vec::new(),
-    })
+/// 빠른 거리 계산 (Equirectangular 근사, km)
+fn quick_dist_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let cos_mid = ((lat1 + lat2) / 2.0).to_radians().cos();
+    let x = dlon * cos_mid;
+    ((dlat * dlat + x * x).sqrt()) * 6371.0
 }
 
 fn polar_to_latlon(rho_nm: f64, theta_deg: f64, radar_lat: f64, radar_lon: f64) -> (f64, f64) {
@@ -854,7 +1441,6 @@ mod tests {
 
     #[test]
     fn test_i16_from_be_bytes() {
-        // Verify sign extension works correctly
         assert_eq!(i16::from_be_bytes([0xFF, 0xFF]), -1);
         assert_eq!(i16::from_be_bytes([0x80, 0x00]), -32768);
         assert_eq!(i16::from_be_bytes([0x00, 0x01]), 1);
@@ -892,10 +1478,37 @@ mod tests {
 
     #[test]
     fn test_extract_base_date() {
+        // 04:15 KST < 09:00 → UTC date is previous day (March 3)
         let ts = extract_base_date_from_filename("gimpo_260304_0415.ass");
         assert!(ts > 0.0);
-        let expected_days = days_from_epoch(2026, 3, 4);
-        assert!((ts - expected_days as f64 * 86400.0).abs() < 1.0);
+        let expected = days_from_epoch(2026, 3, 3) as f64 * 86400.0; // March 3 UTC
+        assert!((ts - expected).abs() < 1.0, "0415 KST: expected March 3 UTC, got delta={}", ts - expected);
+
+        // 09:06 KST >= 09:00 → UTC date is same day (March 12)
+        let ts2 = extract_base_date_from_filename("gimpo_260312_0906.ass");
+        let expected2 = days_from_epoch(2026, 3, 12) as f64 * 86400.0;
+        assert!((ts2 - expected2).abs() < 1.0, "0906 KST: expected March 12 UTC, got delta={}", ts2 - expected2);
+
+        // 08:29 KST < 09:00 → UTC date is previous day (March 10)
+        let ts3 = extract_base_date_from_filename("gimpo_260311_0829.ass");
+        let expected3 = days_from_epoch(2026, 3, 10) as f64 * 86400.0;
+        assert!((ts3 - expected3).abs() < 1.0, "0829 KST: expected March 10 UTC, got delta={}", ts3 - expected3);
+
+        // Two consecutive files should NOT overlap
+        let base_0311 = extract_base_date_from_filename("gimpo_260311_0829.ass"); // March 10 UTC
+        let base_0312 = extract_base_date_from_filename("gimpo_260312_0906.ass"); // March 12 UTC
+        let gap = base_0312 - base_0311;
+        assert!(gap >= 86400.0, "Bases must be ≥1 day apart, got {}s", gap);
+
+        // No time part → fallback to filename date as UTC
+        let ts4 = extract_base_date_from_filename("gimpo_260304.ass");
+        let expected4 = days_from_epoch(2026, 3, 4) as f64 * 86400.0;
+        assert!((ts4 - expected4).abs() < 1.0);
+
+        // 09:00 KST exactly = 00:00 UTC → same day
+        let ts5 = extract_base_date_from_filename("gimpo_260315_0900.ass");
+        let expected5 = days_from_epoch(2026, 3, 15) as f64 * 86400.0;
+        assert!((ts5 - expected5).abs() < 1.0);
     }
 
     #[test]
@@ -909,97 +1522,169 @@ mod tests {
 
     #[test]
     fn test_detect_nec_frame_requires_confirmation() {
-        // Build data with two consecutive NEC frames + ASTERIX blocks
         let mut data = vec![0x03, 0x04, 0x04, 0x0f, 0x0c]; // NEC frame + counter
         data.push(0x30); // CAT048
         data.extend_from_slice(&[0x00, 0x1a]); // LEN=26
         data.extend(vec![0x00; 23]); // record data
-        // Second frame (same month/day, can differ hour/minute)
-        data.extend_from_slice(&[0x03, 0x04, 0x04, 0x10, 0x0d]); // minute changed 0x0f->0x10
+        data.extend_from_slice(&[0x03, 0x04, 0x04, 0x10, 0x0d]); // minute changed
         data.push(0x22); // CAT034
         data.extend_from_slice(&[0x00, 0x0b]); // LEN=11
         data.extend(vec![0x00; 8]);
 
         let frame = detect_nec_frame(&data);
-        assert_eq!(frame, Some((0x03, 0x04))); // Returns (month, day)
+        assert_eq!(frame, Some((0x03, 0x04)));
     }
 
     #[test]
     fn test_detect_nec_frame_no_false_positive() {
-        // Random data that looks like a date but has no confirmation
-        let mut data = vec![0x03, 0x04, 0x04, 0x0f, 0x0c]; // Looks like frame
-        data.push(0x30); // CAT048
-        data.extend_from_slice(&[0x00, 0x1a]); // LEN=26
-        data.extend(vec![0xAA; 23]); // Random data (no second frame)
+        let mut data = vec![0x03, 0x04, 0x04, 0x0f, 0x0c];
+        data.push(0x30);
+        data.extend_from_slice(&[0x00, 0x1a]);
+        data.extend(vec![0xAA; 23]);
 
         let frame = detect_nec_frame(&data);
-        assert_eq!(frame, None); // Should NOT detect without confirmation
+        assert_eq!(frame, None);
     }
 
     #[test]
     fn test_is_nec_frame() {
-        // Valid NEC frame followed by CAT048
         let data = vec![0x03, 0x0c, 0x09, 0x06, 0x17, 0x30, 0x00, 0x10];
         assert!(is_nec_frame(&data, 0, 0x03, 0x0c));
 
-        // Same month/day but different hour/minute — should still match
         let data2 = vec![0x03, 0x0c, 0x0a, 0x15, 0x20, 0x22, 0x00, 0x10];
         assert!(is_nec_frame(&data2, 0, 0x03, 0x0c));
 
-        // Wrong month — should not match
         assert!(!is_nec_frame(&data, 0, 0x04, 0x0c));
 
-        // Invalid hour (24) — should not match
         let data3 = vec![0x03, 0x0c, 0x18, 0x06, 0x17, 0x30];
         assert!(!is_nec_frame(&data3, 0, 0x03, 0x0c));
     }
 
     #[test]
     fn test_chain_validation() {
-        // Two valid chained ASTERIX blocks
         let mut data = Vec::new();
-        // Block 1: CAT034, LEN=5 (minimum: 3-byte header + 2 data)
         data.push(0x22);
         data.extend_from_slice(&[0x00, 0x05]);
         data.extend_from_slice(&[0x00, 0x00]);
-        // Block 2: CAT048, LEN=5
         data.push(0x30);
         data.extend_from_slice(&[0x00, 0x05]);
         data.extend_from_slice(&[0x00, 0x00]);
 
-        // Block 1 should be valid because block 2 follows
         assert!(try_asterix_block(&data, 0, None).is_some());
 
-        // Single block with no valid successor should fail
         let solo = vec![0x30, 0x00, 0x05, 0x00, 0x00, 0xAA, 0xBB];
         assert!(try_asterix_block(&solo, 0, None).is_none());
     }
 
     #[test]
-    fn test_record_validation_rejects_bad_time() {
-        // Time > 86400 should be rejected
+    fn test_classify_discard_typ0() {
         let record = Cat048Record {
-            time_of_day: Some(90000.0), // > 86400
+            time_of_day: Some(50000.0),
             rho_nm: Some(10.0),
             theta_deg: Some(180.0),
+            radar_typ: 0,
             ..Default::default()
         };
-        // time_of_day > MAX_TIME_OF_DAY won't even be set by parser,
-        // but if it were, record_to_track_point still requires it
-        assert!(record.time_of_day.is_some());
+        assert!(matches!(
+            classify_and_convert(&record, 1700000000.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON),
+            RecordOutcome::Discard
+        ));
     }
 
     #[test]
-    fn test_record_validation_rejects_bad_coords() {
+    fn test_classify_discard_typ1() {
         let record = Cat048Record {
             time_of_day: Some(50000.0),
-            rho_nm: Some(500.0), // Way too far - would produce coords outside Korea
-            theta_deg: Some(0.0),
+            rho_nm: Some(10.0),
+            theta_deg: Some(180.0),
+            radar_typ: 1,
             ..Default::default()
         };
-        // rho_nm > 256 won't be set by parser (validation), but test coords filter
-        let (lat, _lon) = polar_to_latlon(500.0, 0.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON);
-        assert!(lat > 45.0); // Out of Korean bounds
+        assert!(matches!(
+            classify_and_convert(&record, 1700000000.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON),
+            RecordOutcome::Discard
+        ));
+    }
+
+    #[test]
+    fn test_classify_atcrbs() {
+        let record = Cat048Record {
+            time_of_day: Some(50000.0),
+            rho_nm: Some(10.0),
+            theta_deg: Some(180.0),
+            radar_typ: 2,
+            ..Default::default()
+        };
+        assert!(matches!(
+            classify_and_convert(&record, 1700000000.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON),
+            RecordOutcome::AtcrbsPoint(..)
+        ));
+    }
+
+    #[test]
+    fn test_classify_modes_psr() {
+        let record = Cat048Record {
+            time_of_day: Some(50000.0),
+            rho_nm: Some(10.0),
+            theta_deg: Some(180.0),
+            radar_typ: 7,
+            mode_s_address: Some(0x71BF79),
+            ..Default::default()
+        };
+        match classify_and_convert(&record, 1700000000.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON) {
+            RecordOutcome::ModesSPoint(tp, _mode3a) => {
+                assert_eq!(tp.radar_type, RadarDetectionType::ModesPsr);
+                assert_eq!(tp.mode_s, "71BF79");
+            }
+            _ => panic!("Expected ModesSPoint"),
+        }
+    }
+
+    #[test]
+    fn test_track_assembler_same_scan_dedup() {
+        let mut asm = TrackAssembler::new();
+        let p1 = TrackPoint {
+            timestamp: 1000.0, mode_s: "ABC".to_string(),
+            latitude: 37.5, longitude: 126.8, altitude: 3000.0,
+            speed: 200.0, heading: 90.0,
+            radar_type: RadarDetectionType::Atcrbs,
+            raw_data: vec![],
+        };
+        let p2 = TrackPoint {
+            timestamp: 1001.0, mode_s: "ABC".to_string(),
+            latitude: 37.5, longitude: 126.8, altitude: 3000.0,
+            speed: 200.0, heading: 90.0,
+            radar_type: RadarDetectionType::ModesPsr,
+            raw_data: vec![],
+        };
+        asm.insert(p1, None);
+        asm.insert(p2, None);
+        // 동일 스캔 → 우선순위 높은 ModesPsr이 남아야 함
+        assert_eq!(asm.tracks["ABC"].len(), 1);
+        assert_eq!(asm.tracks["ABC"][0].radar_type, RadarDetectionType::ModesPsr);
+    }
+
+    #[test]
+    fn test_track_assembler_garble_reject() {
+        let mut asm = TrackAssembler::new();
+        let p1 = TrackPoint {
+            timestamp: 1000.0, mode_s: "ABC".to_string(),
+            latitude: 37.5, longitude: 126.8, altitude: 3000.0,
+            speed: 200.0, heading: 90.0,
+            radar_type: RadarDetectionType::ModesPsr,
+            raw_data: vec![],
+        };
+        let p2 = TrackPoint {
+            timestamp: 1005.0, mode_s: "ABC".to_string(),
+            latitude: 35.0, longitude: 129.0, altitude: 3000.0, // ~300km jump in 5s
+            speed: 200.0, heading: 90.0,
+            radar_type: RadarDetectionType::ModesPsr,
+            raw_data: vec![],
+        };
+        asm.insert(p1, None);
+        asm.insert(p2, None);
+        assert_eq!(asm.tracks["ABC"].len(), 1); // garbled point rejected
+        assert_eq!(asm.stats.garbled_removed, 1);
     }
 
     #[test]
@@ -1014,6 +1699,7 @@ mod tests {
             test_file.to_str().unwrap(),
             DEFAULT_RADAR_LAT,
             DEFAULT_RADAR_LON,
+            &[],
             |_| {},
         )
         .expect("Failed to parse ASS file");
@@ -1022,15 +1708,12 @@ mod tests {
         println!("Track points: {}", result.track_points.len());
         println!("Parse errors: {}", result.parse_errors.len());
 
-        // Should have substantial data
         assert!(result.total_records > 10_000, "Expected >10K records, got {}", result.total_records);
         assert!(result.track_points.len() > 5_000, "Expected >5K track points, got {}", result.track_points.len());
 
-        // Error rate should be very low
         let error_rate = result.parse_errors.len() as f64 / result.total_records as f64;
         assert!(error_rate < 0.01, "Error rate {:.2}% too high", error_rate * 100.0);
 
-        // All track points should be in Korean airspace
         for tp in &result.track_points {
             assert!(tp.latitude >= 30.0 && tp.latitude <= 45.0,
                 "Latitude {} out of range", tp.latitude);
@@ -1038,21 +1721,298 @@ mod tests {
                 "Longitude {} out of range", tp.longitude);
         }
 
-        // Time should be within 24 hours
         if let (Some(start), Some(end)) = (result.start_time, result.end_time) {
             let duration = end - start;
             assert!(duration > 0.0 && duration < 86400.0,
                 "Duration {} seconds unreasonable", duration);
         }
 
-        // Check unique Mode-S codes (should be reasonable, not tens of thousands of garbage)
         let mut mode_s_codes: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for tp in &result.track_points {
             mode_s_codes.insert(&tp.mode_s);
         }
         println!("Unique Mode-S codes: {}", mode_s_codes.len());
-        // Gimpo radar near Seoul sees thousands of targets; >10K would indicate garbage
         assert!(mode_s_codes.len() < 10_000,
             "Too many unique Mode-S codes ({}), likely parsing garbage", mode_s_codes.len());
+
+        if let Some(stats) = &result.parse_stats {
+            println!("Stats: {:?}", stats);
+        }
     }
+
+    #[test]
+    #[ignore]
+    fn test_debug_71bf78_radar_types() {
+        let file1 = "C:\\code\\airmove-analyzer\\ass\\gimpo_260311_0829.ass";
+        let file2 = "C:\\code\\airmove-analyzer\\ass\\gimpo_260312_0906.ass";
+
+        if !std::path::Path::new(file1).exists() || !std::path::Path::new(file2).exists() {
+            return;
+        }
+
+        let r1 = parse_ass_file(file1, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON, &[], |_| {}).unwrap();
+        let r2 = parse_ass_file(file2, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON, &[], |_| {}).unwrap();
+
+        let mut pts1: Vec<&TrackPoint> = r1.track_points.iter().filter(|p| p.mode_s == "71BF78").collect();
+        let mut pts2: Vec<&TrackPoint> = r2.track_points.iter().filter(|p| p.mode_s == "71BF78").collect();
+        pts1.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+        pts2.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+
+        println!("=== TIMESTAMP COMPARISON ===");
+        println!("File 1 (0311): {} pts, ts range [{:.0}, {:.0}]",
+            pts1.len(), pts1.first().unwrap().timestamp, pts1.last().unwrap().timestamp);
+        println!("File 2 (0312): {} pts, ts range [{:.0}, {:.0}]",
+            pts2.len(), pts2.first().unwrap().timestamp, pts2.last().unwrap().timestamp);
+
+        let f1_min = pts1.first().unwrap().timestamp;
+        let f1_max = pts1.last().unwrap().timestamp;
+        let f2_min = pts2.first().unwrap().timestamp;
+        let f2_max = pts2.last().unwrap().timestamp;
+
+        let overlap = f1_min <= f2_max && f2_min <= f1_max;
+        println!("Overlap: {}", overlap);
+        if overlap {
+            let o_start = f1_min.max(f2_min);
+            let o_end = f1_max.min(f2_max);
+            println!("  Overlap range: [{:.0}, {:.0}] ({:.0}s)",
+                o_start, o_end, o_end - o_start);
+        }
+
+        // 차이 계산
+        let gap = if f2_min > f1_max { f2_min - f1_max } else if f1_min > f2_max { f1_min - f2_max } else { 0.0 };
+        println!("Gap between files: {:.0}s ({:.1}h)", gap, gap / 3600.0);
+
+        // 앱에서 합쳐졌을 때 시뮬레이션
+        let mut combined: Vec<&TrackPoint> = Vec::new();
+        combined.extend(&pts1);
+        combined.extend(&pts2);
+        combined.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+        println!("\n=== COMBINED (simulating app) ===");
+        println!("Total 71BF78 points: {}", combined.len());
+
+        // 지그재그 탐지: 연속 포인트 간 거리가 비정상적으로 큰 경우
+        let mut zigzag_count = 0;
+        for i in 0..combined.len()-1 {
+            let dt = combined[i+1].timestamp - combined[i].timestamp;
+            if dt < 0.5 { continue; }
+            let dist = quick_dist_km(
+                combined[i].latitude, combined[i].longitude,
+                combined[i+1].latitude, combined[i+1].longitude,
+            );
+            let speed_kts = (dist / dt) * 3600.0 / 1.852;
+            if speed_kts > 1200.0 {
+                zigzag_count += 1;
+                if zigzag_count <= 20 {
+                    println!("  ZIGZAG[{}] dt={:.1}s dist={:.1}km speed={:.0}kts",
+                        zigzag_count, dt, dist, speed_kts);
+                    println!("    A: ts={:.0} lat={:.4} lon={:.4} alt={:.0}",
+                        combined[i].timestamp, combined[i].latitude, combined[i].longitude, combined[i].altitude);
+                    println!("    B: ts={:.0} lat={:.4} lon={:.4} alt={:.0}",
+                        combined[i+1].timestamp, combined[i+1].latitude, combined[i+1].longitude, combined[i+1].altitude);
+                }
+            }
+        }
+        println!("Total zigzag jumps (>1200kts): {}", zigzag_count);
+
+        let result = r1;
+
+        // ParseStatistics 출력
+        if let Some(ref stats) = result.parse_stats {
+            println!("=== Parse Statistics ===");
+            println!("  total_asterix_records: {}", stats.total_asterix_records);
+            println!("  discarded_psr_none: {}", stats.discarded_psr_none);
+            println!("  garbled_removed: {}", stats.garbled_removed);
+            println!("  atcrbs_merged: {}", stats.atcrbs_merged);
+            println!("  atcrbs_unmatched: {}", stats.atcrbs_unmatched);
+            println!("  points_by_type: [atcrbs={}, atcrbs_psr={}, modes={}, modes_psr={}]",
+                stats.points_by_type[0], stats.points_by_type[1],
+                stats.points_by_type[2], stats.points_by_type[3]);
+        }
+
+        let mut pts: Vec<&TrackPoint> = result.track_points.iter()
+            .filter(|p| p.mode_s == "71BF78")
+            .collect();
+        pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+
+        println!("\n=== 71BF78 radar_type distribution ===");
+        println!("Total points: {}", pts.len());
+        let mut type_counts: std::collections::HashMap<&RadarDetectionType, usize> = std::collections::HashMap::new();
+        for p in &pts {
+            *type_counts.entry(&p.radar_type).or_insert(0) += 1;
+        }
+        for (rt, count) in &type_counts {
+            println!("  {:?}: {} ({:.1}%)", rt, count, *count as f64 / pts.len() as f64 * 100.0);
+        }
+
+        // 레이더로부터의 거리 분포 (NM)
+        println!("\n=== Distance from radar (Gimpo) ===");
+        let radar_lat = DEFAULT_RADAR_LAT;
+        let radar_lon = DEFAULT_RADAR_LON;
+        let mut dists: Vec<(f64, &RadarDetectionType)> = pts.iter()
+            .map(|p| {
+                let dist_km = quick_dist_km(radar_lat, radar_lon, p.latitude, p.longitude);
+                let dist_nm = dist_km / 1.852;
+                (dist_nm, &p.radar_type)
+            }).collect();
+
+        // 60NM 이상인 포인트의 radar_type
+        let beyond_60 = dists.iter().filter(|(d, _)| *d > 60.0).count();
+        let beyond_60_modes = dists.iter().filter(|(d, rt)| *d > 60.0 && **rt == RadarDetectionType::Modes).count();
+        let beyond_60_modes_psr = dists.iter().filter(|(d, rt)| *d > 60.0 && **rt == RadarDetectionType::ModesPsr).count();
+        let within_60 = dists.iter().filter(|(d, _)| *d <= 60.0).count();
+
+        println!("  Within 60NM: {} pts", within_60);
+        println!("  Beyond 60NM: {} pts (modes={}, modes_psr={})", beyond_60, beyond_60_modes, beyond_60_modes_psr);
+
+        // 거리별 분포 히스토그램
+        let mut bins = vec![0usize; 20]; // 10NM 간격, 0-200NM
+        let mut bin_types: Vec<[usize; 4]> = vec![[0; 4]; 20]; // atcrbs, atcrbs_psr, modes, modes_psr
+        for (d, rt) in &dists {
+            let bin = (*d / 10.0) as usize;
+            if bin < 20 {
+                bins[bin] += 1;
+                let type_idx = match rt {
+                    RadarDetectionType::Atcrbs => 0,
+                    RadarDetectionType::AtcrbsPsr => 1,
+                    RadarDetectionType::Modes => 2,
+                    RadarDetectionType::ModesPsr => 3,
+                };
+                bin_types[bin][type_idx] += 1;
+            }
+        }
+        println!("\n  Distance histogram (10NM bins):");
+        for i in 0..20 {
+            if bins[i] > 0 {
+                println!("    {:3}-{:3}NM: {:4} pts  [atcrbs={}, atcrbs_psr={}, modes={}, modes_psr={}]",
+                    i*10, (i+1)*10, bins[i],
+                    bin_types[i][0], bin_types[i][1], bin_types[i][2], bin_types[i][3]);
+            }
+        }
+
+        // 세그먼트 분석 + 동시 존재 탐지
+        let base = days_from_epoch(2026, 3, 11) as f64 * 86400.0;
+
+        // 동시 존재 탐지: 8초 gap으로 분할한 세그먼트들이 시간적으로 겹치는지 확인
+        println!("\n=== All segments (split at 8s gaps) ===");
+        let mut seg_start = 0;
+        let mut all_segments: Vec<(usize, usize, f64, f64, f64, f64, f64, f64)> = Vec::new(); // start_idx, end_idx, t0, t1, lat0, lon0, lat1, lon1
+        for i in 1..=pts.len() {
+            let split = i == pts.len() || pts[i].timestamp - pts[i-1].timestamp > 8.0;
+            if split {
+                let seg = &pts[seg_start..i];
+                let t0 = seg.first().unwrap().timestamp;
+                let t1 = seg.last().unwrap().timestamp;
+                all_segments.push((
+                    seg_start, i-1, t0, t1,
+                    seg.first().unwrap().latitude, seg.first().unwrap().longitude,
+                    seg.last().unwrap().latitude, seg.last().unwrap().longitude,
+                ));
+                let tod0 = t0 - base;
+                let kst_secs = tod0 + 32400.0;
+                let kst_h = (kst_secs / 3600.0) as u32;
+                let kst_m = ((kst_secs % 3600.0) / 60.0) as u32;
+                let kst_s = (kst_secs % 60.0) as u32;
+                let dur = t1 - t0;
+                let avg_dist_nm = seg.iter().map(|p| {
+                    quick_dist_km(radar_lat, radar_lon, p.latitude, p.longitude) / 1.852
+                }).sum::<f64>() / seg.len() as f64;
+                println!("  seg[{:4}-{:4}] {:3}pts {:02}:{:02}:{:02} dur={:.0}s dist={:.1}NM hdg={:.0}→{:.0} lat={:.4}→{:.4}",
+                    seg_start, i-1, seg.len(), kst_h, kst_m, kst_s, dur, avg_dist_nm,
+                    seg.first().unwrap().heading, seg.last().unwrap().heading,
+                    seg.first().unwrap().latitude, seg.last().unwrap().latitude);
+                seg_start = i;
+            }
+        }
+
+        // 동시 위치 탐지: dt < 2초인데 거리가 3km 이상인 포인트 쌍
+        println!("\n=== Simultaneous positions (dt<2s, dist>3km) ===");
+        let mut sim_count = 0;
+        for i in 0..pts.len() {
+            for j in (i+1)..pts.len() {
+                let dt = (pts[j].timestamp - pts[i].timestamp).abs();
+                if dt > 2.0 { break; }
+                let dist = quick_dist_km(pts[i].latitude, pts[i].longitude,
+                                         pts[j].latitude, pts[j].longitude);
+                if dist > 3.0 {
+                    let tod_i = pts[i].timestamp - base;
+                    let kst_h = ((tod_i + 32400.0) / 3600.0) as u32;
+                    let kst_m = (((tod_i + 32400.0) % 3600.0) / 60.0) as u32;
+                    let kst_s = (tod_i + 32400.0) % 60.0;
+                    println!("  [{:02}:{:02}:{:04.1}] dt={:.1}s dist={:.1}km",
+                        kst_h, kst_m, kst_s, dt, dist);
+                    println!("    A: lat={:.4} lon={:.4} alt={:.0} hdg={:.1} type={:?}",
+                        pts[i].latitude, pts[i].longitude, pts[i].altitude, pts[i].heading, pts[i].radar_type);
+                    println!("    B: lat={:.4} lon={:.4} alt={:.0} hdg={:.1} type={:?}",
+                        pts[j].latitude, pts[j].longitude, pts[j].altitude, pts[j].heading, pts[j].radar_type);
+                    sim_count += 1;
+                }
+            }
+        }
+        println!("Total simultaneous pairs: {}", sim_count);
+
+        // 71BF79(1호기)도 확인
+        let mut pts79: Vec<&TrackPoint> = result.track_points.iter()
+            .filter(|p| p.mode_s == "71BF79")
+            .collect();
+        pts79.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+        println!("\n=== 71BF79 (1호기) ===");
+        println!("Total points: {}", pts79.len());
+        if !pts79.is_empty() {
+            let t0 = pts79.first().unwrap().timestamp - base;
+            let t1 = pts79.last().unwrap().timestamp - base;
+            let kst0 = t0 + 32400.0;
+            let kst1 = t1 + 32400.0;
+            println!("  Time range: {:.0}s ~ {:.0}s (KST {:.0}h ~ {:.0}h)",
+                t0, t1, kst0/3600.0, kst1/3600.0);
+            // 71BF78과 71BF79가 동시에 비행하는 구간 확인
+            if !pts.is_empty() {
+                let overlap_start = pts.first().unwrap().timestamp.max(pts79.first().unwrap().timestamp);
+                let overlap_end = pts.last().unwrap().timestamp.min(pts79.last().unwrap().timestamp);
+                if overlap_start < overlap_end {
+                    let pts78_in_range = pts.iter().filter(|p| p.timestamp >= overlap_start && p.timestamp <= overlap_end).count();
+                    let pts79_in_range = pts79.iter().filter(|p| p.timestamp >= overlap_start && p.timestamp <= overlap_end).count();
+                    println!("  Overlapping time: {:.0}s", overlap_end - overlap_start);
+                    println!("  71BF78 pts in overlap: {}", pts78_in_range);
+                    println!("  71BF79 pts in overlap: {}", pts79_in_range);
+                }
+            }
+        }
+
+        // 기본 필터가 등록 기체만 표시하므로, 다른 등록 기체도 확인
+        println!("\n=== Top 10 Mode-S by point count ===");
+        let mut ms_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for p in &result.track_points {
+            *ms_counts.entry(&p.mode_s).or_insert(0) += 1;
+        }
+        let mut top: Vec<(&&str, &usize)> = ms_counts.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        for (ms, cnt) in top.iter().take(10) {
+            println!("  {}: {} pts", ms, cnt);
+        }
+
+        // 모든 포인트 덤프 (지그재그 패턴 분석)
+        println!("\n=== ALL 71BF78 points (every point) ===");
+        let first_ts = pts.first().unwrap().timestamp;
+        for (i, p) in pts.iter().enumerate() {
+            let dt_prev = if i > 0 { p.timestamp - pts[i-1].timestamp } else { 0.0 };
+            let dist_prev = if i > 0 {
+                quick_dist_km(pts[i-1].latitude, pts[i-1].longitude, p.latitude, p.longitude)
+            } else { 0.0 };
+            let speed_kts = if i > 0 && dt_prev > 0.5 {
+                (dist_prev / dt_prev) * 3600.0 / 1.852
+            } else { 0.0 };
+            // 방향 변화 (이전 포인트의 heading vs 현재)
+            let hdg_change = if i > 0 {
+                let d = (p.heading - pts[i-1].heading).abs();
+                if d > 180.0 { 360.0 - d } else { d }
+            } else { 0.0 };
+            println!("  [{:4}] t={:.0} dt={:5.1}s lat={:.5} lon={:.5} alt={:6.0} hdg={:5.1} spd={:5.0} dist={:.2}km vspd={:.0}kts {:?}{}",
+                i, p.timestamp - first_ts, dt_prev,
+                p.latitude, p.longitude, p.altitude, p.heading, p.speed,
+                dist_prev, speed_kts, p.radar_type,
+                if hdg_change > 30.0 { " *** HDG_JUMP" } else if speed_kts > 600.0 { " *** FAST" } else { "" });
+        }
+
+    }
+
 }

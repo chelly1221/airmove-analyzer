@@ -3,25 +3,24 @@ use std::collections::HashMap;
 use log::info;
 
 use crate::models::{AnalysisResult, LossSegment, ParsedFile, TrackPoint};
+#[cfg(test)]
+use crate::models::RadarDetectionType;
 
-/// 자동 임계값: 추정된 스캔 주기의 이 배수 이상이면 Loss
-const AUTO_THRESHOLD_MULTIPLIER: f64 = 1.8;
-
-/// 자동 추정 불가 시 기본 임계값
+/// 기본 임계값 (초): 이 시간 이상 gap이면 Loss
 pub const DEFAULT_THRESHOLD_SECS: f64 = 8.0;
 
 /// Minimum points per Mode-S to be considered for loss analysis.
-const MIN_POINTS_FOR_ANALYSIS: usize = 5;
+const MIN_POINTS_FOR_ANALYSIS: usize = 3;
 
 /// 레이더 최대 탐지거리의 몇 % 이상이면 범위이탈로 판단
 const OUT_OF_RANGE_THRESHOLD: f64 = 0.88;
 
 /// 이 횟수 이상 연속 스캔 미탐지면 범위이탈로 간주
 /// (레이더 범위 내에서 이렇게 오래 Loss가 지속되기 어려움)
-const MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS: f64 = 8.0;
+const MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS: f64 = 15.0;
 
 /// 이 시간(초) 이상의 gap은 Loss가 아님 → 정상 출발/도착 (다른 공항 경유 등)
-const MAX_LOSS_DURATION_SECS: f64 = 3600.0;
+const MAX_LOSS_DURATION_SECS: f64 = 21600.0; // 6시간
 
 /// Detect loss segments within a single aircraft's track (sorted points).
 fn detect_loss_for_track(
@@ -65,17 +64,13 @@ fn detect_loss_for_track(
             let missed_scans = gap / scan_interval_secs;
 
             // 범위이탈 판단:
-            // 1) 시작/끝점 중 하나라도 레이더 경계 근처
-            // 2) 연속 미탐지 횟수가 너무 많으면 범위이탈로 간주
-            //    (레이더 범위 내에서 8스캔 이상 연속 Loss는 비현실적)
-            // 3) 장시간 Loss + 경계의 70% 이상이면 범위이탈 가능성 높음
-            let loss_type = if start_radar_dist >= boundary_km || end_radar_dist >= boundary_km {
+            // 1) 시작/끝점 모두 레이더 경계 근처 → 확실한 범위이탈
+            // 2) 연속 미탐지 횟수가 매우 많고 한쪽이라도 경계 근처
+            // 3) 한쪽만 경계 밖이면 signal_loss로 분류 (경계에서의 소실 포착)
+            let loss_type = if start_radar_dist >= boundary_km && end_radar_dist >= boundary_km {
                 "out_of_range"
-            } else if missed_scans >= MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS {
-                "out_of_range"
-            } else if missed_scans >= 4.0
-                && (start_radar_dist >= boundary_km * 0.75
-                    || end_radar_dist >= boundary_km * 0.75)
+            } else if missed_scans >= MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS
+                && (start_radar_dist >= boundary_km || end_radar_dist >= boundary_km)
             {
                 "out_of_range"
             } else {
@@ -123,14 +118,14 @@ pub fn calculate_haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) 
 
 /// 트랙의 중앙값 스캔 간격 추정
 fn estimate_scan_interval(points: &[&TrackPoint]) -> Option<f64> {
-    if points.len() < 10 {
+    if points.len() < 5 {
         return None;
     }
     let mut gaps: Vec<f64> = points.windows(2)
         .map(|w| w[1].timestamp - w[0].timestamp)
         .filter(|&g| g > 0.5 && g < 30.0) // 비정상적 gap 제외
         .collect();
-    if gaps.len() < 5 {
+    if gaps.len() < 3 {
         return None;
     }
     gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -171,23 +166,10 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 트랙별 스캔 간격 추정 → 자동 임계값 계산
+        // 스캔 간격 추정 (범위이탈 판단용)
         let estimated_interval = estimate_scan_interval(&points);
-        let (effective_threshold, scan_interval) = if threshold_secs > 0.0 {
-            // 수동 임계값: 스캔 간격은 추정값 사용, 없으면 임계값/1.8로 추정
-            let si = estimated_interval.unwrap_or(threshold_secs / AUTO_THRESHOLD_MULTIPLIER);
-            (threshold_secs, si)
-        } else {
-            // 자동: 중앙값 스캔 간격 * 1.8
-            match estimated_interval {
-                Some(interval) => {
-                    let t = interval * AUTO_THRESHOLD_MULTIPLIER;
-                    info!("  {} scan interval={:.1}s → threshold={:.1}s", mode_s, interval, t);
-                    (t, interval)
-                }
-                None => (DEFAULT_THRESHOLD_SECS, DEFAULT_THRESHOLD_SECS / AUTO_THRESHOLD_MULTIPLIER)
-            }
-        };
+        let effective_threshold = threshold_secs;
+        let scan_interval = estimated_interval.unwrap_or(threshold_secs / 1.8);
 
         let segments = detect_loss_for_track(
             mode_s, &points, effective_threshold, scan_interval,
@@ -274,7 +256,7 @@ mod tests {
             altitude: alt,
             speed: 200.0,
             heading: 90.0,
-            radar_type: "combined".to_string(),
+            radar_type: RadarDetectionType::ModesPsr,
             raw_data: vec![],
         }
     }
@@ -288,7 +270,7 @@ mod tests {
             altitude: alt,
             speed: 200.0,
             heading: 90.0,
-            radar_type: "combined".to_string(),
+            radar_type: RadarDetectionType::ModesPsr,
             raw_data: vec![],
         }
     }
@@ -382,6 +364,7 @@ mod tests {
             end_time: Some(1030.0),
             radar_lat: 37.5585,
             radar_lon: 126.7906,
+            parse_stats: None,
         };
 
         let result = analyze_tracks(parsed, 12.0);

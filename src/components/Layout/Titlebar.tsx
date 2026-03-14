@@ -25,7 +25,7 @@ export default function Titlebar() {
         data-tauri-drag-region
         className="flex flex-1 items-center gap-2 px-3 text-xs"
       >
-        <span className="font-semibold text-gray-400">AirMove Analyzer</span>
+        <span className="font-semibold text-gray-400">비행검사기 항적 분석 체계</span>
       </div>
 
       {/* Window controls */}

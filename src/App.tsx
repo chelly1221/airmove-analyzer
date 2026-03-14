@@ -1,70 +1,78 @@
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, useLocation } from "react-router-dom";
 import Titlebar from "./components/Layout/Titlebar";
 import Sidebar from "./components/Layout/Sidebar";
-import Dashboard from "./pages/Dashboard";
-import AircraftManagement from "./pages/AircraftManagement";
+import Settings from "./pages/Settings";
 import FileUpload from "./pages/FileUpload";
 import TrackMap from "./pages/TrackMap";
 import LossAnalysis from "./pages/LossAnalysis";
 import ReportGeneration from "./pages/ReportGeneration";
+import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
 import { Loader2 } from "lucide-react";
 
 export default function App() {
   const loading = useAppStore((s) => s.loading);
   const loadingMessage = useAppStore((s) => s.loadingMessage);
+  const location = useLocation();
+  const isMapPage = location.pathname === "/map";
 
   return (
     <div className="flex h-full flex-col bg-[#1a1a2e]">
       <Titlebar />
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <main className="flex-1 overflow-auto">
-          <div className="h-full">
-            <Routes>
-              <Route
-                path="/"
-                element={
-                  <PageWrapper>
-                    <Dashboard />
-                  </PageWrapper>
-                }
-              />
-              <Route
-                path="/aircraft"
-                element={
-                  <PageWrapper>
-                    <AircraftManagement />
-                  </PageWrapper>
-                }
-              />
-              <Route
-                path="/upload"
-                element={
-                  <PageWrapper>
-                    <FileUpload />
-                  </PageWrapper>
-                }
-              />
-              <Route path="/map" element={<TrackMap />} />
-              <Route
-                path="/analysis"
-                element={
-                  <PageWrapper>
-                    <LossAnalysis />
-                  </PageWrapper>
-                }
-              />
-              <Route
-                path="/report"
-                element={
-                  <PageWrapper>
-                    <ReportGeneration />
-                  </PageWrapper>
-                }
-              />
-            </Routes>
+        <main className="relative flex-1 overflow-hidden">
+          {/* TrackMap은 항상 마운트 - 탭 전환 시 상태 유지 */}
+          <div className={isMapPage ? "h-full" : "hidden"}>
+            <TrackMap />
           </div>
+          {!isMapPage && (
+            <div className="h-full overflow-auto">
+              <Routes>
+                <Route
+                  path="/settings"
+                  element={
+                    <PageWrapper>
+                      <Settings />
+                    </PageWrapper>
+                  }
+                />
+                <Route
+                  path="/"
+                  element={
+                    <PageWrapper>
+                      <FileUpload />
+                    </PageWrapper>
+                  }
+                />
+                <Route path="/map" element={null} />
+                <Route
+                  path="/drawing"
+                  element={
+                    <PageWrapper>
+                      <Drawing />
+                    </PageWrapper>
+                  }
+                />
+                <Route
+                  path="/analysis"
+                  element={
+                    <PageWrapper>
+                      <LossAnalysis />
+                    </PageWrapper>
+                  }
+                />
+                <Route
+                  path="/report"
+                  element={
+                    <PageWrapper>
+                      <ReportGeneration />
+                    </PageWrapper>
+                  }
+                />
+              </Routes>
+            </div>
+          )}
         </main>
       </div>
 

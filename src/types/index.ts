@@ -2,8 +2,10 @@
 export interface Aircraft {
   /** UUID */
   id: string;
-  /** 기체 이름 */
+  /** 이름 (예: 1호기, 2호기) */
   name: string;
+  /** 기체 모델 (예: Embraer Praetor 600) */
+  model: string;
   /** Mode-S 코드 (hex string) */
   mode_s_code: string;
   /** 운용 기관 */
@@ -28,8 +30,8 @@ export interface TrackPoint {
   speed: number;
   /** Heading in degrees */
   heading: number;
-  /** 레이더 탐지 유형: "combined"(SSR+PSR), "ssr"(SSR only), "psr"(PSR only), "modes"(Mode-S) */
-  radar_type: string;
+  /** 레이더 탐지 유형 (4종 분류) */
+  radar_type: "atcrbs" | "atcrbs_psr" | "modes" | "modes_psr";
   /** Original bytes as number array */
   raw_data: number[];
 }
@@ -54,6 +56,17 @@ export interface LossSegment {
   end_radar_dist_km: number;
 }
 
+/** 파싱 통계 */
+export interface ParseStatistics {
+  total_asterix_records: number;
+  discarded_psr_none: number;
+  garbled_removed: number;
+  atcrbs_merged: number;
+  atcrbs_unmatched: number;
+  /** [atcrbs, atcrbs_psr, modes, modes_psr] */
+  points_by_type: [number, number, number, number];
+}
+
 /** 파싱 결과 (Parse Result) */
 export interface ParsedFile {
   filename: string;
@@ -64,6 +77,7 @@ export interface ParsedFile {
   end_time: number | null;
   radar_lat: number;
   radar_lon: number;
+  parse_stats?: ParseStatistics;
 }
 
 /** 분석 결과 (Analysis Result) */
@@ -101,15 +115,40 @@ export interface LineOfSightResult {
   target_altitude: number;
 }
 
+/** 단면도 고도 샘플 포인트 */
+export interface ElevationPoint {
+  distance: number;
+  elevation: number;
+  latitude: number;
+  longitude: number;
+}
+
+/** LOS 분석 단면도 결과 */
+export interface LOSProfileData {
+  id: string;
+  radarSiteName: string;
+  radarLat: number;
+  radarLon: number;
+  radarHeight: number;
+  targetLat: number;
+  targetLon: number;
+  bearing: number;
+  totalDistance: number;
+  elevationProfile: ElevationPoint[];
+  losBlocked: boolean;
+  maxBlockingPoint?: { distance: number; elevation: number; name?: string };
+  timestamp: number;
+}
+
 /** UI 페이지 */
 export type PageId =
-  | "dashboard"
-  | "aircraft"
   | "upload"
   | "map"
+  | "drawing"
   | "tracks"
   | "analysis"
-  | "report";
+  | "report"
+  | "settings";
 
 /** 파일 업로드 상태 */
 export interface UploadedFile {

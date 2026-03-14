@@ -35,7 +35,7 @@ export default function Dashboard() {
   );
 
   const handleQuickAction = (page: string, path: string) => {
-    setActivePage(page as "aircraft" | "upload" | "map" | "analysis");
+    setActivePage(page as "settings" | "upload" | "map" | "analysis");
     navigate(path);
   };
 
@@ -86,7 +86,7 @@ export default function Dashboard() {
         <h2 className="mb-4 text-base font-semibold text-white">빠른 실행</h2>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <button
-            onClick={() => handleQuickAction("aircraft", "/aircraft")}
+            onClick={() => handleQuickAction("settings", "/settings")}
             className="flex flex-col items-center gap-2 rounded-lg border border-white/10 bg-[#0f3460]/50 p-4 text-gray-300 transition-all hover:border-[#3b82f6]/50 hover:bg-[#0f3460] hover:text-white"
           >
             <Plane size={24} />
@@ -190,7 +190,7 @@ export default function Dashboard() {
                         {a.name}
                       </p>
                       <p className="text-xs text-gray-500">
-                        {a.organization}
+                        {a.model ? `${a.model} · ${a.organization}` : a.organization}
                       </p>
                     </div>
                   </div>

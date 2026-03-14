@@ -12,12 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "AirMove Analyzer",
-        "width": 1400,
-        "height": 900,
+        "title": "비행검사기 항적 분석 체계",
+        "width": 1280,
+        "height": 800,
         "minWidth": 1024,
         "minHeight": 768,
-        "decorations": false
+        "decorations": false,
+        "center": true
       }
     ],
     "security": {
@@ -32,7 +33,9 @@
         "installMode": "currentUser"
       }
     },
+    "createUpdaterArtifacts": false,
     "icon": [
+      "icons/icon.png",
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",

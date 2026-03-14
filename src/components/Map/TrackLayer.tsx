@@ -104,7 +104,7 @@ export default function TrackLayer({ points, maxTimestamp }: TrackLayerProps) {
                   <Popup>
                     <div className="text-xs leading-relaxed">
                       <div className="font-bold text-gray-800">
-                        {format(new Date(p.timestamp * 1000), "HH:mm:ss")}
+                        {format(new Date(p.timestamp * 1000), "MM-dd HH:mm:ss")}
                       </div>
                       <div>Mode-S: {p.mode_s}</div>
                       <div>고도: {p.altitude.toFixed(0)}m</div>

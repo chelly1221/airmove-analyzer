@@ -11,6 +11,7 @@ interface DataTableProps<T> {
   data: T[];
   rowKey: (row: T, index: number) => string;
   onRowClick?: (row: T, index: number) => void;
+  selectedKey?: string;
   emptyMessage?: string;
   maxHeight?: string;
 }
@@ -20,6 +21,7 @@ export default function DataTable<T>({
   data,
   rowKey,
   onRowClick,
+  selectedKey,
   emptyMessage = "데이터가 없습니다",
   maxHeight = "max-h-[600px]",
 }: DataTableProps<T>) {
@@ -55,10 +57,13 @@ export default function DataTable<T>({
               </td>
             </tr>
           ) : (
-            data.map((row, idx) => (
+            data.map((row, idx) => {
+              const key = rowKey(row, idx);
+              const isSelected = selectedKey !== undefined && key === selectedKey;
+              return (
               <tr
-                key={rowKey(row, idx)}
-                className={`bg-[#16213e] transition-colors hover:bg-[#1a2a4e] ${onRowClick ? "cursor-pointer" : ""}`}
+                key={key}
+                className={`transition-colors ${isSelected ? "bg-[#e94560]/15 ring-1 ring-inset ring-[#e94560]/30" : "bg-[#16213e] hover:bg-[#1a2a4e]"} ${onRowClick ? "cursor-pointer" : ""}`}
                 onClick={() => onRowClick?.(row, idx)}
               >
                 {columns.map((col) => (
@@ -73,7 +78,8 @@ export default function DataTable<T>({
                   </td>
                 ))}
               </tr>
-            ))
+              );
+            })
           )}
         </tbody>
       </table>

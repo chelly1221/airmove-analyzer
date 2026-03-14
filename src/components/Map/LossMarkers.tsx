@@ -48,7 +48,7 @@ export default function LossMarkers({ segments, maxTimestamp }: LossMarkersProps
                     Loss 시작 #{idx + 1}
                   </div>
                   <div>
-                    시각: {format(new Date(seg.start_time * 1000), "HH:mm:ss")}
+                    시각: {format(new Date(seg.start_time * 1000), "MM-dd HH:mm:ss")}
                   </div>
                   <div>지속시간: {seg.duration_secs.toFixed(1)}초</div>
                   <div>거리: {seg.distance_km.toFixed(2)}km</div>
@@ -72,7 +72,7 @@ export default function LossMarkers({ segments, maxTimestamp }: LossMarkersProps
                     Loss 종료 #{idx + 1}
                   </div>
                   <div>
-                    시각: {format(new Date(seg.end_time * 1000), "HH:mm:ss")}
+                    시각: {format(new Date(seg.end_time * 1000), "MM-dd HH:mm:ss")}
                   </div>
                 </div>
               </Popup>

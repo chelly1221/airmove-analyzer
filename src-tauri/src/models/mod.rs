@@ -1,12 +1,73 @@
+use std::fmt;
 use serde::{Deserialize, Serialize};
+
+/// 레이더 탐지 유형 (I020 TYP 기반 4종 분류)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RadarDetectionType {
+    Atcrbs,     // TYP=2: ATCRBS/SSR only
+    AtcrbsPsr,  // TYP=3: ATCRBS + PSR
+    Modes,      // TYP=4,5: Mode-S only
+    ModesPsr,   // TYP=6,7: Mode-S + PSR (최고 신뢰)
+}
+
+impl RadarDetectionType {
+    /// 탐지 우선순위 (동일 스캔 중복 처리용)
+    pub fn priority(&self) -> u8 {
+        match self {
+            RadarDetectionType::Atcrbs => 0,
+            RadarDetectionType::AtcrbsPsr => 1,
+            RadarDetectionType::Modes => 2,
+            RadarDetectionType::ModesPsr => 3,
+        }
+    }
+
+    pub fn has_psr(&self) -> bool {
+        matches!(self, RadarDetectionType::AtcrbsPsr | RadarDetectionType::ModesPsr)
+    }
+
+    pub fn has_modes(&self) -> bool {
+        matches!(self, RadarDetectionType::Modes | RadarDetectionType::ModesPsr)
+    }
+
+    pub fn is_atcrbs(&self) -> bool {
+        matches!(self, RadarDetectionType::Atcrbs | RadarDetectionType::AtcrbsPsr)
+    }
+}
+
+impl fmt::Display for RadarDetectionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RadarDetectionType::Atcrbs => write!(f, "ATCRBS"),
+            RadarDetectionType::AtcrbsPsr => write!(f, "ATCRBS+PSR"),
+            RadarDetectionType::Modes => write!(f, "Mode-S"),
+            RadarDetectionType::ModesPsr => write!(f, "Mode-S+PSR"),
+        }
+    }
+}
+
+/// 파싱 통계 (진단/디버깅용)
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ParseStatistics {
+    pub total_asterix_records: usize,
+    pub discarded_psr_none: usize,
+    pub garbled_removed: usize,
+    pub atcrbs_merged: usize,
+    pub atcrbs_unmatched: usize,
+    /// [atcrbs, atcrbs_psr, modes, modes_psr]
+    pub points_by_type: [usize; 4],
+}
 
 /// 비행검사기 (Flight Inspector Aircraft)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Aircraft {
     /// UUID
     pub id: String,
-    /// 기체 이름
+    /// 이름 (예: 1호기, 2호기)
     pub name: String,
+    /// 기체 모델 (예: Embraer Praetor 600)
+    #[serde(default)]
+    pub model: String,
     /// Mode-S 코드 (hex string)
     pub mode_s_code: String,
     /// 운용 기관
@@ -32,8 +93,8 @@ pub struct TrackPoint {
     pub speed: f64,
     /// Heading in degrees
     pub heading: f64,
-    /// 레이더 탐지 유형: "combined"(SSR+PSR), "ssr"(SSR only), "psr"(PSR only), "modes"(Mode-S)
-    pub radar_type: String,
+    /// 레이더 탐지 유형 (4종 분류)
+    pub radar_type: RadarDetectionType,
     /// Original bytes for debugging
     #[serde(with = "serde_bytes_base64")]
     pub raw_data: Vec<u8>,
@@ -74,6 +135,9 @@ pub struct ParsedFile {
     /// 파싱 시 사용된 레이더 좌표
     pub radar_lat: f64,
     pub radar_lon: f64,
+    /// 파싱 통계 (진단용)
+    #[serde(default)]
+    pub parse_stats: Option<ParseStatistics>,
 }
 
 /// 분석 결과 (Analysis Result)

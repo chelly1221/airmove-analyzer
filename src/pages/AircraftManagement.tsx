@@ -11,6 +11,7 @@ function generateId(): string {
 
 const emptyForm: Omit<Aircraft, "id"> = {
   name: "",
+  model: "",
   mode_s_code: "",
   organization: "",
   memo: "",
@@ -40,6 +41,7 @@ export default function AircraftManagement() {
     setEditId(a.id);
     setForm({
       name: a.name,
+      model: a.model,
       mode_s_code: a.mode_s_code,
       organization: a.organization,
       memo: a.memo,
@@ -80,6 +82,7 @@ export default function AircraftManagement() {
     if (editId) {
       updateAircraft(editId, {
         name: form.name.trim(),
+        model: form.model.trim(),
         mode_s_code: form.mode_s_code.trim().toUpperCase(),
         organization: form.organization.trim(),
         memo: form.memo.trim(),
@@ -89,6 +92,7 @@ export default function AircraftManagement() {
       addAircraft({
         id: generateId(),
         name: form.name.trim(),
+        model: form.model.trim(),
         mode_s_code: form.mode_s_code.trim().toUpperCase(),
         organization: form.organization.trim(),
         memo: form.memo.trim(),

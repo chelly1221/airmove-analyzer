@@ -4,6 +4,7 @@ import {
   TileLayer,
   Polyline,
   CircleMarker,
+  Tooltip,
   useMap,
 } from "react-leaflet";
 import { format } from "date-fns";
@@ -54,6 +55,7 @@ interface FlatLoss {
 
 export default function LossAnalysis() {
   const analysisResults = useAppStore((s) => s.analysisResults);
+  const aircraft = useAppStore((s) => s.aircraft);
   const [selectedLoss, setSelectedLoss] = useState<FlatLoss | null>(null);
   const [sortField, setSortField] = useState<string>("start_time");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -61,21 +63,34 @@ export default function LossAnalysis() {
     "table"
   );
 
-  // 전체 Loss 평탄화
+  // 등록된 비행검사기 Mode-S 코드 집합
+  const registeredModeSCodes = useMemo(() => {
+    const codes = new Set<string>();
+    for (const a of aircraft) {
+      if (a.active && a.mode_s_code) {
+        codes.add(a.mode_s_code.toUpperCase());
+      }
+    }
+    return codes;
+  }, [aircraft]);
+
+  // 비행검사기 Loss만 평탄화
   const flatLoss: FlatLoss[] = useMemo(() => {
     const items: FlatLoss[] = [];
     let idx = 0;
     for (const r of analysisResults) {
       for (const seg of r.loss_segments) {
-        items.push({
-          index: idx++,
-          filename: r.file_info.filename,
-          segment: seg,
-        });
+        if (registeredModeSCodes.has(seg.mode_s.toUpperCase())) {
+          items.push({
+            index: idx++,
+            filename: r.file_info.filename,
+            segment: seg,
+          });
+        }
       }
     }
     return items;
-  }, [analysisResults]);
+  }, [analysisResults, registeredModeSCodes]);
 
   // 정렬
   const sorted = useMemo(() => {
@@ -169,7 +184,7 @@ export default function LossAnalysis() {
       key: "end_time",
       header: "종료 시각",
       render: (row: FlatLoss) =>
-        format(new Date(row.segment.end_time * 1000), "HH:mm:ss"),
+        format(new Date(row.segment.end_time * 1000), "MM-dd HH:mm:ss"),
     },
     {
       key: "duration",
@@ -205,9 +220,9 @@ export default function LossAnalysis() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">Loss 분석</h1>
+          <h1 className="text-2xl font-bold text-white">표적소실 분석</h1>
           <p className="mt-1 text-sm text-gray-400">
-            항적 Loss 구간 상세 분석 및 비교
+            비행검사기 항적 표적소실 구간 상세 분석
           </p>
         </div>
         <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-[#16213e] p-1">
@@ -236,13 +251,13 @@ export default function LossAnalysis() {
       {/* Stats */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Card
-          title="총 Loss 건수"
+          title="총 소실 건수"
           value={flatLoss.length}
           icon={BarChart3}
           accent="#e94560"
         />
         <Card
-          title="총 Loss 시간"
+          title="총 소실 시간"
           value={`${stats.totalDuration.toFixed(1)}초`}
           icon={Clock}
           accent="#f59e0b"
@@ -254,7 +269,7 @@ export default function LossAnalysis() {
           accent="#3b82f6"
         />
         <Card
-          title="총 Loss 거리"
+          title="총 소실 거리"
           value={`${stats.totalDistance.toFixed(2)}km`}
           icon={Mountain}
           accent="#10b981"
@@ -290,7 +305,8 @@ export default function LossAnalysis() {
                 data={sorted}
                 rowKey={(row) => `loss-${row.index}`}
                 onRowClick={(row) => setSelectedLoss(row)}
-                emptyMessage="Loss 구간이 없습니다. 자료를 업로드하고 파싱하세요."
+                selectedKey={selectedLoss ? `loss-${selectedLoss.index}` : undefined}
+                emptyMessage="표적소실 구간이 없습니다. 비행검사기를 등록하고 자료를 파싱하세요."
                 maxHeight="max-h-[500px]"
               />
             </div>
@@ -312,18 +328,18 @@ export default function LossAnalysis() {
                         {r.file_info.filename}
                       </h3>
                       <span className="rounded bg-[#e94560]/20 px-2 py-0.5 text-xs font-medium text-[#e94560]">
-                        Loss {r.loss_percentage.toFixed(1)}%
+                        소실 {r.loss_percentage.toFixed(1)}%
                       </span>
                     </div>
                     <div className="grid grid-cols-3 gap-3 text-center text-xs">
                       <div className="rounded-lg bg-[#0f3460]/50 p-2">
-                        <p className="text-gray-500">Loss 건수</p>
+                        <p className="text-gray-500">소실 건수</p>
                         <p className="text-lg font-bold text-white">
                           {r.loss_segments.length}
                         </p>
                       </div>
                       <div className="rounded-lg bg-[#0f3460]/50 p-2">
-                        <p className="text-gray-500">총 Loss 시간</p>
+                        <p className="text-gray-500">총 소실 시간</p>
                         <p className="text-lg font-bold text-white">
                           {r.total_loss_time.toFixed(1)}초
                         </p>
@@ -344,7 +360,7 @@ export default function LossAnalysis() {
           {viewMode === "compare" && (
             <SimpleCard>
               <h3 className="mb-4 font-medium text-white">
-                파일별 Loss 비율 비교
+                파일별 소실 비율 비교
               </h3>
               {analysisResults.length === 0 ? (
                 <p className="text-center text-sm text-gray-500 py-8">
@@ -394,10 +410,10 @@ export default function LossAnalysis() {
               <h3 className="text-sm font-semibold text-white">위치 미리보기</h3>
               {selectedLoss && (
                 <p className="text-xs text-gray-500 mt-0.5">
-                  Loss #{selectedLoss.index + 1} -{" "}
+                  소실 #{selectedLoss.index + 1} -{" "}
                   {format(
                     new Date(selectedLoss.segment.start_time * 1000),
-                    "HH:mm:ss"
+                    "MM-dd HH:mm:ss"
                   )}
                 </p>
               )}
@@ -411,7 +427,7 @@ export default function LossAnalysis() {
               >
                 <TileLayer
                   url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-                  attribution='&copy; <a href="https://carto.com/">CARTO</a>'
+                  attribution=""
                 />
                 {selectedLoss && (
                   <>
@@ -432,7 +448,13 @@ export default function LossAnalysis() {
                         weight: 3,
                         dashArray: "6, 4",
                       }}
-                    />
+                    >
+                      <Tooltip sticky opacity={0.95}>
+                        <div style={{ fontSize: 11 }}>
+                          <b>{selectedLoss.segment.mode_s}</b> — {selectedLoss.segment.duration_secs.toFixed(1)}초 / {selectedLoss.segment.distance_km.toFixed(2)}km
+                        </div>
+                      </Tooltip>
+                    </Polyline>
                     <CircleMarker
                       center={[
                         selectedLoss.segment.start_lat,
@@ -444,7 +466,16 @@ export default function LossAnalysis() {
                         fillColor: "#e94560",
                         fillOpacity: 1,
                       }}
-                    />
+                    >
+                      <Tooltip direction="top" offset={[0, -8]} opacity={0.95}>
+                        <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+                          <div><b>Loss 시작</b></div>
+                          <div>{format(new Date(selectedLoss.segment.start_time * 1000), "MM-dd HH:mm:ss")}</div>
+                          <div>고도: {selectedLoss.segment.start_altitude.toFixed(0)}m</div>
+                          <div>{selectedLoss.segment.start_lat.toFixed(4)}°N {selectedLoss.segment.start_lon.toFixed(4)}°E</div>
+                        </div>
+                      </Tooltip>
+                    </CircleMarker>
                     <CircleMarker
                       center={[
                         selectedLoss.segment.end_lat,
@@ -456,14 +487,23 @@ export default function LossAnalysis() {
                         fillColor: "#ff8a80",
                         fillOpacity: 1,
                       }}
-                    />
+                    >
+                      <Tooltip direction="top" offset={[0, -8]} opacity={0.95}>
+                        <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+                          <div><b>Loss 종료</b></div>
+                          <div>{format(new Date(selectedLoss.segment.end_time * 1000), "MM-dd HH:mm:ss")}</div>
+                          <div>고도: {selectedLoss.segment.end_altitude.toFixed(0)}m</div>
+                          <div>{selectedLoss.segment.end_lat.toFixed(4)}°N {selectedLoss.segment.end_lon.toFixed(4)}°E</div>
+                        </div>
+                      </Tooltip>
+                    </CircleMarker>
                   </>
                 )}
               </MapContainer>
             </div>
             {!selectedLoss && (
               <div className="px-4 py-3 text-center text-xs text-gray-500">
-                테이블에서 Loss 구간을 클릭하면 지도에 표시됩니다
+                테이블에서 소실 구간을 클릭하면 지도에 표시됩니다
               </div>
             )}
           </SimpleCard>

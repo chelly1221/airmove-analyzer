@@ -78,12 +78,32 @@ body {
   background-color: #0f3460 !important;
 }
 .leaflet-control-attribution {
-  background: rgba(22, 33, 62, 0.8) !important;
-  color: #888 !important;
-  font-size: 10px !important;
+  display: none !important;
 }
-.leaflet-control-attribution a {
-  color: #aaa !important;
+
+/* MapLibre controls dark theme */
+.maplibregl-ctrl-group {
+  background: #16213e !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+}
+.maplibregl-ctrl-group button {
+  background-color: transparent !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+.maplibregl-ctrl-group button + button {
+  border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
+}
+.maplibregl-ctrl-group button:hover {
+  background-color: #0f3460 !important;
+}
+.maplibregl-ctrl-group button .maplibregl-ctrl-icon {
+  filter: invert(1) brightness(0.85);
+}
+.maplibregl-ctrl-attrib,
+.maplibregl-ctrl-attrib a {
+  display: none !important;
 }
 
 /* Range input styling */
@@ -121,6 +141,22 @@ select {
   background-repeat: no-repeat;
   background-position: right 8px center;
   padding-right: 28px;
+}
+
+/* Leaflet tooltip overrides for dark theme */
+.leaflet-tooltip {
+  background: #0d1b2a;
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  padding: 6px 10px;
+}
+.leaflet-tooltip-top:before {
+  border-top-color: #0d1b2a;
+}
+.leaflet-tooltip-bottom:before {
+  border-bottom-color: #0d1b2a;
 }
 
 /* Leaflet container fix */
