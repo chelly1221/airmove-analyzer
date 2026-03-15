@@ -1,14 +1,24 @@
 import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   AdsbTrack,
   Aircraft,
-  AnalysisResult,
+  Flight,
   FlightRecord,
   LOSProfileData,
   PageId,
+  ParseStatistics,
   RadarSite,
+  TrackPoint,
   UploadedFile,
 } from "../types";
+
+/** 설정을 DB에 비동기 저장 (fire-and-forget) */
+function persistSetting(key: string, value: unknown) {
+  invoke("save_setting", { key, value: JSON.stringify(value) }).catch((e) =>
+    console.warn(`[Settings] ${key} 저장 실패:`, e)
+  );
+}
 
 interface AppState {
   // 비행검사기 관리
@@ -21,19 +31,28 @@ interface AppState {
   uploadedFiles: UploadedFile[];
   addUploadedFile: (f: UploadedFile) => void;
   updateUploadedFile: (path: string, update: Partial<UploadedFile>) => void;
-  removeUploadedFile: (path: string) => void;
   clearUploadedFiles: () => void;
 
-  // 분석 결과
-  analysisResults: AnalysisResult[];
-  addAnalysisResult: (r: AnalysisResult) => void;
-  appendTrackPoints: (filePath: string, points: import("../types").TrackPoint[]) => void;
-  clearAnalysisResults: () => void;
+  // 원시 데이터 (파싱 결과 축적)
+  rawTrackPoints: TrackPoint[];
+  appendRawTrackPoints: (points: TrackPoint[]) => void;
+  clearRawTrackPoints: () => void;
+
+  // 파싱 통계 (FileUpload 표시용)
+  parseStatsList: { filename: string; stats: ParseStatistics; totalRecords: number }[];
+  addParseStats: (filename: string, stats: ParseStatistics, totalRecords: number) => void;
+  clearParseStats: () => void;
+
+  // 비행 (핵심 분석 단위)
+  flights: Flight[];
+  setFlights: (flights: Flight[]) => void;
+  clearFlights: () => void;
 
   // 레이더 사이트
   radarSite: RadarSite;
   setRadarSite: (site: RadarSite) => void;
   customRadarSites: RadarSite[];
+  setCustomRadarSites: (sites: RadarSite[]) => void;
   addCustomRadarSite: (site: RadarSite) => void;
   updateCustomRadarSite: (name: string, site: RadarSite) => void;
   removeCustomRadarSite: (name: string) => void;
@@ -137,40 +156,35 @@ export const useAppStore = create<AppState>((set) => ({
         f.path === path ? { ...f, ...update } : f
       ),
     })),
-  removeUploadedFile: (path) =>
-    set((state) => {
-      const file = state.uploadedFiles.find((f) => f.path === path);
-      const fname = file?.name ?? path.split(/[/\\]/).pop() ?? path;
-      return {
-        uploadedFiles: state.uploadedFiles.filter((f) => f.path !== path),
-        analysisResults: state.analysisResults.filter(
-          (r) => r.file_info.filename !== fname
-        ),
-      };
-    }),
-  clearUploadedFiles: () =>
-    set({ uploadedFiles: [], analysisResults: [], selectedModeS: null }),
+  clearUploadedFiles: () => {
+    invoke("clear_saved_data").catch((e) => console.warn("[DB] clear failed:", e));
+    set({
+      uploadedFiles: [],
+      rawTrackPoints: [],
+      parseStatsList: [],
+      flights: [],
+      selectedModeS: null,
+    });
+  },
 
-  // 분석 결과
-  analysisResults: [],
-  addAnalysisResult: (r) =>
-    set((state) => ({ analysisResults: [...state.analysisResults, r] })),
-  appendTrackPoints: (filePath, points) =>
+  // 원시 데이터
+  rawTrackPoints: [],
+  appendRawTrackPoints: (points) =>
+    set((state) => ({ rawTrackPoints: [...state.rawTrackPoints, ...points] })),
+  clearRawTrackPoints: () => set({ rawTrackPoints: [] }),
+
+  // 파싱 통계
+  parseStatsList: [],
+  addParseStats: (filename, stats, totalRecords) =>
     set((state) => ({
-      analysisResults: state.analysisResults.map((r) => {
-        // file_info.filename 또는 file_path의 파일명으로 매칭
-        const fname = filePath.split(/[/\\]/).pop() ?? filePath;
-        if (r.file_info.filename !== fname) return r;
-        return {
-          ...r,
-          file_info: {
-            ...r.file_info,
-            track_points: [...r.file_info.track_points, ...points],
-          },
-        };
-      }),
+      parseStatsList: [...state.parseStatsList, { filename, stats, totalRecords }],
     })),
-  clearAnalysisResults: () => set({ analysisResults: [] }),
+  clearParseStats: () => set({ parseStatsList: [] }),
+
+  // 비행
+  flights: [],
+  setFlights: (flights) => set({ flights }),
+  clearFlights: () => set({ flights: [] }),
 
   // 레이더 사이트 (기본: 김포 #1)
   radarSite: {
@@ -181,7 +195,10 @@ export const useAppStore = create<AppState>((set) => ({
     antenna_height: 19.8,
     range_nm: 200,
   },
-  setRadarSite: (site) => set({ radarSite: site }),
+  setRadarSite: (site) => {
+    set({ radarSite: site });
+    persistSetting("selected_radar_site", site);
+  },
   customRadarSites: [
     {
       name: "김포 #1",
@@ -200,18 +217,28 @@ export const useAppStore = create<AppState>((set) => ({
       range_nm: 200,
     },
   ],
+  setCustomRadarSites: (sites) => {
+    set({ customRadarSites: sites });
+    persistSetting("custom_radar_sites", sites);
+  },
   addCustomRadarSite: (site) =>
-    set((state) => ({ customRadarSites: [...state.customRadarSites, site] })),
+    set((state) => {
+      const updated = [...state.customRadarSites, site];
+      persistSetting("custom_radar_sites", updated);
+      return { customRadarSites: updated };
+    }),
   updateCustomRadarSite: (name, site) =>
-    set((state) => ({
-      customRadarSites: state.customRadarSites.map((s) =>
-        s.name === name ? site : s
-      ),
-    })),
+    set((state) => {
+      const updated = state.customRadarSites.map((s) => s.name === name ? site : s);
+      persistSetting("custom_radar_sites", updated);
+      return { customRadarSites: updated };
+    }),
   removeCustomRadarSite: (name) =>
-    set((state) => ({
-      customRadarSites: state.customRadarSites.filter((s) => s.name !== name),
-    })),
+    set((state) => {
+      const updated = state.customRadarSites.filter((s) => s.name !== name);
+      persistSetting("custom_radar_sites", updated);
+      return { customRadarSites: updated };
+    }),
 
   // 필터
   selectedModeS: null,

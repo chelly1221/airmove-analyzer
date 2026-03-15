@@ -12,7 +12,109 @@ import ReportGeneration from "./pages/ReportGeneration";
 import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
 import { Loader2 } from "lucide-react";
-import type { FlightRecord } from "./types";
+import type { FlightRecord, ParseStatistics, RadarSite, TrackPoint } from "./types";
+import { consolidateFlights } from "./utils/flightConsolidation";
+
+/** DB 저장 데이터 타입 */
+interface SavedFileInfo {
+  path: string;
+  name: string;
+  filename: string;
+  total_records: number;
+  start_time: number | null;
+  end_time: number | null;
+  radar_lat: number;
+  radar_lon: number;
+  parse_errors: string[];
+  parse_stats: ParseStatistics | null;
+}
+
+interface SavedParsedData {
+  files: SavedFileInfo[];
+  track_points: TrackPoint[];
+}
+
+/** 앱 시작 시 DB에서 저장된 파싱 데이터 + 설정 복원 */
+function useRestoreSavedData() {
+  const loadedRef = useRef(false);
+
+  useEffect(() => {
+    if (loadedRef.current) return;
+    loadedRef.current = true;
+
+    const restore = async () => {
+      // 1) 설정 복원 (customRadarSites, radarSite)
+      try {
+        const settingsToLoad = ["custom_radar_sites", "selected_radar_site"];
+        for (const key of settingsToLoad) {
+          const value = await invoke<string | null>("load_setting", { key });
+          if (!value) continue;
+          if (key === "custom_radar_sites") {
+            const sites: RadarSite[] = JSON.parse(value);
+            if (sites.length > 0) useAppStore.getState().setCustomRadarSites(sites);
+          } else if (key === "selected_radar_site") {
+            const site: RadarSite = JSON.parse(value);
+            useAppStore.getState().setRadarSite(site);
+          }
+        }
+      } catch (e) {
+        console.log("[Restore] 설정 복원 실패:", e);
+      }
+
+      // 2) 파싱 데이터 복원
+      try {
+        const data = await invoke<SavedParsedData>("load_saved_data");
+        if (data.files.length === 0) return;
+
+        console.log(`[Restore] DB에서 ${data.files.length}개 파일, ${data.track_points.length}개 포인트 복원`);
+
+        const store = useAppStore.getState();
+
+        // uploadedFiles 복원
+        for (const f of data.files) {
+          store.addUploadedFile({
+            path: f.path,
+            name: f.name,
+            status: "done",
+            parsedFile: {
+              filename: f.filename,
+              total_records: f.total_records,
+              track_points: [], // 별도 관리
+              parse_errors: f.parse_errors,
+              start_time: f.start_time,
+              end_time: f.end_time,
+              radar_lat: f.radar_lat,
+              radar_lon: f.radar_lon,
+              parse_stats: f.parse_stats ?? undefined,
+            },
+          });
+
+          // parseStatsList 복원
+          if (f.parse_stats) {
+            store.addParseStats(f.filename, f.parse_stats, f.total_records);
+          }
+        }
+
+        // rawTrackPoints 복원
+        store.appendRawTrackPoints(data.track_points);
+
+        // flights 재생성 (consolidateFlights)
+        const state = useAppStore.getState();
+        const flights = consolidateFlights(
+          state.rawTrackPoints,
+          state.flightHistory,
+          state.aircraft,
+          state.radarSite,
+        );
+        store.setFlights(flights);
+      } catch (e) {
+        console.log("[Restore] 파싱 데이터 복원 실패:", e);
+      }
+    };
+
+    restore();
+  }, []);
+}
 
 /** OpenSky 자동 동기화: 등록 항공기의 최근 5년 운항이력 조회 (최신→과거) */
 function useOpenskyAutoSync() {
@@ -23,17 +125,16 @@ function useOpenskyAutoSync() {
   const unlistenRefs = useRef<(() => void)[]>([]);
 
   useEffect(() => {
-    // 이벤트 리스너를 effect 레벨에서 등록 (sync 함수와 독립적으로 유지)
     let cancelled = false;
-    const setupListeners = async () => {
-      // 증분 결과 리스너 (백엔드가 구간별로 emit → 실시간 UI 업데이트)
+
+    const setupAndSync = async () => {
+      // 1) 이벤트 리스너를 먼저 등록 (await 완료 후 sync 시작 → 이벤트 놓침 방지)
       const unlisten1 = await listen<FlightRecord[]>(
         "flight-history-records",
         (event) => {
           if (!cancelled) useAppStore.getState().addFlightHistory(event.payload);
         }
       );
-      // 진행 상황 리스너 (구간별 진행률 → 사이드바 표시)
       const unlisten2 = await listen<{ current: number; total: number; icao24: string }>(
         "flight-history-progress",
         (event) => {
@@ -46,11 +147,31 @@ function useOpenskyAutoSync() {
         }
       );
       unlistenRefs.current = [unlisten1, unlisten2];
-    };
-    setupListeners();
+      if (cancelled) return;
 
-    const runSync = async () => {
-      if (syncingRef.current) return;
+      // 2) DB에서 기존 캐싱된 이력 즉시 로드 (API 호출 전에 UI에 표시)
+      try {
+        const activeAircraft = useAppStore.getState().aircraft.filter((a) => a.active && a.mode_s_code);
+        if (activeAircraft.length > 0) {
+          const icao24List = activeAircraft.map((a) => a.mode_s_code.toLowerCase());
+          const now = Math.floor(Date.now() / 1000);
+          const fiveYears = 5 * 365 * 86400;
+          const cached = await invoke<FlightRecord[]>("load_flight_history", {
+            icao24List,
+            start: now - fiveYears,
+            end: now,
+          });
+          if (!cancelled && cached.length > 0) {
+            console.log(`[OpenSky] DB 캐시 로드: ${cached.length}건`);
+            useAppStore.getState().addFlightHistory(cached);
+          }
+        }
+      } catch (e) {
+        console.log("[OpenSky] DB 캐시 로드 실패:", e);
+      }
+
+      // 3) API 동기화 시작
+      if (cancelled || syncingRef.current) return;
 
       // 인증정보 확인
       let creds: [string, string];
@@ -65,7 +186,6 @@ function useOpenskyAutoSync() {
         return;
       }
 
-      // store에서 최신 aircraft를 직접 읽기 (의존성 배열 문제 회피)
       const activeAircraft = useAppStore.getState().aircraft.filter((a) => a.active && a.mode_s_code);
       if (activeAircraft.length === 0) return;
 
@@ -113,7 +233,7 @@ function useOpenskyAutoSync() {
         useAppStore.getState().setOpenskySyncProgress("일일 한도 초과 — 30분 후 재시도");
         retryTimerRef.current = setTimeout(() => {
           useAppStore.getState().setOpenskySyncProgress("");
-          runSync();
+          setupAndSync();
         }, 30 * 60 * 1000);
       }
     };
@@ -121,7 +241,7 @@ function useOpenskyAutoSync() {
     // 초기 마운트 또는 버전 변경 시 동기화
     if (lastVersion.current === syncVersion && lastVersion.current !== -1) return;
     lastVersion.current = syncVersion;
-    runSync();
+    setupAndSync();
 
     return () => {
       cancelled = true;
@@ -138,6 +258,7 @@ export default function App() {
   const location = useLocation();
   const isMapPage = location.pathname === "/map";
 
+  useRestoreSavedData();
   useOpenskyAutoSync();
 
   return (
@@ -149,7 +270,8 @@ export default function App() {
         <Titlebar />
         <main className="relative flex-1 overflow-hidden border-l border-t border-gray-200">
           {/* TrackMap은 항상 마운트 - 탭 전환 시 상태 유지 */}
-          <div className={isMapPage ? "h-full" : "hidden"}>
+          {/* TrackMap은 항상 렌더링 - hidden 대신 offscreen으로 canvas 유지 (보고서 캡처용) */}
+          <div className={isMapPage ? "h-full" : "absolute inset-0 -z-10 pointer-events-none opacity-0"}>
             <TrackMap />
           </div>
           {!isMapPage && (

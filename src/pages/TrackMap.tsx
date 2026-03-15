@@ -127,7 +127,7 @@ function interpolateAdsb(
 interface TrackPath {
   modeS: string;
   radarType: string;
-  path: [number, number, number][];
+  path: ([number, number] | [number, number, number])[];
   color: [number, number, number];
   avgAlt: number;
   pointCount: number;
@@ -135,7 +135,7 @@ interface TrackPath {
 }
 
 export default function TrackMap() {
-  const analysisResults = useAppStore((s) => s.analysisResults);
+  const flights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const radarSite = useAppStore((s) => s.radarSite);
   const setRadarSite = useAppStore((s) => s.setRadarSite);
@@ -171,6 +171,7 @@ export default function TrackMap() {
   const [losTarget, setLosTarget] = useState<{ lat: number; lon: number } | null>(null);
   const [losCursor, setLosCursor] = useState<{ lat: number; lon: number } | null>(null);
   const [losHoverRatio, setLosHoverRatio] = useState<number | null>(null);
+  const [losHighlightIdx, setLosHighlightIdx] = useState<number | null>(null);
   const savedTerrainRef = useRef(true); // LOS 모드 진입 전 지형 상태 저장
   const savedPitchRef = useRef(45);
   const savedBearingRef = useRef(0);
@@ -184,15 +185,15 @@ export default function TrackMap() {
   const fittedRef = useRef(false);
   const prevPointsLen = useRef(0);
 
-  // DB에서 ADS-B 트랙 로드 (분석 결과 변경 시)
+  // DB에서 ADS-B 트랙 로드 (비행 데이터 변경 시)
   useEffect(() => {
-    if (analysisResults.length === 0) return;
+    if (flights.length === 0) return;
     const icao24List = aircraft.filter((a) => a.active).map((a) => a.mode_s_code);
     if (icao24List.length === 0) return;
     let minTs = Infinity, maxTs = -Infinity;
-    for (const r of analysisResults) {
-      if (r.file_info.start_time != null && r.file_info.start_time < minTs) minTs = r.file_info.start_time;
-      if (r.file_info.end_time != null && r.file_info.end_time > maxTs) maxTs = r.file_info.end_time;
+    for (const f of flights) {
+      if (f.start_time < minTs) minTs = f.start_time;
+      if (f.end_time > maxTs) maxTs = f.end_time;
     }
     if (minTs === Infinity) return;
     invoke<AdsbTrack[]>("load_adsb_tracks_for_range", {
@@ -200,29 +201,29 @@ export default function TrackMap() {
     }).then((tracks) => {
       if (tracks.length > 0) setAdsbTracks(tracks);
     }).catch(() => {});
-  }, [analysisResults, aircraft]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [flights, aircraft]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 레이더 정보 (첫 번째 분석결과에서)
+  // 레이더 정보
   const radarInfo = useMemo(() => {
-    if (analysisResults.length === 0) return null;
-    const r = analysisResults[0];
+    if (flights.length === 0) return null;
+    const maxRange = Math.max(...flights.map((f) => f.max_radar_range_km));
     const rangeKm = radarSite.range_nm > 0
       ? radarSite.range_nm * 1.852
-      : r.max_radar_range_km;
+      : maxRange;
     return {
-      lat: r.file_info.radar_lat,
-      lon: r.file_info.radar_lon,
+      lat: radarSite.latitude,
+      lon: radarSite.longitude,
       maxRange: rangeKm,
       rangeNm: radarSite.range_nm,
       name: radarSite.name,
     };
-  }, [analysisResults, radarSite.name, radarSite.range_nm]);
+  }, [flights, radarSite]);
 
   // 비정상 항적 제거용: Mode-S별 포인트 수 카운트
   const validModeS = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const r of analysisResults) {
-      for (const p of r.file_info.track_points) {
+    for (const f of flights) {
+      for (const p of f.track_points) {
         counts.set(p.mode_s, (counts.get(p.mode_s) ?? 0) + 1);
       }
     }
@@ -231,7 +232,7 @@ export default function TrackMap() {
         .filter(([, count]) => count >= 10)
         .map(([ms]) => ms)
     );
-  }, [analysisResults]);
+  }, [flights]);
 
   // 등록된 비행검사기 Mode-S 코드 집합
   const registeredModeS = useMemo(
@@ -245,8 +246,8 @@ export default function TrackMap() {
     const pts: TrackPoint[] = [];
     const loss: LossSegment[] = [];
     const showAll = selectedModeS === "__ALL__";
-    for (const r of analysisResults) {
-      for (const p of r.file_info.track_points) {
+    for (const f of flights) {
+      for (const p of f.track_points) {
         if (!validModeS.has(p.mode_s)) continue;
         if (showAll) {
           pts.push(p);
@@ -257,24 +258,24 @@ export default function TrackMap() {
         }
       }
       if (showAll) {
-        loss.push(...r.loss_segments.filter((s) => validModeS.has(s.mode_s)));
+        loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s)));
       } else if (!selectedModeS) {
-        loss.push(...r.loss_segments.filter((s) => validModeS.has(s.mode_s) && registeredModeS.has(s.mode_s.toUpperCase())));
+        loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s) && registeredModeS.has(s.mode_s.toUpperCase())));
       } else {
         loss.push(
-          ...r.loss_segments.filter((s) => s.mode_s === selectedModeS)
+          ...f.loss_segments.filter((s) => s.mode_s === selectedModeS)
         );
       }
     }
     pts.sort((a, b) => a.timestamp - b.timestamp);
     return { allPoints: pts, allLoss: loss };
-  }, [analysisResults, selectedModeS, validModeS, registeredModeS]);
+  }, [flights, selectedModeS, validModeS, registeredModeS]);
 
   // 고유 Mode-S 목록
   const uniqueModeS = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const r of analysisResults) {
-      for (const p of r.file_info.track_points) {
+    for (const f of flights) {
+      for (const p of f.track_points) {
         counts.set(p.mode_s, (counts.get(p.mode_s) ?? 0) + 1);
       }
     }
@@ -289,7 +290,7 @@ export default function TrackMap() {
       })
       .slice(0, 200)
       .map(([ms]) => ms);
-  }, [analysisResults, aircraft]);
+  }, [flights, aircraft]);
 
   // 시간 범위
   const timeRange = useMemo(() => {
@@ -418,6 +419,8 @@ export default function TrackMap() {
   const onMapLoad = useCallback(() => {
     const map = mapRef.current?.getMap();
     if (!map) return;
+    // 보고서 캡처용으로 맵 인스턴스를 window에 노출
+    (window as any).__maplibreInstance = map;
     setupTerrain(map);
     map.on("style.load", () => {
       terrainAdded.current = false;
@@ -487,7 +490,7 @@ export default function TrackMap() {
             paths.push({
               modeS,
               radarType: rt,
-              path: seg.map((p) => [p.longitude, p.latitude, losMode ? 0 : p.altitude * altScale]),
+              path: seg.map((p) => losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale]),
               color,
               avgAlt,
               pointCount: seg.length,
@@ -698,36 +701,39 @@ export default function TrackMap() {
     return () => { map.off("style.load", onStyle); };
   }, [radarInfo]);
 
-  // LOS mode map click handler + 카메라 자동 정렬
+  // LOS mode map click handler (카메라 조정은 단면도 로딩 완료 후)
   const handleMapClick = useCallback(
     (evt: any) => {
       if (!losMode) return;
       const { lngLat } = evt;
-      const target = { lat: lngLat.lat, lon: lngLat.lng };
-      setLosTarget(target);
-      // LOS 선이 수평으로 보이도록 카메라 자동 정렬 (레이더=좌, 타겟=우)
-      const map = mapRef.current?.getMap();
-      if (map) {
-        const rLat = radarSite.latitude;
-        const rLon = radarSite.longitude;
-        const cosLat = Math.cos(((rLat + target.lat) / 2) * Math.PI / 180);
-        const dLon = (target.lon - rLon) * cosLat;
-        const dLat = target.lat - rLat;
-        const bearing = (Math.atan2(dLon, dLat) * 180) / Math.PI;
-        // LOS 방위 - 90° → LOS 선이 화면 수평 (레이더 좌, 타겟 우)
-        const cameraBearing = ((bearing - 90) % 360 + 360) % 360;
-        const minLat = Math.min(rLat, target.lat);
-        const maxLat = Math.max(rLat, target.lat);
-        const minLon = Math.min(rLon, target.lon);
-        const maxLon = Math.max(rLon, target.lon);
-        map.fitBounds(
-          [[minLon, minLat], [maxLon, maxLat]],
-          { bearing: cameraBearing, pitch: 0, padding: { top: 80, bottom: 250, left: 80, right: 80 }, duration: 800, maxZoom: 12 }
-        );
-      }
+      setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
     },
-    [losMode, radarSite]
+    [losMode]
   );
+
+  // LOS 단면도 로딩 완료 → 카메라 자동 정렬
+  const losTargetRef = useRef(losTarget);
+  losTargetRef.current = losTarget;
+  const handleLosLoaded = useCallback(() => {
+    const map = mapRef.current?.getMap();
+    const target = losTargetRef.current;
+    if (!map || !target) return;
+    const rLat = radarSite.latitude;
+    const rLon = radarSite.longitude;
+    const cosLat = Math.cos(((rLat + target.lat) / 2) * Math.PI / 180);
+    const dLon = (target.lon - rLon) * cosLat;
+    const dLat = target.lat - rLat;
+    const bearing = (Math.atan2(dLon, dLat) * 180) / Math.PI;
+    const cameraBearing = ((bearing - 90) % 360 + 360) % 360;
+    const minLat = Math.min(rLat, target.lat);
+    const maxLat = Math.max(rLat, target.lat);
+    const minLon = Math.min(rLon, target.lon);
+    const maxLon = Math.max(rLon, target.lon);
+    map.fitBounds(
+      [[minLon, minLat], [maxLon, maxLat]],
+      { bearing: cameraBearing, pitch: 0, padding: { top: 80, bottom: 250, left: 80, right: 80 }, duration: 800, maxZoom: 12 }
+    );
+  }, [radarSite]);
 
   // LOS mode mouse move handler (커서 추적)
   const handleMapMouseMove = useCallback(
@@ -738,6 +744,47 @@ export default function TrackMap() {
     },
     [losMode, losTarget]
   );
+
+  // LOS 선상 항적/Loss 포인트 전체 (단면도 전달용)
+  const losTrackPoints = useMemo(() => {
+    if (!losTarget) return [];
+    const rLat = radarSite.latitude;
+    const rLon = radarSite.longitude;
+    const tLat = losTarget.lat;
+    const tLon = losTarget.lon;
+    const bearing = Math.atan2(tLon - rLon, tLat - rLat);
+    const cosB = Math.cos(bearing);
+    const sinB = Math.sin(bearing);
+    const lineLen = Math.sqrt((tLat - rLat) ** 2 + (tLon - rLon) ** 2);
+    const tolerance = 0.015;
+    const pts: { distRatio: number; altitude: number; mode_s: string; timestamp: number; radar_type: string; isLoss: boolean; latitude: number; longitude: number }[] = [];
+    // 항적 포인트
+    for (const p of allPoints) {
+      const dx = p.latitude - rLat;
+      const dy = p.longitude - rLon;
+      const along = dx * cosB + dy * sinB;
+      const across = Math.abs(-dx * sinB + dy * cosB);
+      if (across < tolerance && along > 0 && along <= lineLen) {
+        pts.push({ distRatio: along / lineLen, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false, latitude: p.latitude, longitude: p.longitude });
+      }
+    }
+    // Loss 구간 시작/끝점
+    for (const s of signalLoss) {
+      for (const [lon, lat, alt, ts] of [
+        [s.start_lon, s.start_lat, s.start_altitude, s.start_time],
+        [s.end_lon, s.end_lat, s.end_altitude, s.end_time],
+      ] as [number, number, number, number][]) {
+        const dx = lat - rLat;
+        const dy = lon - rLon;
+        const along = dx * cosB + dy * sinB;
+        const across = Math.abs(-dx * sinB + dy * cosB);
+        if (across < tolerance && along > 0 && along <= lineLen) {
+          pts.push({ distRatio: along / lineLen, altitude: alt, mode_s: s.mode_s, timestamp: ts, radar_type: "loss", isLoss: true, latitude: lat, longitude: lon });
+        }
+      }
+    }
+    return pts;
+  }, [losTarget, radarSite, allPoints, signalLoss]);
 
   // deck.gl 레이어
   const deckLayers = useMemo(() => {
@@ -754,8 +801,8 @@ export default function TrackMap() {
         new LineLayer<TrackPoint>({
           id: "dot-stems",
           data: dotPoints,
-          getSourcePosition: (d) => [d.longitude, d.latitude, 0],
-          getTargetPosition: (d) => [d.longitude, d.latitude, losMode ? 0 : d.altitude * altScale],
+          getSourcePosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, 0],
+          getTargetPosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, d.altitude * altScale],
           getColor: (d) => {
             const c = modeSColorMap.get(d.mode_s) ?? [128, 128, 128];
             return [...c, 60];
@@ -773,7 +820,7 @@ export default function TrackMap() {
           new ScatterplotLayer<TrackPoint>({
             id: "dot-psr-glow",
             data: psrDots,
-            getPosition: (d) => [d.longitude, d.latitude, losMode ? 0 : d.altitude * altScale],
+            getPosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, d.altitude * altScale],
             getFillColor: (d) => [...detectionTypeColor(d.radar_type), 30],
             getRadius: 7,
             radiusMinPixels: 4,
@@ -789,7 +836,7 @@ export default function TrackMap() {
         new ScatterplotLayer<TrackPoint>({
           id: "dot-points",
           data: dotPoints,
-          getPosition: (d) => [d.longitude, d.latitude, losMode ? 0 : d.altitude * altScale],
+          getPosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, d.altitude * altScale],
           getFillColor: (d) => {
             const c = selectedModeS
               ? detectionTypeColor(d.radar_type)
@@ -929,7 +976,7 @@ export default function TrackMap() {
           new ScatterplotLayer<LossAdsbPin>({
             id: "loss-adsb-pins",
             data: lossAdsbPins,
-            getPosition: (d) => losMode ? [d.position[0], d.position[1], 0] : d.position,
+            getPosition: (d) => losMode ? [d.position[0], d.position[1]] : d.position,
             getFillColor: [233, 69, 96, 230],
             getLineColor: [255, 255, 255, 200],
             getRadius: 4,
@@ -1047,51 +1094,31 @@ export default function TrackMap() {
         );
       }
 
+      // LOS 단면도 항적 포인트 하이라이트 → 지도 위 마커
+      if (losHighlightIdx !== null && losTrackPoints[losHighlightIdx]) {
+        const tp = losTrackPoints[losHighlightIdx];
+        layers.push(
+          new ScatterplotLayer({
+            id: "los-track-highlight",
+            data: [{ position: [tp.longitude, tp.latitude] }],
+            getPosition: (d: any) => d.position,
+            getFillColor: tp.isLoss ? [239, 68, 68, 255] : [59, 130, 246, 255],
+            getLineColor: [255, 255, 255, 255],
+            getRadius: 8,
+            radiusMinPixels: 7,
+            radiusMaxPixels: 14,
+            radiusUnits: "pixels",
+            lineWidthMinPixels: 2.5,
+            stroked: true,
+            pickable: false,
+          })
+        );
+      }
+
     }
 
     return layers;
-  }, [trackPaths, signalLoss, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, modeSColorMap, aircraft, adsbTracks, lossAdsbPaths, lossAdsbPins, losHoverRatio, allPoints, selectedModeS]);
-
-  // LOS 선상 항적/Loss 포인트 전체 (단면도 전달용)
-  const losTrackPoints = useMemo(() => {
-    if (!losTarget) return [];
-    const rLat = radarSite.latitude;
-    const rLon = radarSite.longitude;
-    const tLat = losTarget.lat;
-    const tLon = losTarget.lon;
-    const bearing = Math.atan2(tLon - rLon, tLat - rLat);
-    const cosB = Math.cos(bearing);
-    const sinB = Math.sin(bearing);
-    const lineLen = Math.sqrt((tLat - rLat) ** 2 + (tLon - rLon) ** 2);
-    const tolerance = 0.015;
-    const pts: { distRatio: number; altitude: number; mode_s: string; timestamp: number; radar_type: string; isLoss: boolean }[] = [];
-    // 항적 포인트
-    for (const p of allPoints) {
-      const dx = p.latitude - rLat;
-      const dy = p.longitude - rLon;
-      const along = dx * cosB + dy * sinB;
-      const across = Math.abs(-dx * sinB + dy * cosB);
-      if (across < tolerance && along > 0 && along <= lineLen) {
-        pts.push({ distRatio: along / lineLen, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false });
-      }
-    }
-    // Loss 구간 시작/끝점
-    for (const s of signalLoss) {
-      for (const [lon, lat, alt, ts] of [
-        [s.start_lon, s.start_lat, s.start_altitude, s.start_time],
-        [s.end_lon, s.end_lat, s.end_altitude, s.end_time],
-      ] as [number, number, number, number][]) {
-        const dx = lat - rLat;
-        const dy = lon - rLon;
-        const along = dx * cosB + dy * sinB;
-        const across = Math.abs(-dx * sinB + dy * cosB);
-        if (across < tolerance && along > 0 && along <= lineLen) {
-          pts.push({ distRatio: along / lineLen, altitude: alt, mode_s: s.mode_s, timestamp: ts, radar_type: "loss", isLoss: true });
-        }
-      }
-    }
-    return pts;
-  }, [losTarget, radarSite, allPoints, signalLoss]);
+  }, [trackPaths, signalLoss, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, modeSColorMap, aircraft, adsbTracks, lossAdsbPaths, lossAdsbPins, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -1195,7 +1222,7 @@ export default function TrackMap() {
 
   // 표시 시간 포맷 (날짜 포함)
   const fmtTs = useCallback(
-    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "MM-dd HH:mm:ss") : "--/-- --:--:--"),
+    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "yyyy-MM-dd HH:mm:ss") : "----/--/-- --:--:--"),
     []
   );
 
@@ -1444,6 +1471,7 @@ export default function TrackMap() {
             } else {
               setLosTarget(null);
               setLosCursor(null);
+              setLosHighlightIdx(null);
               if (savedTerrainRef.current) setTerrainEnabled(true);
               const map = mapRef.current?.getMap();
               if (map) {
@@ -1494,7 +1522,7 @@ export default function TrackMap() {
           <Crosshair size={12} />
           <span>LOS 분석 모드: 지도에서 분석할 지점을 클릭하세요</span>
           <button
-            onClick={() => { setLosMode(false); setLosTarget(null); setLosCursor(null); }}
+            onClick={() => { setLosMode(false); setLosTarget(null); setLosCursor(null); setLosHighlightIdx(null); }}
             className="ml-auto text-[10px] text-gray-500 hover:text-gray-900"
           >
             취소
@@ -1621,9 +1649,11 @@ export default function TrackMap() {
           radarSite={radarSite}
           targetLat={losTarget.lat}
           targetLon={losTarget.lon}
-          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); }}
+          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); }}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
+          onLoaded={handleLosLoaded}
+          onTrackPointHighlight={setLosHighlightIdx}
         />
       )}
 

@@ -24,6 +24,10 @@ interface Props {
   onHoverDistance?: (ratio: number | null) => void;
   /** LOS 선상 항적/Loss 포인트 전체 */
   losTrackPoints?: LOSTrackPoint[];
+  /** 고도 프로파일 로딩 완료 시 콜백 */
+  onLoaded?: () => void;
+  /** 차트에서 항적 포인트 하이라이트 시 인덱스 콜백 (null이면 해제) */
+  onTrackPointHighlight?: (idx: number | null) => void;
 }
 
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -70,7 +74,7 @@ function curvDrop43(dKm: number): number {
 
 
 
-export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints }: Props) {
+export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight }: Props) {
   const addLOSResult = useAppStore((s) => s.addLOSResult);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
@@ -82,6 +86,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const [xZoom, setXZoom] = useState<[number, number]>([0, 100]);
   const xZoomRef = useRef<[number, number]>([0, 100]);
   const [hoveredTrackIdx, setHoveredTrackIdx] = useState<number | null>(null);
+  const [pinnedTrackIdx, setPinnedTrackIdx] = useState<number | null>(null);
 
   const totalDist = haversine(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
   const bearing = bearingDeg(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
@@ -187,7 +192,10 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           setProfile(points);
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          onLoaded?.();
+        }
       }
     };
 
@@ -459,18 +467,16 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const refractedAMSL = refractedH + curvDrop(dist);
     const straightAMSL = straightH + curvDrop(dist);
 
-    // BRA: 레이더에서 해당 거리까지의 최저 탐지 앙각 (4/3 프레임 기준)
-    // 디스플레이(실제지구) → AMSL → 4/3 프레임 변환 후 앙각 계산
-    const refracted43H = refractedAMSL - curvDrop43(dist);
-    const braAngle = dist > 0
-      ? Math.atan2(refracted43H - radarHeight, dist * 1000) * (180 / Math.PI)
-      : 0;
+    // BRA 0.25° 기준선 높이 (AMSL)
+    const BRA_DEG = 0.25;
+    const braH = radarHeight + dist * 1000 * Math.tan((BRA_DEG * Math.PI) / 180);
+    const braAMSL = braH + curvDrop(dist);
 
     // CoS 최고 탐지 고도 (AMSL)
     const cosH = radarHeight + dist * 1000 * Math.tan((70 * Math.PI) / 180);
     const cosAMSL = cosH + curvDrop(dist);
 
-    return { dist, terrainH, realElev, refractedH, straightH, refractedAGL, straightAGL, refractedAMSL, straightAMSL, braAngle, cosAMSL, minY, maxY };
+    return { dist, terrainH, realElev, refractedH, straightH, refractedAGL, straightAGL, refractedAMSL, straightAMSL, braAMSL, cosAMSL, minY, maxY };
   }, [hoverX, chartData, profile, xZoom]);
 
   // 호버 거리 비율을 부모에 전달
@@ -648,17 +654,34 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           if (tpAdjAlt < minY || tpAdjAlt > maxY) return null;
           const tpX = xScale(tpDist);
           const tpY = yScale(tpAdjAlt);
-          const isHovered = hoveredTrackIdx === tpIdx;
+          const isPinned = pinnedTrackIdx === tpIdx;
+          const isActive = hoveredTrackIdx === tpIdx || isPinned;
           return (
             <circle key={`tp-${tpIdx}`}
               cx={tpX} cy={tpY}
-              r={isHovered ? 4 : 2}
+              r={isActive ? 4 : 2}
               fill={tp.isLoss ? "#ef4444" : "#3b82f6"}
-              fillOpacity={isHovered ? 1 : 0.6}
-              stroke={isHovered ? "white" : "none"} strokeWidth={isHovered ? 1.5 : 0}
+              fillOpacity={isActive ? 1 : 0.6}
+              stroke={isPinned ? "#facc15" : isActive ? "white" : "none"}
+              strokeWidth={isPinned ? 2 : isActive ? 1.5 : 0}
               style={{ cursor: "pointer" }}
-              onMouseEnter={() => setHoveredTrackIdx(tpIdx)}
-              onMouseLeave={() => setHoveredTrackIdx(null)}
+              onMouseEnter={() => {
+                setHoveredTrackIdx(tpIdx);
+                if (pinnedTrackIdx === null) onTrackPointHighlight?.(tpIdx);
+              }}
+              onMouseLeave={() => {
+                setHoveredTrackIdx(null);
+                if (pinnedTrackIdx === null) onTrackPointHighlight?.(null);
+              }}
+              onClick={() => {
+                if (pinnedTrackIdx === tpIdx) {
+                  setPinnedTrackIdx(null);
+                  onTrackPointHighlight?.(null);
+                } else {
+                  setPinnedTrackIdx(tpIdx);
+                  onTrackPointHighlight?.(tpIdx);
+                }
+              }}
             />
           );
         })}
@@ -695,7 +718,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         </g>
 
         {/* 인터랙티브 크로스헤어 + 호버 툴팁 */}
-        {hoverData && hoveredTrackIdx === null && (() => {
+        {hoverData && hoveredTrackIdx === null && pinnedTrackIdx === null && (() => {
           const hXPos = xScale(hoverData.dist);
           const tooltipW = 175;
           const tooltipH = 104;
@@ -733,12 +756,12 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 최저탐지(굴절): <tspan fill="#374151" fontWeight="bold">{Math.round(hoverData.refractedAMSL * 3.28084).toLocaleString()}ft</tspan>
                 <tspan fill="#6b7280" fontSize={7}> (AGL {Math.round(hoverData.refractedAGL * 3.28084).toLocaleString()}ft)</tspan>
               </text>
-              <text x={tooltipX + 8} y={tooltipY + 56} fill="#6b7280" fontSize={8}>
-                직선LOS: <tspan fill="#374151">{Math.round(hoverData.straightAMSL * 3.28084).toLocaleString()}ft</tspan>
+              <text x={tooltipX + 8} y={tooltipY + 56} fill="rgba(107,114,128,0.6)" fontSize={8}>
+                직선LOS: <tspan fill="#374151" fontWeight="bold">{Math.round(hoverData.straightAMSL * 3.28084).toLocaleString()}ft</tspan>
                 <tspan fill="#6b7280" fontSize={7}> (AGL {Math.round(hoverData.straightAGL * 3.28084).toLocaleString()}ft)</tspan>
               </text>
               <text x={tooltipX + 8} y={tooltipY + 72} fill="#22d3ee" fontSize={8}>
-                BRA: <tspan fill="#374151" fontWeight="bold">{hoverData.braAngle.toFixed(2)}°</tspan>
+                BRA 0.25°: <tspan fill="#374151" fontWeight="bold">{Math.round(hoverData.braAMSL * 3.28084).toLocaleString()}ft</tspan>
               </text>
               <text x={tooltipX + 8} y={tooltipY + 86} fill="#a855f7" fontSize={8}>
                 최고탐지(CoS): <tspan fill="#374151" fontWeight="bold">{Math.round(hoverData.cosAMSL * 3.28084).toLocaleString()}ft</tspan>
@@ -747,9 +770,11 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })()}
 
-        {/* 항적/Loss 포인트 호버 툴팁 */}
-        {hoveredTrackIdx !== null && losTrackPoints && losTrackPoints[hoveredTrackIdx] && (() => {
-          const tp = losTrackPoints[hoveredTrackIdx];
+        {/* 항적/Loss 포인트 호버/핀 툴팁 */}
+        {(() => {
+          const activeIdx = hoveredTrackIdx ?? pinnedTrackIdx;
+          if (activeIdx === null || !losTrackPoints || !losTrackPoints[activeIdx]) return null;
+          const tp = losTrackPoints[activeIdx];
           const tpDist = tp.distRatio * maxDistance;
           const tpAdjAlt = tp.altitude - curvDrop(tpDist);
           const tpX = xScale(tpDist);

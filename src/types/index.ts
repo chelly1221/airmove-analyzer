@@ -172,6 +172,29 @@ export interface FlightRecord {
   callsign: string | null;
 }
 
+/** 비행 (분석 기본 단위) */
+export interface Flight {
+  /** `${mode_s}_${start_time}` */
+  id: string;
+  mode_s: string;
+  /** Aircraft.name 매칭 */
+  aircraft_name?: string;
+  /** FlightRecord에서 */
+  callsign?: string;
+  departure_airport?: string;
+  arrival_airport?: string;
+  start_time: number;
+  end_time: number;
+  track_points: TrackPoint[];
+  loss_segments: LossSegment[];
+  total_loss_time: number;
+  total_track_time: number;
+  loss_percentage: number;
+  max_radar_range_km: number;
+  /** 매칭 방식 */
+  match_type: "opensky" | "gap";
+}
+
 /** UI 페이지 */
 export type PageId =
   | "upload"

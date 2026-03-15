@@ -260,19 +260,33 @@ fn delete_aircraft(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
     save_aircraft_to_file(&path, &list)
 }
 
-/// Parse an ASS file and immediately analyze it.
+/// Parse an ASS file and immediately analyze it (결과를 DB에 자동 저장).
 #[tauri::command]
 async fn parse_and_analyze(
+    app_handle: tauri::AppHandle,
     file_path: String,
     radar_lat: f64,
     radar_lon: f64,
     mode_s_filter: Vec<String>,
 ) -> Result<AnalysisResult, String> {
     info!("Command: parse_and_analyze({}, radar={},{}, filter={:?})", file_path, radar_lat, radar_lon, mode_s_filter);
+    let handle = app_handle.clone();
+    let fp = file_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let parsed = parser::ass::parse_ass_file(&file_path, radar_lat, radar_lon, &mode_s_filter, |_| {})
+        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_filter, |_| {})
             .map_err(|e| e.to_string())?;
-        Ok(analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS))
+        let analysis = analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS);
+
+        // DB에 자동 저장
+        let state = handle.state::<AppState>();
+        if let Ok(conn) = state.db.lock() {
+            let name = fp.split(['/', '\\']).last().unwrap_or(&fp).to_string();
+            if let Err(e) = db::save_parsed_file_data(&conn, &fp, &name, &analysis) {
+                log::warn!("Failed to save parsed data to DB: {}", e);
+            }
+        }
+
+        Ok(analysis)
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -340,6 +354,14 @@ async fn parse_and_analyze_batch(
             let event = match result {
                 Ok(ref mut analysis) => {
                     succeeded += 1;
+                    // DB에 자동 저장 (메모리 해제 전)
+                    let state = handle.state::<AppState>();
+                    if let Ok(conn) = state.db.lock() {
+                        let name = path.split(['/', '\\']).last().unwrap_or(path).to_string();
+                        if let Err(e) = db::save_parsed_file_data(&conn, path, &name, analysis) {
+                            log::warn!("Failed to save parsed data to DB: {}", e);
+                        }
+                    }
                     // track_points를 청크로 스트리밍 후 메모리 해제
                     emit_and_drain_track_points(&handle, path, &mut analysis.file_info.track_points);
                     BatchResultEvent {
@@ -394,6 +416,15 @@ fn read_file_base64(path: String) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))?;
     Ok(STANDARD.encode(&bytes))
+}
+
+/// base64 데이터를 파일로 저장 (PDF 등)
+#[tauri::command]
+fn write_file_base64(path: String, data: String) -> Result<(), String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(&data).map_err(|e| format!("Base64 decode error: {}", e))?;
+    fs::write(&path, &bytes).map_err(|e| format!("Failed to write file: {}", e))?;
+    Ok(())
 }
 
 /// OpenSky Network API로 ADS-B 항적 조회
@@ -568,14 +599,14 @@ async fn fetch_flight_history(
     }
     let has_auth = true;
 
-    let window = 172800i64; // 2일 (API 최대 허용)
+    let window = 86400i64; // 1일 (OpenSky는 calendar day 기준 파티션 → 2일 윈도우 시 3파티션 에러)
     let total_windows = ((end - begin) as f64 / window as f64).ceil() as usize;
     // 최신→과거 순서로 조회 (최근 데이터 우선)
     let mut cursor = end;
     let mut window_idx = 0usize;
     let mut rate_limited = false;
 
-    info!("Flight history sync: icao24={}, {} windows (30-day each), newest→oldest", icao24, total_windows);
+    info!("Flight history sync: icao24={}, {} windows (1-day each), newest→oldest", icao24, total_windows);
 
     while cursor > begin {
         let w_start = std::cmp::max(cursor - window, begin);
@@ -687,6 +718,13 @@ async fn fetch_flight_history(
                         icao24,
                         body
                     );
+                    // 4xx 에러는 재시도해도 의미 없으므로 조회 완료 처리
+                    if status.as_u16() >= 400 && status.as_u16() < 500 {
+                        let state = app_handle.state::<AppState>();
+                        if let Ok(conn) = state.db.lock() {
+                            let _ = db::mark_window_queried(&conn, &icao24, w_start, w_end);
+                        };
+                    }
                     break;
                 }
                 Err(e) => {
@@ -761,6 +799,107 @@ fn load_opensky_credentials(
     Ok((id, secret))
 }
 
+/// 설정값 로드 (프론트엔드용)
+#[tauri::command]
+fn load_setting(
+    key: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::get_setting(&conn, &key).map_err(|e| format!("DB error: {}", e))
+}
+
+/// 설정값 저장 (프론트엔드용)
+#[tauri::command]
+fn save_setting(
+    key: String,
+    value: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::set_setting(&conn, &key, &value).map_err(|e| format!("DB error: {}", e))
+}
+
+/// DB에서 저장된 파싱 데이터 로드 (앱 시작 시 호출)
+#[tauri::command]
+fn load_saved_data(
+    state: tauri::State<'_, AppState>,
+) -> Result<db::SavedParsedData, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_all_parsed_data(&conn).map_err(|e| format!("DB load error: {}", e))
+}
+
+/// 저장된 파싱 데이터 전체 삭제
+#[tauri::command]
+fn clear_saved_data(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::clear_all_parsed_data(&conn).map_err(|e| format!("DB clear error: {}", e))
+}
+
+/// DB 파일 경로 반환 (내보내기/가져오기 용)
+fn get_db_path(state: &AppState) -> Result<PathBuf, String> {
+    let aircraft_path = state.aircraft_path.lock().map_err(|e| format!("Lock error: {}", e))?;
+    Ok(aircraft_path.with_file_name("adsb.db"))
+}
+
+/// DB 내보내기 (현재 DB를 지정 경로로 복사)
+#[tauri::command]
+fn export_database(
+    dest_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let db_path = get_db_path(&state)?;
+    // WAL 체크포인트 → 단일 파일로 정리
+    {
+        let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| format!("WAL checkpoint error: {}", e))?;
+    }
+    fs::copy(&db_path, &dest_path)
+        .map_err(|e| format!("파일 복사 실패: {}", e))?;
+    info!("Database exported to: {}", dest_path);
+    Ok(())
+}
+
+/// DB 가져오기 (지정 경로의 DB로 교체, 연결 재수립)
+#[tauri::command]
+fn import_database(
+    src_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let db_path = get_db_path(&state)?;
+    let src = std::path::Path::new(&src_path);
+
+    // 유효한 SQLite 파일인지 확인 (매직 바이트)
+    let header = fs::read(src)
+        .map_err(|e| format!("파일 읽기 실패: {}", e))?;
+    if header.len() < 16 || &header[0..16] != b"SQLite format 3\0" {
+        return Err("유효한 SQLite 데이터베이스 파일이 아닙니다.".to_string());
+    }
+
+    // 기존 연결 닫고 파일 교체 후 재연결
+    let mut conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    // WAL/SHM 파일 정리
+    drop(std::mem::replace(&mut *conn, rusqlite::Connection::open_in_memory().map_err(|e| format!("임시 DB 오류: {}", e))?));
+
+    // DB 파일 교체
+    fs::copy(src, &db_path)
+        .map_err(|e| format!("파일 복사 실패: {}", e))?;
+    // WAL/SHM 잔여 파일 제거
+    let _ = fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = fs::remove_file(db_path.with_extension("db-shm"));
+
+    // 새 연결 수립
+    let new_conn = db::init_db(&db_path)
+        .map_err(|e| format!("DB 재연결 실패: {}", e))?;
+    *conn = new_conn;
+
+    info!("Database imported from: {}", src_path);
+    Ok(())
+}
+
 // ---------- App Entry Point ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -813,12 +952,19 @@ pub fn run() {
             delete_aircraft,
             filter_tracks_by_mode_s,
             read_file_base64,
+            write_file_base64,
             fetch_adsb_tracks,
             load_adsb_tracks_for_range,
             fetch_flight_history,
             load_flight_history,
             save_opensky_credentials,
             load_opensky_credentials,
+            load_saved_data,
+            clear_saved_data,
+            load_setting,
+            save_setting,
+            export_database,
+            import_database,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

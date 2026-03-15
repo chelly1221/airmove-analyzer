@@ -12,25 +12,26 @@ import { format } from "date-fns";
 import Card from "../components/common/Card";
 import { SimpleCard } from "../components/common/Card";
 import { useAppStore } from "../store";
+import { flightLabel } from "../utils/flightConsolidation";
 
 export default function Dashboard() {
   const navigate = useNavigate();
-  const analysisResults = useAppStore((s) => s.analysisResults);
+  const flights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const setActivePage = useAppStore((s) => s.setActivePage);
 
-  const totalFlights = analysisResults.length;
-  const totalLossSegments = analysisResults.reduce(
-    (sum, r) => sum + r.loss_segments.length,
+  const totalFlights = flights.length;
+  const totalLossSegments = flights.reduce(
+    (sum, f) => sum + f.loss_segments.length,
     0
   );
   const avgLossPercentage =
     totalFlights > 0
-      ? analysisResults.reduce((sum, r) => sum + r.loss_percentage, 0) /
+      ? flights.reduce((sum, f) => sum + f.loss_percentage, 0) /
         totalFlights
       : 0;
-  const totalTrackTime = analysisResults.reduce(
-    (sum, r) => sum + r.total_track_time,
+  const totalTrackTime = flights.reduce(
+    (sum, f) => sum + f.total_track_time,
     0
   );
 
@@ -54,7 +55,7 @@ export default function Dashboard() {
         <Card
           title="분석 비행 수"
           value={totalFlights}
-          subtitle="파싱 완료 파일"
+          subtitle="식별된 비행"
           icon={Activity}
           accent="#3b82f6"
         />
@@ -123,7 +124,7 @@ export default function Dashboard() {
           <h2 className="mb-4 text-base font-semibold text-gray-800">
             최근 분석 결과
           </h2>
-          {analysisResults.length === 0 ? (
+          {flights.length === 0 ? (
             <div className="flex flex-col items-center py-8 text-gray-500">
               <Activity size={32} className="mb-2 opacity-50" />
               <p className="text-sm">분석 결과가 없습니다</p>
@@ -131,30 +132,28 @@ export default function Dashboard() {
             </div>
           ) : (
             <div className="space-y-2">
-              {analysisResults.slice(-5).reverse().map((r) => (
+              {flights.slice(-5).reverse().map((f) => (
                 <div
-                  key={`result-${r.file_info.filename}`}
+                  key={`result-${f.id}`}
                   className="flex items-center justify-between rounded-lg border border-gray-100 bg-gray-50 px-4 py-3"
                 >
                   <div>
                     <p className="text-sm font-medium text-gray-800">
-                      {r.file_info.filename}
+                      {flightLabel(f, aircraft)}
                     </p>
                     <p className="text-xs text-gray-500">
-                      {r.file_info.start_time
-                        ? format(
-                            new Date(r.file_info.start_time * 1000),
-                            "yyyy-MM-dd HH:mm"
-                          )
-                        : "-"}
+                      {format(
+                        new Date(f.start_time * 1000),
+                        "yyyy-MM-dd HH:mm"
+                      )}
                     </p>
                   </div>
                   <div className="text-right">
                     <p className="text-sm font-bold text-[#a60739]">
-                      {r.loss_percentage.toFixed(1)}%
+                      {f.loss_percentage.toFixed(1)}%
                     </p>
                     <p className="text-xs text-gray-500">
-                      Loss {r.loss_segments.length}건
+                      Loss {f.loss_segments.length}건
                     </p>
                   </div>
                 </div>

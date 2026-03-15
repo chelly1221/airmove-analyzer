@@ -10,6 +10,10 @@ import {
   Check,
   Eye,
   EyeOff,
+  Database,
+  Download,
+  Upload,
+  AlertTriangle,
 } from "lucide-react";
 import maplibregl from "maplibre-gl";
 import { invoke } from "@tauri-apps/api/core";
@@ -132,6 +136,13 @@ function AircraftSection() {
 
   const columns = [
     { key: "name", header: "이름" },
+    {
+      key: "registration",
+      header: "등록번호",
+      render: (a: Aircraft) => (
+        <span className="font-mono text-xs text-gray-500">{a.registration || "-"}</span>
+      ),
+    },
     {
       key: "model",
       header: "기체 모델",
@@ -823,6 +834,142 @@ function OpenSkyCredentialsSection() {
   );
 }
 
+// ─── DB 내보내기/가져오기 섹션 ────────────────────────────────────────
+
+function DatabaseSection() {
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [status, setStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [confirmImport, setConfirmImport] = useState<string | null>(null);
+
+  const handleExport = async () => {
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const dest = await save({
+        title: "데이터베이스 내보내기",
+        defaultPath: `airmove-backup-${new Date().toISOString().slice(0, 10)}.db`,
+        filters: [{ name: "SQLite Database", extensions: ["db"] }],
+      });
+      if (!dest) return;
+
+      setExporting(true);
+      setStatus(null);
+      await invoke("export_database", { destPath: dest });
+      setStatus({ type: "success", message: "데이터베이스를 내보냈습니다." });
+    } catch (e) {
+      setStatus({ type: "error", message: `내보내기 실패: ${e}` });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleImportClick = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const src = await open({
+        title: "데이터베이스 가져오기",
+        filters: [{ name: "SQLite Database", extensions: ["db"] }],
+        multiple: false,
+        directory: false,
+      });
+      if (!src) return;
+      const path = typeof src === "string" ? src : src;
+      setConfirmImport(path as string);
+    } catch (e) {
+      setStatus({ type: "error", message: `파일 선택 실패: ${e}` });
+    }
+  };
+
+  const handleImportConfirm = async () => {
+    if (!confirmImport) return;
+    try {
+      setImporting(true);
+      setStatus(null);
+      setConfirmImport(null);
+      await invoke("import_database", { srcPath: confirmImport });
+      setStatus({ type: "success", message: "데이터베이스를 가져왔습니다. 페이지를 새로고침합니다..." });
+      // 상태 반영을 위해 앱 새로고침
+      setTimeout(() => window.location.reload(), 1500);
+    } catch (e) {
+      setStatus({ type: "error", message: `가져오기 실패: ${e}` });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <Database size={16} className="text-[#a60739]" />
+        <h2 className="text-lg font-semibold text-gray-800">데이터베이스 관리</h2>
+      </div>
+      <p className="text-xs text-gray-500">
+        운항이력, ADS-B 항적, 파싱 데이터 등 모든 저장 데이터를 내보내거나 가져올 수 있습니다.
+      </p>
+
+      <div className="flex gap-3">
+        <button
+          onClick={handleExport}
+          disabled={exporting || importing}
+          className="flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-gray-400 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          <Download size={14} />
+          {exporting ? "내보내는 중..." : "DB 내보내기"}
+        </button>
+        <button
+          onClick={handleImportClick}
+          disabled={exporting || importing}
+          className="flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-gray-400 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          <Upload size={14} />
+          {importing ? "가져오는 중..." : "DB 가져오기"}
+        </button>
+      </div>
+
+      {status && (
+        <div className={`rounded-lg px-4 py-3 text-sm ${
+          status.type === "success"
+            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+            : "bg-red-50 text-red-700 border border-red-200"
+        }`}>
+          {status.message}
+        </div>
+      )}
+
+      {/* 가져오기 확인 모달 */}
+      <Modal
+        open={confirmImport !== null}
+        onClose={() => setConfirmImport(null)}
+        title="데이터베이스 가져오기"
+        width="max-w-sm"
+      >
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 rounded-lg bg-amber-50 border border-amber-200 p-3">
+            <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-600" />
+            <p className="text-sm text-amber-800">
+              현재 저장된 모든 데이터(운항이력, ADS-B 항적, 파싱 데이터, 설정)가 선택한 파일의 데이터로 교체됩니다. 이 작업은 되돌릴 수 없습니다.
+            </p>
+          </div>
+          <div className="flex justify-end gap-3">
+            <button
+              onClick={() => setConfirmImport(null)}
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              취소
+            </button>
+            <button
+              onClick={handleImportConfirm}
+              className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] transition-colors"
+            >
+              가져오기
+            </button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
 // ─── 설정 메인 페이지 ──────────────────────────────────────────────────
 
 export default function Settings() {
@@ -849,6 +996,11 @@ export default function Settings() {
       {/* OpenSky API 인증 */}
       <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
         <OpenSkyCredentialsSection />
+      </div>
+
+      {/* 데이터베이스 관리 */}
+      <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
+        <DatabaseSection />
       </div>
     </div>
   );

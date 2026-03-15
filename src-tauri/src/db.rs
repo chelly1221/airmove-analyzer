@@ -64,6 +64,35 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_query_log_icao ON opensky_query_log(icao24, window_start);
+
+        -- 파싱 데이터 영속화
+        CREATE TABLE IF NOT EXISTS parsed_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            total_records INTEGER NOT NULL DEFAULT 0,
+            start_time REAL,
+            end_time REAL,
+            radar_lat REAL NOT NULL,
+            radar_lon REAL NOT NULL,
+            parse_errors TEXT NOT NULL DEFAULT '[]',
+            stats_json TEXT,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS track_points (
+            file_id INTEGER NOT NULL REFERENCES parsed_files(id) ON DELETE CASCADE,
+            timestamp REAL NOT NULL,
+            mode_s TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            altitude REAL NOT NULL,
+            speed REAL NOT NULL,
+            heading REAL NOT NULL,
+            radar_type TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_track_points_file ON track_points(file_id);
         ",
     )?;
     Ok(conn)
@@ -267,6 +296,198 @@ pub fn get_setting(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
         Some(Ok(val)) => Ok(Some(val)),
         _ => Ok(None),
     }
+}
+
+// ========== 파싱 데이터 영속화 ==========
+
+use crate::models::{AnalysisResult, ParseStatistics, RadarDetectionType, TrackPoint};
+
+fn radar_type_to_str(rt: &RadarDetectionType) -> &'static str {
+    match rt {
+        RadarDetectionType::ModeAC => "mode_ac",
+        RadarDetectionType::ModeACPsr => "mode_ac_psr",
+        RadarDetectionType::ModeSAllCall => "mode_s_allcall",
+        RadarDetectionType::ModeSRollCall => "mode_s_rollcall",
+        RadarDetectionType::ModeSAllCallPsr => "mode_s_allcall_psr",
+        RadarDetectionType::ModeSRollCallPsr => "mode_s_rollcall_psr",
+    }
+}
+
+fn str_to_radar_type(s: &str) -> RadarDetectionType {
+    match s {
+        "mode_ac" => RadarDetectionType::ModeAC,
+        "mode_ac_psr" => RadarDetectionType::ModeACPsr,
+        "mode_s_allcall" => RadarDetectionType::ModeSAllCall,
+        "mode_s_rollcall" => RadarDetectionType::ModeSRollCall,
+        "mode_s_allcall_psr" => RadarDetectionType::ModeSAllCallPsr,
+        "mode_s_rollcall_psr" => RadarDetectionType::ModeSRollCallPsr,
+        _ => RadarDetectionType::ModeSRollCall,
+    }
+}
+
+/// 파싱된 파일 데이터를 DB에 저장 (기존 데이터 교체)
+pub fn save_parsed_file_data(
+    conn: &Connection,
+    file_path: &str,
+    file_name: &str,
+    analysis: &AnalysisResult,
+) -> SqlResult<()> {
+    // 기존 데이터 삭제 (cascade로 track_points도 삭제)
+    conn.execute("DELETE FROM parsed_files WHERE path = ?1", params![file_path])?;
+
+    let errors_json = serde_json::to_string(&analysis.file_info.parse_errors)
+        .unwrap_or_else(|_| "[]".to_string());
+    let stats_json = analysis.file_info.parse_stats.as_ref()
+        .and_then(|s| serde_json::to_string(s).ok());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    conn.execute(
+        "INSERT INTO parsed_files (path, name, total_records, start_time, end_time, radar_lat, radar_lon, parse_errors, stats_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            file_path,
+            file_name,
+            analysis.file_info.total_records as i64,
+            analysis.file_info.start_time,
+            analysis.file_info.end_time,
+            analysis.file_info.radar_lat,
+            analysis.file_info.radar_lon,
+            errors_json,
+            stats_json,
+            now,
+        ],
+    )?;
+
+    let file_id = conn.last_insert_rowid();
+
+    // 트랜잭션으로 track_points 일괄 삽입
+    conn.execute_batch("BEGIN")?;
+    {
+        let mut stmt = conn.prepare(
+            "INSERT INTO track_points (file_id, timestamp, mode_s, latitude, longitude, altitude, speed, heading, radar_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for pt in &analysis.file_info.track_points {
+            stmt.execute(params![
+                file_id,
+                pt.timestamp,
+                pt.mode_s,
+                pt.latitude,
+                pt.longitude,
+                pt.altitude,
+                pt.speed,
+                pt.heading,
+                radar_type_to_str(&pt.radar_type),
+            ])?;
+        }
+    }
+    conn.execute_batch("COMMIT")?;
+
+    Ok(())
+}
+
+/// 저장된 파일 정보 (프론트엔드 반환용)
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SavedFileInfo {
+    pub path: String,
+    pub name: String,
+    pub filename: String,
+    pub total_records: usize,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+    pub radar_lat: f64,
+    pub radar_lon: f64,
+    pub parse_errors: Vec<String>,
+    pub parse_stats: Option<ParseStatistics>,
+}
+
+/// 저장된 전체 데이터 (프론트엔드 반환용)
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SavedParsedData {
+    pub files: Vec<SavedFileInfo>,
+    pub track_points: Vec<TrackPoint>,
+}
+
+/// DB에서 모든 파싱 데이터 로드
+pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
+    // 파일 정보 로드
+    let mut file_stmt = conn.prepare(
+        "SELECT id, path, name, total_records, start_time, end_time, radar_lat, radar_lon, parse_errors, stats_json
+         FROM parsed_files ORDER BY created_at",
+    )?;
+
+    let file_rows: Vec<(i64, String, String, i64, Option<f64>, Option<f64>, f64, f64, String, Option<String>)> = file_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                row.get(8)?, row.get(9)?,
+            ))
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+
+    let mut files = Vec::new();
+    let mut all_points = Vec::new();
+
+    for (file_id, path, name, total_records, start_time, end_time, radar_lat, radar_lon, errors_json, stats_json) in &file_rows {
+        let parse_errors: Vec<String> = serde_json::from_str(errors_json).unwrap_or_default();
+        let parse_stats: Option<ParseStatistics> = stats_json.as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        // name을 filename으로도 사용 (basename)
+        files.push(SavedFileInfo {
+            path: path.clone(),
+            name: name.clone(),
+            filename: name.clone(),
+            total_records: *total_records as usize,
+            start_time: *start_time,
+            end_time: *end_time,
+            radar_lat: *radar_lat,
+            radar_lon: *radar_lon,
+            parse_errors,
+            parse_stats,
+        });
+
+        // 해당 파일의 track_points 로드
+        let mut pt_stmt = conn.prepare(
+            "SELECT timestamp, mode_s, latitude, longitude, altitude, speed, heading, radar_type
+             FROM track_points WHERE file_id = ?1 ORDER BY timestamp",
+        )?;
+
+        let points: Vec<TrackPoint> = pt_stmt
+            .query_map(params![file_id], |row| {
+                let radar_type_str: String = row.get(7)?;
+                Ok(TrackPoint {
+                    timestamp: row.get(0)?,
+                    mode_s: row.get(1)?,
+                    latitude: row.get(2)?,
+                    longitude: row.get(3)?,
+                    altitude: row.get(4)?,
+                    speed: row.get(5)?,
+                    heading: row.get(6)?,
+                    radar_type: str_to_radar_type(&radar_type_str),
+                    raw_data: Vec::new(),
+                })
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        all_points.extend(points);
+    }
+
+    Ok(SavedParsedData {
+        files,
+        track_points: all_points,
+    })
+}
+
+/// 모든 파싱 데이터 삭제
+pub fn clear_all_parsed_data(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM track_points", [])?;
+    conn.execute("DELETE FROM parsed_files", [])?;
+    Ok(())
 }
 
 /// 기존 adsb_cache.json → DB 마이그레이션

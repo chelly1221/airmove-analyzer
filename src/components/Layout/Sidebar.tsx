@@ -11,13 +11,12 @@ import {
   ChevronRight,
   ChevronDown,
   Loader2,
-  PlaneTakeoff,
-  PlaneLanding,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { format } from "date-fns";
 import { ko } from "date-fns/locale";
 import { useAppStore } from "../../store";
+import { mergeFlightRecords } from "../../utils/flightConsolidation";
 import type { FlightRecord, PageId } from "../../types";
 
 interface NavItem {
@@ -31,13 +30,44 @@ const navItems: NavItem[] = [
   { id: "upload", label: "자료 업로드", icon: Upload, path: "/" },
   { id: "map", label: "항적 지도", icon: Map, path: "/map" },
   { id: "drawing", label: "도면", icon: PencilRuler, path: "/drawing" },
-  { id: "analysis", label: "통계/분석", icon: BarChart3, path: "/analysis" },
-  { id: "report", label: "보고서 생성", icon: FileText, path: "/report" },
+  { id: "analysis", label: "통계 / 분석", icon: BarChart3, path: "/analysis" },
+  { id: "report", label: "보고서", icon: FileText, path: "/report" },
 ];
 
 const settingsItem: NavItem = {
   id: "settings", label: "설정", icon: Settings, path: "/settings",
 };
+
+// ─── 공항 ICAO → 한글명 ─────────────────────────────────────────────
+const AIRPORT_NAMES: Record<string, string> = {
+  // 한국 국제공항
+  RKSI: "인천", RKSS: "김포", RKPK: "김해", RKPC: "제주",
+  RKTN: "대구", RKJJ: "광주", RKNY: "양양", RKTU: "청주",
+  RKJK: "군산", RKNW: "원주", RKJY: "여수", RKPU: "울산",
+  RKPS: "사천", RKTH: "포항", RKJB: "무안",
+  // 한국 군용/기타
+  RKSO: "오산", RKSG: "평택", RKSM: "성남", RKSE: "서울",
+  RKSW: "수원", RKTI: "이천", RKJM: "목포", RKTE: "예천",
+  RKTP: "패평", RKNN: "강릉", RKNC: "춘천", RKRA: "안동",
+  RKRN: "속초",
+  // 일본 주요
+  RJTT: "하네다", RJAA: "나리타", RJBB: "간사이", RJOO: "이타미",
+  RJFF: "후쿠오카", RJCC: "신치토세", RJGG: "주부", RJSN: "니가타",
+  RJFK: "가고시마", RJNK: "고마츠", ROAH: "나하",
+  // 중국 주요
+  ZBAA: "베이징", ZSPD: "상하이푸동", ZSSS: "상하이홍차오",
+  ZGGG: "광저우", ZGSZ: "선전", ZUUU: "청두", VHHH: "홍콩",
+  RCTP: "타오위안", RCSS: "쑹산",
+  // 동남아/기타
+  WSSS: "싱가포르", VTBS: "수완나품", RPLL: "마닐라",
+  WIII: "자카르타", RKDD: "동두천",
+};
+
+function airportLabel(code: string | null | undefined): string {
+  if (!code) return "?";
+  const name = AIRPORT_NAMES[code.toUpperCase()];
+  return name ? `${code}(${name})` : code;
+}
 
 // ─── 항적지도 탭: 운항이력 패널 ──────────────────────────────────────
 
@@ -54,21 +84,27 @@ function MapFlightPanel() {
     [aircraft]
   );
 
+  // 같은 날 4시간 이내 출발/도착 레코드 병합
+  const mergedFlightHistory = useMemo(
+    () => mergeFlightRecords(flightHistory),
+    [flightHistory]
+  );
+
   const [selectedAcId, setSelectedAcId] = useState<string | "__ALL__">("__ALL__");
   const [dropdownOpen, setDropdownOpen] = useState(false);
 
   // 선택된 항공기에 따른 비행 기록 필터 (최신순)
   const flights = useMemo(() => {
     if (selectedAcId === "__ALL__") {
-      return [...flightHistory].sort((a, b) => b.first_seen - a.first_seen);
+      return [...mergedFlightHistory].sort((a, b) => b.first_seen - a.first_seen);
     }
     const ac = activeAircraft.find((a) => a.id === selectedAcId);
     if (!ac) return [];
     const ms = ac.mode_s_code.toLowerCase();
-    return flightHistory
+    return mergedFlightHistory
       .filter((f) => f.icao24.toLowerCase() === ms)
       .sort((a, b) => b.first_seen - a.first_seen);
-  }, [selectedAcId, activeAircraft, flightHistory]);
+  }, [selectedAcId, activeAircraft, mergedFlightHistory]);
 
   // 선택 항공기 이름
   const selectedLabel = selectedAcId === "__ALL__"
@@ -109,10 +145,10 @@ function MapFlightPanel() {
                 onClick={() => { setSelectedAcId("__ALL__"); setDropdownOpen(false); }}
                 className={`w-full px-2 py-1 text-left text-[11px] hover:bg-gray-50 ${selectedAcId === "__ALL__" ? "font-semibold text-[#a60739]" : "text-gray-600"}`}
               >
-                전체 ({flightHistory.length})
+                전체 ({mergedFlightHistory.length})
               </button>
               {activeAircraft.map((ac) => {
-                const count = flightHistory.filter(
+                const count = mergedFlightHistory.filter(
                   (f) => f.icao24.toLowerCase() === ac.mode_s_code.toLowerCase()
                 ).length;
                 return (
@@ -179,22 +215,15 @@ function MapFlightPanel() {
                       {acName ?? f.callsign?.trim() ?? "—"}
                     </span>
                   </div>
-                  {/* 시각 + 구간 */}
+                  {/* 시각 + 구간 + 출발→도착 */}
                   <div className="mt-0.5 flex items-center gap-1 text-[10px] text-gray-500">
                     <span>{format(date, "HH:mm")}</span>
                     <span className="text-gray-300">·</span>
                     <span>{dur}분</span>
-                  </div>
-                  <div className="mt-0.5 flex items-center gap-1 text-[10px]">
-                    <PlaneTakeoff size={9} className="text-gray-400" />
-                    <span className="font-mono text-gray-600">
-                      {f.est_departure_airport || "?"}
-                    </span>
-                    <span className="text-gray-300 mx-0.5">&rarr;</span>
-                    <PlaneLanding size={9} className="text-gray-400" />
-                    <span className="font-mono text-gray-600">
-                      {f.est_arrival_airport || "?"}
-                    </span>
+                    <span className="text-gray-300">·</span>
+                    <span className="text-gray-600">{airportLabel(f.est_departure_airport)}</span>
+                    <span className="text-gray-300">&rarr;</span>
+                    <span className="text-gray-600">{airportLabel(f.est_arrival_airport)}</span>
                   </div>
                 </button>
               );

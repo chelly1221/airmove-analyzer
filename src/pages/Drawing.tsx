@@ -45,7 +45,7 @@ function circleCoords(lat: number, lon: number, radiusKm: number, steps = 64): [
 }
 
 export default function Drawing() {
-  const analysisResults = useAppStore((s) => s.analysisResults);
+  const flights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const radarSite = useAppStore((s) => s.radarSite);
   const selectedModeS = useAppStore((s) => s.selectedModeS);
@@ -74,8 +74,8 @@ export default function Drawing() {
   const { filteredPoints, colorMap, legendEntries } = useMemo(() => {
     const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
     const modeSCounts = new Map<string, number>();
-    for (const r of analysisResults) {
-      for (const p of r.file_info.track_points) {
+    for (const f of flights) {
+      for (const p of f.track_points) {
         modeSCounts.set(p.mode_s, (modeSCounts.get(p.mode_s) ?? 0) + 1);
       }
     }
@@ -86,8 +86,8 @@ export default function Drawing() {
 
     const showAll = selectedModeS === "__ALL__";
     const pts: TrackPoint[] = [];
-    for (const r of analysisResults) {
-      for (const p of r.file_info.track_points) {
+    for (const f of flights) {
+      for (const p of f.track_points) {
         if (!validModeS.has(p.mode_s)) continue;
         if (showAll) { pts.push(p); }
         else if (!selectedModeS) {
@@ -100,7 +100,14 @@ export default function Drawing() {
 
     const colorMap = new Map<string, [number, number, number]>();
     let acIdx = 0;
-    const modeSList = [...new Set(pts.map((p) => p.mode_s))];
+    const modeSList = [...new Set(pts.map((p) => p.mode_s))].sort((a, b) => {
+      const acA = aircraft.find((ac) => ac.mode_s_code.toUpperCase() === a.toUpperCase());
+      const acB = aircraft.find((ac) => ac.mode_s_code.toUpperCase() === b.toUpperCase());
+      if (acA && acB) return acA.name.localeCompare(acB.name, "ko");
+      if (acA) return -1;
+      if (acB) return 1;
+      return a.localeCompare(b);
+    });
     for (const ms of modeSList) {
       colorMap.set(ms, AIRCRAFT_COLORS[acIdx % AIRCRAFT_COLORS.length]);
       acIdx++;
@@ -116,7 +123,7 @@ export default function Drawing() {
     });
 
     return { filteredPoints: pts, colorMap, legendEntries };
-  }, [analysisResults, aircraft, selectedModeS]);
+  }, [flights, aircraft, selectedModeS]);
 
   // 시간 범위
   const timeRange = useMemo(() => {
@@ -135,7 +142,7 @@ export default function Drawing() {
   );
 
   const fmtTs = useCallback(
-    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "MM-dd HH:mm:ss") : "--/-- --:--:--"),
+    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "yyyy-MM-dd HH:mm:ss") : "----/--/-- --:--:--"),
     []
   );
 
@@ -182,8 +189,8 @@ export default function Drawing() {
   // Mode-S 드롭다운 옵션 (등록 항공기 제외)
   const modeSOptions = useMemo(() => {
     const modeSCounts = new Map<string, number>();
-    for (const r of analysisResults) {
-      for (const p of r.file_info.track_points) {
+    for (const f of flights) {
+      for (const p of f.track_points) {
         modeSCounts.set(p.mode_s, (modeSCounts.get(p.mode_s) ?? 0) + 1);
       }
     }
@@ -192,7 +199,7 @@ export default function Drawing() {
       if (cnt >= 10 && !registeredModeSSet.has(ms.toUpperCase())) valid.push(ms);
     }
     return valid.sort();
-  }, [analysisResults, registeredModeSSet]);
+  }, [flights, registeredModeSSet]);
 
   // ── 측면도 캔버스 (NM / ft) ──
   useEffect(() => {

@@ -20,6 +20,7 @@ import Card from "../components/common/Card";
 import { SimpleCard } from "../components/common/Card";
 import DataTable from "../components/common/DataTable";
 import { useAppStore } from "../store";
+import { flightLabel } from "../utils/flightConsolidation";
 import type { LossSegment } from "../types";
 
 /** 미니맵 줌 이동 */
@@ -49,17 +50,18 @@ function ZoomToSegment({ segment }: { segment: LossSegment | null }) {
 
 interface FlatLoss {
   index: number;
-  filename: string;
+  flightId: string;
+  flightLabel: string;
   segment: LossSegment;
 }
 
 export default function LossAnalysis() {
-  const analysisResults = useAppStore((s) => s.analysisResults);
+  const flights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const [selectedLoss, setSelectedLoss] = useState<FlatLoss | null>(null);
   const [sortField, setSortField] = useState<string>("start_time");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
-  const [viewMode, setViewMode] = useState<"table" | "by-file" | "compare">(
+  const [viewMode, setViewMode] = useState<"table" | "by-flight" | "compare">(
     "table"
   );
 
@@ -78,19 +80,20 @@ export default function LossAnalysis() {
   const flatLoss: FlatLoss[] = useMemo(() => {
     const items: FlatLoss[] = [];
     let idx = 0;
-    for (const r of analysisResults) {
-      for (const seg of r.loss_segments) {
-        if (registeredModeSCodes.has(seg.mode_s.toUpperCase())) {
-          items.push({
-            index: idx++,
-            filename: r.file_info.filename,
-            segment: seg,
-          });
-        }
+    for (const f of flights) {
+      if (!registeredModeSCodes.has(f.mode_s.toUpperCase())) continue;
+      const label = flightLabel(f, aircraft);
+      for (const seg of f.loss_segments) {
+        items.push({
+          index: idx++,
+          flightId: f.id,
+          flightLabel: label,
+          segment: seg,
+        });
       }
     }
     return items;
-  }, [analysisResults, registeredModeSCodes]);
+  }, [flights, registeredModeSCodes, aircraft]);
 
   // 정렬
   const sorted = useMemo(() => {
@@ -151,6 +154,12 @@ export default function LossAnalysis() {
     );
   };
 
+  // 비행검사기 비행만 필터
+  const registeredFlights = useMemo(
+    () => flights.filter((f) => registeredModeSCodes.has(f.mode_s.toUpperCase())),
+    [flights, registeredModeSCodes]
+  );
+
   const columns = [
     {
       key: "index",
@@ -168,10 +177,10 @@ export default function LossAnalysis() {
       ),
     },
     {
-      key: "filename",
-      header: "파일",
+      key: "flight",
+      header: "비행",
       render: (row: FlatLoss) => (
-        <span className="text-gray-600 text-xs">{row.filename}</span>
+        <span className="text-gray-600 text-xs">{row.flightLabel}</span>
       ),
     },
     {
@@ -229,7 +238,7 @@ export default function LossAnalysis() {
           {(
             [
               ["table", "테이블"],
-              ["by-file", "파일별"],
+              ["by-flight", "비행별"],
               ["compare", "비교"],
             ] as const
           ).map(([mode, label]) => (
@@ -276,58 +285,6 @@ export default function LossAnalysis() {
         />
       </div>
 
-      {/* 파싱 통계 */}
-      {analysisResults.length > 0 && (
-        <SimpleCard>
-          <h3 className="mb-3 text-sm font-semibold text-gray-800">파싱 통계</h3>
-          <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-xs sm:grid-cols-3 lg:grid-cols-6">
-            {analysisResults.map((r) => {
-              const s = r.file_info.parse_stats;
-              if (!s) return null;
-              return (
-                <div key={`stats-${r.file_info.filename}`} className="col-span-full">
-                  <p className="mb-1.5 font-medium text-gray-700">{r.file_info.filename}</p>
-                  <div className="grid grid-cols-3 gap-x-6 gap-y-1 sm:grid-cols-6">
-                    <div>
-                      <span className="text-gray-500">ASTERIX 레코드</span>
-                      <p className="font-mono font-semibold text-gray-800">{s.total_asterix_records.toLocaleString()}</p>
-                    </div>
-                    <div>
-                      <span className="text-gray-500">Garbled 제거</span>
-                      <p className="font-mono font-semibold text-red-600">{s.garbled_removed.toLocaleString()}</p>
-                    </div>
-                    <div>
-                      <span className="text-gray-500">Mode 3/A 무효</span>
-                      <p className="font-mono font-semibold text-amber-600">{(s.mode3a_invalid ?? 0).toLocaleString()}</p>
-                    </div>
-                    <div>
-                      <span className="text-gray-500">ATCRBS 병합</span>
-                      <p className="font-mono font-semibold text-blue-600">{s.atcrbs_merged.toLocaleString()}</p>
-                    </div>
-                    <div>
-                      <span className="text-gray-500">ATCRBS 미매칭</span>
-                      <p className="font-mono font-semibold text-gray-600">{s.atcrbs_unmatched.toLocaleString()}</p>
-                    </div>
-                    <div>
-                      <span className="text-gray-500">PSR/None 폐기</span>
-                      <p className="font-mono font-semibold text-gray-600">{s.discarded_psr_none.toLocaleString()}</p>
-                    </div>
-                  </div>
-                  <div className="mt-1.5 grid grid-cols-3 gap-x-6 gap-y-1 sm:grid-cols-6">
-                    {["Mode A/C", "Mode A/C+PSR", "Mode S All-Call", "Mode S Roll-Call", "Mode S AC+PSR", "Mode S RC+PSR"].map((label, i) => (
-                      <div key={label}>
-                        <span className="text-gray-500">{label}</span>
-                        <p className="font-mono font-semibold text-gray-800">{s.points_by_type[i].toLocaleString()}</p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </SimpleCard>
-      )}
-
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         {/* Table or alternate views */}
         <div className="lg:col-span-2">
@@ -364,47 +321,81 @@ export default function LossAnalysis() {
             </div>
           )}
 
-          {viewMode === "by-file" && (
+          {viewMode === "by-flight" && (
             <div className="space-y-4">
-              {analysisResults.length === 0 ? (
+              {registeredFlights.length === 0 ? (
                 <SimpleCard>
                   <p className="text-center text-sm text-gray-500 py-8">
                     분석 결과가 없습니다
                   </p>
                 </SimpleCard>
               ) : (
-                analysisResults.map((r) => (
-                  <SimpleCard key={`file-${r.file_info.filename}`}>
-                    <div className="mb-3 flex items-center justify-between">
-                      <h3 className="font-medium text-gray-800">
-                        {r.file_info.filename}
-                      </h3>
-                      <span className="rounded bg-[#a60739]/15 px-2 py-0.5 text-xs font-medium text-[#a60739]">
-                        소실 {r.loss_percentage.toFixed(1)}%
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-3 text-center text-xs">
-                      <div className="rounded-lg bg-gray-50 p-2">
-                        <p className="text-gray-500">소실 건수</p>
-                        <p className="text-lg font-bold text-gray-800">
-                          {r.loss_segments.length}
-                        </p>
+                registeredFlights.map((f) => {
+                  // 이 비행의 포인트 타입별 통계
+                  const typeCounts: Record<string, number> = {};
+                  for (const p of f.track_points) {
+                    typeCounts[p.radar_type] = (typeCounts[p.radar_type] ?? 0) + 1;
+                  }
+                  const typeLabels: Record<string, string> = {
+                    mode_ac: "Mode A/C",
+                    mode_ac_psr: "A/C+PSR",
+                    mode_s_allcall: "S All-Call",
+                    mode_s_rollcall: "S Roll-Call",
+                    mode_s_allcall_psr: "S AC+PSR",
+                    mode_s_rollcall_psr: "S RC+PSR",
+                  };
+
+                  return (
+                    <SimpleCard key={`flight-${f.id}`}>
+                      <div className="mb-3 flex items-center justify-between">
+                        <h3 className="font-medium text-gray-800">
+                          {flightLabel(f, aircraft)}
+                        </h3>
+                        <span className="rounded bg-[#a60739]/15 px-2 py-0.5 text-xs font-medium text-[#a60739]">
+                          소실 {f.loss_percentage.toFixed(1)}%
+                        </span>
                       </div>
-                      <div className="rounded-lg bg-gray-50 p-2">
-                        <p className="text-gray-500">총 소실 시간</p>
-                        <p className="text-lg font-bold text-gray-800">
-                          {r.total_loss_time.toFixed(1)}초
-                        </p>
+                      <div className="grid grid-cols-3 gap-3 text-center text-xs">
+                        <div className="rounded-lg bg-gray-50 p-2">
+                          <p className="text-gray-500">소실 건수</p>
+                          <p className="text-lg font-bold text-gray-800">
+                            {f.loss_segments.length}
+                          </p>
+                        </div>
+                        <div className="rounded-lg bg-gray-50 p-2">
+                          <p className="text-gray-500">총 소실 시간</p>
+                          <p className="text-lg font-bold text-gray-800">
+                            {f.total_loss_time.toFixed(1)}초
+                          </p>
+                        </div>
+                        <div className="rounded-lg bg-gray-50 p-2">
+                          <p className="text-gray-500">추적 시간</p>
+                          <p className="text-lg font-bold text-gray-800">
+                            {(f.total_track_time / 60).toFixed(1)}분
+                          </p>
+                        </div>
                       </div>
-                      <div className="rounded-lg bg-gray-50 p-2">
-                        <p className="text-gray-500">추적 시간</p>
-                        <p className="text-lg font-bold text-gray-800">
-                          {(r.total_track_time / 60).toFixed(1)}분
-                        </p>
-                      </div>
-                    </div>
-                  </SimpleCard>
-                ))
+                      {/* 레이더 타입별 포인트 통계 */}
+                      {Object.keys(typeCounts).length > 0 && (
+                        <div className="mt-3 border-t border-gray-100 pt-2">
+                          <p className="mb-1.5 text-[11px] font-medium text-gray-500">레이더 탐지 유형별 포인트</p>
+                          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
+                            {Object.entries(typeCounts).map(([type, count]) => (
+                              <div key={type} className="flex items-center gap-1.5">
+                                <span className="text-gray-500">{typeLabels[type] ?? type}</span>
+                                <span className="font-mono font-semibold text-gray-800">{count.toLocaleString()}</span>
+                              </div>
+                            ))}
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-gray-500">합계</span>
+                              <span className="font-mono font-semibold text-gray-800">{f.track_points.length.toLocaleString()}</span>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </SimpleCard>
+                  );
+                })
               )}
             </div>
           )}
@@ -412,21 +403,22 @@ export default function LossAnalysis() {
           {viewMode === "compare" && (
             <SimpleCard>
               <h3 className="mb-4 font-medium text-gray-800">
-                파일별 소실 비율 비교
+                비행별 소실 비율 비교
               </h3>
-              {analysisResults.length === 0 ? (
+              {registeredFlights.length === 0 ? (
                 <p className="text-center text-sm text-gray-500 py-8">
                   비교할 분석 결과가 없습니다
                 </p>
               ) : (
                 <div className="space-y-3">
-                  {analysisResults.map((r) => {
-                    const pct = r.loss_percentage;
+                  {registeredFlights.map((f) => {
+                    const pct = f.loss_percentage;
+                    const label = flightLabel(f, aircraft);
                     return (
-                      <div key={`cmp-${r.file_info.filename}`}>
+                      <div key={`cmp-${f.id}`}>
                         <div className="mb-1 flex items-center justify-between text-xs">
                           <span className="text-gray-600">
-                            {r.file_info.filename}
+                            {label}
                           </span>
                           <span
                             className={

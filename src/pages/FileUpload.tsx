@@ -19,20 +19,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store";
+import { consolidateFlights } from "../utils/flightConsolidation";
 import type { AdsbTrack, AnalysisResult, FlightRecord, UploadedFile } from "../types";
 
 export default function FileUpload() {
   const uploadedFiles = useAppStore((s) => s.uploadedFiles);
   const addUploadedFile = useAppStore((s) => s.addUploadedFile);
   const updateUploadedFile = useAppStore((s) => s.updateUploadedFile);
-  const removeUploadedFile = useAppStore((s) => s.removeUploadedFile);
   const clearUploadedFiles = useAppStore((s) => s.clearUploadedFiles);
-  const addAnalysisResult = useAppStore((s) => s.addAnalysisResult);
+  const appendRawTrackPoints = useAppStore((s) => s.appendRawTrackPoints);
+  const addParseStats = useAppStore((s) => s.addParseStats);
+  const rawTrackPoints = useAppStore((s) => s.rawTrackPoints);
+  const setFlights = useAppStore((s) => s.setFlights);
   const aircraft = useAppStore((s) => s.aircraft);
   const radarSite = useAppStore((s) => s.radarSite);
   const setRadarSite = useAppStore((s) => s.setRadarSite);
   const customRadarSites = useAppStore((s) => s.customRadarSites);
-  const analysisResults = useAppStore((s) => s.analysisResults);
   const adsbTracks = useAppStore((s) => s.adsbTracks);
   const setAdsbTracks = useAppStore((s) => s.setAdsbTracks);
   const adsbLoading = useAppStore((s) => s.adsbLoading);
@@ -65,22 +67,40 @@ export default function FileUpload() {
     for (const a of aircraft) {
       if (!a.active || !a.mode_s_code) continue;
       const ms = a.mode_s_code.toUpperCase();
-      for (const r of analysisResults) {
-        for (const p of r.file_info.track_points) {
-          if (p.mode_s.toUpperCase() !== ms) continue;
-          const prev = ranges.get(ms);
-          if (!prev) {
-            ranges.set(ms, { name: a.name, minTs: p.timestamp, maxTs: p.timestamp, points: 1 });
-          } else {
-            if (p.timestamp < prev.minTs) prev.minTs = p.timestamp;
-            if (p.timestamp > prev.maxTs) prev.maxTs = p.timestamp;
-            prev.points++;
-          }
+      for (const p of rawTrackPoints) {
+        if (p.mode_s.toUpperCase() !== ms) continue;
+        const prev = ranges.get(ms);
+        if (!prev) {
+          ranges.set(ms, { name: a.name, minTs: p.timestamp, maxTs: p.timestamp, points: 1 });
+        } else {
+          if (p.timestamp < prev.minTs) prev.minTs = p.timestamp;
+          if (p.timestamp > prev.maxTs) prev.maxTs = p.timestamp;
+          prev.points++;
         }
       }
     }
     return ranges;
-  }, [aircraft, analysisResults]);
+  }, [aircraft, rawTrackPoints]);
+
+  // 비행 통합 실행
+  const runConsolidation = useCallback(() => {
+    const state = useAppStore.getState();
+    if (state.rawTrackPoints.length === 0) return;
+    const consolidated = consolidateFlights(
+      state.rawTrackPoints,
+      state.flightHistory,
+      state.aircraft,
+      state.radarSite,
+    );
+    setFlights(consolidated);
+  }, [setFlights]);
+
+  // flightHistory가 변경되면 재통합 (DB 캐시 로드 또는 API 동기화 결과 반영)
+  useEffect(() => {
+    if (rawTrackPoints.length > 0) {
+      runConsolidation();
+    }
+  }, [flightHistory]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fetchAdsb = useCallback(async () => {
     if (registeredTrackRanges.size === 0) return;
@@ -102,9 +122,7 @@ export default function FileUpload() {
         }
       }
       if (queries.length === 0) { setAdsbLoading(false); return; }
-      // API 조회 (건별 DB 저장은 Rust에서 처리)
       await invoke("fetch_adsb_tracks", { queries });
-      // DB에서 전체 로드
       const icao24List = [...registeredTrackRanges.keys()];
       const ranges = [...registeredTrackRanges.values()];
       const start = Math.min(...ranges.map((r) => r.minTs));
@@ -132,7 +150,6 @@ export default function FileUpload() {
           end: Math.round(maxTs),
         });
       }
-      // DB에서 전체 로드
       const icao24List = [...registeredTrackRanges.keys()];
       const ranges = [...registeredTrackRanges.values()];
       const start = Math.min(...ranges.map((r) => r.minTs));
@@ -167,9 +184,13 @@ export default function FileUpload() {
     };
   }, [setAdsbProgress, setFlightHistoryProgress]);
 
-  // 분석 결과 변경 시 DB에서 기존 데이터 자동 로드
+  // rawTrackPoints 변경 시 DB에서 기존 데이터 자동 로드 + 비행 통합
   useEffect(() => {
-    if (registeredTrackRanges.size === 0) return;
+    if (registeredTrackRanges.size === 0) {
+      // 등록 항공기 없어도 rawTrackPoints가 있으면 통합 실행
+      if (rawTrackPoints.length > 0) runConsolidation();
+      return;
+    }
     const icao24List = [...registeredTrackRanges.keys()];
     const ranges = [...registeredTrackRanges.values()];
     const start = Math.min(...ranges.map((r) => r.minTs));
@@ -180,12 +201,20 @@ export default function FileUpload() {
     }).then((tracks) => {
       if (tracks.length > 0) setAdsbTracks(tracks);
     }).catch(() => {});
-    // 운항이력
+    // 운항이력 — DB에서 로드 후 setFlightHistory → flightHistory useEffect가 재통합 트리거
     invoke<FlightRecord[]>("load_flight_history", {
       icao24_list: icao24List, start, end,
     }).then((records) => {
-      if (records.length > 0) setFlightHistory(records);
-    }).catch(() => {});
+      if (records.length > 0) {
+        setFlightHistory(records);
+      } else {
+        // DB에 운항이력 없어도 통합 실행 (gap 분리로라도)
+        runConsolidation();
+      }
+    }).catch(() => {
+      // DB 로드 실패 시에도 통합 실행
+      runConsolidation();
+    });
   }, [registeredTrackRanges]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleFilePick = async () => {
@@ -247,22 +276,23 @@ export default function FileUpload() {
     setShowRadarModal(true);
   };
 
-  const handleRadarConfirm = () => {
+  const handleRadarConfirm = async () => {
     setShowRadarModal(false);
-    // 선택한 사이트를 store에 반영 후 파싱 시작
     setRadarSite(modalSelectedSite);
     if (radarModalAction === "single" && pendingParseFileRef.current) {
-      parseFile(pendingParseFileRef.current);
+      await parseFile(pendingParseFileRef.current);
+      // 단일 파일 파싱 후에도 비행 통합 (DB 로드는 registeredTrackRanges useEffect에서 처리)
+      runConsolidation();
     } else {
       parseAllInternal();
     }
   };
 
-  // Mode-S 필터 생성: "aircraft" 모드면 등록된 활성 기체의 Mode-S 코드 목록
+  // Mode-S 필터 생성
   const getModeSFilter = (): string[] => {
     if (parseMode === "all") return [];
     const activeAircraft = useAppStore.getState().aircraft.filter((a) => a.active);
-    if (activeAircraft.length === 0) return []; // 등록 기체 없으면 전체 파싱
+    if (activeAircraft.length === 0) return [];
     return activeAircraft.map((a) => a.mode_s_code.toUpperCase());
   };
 
@@ -278,7 +308,19 @@ export default function FileUpload() {
         radarLon: currentSite.longitude,
         modeSFilter,
       });
-      addAnalysisResult(result);
+
+      // 원시 포인트 축적
+      appendRawTrackPoints(result.file_info.track_points);
+
+      // 파싱 통계 저장
+      if (result.file_info.parse_stats) {
+        addParseStats(
+          result.file_info.filename,
+          result.file_info.parse_stats,
+          result.file_info.total_records,
+        );
+      }
+
       updateUploadedFile(file.path, {
         status: "done",
         parsedFile: result.file_info,
@@ -306,6 +348,9 @@ export default function FileUpload() {
     for (const file of pending) {
       await parseFile(file);
     }
+
+    // 모든 파일 파싱 완료 후 비행 통합
+    runConsolidation();
   };
 
   const pendingCount = uploadedFiles.filter(
@@ -448,13 +493,6 @@ export default function FileUpload() {
                           <Play size={14} />
                         </button>
                       )}
-                      <button
-                        onClick={() => removeUploadedFile(file.path)}
-                        className="rounded p-1.5 text-gray-500 hover:bg-red-500/20 hover:text-red-600 transition-colors"
-                        title="제거"
-                      >
-                        <Trash2 size={14} />
-                      </button>
                     </div>
                   </div>
                 </div>
