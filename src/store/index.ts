@@ -60,6 +60,8 @@ interface AppState {
   // 필터
   selectedModeS: string | null;
   setSelectedModeS: (modeS: string | null) => void;
+  selectedFlightId: string | null;
+  setSelectedFlightId: (id: string | null) => void;
 
   // LOS 분석
   losResults: LOSProfileData[];
@@ -96,6 +98,8 @@ interface AppState {
   setOpenskySyncProgress: (msg: string) => void;
   openskySyncVersion: number;
   triggerOpenskySync: () => void;
+  openskySyncCancelled: boolean;
+  cancelOpenskySync: () => void;
 
   // UI
   activePage: PageId;
@@ -164,6 +168,7 @@ export const useAppStore = create<AppState>((set) => ({
       parseStatsList: [],
       flights: [],
       selectedModeS: null,
+      selectedFlightId: null,
     });
   },
 
@@ -243,6 +248,8 @@ export const useAppStore = create<AppState>((set) => ({
   // 필터
   selectedModeS: null,
   setSelectedModeS: (modeS) => set({ selectedModeS: modeS }),
+  selectedFlightId: null,
+  setSelectedFlightId: (id) => set({ selectedFlightId: id }),
 
   // LOS 분석
   losResults: [],
@@ -290,7 +297,9 @@ export const useAppStore = create<AppState>((set) => ({
   setOpenskySyncProgress: (msg) => set({ openskySyncProgress: msg }),
   openskySyncVersion: 0,
   triggerOpenskySync: () =>
-    set((state) => ({ openskySyncVersion: state.openskySyncVersion + 1 })),
+    set((state) => ({ openskySyncVersion: state.openskySyncVersion + 1, openskySyncCancelled: false })),
+  openskySyncCancelled: false,
+  cancelOpenskySync: () => set({ openskySyncCancelled: true }),
 
   // UI
   activePage: "upload",

@@ -886,6 +886,8 @@ function DatabaseSection() {
       setImporting(true);
       setStatus(null);
       setConfirmImport(null);
+      // 진행 중인 OpenSky 동기화 중단
+      useAppStore.getState().cancelOpenskySync();
       await invoke("import_database", { srcPath: confirmImport });
       setStatus({ type: "success", message: "데이터베이스를 가져왔습니다. 페이지를 새로고침합니다..." });
       // 상태 반영을 위해 앱 새로고침

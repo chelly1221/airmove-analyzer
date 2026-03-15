@@ -101,7 +101,12 @@ export default function ReportGeneration() {
           }
         }
         if (minLat < maxLat && minLon < maxLon) {
-          map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 60, duration: 0 });
+          map.fitBounds([[minLon, minLat], [maxLon, maxLat]], {
+            padding: 60,
+            duration: 0,
+            bearing: 0,
+            pitch: 0,
+          });
         }
       }
 

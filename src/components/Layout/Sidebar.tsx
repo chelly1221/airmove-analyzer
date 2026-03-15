@@ -19,6 +19,20 @@ import { useAppStore } from "../../store";
 import { mergeFlightRecords } from "../../utils/flightConsolidation";
 import type { FlightRecord, PageId } from "../../types";
 
+/** 항공기별 색상 팔레트 (TrackMap과 동일) */
+const AIRCRAFT_COLORS: [number, number, number][] = [
+  [59, 130, 246],   // blue
+  [16, 185, 129],   // emerald
+  [139, 92, 246],   // violet
+  [6, 182, 212],    // cyan
+  [249, 115, 22],   // orange
+  [236, 72, 153],   // pink
+  [132, 204, 22],   // lime
+  [245, 158, 11],   // amber
+  [99, 102, 241],   // indigo
+  [20, 184, 166],   // teal
+];
+
 interface NavItem {
   id: PageId;
   label: string;
@@ -46,10 +60,10 @@ const AIRPORT_NAMES: Record<string, string> = {
   RKJK: "군산", RKNW: "원주", RKJY: "여수", RKPU: "울산",
   RKPS: "사천", RKTH: "포항", RKJB: "무안",
   // 한국 군용/기타
-  RKSO: "오산", RKSG: "평택", RKSM: "성남", RKSE: "서울",
-  RKSW: "수원", RKTI: "이천", RKJM: "목포", RKTE: "예천",
+  RKSO: "K-55", RKSG: "평택", RKSM: "성남", RKSE: "서울",
+  RKSW: "K-13", RKTI: "K-75", RKJM: "목포", RKTE: "예천",
   RKTP: "패평", RKNN: "강릉", RKNC: "춘천", RKRA: "안동",
-  RKRN: "속초",
+  RKRN: "속초", RKUL: "G-536", RKRB: "G-103",
   // 일본 주요
   RJTT: "하네다", RJAA: "나리타", RJBB: "간사이", RJOO: "이타미",
   RJFF: "후쿠오카", RJCC: "신치토세", RJGG: "주부", RJSN: "니가타",
@@ -63,10 +77,24 @@ const AIRPORT_NAMES: Record<string, string> = {
   WIII: "자카르타", RKDD: "동두천",
 };
 
+/** 공항 ICAO → 상세 설명 (툴팁용) */
+const AIRPORT_TOOLTIP: Record<string, string> = {
+  RKSO: "K-55 전술항공작전기지",
+  RKSW: "K-13 전술항공작전기지",
+  RKTI: "K-75 전술항공작전기지",
+  RKUL: "G-536 지원항공작전기지",
+  RKRB: "G-103 헬기전용작전기지",
+};
+
 function airportLabel(code: string | null | undefined): string {
   if (!code) return "?";
   const name = AIRPORT_NAMES[code.toUpperCase()];
   return name ? `${code}(${name})` : code;
+}
+
+function airportTooltip(code: string | null | undefined): string | undefined {
+  if (!code) return undefined;
+  return AIRPORT_TOOLTIP[code.toUpperCase()];
 }
 
 // ─── 항적지도 탭: 운항이력 패널 ──────────────────────────────────────
@@ -120,11 +148,39 @@ function MapFlightPanel() {
     return m;
   }, [activeAircraft]);
 
+  const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
+  const setSelectedFlightId = useAppStore((s) => s.setSelectedFlightId);
+  const storeFlights = useAppStore((s) => s.flights);
+
+  // 항공기 인덱스 → 색상 매핑
+  const acColorMap = useMemo(() => {
+    const m: Record<string, [number, number, number]> = {};
+    activeAircraft.forEach((ac, i) => {
+      m[ac.mode_s_code.toLowerCase()] = AIRCRAFT_COLORS[i % AIRCRAFT_COLORS.length];
+    });
+    return m;
+  }, [activeAircraft]);
+
   const handleSelect = (f: FlightRecord) => {
     const isSame =
       selectedFlight?.icao24 === f.icao24 &&
       selectedFlight?.first_seen === f.first_seen;
-    setSelectedFlight(isSame ? null : f);
+    if (isSame) {
+      setSelectedFlight(null);
+      setSelectedModeS(null);
+      setSelectedFlightId(null);
+    } else {
+      setSelectedFlight(f);
+      setSelectedModeS(f.icao24.toUpperCase());
+      // 시간 범위가 겹치는 Flight 찾기 (±5분 허용)
+      const modeS = f.icao24.toUpperCase();
+      const matchedFlight = storeFlights.find((sf) =>
+        sf.mode_s.toUpperCase() === modeS &&
+        sf.start_time <= f.last_seen + 300 &&
+        sf.end_time >= f.first_seen - 300
+      );
+      setSelectedFlightId(matchedFlight?.id ?? null);
+    }
   };
 
   return (
@@ -196,34 +252,34 @@ function MapFlightPanel() {
               const acName = selectedAcId === "__ALL__"
                 ? icaoToName[f.icao24.toLowerCase()]
                 : undefined;
+              const pointColor = acColorMap[f.icao24.toLowerCase()] ?? [128, 128, 128];
               return (
                 <button
                   key={`${f.icao24}_${f.first_seen}`}
                   onClick={() => handleSelect(f)}
                   className={`w-full rounded-md px-2 py-1.5 text-left transition-colors ${
-                    isSelected
-                      ? "bg-[#a60739]/10 ring-1 ring-[#a60739]/30"
-                      : "hover:bg-gray-50"
+                    isSelected ? "" : "hover:bg-gray-50"
                   }`}
+                  style={isSelected ? { backgroundColor: `rgb(${pointColor[0]},${pointColor[1]},${pointColor[2]})` } : undefined}
                 >
                   {/* 날짜 + 콜사인/항공기명 */}
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-medium text-gray-700">
-                      {format(date, "M/d (EEE)", { locale: ko })}
+                    <span className={`text-[11px] font-medium ${isSelected ? "text-white" : "text-gray-700"}`}>
+                      {format(date, "yyyy/MM/dd (EEE)", { locale: ko })}
                     </span>
-                    <span className="text-[10px] font-mono text-gray-400">
+                    <span className={`text-[10px] font-mono ${isSelected ? "text-white/70" : "text-gray-400"}`}>
                       {acName ?? f.callsign?.trim() ?? "—"}
                     </span>
                   </div>
                   {/* 시각 + 구간 + 출발→도착 */}
-                  <div className="mt-0.5 flex items-center gap-1 text-[10px] text-gray-500">
+                  <div className={`mt-0.5 flex items-center gap-1 text-[10px] ${isSelected ? "text-white/80" : "text-gray-500"}`}>
                     <span>{format(date, "HH:mm")}</span>
-                    <span className="text-gray-300">·</span>
+                    <span className={isSelected ? "text-white/40" : "text-gray-300"}>·</span>
                     <span>{dur}분</span>
-                    <span className="text-gray-300">·</span>
-                    <span className="text-gray-600">{airportLabel(f.est_departure_airport)}</span>
-                    <span className="text-gray-300">&rarr;</span>
-                    <span className="text-gray-600">{airportLabel(f.est_arrival_airport)}</span>
+                    <span className={isSelected ? "text-white/40" : "text-gray-300"}>·</span>
+                    <span className={isSelected ? "text-white/90" : "text-gray-600"} title={airportTooltip(f.est_departure_airport)}>{airportLabel(f.est_departure_airport)}</span>
+                    <span className={isSelected ? "text-white/40" : "text-gray-300"}>&rarr;</span>
+                    <span className={isSelected ? "text-white/90" : "text-gray-600"} title={airportTooltip(f.est_arrival_airport)}>{airportLabel(f.est_arrival_airport)}</span>
                   </div>
                 </button>
               );

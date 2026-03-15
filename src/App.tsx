@@ -195,30 +195,44 @@ function useOpenskyAutoSync() {
       const fiveYears = 5 * 365 * 86400;
       let hadRateLimit = false;
 
-      console.log(`[OpenSky] 동기화 시작: ${activeAircraft.length}대, 최근 5년`);
+      // 30일 단위 시간 윈도우를 최신→과거 순으로, 모든 항공기 교차 조회
+      const chunkSize = 30 * 86400; // 30일
+      const totalChunks = Math.ceil(fiveYears / chunkSize);
+      console.log(`[OpenSky] 동기화 시작: ${activeAircraft.length}대, ${totalChunks}개 월별 윈도우 (최신→과거)`);
 
-      for (const ac of activeAircraft) {
-        if (cancelled) break;
-        useAppStore.getState().setOpenskySyncProgress(`${ac.name} 운항이력 동기화 중...`);
-        try {
-          const records = await invoke<FlightRecord[]>("fetch_flight_history", {
-            icao24: ac.mode_s_code,
-            begin: now - fiveYears,
-            end: now,
-          });
-          console.log(`[OpenSky] ${ac.name}: ${records.length}건 완료`);
-          if (records.length > 0) {
-            useAppStore.getState().addFlightHistory(records);
-          }
-        } catch (e) {
-          const msg = String(e);
-          console.warn(`[OpenSky] ${ac.name} 동기화 오류:`, msg);
-          if (msg.includes("인증정보") || msg.includes("접근 거부")) {
-            useAppStore.getState().setOpenskySyncProgress("OpenSky 인증정보를 설정에서 확인하세요");
-            break;
-          }
-          if (msg.includes("rate limit") || msg.includes("429")) {
-            hadRateLimit = true;
+      const isCancelled = () => cancelled || useAppStore.getState().openskySyncCancelled;
+
+      let authFailed = false;
+      for (let ci = 0; ci < totalChunks; ci++) {
+        if (isCancelled() || authFailed) break;
+        const chunkEnd = now - ci * chunkSize;
+        const chunkBegin = Math.max(now - (ci + 1) * chunkSize, now - fiveYears);
+
+        for (const ac of activeAircraft) {
+          if (isCancelled() || authFailed) break;
+          const progressLabel = `${ac.name} (${ci + 1}/${totalChunks})`;
+          useAppStore.getState().setOpenskySyncProgress(progressLabel);
+          try {
+            const records = await invoke<FlightRecord[]>("fetch_flight_history", {
+              icao24: ac.mode_s_code,
+              begin: chunkBegin,
+              end: chunkEnd,
+            });
+            if (records.length > 0) {
+              console.log(`[OpenSky] ${ac.name} [${ci + 1}/${totalChunks}]: ${records.length}건`);
+              useAppStore.getState().addFlightHistory(records);
+            }
+          } catch (e) {
+            const msg = String(e);
+            console.warn(`[OpenSky] ${ac.name} 동기화 오류:`, msg);
+            if (msg.includes("인증정보") || msg.includes("접근 거부")) {
+              useAppStore.getState().setOpenskySyncProgress("OpenSky 인증정보를 설정에서 확인하세요");
+              authFailed = true;
+              break;
+            }
+            if (msg.includes("rate limit") || msg.includes("429")) {
+              hadRateLimit = true;
+            }
           }
         }
       }
@@ -227,8 +241,12 @@ function useOpenskyAutoSync() {
       useAppStore.getState().setOpenskySyncProgress("");
       syncingRef.current = false;
 
+      if (isCancelled()) {
+        console.log("[OpenSky] 동기화 취소됨 (DB 가져오기 등)");
+      }
+
       // 한도 초과 시 30분 후 자동 재시도
-      if (hadRateLimit && !cancelled) {
+      if (hadRateLimit && !isCancelled()) {
         console.log("[OpenSky] Rate limit — 30분 후 재시도 예약");
         useAppStore.getState().setOpenskySyncProgress("일일 한도 초과 — 30분 후 재시도");
         retryTimerRef.current = setTimeout(() => {

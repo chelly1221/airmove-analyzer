@@ -87,6 +87,10 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const xZoomRef = useRef<[number, number]>([0, 100]);
   const [hoveredTrackIdx, setHoveredTrackIdx] = useState<number | null>(null);
   const [pinnedTrackIdx, setPinnedTrackIdx] = useState<number | null>(null);
+  // 드래그 패닝
+  const isDragging = useRef(false);
+  const dragStartX = useRef(0);
+  const dragStartZoom = useRef<[number, number]>([0, 100]);
 
   const totalDist = haversine(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
   const bearing = bearingDeg(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
@@ -406,9 +410,55 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       xZoomRef.current = next;
       setXZoom(next);
     };
+    const onMouseDown = (e: MouseEvent) => {
+      // 줌 상태가 아니면 드래그 패닝 불필요
+      const [s, en] = xZoomRef.current;
+      if (s === 0 && en === 100) return;
+      const rect = svg.getBoundingClientRect();
+      const svgX = ((e.clientX - rect.left) / rect.width) * W;
+      if (svgX < PAD.left || svgX > W - PAD.right) return;
+      isDragging.current = true;
+      dragStartX.current = e.clientX;
+      dragStartZoom.current = [...xZoomRef.current];
+      svg.style.cursor = "grabbing";
+      e.preventDefault();
+    };
+    const onMouseMoveGlobal = (e: MouseEvent) => {
+      if (!isDragging.current) return;
+      const rect = svg.getBoundingClientRect();
+      const dx = e.clientX - dragStartX.current;
+      const [origS, origE] = dragStartZoom.current;
+      const range = origE - origS;
+      // dx 픽셀을 줌 %로 변환 (차트 영역 폭 기준)
+      const chartPxWidth = rect.width * (cw / W);
+      const shift = -(dx / chartPxWidth) * range;
+      let newStart = origS + shift;
+      let newEnd = origE + shift;
+      if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+      if (newEnd > 100) { newStart -= (newEnd - 100); newEnd = 100; }
+      newStart = Math.max(0, newStart);
+      newEnd = Math.min(100, newEnd);
+      const next: [number, number] = [newStart, newEnd];
+      xZoomRef.current = next;
+      setXZoom(next);
+    };
+    const onMouseUpGlobal = () => {
+      if (isDragging.current) {
+        isDragging.current = false;
+        svg.style.cursor = "";
+      }
+    };
     svg.addEventListener("wheel", onWheel, { passive: false });
-    return () => svg.removeEventListener("wheel", onWheel);
-  }, [cw]);
+    svg.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("mousemove", onMouseMoveGlobal);
+    document.addEventListener("mouseup", onMouseUpGlobal);
+    return () => {
+      svg.removeEventListener("wheel", onWheel);
+      svg.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("mousemove", onMouseMoveGlobal);
+      document.removeEventListener("mouseup", onMouseUpGlobal);
+    };
+  }, [cw, loading]);
 
   // 줌 리셋 (프로파일 변경 시)
   useEffect(() => {
@@ -418,6 +468,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
   // 마우스 이동 핸들러 (SVG 좌표 → 거리)
   const handleSvgMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    if (isDragging.current) return; // 드래그 중에는 크로스헤어 비활성
     const svg = svgRef.current;
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
@@ -554,7 +605,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     for (let xn = xTickStartNm; xn <= zoomEndNm; xn += xStepNm) xTicks.push(xn / KM_TO_NM); // km으로 변환
 
     return (
-      <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ minHeight: 220 }}
+      <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full"
+        style={{ minHeight: 220, cursor: xZoom[0] !== 0 || xZoom[1] !== 100 ? "grab" : undefined }}
         onMouseMove={handleSvgMouseMove} onMouseLeave={handleSvgMouseLeave}>
         <defs>
           <linearGradient id="terrainGrad" x1="0" y1="0" x2="0" y2="1">

@@ -54,9 +54,10 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
     ? Array.from({ length: 10 }, (_, i) => getWeekStats(flights, i))
     : [];
 
-  // 비행검사기별 그룹핑
+  // 비행검사기별 그룹핑 (OpenSky 매칭된 실제 비행만)
+  const realFlights = flights.filter((f) => f.match_type === "opensky");
   const byAircraft = new Map<string, Flight[]>();
-  for (const f of flights) {
+  for (const f of realFlights) {
     const name = f.aircraft_name ?? f.mode_s;
     let arr = byAircraft.get(name);
     if (!arr) {
@@ -67,7 +68,7 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
   }
 
   // 막대 차트용 최대값
-  const maxLossPercent = Math.max(...flights.map((f) => f.loss_percentage), 1);
+  const maxLossPercent = Math.max(...realFlights.map((f) => f.loss_percentage), 1);
 
   return (
     <div className="mb-8">
@@ -75,7 +76,7 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
         {sectionNum}. 분석 통계
       </h2>
 
-      {/* 주간 보고서: 4주 추이 테이블 */}
+      {/* 주간 보고서: 10주 추이 테이블 */}
       {isWeekly && weeks.length > 0 && (
         <div className="mb-6">
           <h3 className="mb-2 text-[12px] font-semibold text-gray-700">주간 변화 추이 (최근 10주)</h3>
@@ -113,7 +114,7 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
         </div>
       )}
 
-      {/* 비행검사기별 비행 분석 */}
+      {/* 비행검사기별 비행 분석 (OpenSky 매칭 비행만) */}
       {[...byAircraft.entries()].sort(([a], [b]) => a.localeCompare(b, "ko")).map(([acName, acFlights]) => (
         <div key={acName} className="mb-5">
           <h3 className="mb-2 text-[12px] font-semibold text-gray-700">

@@ -4,12 +4,14 @@ import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { PathLayer, ScatterplotLayer, LineLayer, IconLayer } from "@deck.gl/layers";
 import {
-  Filter,
   Play,
   Pause,
   Mountain,
   Crosshair,
   CircleDot,
+  ChevronDown,
+  Radar,
+  Plane,
 } from "lucide-react";
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
@@ -65,13 +67,6 @@ function radarTypeLabel(rt: string): string {
 function detectionTypeColor(rt: string): [number, number, number] {
   return DETECTION_TYPE_COLORS[rt] ?? [128, 128, 128];
 }
-
-/** 범례 3색 계열 그룹 */
-const LEGEND_GROUPS = [
-  { label: "Mode A/C", color: [234, 179, 8] as [number, number, number], types: ["mode_ac", "mode_ac_psr"] },
-  { label: "Mode S All-Call", color: [34, 197, 94] as [number, number, number], types: ["mode_s_allcall", "mode_s_allcall_psr"] },
-  { label: "Mode S Roll-Call", color: [139, 92, 246] as [number, number, number], types: ["mode_s_rollcall", "mode_s_rollcall_psr"] },
-];
 
 
 const MAP_STYLE_URL = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
@@ -142,6 +137,8 @@ export default function TrackMap() {
   const customRadarSites = useAppStore((s) => s.customRadarSites);
   const selectedModeS = useAppStore((s) => s.selectedModeS);
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
+  const selectedFlightId = useAppStore((s) => s.selectedFlightId);
+  const setSelectedFlightId = useAppStore((s) => s.setSelectedFlightId);
   const adsbTracks = useAppStore((s) => s.adsbTracks);
   const setAdsbTracks = useAppStore((s) => s.setAdsbTracks);
   const adsbLoading = useAppStore((s) => s.adsbLoading);
@@ -162,7 +159,8 @@ export default function TrackMap() {
   } | null>(null);
   const [terrainEnabled, setTerrainEnabled] = useState(true);
   const [modeSSearch, setModeSSearch] = useState("");
-  const [filterOpen, setFilterOpen] = useState(false);
+  const [aircraftDropOpen, setAircraftDropOpen] = useState(false);
+  const [radarDropOpen, setRadarDropOpen] = useState(false);
   const [speedDropOpen, setSpeedDropOpen] = useState(false);
   const [trailDropOpen, setTrailDropOpen] = useState(false);
 
@@ -179,7 +177,8 @@ export default function TrackMap() {
   const mapRef = useRef<MapRef>(null);
   const terrainAdded = useRef(false);
   const playRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const filterRef = useRef<HTMLDivElement>(null);
+  const aircraftDropRef = useRef<HTMLDivElement>(null);
+  const radarDropRef = useRef<HTMLDivElement>(null);
   const speedRef = useRef<HTMLDivElement>(null);
   const trailRef = useRef<HTMLDivElement>(null);
   const fittedRef = useRef(false);
@@ -241,10 +240,22 @@ export default function TrackMap() {
   );
 
   // 전체 포인트/Loss 합산 (비정상 항적 + UNKNOWN 제거)
-  // selectedModeS: null → 등록된 비행검사기만, "__ALL__" → 전체, 그 외 → 해당 항적만
+  // selectedFlightId → 해당 비행만, selectedModeS: null → 등록 비행검사기만, "__ALL__" → 전체, 그 외 → 해당 Mode-S 전체
   const { allPoints, allLoss } = useMemo(() => {
     const pts: TrackPoint[] = [];
     const loss: LossSegment[] = [];
+
+    // 특정 비행 선택 시 해당 비행만 표시
+    if (selectedFlightId) {
+      const targetFlight = flights.find((f) => f.id === selectedFlightId);
+      if (targetFlight) {
+        pts.push(...targetFlight.track_points.filter((p) => validModeS.has(p.mode_s)));
+        loss.push(...targetFlight.loss_segments.filter((s) => validModeS.has(s.mode_s)));
+      }
+      pts.sort((a, b) => a.timestamp - b.timestamp);
+      return { allPoints: pts, allLoss: loss };
+    }
+
     const showAll = selectedModeS === "__ALL__";
     for (const f of flights) {
       for (const p of f.track_points) {
@@ -269,7 +280,7 @@ export default function TrackMap() {
     }
     pts.sort((a, b) => a.timestamp - b.timestamp);
     return { allPoints: pts, allLoss: loss };
-  }, [flights, selectedModeS, validModeS, registeredModeS]);
+  }, [flights, selectedModeS, selectedFlightId, validModeS, registeredModeS]);
 
   // 고유 Mode-S 목록
   const uniqueModeS = useMemo(() => {
@@ -1134,8 +1145,11 @@ export default function TrackMap() {
   // 모달/드롭다운 외부 클릭 닫기
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (filterRef.current && !filterRef.current.contains(e.target as Node)) {
-        setFilterOpen(false);
+      if (aircraftDropRef.current && !aircraftDropRef.current.contains(e.target as Node)) {
+        setAircraftDropOpen(false);
+      }
+      if (radarDropRef.current && !radarDropRef.current.contains(e.target as Node)) {
+        setRadarDropOpen(false);
       }
       if (speedRef.current && !speedRef.current.contains(e.target as Node)) {
         setSpeedDropOpen(false);
@@ -1186,7 +1200,7 @@ export default function TrackMap() {
       const [vs, ve] = zoomViewRef.current;
       const cursorAbs = vs + mouseRatio * (ve - vs);
       const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
-      let newRange = Math.max(1, Math.min(100, (ve - vs) * factor));
+      let newRange = Math.max(0.1, Math.min(100, (ve - vs) * factor));
       let ns = cursorAbs - mouseRatio * newRange;
       let ne = ns + newRange;
       if (ns < 0) { ns = 0; ne = Math.min(100, newRange); }
@@ -1352,103 +1366,110 @@ export default function TrackMap() {
 
         <div className="flex-1" />
 
-        {/* Right: Filter button → 2-column dropdown */}
-        <div ref={filterRef} className="relative flex items-center">
+        {/* 비행검사기 선택 드롭다운 */}
+        <div ref={aircraftDropRef} className="relative flex items-center">
           <button
-            onClick={() => { setFilterOpen(!filterOpen); setModeSSearch(""); }}
-            className={`rounded-lg p-1.5 transition-colors ${
-              filterOpen
-                ? "bg-[#a60739] text-white shadow-sm"
-                : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+            onClick={() => { setAircraftDropOpen(!aircraftDropOpen); setRadarDropOpen(false); setModeSSearch(""); }}
+            className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+              aircraftDropOpen
+                ? "border-[#a60739] bg-[#a60739]/10 text-[#a60739]"
+                : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300"
             }`}
-            title="필터"
           >
-            <Filter size={16} />
+            <Plane size={13} />
+            <span className="max-w-[120px] truncate font-medium">
+              {!selectedModeS ? "등록 기체" : selectedModeS === "__ALL__" ? "전체 항적" : getAircraftName(selectedModeS)}
+            </span>
+            <ChevronDown size={12} className={`transition-transform ${aircraftDropOpen ? "rotate-180" : ""}`} />
           </button>
-          {filterOpen && (
-            <div className="absolute right-0 top-full z-[2000] mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
-              {/* 검색 */}
-              <div className="px-3 pt-3 pb-1">
+          {aircraftDropOpen && (
+            <div className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+              <div className="px-2 pt-2 pb-1">
                 <input
                   type="text"
                   value={modeSSearch}
                   onChange={(e) => setModeSSearch(e.target.value)}
-                  placeholder="Mode-S 코드 또는 기체명 검색..."
-                  className="w-full rounded border border-gray-300 bg-white px-2.5 py-1.5 text-sm text-gray-800 outline-none placeholder:text-gray-500 focus:border-[#a60739]/50"
+                  placeholder="검색..."
+                  className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-800 outline-none placeholder:text-gray-400 focus:border-[#a60739]/50"
                   autoFocus
                 />
               </div>
-              {/* 2열: 비행검사기 | 레이더 사이트 */}
-              <div className="flex divide-x divide-gray-200">
-                {/* 왼쪽: 비행검사기 */}
-                <div className="w-56">
-                  <div className="px-3 pt-2 pb-1">
-                    <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">비행검사기</div>
-                  </div>
-                  <div className="max-h-56 overflow-y-auto py-1 px-1 pb-2">
-                    <button
-                      onClick={() => { setSelectedModeS(null); setFilterOpen(false); }}
-                      className={`w-full px-3 py-1.5 text-left text-sm rounded transition-colors ${!selectedModeS ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-                    >
-                      등록 기체 전체
-                    </button>
-                    {aircraft.filter((a) => a.active && (!modeSSearch || a.name.toLowerCase().includes(modeSSearch.toLowerCase()) || a.mode_s_code.toLowerCase().includes(modeSSearch.toLowerCase()))).map((a) => (
-                      <button
-                        key={`ac-${a.id}`}
-                        onClick={() => { setSelectedModeS(a.mode_s_code.toUpperCase()); setFilterOpen(false); }}
-                        className={`w-full px-3 py-1.5 text-left text-sm rounded transition-colors ${selectedModeS === a.mode_s_code.toUpperCase() ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-                      >
-                        <div className="flex items-center gap-2">
-                          <span>{a.name}</span>
-                          <span className={`text-[10px] ${selectedModeS === a.mode_s_code.toUpperCase() ? "text-white/60" : "text-gray-400"}`}>{a.mode_s_code}</span>
-                        </div>
-                      </button>
-                    ))}
-                    <div className="border-t border-gray-200 my-1 mx-2" />
-                    <button
-                      onClick={() => { setSelectedModeS("__ALL__"); setFilterOpen(false); }}
-                      className={`w-full px-3 py-1.5 text-left text-sm rounded transition-colors ${selectedModeS === "__ALL__" ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-                    >
-                      전체 항적
-                    </button>
-                    {filteredModeS.map((ms) => (
-                      <button
-                        key={ms}
-                        onClick={() => { setSelectedModeS(ms); setFilterOpen(false); }}
-                        className={`w-full px-3 py-1.5 text-left text-sm rounded transition-colors ${selectedModeS === ms ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-                      >
-                        {getAircraftName(ms)}
-                      </button>
-                    ))}
-                    {filteredModeS.length === 0 && aircraft.filter((a) => a.active).length === 0 && modeSSearch && (
-                      <div className="px-3 py-2 text-xs text-gray-400">검색 결과 없음</div>
-                    )}
-                  </div>
-                </div>
-                {/* 오른쪽: 레이더 사이트 */}
-                <div className="w-52">
-                  <div className="px-3 pt-2 pb-1">
-                    <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">레이더 사이트</div>
-                  </div>
-                  <div className="max-h-56 overflow-y-auto py-1 px-1 pb-2">
-                    {allRadarSites.map((site) => (
-                      <button
-                        key={site.name}
-                        onClick={() => { setRadarSite(site); setFilterOpen(false); }}
-                        className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${
-                          radarSite.name === site.name
-                            ? "bg-[#a60739] text-white"
-                            : "text-gray-600 hover:bg-gray-100"
-                        }`}
-                      >
-                        <div className="font-medium">{site.name}</div>
-                        <div className={`text-[10px] ${radarSite.name === site.name ? "text-white/60" : "text-gray-400"}`}>
-                          {site.latitude.toFixed(4)}°N {site.longitude.toFixed(4)}°E | {site.range_nm}NM
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
+              <div className="max-h-56 overflow-y-auto py-1 px-1 pb-2">
+                <button
+                  onClick={() => { setSelectedModeS(null); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                  className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${!selectedModeS ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
+                >
+                  등록 기체 전체
+                </button>
+                {aircraft.filter((a) => a.active && (!modeSSearch || a.name.toLowerCase().includes(modeSSearch.toLowerCase()) || a.mode_s_code.toLowerCase().includes(modeSSearch.toLowerCase()))).map((a) => (
+                  <button
+                    key={`ac-${a.id}`}
+                    onClick={() => { setSelectedModeS(a.mode_s_code.toUpperCase()); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                    className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${selectedModeS === a.mode_s_code.toUpperCase() ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span>{a.name}</span>
+                      <span className={`text-[10px] ${selectedModeS === a.mode_s_code.toUpperCase() ? "text-white/60" : "text-gray-400"}`}>{a.mode_s_code}</span>
+                    </div>
+                  </button>
+                ))}
+                <div className="border-t border-gray-200 my-1 mx-2" />
+                <button
+                  onClick={() => { setSelectedModeS("__ALL__"); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                  className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${selectedModeS === "__ALL__" ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
+                >
+                  전체 항적
+                </button>
+                {filteredModeS.map((ms) => (
+                  <button
+                    key={ms}
+                    onClick={() => { setSelectedModeS(ms); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                    className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${selectedModeS === ms ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
+                  >
+                    {getAircraftName(ms)}
+                  </button>
+                ))}
+                {filteredModeS.length === 0 && aircraft.filter((a) => a.active).length === 0 && modeSSearch && (
+                  <div className="px-3 py-2 text-xs text-gray-400">검색 결과 없음</div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 레이더 사이트 선택 드롭다운 */}
+        <div ref={radarDropRef} className="relative flex items-center">
+          <button
+            onClick={() => { setRadarDropOpen(!radarDropOpen); setAircraftDropOpen(false); }}
+            className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+              radarDropOpen
+                ? "border-[#a60739] bg-[#a60739]/10 text-[#a60739]"
+                : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300"
+            }`}
+          >
+            <Radar size={13} />
+            <span className="max-w-[120px] truncate font-medium">{radarSite.name}</span>
+            <ChevronDown size={12} className={`transition-transform ${radarDropOpen ? "rotate-180" : ""}`} />
+          </button>
+          {radarDropOpen && (
+            <div className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+              <div className="max-h-56 overflow-y-auto py-1 px-1">
+                {allRadarSites.map((site) => (
+                  <button
+                    key={site.name}
+                    onClick={() => { setRadarSite(site); setRadarDropOpen(false); }}
+                    className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${
+                      radarSite.name === site.name
+                        ? "bg-[#a60739] text-white"
+                        : "text-gray-600 hover:bg-gray-100"
+                    }`}
+                  >
+                    <div className="font-medium">{site.name}</div>
+                    <div className={`text-[10px] ${radarSite.name === site.name ? "text-white/60" : "text-gray-400"}`}>
+                      {site.range_nm}NM
+                    </div>
+                  </button>
+                ))}
               </div>
             </div>
           )}
@@ -1592,31 +1613,25 @@ export default function TrackMap() {
                   );
                 });
               })()}
-              {/* 탐지 유형 범례 (3색 계열 + PSR glow) */}
-              {selectedModeS && (
-              <div className="space-y-1.5">
-                <div className="text-[8px] text-gray-500 uppercase tracking-wider mb-0.5">탐지 유형</div>
-                {LEGEND_GROUPS.map((g) => (
-                  <div key={g.label} className="space-y-0.5">
-                    {g.types.map((rt) => {
-                      const isPsr = PSR_TYPES.has(rt);
-                      return (
-                        <div key={rt} className="flex items-center gap-1.5">
-                          <span
-                            className="inline-block h-[3px] w-4 rounded-sm"
-                            style={{
-                              backgroundColor: `rgb(${g.color[0]},${g.color[1]},${g.color[2]})`,
-                              boxShadow: isPsr ? `0 0 4px 1px rgba(${g.color[0]},${g.color[1]},${g.color[2]},0.6)` : undefined,
-                            }}
-                          />
-                          <span className="text-gray-500">{radarTypeLabel(rt)}</span>
-                        </div>
-                      );
-                    })}
+              {/* 탐지 유형 범례 (단일 기체 선택 시) */}
+              {selectedModeS && selectedModeS !== "__ALL__" && (() => {
+                const shown = new Map<string, [number,number,number]>();
+                for (const tp of trackPaths) {
+                  if (!shown.has(tp.radarType)) shown.set(tp.radarType, tp.color);
+                }
+                return Array.from(shown.entries()).map(([rt, color]) => (
+                  <div key={rt} className="flex items-center gap-1.5">
+                    <span
+                      className="inline-block h-[3px] w-4 rounded-sm"
+                      style={{
+                        backgroundColor: `rgb(${color[0]},${color[1]},${color[2]})`,
+                        boxShadow: PSR_TYPES.has(rt) ? `0 0 4px 1px rgba(${color[0]},${color[1]},${color[2]},0.6)` : undefined,
+                      }}
+                    />
+                    <span className="text-gray-500">{radarTypeLabel(rt)}</span>
                   </div>
-                ))}
-              </div>
-              )}
+                ));
+              })()}
               {/* 고정 범례 항목 */}
               <div className="border-t border-gray-200 pt-1 mt-1 space-y-1">
                 <div className="flex items-center gap-1.5">
@@ -1673,16 +1688,16 @@ export default function TrackMap() {
 
         return (
         <div className="border-t border-gray-200 bg-white/95 backdrop-blur-sm shadow-lg">
-          <div className="flex items-center gap-3 px-4 py-2">
+          <div className="flex items-center gap-3 px-4 py-2 min-h-[44px]">
             {/* 시작점 시각 */}
-            <span className="min-w-[105px] text-center font-mono text-xs text-gray-400">
+            <span className="min-w-[105px] text-center font-mono text-xs text-gray-400 leading-none">
               {fmtTs(pctToTs(rangeStart))}
             </span>
 
             {/* 통합 타임라인 */}
             <div
               ref={timelineRef}
-              className="relative flex-1 h-8 select-none cursor-pointer"
+              className="relative flex-1 h-6 select-none cursor-pointer self-center"
               onPointerDown={(e) => {
                 if (!timelineRef.current) return;
                 e.preventDefault();
@@ -1776,7 +1791,7 @@ export default function TrackMap() {
               </div>
               {/* 시작점 핸들 — 줌 인 시 뷰 경계에 고정 */}
               <div
-                className="absolute top-0 -translate-x-1/2 cursor-ew-resize z-10"
+                className="absolute top-0 -translate-x-1/2 cursor-ew-resize z-30"
                 style={{ left: `${Math.max(0, Math.min(100, absToScreen(rangeStart)))}%` }}
                 onPointerDown={(e) => {
                   e.preventDefault();
@@ -1810,7 +1825,7 @@ export default function TrackMap() {
             </div>
 
             {/* 줌 끝 시각 */}
-            <span className="min-w-[105px] text-center font-mono text-xs text-gray-400">
+            <span className="min-w-[105px] text-center font-mono text-xs text-gray-400 leading-none">
               {fmtTs(pctToTs(zoomVEnd))}
             </span>
 
