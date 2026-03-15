@@ -4,6 +4,8 @@ export interface Aircraft {
   id: string;
   /** 이름 (예: 1호기, 2호기) */
   name: string;
+  /** 등록번호 (예: FL7779) */
+  registration: string;
   /** 기체 모델 (예: Embraer Praetor 600) */
   model: string;
   /** Mode-S 코드 (hex string) */
@@ -30,8 +32,8 @@ export interface TrackPoint {
   speed: number;
   /** Heading in degrees */
   heading: number;
-  /** 레이더 탐지 유형 (4종 분류) */
-  radar_type: "atcrbs" | "atcrbs_psr" | "modes" | "modes_psr";
+  /** 레이더 탐지 유형 (I020 TYP 기반 6종 분류) */
+  radar_type: "mode_ac" | "mode_ac_psr" | "mode_s_allcall" | "mode_s_rollcall" | "mode_s_allcall_psr" | "mode_s_rollcall_psr";
   /** Original bytes as number array */
   raw_data: number[];
 }
@@ -63,8 +65,9 @@ export interface ParseStatistics {
   garbled_removed: number;
   atcrbs_merged: number;
   atcrbs_unmatched: number;
-  /** [atcrbs, atcrbs_psr, modes, modes_psr] */
-  points_by_type: [number, number, number, number];
+  /** [mode_ac, mode_ac_psr, mode_s_allcall, mode_s_rollcall, mode_s_allcall_psr, mode_s_rollcall_psr] */
+  points_by_type: [number, number, number, number, number, number];
+  mode3a_invalid: number;
 }
 
 /** 파싱 결과 (Parse Result) */
@@ -138,6 +141,35 @@ export interface LOSProfileData {
   losBlocked: boolean;
   maxBlockingPoint?: { distance: number; elevation: number; name?: string };
   timestamp: number;
+}
+
+/** ADS-B 트랙 포인트 (OpenSky Network) */
+export interface AdsbPoint {
+  time: number;
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  heading: number;
+  on_ground: boolean;
+}
+
+/** ADS-B 트랙 (한 비행 구간) */
+export interface AdsbTrack {
+  icao24: string;
+  callsign: string | null;
+  start_time: number;
+  end_time: number;
+  path: AdsbPoint[];
+}
+
+/** 운항이력 (OpenSky /flights/aircraft) */
+export interface FlightRecord {
+  icao24: string;
+  first_seen: number;
+  last_seen: number;
+  est_departure_airport: string | null;
+  est_arrival_airport: string | null;
+  callsign: string | null;
 }
 
 /** UI 페이지 */

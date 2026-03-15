@@ -1,8 +1,8 @@
 [package]
 name = "airmove-analyzer"
 version = "0.1.0"
-description = "NEC Radar Flight Inspector Analysis System"
-authors = ["NEC Radar Team"]
+description = "Desktop analysis tool for ASTERIX CAT048 radar recordings — parses NEC ASS files, visualizes flight inspection tracks on GPU-accelerated maps, and detects signal loss segments with automated classification"
+authors = ["Gimpo Radar Site Flight Inspection Team"]
 edition = "2021"
 
 [lib]
@@ -24,3 +24,6 @@ log = "0.4"
 env_logger = "0.11"
 rayon = "1.10"
 base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }

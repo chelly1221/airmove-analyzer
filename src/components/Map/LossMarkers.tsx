@@ -26,7 +26,7 @@ export default function LossMarkers({ segments, maxTimestamp }: LossMarkersProps
             <Polyline
               positions={positions}
               pathOptions={{
-                color: "#e94560",
+                color: "#a60739",
                 weight: 3,
                 opacity: 0.9,
                 dashArray: "8, 6",
@@ -36,8 +36,8 @@ export default function LossMarkers({ segments, maxTimestamp }: LossMarkersProps
               center={[seg.start_lat, seg.start_lon]}
               radius={6}
               pathOptions={{
-                color: "#e94560",
-                fillColor: "#e94560",
+                color: "#a60739",
+                fillColor: "#a60739",
                 fillOpacity: 0.9,
                 weight: 2,
               }}

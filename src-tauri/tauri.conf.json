@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AirMove Analyzer",
   "version": "0.1.0",
-  "identifier": "com.airmove.analyzer",
+  "identifier": "com.gimpo-radar.airmove-analyzer",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "비행검사기 항적 분석 체계",
+        "title": "AirMove Analyzer — Gimpo Radar Flight Inspection Track Analysis",
         "width": 1280,
         "height": 800,
         "minWidth": 1024,
@@ -29,6 +29,9 @@
     "active": true,
     "targets": ["nsis"],
     "windows": {
+      "certificateThumbprint": "68181B896D10674C1F4E662E290B1B3296F4369D",
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
       "nsis": {
         "installMode": "currentUser"
       }

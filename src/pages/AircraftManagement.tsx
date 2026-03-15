@@ -11,6 +11,7 @@ function generateId(): string {
 
 const emptyForm: Omit<Aircraft, "id"> = {
   name: "",
+  registration: "",
   model: "",
   mode_s_code: "",
   organization: "",
@@ -41,6 +42,7 @@ export default function AircraftManagement() {
     setEditId(a.id);
     setForm({
       name: a.name,
+      registration: a.registration ?? "",
       model: a.model,
       mode_s_code: a.mode_s_code,
       organization: a.organization,
@@ -82,6 +84,7 @@ export default function AircraftManagement() {
     if (editId) {
       updateAircraft(editId, {
         name: form.name.trim(),
+        registration: form.registration.trim(),
         model: form.model.trim(),
         mode_s_code: form.mode_s_code.trim().toUpperCase(),
         organization: form.organization.trim(),
@@ -92,6 +95,7 @@ export default function AircraftManagement() {
       addAircraft({
         id: generateId(),
         name: form.name.trim(),
+        registration: form.registration.trim(),
         model: form.model.trim(),
         mode_s_code: form.mode_s_code.trim().toUpperCase(),
         organization: form.organization.trim(),
@@ -115,7 +119,7 @@ export default function AircraftManagement() {
       render: (a: Aircraft) => (
         <div className="flex justify-center">
           <div
-            className={`h-2.5 w-2.5 rounded-full ${a.active ? "bg-green-400" : "bg-gray-500"}`}
+            className={`h-2.5 w-2.5 rounded-full ${a.active ? "bg-green-500" : "bg-gray-400"}`}
             title={a.active ? "활성" : "비활성"}
           />
         </div>
@@ -124,10 +128,17 @@ export default function AircraftManagement() {
     },
     { key: "name", header: "기체 이름" },
     {
+      key: "registration",
+      header: "등록번호",
+      render: (a: Aircraft) => (
+        <span className="font-mono text-xs">{a.registration || "-"}</span>
+      ),
+    },
+    {
       key: "mode_s_code",
       header: "Mode-S",
       render: (a: Aircraft) => (
-        <span className="rounded bg-[#0f3460] px-2 py-0.5 font-mono text-xs">
+        <span className="rounded bg-gray-100 px-2 py-0.5 font-mono text-xs">
           {a.mode_s_code}
         </span>
       ),
@@ -151,7 +162,7 @@ export default function AircraftManagement() {
               e.stopPropagation();
               openEdit(a);
             }}
-            className="rounded p-1.5 text-gray-400 hover:bg-white/10 hover:text-white transition-colors"
+            className="rounded p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
             title="수정"
           >
             <Pencil size={14} />
@@ -161,7 +172,7 @@ export default function AircraftManagement() {
               e.stopPropagation();
               setDeleteConfirm(a.id);
             }}
-            className="rounded p-1.5 text-gray-400 hover:bg-red-500/20 hover:text-red-400 transition-colors"
+            className="rounded p-1.5 text-gray-500 hover:bg-red-500/20 hover:text-red-600 transition-colors"
             title="삭제"
           >
             <Trash2 size={14} />
@@ -176,15 +187,15 @@ export default function AircraftManagement() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">비행검사기 관리</h1>
-          <p className="mt-1 text-sm text-gray-400">
+          <h1 className="text-2xl font-bold text-gray-800">비행검사기 관리</h1>
+          <p className="mt-1 text-sm text-gray-500">
             최대 10대의 비행검사기를 등록/관리합니다 ({aircraft.length}/10)
           </p>
         </div>
         <button
           onClick={openAdd}
           disabled={aircraft.length >= 10}
-          className="flex items-center gap-2 rounded-lg bg-[#e94560] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#d63851] disabled:opacity-40 disabled:cursor-not-allowed"
+          className="flex items-center gap-2 rounded-lg bg-[#a60739] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <Plus size={16} />
           <span>비행검사기 추가</span>
@@ -193,12 +204,12 @@ export default function AircraftManagement() {
 
       {/* Table */}
       {aircraft.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-white/10 bg-[#16213e] py-20">
-          <Plane size={48} className="mb-4 text-gray-600" />
-          <p className="text-lg font-medium text-gray-400">
+        <div className="flex flex-col items-center justify-center rounded-xl border border-gray-200 bg-gray-50 py-20">
+          <Plane size={48} className="mb-4 text-gray-400" />
+          <p className="text-lg font-medium text-gray-500">
             등록된 비행검사기가 없습니다
           </p>
-          <p className="mt-1 text-sm text-gray-600">
+          <p className="mt-1 text-sm text-gray-500">
             위의 &quot;비행검사기 추가&quot; 버튼을 눌러 등록하세요
           </p>
         </div>
@@ -220,36 +231,49 @@ export default function AircraftManagement() {
         <div className="space-y-4">
           {/* Name */}
           <div>
-            <label className="mb-1 block text-sm text-gray-300">
-              기체 이름 <span className="text-[#e94560]">*</span>
+            <label className="mb-1 block text-sm text-gray-600">
+              기체 이름 <span className="text-[#a60739]">*</span>
             </label>
             <input
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
-              className="w-full rounded-lg border border-white/10 bg-[#0f3460]/50 px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#e94560]/50 transition-colors"
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 outline-none focus:border-[#a60739]/50 transition-colors"
               placeholder="예: King Air 350"
             />
             {errors.name && (
-              <p className="mt-1 text-xs text-[#e94560]">{errors.name}</p>
+              <p className="mt-1 text-xs text-[#a60739]">{errors.name}</p>
             )}
+          </div>
+
+          {/* Registration */}
+          <div>
+            <label className="mb-1 block text-sm text-gray-600">
+              등록번호
+            </label>
+            <input
+              value={form.registration}
+              onChange={(e) => setForm({ ...form, registration: e.target.value })}
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 font-mono text-sm text-gray-800 placeholder-gray-400 outline-none focus:border-[#a60739]/50 transition-colors"
+              placeholder="예: FL7779"
+            />
           </div>
 
           {/* Mode-S */}
           <div>
-            <label className="mb-1 block text-sm text-gray-300">
-              Mode-S 코드 <span className="text-[#e94560]">*</span>
+            <label className="mb-1 block text-sm text-gray-600">
+              Mode-S 코드 <span className="text-[#a60739]">*</span>
             </label>
             <input
               value={form.mode_s_code}
               onChange={(e) =>
                 setForm({ ...form, mode_s_code: e.target.value })
               }
-              className="w-full rounded-lg border border-white/10 bg-[#0f3460]/50 px-3 py-2 font-mono text-sm text-white placeholder-gray-500 outline-none focus:border-[#e94560]/50 transition-colors"
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 font-mono text-sm text-gray-800 placeholder-gray-400 outline-none focus:border-[#a60739]/50 transition-colors"
               placeholder="예: A1B2C3"
               maxLength={6}
             />
             {errors.mode_s_code && (
-              <p className="mt-1 text-xs text-[#e94560]">
+              <p className="mt-1 text-xs text-[#a60739]">
                 {errors.mode_s_code}
               </p>
             )}
@@ -257,19 +281,19 @@ export default function AircraftManagement() {
 
           {/* Organization */}
           <div>
-            <label className="mb-1 block text-sm text-gray-300">
-              운용 기관 <span className="text-[#e94560]">*</span>
+            <label className="mb-1 block text-sm text-gray-600">
+              운용 기관 <span className="text-[#a60739]">*</span>
             </label>
             <input
               value={form.organization}
               onChange={(e) =>
                 setForm({ ...form, organization: e.target.value })
               }
-              className="w-full rounded-lg border border-white/10 bg-[#0f3460]/50 px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#e94560]/50 transition-colors"
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 outline-none focus:border-[#a60739]/50 transition-colors"
               placeholder="예: 항공우주연구원"
             />
             {errors.organization && (
-              <p className="mt-1 text-xs text-[#e94560]">
+              <p className="mt-1 text-xs text-[#a60739]">
                 {errors.organization}
               </p>
             )}
@@ -277,11 +301,11 @@ export default function AircraftManagement() {
 
           {/* Memo */}
           <div>
-            <label className="mb-1 block text-sm text-gray-300">메모</label>
+            <label className="mb-1 block text-sm text-gray-600">메모</label>
             <textarea
               value={form.memo}
               onChange={(e) => setForm({ ...form, memo: e.target.value })}
-              className="w-full rounded-lg border border-white/10 bg-[#0f3460]/50 px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#e94560]/50 transition-colors"
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 outline-none focus:border-[#a60739]/50 transition-colors"
               placeholder="비고 사항"
               rows={2}
             />
@@ -292,13 +316,13 @@ export default function AircraftManagement() {
             <button
               type="button"
               onClick={() => setForm({ ...form, active: !form.active })}
-              className={`relative h-6 w-11 rounded-full transition-colors ${form.active ? "bg-[#e94560]" : "bg-gray-600"}`}
+              className={`relative h-6 w-11 rounded-full transition-colors ${form.active ? "bg-[#a60739]" : "bg-gray-300"}`}
             >
               <div
                 className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${form.active ? "left-[22px]" : "left-0.5"}`}
               />
             </button>
-            <span className="text-sm text-gray-300">
+            <span className="text-sm text-gray-600">
               {form.active ? "활성" : "비활성"}
             </span>
           </div>
@@ -307,13 +331,13 @@ export default function AircraftManagement() {
           <div className="flex justify-end gap-3 pt-2">
             <button
               onClick={() => setModalOpen(false)}
-              className="rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-400 hover:bg-white/5 transition-colors"
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
             >
               취소
             </button>
             <button
               onClick={handleSave}
-              className="rounded-lg bg-[#e94560] px-4 py-2 text-sm font-medium text-white hover:bg-[#d63851] transition-colors"
+              className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] transition-colors"
             >
               {editId ? "수정" : "추가"}
             </button>
@@ -329,13 +353,13 @@ export default function AircraftManagement() {
         width="max-w-sm"
       >
         <div className="space-y-4">
-          <p className="text-sm text-gray-300">
+          <p className="text-sm text-gray-600">
             이 비행검사기를 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.
           </p>
           <div className="flex justify-end gap-3">
             <button
               onClick={() => setDeleteConfirm(null)}
-              className="rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-400 hover:bg-white/5 transition-colors"
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
             >
               취소
             </button>

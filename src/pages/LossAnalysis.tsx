@@ -164,14 +164,14 @@ export default function LossAnalysis() {
       key: "mode_s",
       header: "Mode-S",
       render: (row: FlatLoss) => (
-        <span className="font-mono text-xs text-gray-300">{row.segment.mode_s}</span>
+        <span className="font-mono text-xs text-gray-600">{row.segment.mode_s}</span>
       ),
     },
     {
       key: "filename",
       header: "파일",
       render: (row: FlatLoss) => (
-        <span className="text-gray-300 text-xs">{row.filename}</span>
+        <span className="text-gray-600 text-xs">{row.filename}</span>
       ),
     },
     {
@@ -220,12 +220,12 @@ export default function LossAnalysis() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">표적소실 분석</h1>
-          <p className="mt-1 text-sm text-gray-400">
-            비행검사기 항적 표적소실 구간 상세 분석
+          <h1 className="text-2xl font-bold text-gray-800">통계/분석</h1>
+          <p className="mt-1 text-sm text-gray-500">
+            비행검사기 항적 통계 및 표적소실 구간 분석
           </p>
         </div>
-        <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-[#16213e] p-1">
+        <div className="flex items-center gap-1 rounded-lg border border-gray-200 bg-gray-50 p-1">
           {(
             [
               ["table", "테이블"],
@@ -238,8 +238,8 @@ export default function LossAnalysis() {
               onClick={() => setViewMode(mode)}
               className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                 viewMode === mode
-                  ? "bg-[#e94560] text-white"
-                  : "text-gray-400 hover:text-white"
+                  ? "bg-[#a60739] text-white"
+                  : "text-gray-500 hover:text-gray-900"
               }`}
             >
               {label}
@@ -254,7 +254,7 @@ export default function LossAnalysis() {
           title="총 소실 건수"
           value={flatLoss.length}
           icon={BarChart3}
-          accent="#e94560"
+          accent="#a60739"
         />
         <Card
           title="총 소실 시간"
@@ -276,6 +276,58 @@ export default function LossAnalysis() {
         />
       </div>
 
+      {/* 파싱 통계 */}
+      {analysisResults.length > 0 && (
+        <SimpleCard>
+          <h3 className="mb-3 text-sm font-semibold text-gray-800">파싱 통계</h3>
+          <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-xs sm:grid-cols-3 lg:grid-cols-6">
+            {analysisResults.map((r) => {
+              const s = r.file_info.parse_stats;
+              if (!s) return null;
+              return (
+                <div key={`stats-${r.file_info.filename}`} className="col-span-full">
+                  <p className="mb-1.5 font-medium text-gray-700">{r.file_info.filename}</p>
+                  <div className="grid grid-cols-3 gap-x-6 gap-y-1 sm:grid-cols-6">
+                    <div>
+                      <span className="text-gray-500">ASTERIX 레코드</span>
+                      <p className="font-mono font-semibold text-gray-800">{s.total_asterix_records.toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Garbled 제거</span>
+                      <p className="font-mono font-semibold text-red-600">{s.garbled_removed.toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Mode 3/A 무효</span>
+                      <p className="font-mono font-semibold text-amber-600">{(s.mode3a_invalid ?? 0).toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">ATCRBS 병합</span>
+                      <p className="font-mono font-semibold text-blue-600">{s.atcrbs_merged.toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">ATCRBS 미매칭</span>
+                      <p className="font-mono font-semibold text-gray-600">{s.atcrbs_unmatched.toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">PSR/None 폐기</span>
+                      <p className="font-mono font-semibold text-gray-600">{s.discarded_psr_none.toLocaleString()}</p>
+                    </div>
+                  </div>
+                  <div className="mt-1.5 grid grid-cols-3 gap-x-6 gap-y-1 sm:grid-cols-6">
+                    {["Mode A/C", "Mode A/C+PSR", "Mode S All-Call", "Mode S Roll-Call", "Mode S AC+PSR", "Mode S RC+PSR"].map((label, i) => (
+                      <div key={label}>
+                        <span className="text-gray-500">{label}</span>
+                        <p className="font-mono font-semibold text-gray-800">{s.points_by_type[i].toLocaleString()}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </SimpleCard>
+      )}
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         {/* Table or alternate views */}
         <div className="lg:col-span-2">
@@ -293,7 +345,7 @@ export default function LossAnalysis() {
                   <button
                     key={field}
                     onClick={() => toggleSort(field)}
-                    className={`flex items-center gap-0.5 rounded px-2 py-1 transition-colors ${sortField === field ? "bg-white/10 text-white" : "hover:bg-white/5"}`}
+                    className={`flex items-center gap-0.5 rounded px-2 py-1 transition-colors ${sortField === field ? "bg-gray-100 text-gray-800" : "hover:bg-gray-100"}`}
                   >
                     {label}
                     <SortIcon field={field} />
@@ -324,29 +376,29 @@ export default function LossAnalysis() {
                 analysisResults.map((r) => (
                   <SimpleCard key={`file-${r.file_info.filename}`}>
                     <div className="mb-3 flex items-center justify-between">
-                      <h3 className="font-medium text-white">
+                      <h3 className="font-medium text-gray-800">
                         {r.file_info.filename}
                       </h3>
-                      <span className="rounded bg-[#e94560]/20 px-2 py-0.5 text-xs font-medium text-[#e94560]">
+                      <span className="rounded bg-[#a60739]/15 px-2 py-0.5 text-xs font-medium text-[#a60739]">
                         소실 {r.loss_percentage.toFixed(1)}%
                       </span>
                     </div>
                     <div className="grid grid-cols-3 gap-3 text-center text-xs">
-                      <div className="rounded-lg bg-[#0f3460]/50 p-2">
+                      <div className="rounded-lg bg-gray-50 p-2">
                         <p className="text-gray-500">소실 건수</p>
-                        <p className="text-lg font-bold text-white">
+                        <p className="text-lg font-bold text-gray-800">
                           {r.loss_segments.length}
                         </p>
                       </div>
-                      <div className="rounded-lg bg-[#0f3460]/50 p-2">
+                      <div className="rounded-lg bg-gray-50 p-2">
                         <p className="text-gray-500">총 소실 시간</p>
-                        <p className="text-lg font-bold text-white">
+                        <p className="text-lg font-bold text-gray-800">
                           {r.total_loss_time.toFixed(1)}초
                         </p>
                       </div>
-                      <div className="rounded-lg bg-[#0f3460]/50 p-2">
+                      <div className="rounded-lg bg-gray-50 p-2">
                         <p className="text-gray-500">추적 시간</p>
-                        <p className="text-lg font-bold text-white">
+                        <p className="text-lg font-bold text-gray-800">
                           {(r.total_track_time / 60).toFixed(1)}분
                         </p>
                       </div>
@@ -359,7 +411,7 @@ export default function LossAnalysis() {
 
           {viewMode === "compare" && (
             <SimpleCard>
-              <h3 className="mb-4 font-medium text-white">
+              <h3 className="mb-4 font-medium text-gray-800">
                 파일별 소실 비율 비교
               </h3>
               {analysisResults.length === 0 ? (
@@ -373,24 +425,24 @@ export default function LossAnalysis() {
                     return (
                       <div key={`cmp-${r.file_info.filename}`}>
                         <div className="mb-1 flex items-center justify-between text-xs">
-                          <span className="text-gray-300">
+                          <span className="text-gray-600">
                             {r.file_info.filename}
                           </span>
                           <span
                             className={
-                              pct > 5 ? "text-[#e94560]" : "text-green-400"
+                              pct > 5 ? "text-[#a60739]" : "text-green-600"
                             }
                           >
                             {pct.toFixed(1)}%
                           </span>
                         </div>
-                        <div className="h-3 overflow-hidden rounded-full bg-[#0f3460]">
+                        <div className="h-3 overflow-hidden rounded-full bg-gray-100">
                           <div
                             className="h-full rounded-full transition-all"
                             style={{
                               width: `${Math.min(pct, 100)}%`,
                               backgroundColor:
-                                pct > 5 ? "#e94560" : "#10b981",
+                                pct > 5 ? "#a60739" : "#10b981",
                             }}
                           />
                         </div>
@@ -406,8 +458,8 @@ export default function LossAnalysis() {
         {/* Mini map */}
         <div>
           <SimpleCard className="overflow-hidden p-0">
-            <div className="border-b border-white/10 px-4 py-3">
-              <h3 className="text-sm font-semibold text-white">위치 미리보기</h3>
+            <div className="border-b border-gray-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-gray-800">위치 미리보기</h3>
               {selectedLoss && (
                 <p className="text-xs text-gray-500 mt-0.5">
                   소실 #{selectedLoss.index + 1} -{" "}
@@ -426,7 +478,7 @@ export default function LossAnalysis() {
                 zoomControl={false}
               >
                 <TileLayer
-                  url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+                  url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
                   attribution=""
                 />
                 {selectedLoss && (
@@ -444,7 +496,7 @@ export default function LossAnalysis() {
                         ],
                       ]}
                       pathOptions={{
-                        color: "#e94560",
+                        color: "#a60739",
                         weight: 3,
                         dashArray: "6, 4",
                       }}
@@ -462,8 +514,8 @@ export default function LossAnalysis() {
                       ]}
                       radius={6}
                       pathOptions={{
-                        color: "#e94560",
-                        fillColor: "#e94560",
+                        color: "#a60739",
+                        fillColor: "#a60739",
                         fillOpacity: 1,
                       }}
                     >

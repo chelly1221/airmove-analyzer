@@ -14,14 +14,14 @@ export default function Card({
   value,
   subtitle,
   icon: Icon,
-  accent = "#e94560",
+  accent = "#a60739",
 }: CardProps) {
   return (
-    <div className="rounded-xl border border-white/10 bg-[#16213e] p-5 transition-all hover:border-white/20">
+    <div className="rounded-xl border border-gray-200 bg-gray-50 p-5 transition-all hover:border-gray-300">
       <div className="flex items-start justify-between">
         <div className="flex-1">
-          <p className="text-sm text-gray-400">{title}</p>
-          <p className="mt-1 text-2xl font-bold text-white">{value}</p>
+          <p className="text-sm text-gray-500">{title}</p>
+          <p className="mt-1 text-2xl font-bold text-gray-800">{value}</p>
           {subtitle && (
             <p className="mt-1 text-xs text-gray-500">{subtitle}</p>
           )}
@@ -47,7 +47,7 @@ interface SimpleCardProps {
 export function SimpleCard({ children, className = "" }: SimpleCardProps) {
   return (
     <div
-      className={`rounded-xl border border-white/10 bg-[#16213e] p-5 ${className}`}
+      className={`rounded-xl border border-gray-200 bg-gray-50 p-5 ${className}`}
     >
       {children}
     </div>

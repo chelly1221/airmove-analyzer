@@ -43,8 +43,8 @@ export default function Dashboard() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-white">대시보드</h1>
-        <p className="mt-1 text-sm text-gray-400">
+        <h1 className="text-2xl font-bold text-gray-800">대시보드</h1>
+        <p className="mt-1 text-sm text-gray-500">
           레이더 비행검사기 분석체계 현황
         </p>
       </div>
@@ -63,7 +63,7 @@ export default function Dashboard() {
           value={totalLossSegments}
           subtitle="탐지된 전체 Loss"
           icon={AlertTriangle}
-          accent="#e94560"
+          accent="#a60739"
         />
         <Card
           title="평균 Loss 비율"
@@ -83,32 +83,32 @@ export default function Dashboard() {
 
       {/* Quick Actions */}
       <SimpleCard>
-        <h2 className="mb-4 text-base font-semibold text-white">빠른 실행</h2>
+        <h2 className="mb-4 text-base font-semibold text-gray-800">빠른 실행</h2>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <button
             onClick={() => handleQuickAction("settings", "/settings")}
-            className="flex flex-col items-center gap-2 rounded-lg border border-white/10 bg-[#0f3460]/50 p-4 text-gray-300 transition-all hover:border-[#3b82f6]/50 hover:bg-[#0f3460] hover:text-white"
+            className="flex flex-col items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 p-4 text-gray-600 transition-all hover:border-[#3b82f6]/50 hover:bg-gray-100 hover:text-gray-900"
           >
             <Plane size={24} />
             <span className="text-xs">검사기 관리</span>
           </button>
           <button
             onClick={() => handleQuickAction("upload", "/upload")}
-            className="flex flex-col items-center gap-2 rounded-lg border border-white/10 bg-[#0f3460]/50 p-4 text-gray-300 transition-all hover:border-[#3b82f6]/50 hover:bg-[#0f3460] hover:text-white"
+            className="flex flex-col items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 p-4 text-gray-600 transition-all hover:border-[#3b82f6]/50 hover:bg-gray-100 hover:text-gray-900"
           >
             <Upload size={24} />
             <span className="text-xs">자료 업로드</span>
           </button>
           <button
             onClick={() => handleQuickAction("map", "/map")}
-            className="flex flex-col items-center gap-2 rounded-lg border border-white/10 bg-[#0f3460]/50 p-4 text-gray-300 transition-all hover:border-[#3b82f6]/50 hover:bg-[#0f3460] hover:text-white"
+            className="flex flex-col items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 p-4 text-gray-600 transition-all hover:border-[#3b82f6]/50 hover:bg-gray-100 hover:text-gray-900"
           >
             <Map size={24} />
             <span className="text-xs">항적 지도</span>
           </button>
           <button
             onClick={() => handleQuickAction("analysis", "/analysis")}
-            className="flex flex-col items-center gap-2 rounded-lg border border-white/10 bg-[#0f3460]/50 p-4 text-gray-300 transition-all hover:border-[#3b82f6]/50 hover:bg-[#0f3460] hover:text-white"
+            className="flex flex-col items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 p-4 text-gray-600 transition-all hover:border-[#3b82f6]/50 hover:bg-gray-100 hover:text-gray-900"
           >
             <BarChart3 size={24} />
             <span className="text-xs">Loss 분석</span>
@@ -120,7 +120,7 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {/* Recent Analysis */}
         <SimpleCard>
-          <h2 className="mb-4 text-base font-semibold text-white">
+          <h2 className="mb-4 text-base font-semibold text-gray-800">
             최근 분석 결과
           </h2>
           {analysisResults.length === 0 ? (
@@ -134,10 +134,10 @@ export default function Dashboard() {
               {analysisResults.slice(-5).reverse().map((r) => (
                 <div
                   key={`result-${r.file_info.filename}`}
-                  className="flex items-center justify-between rounded-lg border border-white/5 bg-[#0f3460]/30 px-4 py-3"
+                  className="flex items-center justify-between rounded-lg border border-gray-100 bg-gray-50 px-4 py-3"
                 >
                   <div>
-                    <p className="text-sm font-medium text-white">
+                    <p className="text-sm font-medium text-gray-800">
                       {r.file_info.filename}
                     </p>
                     <p className="text-xs text-gray-500">
@@ -150,7 +150,7 @@ export default function Dashboard() {
                     </p>
                   </div>
                   <div className="text-right">
-                    <p className="text-sm font-bold text-[#e94560]">
+                    <p className="text-sm font-bold text-[#a60739]">
                       {r.loss_percentage.toFixed(1)}%
                     </p>
                     <p className="text-xs text-gray-500">
@@ -165,7 +165,7 @@ export default function Dashboard() {
 
         {/* Aircraft List */}
         <SimpleCard>
-          <h2 className="mb-4 text-base font-semibold text-white">
+          <h2 className="mb-4 text-base font-semibold text-gray-800">
             등록 비행검사기
           </h2>
           {aircraft.length === 0 ? (
@@ -179,14 +179,14 @@ export default function Dashboard() {
               {aircraft.map((a) => (
                 <div
                   key={a.id}
-                  className="flex items-center justify-between rounded-lg border border-white/5 bg-[#0f3460]/30 px-4 py-3"
+                  className="flex items-center justify-between rounded-lg border border-gray-100 bg-gray-50 px-4 py-3"
                 >
                   <div className="flex items-center gap-3">
                     <div
-                      className={`h-2 w-2 rounded-full ${a.active ? "bg-green-400" : "bg-gray-500"}`}
+                      className={`h-2 w-2 rounded-full ${a.active ? "bg-green-500" : "bg-gray-400"}`}
                     />
                     <div>
-                      <p className="text-sm font-medium text-white">
+                      <p className="text-sm font-medium text-gray-800">
                         {a.name}
                       </p>
                       <p className="text-xs text-gray-500">
@@ -194,7 +194,7 @@ export default function Dashboard() {
                       </p>
                     </div>
                   </div>
-                  <span className="rounded bg-[#0f3460] px-2 py-0.5 font-mono text-xs text-gray-300">
+                  <span className="rounded bg-gray-100 px-2 py-0.5 font-mono text-xs text-gray-600">
                     {a.mode_s_code}
                   </span>
                 </div>

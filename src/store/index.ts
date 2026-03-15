@@ -1,7 +1,9 @@
 import { create } from "zustand";
 import type {
+  AdsbTrack,
   Aircraft,
   AnalysisResult,
+  FlightRecord,
   LOSProfileData,
   PageId,
   RadarSite,
@@ -46,6 +48,36 @@ interface AppState {
   removeLOSResult: (id: string) => void;
   clearLOSResults: () => void;
 
+  // ADS-B
+  adsbTracks: AdsbTrack[];
+  setAdsbTracks: (tracks: AdsbTrack[]) => void;
+  addAdsbTracks: (tracks: AdsbTrack[]) => void;
+  clearAdsbTracks: () => void;
+  adsbLoading: boolean;
+  setAdsbLoading: (v: boolean) => void;
+  adsbProgress: string;
+  setAdsbProgress: (msg: string) => void;
+
+  // 운항이력
+  flightHistory: FlightRecord[];
+  setFlightHistory: (records: FlightRecord[]) => void;
+  addFlightHistory: (records: FlightRecord[]) => void;
+  clearFlightHistory: () => void;
+  flightHistoryLoading: boolean;
+  setFlightHistoryLoading: (v: boolean) => void;
+  flightHistoryProgress: string;
+  setFlightHistoryProgress: (msg: string) => void;
+  selectedFlight: FlightRecord | null;
+  setSelectedFlight: (f: FlightRecord | null) => void;
+
+  // OpenSky 동기화
+  openskySync: boolean;
+  setOpenskySync: (v: boolean) => void;
+  openskySyncProgress: string;
+  setOpenskySyncProgress: (msg: string) => void;
+  openskySyncVersion: number;
+  triggerOpenskySync: () => void;
+
   // UI
   activePage: PageId;
   setActivePage: (page: PageId) => void;
@@ -61,6 +93,7 @@ export const useAppStore = create<AppState>((set) => ({
     {
       id: "preset-1",
       name: "1호기",
+      registration: "FL7779",
       model: "Embraer Praetor 600",
       mode_s_code: "71BF79",
       organization: "비행점검센터",
@@ -70,6 +103,7 @@ export const useAppStore = create<AppState>((set) => ({
     {
       id: "preset-2",
       name: "2호기",
+      registration: "FL7778",
       model: "Hawker 750",
       mode_s_code: "71BF78",
       organization: "비행점검센터",
@@ -104,9 +138,16 @@ export const useAppStore = create<AppState>((set) => ({
       ),
     })),
   removeUploadedFile: (path) =>
-    set((state) => ({
-      uploadedFiles: state.uploadedFiles.filter((f) => f.path !== path),
-    })),
+    set((state) => {
+      const file = state.uploadedFiles.find((f) => f.path === path);
+      const fname = file?.name ?? path.split(/[/\\]/).pop() ?? path;
+      return {
+        uploadedFiles: state.uploadedFiles.filter((f) => f.path !== path),
+        analysisResults: state.analysisResults.filter(
+          (r) => r.file_info.filename !== fname
+        ),
+      };
+    }),
   clearUploadedFiles: () =>
     set({ uploadedFiles: [], analysisResults: [], selectedModeS: null }),
 
@@ -185,6 +226,44 @@ export const useAppStore = create<AppState>((set) => ({
       losResults: state.losResults.filter((r) => r.id !== id),
     })),
   clearLOSResults: () => set({ losResults: [] }),
+
+  // ADS-B
+  adsbTracks: [],
+  setAdsbTracks: (tracks) => set({ adsbTracks: tracks }),
+  addAdsbTracks: (tracks) =>
+    set((state) => ({ adsbTracks: [...state.adsbTracks, ...tracks] })),
+  clearAdsbTracks: () => set({ adsbTracks: [] }),
+  adsbLoading: false,
+  setAdsbLoading: (v) => set({ adsbLoading: v }),
+  adsbProgress: "",
+  setAdsbProgress: (msg) => set({ adsbProgress: msg }),
+
+  // 운항이력
+  flightHistory: [],
+  setFlightHistory: (records) => set({ flightHistory: records }),
+  addFlightHistory: (records) =>
+    set((state) => {
+      const existing = new Set(state.flightHistory.map((f) => `${f.icao24}_${f.first_seen}`));
+      const newOnes = records.filter((f) => !existing.has(`${f.icao24}_${f.first_seen}`));
+      if (newOnes.length === 0) return state;
+      return { flightHistory: [...state.flightHistory, ...newOnes] };
+    }),
+  clearFlightHistory: () => set({ flightHistory: [], selectedFlight: null }),
+  flightHistoryLoading: false,
+  setFlightHistoryLoading: (v) => set({ flightHistoryLoading: v }),
+  flightHistoryProgress: "",
+  setFlightHistoryProgress: (msg) => set({ flightHistoryProgress: msg }),
+  selectedFlight: null,
+  setSelectedFlight: (f) => set({ selectedFlight: f }),
+
+  // OpenSky 동기화
+  openskySync: false,
+  setOpenskySync: (v) => set({ openskySync: v }),
+  openskySyncProgress: "",
+  setOpenskySyncProgress: (msg) => set({ openskySyncProgress: msg }),
+  openskySyncVersion: 0,
+  triggerOpenskySync: () =>
+    set((state) => ({ openskySyncVersion: state.openskySyncVersion + 1 })),
 
   // UI
   activePage: "upload",

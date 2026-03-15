@@ -104,6 +104,8 @@ struct Cat048Record {
     radar_typ: u8,
     /// I020 SIM bit: 0=actual, 1=simulated
     sim_flag: bool,
+    /// I070 V=1 or G=1: invalid/garbled Mode 3/A
+    mode3a_garbled: bool,
 }
 
 /// classify_and_convert 결과
@@ -209,10 +211,12 @@ impl TrackAssembler {
 
         // 타입별 통계
         match &point.radar_type {
-            RadarDetectionType::Atcrbs => self.stats.points_by_type[0] += 1,
-            RadarDetectionType::AtcrbsPsr => self.stats.points_by_type[1] += 1,
-            RadarDetectionType::Modes => self.stats.points_by_type[2] += 1,
-            RadarDetectionType::ModesPsr => self.stats.points_by_type[3] += 1,
+            RadarDetectionType::ModeAC => self.stats.points_by_type[0] += 1,
+            RadarDetectionType::ModeACPsr => self.stats.points_by_type[1] += 1,
+            RadarDetectionType::ModeSAllCall => self.stats.points_by_type[2] += 1,
+            RadarDetectionType::ModeSRollCall => self.stats.points_by_type[3] += 1,
+            RadarDetectionType::ModeSAllCallPsr => self.stats.points_by_type[4] += 1,
+            RadarDetectionType::ModeSRollCallPsr => self.stats.points_by_type[5] += 1,
         }
 
         track.push(point);
@@ -321,10 +325,10 @@ impl TrackAssembler {
         // 실제 병합
         for (ms, mut np) in merged_points {
             np.mode_s = ms.clone();
-            // radar_type은 원래 값 보존 (atcrbs 또는 atcrbs_psr)
+            // radar_type은 원래 값 보존 (Mode A/C 계열)
             match &np.radar_type {
-                RadarDetectionType::Atcrbs => self.stats.points_by_type[0] += 1,
-                RadarDetectionType::AtcrbsPsr => self.stats.points_by_type[1] += 1,
+                RadarDetectionType::ModeAC => self.stats.points_by_type[0] += 1,
+                RadarDetectionType::ModeACPsr => self.stats.points_by_type[1] += 1,
                 _ => {}
             }
             self.stats.atcrbs_merged += 1;
@@ -621,12 +625,20 @@ fn classify_and_convert(
         .map(|fl| fl * 100.0 * 0.3048)
         .unwrap_or(0.0);
 
-    // I020 TYP → RadarDetectionType
+    // I020 TYP → RadarDetectionType (6종 분류)
+    // TYP=2: SSR only (Mode A/C 응답기)
+    // TYP=3: SSR + PSR (Mode A/C Combined)
+    // TYP=4: Mode S All-Call (PSR 없음)
+    // TYP=5: Mode S Roll-Call (PSR 없음)
+    // TYP=6: Mode S All-Call + PSR
+    // TYP=7: Mode S Roll-Call + PSR
     let radar_type = match record.radar_typ {
-        2 => RadarDetectionType::Atcrbs,
-        3 => RadarDetectionType::AtcrbsPsr,
-        4 | 5 => RadarDetectionType::Modes,
-        6 | 7 => RadarDetectionType::ModesPsr,
+        2 => RadarDetectionType::ModeAC,
+        3 => RadarDetectionType::ModeACPsr,
+        4 => RadarDetectionType::ModeSAllCall,
+        5 => RadarDetectionType::ModeSRollCall,
+        6 => RadarDetectionType::ModeSAllCallPsr,
+        7 => RadarDetectionType::ModeSRollCallPsr,
         _ => return RecordOutcome::Discard,
     };
 
@@ -714,7 +726,8 @@ where
 
     let base_date_secs = extract_base_date_from_filename(&filename);
     let mut day_offset_secs: f64 = 0.0; // 자정 넘김 보정용
-    let mut prev_tod: f64 = 0.0; // 이전 레코드의 time_of_day
+    let mut max_tod_seen: f64 = 0.0; // 전체 레코드 중 최대 tod (자정 교차 판정용)
+    let mut midnight_crossed = false; // 이미 자정 교차 감지했는지 여부
     let data_len = data.len();
     let mut last_reported_pct = 0u32;
     let mut point_count = 0usize; // 진행률 보고용
@@ -755,18 +768,36 @@ where
                             total_records += 1;
                             assembler.stats.total_asterix_records += 1;
 
-                            // 자정 넘김 감지: tod가 이전보다 크게 줄어들면 날짜 변경
-                            if let Some(tod) = record.time_of_day {
-                                if prev_tod > 70000.0 && tod < 16000.0 {
-                                    day_offset_secs += 86400.0;
-                                    info!("Midnight wrap detected: prev_tod={:.0}, tod={:.0}, day_offset=+{:.0}s", prev_tod, tod, day_offset_secs);
-                                }
-                                prev_tod = tod;
+                            if record.mode3a_garbled {
+                                assembler.stats.mode3a_invalid += 1;
                             }
 
+                            // 자정 넘김 감지: 이전에 큰 tod(19:26+)를 본 적 있는데
+                            // 현재 tod가 작으면(04:26-) 자정 교차로 판정 (1회만)
+                            if let Some(tod) = record.time_of_day {
+                                if tod > max_tod_seen {
+                                    max_tod_seen = tod;
+                                }
+                                if !midnight_crossed && max_tod_seen > 70000.0 && tod < 16000.0 {
+                                    midnight_crossed = true;
+                                    day_offset_secs += 86400.0;
+                                    info!("Midnight wrap detected: max_tod={:.0}, tod={:.0}, day_offset=+{:.0}s", max_tod_seen, tod, day_offset_secs);
+                                }
+                            }
+
+                            // 자정 교차된 경우: tod가 작으면(자정 이후) offset 적용,
+                            // tod가 크면(자정 이전 잔여 레코드) offset 미적용
+                            let effective_offset = if midnight_crossed {
+                                match record.time_of_day {
+                                    Some(tod) if tod < 43200.0 => day_offset_secs,
+                                    _ => 0.0,
+                                }
+                            } else {
+                                0.0
+                            };
                             match classify_and_convert(
                                 &record,
-                                base_date_secs + day_offset_secs,
+                                base_date_secs + effective_offset,
                                 radar_lat,
                                 radar_lon,
                             ) {
@@ -1161,8 +1192,13 @@ fn parse_cat048_record(
 
             UAP_I070 => {
                 if pos + 2 > block.len() { break; }
-                let raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
-                record.mode3a = Some(raw & 0x0FFF);
+                let v_flag = (block[pos] >> 7) & 1;
+                let g_flag = (block[pos] >> 6) & 1;
+                if v_flag == 0 && g_flag == 0 {
+                    record.mode3a = Some(((block[pos] as u16 & 0x0F) << 8) | block[pos + 1] as u16);
+                } else {
+                    record.mode3a_garbled = true;
+                }
                 pos += 2;
             }
 
@@ -1170,10 +1206,19 @@ fn parse_cat048_record(
                 if pos + 2 > block.len() { break; }
                 let raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
                 let v_flag = (raw >> 15) & 1; // 0=validated, 1=not validated
-                let g_flag = (raw >> 14) & 1; // 0=ok, 1=garbled
-                if v_flag == 0 && g_flag == 0 {
-                    let fl = (raw & 0x3FFF) as f64 / 4.0;
-                    if fl <= MAX_FLIGHT_LEVEL {
+                let _g_flag = (raw >> 14) & 1; // 0=ok, 1=garbled
+                if v_flag == 0 {
+                    // I090: bits 15=V, 14=G, bits 13-0 = Flight Level (14-bit signed, LSB=1/4 FL)
+                    // G=1(garbled)이어도 V=0이면 대략 유효한 경우가 많으므로 수용
+                    let fl_unsigned = raw & 0x3FFF; // 14 bits
+                    let fl_signed = if fl_unsigned & 0x2000 != 0 {
+                        // negative: sign-extend
+                        (fl_unsigned | 0xC000) as i16
+                    } else {
+                        fl_unsigned as i16
+                    };
+                    let fl = fl_signed as f64 * 0.25;
+                    if fl >= -10.0 && fl <= MAX_FLIGHT_LEVEL {
                         record.flight_level = Some(fl);
                     }
                 }
@@ -1394,14 +1439,25 @@ fn quick_dist_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     ((dlat * dlat + x * x).sqrt()) * 6371.0
 }
 
+/// Convert polar coordinates (rho, theta) to WGS-84 lat/lon.
+/// Uses the great-circle destination formula for better accuracy at long range.
 fn polar_to_latlon(rho_nm: f64, theta_deg: f64, radar_lat: f64, radar_lon: f64) -> (f64, f64) {
-    let rng_km = rho_nm * 1.852;
-    let az_rad = theta_deg.to_radians();
+    let d_m = rho_nm * 1852.0; // NM to meters
+    let brg = theta_deg.to_radians(); // bearing (ASTERIX theta: 0=North, CW)
+    let lat1 = radar_lat.to_radians();
+    let lon1 = radar_lon.to_radians();
+    const R: f64 = 6_371_000.0; // Earth radius in meters
 
-    let lat_offset = rng_km * az_rad.cos() / 111.32;
-    let lon_offset = rng_km * az_rad.sin() / (111.32 * radar_lat.to_radians().cos());
+    let angular_dist = d_m / R;
+    let sin_ad = angular_dist.sin();
+    let cos_ad = angular_dist.cos();
+    let sin_lat1 = lat1.sin();
+    let cos_lat1 = lat1.cos();
 
-    (radar_lat + lat_offset, radar_lon + lon_offset)
+    let lat2 = (sin_lat1 * cos_ad + cos_lat1 * sin_ad * brg.cos()).asin();
+    let lon2 = lon1 + (brg.sin() * sin_ad * cos_lat1).atan2(cos_ad - sin_lat1 * lat2.sin());
+
+    (lat2.to_degrees(), lon2.to_degrees())
 }
 
 fn cartesian_to_latlon(x_nm: f64, y_nm: f64, radar_lat: f64, radar_lon: f64) -> (f64, f64) {
@@ -1633,7 +1689,7 @@ mod tests {
         };
         match classify_and_convert(&record, 1700000000.0, DEFAULT_RADAR_LAT, DEFAULT_RADAR_LON) {
             RecordOutcome::ModesSPoint(tp, _mode3a) => {
-                assert_eq!(tp.radar_type, RadarDetectionType::ModesPsr);
+                assert_eq!(tp.radar_type, RadarDetectionType::ModeSRollCallPsr);
                 assert_eq!(tp.mode_s, "71BF79");
             }
             _ => panic!("Expected ModesSPoint"),
@@ -1647,21 +1703,21 @@ mod tests {
             timestamp: 1000.0, mode_s: "ABC".to_string(),
             latitude: 37.5, longitude: 126.8, altitude: 3000.0,
             speed: 200.0, heading: 90.0,
-            radar_type: RadarDetectionType::Atcrbs,
+            radar_type: RadarDetectionType::ModeAC,
             raw_data: vec![],
         };
         let p2 = TrackPoint {
             timestamp: 1001.0, mode_s: "ABC".to_string(),
             latitude: 37.5, longitude: 126.8, altitude: 3000.0,
             speed: 200.0, heading: 90.0,
-            radar_type: RadarDetectionType::ModesPsr,
+            radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
         };
         asm.insert(p1, None);
         asm.insert(p2, None);
-        // 동일 스캔 → 우선순위 높은 ModesPsr이 남아야 함
+        // 동일 스캔 → 우선순위 높은 ModeSRollCallPsr이 남아야 함
         assert_eq!(asm.tracks["ABC"].len(), 1);
-        assert_eq!(asm.tracks["ABC"][0].radar_type, RadarDetectionType::ModesPsr);
+        assert_eq!(asm.tracks["ABC"][0].radar_type, RadarDetectionType::ModeSRollCallPsr);
     }
 
     #[test]
@@ -1671,14 +1727,14 @@ mod tests {
             timestamp: 1000.0, mode_s: "ABC".to_string(),
             latitude: 37.5, longitude: 126.8, altitude: 3000.0,
             speed: 200.0, heading: 90.0,
-            radar_type: RadarDetectionType::ModesPsr,
+            radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
         };
         let p2 = TrackPoint {
             timestamp: 1005.0, mode_s: "ABC".to_string(),
             latitude: 35.0, longitude: 129.0, altitude: 3000.0, // ~300km jump in 5s
             speed: 200.0, heading: 90.0,
-            radar_type: RadarDetectionType::ModesPsr,
+            radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
         };
         asm.insert(p1, None);
@@ -1857,8 +1913,8 @@ mod tests {
 
         // 60NM 이상인 포인트의 radar_type
         let beyond_60 = dists.iter().filter(|(d, _)| *d > 60.0).count();
-        let beyond_60_modes = dists.iter().filter(|(d, rt)| *d > 60.0 && **rt == RadarDetectionType::Modes).count();
-        let beyond_60_modes_psr = dists.iter().filter(|(d, rt)| *d > 60.0 && **rt == RadarDetectionType::ModesPsr).count();
+        let beyond_60_modes = dists.iter().filter(|(d, rt)| *d > 60.0 && rt.has_modes() && !rt.has_psr()).count();
+        let beyond_60_modes_psr = dists.iter().filter(|(d, rt)| *d > 60.0 && rt.has_modes() && rt.has_psr()).count();
         let within_60 = dists.iter().filter(|(d, _)| *d <= 60.0).count();
 
         println!("  Within 60NM: {} pts", within_60);
@@ -1866,16 +1922,18 @@ mod tests {
 
         // 거리별 분포 히스토그램
         let mut bins = vec![0usize; 20]; // 10NM 간격, 0-200NM
-        let mut bin_types: Vec<[usize; 4]> = vec![[0; 4]; 20]; // atcrbs, atcrbs_psr, modes, modes_psr
+        let mut bin_types: Vec<[usize; 6]> = vec![[0; 6]; 20]; // mode_ac, mode_ac_psr, mode_s, mode_s_psr, mode_s_ac, mode_s_ac_psr
         for (d, rt) in &dists {
             let bin = (*d / 10.0) as usize;
             if bin < 20 {
                 bins[bin] += 1;
                 let type_idx = match rt {
-                    RadarDetectionType::Atcrbs => 0,
-                    RadarDetectionType::AtcrbsPsr => 1,
-                    RadarDetectionType::Modes => 2,
-                    RadarDetectionType::ModesPsr => 3,
+                    RadarDetectionType::ModeAC => 0,
+                    RadarDetectionType::ModeACPsr => 1,
+                    RadarDetectionType::ModeSAllCall => 2,
+                    RadarDetectionType::ModeSRollCall => 3,
+                    RadarDetectionType::ModeSAllCallPsr => 4,
+                    RadarDetectionType::ModeSRollCallPsr => 5,
                 };
                 bin_types[bin][type_idx] += 1;
             }
@@ -1883,9 +1941,10 @@ mod tests {
         println!("\n  Distance histogram (10NM bins):");
         for i in 0..20 {
             if bins[i] > 0 {
-                println!("    {:3}-{:3}NM: {:4} pts  [atcrbs={}, atcrbs_psr={}, modes={}, modes_psr={}]",
+                println!("    {:3}-{:3}NM: {:4} pts  [ac={}, ac_psr={}, s={}, s_psr={}, s_ac={}, s_ac_psr={}]",
                     i*10, (i+1)*10, bins[i],
-                    bin_types[i][0], bin_types[i][1], bin_types[i][2], bin_types[i][3]);
+                    bin_types[i][0], bin_types[i][1], bin_types[i][2], bin_types[i][3],
+                    bin_types[i][4], bin_types[i][5]);
             }
         }
 

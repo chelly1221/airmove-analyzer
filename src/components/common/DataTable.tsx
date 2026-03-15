@@ -27,10 +27,10 @@ export default function DataTable<T>({
 }: DataTableProps<T>) {
   return (
     <div
-      className={`overflow-auto rounded-lg border border-white/10 ${maxHeight}`}
+      className={`overflow-auto rounded-lg border border-gray-200 ${maxHeight}`}
     >
       <table className="w-full text-sm">
-        <thead className="sticky top-0 z-10 bg-[#0f3460] text-gray-300">
+        <thead className="sticky top-0 z-10 bg-gray-100 text-gray-600">
           <tr>
             {columns.map((col) => (
               <th
@@ -46,7 +46,7 @@ export default function DataTable<T>({
             ))}
           </tr>
         </thead>
-        <tbody className="divide-y divide-white/5">
+        <tbody className="divide-y divide-gray-100">
           {data.length === 0 ? (
             <tr>
               <td
@@ -63,13 +63,13 @@ export default function DataTable<T>({
               return (
               <tr
                 key={key}
-                className={`transition-colors ${isSelected ? "bg-[#e94560]/15 ring-1 ring-inset ring-[#e94560]/30" : "bg-[#16213e] hover:bg-[#1a2a4e]"} ${onRowClick ? "cursor-pointer" : ""}`}
+                className={`transition-colors ${isSelected ? "bg-[#a60739]/10 ring-1 ring-inset ring-[#a60739]/30" : "bg-white hover:bg-gray-100"} ${onRowClick ? "cursor-pointer" : ""}`}
                 onClick={() => onRowClick?.(row, idx)}
               >
                 {columns.map((col) => (
                   <td
                     key={col.key}
-                    className="whitespace-nowrap px-4 py-3 text-gray-300"
+                    className="whitespace-nowrap px-4 py-3 text-gray-600"
                     style={{ textAlign: col.align ?? "left" }}
                   >
                     {col.render

@@ -405,11 +405,11 @@ export default function ReportGeneration() {
       onClick={onChange}
       className={`flex items-center gap-3 rounded-lg border px-4 py-3 text-sm transition-all ${
         checked
-          ? "border-[#e94560]/50 bg-[#e94560]/10 text-white"
-          : "border-white/10 text-gray-400 hover:border-white/20"
+          ? "border-[#a60739]/50 bg-[#a60739]/10 text-gray-800"
+          : "border-gray-200 text-gray-500 hover:border-gray-300"
       }`}
     >
-      {checked ? <CheckSquare size={18} className="text-[#e94560]" /> : <Square size={18} />}
+      {checked ? <CheckSquare size={18} className="text-[#a60739]" /> : <Square size={18} />}
       <Icon size={16} />
       <span>{label}</span>
     </button>
@@ -420,15 +420,15 @@ export default function ReportGeneration() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">보고서 생성</h1>
-          <p className="mt-1 text-sm text-gray-400">
+          <h1 className="text-2xl font-bold text-gray-800">보고서 생성</h1>
+          <p className="mt-1 text-sm text-gray-500">
             분석 결과를 공공기관 양식 PDF 보고서로 생성합니다
           </p>
         </div>
         <button
           onClick={handleGeneratePDF}
           disabled={generating || analysisResults.length === 0}
-          className="flex items-center gap-2 rounded-lg bg-[#e94560] px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#d63851] disabled:opacity-40 disabled:cursor-not-allowed"
+          className="flex items-center gap-2 rounded-lg bg-[#a60739] px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {generating ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
           <span>{generating ? "생성 중..." : "PDF 다운로드"}</span>
@@ -437,14 +437,14 @@ export default function ReportGeneration() {
 
       {/* Template selector */}
       <SimpleCard>
-        <h2 className="mb-3 text-base font-semibold text-white">보고서 템플릿</h2>
+        <h2 className="mb-3 text-base font-semibold text-gray-800">보고서 템플릿</h2>
         <div className="flex gap-3">
           <button
             onClick={() => setTemplate("weekly")}
             className={`flex-1 rounded-lg border px-4 py-3 text-sm font-medium transition-all ${
               template === "weekly"
-                ? "border-[#e94560] bg-[#e94560]/15 text-[#e94560]"
-                : "border-white/10 text-gray-400 hover:border-white/20"
+                ? "border-[#a60739] bg-[#a60739]/10 text-[#a60739]"
+                : "border-gray-200 text-gray-500 hover:border-gray-300"
             }`}
           >
             <div className="text-base font-bold">주간 보고서</div>
@@ -456,8 +456,8 @@ export default function ReportGeneration() {
             onClick={() => setTemplate("monthly")}
             className={`flex-1 rounded-lg border px-4 py-3 text-sm font-medium transition-all ${
               template === "monthly"
-                ? "border-[#e94560] bg-[#e94560]/15 text-[#e94560]"
-                : "border-white/10 text-gray-400 hover:border-white/20"
+                ? "border-[#a60739] bg-[#a60739]/10 text-[#a60739]"
+                : "border-gray-200 text-gray-500 hover:border-gray-300"
             }`}
           >
             <div className="text-base font-bold">월간 보고서</div>
@@ -470,7 +470,7 @@ export default function ReportGeneration() {
 
       {/* Options */}
       <SimpleCard>
-        <h2 className="mb-3 text-base font-semibold text-white">포함 항목</h2>
+        <h2 className="mb-3 text-base font-semibold text-gray-800">포함 항목</h2>
         <div className="flex flex-wrap gap-3">
           <ToggleOption label="지도 스크린샷" icon={Map} checked={options.includeMap}
             onChange={() => setOptions((o) => ({ ...o, includeMap: !o.includeMap }))} />
@@ -486,8 +486,8 @@ export default function ReportGeneration() {
       {/* Error */}
       {error && (
         <div className="flex items-center gap-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3">
-          <span className="text-sm text-red-400">{error}</span>
-          <button onClick={() => setError(null)} className="ml-auto text-xs text-gray-400 hover:text-white">
+          <span className="text-sm text-red-600">{error}</span>
+          <button onClick={() => setError(null)} className="ml-auto text-xs text-gray-500 hover:text-gray-900">
             닫기
           </button>
         </div>
@@ -495,28 +495,28 @@ export default function ReportGeneration() {
 
       {/* Preview summary */}
       <SimpleCard>
-        <h2 className="mb-3 text-base font-semibold text-white">보고서 요약</h2>
+        <h2 className="mb-3 text-base font-semibold text-gray-800">보고서 요약</h2>
         <div className="grid grid-cols-4 gap-3">
-          <div className="rounded-lg border border-white/10 bg-[#0d1b2a] p-3 text-center">
-            <p className="text-xs text-gray-500">분석 파일</p>
-            <p className="text-lg font-bold text-white">{analysisResults.length}</p>
+          <div className="rounded-lg border border-gray-200 bg-gray-100 p-3 text-center">
+            <p className="text-xs text-gray-400">분석 파일</p>
+            <p className="text-lg font-bold text-gray-800">{analysisResults.length}</p>
           </div>
-          <div className="rounded-lg border border-white/10 bg-[#0d1b2a] p-3 text-center">
-            <p className="text-xs text-gray-500">소실 건수</p>
-            <p className="text-lg font-bold text-[#e94560]">{totalLoss}</p>
+          <div className="rounded-lg border border-gray-200 bg-gray-100 p-3 text-center">
+            <p className="text-xs text-gray-400">소실 건수</p>
+            <p className="text-lg font-bold text-[#a60739]">{totalLoss}</p>
           </div>
-          <div className="rounded-lg border border-white/10 bg-[#0d1b2a] p-3 text-center">
-            <p className="text-xs text-gray-500">평균 소실율</p>
-            <p className="text-lg font-bold text-yellow-400">{avgLossPercent.toFixed(1)}%</p>
+          <div className="rounded-lg border border-gray-200 bg-gray-100 p-3 text-center">
+            <p className="text-xs text-gray-400">평균 소실율</p>
+            <p className="text-lg font-bold text-yellow-600">{avgLossPercent.toFixed(1)}%</p>
           </div>
-          <div className="rounded-lg border border-white/10 bg-[#0d1b2a] p-3 text-center">
-            <p className="text-xs text-gray-500">LOS 분석</p>
-            <p className="text-lg font-bold text-white">{losResults.length}건</p>
+          <div className="rounded-lg border border-gray-200 bg-gray-100 p-3 text-center">
+            <p className="text-xs text-gray-400">LOS 분석</p>
+            <p className="text-lg font-bold text-gray-800">{losResults.length}건</p>
           </div>
         </div>
 
         {template === "monthly" && allLoss.length > 20 && (
-          <p className="mt-3 text-xs text-gray-500">
+          <p className="mt-3 text-xs text-gray-400">
             월간 보고서: 소실 상세는 상위 20건만 포함됩니다 (전체 {allLoss.length}건)
           </p>
         )}
@@ -524,9 +524,9 @@ export default function ReportGeneration() {
 
       {/* No data */}
       {analysisResults.length === 0 && (
-        <div className="flex flex-col items-center rounded-xl border border-white/10 bg-[#16213e] py-12">
+        <div className="flex flex-col items-center rounded-xl border border-gray-200 bg-gray-50 py-12">
           <FileText size={40} className="mb-3 text-gray-600" />
-          <p className="text-sm text-gray-400">
+          <p className="text-sm text-gray-500">
             보고서를 생성하려면 먼저 자료를 업로드하고 파싱하세요
           </p>
         </div>

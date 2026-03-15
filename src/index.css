@@ -6,12 +6,12 @@
 /* MapLibre GL CSS (항적 지도 GPU) */
 @import "maplibre-gl/dist/maplibre-gl.css";
 
-/* Dark theme base */
+/* White + #a60739 accent theme */
 :root {
-  --color-bg-primary: #1a1a2e;
-  --color-bg-card: #16213e;
-  --color-bg-accent: #0f3460;
-  --color-highlight: #e94560;
+  --color-bg-primary: #ffffff;
+  --color-bg-card: #f8f9fa;
+  --color-bg-accent: #f3f4f6;
+  --color-highlight: #a60739;
 }
 
 html,
@@ -24,8 +24,8 @@ body,
 }
 
 body {
-  background-color: #1a1a2e;
-  color: #e0e0e0;
+  background-color: #ffffff;
+  color: #1f2937;
   font-family:
     "Pretendard Variable",
     Pretendard,
@@ -38,7 +38,7 @@ body {
     sans-serif;
 }
 
-/* Scrollbar styling */
+/* Scrollbar styling - light theme */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -47,59 +47,59 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.12);
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.22);
 }
 
-/* Leaflet popup overrides for dark theme */
+/* Leaflet popup overrides - light theme */
 .leaflet-popup-content-wrapper {
-  background: #16213e;
-  color: #e0e0e0;
+  background: #ffffff;
+  color: #1f2937;
   border-radius: 8px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
 }
 .leaflet-popup-tip {
-  background: #16213e;
+  background: #ffffff;
 }
 .leaflet-popup-content {
   margin: 8px 12px;
 }
 
-/* Leaflet controls dark theme */
+/* Leaflet controls - light theme */
 .leaflet-control-zoom a {
-  background-color: #16213e !important;
-  color: #e0e0e0 !important;
-  border-color: rgba(255, 255, 255, 0.1) !important;
+  background-color: #ffffff !important;
+  color: #374151 !important;
+  border-color: #e5e7eb !important;
 }
 .leaflet-control-zoom a:hover {
-  background-color: #0f3460 !important;
+  background-color: #f3f4f6 !important;
 }
 .leaflet-control-attribution {
   display: none !important;
 }
 
-/* MapLibre controls dark theme */
+/* MapLibre controls - light theme */
 .maplibregl-ctrl-group {
-  background: #16213e !important;
-  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  background: #ffffff !important;
+  border: 1px solid #e5e7eb !important;
   border-radius: 8px !important;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important;
 }
 .maplibregl-ctrl-group button {
   background-color: transparent !important;
-  border-color: rgba(255, 255, 255, 0.1) !important;
+  border-color: #e5e7eb !important;
 }
 .maplibregl-ctrl-group button + button {
-  border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-top: 1px solid #e5e7eb !important;
 }
 .maplibregl-ctrl-group button:hover {
-  background-color: #0f3460 !important;
+  background-color: #f3f4f6 !important;
 }
 .maplibregl-ctrl-group button .maplibregl-ctrl-icon {
-  filter: invert(1) brightness(0.85);
+  filter: none;
 }
 .maplibregl-ctrl-attrib,
 .maplibregl-ctrl-attrib a {
@@ -111,7 +111,7 @@ input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
   height: 4px;
-  background: rgba(255, 255, 255, 0.1);
+  background: #e5e7eb;
   border-radius: 2px;
   outline: none;
 }
@@ -120,46 +120,48 @@ input[type="range"]::-webkit-slider-thumb {
   appearance: none;
   width: 14px;
   height: 14px;
-  background: #e94560;
+  background: #a60739;
   border-radius: 50%;
   cursor: pointer;
-  border: 2px solid #1a1a2e;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 input[type="range"]::-moz-range-thumb {
   width: 14px;
   height: 14px;
-  background: #e94560;
+  background: #a60739;
   border-radius: 50%;
   cursor: pointer;
-  border: 2px solid #1a1a2e;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
-/* Select styling for dark theme */
+/* Select styling */
 select {
   appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 8px center;
   padding-right: 28px;
 }
 
-/* Leaflet tooltip overrides for dark theme */
+/* Leaflet tooltip overrides - light theme */
 .leaflet-tooltip {
-  background: #0d1b2a;
-  color: #e0e0e0;
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: #ffffff;
+  color: #1f2937;
+  border: 1px solid #e5e7eb;
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
   padding: 6px 10px;
 }
 .leaflet-tooltip-top:before {
-  border-top-color: #0d1b2a;
+  border-top-color: #ffffff;
 }
 .leaflet-tooltip-bottom:before {
-  border-bottom-color: #0d1b2a;
+  border-bottom-color: #ffffff;
 }
 
-/* Leaflet container fix */
+/* Leaflet container */
 .leaflet-container {
-  background: #0d1b2a;
+  background: #f3f4f6;
 }

@@ -53,17 +53,20 @@ pub fn calculate_line_of_sight(
     let max_detection_range_m = radar_horizon_m + target_horizon_m;
     let max_range_km = max_detection_range_m / 1000.0;
 
-    // Slant range: straight-line distance accounting for Earth curvature
-    // For simplicity with the 4/3 model, we compute the 3D distance:
-    let height_diff = target_alt - radar_height;
-    let slant_range_m = (ground_distance_m.powi(2) + height_diff.powi(2)).sqrt();
+    // Slant range accounting for Earth curvature (law of cosines on spherical triangle)
+    let central_angle = ground_distance_m / EARTH_RADIUS_M;
+    let r_radar = EARTH_RADIUS_M + radar_height;
+    let r_target = EARTH_RADIUS_M + target_alt;
+    let slant_range_m = (r_radar.powi(2) + r_target.powi(2)
+        - 2.0 * r_radar * r_target * central_angle.cos())
+    .sqrt();
     let slant_range_km = slant_range_m / 1000.0;
 
     // Elevation angle from radar to target
     // Accounting for Earth curvature using the 4/3 model:
     // The target appears to be lowered by d^2 / (2 * R_eff)
     let earth_curvature_drop = ground_distance_m.powi(2) / (2.0 * EFFECTIVE_EARTH_RADIUS_M);
-    let apparent_height_diff = height_diff - earth_curvature_drop;
+    let apparent_height_diff = (target_alt - radar_height) - earth_curvature_drop;
     let elevation_rad = if ground_distance_m > 0.0 {
         (apparent_height_diff / ground_distance_m).atan()
     } else {

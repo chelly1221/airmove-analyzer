@@ -7,10 +7,10 @@ use crate::models::{AnalysisResult, LossSegment, ParsedFile, TrackPoint};
 use crate::models::RadarDetectionType;
 
 /// 기본 임계값 (초): 이 시간 이상 gap이면 Loss
-pub const DEFAULT_THRESHOLD_SECS: f64 = 8.0;
+pub const DEFAULT_THRESHOLD_SECS: f64 = 7.0;
 
 /// Minimum points per Mode-S to be considered for loss analysis.
-const MIN_POINTS_FOR_ANALYSIS: usize = 3;
+const MIN_POINTS_FOR_ANALYSIS: usize = 1;
 
 /// 레이더 최대 탐지거리의 몇 % 이상이면 범위이탈로 판단
 const OUT_OF_RANGE_THRESHOLD: f64 = 0.88;
@@ -137,10 +137,6 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
     let radar_lat = parsed.radar_lat;
     let radar_lon = parsed.radar_lon;
 
-    // 레이더 최대 탐지거리 추정 (전체 포인트의 95th percentile 거리)
-    let max_radar_range_km = estimate_max_radar_range(&parsed.track_points, radar_lat, radar_lon);
-    info!("Estimated max radar range: {:.1} km", max_radar_range_km);
-
     // Group track points by Mode-S
     let mut groups: HashMap<&str, Vec<&TrackPoint>> = HashMap::new();
     for point in &parsed.track_points {
@@ -153,6 +149,8 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
     // Sort each group by timestamp and detect losses
     let mut all_loss_segments = Vec::new();
     let mut analyzed_count = 0usize;
+    let mut total_aircraft_track_time: f64 = 0.0;
+    let mut overall_max_range_km: f64 = 50.0;
 
     for (mode_s, mut points) in groups {
         if points.len() < MIN_POINTS_FOR_ANALYSIS {
@@ -166,17 +164,30 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // 이 항공기의 실제 비행 시간
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            total_aircraft_track_time += last.timestamp - first.timestamp;
+        }
+
+        // 이 항공기의 레이더 최대 탐지거리 추정
+        let aircraft_range_km = estimate_max_radar_range_refs(&points, radar_lat, radar_lon);
+        if aircraft_range_km > overall_max_range_km {
+            overall_max_range_km = aircraft_range_km;
+        }
+
         // 스캔 간격 추정 (범위이탈 판단용)
         let estimated_interval = estimate_scan_interval(&points);
         let effective_threshold = threshold_secs;
-        let scan_interval = estimated_interval.unwrap_or(threshold_secs / 1.8);
+        let scan_interval = estimated_interval.unwrap_or(5.0);
 
         let segments = detect_loss_for_track(
             mode_s, &points, effective_threshold, scan_interval,
-            radar_lat, radar_lon, max_radar_range_km,
+            radar_lat, radar_lon, aircraft_range_km,
         );
         all_loss_segments.extend(segments);
     }
+
+    info!("Estimated overall max radar range: {:.1} km", overall_max_range_km);
 
     let signal_loss_count = all_loss_segments.iter()
         .filter(|s| s.loss_type == "signal_loss").count();
@@ -204,10 +215,7 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
         .map(|s| s.duration_secs)
         .sum();
 
-    let total_track_time = match (parsed.start_time, parsed.end_time) {
-        (Some(start), Some(end)) => end - start,
-        _ => 0.0,
-    };
+    let total_track_time = total_aircraft_track_time;
 
     let loss_percentage = if total_track_time > 0.0 {
         (total_loss_time / total_track_time) * 100.0
@@ -221,11 +229,12 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
         total_loss_time,
         total_track_time,
         loss_percentage,
-        max_radar_range_km,
+        max_radar_range_km: overall_max_range_km,
     }
 }
 
 /// 레이더 최대 탐지거리 추정 (전체 포인트의 95th percentile 거리)
+#[allow(dead_code)]
 fn estimate_max_radar_range(points: &[TrackPoint], radar_lat: f64, radar_lon: f64) -> f64 {
     if points.is_empty() {
         return 150.0; // 기본값 150km
@@ -243,6 +252,23 @@ fn estimate_max_radar_range(points: &[TrackPoint], radar_lat: f64, radar_lon: f6
     distances[idx].max(50.0) // 최소 50km
 }
 
+/// 레이더 최대 탐지거리 추정 (참조 슬라이스용)
+fn estimate_max_radar_range_refs(points: &[&TrackPoint], radar_lat: f64, radar_lon: f64) -> f64 {
+    if points.is_empty() {
+        return 150.0;
+    }
+
+    let mut distances: Vec<f64> = points
+        .iter()
+        .map(|p| calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude))
+        .collect();
+    distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let idx = (distances.len() as f64 * 0.95) as usize;
+    let idx = idx.min(distances.len() - 1);
+    distances[idx].max(50.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +282,7 @@ mod tests {
             altitude: alt,
             speed: 200.0,
             heading: 90.0,
-            radar_type: RadarDetectionType::ModesPsr,
+            radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
         }
     }
@@ -270,7 +296,7 @@ mod tests {
             altitude: alt,
             speed: 200.0,
             heading: 90.0,
-            radar_type: RadarDetectionType::ModesPsr,
+            radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
         }
     }

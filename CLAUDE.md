@@ -83,8 +83,9 @@ src/                    # React frontend
   └── types/
       └── index.ts      # TypeScript 인터페이스 정의
 src-tauri/src/          # Rust backend
-  ├── lib.rs            # Tauri entry point + IPC commands (9개)
+  ├── lib.rs            # Tauri entry point + IPC commands (14개)
   ├── main.rs           # WebView2 GPU 가속 강제 플래그 설정
+  ├── db.rs             # SQLite 데이터베이스 (운항이력/ADS-B/설정 영속화)
   ├── parser/
   │   ├── mod.rs
   │   └── ass.rs        # ASTERIX CAT048 파싱 (NEC 프레임 + FSPEC 기반)
@@ -101,14 +102,14 @@ public/                 # 정적 자산
 ```
 
 ## 핵심 기능
-1. 비행검사기 관리 (최대 10대, Mode-S 코드, aircraft.json 영속화)
+1. 비행검사기 관리 (최대 10대, Mode-S 코드, 등록번호, aircraft.json 영속화)
 2. NEC ASS 파일 파싱 (ASTERIX CAT048 바이너리, 배치 병렬 파싱 with rayon)
 3. 항적 시각화 (deck.gl GPU 렌더링, SSR+PSR/SSR Only 색상 분리)
 4. Loss 구간 자동 탐지 (Signal Loss만 표시, 범위이탈 분리 분류)
 5. 레이더 사이트 관리 (좌표/고도/안테나높이/지원범위NM)
 6. 레이더 동심원 표시 (20NM 간격, 200NM까지, MapLibre 네이티브 레이어)
 7. 검색 가능한 Mode-S 드롭다운 필터 + UNKNOWN/소수 항적 자동 제외
-8. LOS 분석 (SVG 단면도: 지형+4/3 지구곡률+굴절 모델+산 이름, 인터랙티브 크로스헤어)
+8. LOS 분석 (SVG 단면도: 지형+실제지구곡률+4/3굴절 모델+산 이름, 인터랙티브 크로스헤어)
 9. 항적 지도 상태 유지 (App.tsx에서 항상 마운트, CSS hidden 토글)
 10. GPU 상태 뱃지 (실제 WebGL 렌더러 감지, HW/SW 표시)
 11. PDF 보고서 (주간/월간, 공공기관 양식, 한글 폰트, LOS 결과 포함)
@@ -116,6 +117,8 @@ public/                 # 정적 자산
 13. 3D 지형 (AWS Terrarium DEM, 음영기복도, 고도 배율 조절)
 14. Dot 모드 (개별 표적 점+수직선 시각화)
 15. 구조화된 호버 툴팁 (항적/Loss/레이더에 다중행 정보 표시)
+16. OpenSky 운항이력 자동 동기화 (OAuth2 인증, 최근 5년, SQLite 캐싱)
+17. 도면/측면도 그리기 도구 (거리 축 라벨)
 
 ## Tauri IPC 명령
 | 명령 | 설명 |
@@ -129,11 +132,20 @@ public/                 # 정적 자산
 | `delete_aircraft` | 항공기 삭제 |
 | `filter_tracks_by_mode_s` | Mode-S 필터링 |
 | `read_file_base64` | 파일 base64 읽기 (폰트 로딩용) |
+| `fetch_flight_history` | OpenSky 운항이력 조회 (OAuth2, 2일 윈도우) |
+| `load_flight_history` | SQLite에서 저장된 운항이력 로드 |
+| `save_opensky_credentials` | OpenSky Client ID/Secret 저장 |
+| `load_opensky_credentials` | 저장된 OpenSky 인증정보 로드 |
+| `fetch_adsb_tracks` | ADS-B 항적 데이터 조회 |
 
 ### 배치 파싱 이벤트
 - `batch-parse-result`: 파일별 결과 (성공/실패)
 - `batch-parse-done`: 배치 완료 통계
 - `parse-points-chunk`: 5000포인트 단위 스트리밍 (메모리 관리)
+
+### 운항이력 이벤트
+- `flight-history-records`: 건별 운항이력 실시간 스트리밍
+- `flight-history-progress`: 동기화 진행 상황 (current/total/icao24)
 
 ## GPU 가속
 - `src-tauri/src/main.rs`에서 WebView2에 GPU 가속 강제 플래그 설정
@@ -153,7 +165,8 @@ public/                 # 정적 자산
 - 유효성 필터: 한국 영공 (lat 30-45°, lon 120-135°)
 
 ## Loss 탐지 알고리즘
-- **자동 임계값**: 스캔 주기 중앙값 × 1.8 (기본 8초)
+- **레이더 스캔 주기**: 5초
+- **자동 임계값**: 7초 이상 gap이면 Loss로 판정 (기본 7초)
 - **분류 기준**:
   - `signal_loss`: 일반 표적소실
   - `out_of_range`: 양쪽 끝점 ≥ 최대 범위의 88%
@@ -161,6 +174,9 @@ public/                 # 정적 자산
 - **제외 조건**: 6시간 초과 gap (공항 정류 등), 0.5초 미만 gap
 
 ## 데이터 모델
+### Aircraft
+`id`, `name`, `registration`, `model`, `mode_s_code`, `organization`, `memo`, `active`
+
 ### TrackPoint
 `timestamp`, `mode_s`, `latitude`, `longitude`, `altitude`, `speed`, `heading`, `radar_type`(ssr/combined/psr/modes), `raw_data`
 
@@ -203,26 +219,48 @@ public/                 # 정적 자산
 - **데이터 테이블**: 선택 행 시각적 강조 (ring + 배경색)
 - **PathLayer**: autoHighlight (흰색 오버레이)
 
-## LOS 분석 (4/3 유효지구반경 모델)
+## LOS 분석 (실제 지구 디스플레이 프레임)
 - **원리**: 실제 지구(R=6,371km) + 굴절 전파 경로 = 4/3 유효지구(R_eff=8,495km) + 직선 경로 (수학적 등가)
-- **조정 프레임**: 지형을 `curvDrop(d) = d² / (2 × R_eff)` 만큼 낮춰 그린 뒤, 전파 경로를 직선으로 그림
+- **디스플레이 프레임**: 실제 지구반경(R) 기준 — 직선 LOS가 직선으로 표시됨
+  - `curvDrop(d) = d² / (2 × R)`: 디스플레이 프레임 곡률 보정 (실제 지구)
+  - `curvDrop43(d) = d² / (2 × R_eff)`: 4/3 유효지구 곡률 보정 (굴절 계산용)
+  - 4/3 굴절선 → 디스플레이 변환: `h43 + curvDrop43(d) - curvDrop(d)`
 - **차트 요소**:
-  1. 녹색 면: 조정 지형 (4/3 곡률 보정)
-  2. 주황 실선: 최저 탐지가능 높이 (4/3 전파굴절)
-  3. 흰색 점선: 최저 탐지가능 높이 (직선 LOS)
-  4. 시안 점선: BRA 0.25° 기준선
+  1. 녹색 면: 조정 지형 (실제 지구 곡률 보정)
+  2. 주황 실선: 최저 탐지가능 높이 (4/3 전파굴절, 프레임 변환 적용)
+  3. 흰색 점선: 최저 탐지가능 높이 (직선 LOS, 직선으로 표시)
+  4. 시안 점선: BRA 0.25° 기준선 (직선)
   5. 빨간 점: 최대 차단점 (산 이름 Overpass API 조회)
+- **차단 판정**: 4/3 프레임에서 수행 (굴절 전파 기준)
 - **고도 API**: open-meteo.com (150 샘플, 100개씩 배치 요청)
 - **산 이름**: Overpass API (natural=peak, 반경 3km)
 
 ## Zustand 전역 상태 (src/store/index.ts)
-- **항공기**: aircraft[] (최대 10대, preset: 1호기 71BF79, 2호기 71BF78)
+- **항공기**: aircraft[] (최대 10대, preset: 1호기 FL7779/71BF79, 2호기 FL7778/71BF78)
 - **파일**: uploadedFiles[] (상태: pending/parsing/done/error)
 - **분석**: analysisResults[], appendTrackPoints (청크 병합)
 - **레이더**: radarSite (현재 활성), customRadarSites[] (프리셋 + 사용자 등록)
 - **필터**: selectedModeS (null=등록기체, "__ALL__"=전체, 특정코드)
 - **LOS**: losResults[] (저장된 LOS 프로파일)
+- **ADS-B**: adsbTracks[], adsbLoading, adsbProgress
+- **운항이력**: flightHistory[], flightHistoryLoading/Progress, selectedFlight
+- **OpenSky 동기화**: openskySync, openskySyncProgress, openskySyncVersion (triggerOpenskySync)
 - **UI**: activePage, loading, loadingMessage
+
+## OpenSky Network 연동
+- **인증**: OAuth2 Client Credentials 필수 (익명 접근 403 차단)
+- **API**: `/flights/aircraft` — ICAO24 기준 운항이력 조회
+- **제한**: 최대 2일(172,800초) 윈도우, 레이트 리밋 적용
+- **자동 동기화**: 앱 시작 시 등록 기체별 최근 5년치 운항이력 순차 조회
+- **캐싱**: SQLite `opensky_query_log`로 이미 조회한 시간 윈도우 추적 → 중복 요청 방지
+- **실시간 업데이트**: Tauri 이벤트로 건별 스트리밍 (`flight-history-records`)
+- **설정**: 설정 페이지에서 Client ID/Secret 입력, SQLite에 영속 저장
+
+## SQLite 데이터베이스 (src-tauri/src/db.rs)
+- **flight_history**: 운항이력 레코드 (icao24, callsign, 출발/도착 공항, 시간)
+- **adsb_tracks**: ADS-B 항적 데이터
+- **opensky_query_log**: 조회 완료 시간 윈도우 기록 (중복 방지)
+- **settings**: Key-Value 설정 저장 (OpenSky 인증정보 등)
 
 ## 코딩 컨벤션
 - Rust: snake_case, 에러 핸들링은 Result/Option 사용

@@ -29,23 +29,23 @@ export default function MapStyleToggle({ style, onChange }: MapStyleToggleProps)
       <div className="relative">
         <button
           onClick={() => setOpen(!open)}
-          className="flex items-center gap-2 rounded-lg border border-white/20 bg-[#16213e]/95 px-3 py-2 text-sm text-white shadow-lg backdrop-blur hover:bg-[#16213e] transition-colors"
+          className="flex items-center gap-2 rounded-lg border border-gray-300 bg-white/95 px-3 py-2 text-sm text-gray-800 shadow-lg backdrop-blur hover:bg-white transition-colors"
           title="지도 스타일 변경"
         >
           <Layers size={16} />
           <span>{style === "osm" ? "표준" : "다크"}</span>
         </button>
         {open && (
-          <div className="absolute right-0 top-full mt-1 w-36 overflow-hidden rounded-lg border border-white/20 bg-[#16213e]/95 shadow-xl backdrop-blur">
+          <div className="absolute right-0 top-full mt-1 w-36 overflow-hidden rounded-lg border border-gray-300 bg-white/95 shadow-xl backdrop-blur">
             <button
               onClick={() => { onChange("osm"); setOpen(false); }}
-              className={`flex w-full items-center px-3 py-2 text-sm transition-colors ${style === "osm" ? "bg-[#e94560]/20 text-[#e94560]" : "text-gray-300 hover:bg-white/10"}`}
+              className={`flex w-full items-center px-3 py-2 text-sm transition-colors ${style === "osm" ? "bg-[#a60739]/20 text-[#a60739]" : "text-gray-600 hover:bg-gray-100"}`}
             >
               OSM 표준
             </button>
             <button
               onClick={() => { onChange("carto-dark"); setOpen(false); }}
-              className={`flex w-full items-center px-3 py-2 text-sm transition-colors ${style === "carto-dark" ? "bg-[#e94560]/20 text-[#e94560]" : "text-gray-300 hover:bg-white/10"}`}
+              className={`flex w-full items-center px-3 py-2 text-sm transition-colors ${style === "carto-dark" ? "bg-[#a60739]/20 text-[#a60739]" : "text-gray-600 hover:bg-gray-100"}`}
             >
               Carto 다크
             </button>

@@ -1,47 +1,58 @@
 use std::fmt;
 use serde::{Deserialize, Serialize};
 
-/// 레이더 탐지 유형 (I020 TYP 기반 4종 분류)
+/// 레이더 탐지 유형 (I020 TYP 기반 6종 분류)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
 pub enum RadarDetectionType {
-    Atcrbs,     // TYP=2: ATCRBS/SSR only
-    AtcrbsPsr,  // TYP=3: ATCRBS + PSR
-    Modes,      // TYP=4,5: Mode-S only
-    ModesPsr,   // TYP=6,7: Mode-S + PSR (최고 신뢰)
+    #[serde(rename = "mode_ac")]
+    ModeAC,              // TYP=2 (010): SSR (Mode A/C) only
+    #[serde(rename = "mode_ac_psr")]
+    ModeACPsr,           // TYP=3 (011): SSR (Mode A/C) + PSR
+    #[serde(rename = "mode_s_allcall")]
+    ModeSAllCall,        // TYP=4 (100): Mode S All-Call
+    #[serde(rename = "mode_s_rollcall")]
+    ModeSRollCall,       // TYP=5 (101): Mode S Roll-Call
+    #[serde(rename = "mode_s_allcall_psr")]
+    ModeSAllCallPsr,     // TYP=6 (110): Mode S All-Call + PSR
+    #[serde(rename = "mode_s_rollcall_psr")]
+    ModeSRollCallPsr,    // TYP=7 (111): Mode S Roll-Call + PSR
 }
 
 impl RadarDetectionType {
     /// 탐지 우선순위 (동일 스캔 중복 처리용)
     pub fn priority(&self) -> u8 {
         match self {
-            RadarDetectionType::Atcrbs => 0,
-            RadarDetectionType::AtcrbsPsr => 1,
-            RadarDetectionType::Modes => 2,
-            RadarDetectionType::ModesPsr => 3,
+            RadarDetectionType::ModeAC => 0,
+            RadarDetectionType::ModeACPsr => 1,
+            RadarDetectionType::ModeSAllCall => 2,
+            RadarDetectionType::ModeSRollCall => 3,
+            RadarDetectionType::ModeSAllCallPsr => 4,
+            RadarDetectionType::ModeSRollCallPsr => 5,
         }
     }
 
     pub fn has_psr(&self) -> bool {
-        matches!(self, RadarDetectionType::AtcrbsPsr | RadarDetectionType::ModesPsr)
+        matches!(self, RadarDetectionType::ModeACPsr | RadarDetectionType::ModeSAllCallPsr | RadarDetectionType::ModeSRollCallPsr)
     }
 
     pub fn has_modes(&self) -> bool {
-        matches!(self, RadarDetectionType::Modes | RadarDetectionType::ModesPsr)
+        matches!(self, RadarDetectionType::ModeSAllCall | RadarDetectionType::ModeSRollCall | RadarDetectionType::ModeSAllCallPsr | RadarDetectionType::ModeSRollCallPsr)
     }
 
     pub fn is_atcrbs(&self) -> bool {
-        matches!(self, RadarDetectionType::Atcrbs | RadarDetectionType::AtcrbsPsr)
+        matches!(self, RadarDetectionType::ModeAC | RadarDetectionType::ModeACPsr)
     }
 }
 
 impl fmt::Display for RadarDetectionType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RadarDetectionType::Atcrbs => write!(f, "ATCRBS"),
-            RadarDetectionType::AtcrbsPsr => write!(f, "ATCRBS+PSR"),
-            RadarDetectionType::Modes => write!(f, "Mode-S"),
-            RadarDetectionType::ModesPsr => write!(f, "Mode-S+PSR"),
+            RadarDetectionType::ModeAC => write!(f, "Mode A/C"),
+            RadarDetectionType::ModeACPsr => write!(f, "Mode A/C+PSR"),
+            RadarDetectionType::ModeSAllCall => write!(f, "Mode S All-Call"),
+            RadarDetectionType::ModeSRollCall => write!(f, "Mode S Roll-Call"),
+            RadarDetectionType::ModeSAllCallPsr => write!(f, "Mode S All-Call+PSR"),
+            RadarDetectionType::ModeSRollCallPsr => write!(f, "Mode S Roll-Call+PSR"),
         }
     }
 }
@@ -54,8 +65,10 @@ pub struct ParseStatistics {
     pub garbled_removed: usize,
     pub atcrbs_merged: usize,
     pub atcrbs_unmatched: usize,
-    /// [atcrbs, atcrbs_psr, modes, modes_psr]
-    pub points_by_type: [usize; 4],
+    /// [mode_ac, mode_ac_psr, mode_s_allcall, mode_s_rollcall, mode_s_allcall_psr, mode_s_rollcall_psr]
+    pub points_by_type: [usize; 6],
+    /// I070 Mode 3/A: V=1(무효) 또는 G=1(garbled) 레코드 수
+    pub mode3a_invalid: usize,
 }
 
 /// 비행검사기 (Flight Inspector Aircraft)
@@ -65,6 +78,9 @@ pub struct Aircraft {
     pub id: String,
     /// 이름 (예: 1호기, 2호기)
     pub name: String,
+    /// 등록번호 (예: FL7779)
+    #[serde(default)]
+    pub registration: String,
     /// 기체 모델 (예: Embraer Praetor 600)
     #[serde(default)]
     pub model: String,
@@ -179,6 +195,40 @@ pub struct LineOfSightResult {
     pub max_range_km: f64,
     /// Target altitude in meters
     pub target_altitude: f64,
+}
+
+/// ADS-B 트랙 포인트 (OpenSky Network)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AdsbPoint {
+    pub time: f64,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// 기압 고도 (m)
+    pub altitude: f64,
+    /// 방위 (degrees)
+    pub heading: f64,
+    pub on_ground: bool,
+}
+
+/// ADS-B 트랙 (한 비행 구간)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AdsbTrack {
+    pub icao24: String,
+    pub callsign: Option<String>,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub path: Vec<AdsbPoint>,
+}
+
+/// 운항이력 (OpenSky /flights/aircraft)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FlightRecord {
+    pub icao24: String,
+    pub first_seen: f64,
+    pub last_seen: f64,
+    pub est_departure_airport: Option<String>,
+    pub est_arrival_airport: Option<String>,
+    pub callsign: Option<String>,
 }
 
 /// Custom serialization for Vec<u8> as base64, so JSON transport works cleanly.

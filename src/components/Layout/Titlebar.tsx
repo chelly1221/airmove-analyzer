@@ -11,7 +11,6 @@ export default function Titlebar() {
     const unlisten = appWindow.onResized(async () => {
       setMaximized(await appWindow.isMaximized());
     });
-    // Check initial state
     appWindow.isMaximized().then(setMaximized);
     return () => {
       unlisten.then((fn) => fn());
@@ -19,27 +18,29 @@ export default function Titlebar() {
   }, []);
 
   return (
-    <div className="flex h-8 shrink-0 select-none items-center bg-[#080f1a] text-white">
-      {/* Drag region with app title */}
+    <div className="flex h-8 shrink-0 select-none items-center bg-white">
+      {/* Drag region + title */}
       <div
         data-tauri-drag-region
-        className="flex flex-1 items-center gap-2 px-3 text-xs"
+        className="flex-1 h-full flex items-center pl-4"
       >
-        <span className="font-semibold text-gray-400">비행검사기 항적 분석 체계</span>
+        <span className="text-xs font-bold tracking-wide text-[#a60739] pointer-events-none">
+          김포공항 레이더송신소 비행검사기 항적 분석 시스템
+        </span>
       </div>
 
       {/* Window controls */}
       <div className="flex h-full">
         <button
           onClick={() => appWindow.minimize()}
-          className="flex h-full w-11 items-center justify-center text-gray-400 hover:bg-white/10 hover:text-white transition-colors"
+          className="flex h-full w-11 items-center justify-center text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors"
           aria-label="Minimize"
         >
           <Minus size={14} />
         </button>
         <button
           onClick={() => appWindow.toggleMaximize()}
-          className="flex h-full w-11 items-center justify-center text-gray-400 hover:bg-white/10 hover:text-white transition-colors"
+          className="flex h-full w-11 items-center justify-center text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors"
           aria-label="Maximize"
         >
           {maximized ? <Copy size={12} /> : <Square size={12} />}
