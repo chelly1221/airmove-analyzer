@@ -127,6 +127,13 @@ export default function TrackMap() {
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
   const [trailDuration, setTrailDuration] = useState(0);
+
+  // 비행 선택 시 시간 바 리셋 (전체 범위 표시)
+  useEffect(() => {
+    setSliderValue(100);
+    setRangeStart(0);
+    setPlaying(false);
+  }, [selectedFlightId]);
   const [hoverInfo, setHoverInfo] = useState<{
     x: number;
     y: number;

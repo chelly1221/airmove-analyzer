@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import {
   FileText,
   Download,
@@ -16,6 +16,7 @@ import {
   CalendarRange,
   ScanSearch,
   ListChecks,
+  Mountain,
 } from "lucide-react";
 import { format } from "date-fns";
 import { useAppStore } from "../store";
@@ -32,9 +33,11 @@ import ReportWeatherSection from "../components/Report/ReportWeatherSection";
 import ReportFlightComparisonSection from "../components/Report/ReportFlightComparisonSection";
 import ReportFlightProfileSection from "../components/Report/ReportFlightProfileSection";
 import ReportFlightLossAnalysisSection from "../components/Report/ReportFlightLossAnalysisSection";
+import ReportPanoramaSection from "../components/Report/ReportPanoramaSection";
 import { useReportExport } from "../components/Report/useReportExport";
+import { invoke } from "@tauri-apps/api/core";
 import { flightLabel } from "../utils/flightConsolidation";
-import type { Flight, LOSProfileData, WeatherSnapshot, Aircraft as AircraftType, ReportMetadata } from "../types";
+import type { Flight, LOSProfileData, WeatherSnapshot, Aircraft as AircraftType, ReportMetadata, PanoramaPoint } from "../types";
 
 type ReportTemplate = "weekly" | "monthly" | "flights" | "single";
 type ReportMode = "config" | "preview";
@@ -46,6 +49,7 @@ interface ReportSections {
   stats: boolean;
   weather: boolean;
   los: boolean;
+  panorama: boolean;
   aircraft: boolean;
   // 건별 보고서 전용
   flightComparison: boolean;
@@ -62,6 +66,7 @@ const DEFAULT_SECTIONS: ReportSections = {
   stats: true,
   weather: true,
   los: true,
+  panorama: true,
   aircraft: true,
   flightComparison: true,
   lossDetail: true,
@@ -79,6 +84,7 @@ function getSectionToggles(template: ReportTemplate, _sections: ReportSections):
       { key: "lossDetail", label: "소실" },
       { key: "weather", label: "기상" },
       { key: "los", label: "LOS" },
+      { key: "panorama", label: "장애물" },
     ];
   }
   if (template === "single") {
@@ -89,6 +95,7 @@ function getSectionToggles(template: ReportTemplate, _sections: ReportSections):
       { key: "flightLossAnalysis", label: "소실분석" },
       { key: "weather", label: "기상" },
       { key: "los", label: "LOS" },
+      { key: "panorama", label: "장애물" },
     ];
   }
   return [
@@ -98,6 +105,7 @@ function getSectionToggles(template: ReportTemplate, _sections: ReportSections):
     { key: "stats", label: "통계" },
     { key: "weather", label: "기상" },
     { key: "los", label: "LOS" },
+    { key: "panorama", label: "장애물" },
     { key: "aircraft", label: "검사기" },
   ];
 }
@@ -126,6 +134,24 @@ export default function ReportGeneration() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mapImage, setMapImage] = useState<string | null>(null);
+
+  // 파노라마 데이터 (캐시에서 로드)
+  const [panoramaData, setPanoramaData] = useState<PanoramaPoint[]>([]);
+
+  useEffect(() => {
+    if (!radarSite) return;
+    invoke<string | null>("load_panorama_cache", {
+      radarLat: radarSite.latitude,
+      radarLon: radarSite.longitude,
+    })
+      .then((json) => {
+        if (json) {
+          const data = JSON.parse(json) as PanoramaPoint[];
+          setPanoramaData(data);
+        }
+      })
+      .catch(() => {});
+  }, [radarSite]);
 
   // 비행 선택 (건별/단일 상세용)
   const [selectedFlightIds, setSelectedFlightIds] = useState<Set<string>>(new Set());
@@ -295,22 +321,25 @@ export default function ReportGeneration() {
       if (sections.lossDetail) nums.lossDetail = n++;
       if (sections.weather && weatherData) nums.weather = n++;
       if (sections.los && losResults.length > 0) nums.los = n++;
+      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else if (template === "single") {
       if (sections.flightProfile) nums.flightProfile = n++;
       if (sections.trackMap) nums.trackMap = n++;
       if (sections.flightLossAnalysis) nums.flightLossAnalysis = n++;
       if (sections.weather && weatherData) nums.weather = n++;
       if (sections.los && losResults.length > 0) nums.los = n++;
+      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else {
       if (sections.summary) nums.summary = n++;
       if (sections.trackMap) nums.trackMap = n++;
       if (sections.stats && flights.length > 0) nums.stats = n++;
       if (sections.weather && weatherData) nums.weather = n++;
       if (sections.los && losResults.length > 0) nums.los = n++;
+      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
       if (sections.aircraft && aircraft.length > 0) nums.aircraft = n++;
     }
     return nums;
-  }, [template, sections, weatherData, losResults, flights, aircraft]);
+  }, [template, sections, weatherData, losResults, flights, aircraft, panoramaData]);
 
   // ── 설정 모드 (Config) ──
   if (mode === "config") {
@@ -393,6 +422,7 @@ export default function ReportGeneration() {
             aircraft={aircraft}
             metadata={reportMetadata}
             radarName={radarSite?.name ?? ""}
+            panoramaData={panoramaData}
             onClose={() => setTemplateModalOpen(null)}
             onGenerate={handleGenerate}
           />
@@ -520,6 +550,16 @@ export default function ReportGeneration() {
               </ReportPage>
             )}
 
+            {sections.panorama && panoramaData.length > 0 && radarSite && (
+              <ReportPage>
+                <ReportPanoramaSection
+                  sectionNum={sectionNumbers.panorama ?? 6}
+                  panoramaData={panoramaData}
+                  radarSite={radarSite}
+                />
+              </ReportPage>
+            )}
+
             {sections.aircraft && aircraft.length > 0 && (
               <ReportPage>
                 <ReportAircraftSection
@@ -586,6 +626,16 @@ export default function ReportGeneration() {
                 />
               </ReportPage>
             )}
+
+            {sections.panorama && panoramaData.length > 0 && radarSite && (
+              <ReportPage>
+                <ReportPanoramaSection
+                  sectionNum={sectionNumbers.panorama ?? 6}
+                  panoramaData={panoramaData}
+                  radarSite={radarSite}
+                />
+              </ReportPage>
+            )}
           </>
         )}
 
@@ -634,6 +684,16 @@ export default function ReportGeneration() {
                 <ReportLOSSection
                   sectionNum={sectionNumbers.los ?? 5}
                   losResults={losResults}
+                />
+              </ReportPage>
+            )}
+
+            {sections.panorama && panoramaData.length > 0 && radarSite && (
+              <ReportPage>
+                <ReportPanoramaSection
+                  sectionNum={sectionNumbers.panorama ?? 6}
+                  panoramaData={panoramaData}
+                  radarSite={radarSite}
                 />
               </ReportPage>
             )}
@@ -704,6 +764,7 @@ function TemplateConfigModal({
   aircraft,
   metadata,
   radarName,
+  panoramaData,
   onClose,
   onGenerate,
 }: {
@@ -714,6 +775,7 @@ function TemplateConfigModal({
   aircraft: AircraftType[];
   metadata: ReportMetadata;
   radarName: string;
+  panoramaData: PanoramaPoint[];
   onClose: () => void;
   onGenerate: (tpl: ReportTemplate, sections: ReportSections, flightIds?: Set<string>, singleId?: string | null) => void;
 }) {
@@ -744,6 +806,7 @@ function TemplateConfigModal({
         { key: "lossDetail", label: "소실 상세", icon: Crosshair, desc: "소실 포인트 상세 목록", available: true },
         { key: "weather", label: "기상 분석", icon: Cloud, desc: "기상 조건 및 영향 분석", available: !!weatherData },
         { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
+        { key: "panorama", label: "전파 장애물", icon: Mountain, desc: "360° 파노라마 장애물 분석", available: panoramaData.length > 0 },
       ];
     }
     if (isSingleMode) {
@@ -754,6 +817,7 @@ function TemplateConfigModal({
         { key: "flightLossAnalysis", label: "소실 구간 분석", icon: BarChart3, desc: "구간별 상세, 분포 분석 차트", available: true },
         { key: "weather", label: "기상 분석", icon: Cloud, desc: "기상 조건 및 영향 분석", available: !!weatherData },
         { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
+        { key: "panorama", label: "전파 장애물", icon: Mountain, desc: "360° 파노라마 장애물 분석", available: panoramaData.length > 0 },
       ];
     }
     return [
@@ -763,6 +827,7 @@ function TemplateConfigModal({
       { key: "stats", label: "분석 통계", icon: BarChart3, desc: `비행별 상세 ${template === "weekly" ? "통계" : "추이 차트"}`, available: flights.length > 0 },
       { key: "weather", label: "기상 분석", icon: Cloud, desc: "기상 조건 및 영향 분석", available: !!weatherData },
       { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
+      { key: "panorama", label: "전파 장애물", icon: Mountain, desc: "360° 파노라마 장애물 분석", available: panoramaData.length > 0 },
       { key: "aircraft", label: "검사기 현황", icon: Plane, desc: "비행검사기 운용 현황", available: aircraft.length > 0 },
     ];
   })();

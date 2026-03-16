@@ -137,9 +137,39 @@ export default function Drawing() {
     return { min, max };
   }, [filteredPoints]);
 
+  // Mode-S 필터 적용된 비행 목록
+  const filteredFlights = useMemo(() => {
+    const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
+    const showAll = selectedModeS === "__ALL__";
+    return flights.filter((f) => {
+      if (showAll) return true;
+      if (!selectedModeS) return registeredModeS.has(f.mode_s.toUpperCase());
+      return f.mode_s === selectedModeS;
+    });
+  }, [flights, aircraft, selectedModeS]);
+
+  // 비행 선택 시 해당 비행의 시간 범위로 표시
+  const displayTimeRange = useMemo(() => {
+    const pts = selectedFlightId
+      ? (filteredFlights.find((f) => f.id === selectedFlightId)?.track_points ?? [])
+      : filteredPoints;
+    if (pts.length === 0) return { min: 0, max: 0 };
+    let min = Infinity, max = -Infinity;
+    for (const p of pts) {
+      if (p.timestamp < min) min = p.timestamp;
+      if (p.timestamp > max) max = p.timestamp;
+    }
+    return { min, max };
+  }, [selectedFlightId, filteredFlights, filteredPoints]);
+
   const pctToTs = useCallback(
     (pct: number) => timeRange.min + ((timeRange.max - timeRange.min) * pct) / 100,
     [timeRange]
+  );
+
+  const displayPctToTs = useCallback(
+    (pct: number) => displayTimeRange.min + ((displayTimeRange.max - displayTimeRange.min) * pct) / 100,
+    [displayTimeRange]
   );
 
   const fmtDate = useCallback(
@@ -205,17 +235,6 @@ export default function Drawing() {
     }
     return valid.sort();
   }, [flights, registeredModeSSet]);
-
-  // Mode-S 필터 적용된 비행 목록
-  const filteredFlights = useMemo(() => {
-    const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
-    const showAll = selectedModeS === "__ALL__";
-    return flights.filter((f) => {
-      if (showAll) return true;
-      if (!selectedModeS) return registeredModeS.has(f.mode_s.toUpperCase());
-      return f.mode_s === selectedModeS;
-    });
-  }, [flights, aircraft, selectedModeS]);
 
   // 비행 선택 시 해당 비행만 필터, 선택 해제 시 전체
   const flightFilteredPoints = useMemo(() => {
@@ -582,8 +601,8 @@ export default function Drawing() {
           <div className="rounded-xl border border-gray-200 bg-white">
             <div className="flex items-center gap-3 px-4 py-2">
               <div className="min-w-[62px] text-center font-mono leading-tight">
-                <div className="text-[9px] text-gray-300">{fmtDate(pctToTs(rangeStart))}</div>
-                <div className="text-[10px] text-gray-500">{fmtTime(pctToTs(rangeStart))}</div>
+                <div className="text-[9px] text-gray-300">{fmtDate(displayPctToTs(rangeStart))}</div>
+                <div className="text-[10px] text-gray-500">{fmtTime(displayPctToTs(rangeStart))}</div>
               </div>
 
               <div
@@ -643,8 +662,8 @@ export default function Drawing() {
               </div>
 
               <div className="min-w-[62px] text-center font-mono leading-tight">
-                <div className="text-[9px] text-gray-300">{fmtDate(pctToTs(rangeEnd))}</div>
-                <div className="text-[10px] text-gray-500">{fmtTime(pctToTs(rangeEnd))}</div>
+                <div className="text-[9px] text-gray-300">{fmtDate(displayPctToTs(rangeEnd))}</div>
+                <div className="text-[10px] text-gray-500">{fmtTime(displayPctToTs(rangeEnd))}</div>
               </div>
             </div>
           </div>

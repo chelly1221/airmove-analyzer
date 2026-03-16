@@ -165,6 +165,38 @@ function BuildingModal({
     setMousePt(null);
   }, [drawTool]);
 
+  // 도형 확정 후 맵 자동 fit bounds (사각형/원/타원/선)
+  useEffect(() => {
+    if (!miniMapRef.current || !form.geometry_json || clickPts.length > 0) return;
+    try {
+      if (form.geometry_type === "rectangle") {
+        const [[minLat, minLon], [maxLat, maxLon]] = JSON.parse(form.geometry_json);
+        miniMapRef.current.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 50, maxZoom: 18, duration: 500 });
+      } else if (form.geometry_type === "circle") {
+        const gj = JSON.parse(form.geometry_json);
+        const [clat, clon] = gj.center;
+        const rDeg = (gj.semi_major_m ?? gj.radius_m ?? 100) / 111320;
+        const cosLat = Math.cos((clat * Math.PI) / 180);
+        miniMapRef.current.fitBounds(
+          [[clon - rDeg / cosLat, clat - rDeg], [clon + rDeg / cosLat, clat + rDeg]],
+          { padding: 50, maxZoom: 18, duration: 500 },
+        );
+      } else if (form.geometry_type === "line") {
+        const pts: [number, number][] = JSON.parse(form.geometry_json);
+        if (pts.length >= 2) {
+          let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+          for (const [lat, lon] of pts) {
+            if (lat < minLat) minLat = lat;
+            if (lat > maxLat) maxLat = lat;
+            if (lon < minLon) minLon = lon;
+            if (lon > maxLon) maxLon = lon;
+          }
+          miniMapRef.current.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 50, maxZoom: 18, duration: 500 });
+        }
+      }
+    } catch { /* ignore parse errors */ }
+  }, [form.geometry_json, form.geometry_type, clickPts.length]);
+
   /** form에 사각형 반영 (clickPts는 건드리지 않음) */
   const applyRect = useCallback((c1: [number, number], c2: [number, number]) => {
     const minLat = Math.min(c1[0], c2[0]);
@@ -409,7 +441,7 @@ function BuildingModal({
     if (drawTool === "circle") {
       if (clickPts.length === 0) return "중심점 클릭";
       if (clickPts.length === 1) return "장축 끝점 클릭";
-      return "단축 길이 클릭 (타원) — 생략 시 원 유지";
+      return "단축 길이 클릭 (타원) 또는 '원으로 확정' 클릭";
     }
     if (drawTool === "line") return clickPts.length === 0 ? "첫 번째 꼭짓점 클릭" : "다음 꼭짓점 클릭";
     return "";
@@ -597,9 +629,21 @@ function BuildingModal({
                 {label}
               </button>
             ))}
-            {clickPts.length > 0 && (
+            {drawTool === "circle" && clickPts.length === 2 && (
               <button
                 onClick={() => setClickPts([])}
+                className="ml-1 rounded-lg bg-[#a60739] px-2.5 py-1.5 text-xs font-medium text-white hover:bg-[#85062e] transition-colors"
+              >
+                원으로 확정
+              </button>
+            )}
+            {clickPts.length > 0 && (
+              <button
+                onClick={() => {
+                  setClickPts([]);
+                  // 도형도 함께 초기화
+                  setForm((f) => ({ ...f, geometry_type: drawTool as GeometryType, geometry_json: null }));
+                }}
                 className="ml-1 rounded-lg bg-gray-100 px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-200 transition-colors"
               >
                 초기화
@@ -638,54 +682,52 @@ function BuildingModal({
                 </Marker>
               )}
 
-              {/* 도형 미리보기 (드래그 중 또는 확정) */}
-              {previewGeoJson && (
-                <Source id="preview-shape" type="geojson" data={previewGeoJson as any}>
-                  {previewGeoJson.geometry.type === "Polygon" && (
-                    <>
-                      <Layer
-                        id="preview-fill"
-                        type="fill"
-                        paint={{ "fill-color": "#a60739", "fill-opacity": 0.15 }}
-                      />
-                      <Layer
-                        id="preview-outline"
-                        type="line"
-                        paint={{ "line-color": "#a60739", "line-width": 2 }}
-                      />
-                    </>
-                  )}
-                  {previewGeoJson.geometry.type === "LineString" && (
-                    <Layer
-                      id="preview-line"
-                      type="line"
-                      paint={{ "line-color": "#a60739", "line-width": 2.5 }}
-                    />
-                  )}
-                </Source>
-              )}
-
-              {/* 라인 진행 중 미리보기 */}
-              {linePreviewGeoJson && !previewGeoJson && (
-                <Source id="line-preview" type="geojson" data={linePreviewGeoJson as any}>
-                  <Layer
-                    id="line-preview-line"
-                    type="line"
-                    paint={{ "line-color": "#a60739", "line-width": 2, "line-dasharray": [4, 3] }}
-                  />
-                </Source>
-              )}
+              {/* 도형 (미리보기 + 확정) — Source 항상 마운트하여 MapLibre 깜빡임 방지 */}
+              <Source
+                id="preview-shape"
+                type="geojson"
+                data={(previewGeoJson ?? linePreviewGeoJson ?? { type: "FeatureCollection", features: [] }) as any}
+              >
+                <Layer
+                  id="preview-fill"
+                  type="fill"
+                  paint={{ "fill-color": "#a60739", "fill-opacity": 0.2 }}
+                  filter={["==", ["geometry-type"], "Polygon"]}
+                />
+                <Layer
+                  id="preview-outline"
+                  type="line"
+                  paint={{
+                    "line-color": "#a60739",
+                    "line-width": 2,
+                    "line-dasharray": previewGeoJson ? [1, 0] : [4, 3],
+                  }}
+                  filter={["==", ["geometry-type"], "Polygon"]}
+                />
+                <Layer
+                  id="preview-line"
+                  type="line"
+                  paint={{
+                    "line-color": "#a60739",
+                    "line-width": 2.5,
+                    "line-dasharray": linePreviewGeoJson && !previewGeoJson ? [4, 3] : [1, 0],
+                  }}
+                  filter={["==", ["geometry-type"], "LineString"]}
+                />
+              </Source>
 
               {/* 타원 장축선 (3단계 시) */}
-              {majorAxisGeoJson && (
-                <Source id="major-axis" type="geojson" data={majorAxisGeoJson as any}>
-                  <Layer
-                    id="major-axis-line"
-                    type="line"
-                    paint={{ "line-color": "#a60739", "line-width": 1.5, "line-dasharray": [6, 4] }}
-                  />
-                </Source>
-              )}
+              <Source
+                id="major-axis"
+                type="geojson"
+                data={(majorAxisGeoJson ?? { type: "FeatureCollection", features: [] }) as any}
+              >
+                <Layer
+                  id="major-axis-line"
+                  type="line"
+                  paint={{ "line-color": "#a60739", "line-width": 1.5, "line-dasharray": [6, 4] }}
+                />
+              </Source>
 
               {/* 클릭 포인트 마커 (사각형 꼭짓점, 타원 중심/장축끝, 라인 꼭짓점) */}
               {clickPts.map(([lat, lon], i) => (

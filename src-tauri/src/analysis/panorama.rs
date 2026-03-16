@@ -11,6 +11,9 @@ use crate::srtm::SrtmReader;
 /// 4/3 유효지구반경 (m)
 const R_EFF: f64 = 6_371_000.0 * 4.0 / 3.0;
 
+/// 건물 높이 상한 (m)
+const MAX_BUILDING_HEIGHT_M: f64 = 1000.0;
+
 /// 파노라마 포인트 (방위별 최대 앙각 장애물)
 #[derive(Serialize, Clone, Debug)]
 pub struct PanoramaPoint {
@@ -114,10 +117,11 @@ fn query_building_candidates(
          FROM buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
-           AND height >= ?5"
+           AND height >= ?5
+           AND height <= ?6"
     ) {
         if let Ok(rows) = stmt.query_map(
-            params![min_lat, max_lat, min_lon, max_lon, min_height_m],
+            params![min_lat, max_lat, min_lon, max_lon, min_height_m, MAX_BUILDING_HEIGHT_M],
             |row| {
                 Ok(BuildingCandidate {
                     lat: row.get(0)?,
@@ -137,30 +141,50 @@ fn query_building_candidates(
         }
     }
 
-    // 수동 등록 건물
+    // 수동 등록 건물 (geometry 확장을 위해 넉넉한 버퍼 적용)
+    let geo_buffer = 0.01; // ~1.1km 버퍼 — 대형 도형 커버
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT latitude, longitude, height, ground_elev, name, memo
+        "SELECT latitude, longitude, height, ground_elev, name, memo, geometry_type, geometry_json
          FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2
            AND longitude BETWEEN ?3 AND ?4"
     ) {
         if let Ok(rows) = stmt.query_map(
-            params![min_lat, max_lat, min_lon, max_lon],
+            params![min_lat - geo_buffer, max_lat + geo_buffer, min_lon - geo_buffer, max_lon + geo_buffer],
             |row| {
-                Ok(BuildingCandidate {
-                    lat: row.get(0)?,
-                    lon: row.get(1)?,
-                    height_m: row.get(2)?,
-                    ground_elev: row.get(3)?,
-                    name: row.get(4)?,
-                    address: None,
-                    usage: row.get::<_, Option<String>>(5)?,
-                    is_manual: true,
-                })
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
             },
         ) {
             for row in rows.flatten() {
-                result.push(row);
+                let (lat, lon, height_m, ground_elev, name, memo, geo_type, geo_json) = row;
+                let base = BuildingCandidate {
+                    lat, lon, height_m, ground_elev,
+                    name: name.clone(), address: None, usage: memo.clone(),
+                    is_manual: true,
+                };
+
+                // geometry_json이 있으면 다중 샘플 포인트로 확장
+                let sample_pts = expand_manual_geometry(lat, lon, geo_type.as_deref(), geo_json.as_deref());
+                if sample_pts.is_empty() {
+                    result.push(base);
+                } else {
+                    for (slat, slon) in sample_pts {
+                        result.push(BuildingCandidate {
+                            lat: slat, lon: slon, height_m, ground_elev,
+                            name: name.clone(), address: None, usage: memo.clone(),
+                            is_manual: true,
+                        });
+                    }
+                }
             }
         }
     }
@@ -325,4 +349,100 @@ pub fn calculate_panorama(
     }
 
     panorama
+}
+
+/// 수동 건물 geometry_json을 파싱하여 샘플 포인트 (lat, lon) 목록으로 확장.
+/// 반환값이 비어 있으면 중심점만 사용.
+fn expand_manual_geometry(
+    center_lat: f64,
+    center_lon: f64,
+    geo_type: Option<&str>,
+    geo_json: Option<&str>,
+) -> Vec<(f64, f64)> {
+    let geo_type = match geo_type {
+        Some(t) if t != "point" => t,
+        _ => return vec![],
+    };
+    let json_str = match geo_json {
+        Some(s) if !s.is_empty() => s,
+        _ => return vec![],
+    };
+
+    let val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    match geo_type {
+        "rectangle" => {
+            // [[minLat, minLon], [maxLat, maxLon]]
+            if let Some(arr) = val.as_array() {
+                if arr.len() == 2 {
+                    let min_lat = arr[0].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
+                    let min_lon = arr[0].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
+                    let max_lat = arr[1].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
+                    let max_lon = arr[1].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
+                    let mid_lat = (min_lat + max_lat) / 2.0;
+                    let mid_lon = (min_lon + max_lon) / 2.0;
+                    // 4 꼭짓점 + 4 변 중점 + 중심 = 9포인트
+                    return vec![
+                        (min_lat, min_lon), (min_lat, max_lon),
+                        (max_lat, min_lon), (max_lat, max_lon),
+                        (mid_lat, min_lon), (mid_lat, max_lon),
+                        (min_lat, mid_lon), (max_lat, mid_lon),
+                        (mid_lat, mid_lon),
+                    ];
+                }
+            }
+        }
+        "circle" => {
+            // {center: [lat, lon], semi_major_m, semi_minor_m, rotation_deg}
+            let clat = val.get("center").and_then(|c| c.get(0)).and_then(|v| v.as_f64()).unwrap_or(center_lat);
+            let clon = val.get("center").and_then(|c| c.get(1)).and_then(|v| v.as_f64()).unwrap_or(center_lon);
+            let semi_major = val.get("semi_major_m").and_then(|v| v.as_f64())
+                .or_else(|| val.get("radius_m").and_then(|v| v.as_f64()))
+                .unwrap_or(0.0);
+            let semi_minor = val.get("semi_minor_m").and_then(|v| v.as_f64()).unwrap_or(semi_major);
+            let rot_deg = val.get("rotation_deg").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            if semi_major < 1.0 {
+                return vec![];
+            }
+
+            let rot_rad = rot_deg.to_radians();
+            let cos_lat = clat.to_radians().cos().max(0.01);
+            let num_samples = 12;
+            let mut pts = Vec::with_capacity(num_samples + 1);
+            pts.push((clat, clon)); // 중심
+
+            for i in 0..num_samples {
+                let angle = (i as f64 / num_samples as f64) * 2.0 * std::f64::consts::PI;
+                let lx = semi_major * angle.cos();
+                let ly = semi_minor * angle.sin();
+                // 회전 적용 (북=위도+ 기준 시계방향)
+                let rx = lx * rot_rad.sin() + ly * rot_rad.cos(); // east (m)
+                let ry = lx * rot_rad.cos() - ly * rot_rad.sin(); // north (m)
+                let dlat = ry / 111_320.0;
+                let dlon = rx / (111_320.0 * cos_lat);
+                pts.push((clat + dlat, clon + dlon));
+            }
+            return pts;
+        }
+        "line" => {
+            // [[lat, lon], [lat, lon], ...]
+            if let Some(arr) = val.as_array() {
+                let pts: Vec<(f64, f64)> = arr.iter().filter_map(|p| {
+                    let lat = p.get(0).and_then(|v| v.as_f64())?;
+                    let lon = p.get(1).and_then(|v| v.as_f64())?;
+                    Some((lat, lon))
+                }).collect();
+                if !pts.is_empty() {
+                    return pts;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    vec![]
 }

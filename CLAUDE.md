@@ -62,13 +62,13 @@ src/                    # React frontend
   │   ├── Dashboard.tsx           # 홈 대시보드 (비행 기반 통계 카드)
   │   ├── Drawing.tsx             # 그리기 도구 + 수동 건물 등록 도형
   │   ├── FileUpload.tsx          # NEC ASS 파일 업로드/파싱 (배치 지원, Garble 이벤트)
-  │   ├── LossAnalysis.tsx        # 표적소실 분석 (테이블/비행별/비교 뷰, 개별 스캔 미탐지)
-  │   ├── ReportGeneration.tsx    # PDF 보고서 (설정→미리보기 2단계, 8개 섹션 토글)
+  │   ├── LossAnalysis.tsx        # 표적소실 분석 (테이블/비행별/비교 뷰, 파노라마 상세는 사이드바로 이동)
+  │   ├── ReportGeneration.tsx    # PDF 보고서 (설정→미리보기 2단계, 9개 섹션 토글)
   │   ├── Settings.tsx            # 설정 + DB 내보내기/가져오기 + GIS건물 임포트 + SRTM 다운로드
   │   └── TrackMap.tsx            # 항적 지도 (deck.gl GPU 렌더링, 커버리지/구름/Garble 오버레이)
   ├── components/
   │   ├── Layout/
-  │   │   ├── Sidebar.tsx         # 사이드바 네비게이션 (w-60, 공항명 한글 변환)
+  │   │   ├── Sidebar.tsx         # 사이드바 네비게이션 (w-60, 공항명 한글 변환, 비행 병합, 파노라마 패널)
   │   │   └── Titlebar.tsx        # Tauri 커스텀 타이틀바 (드래그/창 컨트롤)
   │   ├── Map/
   │   │   ├── DeckGLOverlay.tsx   # deck.gl ↔ MapLibre 통합 (MapboxOverlay)
@@ -84,6 +84,7 @@ src/                    # React frontend
   │   │   ├── ReportLossSection.tsx   # 표적소실 구간 상세 테이블
   │   │   ├── ReportMapSection.tsx    # 항적 지도 캡처 이미지
   │   │   ├── ReportPage.tsx          # A4 페이지 래퍼 (210×297mm)
+  │   │   ├── ReportPanoramaSection.tsx  # 360° 파노라마 장애물 분석 (SVG 차트+8방위 요약+건물 목록)
   │   │   ├── ReportStatsSection.tsx  # 분석 통계 (추이 차트+비행별 막대 차트)
   │   │   ├── ReportSummarySection.tsx # 요약 (KPI 그리드, 종합 판정, 분석 소견)
   │   │   ├── ReportWeatherSection.tsx # 기상 조건 분석 (기상 테이블, 덕팅 위험, Garble 상관)
@@ -137,13 +138,13 @@ public/                 # 정적 자산
 8. LOS 분석 (SVG 단면도: 지형+건물+실제지구곡률+4/3굴절 모델+산 이름, 크로스헤어+포인트 핀)
 9. 항적 지도 상태 유지 (App.tsx에서 항상 마운트, offscreen 토글)
 10. GPU 상태 뱃지 (실제 WebGL 렌더러 감지, HW/SW 표시)
-11. PDF 보고서 (HTML 미리보기→캡처→PDF, 8개 섹션 토글, 인라인 텍스트 편집, 추이 차트)
+11. PDF 보고서 (HTML 미리보기→캡처→PDF, 9개 섹션 토글, 인라인 텍스트 편집, 추이 차트)
 12. 재생/구간 컨트롤 (실시간 배속 재생, 구간 선택 드래그)
 13. 3D 지형 (AWS Terrarium DEM, 음영기복도, 고도 배율 조절)
 14. Dot 모드 (개별 표적 점+수직선 시각화)
 15. 구조화된 호버 툴팁 (항적/Loss/레이더에 다중행 정보 표시)
 16. OpenSky 운항이력 자동 동기화 (OAuth2 인증, 최근 5년, SQLite 캐싱)
-17. 도면/측면도 그리기 도구 (거리 축 라벨, 수동 건물 도형 등록)
+17. 도면/측면도 그리기 도구 (거리 축 라벨, 수동 건물 도형 등록, 타원 지오메트리 지원)
 18. 비행 통합 (OpenSky 매칭 + gap 분리 + 수동 병합, 분석 단위를 파일→비행으로 전환)
 19. 파싱 데이터 DB 영속화 (앱 재시작 시 자동 복원)
 20. DB 내보내기/가져오기 (전체 데이터 이식)
@@ -153,11 +154,12 @@ public/                 # 정적 자산
 24. 구름 그리드 오버레이 (레이더 주변 격자 구름 분포, 시간별 애니메이션)
 25. Garble 분석 (sidelobe/multipath 분류, 반사체 위치 추정, Mode-S별 통계)
 26. GIS 건물통합정보 임포트 (vWorld SHP ZIP, EPSG:5186→WGS84, LOS 경로 건물 쿼리)
-27. 수동 건물 관리 (점/사각형/원/선 도형, CRUD, LOS 분석 반영)
+27. 수동 건물 관리 (점/사각형/타원/선 도형, CRUD, LOS 분석 반영, 도형 지오메트리 샘플링)
 28. SRTM 고도 데이터 (1-arcsecond 30m 해상도, 한국 영역 타일 다운로드/캐시)
 29. 360° LoS 파노라마 (방위별 최대 앙각 장애물 탐색, 지형+건물 통합)
 30. 이상고도 보정 (수직속도 기반 탐지 + 선형 보간)
 31. 기상-Garble 상관관계 분석 (Garble 발생 시점 기상 조건 비교)
+32. 파노라마 캐시 (계산 결과 DB 영속화, 보고서 생성 시 재활용)
 
 ## 핵심 아키텍처: 비행(Flight) 기반 분석
 분석 단위가 "파싱 파일(`AnalysisResult`)"에서 "**비행(`Flight`)**"으로 전환됨.
@@ -212,6 +214,7 @@ public/                 # 정적 자산
 | `fetch_elevation` | SRTM 타일 기반 배치 고도 조회 |
 | `download_srtm_korea` | 한국 영역 SRTM 타일 다운로드 |
 | `calculate_los_panorama` | 360° LoS 파노라마 계산 (지형+건물) |
+| `load_panorama_cache` | 캐시된 파노라마 데이터 로드 (보고서용) |
 | **GIS 건물** | |
 | `import_building_data` | vWorld SHP ZIP 임포트 (진행률 이벤트) |
 | `query_buildings_along_path` | LOS 경로 상 건물 조회 |
@@ -295,9 +298,10 @@ public/                 # 정적 자산
 - **좌표 변환**: `coord.rs` — GRS80 타원체 Transverse Mercator 역변환
 
 ### 수동 건물
-- **도형 유형**: point, rectangle, circle, line (`GeometryType`)
-- **CRUD**: `manual_buildings` 테이블, Drawing.tsx에서 도형 그리기
-- **LOS 반영**: GIS 건물과 함께 경로 분석에 통합
+- **도형 유형**: point, rectangle, circle/ellipse, line (`GeometryType`)
+- **타원 지오메트리**: `{center, semi_major_m, semi_minor_m, rotation_deg}` (레거시 `radius_m` 호환)
+- **CRUD**: `manual_buildings` 테이블, Drawing.tsx에서 도형 그리기 (도형 확정 후 자동 맵핏)
+- **LOS 반영**: GIS 건물과 함께 경로 분석에 통합 (도형별 샘플 포인트 생성으로 공간 쿼리)
 
 ### SRTM 고도 데이터
 - **해상도**: 1-arcsecond (~30m), 3601×3601 big-endian i16
@@ -307,7 +311,10 @@ public/                 # 정적 자산
 ## 360° LoS 파노라마
 - **모듈**: `src-tauri/src/analysis/panorama.rs`
 - **원리**: 레이더 안테나에서 0°~360° 방위별 ray → 지형(SRTM) + GIS/수동 건물 중 최대 앙각 장애물
+- **건물 높이 필터**: MAX_BUILDING_HEIGHT_M = 1000m (비현실적 높이 제외)
+- **수동 건물 지오메트리 확장**: rectangle(9점), circle/ellipse(13점), line(전체점), point(중심점) 샘플링
 - **출력**: `PanoramaPoint[]` — 방위, 거리, 높이, 앙각, 장애물 유형/이름/주소/용도
+- **캐싱**: `load_panorama_cache(radarLat, radarLon)` — 계산 결과 DB 영속화, 보고서 재활용
 - **4/3 유효지구 모델**: 앙각 계산에 굴절 모델 적용
 
 ## 데이터 모델
@@ -342,7 +349,7 @@ public/                 # 정적 자산
 격자 셀 좌표 + 운량 4종, 시간별 프레임 타임시리즈
 
 ### BuildingOnPath / ManualBuilding
-LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON)
+LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rectangle `[[minLat,minLon],[maxLat,maxLon]]`, circle/ellipse `{center,semi_major_m,semi_minor_m,rotation_deg}`, line `[[lat,lon],...]`, point `[lat,lon]`)
 
 ### PanoramaPoint
 방위별 최대 앙각 장애물 (거리, 높이, 유형, 이름, 주소, 용도)
@@ -403,15 +410,16 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON)
 - **렌더링 파이프라인**: React 컴포넌트 → A4 HTML 미리보기 → html2canvas(scale:2) → jsPDF
 - **저장**: Tauri `write_file_base64` + `@tauri-apps/plugin-dialog` 저장 다이얼로그
 
-### 8개 섹션 (토글 가능)
+### 9개 섹션 (토글 가능)
 1. **표지** (`ReportCoverPage`): 문서번호, 시행일자, 레이더명, 제목/부제 인라인 편집
 2. **요약** (`ReportSummarySection`): KPI 그리드, 종합 판정 등급(양호/주의/경고), 편집 가능한 분석 소견
 3. **항적 지도** (`ReportMapSection`): MapLibre 캡처 이미지
 4. **분석 통계** (`ReportStatsSection`): 주간 보고서 시 최근 10주 추이 테이블+SVG 이중 막대 차트, 비행별 상세 테이블+가로 막대 차트
 5. **소실 상세** (`ReportLossSection`): 표적소실 구간 테이블 (월간 보고서 최대 20건)
 6. **LOS 분석** (`ReportLOSSection`): LOS 결과 테이블 (차단/양호 배지)
-7. **기상 조건** (`ReportWeatherSection`): 시간별 기상 테이블, 덕팅 위험, Garble-기상 상관관계
-8. **기체 현황** (`ReportAircraftSection`): 비행검사기 현황 테이블
+7. **장애물 분석** (`ReportPanoramaSection`): 360° 파노라마 SVG 차트, 8방위 요약 테이블, 상위 15건 건물 목록
+8. **기상 조건** (`ReportWeatherSection`): 시간별 기상 테이블, 덕팅 위험, Garble-기상 상관관계
+9. **기체 현황** (`ReportAircraftSection`): 비행검사기 현황 테이블
 
 ### 공통 컴포넌트
 - `ReportPage`: A4 페이지 래퍼 (210×297mm, `data-page` 속성)
@@ -426,7 +434,9 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON)
 
 ## 이상고도 보정 (src/utils/altitudeCorrection.ts)
 - **절대 범위 검사**: -100m ~ 20,000m
-- **수직속도 기반**: 200m/s 초과 → 이상값 후보 → 전후 모두 초과 시 확정
+- **수직속도 기반**: 100m/s 초과 → 이상값 후보 (전투기 급상승 수준, ~20,000 ft/min)
+- **연속 이상값 탐지**: 가장 가까운 정상 이전 포인트 기준 비교 (연속 이상값도 포착)
+- **첫/끝점 검사**: 인접 정상 포인트 2개의 추세와 비교
 - **보간**: 양쪽 정상 포인트로 선형 보간
 - **적용**: 파싱 후 비행 통합 전 자동 적용
 

@@ -28,7 +28,7 @@ import Modal from "../common/Modal";
 import { useAppStore } from "../../store";
 import { mergeFlightRecords } from "../../utils/flightConsolidation";
 import { summarizeGarbleByModeS } from "../../utils/reflectorAnalysis";
-import type { Flight, FlightRecord, PageId } from "../../types";
+import type { FlightRecord, PageId } from "../../types";
 
 /** 항공기별 색상 팔레트 (TrackMap과 동일) */
 const AIRCRAFT_COLORS: [number, number, number][] = [
@@ -187,49 +187,20 @@ function MapFlightPanel() {
     return matched?.id ?? null;
   }, [storeFlights]);
 
-  const setFlights = useAppStore((s) => s.setFlights);
-
-  // 파싱 데이터 없는 FlightRecord → 빈 Flight 생성하여 store 추가
-  const createPlaceholderFlight = useCallback((f: FlightRecord): string => {
-    const modeS = f.icao24.toUpperCase();
-    const id = `${modeS}_${f.first_seen}`;
-    const acName = icaoToName[f.icao24.toLowerCase()];
-    const placeholder: Flight = {
-      id,
-      mode_s: modeS,
-      aircraft_name: acName,
-      callsign: f.callsign?.trim() || undefined,
-      departure_airport: f.est_departure_airport || undefined,
-      arrival_airport: f.est_arrival_airport || undefined,
-      start_time: f.first_seen,
-      end_time: f.last_seen,
-      track_points: [],
-      loss_points: [],
-      loss_segments: [],
-      total_loss_time: 0,
-      total_track_time: f.last_seen - f.first_seen,
-      loss_percentage: 0,
-      max_radar_range_km: 0,
-      match_type: "opensky",
-    };
-    // 최신 store 상태 사용 (클로저 stale 방지)
-    const currentFlights = useAppStore.getState().flights;
-    setFlights([...currentFlights, placeholder]);
-    return id;
-  }, [setFlights, icaoToName]);
+  // FlightRecord 고유 키 (병합 선택용)
+  const flightRecordKey = useCallback(
+    (f: FlightRecord) => `${f.icao24.toUpperCase()}_${f.first_seen}`,
+    []
+  );
 
   const handleSelect = (f: FlightRecord) => {
-    // 병합 모드: 다중 선택 토글
+    // 병합 모드: FlightRecord 키 기반 다중 선택 토글
     if (mergeMode) {
-      let flightId = findStoreFlightId(f);
-      // 파싱 데이터 없으면 빈 Flight 생성
-      if (!flightId) {
-        flightId = createPlaceholderFlight(f);
-      }
+      const key = flightRecordKey(f);
       setMergeSelection((prev) => {
         const next = new Set(prev);
-        if (next.has(flightId)) next.delete(flightId);
-        else next.add(flightId);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
         return next;
       });
       return;
@@ -250,19 +221,59 @@ function MapFlightPanel() {
     }
   };
 
-  // 병합 실행
+  // 병합 실행: FlightRecord 키 → store Flight ID 매핑 후 병합
   const handleMerge = () => {
     if (mergeSelection.size < 2) return;
-    // 최신 store 상태로 검증 (클로저 stale 방지)
     const currentFlights = useAppStore.getState().flights;
-    const selected = currentFlights.filter((f) => mergeSelection.has(f.id));
-    if (selected.length < 2) return;
+
+    // 선택된 FlightRecord 키에 대응하는 store Flight ID 수집
+    const storeFlightIds = new Set<string>();
+    for (const f of flights) {
+      const key = flightRecordKey(f);
+      if (!mergeSelection.has(key)) continue;
+      const modeS = f.icao24.toUpperCase();
+      for (const sf of currentFlights) {
+        if (
+          sf.mode_s.toUpperCase() === modeS &&
+          sf.start_time <= f.last_seen + 300 &&
+          sf.end_time >= f.first_seen - 300
+        ) {
+          storeFlightIds.add(sf.id);
+        }
+      }
+    }
+
+    if (storeFlightIds.size < 2) {
+      // 같은 store Flight에 매핑된 경우 → 같은 날 같은 항공기 전체 비행 수집
+      const selectedRecords = flights.filter((f) => mergeSelection.has(flightRecordKey(f)));
+      if (selectedRecords.length >= 2) {
+        const modeS = selectedRecords[0].icao24.toUpperCase();
+        // 선택된 레코드의 날짜 범위 (같은 날)
+        const minTs = Math.min(...selectedRecords.map((r) => r.first_seen));
+        const maxTs = Math.max(...selectedRecords.map((r) => r.last_seen));
+        for (const sf of currentFlights) {
+          if (
+            sf.mode_s.toUpperCase() === modeS &&
+            sf.start_time <= maxTs + 300 &&
+            sf.end_time >= minTs - 300
+          ) {
+            storeFlightIds.add(sf.id);
+          }
+        }
+      }
+      if (storeFlightIds.size < 2) {
+        alert("병합할 수 있는 파싱된 비행이 2개 이상 필요합니다.");
+        return;
+      }
+    }
+
+    const selected = currentFlights.filter((f) => storeFlightIds.has(f.id));
     const modeS = selected[0].mode_s.toUpperCase();
     if (!selected.every((f) => f.mode_s.toUpperCase() === modeS)) {
       alert("같은 항공기(Mode-S)의 비행만 병합할 수 있습니다.");
       return;
     }
-    mergeFlights(Array.from(mergeSelection));
+    mergeFlights(Array.from(storeFlightIds));
     setMergeMode(false);
     setMergeSelection(new Set());
     setSelectedFlightId(null);
@@ -372,8 +383,7 @@ function MapFlightPanel() {
         ) : (
           <div className="space-y-0.5">
             {flights.map((f) => {
-              const flightId = findStoreFlightId(f) ?? `${f.icao24.toUpperCase()}_${f.first_seen}`;
-              const isMergeSelected = mergeMode && mergeSelection.has(flightId);
+              const isMergeSelected = mergeMode && mergeSelection.has(flightRecordKey(f));
               const isSelected = !mergeMode &&
                 selectedFlight?.icao24 === f.icao24 &&
                 selectedFlight?.first_seen === f.first_seen;
@@ -718,7 +728,7 @@ function PanoramaObstaclePanel() {
 
   if (!pt) {
     return (
-      <div className="flex flex-col items-center justify-center gap-1.5 py-6 text-center">
+      <div className="flex flex-col items-center justify-center gap-1.5 text-center" style={{ minHeight: 260 }}>
         <Eye size={16} className="text-gray-300" />
         <p className="text-[10px] text-gray-400">
           차트 위를 호버하거나 클릭하여<br />장애물 정보를 확인하세요
@@ -738,7 +748,7 @@ function PanoramaObstaclePanel() {
     : "bg-red-100 text-red-700";
 
   return (
-    <div className="flex flex-col gap-2 px-3 py-2">
+    <div className="flex flex-col gap-2 px-3 py-2" style={{ minHeight: 260 }}>
       {/* 유형 뱃지 + 이름 + 고정 상태 */}
       <div className="flex items-center gap-1.5">
         <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${typeColor}`}>
@@ -935,7 +945,7 @@ export default function Sidebar() {
 
         {/* 전파 장애물 (파노라마) 활성 시 장애물 정보 패널 */}
         {!collapsed && panoramaViewActive && (
-          <div className="mt-auto border-t border-gray-100 overflow-y-auto">
+          <div className="mt-auto border-t border-gray-100 overflow-y-auto" style={{ minHeight: 280 }}>
             <PanoramaObstaclePanel />
           </div>
         )}
