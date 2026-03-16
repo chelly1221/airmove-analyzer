@@ -705,6 +705,21 @@ pub fn delete_manual_building(conn: &Connection, id: i64) -> Result<(), String> 
 
 // ─── 헬퍼 함수 ─────────────────────────────────────────────────
 
+/// 인코딩 깨짐으로 인한 비정상 건물명 판별
+/// - 전각 물음표(？, U+FF1F): UTF-8 바이트를 EUC-KR로 잘못 디코딩한 흔적
+/// - ASCII 물음표(?): 원본 SHP에서 EUC-KR 미지원 문자가 0x3F로 치환된 것
+fn is_garbled_name(s: &str) -> bool {
+    // 전각 물음표 포함 → 항상 인코딩 깨짐
+    if s.contains('\u{FF1F}') {
+        return true;
+    }
+    // ASCII '?' + 주변에 한글이 있으면 대체문자로 판단
+    if s.contains('?') && s.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c)) {
+        return true;
+    }
+    false
+}
+
 /// DBF 파일에서 특정 문자열 필드의 원본 바이트를 EUC-KR로 디코딩하여 레코드별 Vec 반환
 fn parse_dbf_euckr_field(dbf_path: &Path, field_names: &[&str]) -> Option<Vec<Option<String>>> {
     let data = std::fs::read(dbf_path).ok()?;
@@ -751,10 +766,24 @@ fn parse_dbf_euckr_field(dbf_path: &Path, field_names: &[&str]) -> Option<Vec<Op
             continue;
         }
         let raw = &data[rec_start + t_off..rec_start + t_off + t_len];
-        // EUC-KR 디코딩
-        let (decoded, _, _) = EUC_KR.decode(raw);
-        let trimmed = decoded.trim().to_string();
-        if trimmed.is_empty() {
+        // null 바이트 및 공백 제거 후 실제 데이터 길이 확인
+        let raw_trimmed = raw.iter()
+            .rposition(|&b| b != 0x00 && b != 0x20)
+            .map(|end| &raw[..=end])
+            .unwrap_or(&[]);
+        if raw_trimmed.is_empty() {
+            results.push(None);
+            continue;
+        }
+        // UTF-8 유효성 먼저 확인 (일부 레코드가 UTF-8로 인코딩된 경우)
+        let decoded_str = if let Ok(utf8) = std::str::from_utf8(raw_trimmed) {
+            utf8.to_string()
+        } else {
+            let (decoded, _, _) = EUC_KR.decode(raw_trimmed);
+            decoded.into_owned()
+        };
+        let trimmed = decoded_str.trim().to_string();
+        if trimmed.is_empty() || is_garbled_name(&trimmed) {
             results.push(None);
         } else {
             results.push(Some(trimmed));

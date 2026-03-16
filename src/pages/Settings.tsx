@@ -1068,8 +1068,9 @@ export function SrtmDownloadSection() {
 // ─── 건물 데이터 (GIS건물통합정보) ────────────────────────────────────
 
 const REGIONS = [
-  { key: "seoul", label: "서울특별시", size: "~129MB" },
-  { key: "gyeonggi", label: "경기도", size: "~367MB" },
+  { key: "seoul", label: "서울특별시" },
+  { key: "incheon", label: "인천광역시" },
+  { key: "gyeonggi", label: "경기도" },
 ] as const;
 
 export function BuildingDataSection() {
@@ -1175,14 +1176,14 @@ export function BuildingDataSection() {
       </div>
       <p className="text-xs text-gray-500">
         국토교통부 GIS건물통합정보 SHP 데이터를 임포트하여 LOS 분석에 건물 차폐를 반영합니다.
-        vworld에서 서울/경기도 ZIP 파일을 다운로드한 후 아래에서 가져오기 하세요.
+        vworld에서 서울/인천/경기도 ZIP 파일을 다운로드한 후 아래에서 가져오기 하세요.
       </p>
 
       {loading ? (
         <div className="py-4 text-center text-sm text-gray-500">로딩 중...</div>
       ) : (
         <div className="grid grid-cols-2 gap-4">
-          {REGIONS.map(({ key, label, size }) => {
+          {REGIONS.map(({ key, label }) => {
             const status = getRegionStatus(key);
             const isImporting = importing === key;
             return (
@@ -1190,7 +1191,6 @@ export function BuildingDataSection() {
                 <div className="flex items-center justify-between">
                   <div>
                     <h3 className="text-sm font-semibold text-gray-800">{label}</h3>
-                    <span className="text-[10px] text-gray-500">ZIP 크기: {size}</span>
                   </div>
                   {status ? (
                     <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">

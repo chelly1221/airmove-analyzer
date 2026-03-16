@@ -78,6 +78,45 @@ export function correctAnomalousAltitudes(
     if (vrPrev > MAX_VERTICAL_RATE_MS && vrNext > MAX_VERTICAL_RATE_MS) {
       isAnomalous[i] = true;
     }
+    // 한쪽이라도 극단적 수직속도 (500 m/s ≈ 100,000 ft/min, 물리적 불가) → 이상값
+    // Loss gap 직후 단일 스파이크 포인트 탐지용 (앞 포인트가 멀어 vrPrev가 낮은 경우)
+    else if (vrPrev > 500 || vrNext > 500) {
+      isAnomalous[i] = true;
+    }
+  }
+
+  // 2.5단계: 단일 포인트 스파이크 탐지
+  // 앞뒤 정상 포인트 간 선형 보간 대비 크게 벗어나는 포인트 탐지
+  // (수직속도 기반으로 잡히지 않는 중간 크기 스파이크 보완)
+  const SPIKE_DEVIATION_M = 300;
+  for (let i = 1; i < n - 1; i++) {
+    if (isAnomalous[i]) continue;
+
+    // 가장 가까운 양쪽 정상 포인트 찾기
+    let leftIdx = -1;
+    for (let j = i - 1; j >= 0; j--) {
+      if (!isAnomalous[j]) { leftIdx = j; break; }
+    }
+    let rightIdx = -1;
+    for (let j = i + 1; j < n; j++) {
+      if (!isAnomalous[j]) { rightIdx = j; break; }
+    }
+    if (leftIdx < 0 || rightIdx < 0) continue;
+
+    const left = points[leftIdx];
+    const right = points[rightIdx];
+    const curr = points[i];
+    const totalDt = right.timestamp - left.timestamp;
+    if (totalDt <= 0) continue;
+
+    // 선형 보간으로 예상 고도 계산
+    const t = (curr.timestamp - left.timestamp) / totalDt;
+    const expectedAlt = left.altitude + (right.altitude - left.altitude) * t;
+    const deviation = Math.abs(curr.altitude - expectedAlt);
+
+    if (deviation > SPIKE_DEVIATION_M) {
+      isAnomalous[i] = true;
+    }
   }
 
   // 첫 포인트 검사: 인접 정상 포인트와 비교
