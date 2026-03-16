@@ -7,20 +7,872 @@ import {
   CheckCircle2,
   XCircle,
   Loader2,
-  FolderOpen,
   AlertCircle,
   Radar,
   Plane,
   Globe,
-  Satellite,
-  RefreshCw,
+  Plus,
+  Pencil,
+  Building2,
+  MapPin,
+  Square,
+  Circle,
+  Minus,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre";
 import { useAppStore } from "../store";
 import { consolidateFlights } from "../utils/flightConsolidation";
-import type { AdsbTrack, AnalysisResult, FlightRecord, UploadedFile } from "../types";
+import Modal from "../components/common/Modal";
+import type { AnalysisResult, FlightRecord, GeometryType, ManualBuilding, UploadedFile } from "../types";
+
+// ─── 건물 입력 모달 ──────────────────────────────────────────────
+
+const MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
+
+type DrawTool = "point" | "rectangle" | "circle" | "line";
+
+interface BuildingFormData {
+  name: string;
+  latitude: string;
+  longitude: string;
+  height: string;
+  ground_elev: string;
+  memo: string;
+  geometry_type: GeometryType;
+  geometry_json: string | null;
+}
+
+const emptyForm: BuildingFormData = {
+  name: "",
+  latitude: "",
+  longitude: "",
+  height: "",
+  ground_elev: "0",
+  memo: "",
+  geometry_type: "point",
+  geometry_json: null,
+};
+
+/** 두 좌표 간 거리 (m) */
+function haversineM(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/** 두 좌표 간 방위각 (degrees, 북=0 시계방향) */
+function bearing(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const la1 = (lat1 * Math.PI) / 180;
+  const la2 = (lat2 * Math.PI) / 180;
+  const y = Math.sin(dLon) * Math.cos(la2);
+  const x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dLon);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+/** 점에서 직선(p1→p2)까지 수직 거리 (m) */
+function perpDistM(pt: [number, number], p1: [number, number], p2: [number, number]): number {
+  // p1→pt 벡터를 p1→p2 방향에 사영한 후 수직 성분 계산
+  const d1x = (pt[1] - p1[1]) * Math.cos((p1[0] * Math.PI) / 180) * 111320;
+  const d1y = (pt[0] - p1[0]) * 111320;
+  const d2x = (p2[1] - p1[1]) * Math.cos((p1[0] * Math.PI) / 180) * 111320;
+  const d2y = (p2[0] - p1[0]) * 111320;
+  const len = Math.sqrt(d2x * d2x + d2y * d2y);
+  if (len < 1) return Math.sqrt(d1x * d1x + d1y * d1y);
+  const cross = Math.abs(d1x * d2y - d1y * d2x);
+  return cross / len;
+}
+
+/** 타원을 GeoJSON polygon 좌표로 변환 */
+function ellipseToPolygon(
+  center: [number, number],
+  semiMajorM: number,
+  semiMinorM: number,
+  rotationDeg: number,
+  segments = 64,
+): [number, number][] {
+  const [lat, lon] = center;
+  const rotRad = (rotationDeg * Math.PI) / 180;
+  const cosLat = Math.cos((lat * Math.PI) / 180);
+  const coords: [number, number][] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * 2 * Math.PI;
+    // 타원 로컬 좌표 (미터)
+    const lx = semiMajorM * Math.cos(t);
+    const ly = semiMinorM * Math.sin(t);
+    // 회전 적용 (rotationDeg는 북(위도+) 기준 시계방향)
+    const rx = lx * Math.sin(rotRad) + ly * Math.cos(rotRad);  // east
+    const ry = lx * Math.cos(rotRad) - ly * Math.sin(rotRad);  // north
+    const dLon = rx / (111320 * cosLat);
+    const dLat = ry / 111320;
+    coords.push([lon + dLon, lat + dLat]);
+  }
+  return coords;
+}
+
+function BuildingModal({
+  open: isOpen,
+  onClose,
+  onSave,
+  initial,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onSave: (data: BuildingFormData) => void;
+  initial?: ManualBuilding | null;
+}) {
+  const [form, setForm] = useState<BuildingFormData>(emptyForm);
+  const [drawTool, setDrawTool] = useState<DrawTool>("point");
+  const miniMapRef = useRef<MapRef>(null);
+
+  // 그리기 임시 상태: 클릭 포인트 축적 + 마우스 현재 위치
+  const [clickPts, setClickPts] = useState<[number, number][]>([]); // [lat, lon][]
+  const [mousePt, setMousePt] = useState<[number, number] | null>(null);
+
+  useEffect(() => {
+    if (initial) {
+      setForm({
+        name: initial.name,
+        latitude: String(initial.latitude),
+        longitude: String(initial.longitude),
+        height: String(initial.height),
+        ground_elev: String(initial.ground_elev),
+        memo: initial.memo,
+        geometry_type: initial.geometry_type || "point",
+        geometry_json: initial.geometry_json || null,
+      });
+      setDrawTool(initial.geometry_type as DrawTool || "point");
+    } else {
+      setForm(emptyForm);
+      setDrawTool("point");
+    }
+    setClickPts([]);
+    setMousePt(null);
+  }, [initial, isOpen]);
+
+  const handleSubmit = () => {
+    if (!form.name.trim() || !form.latitude || !form.longitude || !form.height) return;
+    onSave(form);
+  };
+
+  // 도구 변경 시 임시 상태 초기화
+  useEffect(() => {
+    setClickPts([]);
+    setMousePt(null);
+  }, [drawTool]);
+
+  /** form에 사각형 반영 (clickPts는 건드리지 않음) */
+  const applyRect = useCallback((c1: [number, number], c2: [number, number]) => {
+    const minLat = Math.min(c1[0], c2[0]);
+    const maxLat = Math.max(c1[0], c2[0]);
+    const minLon = Math.min(c1[1], c2[1]);
+    const maxLon = Math.max(c1[1], c2[1]);
+    setForm((f) => ({
+      ...f,
+      latitude: ((minLat + maxLat) / 2).toFixed(6),
+      longitude: ((minLon + maxLon) / 2).toFixed(6),
+      geometry_type: "rectangle" as GeometryType,
+      geometry_json: JSON.stringify([[minLat, minLon], [maxLat, maxLon]]),
+    }));
+  }, []);
+
+  /** form에 타원 반영 (clickPts는 건드리지 않음) */
+  const applyEllipse = useCallback((center: [number, number], semiMajorM: number, semiMinorM: number, rotDeg: number) => {
+    setForm((f) => ({
+      ...f,
+      latitude: center[0].toFixed(6),
+      longitude: center[1].toFixed(6),
+      geometry_type: "circle" as GeometryType,
+      geometry_json: JSON.stringify({
+        center,
+        semi_major_m: Math.round(semiMajorM),
+        semi_minor_m: Math.round(semiMinorM),
+        rotation_deg: Math.round(rotDeg * 10) / 10,
+      }),
+    }));
+  }, []);
+
+  // 미니맵 클릭
+  const handleMapClick = useCallback((evt: any) => {
+    const { lngLat } = evt;
+    const lat: number = lngLat.lat;
+    const lon: number = lngLat.lng;
+    const pt: [number, number] = [lat, lon];
+
+    if (drawTool === "point") {
+      setForm((f) => ({
+        ...f,
+        latitude: lat.toFixed(6),
+        longitude: lon.toFixed(6),
+        geometry_type: "point",
+        geometry_json: null,
+      }));
+      return;
+    }
+
+    if (drawTool === "rectangle") {
+      setClickPts((prev) => {
+        if (prev.length === 0) return [pt];
+        // 두 번째 클릭 → 확정
+        applyRect(prev[0], pt);
+        return [];
+      });
+      return;
+    }
+
+    if (drawTool === "circle") {
+      setClickPts((prev) => {
+        if (prev.length === 0) {
+          // 1단계: 중심
+          return [pt];
+        }
+        if (prev.length === 1) {
+          // 2단계: 장축 끝점 → 원으로 우선 확정, 3단계 진행 대기
+          const center = prev[0];
+          const semiMajor = haversineM(center[0], center[1], lat, lon);
+          const rot = bearing(center[0], center[1], lat, lon);
+          applyEllipse(center, semiMajor, semiMajor, rot);
+          return [center, pt];
+        }
+        if (prev.length === 2) {
+          // 3단계: 단축 조절 → 타원 확정
+          const center = prev[0];
+          const majorEnd = prev[1];
+          const semiMajor = haversineM(center[0], center[1], majorEnd[0], majorEnd[1]);
+          const rot = bearing(center[0], center[1], majorEnd[0], majorEnd[1]);
+          const semiMinor = Math.max(1, perpDistM(pt, center, majorEnd));
+          applyEllipse(center, semiMajor, semiMinor, rot);
+          return [];
+        }
+        return [];
+      });
+      return;
+    }
+
+    if (drawTool === "line") {
+      setClickPts((prev) => {
+        const updated = [...prev, pt];
+        const center = updated.reduce(
+          (acc, p) => [acc[0] + p[0] / updated.length, acc[1] + p[1] / updated.length],
+          [0, 0],
+        );
+        setForm((f) => ({
+          ...f,
+          latitude: center[0].toFixed(6),
+          longitude: center[1].toFixed(6),
+          geometry_type: "line",
+          geometry_json: JSON.stringify(updated),
+        }));
+        return updated;
+      });
+    }
+  }, [drawTool, applyRect, applyEllipse]);
+
+  // 라인 더블클릭으로 완료
+  const handleMapDblClick = useCallback((evt: any) => {
+    if (drawTool === "line") {
+      evt.preventDefault();
+    }
+  }, [drawTool]);
+
+  // 마우스 추적 (실시간 미리보기용)
+  const handleMapMouseMove = useCallback((evt: any) => {
+    const { lngLat } = evt;
+    setMousePt([lngLat.lat, lngLat.lng]);
+  }, []);
+
+  // ── GeoJSON 미리보기 생성 ──
+
+  const previewGeoJson = useMemo(() => {
+    // 사각형 미리보기: 1포인트 + 마우스
+    if (drawTool === "rectangle" && clickPts.length === 1 && mousePt) {
+      const c1 = clickPts[0], c2 = mousePt;
+      const minLat = Math.min(c1[0], c2[0]), maxLat = Math.max(c1[0], c2[0]);
+      const minLon = Math.min(c1[1], c2[1]), maxLon = Math.max(c1[1], c2[1]);
+      return {
+        type: "Feature" as const,
+        geometry: {
+          type: "Polygon" as const,
+          coordinates: [[[minLon, minLat], [maxLon, minLat], [maxLon, maxLat], [minLon, maxLat], [minLon, minLat]]],
+        },
+        properties: {},
+      };
+    }
+
+    // 타원 미리보기
+    if (drawTool === "circle" && clickPts.length >= 1 && mousePt) {
+      const center = clickPts[0];
+      if (clickPts.length === 1) {
+        // 2단계 미리보기: 중심→마우스 = 원(장축=단축)
+        const r = haversineM(center[0], center[1], mousePt[0], mousePt[1]);
+        if (r < 1) return null;
+        const rot = bearing(center[0], center[1], mousePt[0], mousePt[1]);
+        return {
+          type: "Feature" as const,
+          geometry: { type: "Polygon" as const, coordinates: [ellipseToPolygon(center, r, r, rot)] },
+          properties: {},
+        };
+      }
+      if (clickPts.length === 2) {
+        // 3단계 미리보기: 장축 확정, 마우스로 단축 조절
+        const majorEnd = clickPts[1];
+        const semiMajor = haversineM(center[0], center[1], majorEnd[0], majorEnd[1]);
+        const rot = bearing(center[0], center[1], majorEnd[0], majorEnd[1]);
+        const semiMinor = Math.max(1, perpDistM(mousePt, center, majorEnd));
+        return {
+          type: "Feature" as const,
+          geometry: { type: "Polygon" as const, coordinates: [ellipseToPolygon(center, semiMajor, semiMinor, rot)] },
+          properties: {},
+        };
+      }
+    }
+
+    // 확정된 도형 표시
+    if (form.geometry_type === "rectangle" && form.geometry_json) {
+      try {
+        const [[minLat, minLon], [maxLat, maxLon]] = JSON.parse(form.geometry_json);
+        return {
+          type: "Feature" as const,
+          geometry: {
+            type: "Polygon" as const,
+            coordinates: [[[minLon, minLat], [maxLon, minLat], [maxLon, maxLat], [minLon, maxLat], [minLon, minLat]]],
+          },
+          properties: {},
+        };
+      } catch { /* ignore */ }
+    }
+    if (form.geometry_type === "circle" && form.geometry_json) {
+      try {
+        const gj = JSON.parse(form.geometry_json);
+        const center: [number, number] = gj.center;
+        const semiMajor: number = gj.semi_major_m ?? gj.radius_m ?? 100;
+        const semiMinor: number = gj.semi_minor_m ?? semiMajor;
+        const rot: number = gj.rotation_deg ?? 0;
+        return {
+          type: "Feature" as const,
+          geometry: { type: "Polygon" as const, coordinates: [ellipseToPolygon(center, semiMajor, semiMinor, rot)] },
+          properties: {},
+        };
+      } catch { /* ignore */ }
+    }
+    if (form.geometry_type === "line" && form.geometry_json) {
+      try {
+        const pts: [number, number][] = JSON.parse(form.geometry_json);
+        if (pts.length >= 2) {
+          return {
+            type: "Feature" as const,
+            geometry: { type: "LineString" as const, coordinates: pts.map(([lat, lon]) => [lon, lat]) },
+            properties: {},
+          };
+        }
+      } catch { /* ignore */ }
+    }
+    return null;
+  }, [drawTool, clickPts, mousePt, form.geometry_type, form.geometry_json]);
+
+  // 라인 그리기 중 진행 미리보기 (확정 전 점선)
+  const linePreviewGeoJson = useMemo(() => {
+    if (drawTool !== "line" || clickPts.length === 0) return null;
+    const pts = mousePt ? [...clickPts, mousePt] : clickPts;
+    if (pts.length < 2) return null;
+    return {
+      type: "Feature" as const,
+      geometry: { type: "LineString" as const, coordinates: pts.map(([lat, lon]) => [lon, lat]) },
+      properties: {},
+    };
+  }, [drawTool, clickPts, mousePt]);
+
+  // 타원 장축선 미리보기 (3단계 시)
+  const majorAxisGeoJson = useMemo(() => {
+    if (drawTool !== "circle" || clickPts.length !== 2) return null;
+    const [center, majorEnd] = clickPts;
+    return {
+      type: "Feature" as const,
+      geometry: {
+        type: "LineString" as const,
+        coordinates: [[center[1], center[0]], [majorEnd[1], majorEnd[0]]],
+      },
+      properties: {},
+    };
+  }, [drawTool, clickPts]);
+
+  // 힌트 텍스트
+  const hintText = useMemo(() => {
+    if (drawTool === "point") return "클릭하여 위치 지정";
+    if (drawTool === "rectangle") {
+      return clickPts.length === 0 ? "첫 번째 꼭짓점 클릭" : "대각 꼭짓점 클릭";
+    }
+    if (drawTool === "circle") {
+      if (clickPts.length === 0) return "중심점 클릭";
+      if (clickPts.length === 1) return "장축 끝점 클릭";
+      return "단축 길이 클릭 (타원) — 생략 시 원 유지";
+    }
+    if (drawTool === "line") return clickPts.length === 0 ? "첫 번째 꼭짓점 클릭" : "다음 꼭짓점 클릭";
+    return "";
+  }, [drawTool, clickPts.length]);
+
+  const markerLat = parseFloat(form.latitude);
+  const markerLon = parseFloat(form.longitude);
+  const hasMarker = !isNaN(markerLat) && !isNaN(markerLon);
+
+  const mapCenter = hasMarker
+    ? { latitude: markerLat, longitude: markerLon }
+    : { latitude: 37.55, longitude: 126.99 };
+
+  const drawTools: { tool: DrawTool; icon: typeof MapPin; label: string }[] = [
+    { tool: "point", icon: MapPin, label: "포인트" },
+    { tool: "rectangle", icon: Square, label: "사각형" },
+    { tool: "circle", icon: Circle, label: "원/타원" },
+    { tool: "line", icon: Minus, label: "선" },
+  ];
+
+  // 지면 표고 자동/수동 모드
+  const [elevMode, setElevMode] = useState<"auto" | "manual">("auto");
+  const [elevLoading, setElevLoading] = useState(false);
+
+  // 초기값에 수동 표고가 있으면 수동 모드로 시작
+  useEffect(() => {
+    if (initial && initial.ground_elev > 0) {
+      setElevMode("manual");
+    } else {
+      setElevMode("auto");
+    }
+  }, [initial, isOpen]);
+
+  // 자동 모드: 위경도 변경 시 SRTM에서 표고 조회
+  useEffect(() => {
+    if (elevMode !== "auto") return;
+    const lat = parseFloat(form.latitude);
+    const lon = parseFloat(form.longitude);
+    if (isNaN(lat) || isNaN(lon)) return;
+    let cancelled = false;
+    setElevLoading(true);
+    invoke<number[]>("fetch_elevation", {
+      latitudes: [lat],
+      longitudes: [lon],
+    }).then((elevs) => {
+      if (cancelled) return;
+      const elev = elevs[0] ?? 0;
+      setForm((f) => ({ ...f, ground_elev: String(Math.round(elev)) }));
+    }).catch(() => {
+      if (cancelled) return;
+      setForm((f) => ({ ...f, ground_elev: "0" }));
+    }).finally(() => {
+      if (!cancelled) setElevLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [elevMode, form.latitude, form.longitude]);
+
+  const fields: { key: keyof BuildingFormData; label: string; placeholder: string; type?: string; required?: boolean }[] = [
+    { key: "name", label: "건물명", placeholder: "예: 남산타워", required: true },
+    { key: "latitude", label: "위도", placeholder: "예: 37.5512", type: "number", required: true },
+    { key: "longitude", label: "경도", placeholder: "예: 126.9882", type: "number", required: true },
+    { key: "height", label: "건물 높이 (m)", placeholder: "예: 236.7", type: "number", required: true },
+    { key: "memo", label: "메모", placeholder: "비고 사항" },
+  ];
+
+  return (
+    <Modal open={isOpen} onClose={onClose} title={initial ? "건물 정보 수정" : "건물 수동 등록"} width="max-w-3xl">
+      <div className="flex gap-4">
+        {/* 왼쪽: 입력 폼 */}
+        <div className="w-64 shrink-0 space-y-2.5">
+          {fields.map(({ key, label, placeholder, type, required }) => (
+            <div key={key}>
+              <label className="mb-0.5 block text-xs font-medium text-gray-600">
+                {label}{required && <span className="text-red-500 ml-0.5">*</span>}
+              </label>
+              <input
+                type={type ?? "text"}
+                value={form[key] ?? ""}
+                onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
+                placeholder={placeholder}
+                className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-800 placeholder:text-gray-400 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30"
+              />
+            </div>
+          ))}
+
+          {/* 지면 표고: 자동/수동 선택 */}
+          <div>
+            <div className="mb-0.5 flex items-center justify-between">
+              <label className="text-xs font-medium text-gray-600">지면 표고 (m)</label>
+              <div className="flex rounded-md border border-gray-200 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setElevMode("auto")}
+                  className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                    elevMode === "auto"
+                      ? "bg-[#a60739] text-white"
+                      : "bg-gray-50 text-gray-400 hover:bg-gray-100"
+                  }`}
+                >
+                  자동
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setElevMode("manual")}
+                  className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                    elevMode === "manual"
+                      ? "bg-[#a60739] text-white"
+                      : "bg-gray-50 text-gray-400 hover:bg-gray-100"
+                  }`}
+                >
+                  수동
+                </button>
+              </div>
+            </div>
+            <div className="relative">
+              <input
+                type="number"
+                value={form.ground_elev}
+                onChange={(e) => setForm((f) => ({ ...f, ground_elev: e.target.value }))}
+                placeholder="예: 243"
+                disabled={elevMode === "auto"}
+                className={`w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-800 placeholder:text-gray-400 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30 ${
+                  elevMode === "auto" ? "pr-8 text-gray-500" : ""
+                }`}
+              />
+              {elevMode === "auto" && elevLoading && (
+                <Loader2 size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 animate-spin text-gray-400" />
+              )}
+              {elevMode === "auto" && !elevLoading && form.ground_elev && (
+                <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">SRTM</span>
+              )}
+            </div>
+          </div>
+
+          {/* 도형 유형 표시 */}
+          {form.geometry_type !== "point" && (
+            <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-gray-500">
+              도형: {form.geometry_type === "rectangle" ? "사각형" : form.geometry_type === "circle" ? "원/타원" : "선"}
+              {form.geometry_type === "circle" && form.geometry_json && (() => {
+                try {
+                  const g = JSON.parse(form.geometry_json);
+                  const ma = g.semi_major_m ?? g.radius_m;
+                  const mi = g.semi_minor_m ?? ma;
+                  const rot = g.rotation_deg ?? 0;
+                  if (ma === mi) return ` (반경 ${ma}m)`;
+                  return ` (${ma}×${mi}m, ${rot}°)`;
+                } catch { return ""; }
+              })()}
+            </div>
+          )}
+
+          <div className="flex items-center justify-end gap-2 pt-2">
+            <button
+              onClick={onClose}
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              취소
+            </button>
+            <button
+              onClick={handleSubmit}
+              disabled={!form.name.trim() || !form.latitude || !form.longitude || !form.height}
+              className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] disabled:opacity-40 transition-colors"
+            >
+              {initial ? "수정" : "등록"}
+            </button>
+          </div>
+        </div>
+
+        {/* 오른쪽: 미니맵 */}
+        <div className="flex-1 flex flex-col gap-2">
+          {/* 도구 모음 */}
+          <div className="flex items-center gap-1">
+            {drawTools.map(({ tool, icon: Icon, label }) => (
+              <button
+                key={tool}
+                onClick={() => setDrawTool(tool)}
+                className={`flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all ${
+                  drawTool === tool
+                    ? "bg-[#a60739] text-white"
+                    : "bg-gray-100 text-gray-500 hover:bg-gray-200"
+                }`}
+                title={label}
+              >
+                <Icon size={13} />
+                {label}
+              </button>
+            ))}
+            {clickPts.length > 0 && (
+              <button
+                onClick={() => setClickPts([])}
+                className="ml-1 rounded-lg bg-gray-100 px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-200 transition-colors"
+              >
+                초기화
+              </button>
+            )}
+            <span className="ml-auto text-[10px] text-gray-400">
+              {hintText}
+            </span>
+          </div>
+
+          {/* 지도 */}
+          <div className="relative h-80 w-full overflow-hidden rounded-xl border border-gray-200">
+            <MapGL
+              ref={miniMapRef}
+              initialViewState={{
+                ...mapCenter,
+                zoom: hasMarker ? 14 : 7,
+              }}
+              mapStyle={MAP_STYLE}
+              style={{ width: "100%", height: "100%" }}
+              cursor="crosshair"
+              onClick={handleMapClick}
+              onDblClick={handleMapDblClick}
+              onMouseMove={handleMapMouseMove}
+              attributionControl={false}
+              doubleClickZoom={drawTool !== "line"}
+            >
+              {/* 확정된 포인트 마커 */}
+              {hasMarker && form.geometry_type === "point" && (
+                <Marker latitude={markerLat} longitude={markerLon} anchor="bottom">
+                  <div className="flex flex-col items-center">
+                    <div className="rounded-full bg-[#a60739] p-1 shadow-lg">
+                      <MapPin size={16} className="text-white" />
+                    </div>
+                  </div>
+                </Marker>
+              )}
+
+              {/* 도형 미리보기 (드래그 중 또는 확정) */}
+              {previewGeoJson && (
+                <Source id="preview-shape" type="geojson" data={previewGeoJson as any}>
+                  {previewGeoJson.geometry.type === "Polygon" && (
+                    <>
+                      <Layer
+                        id="preview-fill"
+                        type="fill"
+                        paint={{ "fill-color": "#a60739", "fill-opacity": 0.15 }}
+                      />
+                      <Layer
+                        id="preview-outline"
+                        type="line"
+                        paint={{ "line-color": "#a60739", "line-width": 2 }}
+                      />
+                    </>
+                  )}
+                  {previewGeoJson.geometry.type === "LineString" && (
+                    <Layer
+                      id="preview-line"
+                      type="line"
+                      paint={{ "line-color": "#a60739", "line-width": 2.5 }}
+                    />
+                  )}
+                </Source>
+              )}
+
+              {/* 라인 진행 중 미리보기 */}
+              {linePreviewGeoJson && !previewGeoJson && (
+                <Source id="line-preview" type="geojson" data={linePreviewGeoJson as any}>
+                  <Layer
+                    id="line-preview-line"
+                    type="line"
+                    paint={{ "line-color": "#a60739", "line-width": 2, "line-dasharray": [4, 3] }}
+                  />
+                </Source>
+              )}
+
+              {/* 타원 장축선 (3단계 시) */}
+              {majorAxisGeoJson && (
+                <Source id="major-axis" type="geojson" data={majorAxisGeoJson as any}>
+                  <Layer
+                    id="major-axis-line"
+                    type="line"
+                    paint={{ "line-color": "#a60739", "line-width": 1.5, "line-dasharray": [6, 4] }}
+                  />
+                </Source>
+              )}
+
+              {/* 클릭 포인트 마커 (사각형 꼭짓점, 타원 중심/장축끝, 라인 꼭짓점) */}
+              {clickPts.map(([lat, lon], i) => (
+                <Marker key={`cp-${i}`} latitude={lat} longitude={lon}>
+                  <div className="h-2.5 w-2.5 rounded-full border-2 border-[#a60739] bg-white" />
+                </Marker>
+              ))}
+
+              {/* 확정된 도형 중심점 마커 */}
+              {hasMarker && (form.geometry_type === "rectangle" || form.geometry_type === "circle") && clickPts.length === 0 && (
+                <Marker latitude={markerLat} longitude={markerLon}>
+                  <div className="h-2 w-2 rounded-full bg-[#a60739] ring-2 ring-white" />
+                </Marker>
+              )}
+            </MapGL>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── 건물 목록 패널 ──────────────────────────────────────────────
+
+function ManualBuildingPanel() {
+  const [buildings, setBuildings] = useState<ManualBuilding[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState<ManualBuilding | null>(null);
+
+  const loadBuildings = useCallback(async () => {
+    try {
+      const list = await invoke<ManualBuilding[]>("list_manual_buildings");
+      setBuildings(list);
+    } catch (e) {
+      console.warn("건물 목록 로드 실패:", e);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadBuildings(); }, [loadBuildings]);
+
+  const handleSave = async (data: BuildingFormData) => {
+    try {
+      if (editTarget) {
+        await invoke("update_manual_building", {
+          id: editTarget.id,
+          name: data.name.trim(),
+          latitude: parseFloat(data.latitude),
+          longitude: parseFloat(data.longitude),
+          height: parseFloat(data.height),
+          groundElev: parseFloat(data.ground_elev) || 0,
+          memo: data.memo,
+          geometryType: data.geometry_type || "point",
+          geometryJson: data.geometry_json || null,
+        });
+      } else {
+        await invoke("add_manual_building", {
+          name: data.name.trim(),
+          latitude: parseFloat(data.latitude),
+          longitude: parseFloat(data.longitude),
+          height: parseFloat(data.height),
+          groundElev: parseFloat(data.ground_elev) || 0,
+          memo: data.memo,
+          geometryType: data.geometry_type || "point",
+          geometryJson: data.geometry_json || null,
+        });
+      }
+      setModalOpen(false);
+      setEditTarget(null);
+      loadBuildings();
+    } catch (e) {
+      console.error("건물 저장 실패:", e);
+    }
+  };
+
+  const handleDelete = async (b: ManualBuilding) => {
+    try {
+      await invoke("delete_manual_building", { id: b.id });
+      loadBuildings();
+    } catch (e) {
+      console.error("건물 삭제 실패:", e);
+    }
+  };
+
+  const openAdd = () => {
+    setEditTarget(null);
+    setModalOpen(true);
+  };
+
+  const openEdit = (b: ManualBuilding) => {
+    setEditTarget(b);
+    setModalOpen(true);
+  };
+
+  return (
+    <>
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800">수동 등록 건물</h1>
+            <p className="mt-1 text-sm text-gray-500">
+              LOS 분석에 사용할 건물을 수동 등록합니다
+            </p>
+          </div>
+          <button
+            onClick={openAdd}
+            className="flex items-center gap-2 rounded-lg bg-[#a60739] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e]"
+          >
+            <Plus size={16} />
+            건물 추가
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center py-12 text-gray-400">
+            <Loader2 size={20} className="animate-spin" />
+          </div>
+        ) : buildings.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-gray-300 py-12 text-center">
+            <Building2 size={32} className="mx-auto mb-2 text-gray-300" />
+            <p className="text-sm text-gray-400">등록된 건물이 없습니다</p>
+            <button
+              onClick={openAdd}
+              className="mt-3 text-sm font-medium text-[#a60739] hover:underline"
+            >
+              건물 추가하기
+            </button>
+          </div>
+        ) : (
+          <div className="divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200 bg-gray-50">
+            {buildings.map((b) => (
+              <div key={b.id} className="flex items-center gap-3 px-3 py-2 hover:bg-gray-100 transition-colors group">
+                {b.geometry_type === "rectangle" ? <Square size={14} className="shrink-0 text-gray-400" />
+                  : b.geometry_type === "circle" ? <Circle size={14} className="shrink-0 text-gray-400" />
+                  : b.geometry_type === "line" ? <Minus size={14} className="shrink-0 text-gray-400" />
+                  : <Building2 size={14} className="shrink-0 text-gray-400" />}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-sm font-medium text-gray-800 truncate">{b.name}</span>
+                    <span className="text-[10px] text-gray-400">{b.height}m</span>
+                    {b.geometry_type && b.geometry_type !== "point" && (
+                      <span className="text-[9px] text-gray-400 bg-gray-200 px-1 rounded">
+                        {b.geometry_type === "rectangle" ? "사각형" : b.geometry_type === "circle" ? "원/타원" : "선"}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-gray-400">
+                    {b.latitude.toFixed(4)}°N, {b.longitude.toFixed(4)}°E
+                    {b.ground_elev > 0 && ` · 표고 ${b.ground_elev}m`}
+                    {b.memo && ` · ${b.memo}`}
+                  </div>
+                </div>
+                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    onClick={() => openEdit(b)}
+                    className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700 transition-colors"
+                    title="수정"
+                  >
+                    <Pencil size={12} />
+                  </button>
+                  <button
+                    onClick={() => handleDelete(b)}
+                    className="rounded p-1 text-gray-400 hover:bg-red-100 hover:text-red-600 transition-colors"
+                    title="삭제"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <BuildingModal
+        open={modalOpen}
+        onClose={() => { setModalOpen(false); setEditTarget(null); }}
+        onSave={handleSave}
+        initial={editTarget}
+      />
+    </>
+  );
+}
+
+// ─── 메인 페이지 ─────────────────────────────────────────────────
 
 export default function FileUpload() {
   const uploadedFiles = useAppStore((s) => s.uploadedFiles);
@@ -35,19 +887,8 @@ export default function FileUpload() {
   const radarSite = useAppStore((s) => s.radarSite);
   const setRadarSite = useAppStore((s) => s.setRadarSite);
   const customRadarSites = useAppStore((s) => s.customRadarSites);
-  const adsbTracks = useAppStore((s) => s.adsbTracks);
-  const setAdsbTracks = useAppStore((s) => s.setAdsbTracks);
-  const adsbLoading = useAppStore((s) => s.adsbLoading);
-  const setAdsbLoading = useAppStore((s) => s.setAdsbLoading);
-  const adsbProgress = useAppStore((s) => s.adsbProgress);
-  const setAdsbProgress = useAppStore((s) => s.setAdsbProgress);
   const flightHistory = useAppStore((s) => s.flightHistory);
   const setFlightHistory = useAppStore((s) => s.setFlightHistory);
-  const flightHistoryLoading = useAppStore((s) => s.flightHistoryLoading);
-  const setFlightHistoryLoading = useAppStore((s) => s.setFlightHistoryLoading);
-  const flightHistoryProgress = useAppStore((s) => s.flightHistoryProgress);
-  const setFlightHistoryProgress = useAppStore((s) => s.setFlightHistoryProgress);
-  const [dragOver, setDragOver] = useState(false);
   const [errorLog, setErrorLog] = useState<string[]>([]);
   // 파싱 모드: "aircraft" = 등록 비행검사기만, "all" = 전체 데이터
   const [parseMode, setParseMode] = useState<"aircraft" | "all">("aircraft");
@@ -102,88 +943,6 @@ export default function FileUpload() {
     }
   }, [flightHistory]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const fetchAdsb = useCallback(async () => {
-    if (registeredTrackRanges.size === 0) return;
-    setAdsbLoading(true);
-    try {
-      const seen = new Set<string>();
-      const queries: { icao24: string; time: number }[] = [];
-      for (const [ms, { minTs, maxTs }] of registeredTrackRanges) {
-        for (let t = minTs; t <= maxTs; t += 3600) {
-          const key = `${ms}_${Math.round(t / 3600)}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          queries.push({ icao24: ms, time: Math.round(t) });
-        }
-        const lastKey = `${ms}_${Math.round(maxTs / 3600)}`;
-        if (!seen.has(lastKey)) {
-          seen.add(lastKey);
-          queries.push({ icao24: ms, time: Math.round(maxTs) });
-        }
-      }
-      if (queries.length === 0) { setAdsbLoading(false); return; }
-      await invoke("fetch_adsb_tracks", { queries });
-      const icao24List = [...registeredTrackRanges.keys()];
-      const ranges = [...registeredTrackRanges.values()];
-      const start = Math.min(...ranges.map((r) => r.minTs));
-      const end = Math.max(...ranges.map((r) => r.maxTs));
-      const tracks = await invoke<AdsbTrack[]>("load_adsb_tracks_for_range", {
-        icao24_list: icao24List, start, end,
-      });
-      setAdsbTracks(tracks);
-    } catch (e) {
-      console.warn("ADS-B fetch failed:", e);
-    } finally {
-      setAdsbLoading(false);
-      setAdsbProgress("");
-    }
-  }, [registeredTrackRanges, setAdsbTracks, setAdsbLoading, setAdsbProgress]);
-
-  const fetchFlightHistory = useCallback(async () => {
-    if (registeredTrackRanges.size === 0) return;
-    setFlightHistoryLoading(true);
-    try {
-      for (const [ms, { minTs, maxTs }] of registeredTrackRanges) {
-        await invoke("fetch_flight_history", {
-          icao24: ms,
-          begin: Math.round(minTs),
-          end: Math.round(maxTs),
-        });
-      }
-      const icao24List = [...registeredTrackRanges.keys()];
-      const ranges = [...registeredTrackRanges.values()];
-      const start = Math.min(...ranges.map((r) => r.minTs));
-      const end = Math.max(...ranges.map((r) => r.maxTs));
-      const records = await invoke<FlightRecord[]>("load_flight_history", {
-        icao24_list: icao24List, start, end,
-      });
-      setFlightHistory(records);
-    } catch (e) {
-      const msg = String(e);
-      console.warn("Flight history fetch failed:", msg);
-      if (msg.includes("인증정보") || msg.includes("접근 거부")) {
-        setFlightHistoryProgress("OpenSky 인증정보를 설정에서 확인하세요");
-      }
-    } finally {
-      setFlightHistoryLoading(false);
-    }
-  }, [registeredTrackRanges, setFlightHistory, setFlightHistoryLoading, setFlightHistoryProgress]);
-
-  useEffect(() => {
-    const unlisten1 = listen<{ current: number; total: number; icao24: string }>(
-      "adsb-progress",
-      (e) => setAdsbProgress(`${e.payload.icao24} (${e.payload.current}/${e.payload.total})`)
-    );
-    const unlisten2 = listen<{ current: number; total: number; icao24: string }>(
-      "flight-history-progress",
-      (e) => setFlightHistoryProgress(`${e.payload.icao24} (${e.payload.current}/${e.payload.total})`)
-    );
-    return () => {
-      unlisten1.then((fn) => fn());
-      unlisten2.then((fn) => fn());
-    };
-  }, [setAdsbProgress, setFlightHistoryProgress]);
-
   // rawTrackPoints 변경 시 DB에서 기존 데이터 자동 로드 + 비행 통합
   useEffect(() => {
     if (registeredTrackRanges.size === 0) {
@@ -195,12 +954,6 @@ export default function FileUpload() {
     const ranges = [...registeredTrackRanges.values()];
     const start = Math.min(...ranges.map((r) => r.minTs));
     const end = Math.max(...ranges.map((r) => r.maxTs));
-    // ADS-B 트랙
-    invoke<AdsbTrack[]>("load_adsb_tracks_for_range", {
-      icao24_list: icao24List, start, end,
-    }).then((tracks) => {
-      if (tracks.length > 0) setAdsbTracks(tracks);
-    }).catch(() => {});
     // 운항이력 — DB에서 로드 후 setFlightHistory → flightHistory useEffect가 재통합 트리거
     invoke<FlightRecord[]>("load_flight_history", {
       icao24_list: icao24List, start, end,
@@ -248,18 +1001,6 @@ export default function FileUpload() {
       ]);
     }
   };
-
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragOver(false);
-      setErrorLog((prev) => [
-        ...prev,
-        "드래그 앤 드롭은 Tauri 환경에서 제한될 수 있습니다. 파일 선택 버튼을 사용하세요.",
-      ]);
-    },
-    []
-  );
 
   // 파싱 전 레이더 선택 모달 표시
   const requestParseSingle = (file: UploadedFile) => {
@@ -311,6 +1052,11 @@ export default function FileUpload() {
 
       // 원시 포인트 축적
       appendRawTrackPoints(result.file_info.track_points);
+
+      // garble 포인트 축적
+      if (result.file_info.garble_points && result.file_info.garble_points.length > 0) {
+        useAppStore.getState().appendGarblePoints(result.file_info.garble_points);
+      }
 
       // 파싱 통계 저장
       if (result.file_info.parse_stats) {
@@ -388,46 +1134,24 @@ export default function FileUpload() {
 
   return (
     <>
-    <div className="flex gap-6">
-      {/* Left column: Upload + File list */}
-      <div className="flex-1 min-w-0 space-y-6">
+    <div className="grid grid-cols-2 gap-6">
+      {/* ── 왼쪽 열: 자료 업로드 ── */}
+      <div className="space-y-6">
         {/* Header */}
-        <div>
-          <h1 className="text-2xl font-bold text-gray-800">자료 업로드</h1>
-          <p className="mt-1 text-sm text-gray-500">
-            NEC ASS 파일을 업로드하여 파싱합니다
-          </p>
-        </div>
-
-        {/* Drop Zone */}
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragOver(true);
-          }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={handleDrop}
-          onClick={handleFilePick}
-          className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-16 transition-all ${
-            dragOver
-              ? "border-[#a60739] bg-[#a60739]/10"
-              : "border-gray-300 bg-gray-50 hover:border-gray-400 hover:bg-gray-100"
-          }`}
-        >
-          <div
-            className={`mb-4 flex h-16 w-16 items-center justify-center rounded-full ${dragOver ? "bg-[#a60739]/15" : "bg-gray-100"}`}
-          >
-            <Upload
-              size={28}
-              className={dragOver ? "text-[#a60739]" : "text-gray-500"}
-            />
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800">자료 업로드</h1>
+            <p className="mt-1 text-sm text-gray-500">
+              NEC ASS 파일을 업로드하여 파싱합니다
+            </p>
           </div>
-          <p className="text-sm font-medium text-gray-600">
-            클릭하여 NEC ASS 파일 선택
-          </p>
-          <p className="mt-1 text-xs text-gray-500">
-            또는 파일을 이 영역에 드래그 앤 드롭
-          </p>
+          <button
+            onClick={handleFilePick}
+            className="flex items-center gap-2 rounded-lg bg-[#a60739] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e]"
+          >
+            <Upload size={16} />
+            파일 선택
+          </button>
         </div>
 
         {/* File List */}
@@ -460,41 +1184,34 @@ export default function FileUpload() {
 
             <div className="divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200 bg-gray-50">
               {uploadedFiles.map((file) => (
-                <div key={file.path} className="px-4 py-3">
-                  <div className="flex items-center gap-3">
-                    {statusIcon(file.status)}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <FolderOpen size={12} className="text-gray-400 shrink-0" />
-                        <p className="truncate text-sm text-gray-800">{file.name}</p>
-                      </div>
-                      <p className="text-xs text-gray-500 truncate">{file.path}</p>
-                    </div>
-                    <span
-                      className={`shrink-0 text-xs ${
-                        file.status === "done"
-                          ? "text-green-600"
-                          : file.status === "error"
-                            ? "text-red-600"
-                            : file.status === "parsing"
-                              ? "text-blue-600"
-                              : "text-gray-500"
-                      }`}
+                <div key={file.path} className="flex items-center gap-2 px-3 py-1.5">
+                  {statusIcon(file.status)}
+                  <span className="truncate text-xs font-medium text-gray-800 min-w-0">{file.name}</span>
+                  <span className="text-[10px] text-gray-400 truncate min-w-0 shrink">{file.path.replace(/[/\\][^/\\]+$/, '')}</span>
+                  <span
+                    className={`ml-auto shrink-0 text-[11px] ${
+                      file.status === "done"
+                        ? "text-green-600"
+                        : file.status === "error"
+                          ? "text-red-600"
+                          : file.status === "parsing"
+                            ? "text-blue-600"
+                            : "text-gray-400"
+                    }`}
+                  >
+                    {statusText(file)}
+                  </span>
+                  {file.status === "pending" ? (
+                    <button
+                      onClick={() => requestParseSingle(file)}
+                      className="shrink-0 rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-900 transition-colors"
+                      title="파싱"
                     >
-                      {statusText(file)}
-                    </span>
-                    <div className="flex items-center gap-1 shrink-0">
-                      {file.status === "pending" && (
-                        <button
-                          onClick={() => requestParseSingle(file)}
-                          className="rounded p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
-                          title="파싱"
-                        >
-                          <Play size={14} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
+                      <Play size={12} />
+                    </button>
+                  ) : (
+                    <span className="w-[22px] shrink-0" />
+                  )}
                 </div>
               ))}
             </div>
@@ -530,128 +1247,9 @@ export default function FileUpload() {
         )}
       </div>
 
-      {/* Right column: ADS-B */}
-      <div className="w-80 shrink-0 space-y-4">
-        <div className="rounded-xl border border-gray-200 bg-white p-4">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
-              <Satellite size={16} className="text-emerald-600" />
-              <h3 className="text-sm font-semibold text-gray-800">ADS-B 데이터</h3>
-            </div>
-            <button
-              onClick={fetchAdsb}
-              disabled={adsbLoading || registeredTrackRanges.size === 0}
-              className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40 transition-colors"
-            >
-              <RefreshCw size={12} className={adsbLoading ? "animate-spin" : ""} />
-              {adsbLoading ? "조회 중..." : "조회"}
-            </button>
-          </div>
-
-          {/* Progress */}
-          {adsbLoading && adsbProgress && (
-            <div className="mb-3 rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
-              {adsbProgress}
-            </div>
-          )}
-
-          {/* 등록 항공기 목록 + ADS-B 수신 현황 */}
-          {registeredTrackRanges.size === 0 ? (
-            <p className="text-xs text-gray-400 py-4 text-center">
-              파싱된 등록 항공기 데이터가 없습니다
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {Array.from(registeredTrackRanges.entries()).map(([ms, info]) => {
-                const matched = adsbTracks.filter((t) => t.icao24.toLowerCase() === ms.toLowerCase());
-                const totalAdsbPoints = matched.reduce((sum, t) => sum + t.path.length, 0);
-                return (
-                  <div key={ms} className="rounded-lg border border-gray-100 bg-gray-50 p-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs font-medium text-gray-800">{info.name}</span>
-                      <span className="font-mono text-[10px] text-gray-500">{ms}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-[10px] text-gray-500">
-                      <span>레이더: {info.points.toLocaleString()} pts</span>
-                      <span className={totalAdsbPoints > 0 ? "text-emerald-600 font-medium" : "text-gray-400"}>
-                        ADS-B: {totalAdsbPoints > 0 ? `${totalAdsbPoints} pts (${matched.length}건)` : "없음"}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {/* 전체 요약 */}
-          {adsbTracks.length > 0 && (
-            <div className="mt-3 pt-3 border-t border-gray-100 text-xs text-gray-500">
-              총 {adsbTracks.length}건 ADS-B 트랙 수신
-            </div>
-          )}
-        </div>
-
-        {/* 운항이력 */}
-        <div className="rounded-xl border border-gray-200 bg-white p-4">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
-              <Globe size={16} className="text-blue-600" />
-              <h3 className="text-sm font-semibold text-gray-800">운항이력</h3>
-            </div>
-            <button
-              onClick={fetchFlightHistory}
-              disabled={flightHistoryLoading || registeredTrackRanges.size === 0}
-              className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-40 transition-colors"
-            >
-              <RefreshCw size={12} className={flightHistoryLoading ? "animate-spin" : ""} />
-              {flightHistoryLoading ? "조회 중..." : "조회"}
-            </button>
-          </div>
-
-          {flightHistoryProgress && (
-            <div className={`mb-3 rounded-lg px-3 py-2 text-xs ${
-              flightHistoryProgress.includes("확인하세요")
-                ? "bg-red-50 text-red-700"
-                : "bg-blue-50 text-blue-700"
-            }`}>
-              {flightHistoryProgress}
-            </div>
-          )}
-
-          {flightHistory.length === 0 ? (
-            <p className="text-xs text-gray-400 py-2 text-center">
-              {registeredTrackRanges.size === 0 ? "파싱된 등록 항공기 데이터가 없습니다" : "운항이력 없음"}
-            </p>
-          ) : (
-            <div className="max-h-48 overflow-y-auto space-y-1">
-              {flightHistory.map((f, i) => {
-                const dep = f.est_departure_airport ?? "—";
-                const arr = f.est_arrival_airport ?? "—";
-                const dur = Math.round((f.last_seen - f.first_seen) / 60);
-                const d = new Date(f.first_seen * 1000);
-                const dateStr = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-                return (
-                  <div key={i} className="rounded-lg border border-gray-100 bg-gray-50 px-3 py-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-medium text-gray-800">{dep} → {arr}</span>
-                      <span className="text-[10px] text-gray-400">{dateStr}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-[10px] text-gray-500 mt-0.5">
-                      <span>{f.callsign?.trim() || f.icao24}</span>
-                      <span>{dur}분</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {flightHistory.length > 0 && (
-            <div className="mt-2 pt-2 border-t border-gray-100 text-xs text-gray-500">
-              총 {flightHistory.length}건
-            </div>
-          )}
-        </div>
+      {/* ── 오른쪽 열: 수동 등록 건물 ── */}
+      <div>
+        <ManualBuildingPanel />
       </div>
     </div>
 

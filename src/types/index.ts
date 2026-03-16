@@ -38,7 +38,34 @@ export interface TrackPoint {
   raw_data: number[];
 }
 
-/** Loss 구간 (Loss Segment) */
+/** Loss 포인트 (개별 미탐지 스캔) */
+export interface LossPoint {
+  mode_s: string;
+  /** 예상 탐지 시각 (보간) */
+  timestamp: number;
+  /** 보간 위도 */
+  latitude: number;
+  /** 보간 경도 */
+  longitude: number;
+  /** 보간 고도 (m) */
+  altitude: number;
+  /** 레이더까지 거리 (km) */
+  radar_distance_km: number;
+  /** "signal_loss" = 실제 Loss, "out_of_range" = 레이더 범위 이탈 */
+  loss_type: string;
+  /** gap 내 몇 번째 미탐지 (1-based) */
+  scan_index: number;
+  /** gap 내 총 미탐지 수 */
+  total_missed_scans: number;
+  /** gap 시작 시각 (마지막 탐지 포인트) */
+  gap_start_time: number;
+  /** gap 끝 시각 (다음 탐지 포인트) */
+  gap_end_time: number;
+  /** gap 총 지속시간 (초) */
+  gap_duration_secs: number;
+}
+
+/** Loss 구간 (Loss Segment) — LossPoint에서 파생, 하위 호환용 */
 export interface LossSegment {
   mode_s: string;
   start_time: number;
@@ -58,6 +85,26 @@ export interface LossSegment {
   end_radar_dist_km: number;
 }
 
+/** Garble 포인트 (사이드로브/다중경로 유령 표적) */
+export interface GarblePoint {
+  timestamp: number;
+  mode_s: string;
+  track_number: number;
+  rho_nm: number;
+  theta_deg: number;
+  ghost_lat: number;
+  ghost_lon: number;
+  ghost_altitude: number;
+  real_lat: number;
+  real_lon: number;
+  real_altitude: number;
+  real_rho_nm: number;
+  real_theta_deg: number;
+  garble_type: "sidelobe" | "multipath";
+  bearing_diff_deg: number;
+  range_diff_nm: number;
+}
+
 /** 파싱 통계 */
 export interface ParseStatistics {
   total_asterix_records: number;
@@ -68,6 +115,9 @@ export interface ParseStatistics {
   /** [mode_ac, mode_ac_psr, mode_s_allcall, mode_s_rollcall, mode_s_allcall_psr, mode_s_rollcall_psr] */
   points_by_type: [number, number, number, number, number, number];
   mode3a_invalid: number;
+  garble_detected: number;
+  garble_sidelobe: number;
+  garble_multipath: number;
 }
 
 /** 파싱 결과 (Parse Result) */
@@ -81,6 +131,7 @@ export interface ParsedFile {
   radar_lat: number;
   radar_lon: number;
   parse_stats?: ParseStatistics;
+  garble_points: GarblePoint[];
 }
 
 /** 분석 결과 (Analysis Result) */
@@ -143,6 +194,72 @@ export interface LOSProfileData {
   timestamp: number;
 }
 
+/** LOS 경로 상의 건물 */
+export interface BuildingOnPath {
+  distance_km: number;
+  height_m: number;
+  ground_elev_m: number;
+  total_height_m: number;
+  name: string | null;
+  address: string | null;
+  usage: string | null;
+  lat: number;
+  lon: number;
+}
+
+/** 건물 데이터 임포트 상태 */
+export interface BuildingImportStatus {
+  region: string;
+  file_date: string;
+  imported_at: number;
+  record_count: number;
+}
+
+/** 도형 유형 */
+export type GeometryType = "point" | "rectangle" | "circle" | "line";
+
+/** 수동 등록 건물 */
+export interface ManualBuilding {
+  id: number;
+  name: string;
+  latitude: number;
+  longitude: number;
+  /** 건물 높이 (m) */
+  height: number;
+  /** 지면 표고 (m) */
+  ground_elev: number;
+  memo: string;
+  /** 도형 유형 */
+  geometry_type: GeometryType;
+  /** 도형 좌표 JSON */
+  geometry_json: string | null;
+}
+
+/** LoS 파노라마 포인트 (방위별 최대 앙각 장애물) */
+export interface PanoramaPoint {
+  /** 방위 (°, 정북=0, 시계방향) */
+  azimuth_deg: number;
+  /** 앙각 (°, 4/3 유효지구 모델) */
+  elevation_angle_deg: number;
+  /** 장애물까지 지표 거리 (km) */
+  distance_km: number;
+  /** 장애물 높이 (m) */
+  obstacle_height_m: number;
+  /** 지면 표고 (m ASL) */
+  ground_elev_m: number;
+  /** 장애물 유형 */
+  obstacle_type: "terrain" | "gis_building" | "manual_building";
+  /** 장애물 이름 */
+  name: string | null;
+  /** 주소 (건물) */
+  address: string | null;
+  /** 용도 (건물) */
+  usage: string | null;
+  /** 장애물 위치 WGS84 */
+  lat: number;
+  lon: number;
+}
+
 /** ADS-B 트랙 포인트 (OpenSky Network) */
 export interface AdsbPoint {
   time: number;
@@ -186,13 +303,90 @@ export interface Flight {
   start_time: number;
   end_time: number;
   track_points: TrackPoint[];
+  loss_points: LossPoint[];
   loss_segments: LossSegment[];
   total_loss_time: number;
   total_track_time: number;
   loss_percentage: number;
   max_radar_range_km: number;
   /** 매칭 방식 */
-  match_type: "opensky" | "gap";
+  match_type: "opensky" | "gap" | "manual";
+}
+
+/** 시간별 기상 데이터 (Open-Meteo Archive API) */
+export interface WeatherHourly {
+  /** Unix timestamp */
+  timestamp: number;
+  /** 기온 (°C) */
+  temperature: number;
+  /** 강수량 (mm) */
+  precipitation: number;
+  /** 전체 운량 (%) */
+  cloud_cover: number;
+  /** 하층 운량 (%) */
+  cloud_cover_low: number;
+  /** 중층 운량 (%) */
+  cloud_cover_mid: number;
+  /** 상층 운량 (%) */
+  cloud_cover_high: number;
+  /** 시정 (m) */
+  visibility: number;
+  /** 풍속 (m/s) */
+  wind_speed: number;
+  /** 풍향 (degrees) */
+  wind_direction: number;
+  /** 해면기압 (hPa) */
+  pressure: number;
+  /** 이슬점 (°C) */
+  dewpoint: number;
+}
+
+/** 기상 스냅샷 (특정 기간/위치) */
+export interface WeatherSnapshot {
+  radarLat: number;
+  radarLon: number;
+  startDate: string;
+  endDate: string;
+  hourly: WeatherHourly[];
+  fetchedAt: number;
+}
+
+/** 구름 그리드 셀 (공간 분포) */
+export interface CloudGridCell {
+  lat: number;
+  lon: number;
+  cloud_cover: number;
+  cloud_cover_low: number;
+  cloud_cover_mid: number;
+  cloud_cover_high: number;
+}
+
+/** 구름 그리드 (시간별 공간 분포) */
+export interface CloudGridFrame {
+  timestamp: number;
+  cells: CloudGridCell[];
+}
+
+/** 구름 그리드 타임시리즈 */
+export interface CloudGridData {
+  radarLat: number;
+  radarLon: number;
+  frames: CloudGridFrame[];
+  gridSpacingKm: number;
+}
+
+/** 보고서 메타데이터 (프리셋) */
+export interface ReportMetadata {
+  /** 부서명 (예: 비행점검센터) */
+  department: string;
+  /** 작성자 */
+  author: string;
+  /** 문서번호 접두사 (예: 레이더분석) */
+  docPrefix: string;
+  /** 기관명 (예: 항공교통본부) */
+  organization: string;
+  /** 하단 푸터 문구 */
+  footer: string;
 }
 
 /** UI 페이지 */

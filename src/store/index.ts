@@ -3,15 +3,21 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AdsbTrack,
   Aircraft,
+  CloudGridData,
   Flight,
   FlightRecord,
+  GarblePoint,
   LOSProfileData,
   PageId,
   ParseStatistics,
   RadarSite,
+  ReportMetadata,
   TrackPoint,
   UploadedFile,
+  WeatherSnapshot,
 } from "../types";
+import type { MultiCoverageResult } from "../utils/radarCoverage";
+import { manualMergeFlights } from "../utils/flightConsolidation";
 
 /** 설정을 DB에 비동기 저장 (fire-and-forget) */
 function persistSetting(key: string, value: unknown) {
@@ -47,6 +53,8 @@ interface AppState {
   flights: Flight[];
   setFlights: (flights: Flight[]) => void;
   clearFlights: () => void;
+  /** 선택된 비행들을 하나로 수동 병합 */
+  mergeFlights: (ids: string[]) => void;
 
   // 레이더 사이트
   radarSite: RadarSite;
@@ -100,6 +108,45 @@ interface AppState {
   triggerOpenskySync: () => void;
   openskySyncCancelled: boolean;
   cancelOpenskySync: () => void;
+
+  // Garble 분석
+  garblePoints: GarblePoint[];
+  appendGarblePoints: (points: GarblePoint[]) => void;
+  clearGarblePoints: () => void;
+  garbleViewActive: boolean;
+  setGarbleViewActive: (v: boolean) => void;
+  garbleSelectedModeS: string | null;
+  setGarbleSelectedModeS: (v: string | null) => void;
+
+  // 레이더 커버리지 (다중 고도 레이어)
+  coverageData: MultiCoverageResult | null;
+  setCoverageData: (data: MultiCoverageResult | null) => void;
+  coverageVisible: boolean;
+  setCoverageVisible: (v: boolean) => void;
+  coverageLoading: boolean;
+  setCoverageLoading: (v: boolean) => void;
+  coverageProgress: string;
+  setCoverageProgress: (msg: string) => void;
+
+  // 기상 데이터
+  weatherData: WeatherSnapshot | null;
+  setWeatherData: (data: WeatherSnapshot | null) => void;
+  weatherLoading: boolean;
+  setWeatherLoading: (v: boolean) => void;
+
+  // 구름 오버레이
+  cloudGrid: CloudGridData | null;
+  setCloudGrid: (data: CloudGridData | null) => void;
+  cloudGridVisible: boolean;
+  setCloudGridVisible: (v: boolean) => void;
+  cloudGridLoading: boolean;
+  setCloudGridLoading: (v: boolean) => void;
+  cloudGridProgress: string;
+  setCloudGridProgress: (msg: string) => void;
+
+  // 보고서 메타데이터
+  reportMetadata: ReportMetadata;
+  setReportMetadata: (meta: Partial<ReportMetadata>) => void;
 
   // UI
   activePage: PageId;
@@ -169,6 +216,7 @@ export const useAppStore = create<AppState>((set) => ({
       flights: [],
       selectedModeS: null,
       selectedFlightId: null,
+      garblePoints: [],
     });
   },
 
@@ -190,6 +238,18 @@ export const useAppStore = create<AppState>((set) => ({
   flights: [],
   setFlights: (flights) => set({ flights }),
   clearFlights: () => set({ flights: [] }),
+  mergeFlights: (ids) => set((state) => {
+    if (ids.length < 2) return state;
+    const selected = state.flights.filter((f) => ids.includes(f.id));
+    if (selected.length < 2) return state;
+    // 같은 mode_s만 병합 가능
+    const modeS = selected[0].mode_s.toUpperCase();
+    if (!selected.every((f) => f.mode_s.toUpperCase() === modeS)) return state;
+    const merged = manualMergeFlights(selected, state.radarSite);
+    const remaining = state.flights.filter((f) => !ids.includes(f.id));
+    const flights = [...remaining, merged].sort((a, b) => a.start_time - b.start_time);
+    return { flights };
+  }),
 
   // 레이더 사이트 (기본: 김포 #1)
   radarSite: {
@@ -300,6 +360,62 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => ({ openskySyncVersion: state.openskySyncVersion + 1, openskySyncCancelled: false })),
   openskySyncCancelled: false,
   cancelOpenskySync: () => set({ openskySyncCancelled: true }),
+
+  // Garble 분석
+  garblePoints: [],
+  appendGarblePoints: (points) =>
+    set((state) => ({ garblePoints: [...state.garblePoints, ...points] })),
+  clearGarblePoints: () => set({ garblePoints: [] }),
+  garbleViewActive: false,
+  setGarbleViewActive: (v) => set({ garbleViewActive: v }),
+  garbleSelectedModeS: null,
+  setGarbleSelectedModeS: (v) => set({ garbleSelectedModeS: v }),
+
+  // 레이더 커버리지 (다중 고도 레이어)
+  coverageData: null,
+  setCoverageData: (data) => {
+    set({ coverageData: data });
+    if (data) {
+      persistSetting(`coverage_map_${data.radarName}`, data);
+    }
+  },
+  coverageVisible: false,
+  setCoverageVisible: (v) => set({ coverageVisible: v }),
+  coverageLoading: false,
+  setCoverageLoading: (v) => set({ coverageLoading: v }),
+  coverageProgress: "",
+  setCoverageProgress: (msg) => set({ coverageProgress: msg }),
+
+  // 기상 데이터
+  weatherData: null,
+  setWeatherData: (data) => set({ weatherData: data }),
+  weatherLoading: false,
+  setWeatherLoading: (v) => set({ weatherLoading: v }),
+
+  // 구름 오버레이
+  cloudGrid: null,
+  setCloudGrid: (data) => set({ cloudGrid: data }),
+  cloudGridVisible: false,
+  setCloudGridVisible: (v) => set({ cloudGridVisible: v }),
+  cloudGridLoading: false,
+  setCloudGridLoading: (v) => set({ cloudGridLoading: v }),
+  cloudGridProgress: "",
+  setCloudGridProgress: (msg) => set({ cloudGridProgress: msg }),
+
+  // 보고서 메타데이터
+  reportMetadata: {
+    department: "비행점검센터",
+    author: "",
+    docPrefix: "레이더분석",
+    organization: "항공교통본부",
+    footer: "비행검사기 항적 분석 체계 - 자동 생성 보고서",
+  },
+  setReportMetadata: (meta) =>
+    set((state) => {
+      const updated = { ...state.reportMetadata, ...meta };
+      persistSetting("report_metadata", updated);
+      return { reportMetadata: updated };
+    }),
 
   // UI
   activePage: "upload",

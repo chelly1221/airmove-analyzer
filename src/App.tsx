@@ -12,7 +12,7 @@ import ReportGeneration from "./pages/ReportGeneration";
 import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
 import { Loader2 } from "lucide-react";
-import type { FlightRecord, ParseStatistics, RadarSite, TrackPoint } from "./types";
+import type { FlightRecord, GarblePoint, ParseStatistics, RadarSite, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
 import { consolidateFlights } from "./utils/flightConsolidation";
 
 /** DB 저장 데이터 타입 */
@@ -32,6 +32,7 @@ interface SavedFileInfo {
 interface SavedParsedData {
   files: SavedFileInfo[];
   track_points: TrackPoint[];
+  garble_points?: GarblePoint[];
 }
 
 /** 앱 시작 시 DB에서 저장된 파싱 데이터 + 설정 복원 */
@@ -45,7 +46,7 @@ function useRestoreSavedData() {
     const restore = async () => {
       // 1) 설정 복원 (customRadarSites, radarSite)
       try {
-        const settingsToLoad = ["custom_radar_sites", "selected_radar_site"];
+        const settingsToLoad = ["custom_radar_sites", "selected_radar_site", "report_metadata"];
         for (const key of settingsToLoad) {
           const value = await invoke<string | null>("load_setting", { key });
           if (!value) continue;
@@ -55,6 +56,9 @@ function useRestoreSavedData() {
           } else if (key === "selected_radar_site") {
             const site: RadarSite = JSON.parse(value);
             useAppStore.getState().setRadarSite(site);
+          } else if (key === "report_metadata") {
+            const meta = JSON.parse(value);
+            useAppStore.getState().setReportMetadata(meta);
           }
         }
       } catch (e) {
@@ -86,6 +90,7 @@ function useRestoreSavedData() {
               radar_lat: f.radar_lat,
               radar_lon: f.radar_lon,
               parse_stats: f.parse_stats ?? undefined,
+              garble_points: [], // 별도 관리
             },
           });
 
@@ -98,7 +103,34 @@ function useRestoreSavedData() {
         // rawTrackPoints 복원
         store.appendRawTrackPoints(data.track_points);
 
-        // flights 재생성 (consolidateFlights)
+        // garblePoints 복원
+        if (data.garble_points && data.garble_points.length > 0) {
+          console.log(`[Restore] DB에서 ${data.garble_points.length}개 Garble 포인트 복원`);
+          store.appendGarblePoints(data.garble_points);
+        }
+
+        // 3) flightHistory를 DB에서 먼저 로드 (consolidateFlights 전에 필요)
+        try {
+          const activeAircraft = useAppStore.getState().aircraft.filter((a) => a.active && a.mode_s_code);
+          if (activeAircraft.length > 0) {
+            const icao24List = activeAircraft.map((a) => a.mode_s_code.toLowerCase());
+            const now = Math.floor(Date.now() / 1000);
+            const fiveYears = 5 * 365 * 86400;
+            const cached = await invoke<FlightRecord[]>("load_flight_history", {
+              icao24List,
+              start: now - fiveYears,
+              end: now,
+            });
+            if (cached.length > 0) {
+              console.log(`[Restore] DB에서 운항이력 ${cached.length}건 로드`);
+              useAppStore.getState().addFlightHistory(cached);
+            }
+          }
+        } catch (e) {
+          console.log("[Restore] 운항이력 로드 실패:", e);
+        }
+
+        // flights 재생성 (flightHistory 로드 후 consolidateFlights)
         const state = useAppStore.getState();
         const flights = consolidateFlights(
           state.rawTrackPoints,
@@ -107,6 +139,73 @@ function useRestoreSavedData() {
           state.radarSite,
         );
         store.setFlights(flights);
+
+        // 4) 기상 데이터 DB 캐시 복원 (비행 시간 범위 기반)
+        if (flights.length > 0) {
+          try {
+            let minTs = Infinity, maxTs = -Infinity;
+            for (const f of flights) {
+              if (f.start_time < minTs) minTs = f.start_time;
+              if (f.end_time > maxTs) maxTs = f.end_time;
+            }
+            const startDate = new Date(minTs * 1000).toISOString().slice(0, 10);
+            const endDate = new Date(maxTs * 1000).toISOString().slice(0, 10);
+
+            // 날짜 범위 생성
+            const dates: string[] = [];
+            const d = new Date(startDate + "T00:00:00Z");
+            const endD = new Date(endDate + "T00:00:00Z");
+            while (d <= endD) {
+              dates.push(d.toISOString().slice(0, 10));
+              d.setUTCDate(d.getUTCDate() + 1);
+            }
+
+            const { radarSite: rs } = state;
+
+            // 기상 데이터 복원
+            const weatherRows = await invoke<[string, string][]>("load_weather_cache", {
+              radarLat: rs.latitude, radarLon: rs.longitude, dates,
+            });
+            if (weatherRows.length > 0) {
+              const allHourly: WeatherHourly[] = [];
+              for (const [, json] of weatherRows) {
+                allHourly.push(...(JSON.parse(json) as WeatherHourly[]));
+              }
+              allHourly.sort((a, b) => a.timestamp - b.timestamp);
+              store.setWeatherData({
+                radarLat: rs.latitude,
+                radarLon: rs.longitude,
+                startDate, endDate,
+                hourly: allHourly,
+                fetchedAt: Date.now() / 1000,
+              });
+              console.log(`[Restore] 기상 캐시 ${weatherRows.length}일 복원 (${allHourly.length}시간)`);
+            }
+
+            // 구름 그리드 복원
+            const cloudRows = await invoke<[string, string, number][]>("load_cloud_grid_cache", {
+              radarLat: rs.latitude, radarLon: rs.longitude, dates,
+            });
+            if (cloudRows.length > 0) {
+              const allFrames: CloudGridFrame[] = [];
+              let gridSpacing = 50;
+              for (const [, framesJson, spacing] of cloudRows) {
+                allFrames.push(...(JSON.parse(framesJson) as CloudGridFrame[]));
+                gridSpacing = spacing;
+              }
+              allFrames.sort((a, b) => a.timestamp - b.timestamp);
+              store.setCloudGrid({
+                radarLat: rs.latitude,
+                radarLon: rs.longitude,
+                frames: allFrames,
+                gridSpacingKm: gridSpacing,
+              });
+              console.log(`[Restore] 구름 그리드 캐시 ${cloudRows.length}일 복원 (${allFrames.length}프레임)`);
+            }
+          } catch (e) {
+            console.log("[Restore] 기상 캐시 복원 실패:", e);
+          }
+        }
       } catch (e) {
         console.log("[Restore] 파싱 데이터 복원 실패:", e);
       }
@@ -135,11 +234,15 @@ function useOpenskyAutoSync() {
           if (!cancelled) useAppStore.getState().addFlightHistory(event.payload);
         }
       );
-      const unlisten2 = await listen<{ current: number; total: number; icao24: string }>(
+      let lastRetryAfterSecs: number | null = null;
+      const unlisten2 = await listen<{ current: number; total: number; icao24: string; retry_after_secs?: number }>(
         "flight-history-progress",
         (event) => {
           if (cancelled) return;
-          const { current, total, icao24 } = event.payload;
+          const { current, total, icao24, retry_after_secs } = event.payload;
+          if (retry_after_secs != null) {
+            lastRetryAfterSecs = retry_after_secs;
+          }
           const aircraft = useAppStore.getState().aircraft;
           const ac = aircraft.find((a) => a.mode_s_code.toUpperCase() === icao24.toUpperCase());
           const name = ac?.name ?? icao24;
@@ -230,7 +333,7 @@ function useOpenskyAutoSync() {
               authFailed = true;
               break;
             }
-            if (msg.includes("rate limit") || msg.includes("429")) {
+            if (msg.includes("rate_limit") || msg.includes("rate limit") || msg.includes("429")) {
               hadRateLimit = true;
             }
           }
@@ -245,14 +348,16 @@ function useOpenskyAutoSync() {
         console.log("[OpenSky] 동기화 취소됨 (DB 가져오기 등)");
       }
 
-      // 한도 초과 시 30분 후 자동 재시도
+      // 한도 초과 시 자동 재시도 (API 헤더 기반 대기 시간, 기본 30분)
       if (hadRateLimit && !isCancelled()) {
-        console.log("[OpenSky] Rate limit — 30분 후 재시도 예약");
-        useAppStore.getState().setOpenskySyncProgress("일일 한도 초과 — 30분 후 재시도");
+        const retrySecs = lastRetryAfterSecs ?? 1800;
+        const retryMins = Math.ceil(retrySecs / 60);
+        console.log(`[OpenSky] Rate limit — ${retryMins}분 후 재시도 예약 (${retrySecs}초)`);
+        useAppStore.getState().setOpenskySyncProgress(`일일 한도 초과 — ${retryMins}분 후 재시도`);
         retryTimerRef.current = setTimeout(() => {
           useAppStore.getState().setOpenskySyncProgress("");
           setupAndSync();
-        }, 30 * 60 * 1000);
+        }, retrySecs * 1000);
       }
     };
 
@@ -270,6 +375,36 @@ function useOpenskyAutoSync() {
   }, [syncVersion]);
 }
 
+/** Garble 포인트 청크 이벤트 리스너 */
+function useGarbleChunkListener() {
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    (async () => {
+      const unlistenGarble = await listen<{ file_path: string; points: GarblePoint[] }>(
+        "garble-points-chunk",
+        (event) => {
+          if (!cancelled) {
+            console.log(`[Garble] 수신: ${event.payload.points.length}개 garble points (${event.payload.file_path})`);
+            useAppStore.getState().appendGarblePoints(event.payload.points);
+          }
+        }
+      );
+      if (cancelled) {
+        unlistenGarble();
+      } else {
+        unlisten = unlistenGarble;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+}
+
 export default function App() {
   const loading = useAppStore((s) => s.loading);
   const loadingMessage = useAppStore((s) => s.loadingMessage);
@@ -278,6 +413,7 @@ export default function App() {
 
   useRestoreSavedData();
   useOpenskyAutoSync();
+  useGarbleChunkListener();
 
   return (
     <div className="flex h-full bg-white">
@@ -286,7 +422,7 @@ export default function App() {
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* Titlebar - 윈도우 컨트롤만 */}
         <Titlebar />
-        <main className="relative flex-1 overflow-hidden border-l border-t border-gray-200">
+        <main className="relative flex-1 overflow-hidden border-t border-gray-200">
           {/* TrackMap은 항상 마운트 - 탭 전환 시 상태 유지 */}
           {/* TrackMap은 항상 렌더링 - hidden 대신 offscreen으로 canvas 유지 (보고서 캡처용) */}
           <div className={isMapPage ? "h-full" : "absolute inset-0 -z-10 pointer-events-none opacity-0"}>

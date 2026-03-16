@@ -13,14 +13,17 @@ pub const DEFAULT_THRESHOLD_SECS: f64 = 7.0;
 const MIN_POINTS_FOR_ANALYSIS: usize = 1;
 
 /// 레이더 최대 탐지거리의 몇 % 이상이면 범위이탈로 판단
-const OUT_OF_RANGE_THRESHOLD: f64 = 0.88;
+const OUT_OF_RANGE_THRESHOLD: f64 = 1.0;
 
 /// 이 횟수 이상 연속 스캔 미탐지면 범위이탈로 간주
 /// (레이더 범위 내에서 이렇게 오래 Loss가 지속되기 어려움)
 const MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS: f64 = 15.0;
 
-/// 이 시간(초) 이상의 gap은 Loss가 아님 → 정상 출발/도착 (다른 공항 경유 등)
-const MAX_LOSS_DURATION_SECS: f64 = 21600.0; // 6시간
+/// 이 시간(초) 이상의 gap은 Loss가 아님 → 비행 분리 기준과 동일 (4시간)
+const MAX_LOSS_DURATION_SECS: f64 = 14400.0; // 4시간 — TypeScript detectLoss와 일치
+
+/// 보간 속도 vs 직전 속도 차이 비율이 이 값을 초과하면 범위이탈로 판정 (50% 차이)
+const SPEED_DEVIATION_RATIO: f64 = 0.5;
 
 /// Detect loss segments within a single aircraft's track (sorted points).
 fn detect_loss_for_track(
@@ -63,15 +66,27 @@ fn detect_loss_for_track(
             // 놓친 스캔 횟수 추정
             let missed_scans = gap / scan_interval_secs;
 
+            // 보간 속도 계산 (knots): gap 구간의 직선거리 / 시간
+            let implied_speed_kts = (distance_km / gap) * 3600.0 / 1.852;
+            let prev_speed = prev.speed; // knots
+            let speed_deviation = if prev_speed > 10.0 {
+                (implied_speed_kts - prev_speed).abs() / prev_speed
+            } else {
+                0.0
+            };
+
             // 범위이탈 판단:
             // 1) 시작/끝점 모두 레이더 경계 근처 → 확실한 범위이탈
             // 2) 연속 미탐지 횟수가 매우 많고 한쪽이라도 경계 근처
-            // 3) 한쪽만 경계 밖이면 signal_loss로 분류 (경계에서의 소실 포착)
+            // 3) 보간 속도가 직전 속도와 크게 다르면 범위이탈 (직선 보간 무의미)
+            // 4) 그 외 → signal_loss
             let loss_type = if start_radar_dist >= boundary_km && end_radar_dist >= boundary_km {
                 "out_of_range"
             } else if missed_scans >= MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS
                 && (start_radar_dist >= boundary_km || end_radar_dist >= boundary_km)
             {
+                "out_of_range"
+            } else if speed_deviation > SPEED_DEVIATION_RATIO {
                 "out_of_range"
             } else {
                 "signal_loss"
@@ -209,9 +224,8 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Loss 시간은 실제 signal_loss만 합산
+    // Loss 시간 전체 합산
     let total_loss_time: f64 = all_loss_segments.iter()
-        .filter(|s| s.loss_type == "signal_loss")
         .map(|s| s.duration_secs)
         .sum();
 
@@ -391,6 +405,7 @@ mod tests {
             radar_lat: 37.5585,
             radar_lon: 126.7906,
             parse_stats: None,
+            garble_points: vec![],
         };
 
         let result = analyze_tracks(parsed, 12.0);

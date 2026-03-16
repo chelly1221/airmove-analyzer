@@ -2,49 +2,54 @@ import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
-import { PathLayer, ScatterplotLayer, LineLayer, IconLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
 import {
   Play,
   Pause,
   Mountain,
   Crosshair,
-  CircleDot,
   ChevronDown,
   Radar,
   Plane,
+  Loader2,
+  Zap,
+  Cloud,
 } from "lucide-react";
+
+/** Dot 모드 핀 아이콘 (가느다란 선 위에 원) */
+const DotPinIcon = ({ size = 16 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+    <circle cx="8" cy="4" r="2.5" />
+    <line x1="8" y1="6.5" x2="8" y2="14" />
+  </svg>
+);
+
+/** 커버리지 맵 아이콘 (날카로운 별 형태 — 레이더 커버리지 불규칙 경계 느낌) */
+const CoverageIcon = ({ size = 16 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" strokeLinecap="round">
+    <polygon points="8,0.2 9,3.5 11.5,0.8 10.5,4.2 14.5,2 11.5,5 15.8,5.5 12,6.8 15.5,9 11.5,8.5 14,12 10.5,9.5 10,13.5 8.5,10 7,15 7,10.5 4,13.5 5.5,9.5 1.5,11.5 4.5,8.2 0.2,8.5 4,6.5 0.5,4.5 4.2,5 2,1.8 5.5,4 6,0.8 7,4" />
+  </svg>
+);
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, AdsbTrack } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, AdsbTrack, GarblePoint } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
-
-/** 항공기별 색상 팔레트 (비행검사기 전체 모드) */
-const AIRCRAFT_COLORS: [number, number, number][] = [
-  [59, 130, 246],   // blue
-  [16, 185, 129],   // emerald
-  [139, 92, 246],   // violet
-  [6, 182, 212],    // cyan
-  [249, 115, 22],   // orange
-  [236, 72, 153],   // pink
-  [132, 204, 22],   // lime
-  [245, 158, 11],   // amber
-  [99, 102, 241],   // indigo
-  [20, 184, 166],   // teal
-];
+import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrainProfile, invalidateTerrainCache, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
+import { fetchCloudGrid, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 
 /**
  * 탐지 유형 3색 계열:
- *   노랑 = A/C 계열, 초록 = S 계열, 파랑 = A/C+S 계열
- *   PSR 동반 시 동일 색상 + glow 효과
+ *   노랑 = A/C 계열, 초록 = All-Call 계열, 에메랄드 = Roll-Call 계열
+ *   PSR 동반 시 동일 색상 + 흰색 glow 효과
  */
 const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
   mode_ac:              [234, 179, 8],    // yellow
-  mode_ac_psr:          [234, 179, 8],    // yellow (glow)
+  mode_ac_psr:          [234, 179, 8],    // yellow (white glow)
   mode_s_allcall:       [34, 197, 94],    // green
-  mode_s_allcall_psr:   [34, 197, 94],    // green (glow)
-  mode_s_rollcall:      [139, 92, 246],   // purple
-  mode_s_rollcall_psr:  [16, 185, 129],   // emerald (glow)
+  mode_s_allcall_psr:   [34, 197, 94],    // green (white glow)
+  mode_s_rollcall:      [16, 185, 129],   // emerald
+  mode_s_rollcall_psr:  [16, 185, 129],   // emerald (white glow)
 };
 
 /** PSR 동반 탐지 유형 */
@@ -73,52 +78,6 @@ const MAP_STYLE_URL = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.j
 
 const SPEED_OPTIONS = [1, 60, 120, 300];
 
-/** ADS-B 보간 핀 (5초 간격) */
-interface LossAdsbPin {
-  position: [number, number, number]; // [lon, lat, alt]
-  time: number;
-  altitude: number;
-  heading: number;
-  modeS: string;
-  secondsIntoLoss: number;
-  lossDuration: number;
-}
-
-/** 방위각 보간 (360° 랩어라운드 처리) */
-function interpHeading(h0: number, h1: number, t: number): number {
-  let diff = h1 - h0;
-  if (diff > 180) diff -= 360;
-  if (diff < -180) diff += 360;
-  return ((h0 + diff * t) % 360 + 360) % 360;
-}
-
-/** ADS-B 포인트 시간 보간 */
-function interpolateAdsb(
-  points: import("../types").AdsbPoint[],
-  targetTime: number,
-): { lat: number; lon: number; alt: number; heading: number } | null {
-  if (points.length === 0) return null;
-  // 범위 밖
-  if (targetTime < points[0].time || targetTime > points[points.length - 1].time) return null;
-  // 이진 탐색으로 앞쪽 포인트 찾기
-  let lo = 0, hi = points.length - 1;
-  while (lo < hi - 1) {
-    const mid = (lo + hi) >> 1;
-    if (points[mid].time <= targetTime) lo = mid; else hi = mid;
-  }
-  const p0 = points[lo], p1 = points[hi];
-  if (p1.time === p0.time) {
-    return { lat: p0.latitude, lon: p0.longitude, alt: p0.altitude, heading: p0.heading };
-  }
-  const t = (targetTime - p0.time) / (p1.time - p0.time);
-  return {
-    lat: p0.latitude + (p1.latitude - p0.latitude) * t,
-    lon: p0.longitude + (p1.longitude - p0.longitude) * t,
-    alt: p0.altitude + (p1.altitude - p0.altitude) * t,
-    heading: interpHeading(p0.heading, p1.heading, t),
-  };
-}
-
 interface TrackPath {
   modeS: string;
   radarType: string;
@@ -139,15 +98,31 @@ export default function TrackMap() {
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
   const selectedFlightId = useAppStore((s) => s.selectedFlightId);
   const setSelectedFlightId = useAppStore((s) => s.setSelectedFlightId);
+  const selectedFlight = useAppStore((s) => s.selectedFlight);
+  const setSelectedFlight = useAppStore((s) => s.setSelectedFlight);
   const adsbTracks = useAppStore((s) => s.adsbTracks);
   const setAdsbTracks = useAppStore((s) => s.setAdsbTracks);
   const adsbLoading = useAppStore((s) => s.adsbLoading);
   const adsbProgress = useAppStore((s) => s.adsbProgress);
+  const garblePoints = useAppStore((s) => s.garblePoints);
+
+  // 기상/구름 데이터
+  const cloudGrid = useAppStore((s) => s.cloudGrid);
+  const setCloudGrid = useAppStore((s) => s.setCloudGrid);
+  const cloudGridVisible = useAppStore((s) => s.cloudGridVisible);
+  const setCloudGridVisible = useAppStore((s) => s.setCloudGridVisible);
+  const cloudGridLoading = useAppStore((s) => s.cloudGridLoading);
+  const setCloudGridLoading = useAppStore((s) => s.setCloudGridLoading);
+  const cloudGridProgress = useAppStore((s) => s.cloudGridProgress);
+  const setCloudGridProgress = useAppStore((s) => s.setCloudGridProgress);
+  const setWeatherData = useAppStore((s) => s.setWeatherData);
+  const setWeatherLoading = useAppStore((s) => s.setWeatherLoading);
 
   const [sliderValue, setSliderValue] = useState(100);
   const [playing, setPlaying] = useState(false);
   const altScale = 1;
   const [dotMode, setDotMode] = useState(false);
+  const [showGarble, setShowGarble] = useState(false);
   const [playSpeed, setPlaySpeed] = useState(1);
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
@@ -163,6 +138,19 @@ export default function TrackMap() {
   const [radarDropOpen, setRadarDropOpen] = useState(false);
   const [speedDropOpen, setSpeedDropOpen] = useState(false);
   const [trailDropOpen, setTrailDropOpen] = useState(false);
+
+  // 레이더 커버리지 (범위 슬라이더: min~max)
+  const [coverageAltMin, setCoverageAltMin] = useState(1000); // 하한 (ft)
+  const [coverageAltMax, setCoverageAltMax] = useState(10000); // 상한 (ft)
+  const [terrainProfile, setTerrainProfile] = useState<CoverageTerrainProfile | null>(null);
+  const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
+  const coverageVisible = useAppStore((s) => s.coverageVisible);
+  const setCoverageVisible = useAppStore((s) => s.setCoverageVisible);
+  const coverageLoading = useAppStore((s) => s.coverageLoading);
+  const setCoverageLoading = useAppStore((s) => s.setCoverageLoading);
+  const coverageProgress = useAppStore((s) => s.coverageProgress);
+  const setCoverageProgress = useAppStore((s) => s.setCoverageProgress);
+  const coverageAltRef = useRef<HTMLDivElement>(null);
 
   // LOS Analysis state
   const [losMode, setLosMode] = useState(false);
@@ -240,10 +228,11 @@ export default function TrackMap() {
   );
 
   // 전체 포인트/Loss 합산 (비정상 항적 + UNKNOWN 제거)
-  // selectedFlightId → 해당 비행만, selectedModeS: null → 등록 비행검사기만, "__ALL__" → 전체, 그 외 → 해당 Mode-S 전체
-  const { allPoints, allLoss } = useMemo(() => {
+  // selectedFlightId → 해당 비행만, selectedFlight(시간범위) → 시간 필터, selectedModeS: null → 등록 비행검사기만, "__ALL__" → 전체, 그 외 → 해당 Mode-S 전체
+  const { allPoints, allLoss, allLossPoints } = useMemo(() => {
     const pts: TrackPoint[] = [];
     const loss: LossSegment[] = [];
+    const lossP: LossPoint[] = [];
 
     // 특정 비행 선택 시 해당 비행만 표시
     if (selectedFlightId) {
@@ -251,9 +240,33 @@ export default function TrackMap() {
       if (targetFlight) {
         pts.push(...targetFlight.track_points.filter((p) => validModeS.has(p.mode_s)));
         loss.push(...targetFlight.loss_segments.filter((s) => validModeS.has(s.mode_s)));
+        lossP.push(...targetFlight.loss_points.filter((p) => validModeS.has(p.mode_s)));
       }
       pts.sort((a, b) => a.timestamp - b.timestamp);
-      return { allPoints: pts, allLoss: loss };
+      return { allPoints: pts, allLoss: loss, allLossPoints: lossP };
+    }
+
+    // 사이드바에서 비행 선택했지만 store Flight 매칭 실패 시 → 시간 범위로 필터링
+    if (selectedFlight && selectedModeS) {
+      const tMin = selectedFlight.first_seen - 300;
+      const tMax = selectedFlight.last_seen + 300;
+      const modeS = selectedModeS;
+      for (const f of flights) {
+        for (const p of f.track_points) {
+          if (!validModeS.has(p.mode_s)) continue;
+          if (p.mode_s === modeS && p.timestamp >= tMin && p.timestamp <= tMax) {
+            pts.push(p);
+          }
+        }
+        loss.push(...f.loss_segments.filter((s) =>
+          s.mode_s === modeS && s.start_time >= tMin && s.end_time <= tMax
+        ));
+        lossP.push(...f.loss_points.filter((p) =>
+          p.mode_s === modeS && p.timestamp >= tMin && p.timestamp <= tMax
+        ));
+      }
+      pts.sort((a, b) => a.timestamp - b.timestamp);
+      return { allPoints: pts, allLoss: loss, allLossPoints: lossP };
     }
 
     const showAll = selectedModeS === "__ALL__";
@@ -270,17 +283,22 @@ export default function TrackMap() {
       }
       if (showAll) {
         loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s)));
+        lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s)));
       } else if (!selectedModeS) {
         loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s) && registeredModeS.has(s.mode_s.toUpperCase())));
+        lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s) && registeredModeS.has(p.mode_s.toUpperCase())));
       } else {
         loss.push(
           ...f.loss_segments.filter((s) => s.mode_s === selectedModeS)
         );
+        lossP.push(
+          ...f.loss_points.filter((p) => p.mode_s === selectedModeS)
+        );
       }
     }
     pts.sort((a, b) => a.timestamp - b.timestamp);
-    return { allPoints: pts, allLoss: loss };
-  }, [flights, selectedModeS, selectedFlightId, validModeS, registeredModeS]);
+    return { allPoints: pts, allLoss: loss, allLossPoints: lossP };
+  }, [flights, selectedModeS, selectedFlightId, selectedFlight, validModeS, registeredModeS]);
 
   // 고유 Mode-S 목록
   const uniqueModeS = useMemo(() => {
@@ -456,8 +474,201 @@ export default function TrackMap() {
     }
   }, [terrainEnabled]);
 
+  // 레이더 사이트 변경 시 커버리지 캐시 무효화
+  useEffect(() => {
+    setTerrainProfile(null);
+    setCoverageLayers([]);
+    setCoverageVisible(false);
+  }, [radarSite.name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** 고도 비율 → 색상 매핑 */
+  const altToColor = useCallback((altFt: number): [number, number, number] => {
+    const r = Math.min(1, Math.max(0, (altFt - 100) / 19900));
+    return r < 0.25 ? [239, 68, 68]
+      : r < 0.5 ? [249, 115, 22]
+      : r < 0.75 ? [234, 179, 8]
+      : r < 0.9 ? [34, 197, 94]
+      : [6, 182, 212];
+  }, []);
+
+  // 커버리지 deck.gl 데이터 (범위 내 다중 레이어 → 겹침 3D 폴리곤)
+  const coveragePolygonsList = useMemo(() => {
+    if (!coverageVisible || coverageLayers.length === 0) return null;
+    const rLat = radarSite.latitude;
+    const rLon = radarSite.longitude;
+    const CONE_PTS = 72;
+
+    return coverageLayers.map((layer) => {
+      const altM = layer.altitudeM;
+      const outerRing: [number, number, number][] = layer.bearings.map((b) => [b.lon, b.lat, altM * altScale]);
+      if (outerRing.length > 0) outerRing.push(outerRing[0]);
+
+      const polygon: [number, number, number][][] = [outerRing];
+      let coneRing: [number, number, number][] | null = null;
+
+      if (layer.coneRadiusKm > 0.5) {
+        const hole: [number, number, number][] = [];
+        for (let i = CONE_PTS; i >= 0; i--) {
+          const deg = (i / CONE_PTS) * 360;
+          const rad = (deg * Math.PI) / 180;
+          const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
+          const lat = rLat + dLat * Math.cos(rad);
+          const lon = rLon + (dLat / Math.cos((rLat * Math.PI) / 180)) * Math.sin(rad);
+          hole.push([lon, lat, altM * altScale]);
+        }
+        polygon.push(hole);
+        coneRing = [];
+        for (let i = 0; i <= CONE_PTS; i++) {
+          const deg = (i / CONE_PTS) * 360;
+          const rad = (deg * Math.PI) / 180;
+          const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
+          const lat = rLat + dLat * Math.cos(rad);
+          const lon = rLon + (dLat / Math.cos((rLat * Math.PI) / 180)) * Math.sin(rad);
+          coneRing.push([lon, lat, altM * altScale]);
+        }
+      }
+
+      const fillColor = altToColor(layer.altitudeFt);
+      return { polygon, outerRing, coneRing, fillColor, altM, altFt: layer.altitudeFt };
+    });
+  }, [coverageLayers, coverageVisible, altScale, radarSite, altToColor]);
+
+  // Garble 포인트 시간 필터링 (가시 범위 내만 표시)
+  const filteredGarblePoints = useMemo(() => {
+    if (!showGarble || garblePoints.length === 0) return [];
+    return garblePoints.filter(
+      (g) => g.timestamp >= visibleMinTs && g.timestamp <= visibleMaxTs
+    );
+  }, [showGarble, garblePoints, visibleMinTs, visibleMaxTs]);
+
+  // 구름 오버레이 데이터 (현재 시각 기반 프레임)
+  const cloudPolygons = useMemo(() => {
+    if (!cloudGrid || !cloudGridVisible) return null;
+    const currentTs = sliderValue >= 100 ? timeRange.max : pctToTs(sliderValue);
+    const frame = getCloudFrameAtTime(cloudGrid, currentTs);
+    if (!frame || frame.cells.length === 0) return null;
+
+    const halfStep = (cloudGrid.gridSpacingKm / 111.32) * 0.5;
+    const cosLat = Math.cos((cloudGrid.radarLat * Math.PI) / 180);
+    const halfStepLon = halfStep / cosLat;
+
+    return frame.cells
+      .filter((c) => c.cloud_cover > 10) // 10% 미만은 무시
+      .map((c) => ({
+        polygon: [
+          [c.lon - halfStepLon, c.lat - halfStep],
+          [c.lon + halfStepLon, c.lat - halfStep],
+          [c.lon + halfStepLon, c.lat + halfStep],
+          [c.lon - halfStepLon, c.lat + halfStep],
+        ] as [number, number][],
+        cover: c.cloud_cover,
+        coverLow: c.cloud_cover_low,
+        coverMid: c.cloud_cover_mid,
+        coverHigh: c.cloud_cover_high,
+      }));
+  }, [cloudGrid, cloudGridVisible, sliderValue, timeRange.max, pctToTs]);
+
+  /** 구름 그리드 조회 시작 */
+  const startCloudFetch = useCallback(async () => {
+    if (flights.length === 0) return;
+    let minTs = Infinity, maxTs = -Infinity;
+    for (const f of flights) {
+      if (f.start_time < minTs) minTs = f.start_time;
+      if (f.end_time > maxTs) maxTs = f.end_time;
+    }
+    if (minTs === Infinity) return;
+
+    const startDate = new Date(minTs * 1000).toISOString().slice(0, 10);
+    const endDate = new Date(maxTs * 1000).toISOString().slice(0, 10);
+
+    setCloudGridLoading(true);
+    setCloudGridProgress("구름 데이터 조회 중...");
+
+    try {
+      // 기상 데이터도 함께 조회 (보고서용, 일 단위 캐싱)
+      setWeatherLoading(true);
+      const weather = await fetchHistoricalWeather(
+        radarSite.latitude, radarSite.longitude, startDate, endDate,
+        (msg) => setCloudGridProgress(msg),
+      );
+      setWeatherData(weather);
+      setWeatherLoading(false);
+
+      // 구름 그리드 (200km 반경, 50km 간격, 일 단위 캐싱)
+      const grid = await fetchCloudGrid(
+        radarSite.latitude, radarSite.longitude,
+        200, 50, startDate, endDate,
+        (_pct, msg) => setCloudGridProgress(msg),
+      );
+      setCloudGrid(grid);
+      setCloudGridVisible(true);
+    } catch (err) {
+      console.error("구름 데이터 조회 실패:", err);
+    } finally {
+      setCloudGridLoading(false);
+      setCloudGridProgress("");
+    }
+  }, [flights, radarSite, setCloudGrid, setCloudGridVisible, setCloudGridLoading, setCloudGridProgress, setWeatherData, setWeatherLoading]);
+
+  /** 커버리지 맵 계산 시작 — 지형 프로파일 한번 계산 후 캐시 */
+  const startCoverageCompute = useCallback(async (force = false) => {
+    setCoverageLoading(true);
+    setCoverageProgress("준비 중...");
+    try {
+      // 강제 재계산이면 캐시 무효화
+      if (force) invalidateTerrainCache();
+
+      const profile = await computeCoverageTerrainProfile(radarSite, (_pct, msg) => {
+        setCoverageProgress(msg);
+      });
+      setTerrainProfile(profile);
+
+      // useEffect에서 범위 내 레이어 자동 생성됨
+      setCoverageVisible(true);
+    } catch (err) {
+      console.error("커버리지 계산 실패:", err);
+      setCoverageProgress("");
+    } finally {
+      setCoverageLoading(false);
+      setCoverageProgress("");
+    }
+  }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageVisible]);
+
+  // 범위 슬라이더 변경 시 레이어들 재계산 (지형 프로파일 캐시에서 즉시 계산)
+  useEffect(() => {
+    const profile = terrainProfile || getCachedTerrainProfile();
+    if (!profile || !coverageVisible) return;
+
+    // 범위 내 적절한 간격으로 레이어 생성 (최대 20개)
+    const range = coverageAltMax - coverageAltMin;
+    let step: number;
+    if (range <= 2000) step = 100;
+    else if (range <= 5000) step = 500;
+    else step = 1000;
+
+    const layers: CoverageLayer[] = [];
+    for (let alt = coverageAltMin; alt <= coverageAltMax; alt += step) {
+      layers.push(computeLayerFromProfile(profile, alt));
+    }
+    // 상한이 정확히 포함되지 않았으면 추가
+    if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== coverageAltMax) {
+      layers.push(computeLayerFromProfile(profile, coverageAltMax));
+    }
+    setCoverageLayers(layers);
+  }, [coverageAltMin, coverageAltMax, terrainProfile, coverageVisible]);
+
   // Mode-S별 트랙 패스 데이터 (gap + radar_type 변경 시 분할)
-  const trackPaths: TrackPath[] = useMemo(() => {
+  /** 1포인트 항적용 데이터 */
+  interface SinglePoint {
+    modeS: string;
+    position: [number, number] | [number, number, number];
+    color: [number, number, number];
+    point: TrackPoint;
+  }
+
+  // mode_s → 색상 안정 매핑 (allPoints 기반, 정렬하여 슬라이더/필터 변경에도 색상 유지)
+
+  const { trackPaths, singlePoints } = useMemo(() => {
     const groups = new Map<string, TrackPoint[]>();
 
     for (const p of allPoints) {
@@ -472,42 +683,37 @@ export default function TrackMap() {
     }
 
     const paths: TrackPath[] = [];
-    // 색상 모드: null(비행검사기 전체) → 항공기별, 그 외 → 탐지유형별
-    const colorByAircraft = !selectedModeS;
-    let acIdx = 0;
+    const singles: SinglePoint[] = [];
     for (const [modeS, pts] of groups) {
-      if (pts.length < 2) continue;
+      if (pts.length === 1) {
+        // 1포인트 항적: ScatterplotLayer용 데이터로 수집
+        const p = pts[0];
+        const color = detectionTypeColor(p.radar_type);
+        singles.push({
+          modeS,
+          position: losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale],
+          color,
+          point: p,
+        });
+        continue;
+      }
 
-      // 레이더 5초 회전주기 기준, 8초 이상 gap이면 세그먼트 분할
-      const splitThreshold = 8;
+      // Loss 탐지 임계값과 동일하게 7초 이상 gap이면 세그먼트 분할
+      const splitThreshold = 7;
 
       const totalAlts = pts.map((p) => p.altitude);
       const avgAlt = totalAlts.reduce((s, a) => s + a, 0) / totalAlts.length;
 
-      // 항공기별 고정 색상
-      const acColor = AIRCRAFT_COLORS[acIdx % AIRCRAFT_COLORS.length];
-
+      // 1단계: 원시 세그먼트 수집 (start/end 인덱스)
+      const rawSegs: { start: number; end: number }[] = [];
       let segStart = 0;
       for (let i = 1; i <= pts.length; i++) {
         const isEnd = i === pts.length;
         const hasGap = !isEnd && pts[i].timestamp - pts[i - 1].timestamp > splitThreshold;
-        const typeChanged = !colorByAircraft && !isEnd && pts[i].radar_type !== pts[i - 1].radar_type;
+        const typeChanged = !isEnd && pts[i].radar_type !== pts[i - 1].radar_type;
 
         if (isEnd || hasGap || typeChanged) {
-          const seg = pts.slice(segStart, i);
-          if (seg.length >= 2) {
-            const rt = seg[0].radar_type;
-            const color = colorByAircraft ? acColor : detectionTypeColor(rt);
-            paths.push({
-              modeS,
-              radarType: rt,
-              path: seg.map((p) => losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale]),
-              color,
-              avgAlt,
-              pointCount: seg.length,
-              hasPsr: PSR_TYPES.has(rt),
-            });
-          }
+          rawSegs.push({ start: segStart, end: i });
           if (typeChanged && !hasGap) {
             segStart = i - 1;
           } else {
@@ -515,96 +721,81 @@ export default function TrackMap() {
           }
         }
       }
-      acIdx++;
-    }
-    return paths;
-  }, [allPoints, visibleMinTs, visibleMaxTs, altScale, losMode, selectedModeS]);
 
-  // Loss 데이터 (signal_loss만 표시)
-  const signalLoss = useMemo(() => {
-    return allLoss.filter(
-      (s) => s.loss_type === "signal_loss" && s.start_time >= visibleMinTs && s.start_time <= visibleMaxTs
-    );
-  }, [allLoss, visibleMinTs, visibleMaxTs]);
+      // 2단계: 1-포인트 세그먼트를 인접 세그먼트에 병합 (solo dot 방지)
+      // 단, 인접 세그먼트와의 gap이 splitThreshold 이하일 때만 병합
+      // gap이 크면 Loss 구간이므로 진짜 싱글 타겟 → singles로 유지
+      for (let s = 0; s < rawSegs.length; s++) {
+        if (rawSegs[s].end - rawSegs[s].start === 1) {
+          const singlePt = pts[rawSegs[s].start];
+          const canMergeNext = s < rawSegs.length - 1 &&
+            pts[rawSegs[s + 1].start].timestamp - singlePt.timestamp <= splitThreshold;
+          const canMergePrev = s > 0 &&
+            singlePt.timestamp - pts[rawSegs[s - 1].end - 1].timestamp <= splitThreshold;
 
-  // ADS-B fetch는 FileUpload에서 관리 (store 공유)
+          if (canMergeNext) {
+            // 다음 세그먼트에 흡수 (첫점으로 prepend)
+            rawSegs[s + 1].start = rawSegs[s].start;
+            rawSegs.splice(s, 1);
+            s--;
+          } else if (canMergePrev) {
+            // 이전 세그먼트에 흡수
+            rawSegs[s - 1].end = rawSegs[s].end;
+            rawSegs.splice(s, 1);
+            s--;
+          }
+          // 양쪽 모두 gap 초과 → 진짜 고립 싱글 타겟, path 생성에서 singles로 처리
+        }
+      }
 
-  // Loss 구간별 ADS-B 경로 매칭 (경로 좌표 + 원본 포인트 보존)
-  const lossAdsbPaths = useMemo(() => {
-    if (adsbTracks.length === 0) return null;
-    const map = new Map<string, { loss: LossSegment; path: [number, number, number][]; adsbPoints: import("../types").AdsbPoint[] }[]>();
-    for (const loss of signalLoss) {
-      const matchingTrack = adsbTracks.find(
-        (t) => t.icao24.toLowerCase() === loss.mode_s.toLowerCase()
-      );
-      if (!matchingTrack) continue;
-      // Loss 시간 전후 30초 패딩 (경로 렌더링용)
-      const pts = matchingTrack.path.filter(
-        (p) => p.time >= loss.start_time - 30 && p.time <= loss.end_time + 30 && !p.on_ground
-      );
-      if (pts.length < 2) continue;
-      const key = `${loss.mode_s}_${loss.start_time}`;
-      map.set(key, [
-        ...(map.get(key) || []),
-        {
-          loss,
-          path: pts.map((p) => [p.longitude, p.latitude, p.altitude] as [number, number, number]),
-          adsbPoints: pts,
-        },
-      ]);
-    }
-    return map;
-  }, [signalLoss, adsbTracks]);
-
-  // Loss 구간 5초 간격 핀 생성 (ADS-B 보간)
-  const lossAdsbPins = useMemo(() => {
-    if (!lossAdsbPaths || lossAdsbPaths.size === 0) return [];
-    const pins: LossAdsbPin[] = [];
-    for (const entries of lossAdsbPaths.values()) {
-      for (const { loss, adsbPoints } of entries) {
-        const duration = loss.end_time - loss.start_time;
-        for (let sec = 0; sec <= duration; sec += 5) {
-          const t = loss.start_time + sec;
-          const pt = interpolateAdsb(adsbPoints, t);
-          if (!pt) continue;
-          pins.push({
-            position: [pt.lon, pt.lat, pt.alt],
-            time: t,
-            altitude: pt.alt,
-            heading: pt.heading,
-            modeS: loss.mode_s,
-            secondsIntoLoss: sec,
-            lossDuration: duration,
+      // 3단계: 세그먼트 → PathLayer 데이터 생성
+      for (const seg of rawSegs) {
+        const slice = pts.slice(seg.start, seg.end);
+        if (slice.length >= 2) {
+          const rt = slice[0].radar_type;
+          const color = detectionTypeColor(rt);
+          paths.push({
+            modeS,
+            radarType: rt,
+            path: slice.map((p) => losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale]),
+            color,
+            avgAlt,
+            pointCount: slice.length,
+            hasPsr: PSR_TYPES.has(rt),
+          });
+        } else if (slice.length === 1) {
+          // 병합 불가능한 진짜 단독 포인트 (전체 항적이 1포인트)
+          const p = slice[0];
+          const color = detectionTypeColor(p.radar_type);
+          singles.push({
+            modeS,
+            position: losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale],
+            color,
+            point: p,
           });
         }
       }
     }
-    return pins;
-  }, [lossAdsbPaths]);
+    return { trackPaths: paths, singlePoints: singles };
+  }, [allPoints, visibleMinTs, visibleMaxTs, altScale, losMode]);
+
+  // Loss 데이터 (전체 loss type 표시)
+  const signalLoss = useMemo(() => {
+    return allLoss.filter(
+      (s) => s.start_time >= visibleMinTs && s.start_time <= visibleMaxTs
+    );
+  }, [allLoss, visibleMinTs, visibleMaxTs]);
+
+  // Loss 포인트 (전체 loss type, 시간 범위 필터)
+  const signalLossPoints = useMemo(() => {
+    return allLossPoints.filter(
+      (p) => p.timestamp >= visibleMinTs && p.timestamp <= visibleMaxTs
+    );
+  }, [allLossPoints, visibleMinTs, visibleMaxTs]);
+
+  // ADS-B fetch는 FileUpload에서 관리 (store 공유)
 
   // Dot 모드용 색상 맵 (Mode-S → color)
-  const modeSColorMap = useMemo(() => {
-    const map = new Map<string, [number, number, number]>();
-    for (const tp of trackPaths) {
-      if (!map.has(tp.modeS)) {
-        map.set(tp.modeS, tp.color);
-      }
-    }
-    return map;
-  }, [trackPaths]);
-
-  // 타임라인 밴드용 안정적 색상 맵 (슬라이더 위치와 무관하게 allPoints 기반)
-  const bandColorMap = useMemo(() => {
-    const map = new Map<string, [number, number, number]>();
-    let idx = 0;
-    for (const p of allPoints) {
-      if (!map.has(p.mode_s)) {
-        map.set(p.mode_s, AIRCRAFT_COLORS[idx % AIRCRAFT_COLORS.length]);
-        idx++;
-      }
-    }
-    return map;
-  }, [allPoints]);
 
   // Dot 모드용 가시 포인트
   const dotPoints = useMemo(() => {
@@ -767,10 +958,11 @@ export default function TrackMap() {
     const cosB = Math.cos(bearing);
     const sinB = Math.sin(bearing);
     const lineLen = Math.sqrt((tLat - rLat) ** 2 + (tLon - rLon) ** 2);
-    const tolerance = 0.015;
+    const tolerance = 0.27; // ~30km
     const pts: { distRatio: number; altitude: number; mode_s: string; timestamp: number; radar_type: string; isLoss: boolean; latitude: number; longitude: number }[] = [];
-    // 항적 포인트
+    // 항적 포인트 (타임라인 슬라이더 범위 적용)
     for (const p of allPoints) {
+      if (p.timestamp < visibleMinTs || p.timestamp > visibleMaxTs) continue;
       const dx = p.latitude - rLat;
       const dy = p.longitude - rLon;
       const along = dx * cosB + dy * sinB;
@@ -779,23 +971,18 @@ export default function TrackMap() {
         pts.push({ distRatio: along / lineLen, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false, latitude: p.latitude, longitude: p.longitude });
       }
     }
-    // Loss 구간 시작/끝점
-    for (const s of signalLoss) {
-      for (const [lon, lat, alt, ts] of [
-        [s.start_lon, s.start_lat, s.start_altitude, s.start_time],
-        [s.end_lon, s.end_lat, s.end_altitude, s.end_time],
-      ] as [number, number, number, number][]) {
-        const dx = lat - rLat;
-        const dy = lon - rLon;
-        const along = dx * cosB + dy * sinB;
-        const across = Math.abs(-dx * sinB + dy * cosB);
-        if (across < tolerance && along > 0 && along <= lineLen) {
-          pts.push({ distRatio: along / lineLen, altitude: alt, mode_s: s.mode_s, timestamp: ts, radar_type: "loss", isLoss: true, latitude: lat, longitude: lon });
-        }
+    // Loss 포인트
+    for (const lp of signalLossPoints) {
+      const dx = lp.latitude - rLat;
+      const dy = lp.longitude - rLon;
+      const along = dx * cosB + dy * sinB;
+      const across = Math.abs(-dx * sinB + dy * cosB);
+      if (across < tolerance && along > 0 && along <= lineLen) {
+        pts.push({ distRatio: along / lineLen, altitude: lp.altitude, mode_s: lp.mode_s, timestamp: lp.timestamp, radar_type: "loss", isLoss: true, latitude: lp.latitude, longitude: lp.longitude });
       }
     }
     return pts;
-  }, [losTarget, radarSite, allPoints, signalLoss]);
+  }, [losTarget, radarSite, allPoints, signalLossPoints, visibleMinTs, visibleMaxTs]);
 
   // deck.gl 레이어
   const deckLayers = useMemo(() => {
@@ -812,10 +999,11 @@ export default function TrackMap() {
         new LineLayer<TrackPoint>({
           id: "dot-stems",
           data: dotPoints,
-          getSourcePosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, 0],
-          getTargetPosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, d.altitude * altScale],
+          getSourcePosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, 0],
+          getTargetPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
+          updateTriggers: { getSourcePosition: [losMode], getTargetPosition: [losMode, altScale] },
           getColor: (d) => {
-            const c = modeSColorMap.get(d.mode_s) ?? [128, 128, 128];
+            const c = detectionTypeColor(d.radar_type);
             return [...c, 60];
           },
           getWidth: 1,
@@ -824,15 +1012,16 @@ export default function TrackMap() {
           widthUnits: "pixels" as const,
         })
       );
-      // PSR glow 링 (PSR 동반 포인트만)
+      // PSR 흰색 glow 링 (PSR 동반 포인트만)
       const psrDots = dotPoints.filter((d) => PSR_TYPES.has(d.radar_type));
-      if (psrDots.length > 0 && selectedModeS) {
+      if (psrDots.length > 0) {
         layers.push(
           new ScatterplotLayer<TrackPoint>({
             id: "dot-psr-glow",
             data: psrDots,
-            getPosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, d.altitude * altScale],
-            getFillColor: (d) => [...detectionTypeColor(d.radar_type), 30],
+            getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
+            updateTriggers: { getPosition: [losMode, altScale] },
+            getFillColor: [255, 255, 255, 30],
             getRadius: 7,
             radiusMinPixels: 4,
             radiusMaxPixels: 10,
@@ -847,11 +1036,10 @@ export default function TrackMap() {
         new ScatterplotLayer<TrackPoint>({
           id: "dot-points",
           data: dotPoints,
-          getPosition: (d) => losMode ? [d.longitude, d.latitude] : [d.longitude, d.latitude, d.altitude * altScale],
+          getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
+          updateTriggers: { getPosition: [losMode, altScale] },
           getFillColor: (d) => {
-            const c = selectedModeS
-              ? detectionTypeColor(d.radar_type)
-              : (modeSColorMap.get(d.mode_s) ?? [128, 128, 128]);
+            const c = detectionTypeColor(d.radar_type);
             return [...c, 200];
           },
           getRadius: 3,
@@ -869,7 +1057,7 @@ export default function TrackMap() {
                 x: info.x,
                 y: info.y,
                 lines: [
-                  { label: "항적", value: name !== p.mode_s ? `${name} (${p.mode_s})` : p.mode_s, color: (() => { const c = modeSColorMap.get(p.mode_s); return c ? `rgb(${c[0]},${c[1]},${c[2]})` : undefined; })() },
+                  { label: "항적", value: name !== p.mode_s ? `${name} (${p.mode_s})` : p.mode_s, color: (() => { const c = detectionTypeColor(p.radar_type); return `rgb(${c[0]},${c[1]},${c[2]})`; })() },
                   { label: "시각", value: format(new Date(p.timestamp * 1000), "MM-dd HH:mm:ss") },
                   { label: "고도", value: `FL${Math.round(altFt / 100)} (${Math.round(p.altitude)}m)` },
                   { label: "속도", value: `${p.speed.toFixed(0)} kts` },
@@ -885,7 +1073,7 @@ export default function TrackMap() {
         })
       );
     } else {
-      // PSR glow 레이어 (PSR 동반 세그먼트만 넓은 반투명 경로)
+      // PSR 흰색 glow 레이어 (PSR 동반 세그먼트만 넓은 반투명 경로)
       // depthWriteEnabled: false → glow가 depth buffer에 쓰지 않아 실선을 가리지 않음
       const psrPaths = trackPaths.filter((d) => d.hasPsr);
       if (psrPaths.length > 0) {
@@ -894,7 +1082,7 @@ export default function TrackMap() {
             id: "track-psr-glow",
             data: psrPaths,
             getPath: (d) => d.path,
-            getColor: (d) => [...d.color, 30],
+            getColor: [255, 255, 255, 30],
             getWidth: 8,
             widthMinPixels: 4,
             widthMaxPixels: 12,
@@ -923,18 +1111,81 @@ export default function TrackMap() {
           autoHighlight: true,
           highlightColor: [255, 255, 255, 80],
           onHover: (info) => {
+            if (info.object && info.coordinate) {
+              const d = info.object;
+              const [hLon, hLat] = info.coordinate;
+              // 해당 세그먼트의 mode_s로 가장 가까운 실제 TrackPoint 찾기
+              let bestPt: TrackPoint | null = null;
+              let bestDist = Infinity;
+              for (const p of allPoints) {
+                if (p.mode_s !== d.modeS) continue;
+                const dl = p.latitude - hLat;
+                const dn = p.longitude - hLon;
+                const dist2 = dl * dl + dn * dn;
+                if (dist2 < bestDist) {
+                  bestDist = dist2;
+                  bestPt = p;
+                }
+              }
+              if (bestPt) {
+                const p = bestPt;
+                const altFt = Math.round(p.altitude / 0.3048);
+                const name = acName(d.modeS);
+                setHoverInfo({
+                  x: info.x,
+                  y: info.y,
+                  lines: [
+                    { label: "항적", value: name !== d.modeS ? `${name} (${d.modeS})` : d.modeS, color: `rgb(${d.color[0]},${d.color[1]},${d.color[2]})` },
+                    { label: "시각", value: format(new Date(p.timestamp * 1000), "MM-dd HH:mm:ss") },
+                    { label: "고도", value: `FL${Math.round(altFt / 100)} (${Math.round(p.altitude)}m)` },
+                    { label: "속도", value: `${p.speed.toFixed(0)} kts` },
+                    { label: "방위", value: `${p.heading.toFixed(0)}°` },
+                    { label: "레이더", value: radarTypeLabel(p.radar_type) },
+                    { label: "좌표", value: `${p.latitude.toFixed(4)}°N ${p.longitude.toFixed(4)}°E` },
+                  ],
+                });
+              }
+            } else {
+              setHoverInfo(null);
+            }
+          },
+        })
+      );
+    }
+
+    // 1포인트 항적 (ScatterplotLayer)
+    if (singlePoints.length > 0) {
+      layers.push(
+        new ScatterplotLayer({
+          id: "track-single-points",
+          data: singlePoints,
+          getPosition: (d: any) => d.position,
+          getFillColor: (d: any) => [d.color[0], d.color[1], d.color[2], 220] as [number, number, number, number],
+          getLineColor: [255, 255, 255, 160],
+          getRadius: 5,
+          radiusMinPixels: 3,
+          radiusMaxPixels: 10,
+          radiusUnits: "pixels",
+          stroked: true,
+          lineWidthMinPixels: 1,
+          billboard: true,
+          pickable: true,
+          onHover: (info: any) => {
             if (info.object) {
               const d = info.object;
-              const altFt = Math.round(d.avgAlt / 0.3048);
+              const p = d.point;
+              const altFt = Math.round(p.altitude / 0.3048);
               const name = acName(d.modeS);
               setHoverInfo({
                 x: info.x,
                 y: info.y,
                 lines: [
                   { label: "항적", value: name !== d.modeS ? `${name} (${d.modeS})` : d.modeS, color: `rgb(${d.color[0]},${d.color[1]},${d.color[2]})` },
-                  { label: "포인트", value: `${d.pointCount.toLocaleString()}개` },
-                  { label: "평균고도", value: `FL${Math.round(altFt / 100)} (${Math.round(d.avgAlt)}m)` },
-                  { label: "레이더", value: radarTypeLabel(d.radarType) },
+                  { label: "시각", value: format(new Date(p.timestamp * 1000), "MM-dd HH:mm:ss") },
+                  { label: "고도", value: `FL${Math.round(altFt / 100)} (${Math.round(p.altitude)}m)` },
+                  { label: "속도", value: `${p.speed.toFixed(0)} kts` },
+                  { label: "레이더", value: radarTypeLabel(p.radar_type) },
+                  { label: "포인트", value: "1개 (단독)" },
                 ],
               });
             } else {
@@ -979,49 +1230,45 @@ export default function TrackMap() {
       );
     }
 
-    // Signal Loss 구간: ADS-B 기반 5초 간격 dot 표시
-    if (signalLoss.length > 0) {
-      // ADS-B 5초 간격 핀 (주 표시 방식)
-      if (lossAdsbPins.length > 0) {
-        layers.push(
-          new ScatterplotLayer<LossAdsbPin>({
-            id: "loss-adsb-pins",
-            data: lossAdsbPins,
-            getPosition: (d) => losMode ? [d.position[0], d.position[1]] : d.position,
-            getFillColor: [233, 69, 96, 230],
-            getLineColor: [255, 255, 255, 200],
-            getRadius: 4,
-            radiusMinPixels: 3,
-            radiusMaxPixels: 10,
-            radiusUnits: "pixels",
-            lineWidthMinPixels: 1,
-            stroked: true,
-            billboard: true,
-            pickable: true,
-            onHover: (info) => {
-              if (info.object) {
-                const d = info.object;
-                const name = acName(d.modeS);
-                setHoverInfo({
-                  x: info.x,
-                  y: info.y,
-                  lines: [
-                    { label: "표적소실", value: name !== d.modeS ? `${name} (${d.modeS})` : d.modeS, color: "#a60739" },
-                    { label: "시각", value: format(new Date(d.time * 1000), "HH:mm:ss") },
-                    { label: "소실 후", value: `+${d.secondsIntoLoss.toFixed(0)}초 / ${d.lossDuration.toFixed(0)}초` },
-                    { label: "고도", value: `${Math.round(d.altitude)}m (FL${Math.round(d.altitude / 0.3048 / 100)})` },
-                    { label: "방위", value: `${d.heading.toFixed(0)}°` },
-                    { label: "좌표", value: `${d.position[1].toFixed(4)}°N ${d.position[0].toFixed(4)}°E` },
-                  ],
-                });
-              } else {
-                setHoverInfo(null);
-              }
-            },
-          })
-        );
-      }
-
+    // Signal Loss 포인트 (개별 미탐지 스캔 — 항적 dot과 동일 스타일)
+    if (signalLossPoints.length > 0) {
+      layers.push(
+        new ScatterplotLayer<LossPoint>({
+          id: "loss-points",
+          data: signalLossPoints,
+          getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
+          updateTriggers: { getPosition: [losMode, altScale] },
+          getFillColor: [233, 69, 96, 200],
+          getRadius: 3,
+          radiusMinPixels: 1.5,
+          radiusMaxPixels: 5,
+          radiusUnits: "pixels",
+          billboard: true,
+          pickable: true,
+          onHover: (info) => {
+            if (info.object) {
+              const d = info.object;
+              const name = acName(d.mode_s);
+              const altFt = Math.round(d.altitude / 0.3048);
+              setHoverInfo({
+                x: info.x,
+                y: info.y,
+                lines: [
+                  { label: "표적소실", value: name !== d.mode_s ? `${name} (${d.mode_s})` : d.mode_s, color: "#e94560" },
+                  { label: "예상시각", value: format(new Date(d.timestamp * 1000), "HH:mm:ss") },
+                  { label: "미탐지", value: `${d.scan_index}/${d.total_missed_scans} 스캔` },
+                  { label: "gap", value: `${d.gap_duration_secs.toFixed(1)}초` },
+                  { label: "고도", value: `FL${Math.round(altFt / 100)} (${Math.round(d.altitude)}m)` },
+                  { label: "레이더거리", value: `${d.radar_distance_km.toFixed(1)}km` },
+                  { label: "좌표", value: `${d.latitude.toFixed(4)}°N ${d.longitude.toFixed(4)}°E` },
+                ],
+              });
+            } else {
+              setHoverInfo(null);
+            }
+          },
+        })
+      );
     }
 
     // 레이더 아이콘
@@ -1113,7 +1360,7 @@ export default function TrackMap() {
             id: "los-track-highlight",
             data: [{ position: [tp.longitude, tp.latitude] }],
             getPosition: (d: any) => d.position,
-            getFillColor: tp.isLoss ? [239, 68, 68, 255] : [59, 130, 246, 255],
+            getFillColor: tp.isLoss ? [239, 68, 68, 255] : [...detectionTypeColor(tp.radar_type), 255],
             getLineColor: [255, 255, 255, 255],
             getRadius: 8,
             radiusMinPixels: 7,
@@ -1128,8 +1375,155 @@ export default function TrackMap() {
 
     }
 
+    // 커버리지 맵 (범위 내 다중 고도 폴리곤 겹침)
+    if (coveragePolygonsList && coveragePolygonsList.length > 0) {
+      const n = coveragePolygonsList.length;
+      const baseAlpha = Math.max(12, Math.min(40, Math.round(120 / n))); // 레이어 수에 따라 투명도 조절
+
+      coveragePolygonsList.forEach((cp, idx) => {
+        const { polygon, outerRing, coneRing, fillColor, altFt } = cp;
+        // 반투명 채우기
+        layers.push(
+          new PolygonLayer({
+            id: `coverage-fill-${altFt}`,
+            data: [{ polygon }],
+            getPolygon: (d: any) => d.polygon,
+            getFillColor: [...fillColor, baseAlpha],
+            getLineColor: [0, 0, 0, 0],
+            filled: true,
+            stroked: false,
+            extruded: false,
+            _full3d: true,
+            parameters: { depthWriteEnabled: false },
+          })
+        );
+        // 최하/최상 레이어만 외부 경계선 표시
+        if (idx === 0 || idx === n - 1) {
+          layers.push(
+            new PathLayer({
+              id: `coverage-outline-${altFt}`,
+              data: [{ path: outerRing }],
+              getPath: (d: any) => d.path,
+              getColor: [...fillColor, idx === 0 ? 255 : 180],
+              getWidth: idx === 0 ? 2.5 : 1.5,
+              widthMinPixels: idx === 0 ? 2 : 1,
+              widthMaxPixels: idx === 0 ? 4 : 3,
+              widthUnits: "pixels" as const,
+            })
+          );
+        }
+        // 최하 레이어 Cone of Silence 경계선
+        if (idx === 0 && coneRing) {
+          layers.push(
+            new PathLayer({
+              id: `cone-outline-${altFt}`,
+              data: [{ path: coneRing }],
+              getPath: (d: any) => d.path,
+              getColor: [...fillColor, 100],
+              getWidth: 1,
+              widthMinPixels: 1,
+              widthMaxPixels: 2,
+              widthUnits: "pixels" as const,
+            })
+          );
+        }
+      });
+    }
+
+    // 구름 오버레이
+    if (cloudPolygons && cloudPolygons.length > 0) {
+      layers.push(
+        new SolidPolygonLayer({
+          id: "cloud-overlay",
+          data: cloudPolygons,
+          getPolygon: (d: any) => d.polygon,
+          getFillColor: (d: any) => {
+            const cover = d.cover as number;
+            const alpha = Math.min(120, Math.round(cover * 1.2));
+            return [220, 225, 235, alpha];
+          },
+          extruded: false,
+          parameters: { depthWriteEnabled: false },
+        })
+      );
+    }
+
+    // Garble 유령표적 시각화 (고도 반영 + 시간 필터링)
+    if (showGarble && filteredGarblePoints.length > 0) {
+      // Ghost → Real 연결선 (고도 반영)
+      layers.push(
+        new LineLayer<GarblePoint>({
+          id: "garble-connections",
+          data: filteredGarblePoints,
+          getSourcePosition: (d) => losMode
+            ? [d.ghost_lon, d.ghost_lat]
+            : [d.ghost_lon, d.ghost_lat, d.ghost_altitude * altScale],
+          getTargetPosition: (d) => losMode
+            ? [d.real_lon, d.real_lat]
+            : [d.real_lon, d.real_lat, d.real_altitude * altScale],
+          getColor: (d) => d.garble_type === "sidelobe"
+            ? [234, 179, 8, 80]   // 노랑 (사이드로브)
+            : [249, 115, 22, 80], // 주황 (다중경로)
+          getWidth: 1,
+          pickable: false,
+        })
+      );
+      // Garble ghost positions (고도 반영, 유형별 색상)
+      layers.push(
+        new ScatterplotLayer<GarblePoint>({
+          id: "garble-ghost-points",
+          data: filteredGarblePoints,
+          getPosition: (d) => losMode
+            ? [d.ghost_lon, d.ghost_lat]
+            : [d.ghost_lon, d.ghost_lat, d.ghost_altitude * altScale],
+          getRadius: 4,
+          radiusMinPixels: 3,
+          radiusMaxPixels: 8,
+          radiusUnits: "pixels",
+          getFillColor: (d) => d.garble_type === "sidelobe"
+            ? [234, 179, 8, 160]   // 노랑
+            : [249, 115, 22, 160], // 주황
+          getLineColor: (d) => d.garble_type === "sidelobe"
+            ? [234, 179, 8, 255]
+            : [249, 115, 22, 255],
+          stroked: true,
+          lineWidthMinPixels: 1,
+          billboard: true,
+          pickable: true,
+          onHover: (info) => {
+            if (info.object) {
+              const d = info.object;
+              const typeLabel = d.garble_type === "sidelobe" ? "Garble (사이드로브)" : "Garble (다중경로)";
+              const altDiff = Math.abs(d.ghost_altitude - d.real_altitude);
+              const ghostAltFt = Math.round(d.ghost_altitude / 0.3048);
+              const realAltFt = Math.round(d.real_altitude / 0.3048);
+              setHoverInfo({
+                x: info.x,
+                y: info.y,
+                lines: [
+                  { label: "유형", value: typeLabel, color: d.garble_type === "sidelobe" ? "#eab308" : "#f97316" },
+                  { label: "Mode-S", value: d.mode_s },
+                  { label: "Track #", value: String(d.track_number) },
+                  { label: "유령 고도", value: `FL${Math.round(ghostAltFt / 100)} (${Math.round(d.ghost_altitude)}m)` },
+                  { label: "실제 고도", value: `FL${Math.round(realAltFt / 100)} (${Math.round(d.real_altitude)}m)` },
+                  { label: "고도차", value: `${Math.round(altDiff)}m (${Math.round(altDiff / 0.3048)}ft)` },
+                  { label: "방위", value: `${d.theta_deg.toFixed(1)}°` },
+                  { label: "거리", value: `${d.rho_nm.toFixed(1)} NM` },
+                  { label: "방위차", value: `${d.bearing_diff_deg.toFixed(1)}°` },
+                  { label: "거리차", value: `${d.range_diff_nm.toFixed(2)} NM` },
+                  { label: "시각", value: format(new Date(d.timestamp * 1000), "MM-dd HH:mm:ss") },
+                ],
+              });
+            } else {
+              setHoverInfo(null);
+            }
+          },
+        })
+      );
+    }
+
     return layers;
-  }, [trackPaths, signalLoss, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, modeSColorMap, aircraft, adsbTracks, lossAdsbPaths, lossAdsbPins, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showGarble, filteredGarblePoints, cloudPolygons]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -1200,7 +1594,7 @@ export default function TrackMap() {
       const [vs, ve] = zoomViewRef.current;
       const cursorAbs = vs + mouseRatio * (ve - vs);
       const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
-      let newRange = Math.max(0.1, Math.min(100, (ve - vs) * factor));
+      let newRange = Math.max(0.005, Math.min(100, (ve - vs) * factor));
       let ns = cursorAbs - mouseRatio * newRange;
       let ne = ns + newRange;
       if (ns < 0) { ns = 0; ne = Math.min(100, newRange); }
@@ -1235,8 +1629,12 @@ export default function TrackMap() {
   }, [sliderValue, playing]);
 
   // 표시 시간 포맷 (날짜 포함)
-  const fmtTs = useCallback(
-    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "yyyy-MM-dd HH:mm:ss") : "----/--/-- --:--:--"),
+  const fmtDate = useCallback(
+    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "yyyy-MM-dd") : "----/--/--"),
+    []
+  );
+  const fmtTime = useCallback(
+    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "HH:mm:ss") : "--:--:--"),
     []
   );
 
@@ -1253,7 +1651,18 @@ export default function TrackMap() {
     }
     const bands: { modeS: string; color: [number, number, number]; segments: { start: number; end: number }[] }[] = [];
     for (const [modeS, times] of byModeS) {
-      const color = bandColorMap.get(modeS) ?? [128, 128, 128];
+      // 해당 mode_s의 가장 많은 탐지 유형 색상 사용
+      const typeCounts = new Map<string, number>();
+      for (const p of allPoints) {
+        if (p.mode_s !== modeS) continue;
+        typeCounts.set(p.radar_type, (typeCounts.get(p.radar_type) ?? 0) + 1);
+      }
+      let dominantType = "mode_s_rollcall";
+      let maxCount = 0;
+      for (const [rt, cnt] of typeCounts) {
+        if (cnt > maxCount) { maxCount = cnt; dominantType = rt; }
+      }
+      const color = detectionTypeColor(dominantType);
       // 연속 구간 병합 (15초 이내 gap은 연결)
       const sorted = times.sort((a, b) => a - b);
       const segments: { start: number; end: number }[] = [];
@@ -1277,7 +1686,7 @@ export default function TrackMap() {
       bands.push({ modeS, color, segments });
     }
     return bands;
-  }, [allPoints, timeRange, bandColorMap]);
+  }, [allPoints, timeRange]);
 
   return (
     <div className="flex h-full flex-col">
@@ -1303,7 +1712,7 @@ export default function TrackMap() {
             <div ref={speedRef} className="relative">
               <button
                 onClick={() => { setSpeedDropOpen(!speedDropOpen); setTrailDropOpen(false); }}
-                className="rounded-md border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] font-semibold text-gray-600 hover:border-gray-300 transition-colors"
+                className="flex h-7 items-center justify-center rounded-md border border-gray-200 bg-gray-50 px-2 text-[11px] font-semibold leading-none text-gray-600 hover:border-gray-300 transition-colors"
               >
                 {playSpeed}x
               </button>
@@ -1328,7 +1737,7 @@ export default function TrackMap() {
             <div ref={trailRef} className="relative">
               <button
                 onClick={() => { setTrailDropOpen(!trailDropOpen); setSpeedDropOpen(false); }}
-                className="rounded-md border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] font-semibold text-gray-600 hover:border-gray-300 transition-colors"
+                className="flex h-7 items-center justify-center rounded-md border border-gray-200 bg-gray-50 px-2 text-[11px] font-semibold leading-none text-gray-600 hover:border-gray-300 transition-colors"
               >
                 {trailDuration === 0 ? "전체" : "30분"}
               </button>
@@ -1356,7 +1765,7 @@ export default function TrackMap() {
         {/* Center: Compact stats */}
         <div className="flex items-center gap-3 text-[10px] text-gray-400">
           <span>{allPoints.length.toLocaleString()} pts</span>
-          <span className="text-[#a60739]">Loss {signalLoss.length}</span>
+          <span className="text-[#a60739]">Loss {signalLossPoints.length}pt/{signalLoss.length}gap</span>
         </div>
 
         {/* ADS-B 로딩 표시 */}
@@ -1376,7 +1785,7 @@ export default function TrackMap() {
                 : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300"
             }`}
           >
-            <Plane size={13} />
+            <Plane size={13} fill="white" />
             <span className="max-w-[120px] truncate font-medium">
               {!selectedModeS ? "등록 기체" : selectedModeS === "__ALL__" ? "전체 항적" : getAircraftName(selectedModeS)}
             </span>
@@ -1396,7 +1805,7 @@ export default function TrackMap() {
               </div>
               <div className="max-h-56 overflow-y-auto py-1 px-1 pb-2">
                 <button
-                  onClick={() => { setSelectedModeS(null); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                  onClick={() => { setSelectedModeS(null); setSelectedFlightId(null); setSelectedFlight(null); setAircraftDropOpen(false); }}
                   className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${!selectedModeS ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
                 >
                   등록 기체 전체
@@ -1404,7 +1813,7 @@ export default function TrackMap() {
                 {aircraft.filter((a) => a.active && (!modeSSearch || a.name.toLowerCase().includes(modeSSearch.toLowerCase()) || a.mode_s_code.toLowerCase().includes(modeSSearch.toLowerCase()))).map((a) => (
                   <button
                     key={`ac-${a.id}`}
-                    onClick={() => { setSelectedModeS(a.mode_s_code.toUpperCase()); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                    onClick={() => { setSelectedModeS(a.mode_s_code.toUpperCase()); setSelectedFlightId(null); setSelectedFlight(null); setAircraftDropOpen(false); }}
                     className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${selectedModeS === a.mode_s_code.toUpperCase() ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
                   >
                     <div className="flex items-center gap-2">
@@ -1415,7 +1824,7 @@ export default function TrackMap() {
                 ))}
                 <div className="border-t border-gray-200 my-1 mx-2" />
                 <button
-                  onClick={() => { setSelectedModeS("__ALL__"); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                  onClick={() => { setSelectedModeS("__ALL__"); setSelectedFlightId(null); setSelectedFlight(null); setAircraftDropOpen(false); }}
                   className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${selectedModeS === "__ALL__" ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
                 >
                   전체 항적
@@ -1423,7 +1832,7 @@ export default function TrackMap() {
                 {filteredModeS.map((ms) => (
                   <button
                     key={ms}
-                    onClick={() => { setSelectedModeS(ms); setSelectedFlightId(null); setAircraftDropOpen(false); }}
+                    onClick={() => { setSelectedModeS(ms); setSelectedFlightId(null); setSelectedFlight(null); setAircraftDropOpen(false); }}
                     className={`w-full px-3 py-1.5 text-left text-xs rounded transition-colors ${selectedModeS === ms ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
                   >
                     {getAircraftName(ms)}
@@ -1520,8 +1929,137 @@ export default function TrackMap() {
           }`}
           title="Dot 모드"
         >
-          <CircleDot size={16} />
+          <DotPinIcon size={16} />
         </button>
+
+        {/* Garble 시각화 토글 */}
+        <button
+          onClick={() => setShowGarble(!showGarble)}
+          className={`relative rounded-lg p-1.5 transition-colors ${
+            showGarble
+              ? "bg-[#a60739] text-white shadow-sm"
+              : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+          }`}
+          title="Garble 유령표적 표시"
+        >
+          <Zap size={16} />
+          {garblePoints.length > 0 && (
+            <span className="absolute -top-1 -right-1 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-red-500 px-0.5 text-[8px] font-bold text-white leading-none">
+              {garblePoints.length > 999 ? "999+" : garblePoints.length}
+            </span>
+          )}
+        </button>
+
+        {/* 레이더 커버리지 맵 */}
+        <div ref={coverageAltRef} className="relative">
+          {coverageLoading ? (
+            <div className="flex items-center gap-1 rounded-lg bg-red-50 px-2 py-1.5 text-[10px] text-[#a60739]">
+              <Loader2 size={14} className="animate-spin" />
+              <span className="max-w-[140px] truncate">{coverageProgress}</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => {
+                  if (terrainProfile && terrainProfile.radarName === radarSite.name) {
+                    setCoverageVisible(!coverageVisible);
+                  } else {
+                    startCoverageCompute();
+                  }
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  startCoverageCompute(true);
+                }}
+                className={`rounded-lg p-1.5 transition-colors ${
+                  coverageVisible && coverageLayers.length > 0
+                    ? "bg-[#a60739] text-white shadow-sm"
+                    : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+                }`}
+                title={terrainProfile ? "커버리지 맵 (우클릭: 재생성)" : "커버리지 맵 생성"}
+              >
+                <CoverageIcon size={16} />
+              </button>
+              {/* 고도 범위 슬라이더 (100ft 단위, 듀얼 핸들) */}
+              {coverageVisible && coverageLayers.length > 0 && (
+                <div className="flex items-center gap-1">
+                  <span className="min-w-[32px] rounded bg-[#a60739]/80 px-1 py-0.5 text-center text-[8px] font-semibold text-white leading-tight">
+                    {coverageAltMin >= 1000 ? `${(coverageAltMin / 1000).toFixed(coverageAltMin % 1000 === 0 ? 0 : 1)}k` : coverageAltMin}
+                  </span>
+                  <div className="relative h-4 w-24">
+                    {/* 트랙 배경 */}
+                    <div className="absolute top-1/2 left-0 right-0 h-1 -translate-y-1/2 rounded-full bg-gray-300" />
+                    {/* 활성 범위 바 */}
+                    <div
+                      className="absolute top-1/2 h-1 -translate-y-1/2 rounded-full bg-[#a60739]"
+                      style={{
+                        left: `${((coverageAltMin - 100) / 19900) * 100}%`,
+                        right: `${100 - ((coverageAltMax - 100) / 19900) * 100}%`,
+                      }}
+                    />
+                    {/* 최소 핸들 */}
+                    <input
+                      type="range"
+                      min={100}
+                      max={20000}
+                      step={100}
+                      value={coverageAltMin}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setCoverageAltMin(Math.min(v, coverageAltMax - 100));
+                      }}
+                      className="pointer-events-none absolute top-0 left-0 h-full w-full appearance-none bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-sm [&::-webkit-slider-thumb]:cursor-pointer"
+                      title={`하한: ${coverageAltMin.toLocaleString()}ft (${Math.round(coverageAltMin * 0.3048)}m)`}
+                    />
+                    {/* 최대 핸들 */}
+                    <input
+                      type="range"
+                      min={100}
+                      max={20000}
+                      step={100}
+                      value={coverageAltMax}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setCoverageAltMax(Math.max(v, coverageAltMin + 100));
+                      }}
+                      className="pointer-events-none absolute top-0 left-0 h-full w-full appearance-none bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-sm [&::-webkit-slider-thumb]:cursor-pointer"
+                      title={`상한: ${coverageAltMax.toLocaleString()}ft (${Math.round(coverageAltMax * 0.3048)}m)`}
+                    />
+                  </div>
+                  <span className="min-w-[32px] rounded bg-[#a60739]/80 px-1 py-0.5 text-center text-[8px] font-semibold text-white leading-tight">
+                    {coverageAltMax >= 1000 ? `${(coverageAltMax / 1000).toFixed(coverageAltMax % 1000 === 0 ? 0 : 1)}k` : coverageAltMax}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* 구름 오버레이 토글 */}
+        {cloudGridLoading ? (
+          <div className="flex items-center gap-1 rounded-lg bg-blue-50 px-2 py-1.5 text-[10px] text-blue-600">
+            <Loader2 size={14} className="animate-spin" />
+            <span className="max-w-[100px] truncate">{cloudGridProgress || "구름..."}</span>
+          </div>
+        ) : (
+          <button
+            onClick={() => {
+              if (cloudGrid) {
+                setCloudGridVisible(!cloudGridVisible);
+              } else {
+                startCloudFetch();
+              }
+            }}
+            className={`rounded-lg p-1.5 transition-colors ${
+              cloudGridVisible && cloudGrid
+                ? "bg-[#a60739] text-white shadow-sm"
+                : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+            }`}
+            title={cloudGrid ? "구름 오버레이 토글" : "구름/기상 데이터 조회"}
+          >
+            <Cloud size={16} />
+          </button>
+        )}
 
         {/* Terrain toggle */}
         <button
@@ -1596,25 +2134,8 @@ export default function TrackMap() {
           <div className="absolute bottom-3 left-3 z-[1000] rounded-lg border border-gray-200 bg-white/95 px-3 py-2.5 text-[10px] backdrop-blur-sm shadow-lg">
             <div className="mb-1.5 text-[9px] font-semibold text-gray-500 uppercase tracking-wider">범례</div>
             <div className="space-y-1">
-              {/* 항공기별 범례 (비행검사기 전체 모드) */}
-              {!selectedModeS && (() => {
-                const shown = new Map<string, [number,number,number]>();
-                for (const tp of trackPaths) {
-                  if (!shown.has(tp.modeS)) shown.set(tp.modeS, tp.color);
-                }
-                const entries = Array.from(shown.entries()).slice(0, 8);
-                return entries.map(([ms, color]) => {
-                  const name = aircraft.find((a) => a.mode_s_code.toUpperCase() === ms.toUpperCase())?.name;
-                  return (
-                    <div key={ms} className="flex items-center gap-1.5">
-                      <span className="inline-block h-[3px] w-4 rounded-sm" style={{ backgroundColor: `rgb(${color[0]},${color[1]},${color[2]})` }} />
-                      <span className="text-gray-600">{name ? `${name} (${ms})` : ms}</span>
-                    </div>
-                  );
-                });
-              })()}
-              {/* 탐지 유형 범례 (단일 기체 선택 시) */}
-              {selectedModeS && selectedModeS !== "__ALL__" && (() => {
+              {/* 탐지 유형 범례 (항상 표시) */}
+              {(() => {
                 const shown = new Map<string, [number,number,number]>();
                 for (const tp of trackPaths) {
                   if (!shown.has(tp.radarType)) shown.set(tp.radarType, tp.color);
@@ -1625,7 +2146,7 @@ export default function TrackMap() {
                       className="inline-block h-[3px] w-4 rounded-sm"
                       style={{
                         backgroundColor: `rgb(${color[0]},${color[1]},${color[2]})`,
-                        boxShadow: PSR_TYPES.has(rt) ? `0 0 4px 1px rgba(${color[0]},${color[1]},${color[2]},0.6)` : undefined,
+                        boxShadow: PSR_TYPES.has(rt) ? `0 0 4px 1px rgba(255,255,255,0.8)` : undefined,
                       }}
                     />
                     <span className="text-gray-500">{radarTypeLabel(rt)}</span>
@@ -1638,6 +2159,38 @@ export default function TrackMap() {
                   <span className="inline-block h-[3px] w-4 rounded-sm bg-[#a60739]" />
                   <span className="text-gray-600">표적소실 구간</span>
                 </div>
+                {showGarble && filteredGarblePoints.length > 0 && (
+                  <>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "#eab308" }} />
+                      <span className="text-gray-600">Garble (사이드로브)</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "#f97316" }} />
+                      <span className="text-gray-600">Garble (다중경로)</span>
+                    </div>
+                  </>
+                )}
+                {cloudGridVisible && cloudGrid && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="inline-block h-3 w-4 rounded-sm" style={{ backgroundColor: "rgba(220,225,235,0.7)" }} />
+                    <span className="text-gray-600">구름</span>
+                  </div>
+                )}
+                {coverageVisible && coverageLayers.length > 0 && (() => {
+                  const fmtAlt = (ft: number) => ft >= 1000 ? `${(ft / 1000).toFixed(ft % 1000 === 0 ? 0 : 1)}kft` : `${ft}ft`;
+                  const colorMin = altToColor(coverageAltMin);
+                  const colorMax = altToColor(coverageAltMax);
+                  return (
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-flex h-3 w-5 rounded-sm overflow-hidden">
+                        <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMin})`, opacity: 0.7 }} />
+                        <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMax})`, opacity: 0.7 }} />
+                      </span>
+                      <span className="text-gray-600">커버리지 ({fmtAlt(coverageAltMin)}~{fmtAlt(coverageAltMax)})</span>
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           </div>
@@ -1676,7 +2229,6 @@ export default function TrackMap() {
       {allPoints.length > 0 && (() => {
         // Loss 구간 타임라인 마커
         const lossMarkers = allLoss
-          .filter((l) => l.loss_type === "signal_loss")
           .map((l) => {
             const range = timeRange.max - timeRange.min;
             if (range <= 0) return null;
@@ -1689,10 +2241,11 @@ export default function TrackMap() {
         return (
         <div className="border-t border-gray-200 bg-white/95 backdrop-blur-sm shadow-lg">
           <div className="flex items-center gap-3 px-4 py-2 min-h-[44px]">
-            {/* 시작점 시각 */}
-            <span className="min-w-[105px] text-center font-mono text-xs text-gray-400 leading-none">
-              {fmtTs(pctToTs(rangeStart))}
-            </span>
+            {/* 시작점 시각 (2행) */}
+            <div className="min-w-[62px] text-center font-mono leading-tight">
+              <div className="text-[10px] text-gray-300">{fmtDate(pctToTs(rangeStart))}</div>
+              <div className="text-xs text-gray-400">{fmtTime(pctToTs(rangeStart))}</div>
+            </div>
 
             {/* 통합 타임라인 */}
             <div
@@ -1707,7 +2260,7 @@ export default function TrackMap() {
                 const pct = Math.max(0, Math.min(100, zvs + (screenPct / 100) * (zve - zvs)));
                 const rangeStartScreen = absToScreen(rangeStart);
                 // 시작점 핸들 근처(화면 4% 이내)면 시작점 드래그
-                if (Math.abs(screenPct - rangeStartScreen) < 4 && pct < sliderValue - 0.5) {
+                if (Math.abs(screenPct - rangeStartScreen) < 4 && pct <= sliderValue) {
                   setDraggingStart(true);
                   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
                 } else {
@@ -1735,7 +2288,7 @@ export default function TrackMap() {
                 const rect = timelineRef.current.getBoundingClientRect();
                 const sp = ((e.clientX - rect.left) / rect.width) * 100;
                 const [zvs, zve] = zoomViewRef.current;
-                const pct = Math.max(0, Math.min(sliderValue - 0.5, zvs + (sp / 100) * (zve - zvs)));
+                const pct = Math.max(0, Math.min(sliderValue, zvs + (sp / 100) * (zve - zvs)));
                 setRangeStart(pct);
               }}
               onPointerUp={() => setDraggingStart(false)}
@@ -1783,6 +2336,48 @@ export default function TrackMap() {
                     />
                   );
                 })}
+                {/* Garble 마커 (상단 노랑/주황 틱) */}
+                {showGarble && garblePoints.length > 0 && (() => {
+                  const range = timeRange.max - timeRange.min;
+                  if (range <= 0) return null;
+                  // 밀도 기반: 시간 빈으로 집계 (100개 빈)
+                  const BIN_COUNT = 100;
+                  const bins: { sidelobe: number; multipath: number }[] = Array.from(
+                    { length: BIN_COUNT },
+                    () => ({ sidelobe: 0, multipath: 0 }),
+                  );
+                  for (const g of garblePoints) {
+                    const idx = Math.min(BIN_COUNT - 1, Math.floor(((g.timestamp - timeRange.min) / range) * BIN_COUNT));
+                    if (g.garble_type === "sidelobe") bins[idx].sidelobe++;
+                    else bins[idx].multipath++;
+                  }
+                  const maxCount = Math.max(1, ...bins.map((b) => b.sidelobe + b.multipath));
+                  return bins.map((bin, i) => {
+                    const total = bin.sidelobe + bin.multipath;
+                    if (total === 0) return null;
+                    const pctStart = (i / BIN_COUNT) * 100;
+                    const pctEnd = ((i + 1) / BIN_COUNT) * 100;
+                    const l = absToScreen(pctStart);
+                    const r = absToScreen(pctEnd);
+                    if (r < -5 || l > 105) return null;
+                    const alpha = Math.min(0.9, 0.3 + (total / maxCount) * 0.6);
+                    const color = bin.multipath > bin.sidelobe
+                      ? `rgba(249, 115, 22, ${alpha})`
+                      : `rgba(234, 179, 8, ${alpha})`;
+                    return (
+                      <div
+                        key={`garble-${i}`}
+                        className="absolute top-0 rounded-sm"
+                        style={{
+                          left: `${l}%`,
+                          width: `${Math.max(0.3, r - l)}%`,
+                          height: "3px",
+                          backgroundColor: color,
+                        }}
+                      />
+                    );
+                  });
+                })()}
                 {/* 활성 구간 (시작점 ~ 현재위치) — overflow-hidden 안에서 자동 클리핑 */}
                 <div
                   className="absolute top-0 h-full bg-[#a60739]/10 pointer-events-none"
@@ -1791,7 +2386,7 @@ export default function TrackMap() {
               </div>
               {/* 시작점 핸들 — 줌 인 시 뷰 경계에 고정 */}
               <div
-                className="absolute top-0 -translate-x-1/2 cursor-ew-resize z-30"
+                className="absolute top-0 -translate-x-1/2 cursor-ew-resize z-[100]"
                 style={{ left: `${Math.max(0, Math.min(100, absToScreen(rangeStart)))}%` }}
                 onPointerDown={(e) => {
                   e.preventDefault();
@@ -1814,20 +2409,18 @@ export default function TrackMap() {
               </div>
               {/* 재생 위치 인디케이터 + 현재 시각 — 줌 인 시 뷰 경계에 고정 */}
               <div
-                className="absolute top-0 -translate-x-1/2 pointer-events-none z-[5]"
+                className="absolute top-0 -translate-x-1/2 pointer-events-none z-[99]"
                 style={{ left: `${Math.max(0, Math.min(100, absToScreen(sliderValue)))}%` }}
               >
                 <div className="h-6 w-0.5 bg-[#a60739] rounded-full shadow-sm" />
-                <span className="absolute -top-3.5 left-1/2 -translate-x-1/2 whitespace-nowrap font-mono text-[9px] font-semibold text-[#a60739]">
-                  {fmtTs(pctToTs(sliderValue))}
-                </span>
               </div>
             </div>
 
-            {/* 줌 끝 시각 */}
-            <span className="min-w-[105px] text-center font-mono text-xs text-gray-400 leading-none">
-              {fmtTs(pctToTs(zoomVEnd))}
-            </span>
+            {/* 현재 재생 시각 */}
+            <div className="min-w-[62px] text-center font-mono leading-tight">
+              <div className="text-[10px] text-gray-300">{fmtDate(pctToTs(sliderValue))}</div>
+              <div className="text-xs text-gray-400">{fmtTime(pctToTs(sliderValue))}</div>
+            </div>
 
           </div>
         </div>

@@ -14,13 +14,18 @@ import {
   Download,
   Upload,
   AlertTriangle,
+  Mountain,
+  Building2,
+  Trash2,
+  ExternalLink,
+  Loader2,
 } from "lucide-react";
 import maplibregl from "maplibre-gl";
 import { invoke } from "@tauri-apps/api/core";
 import Modal from "../components/common/Modal";
 import DataTable from "../components/common/DataTable";
 import { useAppStore } from "../store";
-import type { Aircraft, RadarSite } from "../types";
+import type { Aircraft, RadarSite, BuildingImportStatus } from "../types";
 
 /** 기본 레이더 사이트 */
 const DEFAULT_RADAR_SITE: RadarSite = {
@@ -728,7 +733,7 @@ function RadarSiteSection() {
 
 // ─── OpenSky 인증정보 섹션 ────────────────────────────────────────────
 
-function OpenSkyCredentialsSection() {
+export function OpenSkyCredentialsSection() {
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [showSecret, setShowSecret] = useState(false);
@@ -836,7 +841,7 @@ function OpenSkyCredentialsSection() {
 
 // ─── DB 내보내기/가져오기 섹션 ────────────────────────────────────────
 
-function DatabaseSection() {
+export function DatabaseSection() {
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [status, setStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
@@ -972,6 +977,318 @@ function DatabaseSection() {
   );
 }
 
+// ─── 고도 데이터 사전 적재 ────────────────────────────────────────────────
+
+export function SrtmDownloadSection() {
+  const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<{ total: number; downloaded: number; skipped?: number; current_tile?: string; status: string } | null>(null);
+  const [result, setResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ total: number; downloaded: number; skipped?: number; current_tile?: string; status: string }>(
+        "srtm-download-progress",
+        (event) => setProgress(event.payload),
+      );
+    })();
+    return () => { unlisten?.(); };
+  }, []);
+
+  const handleDownload = async () => {
+    setLoading(true);
+    setResult(null);
+    setProgress(null);
+    try {
+      const msg = await invoke<string>("download_srtm_korea");
+      setResult({ type: "success", message: msg });
+    } catch (err) {
+      setResult({ type: "error", message: String(err) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const done = progress ? (progress.downloaded + (progress.skipped ?? 0)) : 0;
+  const pct = progress && progress.total > 0
+    ? Math.round((done / progress.total) * 100)
+    : 0;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <Mountain size={16} className="text-emerald-600" />
+        <h2 className="text-lg font-semibold text-gray-800">SRTM 지형 데이터 (30m 해상도)</h2>
+      </div>
+      <p className="text-xs text-gray-500">
+        NASA SRTM 30m 해상도 고도 데이터를 다운로드합니다 (한국 영역, ~250MB).
+        다운로드 후 LOS 단면도와 레이더 커버리지에서 API 호출 없이 오프라인으로 30m 정밀 지형 데이터를 사용합니다.
+      </p>
+
+      <button
+        onClick={handleDownload}
+        disabled={loading}
+        className="flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-emerald-400 hover:text-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        <Download size={14} />
+        {loading ? "다운로드 중..." : "한국 SRTM 데이터 다운로드"}
+      </button>
+
+      {loading && progress && (
+        <div className="space-y-1">
+          <div className="h-2 w-full rounded-full bg-gray-200 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-emerald-500 transition-all duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <p className="text-xs text-gray-500">
+            {progress.current_tile && <span className="font-mono">{progress.current_tile}</span>}
+            {" "}{done} / {progress.total} 타일 ({pct}%)
+            {progress.downloaded > 0 && <span> · {progress.downloaded}개 다운로드</span>}
+            {(progress.skipped ?? 0) > 0 && <span> · {progress.skipped}개 스킵(해양)</span>}
+          </p>
+        </div>
+      )}
+
+      {result && (
+        <div className={`rounded-lg px-4 py-3 text-sm ${
+          result.type === "success"
+            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+            : "bg-red-50 text-red-700 border border-red-200"
+        }`}>
+          {result.message}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── 건물 데이터 (GIS건물통합정보) ────────────────────────────────────
+
+const REGIONS = [
+  { key: "seoul", label: "서울특별시", size: "~129MB" },
+  { key: "gyeonggi", label: "경기도", size: "~367MB" },
+] as const;
+
+export function BuildingDataSection() {
+  const [importStatus, setImportStatus] = useState<BuildingImportStatus[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [importing, setImporting] = useState<string | null>(null);
+  const [progress, setProgress] = useState<{ region: string; processed: number; status: string } | null>(null);
+  const [result, setResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+
+  const loadStatus = async () => {
+    try {
+      const status = await invoke<BuildingImportStatus[]>("get_building_import_status");
+      setImportStatus(status);
+    } catch {
+      // 무시
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadStatus();
+  }, []);
+
+  // 진행률 이벤트 리스너
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ region: string; processed: number; status: string }>(
+        "building-import-progress",
+        (event) => setProgress(event.payload),
+      );
+    })();
+    return () => { unlisten?.(); };
+  }, []);
+
+  const handleImport = async (regionKey: string) => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const src = await open({
+        title: `건물 데이터 가져오기 (${regionKey})`,
+        filters: [{ name: "SHP ZIP 파일", extensions: ["zip"] }],
+        multiple: false,
+        directory: false,
+      });
+      if (!src) return;
+
+      setImporting(regionKey);
+      setResult(null);
+      setProgress(null);
+      const msg = await invoke<string>("import_building_data", {
+        zipPath: src as string,
+        region: regionKey,
+      });
+      setResult({ type: "success", message: msg });
+      await loadStatus();
+    } catch (e) {
+      setResult({ type: "error", message: `임포트 실패: ${e}` });
+    } finally {
+      setImporting(null);
+      setProgress(null);
+    }
+  };
+
+  const handleClear = async (regionKey: string) => {
+    try {
+      await invoke("clear_building_data", { region: regionKey });
+      setDeleteConfirm(null);
+      setResult({ type: "success", message: `${regionKey} 건물 데이터 삭제 완료` });
+      await loadStatus();
+    } catch (e) {
+      setResult({ type: "error", message: `삭제 실패: ${e}` });
+    }
+  };
+
+  const getRegionStatus = (regionKey: string) =>
+    importStatus.find((s) => s.region === regionKey);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Building2 size={16} className="text-slate-600" />
+          <h2 className="text-lg font-semibold text-gray-800">건물 데이터 (GIS건물통합정보)</h2>
+        </div>
+        <a
+          href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?dsId=18"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 transition-colors"
+          onClick={(e) => {
+            e.preventDefault();
+            import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
+              openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?dsId=18")
+            );
+          }}
+        >
+          <ExternalLink size={12} />
+          vworld 다운로드
+        </a>
+      </div>
+      <p className="text-xs text-gray-500">
+        국토교통부 GIS건물통합정보 SHP 데이터를 임포트하여 LOS 분석에 건물 차폐를 반영합니다.
+        vworld에서 서울/경기도 ZIP 파일을 다운로드한 후 아래에서 가져오기 하세요.
+      </p>
+
+      {loading ? (
+        <div className="py-4 text-center text-sm text-gray-500">로딩 중...</div>
+      ) : (
+        <div className="grid grid-cols-2 gap-4">
+          {REGIONS.map(({ key, label, size }) => {
+            const status = getRegionStatus(key);
+            const isImporting = importing === key;
+            return (
+              <div key={key} className="rounded-xl border border-gray-200 bg-gray-100 p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-semibold text-gray-800">{label}</h3>
+                    <span className="text-[10px] text-gray-500">ZIP 크기: {size}</span>
+                  </div>
+                  {status ? (
+                    <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                      {status.record_count.toLocaleString()}건
+                    </span>
+                  ) : (
+                    <span className="rounded-full bg-gray-200 px-2 py-0.5 text-[10px] font-medium text-gray-500">
+                      미임포트
+                    </span>
+                  )}
+                </div>
+
+                {status && (
+                  <div className="text-xs text-gray-500">
+                    <span>임포트: {new Date(status.imported_at * 1000).toLocaleDateString("ko-KR")}</span>
+                    <span className="ml-2">데이터: {status.file_date}</span>
+                  </div>
+                )}
+
+                {isImporting && progress && (
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <Loader2 size={12} className="animate-spin text-slate-600" />
+                      <span className="text-xs text-gray-600">{progress.status}</span>
+                    </div>
+                    <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                      <div className="h-full rounded-full bg-slate-500 animate-pulse" style={{ width: "60%" }} />
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleImport(key)}
+                    disabled={isImporting || importing !== null}
+                    className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-gray-400 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Upload size={12} />
+                    {isImporting ? "임포트 중..." : status ? "재임포트" : "가져오기"}
+                  </button>
+                  {status && (
+                    <button
+                      onClick={() => setDeleteConfirm(key)}
+                      disabled={isImporting || importing !== null}
+                      className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-red-500 hover:bg-red-50 transition-colors disabled:opacity-40"
+                    >
+                      <Trash2 size={12} />
+                      삭제
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {result && (
+        <div className={`rounded-lg px-4 py-3 text-sm ${
+          result.type === "success"
+            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+            : "bg-red-50 text-red-700 border border-red-200"
+        }`}>
+          {result.message}
+        </div>
+      )}
+
+      {/* 삭제 확인 모달 */}
+      <Modal
+        open={deleteConfirm !== null}
+        onClose={() => setDeleteConfirm(null)}
+        title="건물 데이터 삭제"
+        width="max-w-sm"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            {deleteConfirm} 지역의 건물 데이터를 삭제하시겠습니까?
+          </p>
+          <div className="flex justify-end gap-3">
+            <button
+              onClick={() => setDeleteConfirm(null)}
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              취소
+            </button>
+            <button
+              onClick={() => deleteConfirm && handleClear(deleteConfirm)}
+              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+            >
+              삭제
+            </button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
 // ─── 설정 메인 페이지 ──────────────────────────────────────────────────
 
 export default function Settings() {
@@ -995,15 +1312,6 @@ export default function Settings() {
         <RadarSiteSection />
       </div>
 
-      {/* OpenSky API 인증 */}
-      <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
-        <OpenSkyCredentialsSection />
-      </div>
-
-      {/* 데이터베이스 관리 */}
-      <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
-        <DatabaseSection />
-      </div>
     </div>
   );
 }

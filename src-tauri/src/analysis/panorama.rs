@@ -1,0 +1,328 @@
+//! 360° LoS 파노라마 계산
+//!
+//! 레이더 안테나 위치에서 전방위(0°~360°)로 ray를 쏘아
+//! 지형(SRTM) + GIS건물 + 수동건물 중 가장 높은 앙각의 장애물을 찾는다.
+
+use rusqlite::{params, Connection};
+use serde::Serialize;
+
+use crate::srtm::SrtmReader;
+
+/// 4/3 유효지구반경 (m)
+const R_EFF: f64 = 6_371_000.0 * 4.0 / 3.0;
+
+/// 파노라마 포인트 (방위별 최대 앙각 장애물)
+#[derive(Serialize, Clone, Debug)]
+pub struct PanoramaPoint {
+    /// 방위 (°, 정북=0, 시계방향)
+    pub azimuth_deg: f64,
+    /// 앙각 (°, 4/3 유효지구 모델)
+    pub elevation_angle_deg: f64,
+    /// 장애물까지 지표 거리 (km)
+    pub distance_km: f64,
+    /// 장애물 높이 (m, 건물=건물높이, 지형=지형고)
+    pub obstacle_height_m: f64,
+    /// 지면 표고 (m ASL)
+    pub ground_elev_m: f64,
+    /// 장애물 유형: "terrain" | "gis_building" | "manual_building"
+    pub obstacle_type: String,
+    /// 장애물 이름 (산 이름, 건물명 등)
+    pub name: Option<String>,
+    /// 주소 (건물)
+    pub address: Option<String>,
+    /// 용도 (건물)
+    pub usage: Option<String>,
+    /// 장애물 위치 WGS84
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// 건물 후보 (DB 조회 결과)
+struct BuildingCandidate {
+    lat: f64,
+    lon: f64,
+    height_m: f64,
+    ground_elev: f64,  // manual building만 유효, GIS는 0
+    name: Option<String>,
+    address: Option<String>,
+    usage: Option<String>,
+    is_manual: bool,
+}
+
+/// 4/3 유효지구 모델 앙각 계산
+/// d: 지표 거리 (m), h_obs: 장애물 해발고 (m), h_radar: 레이더 안테나 해발고 (m)
+fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
+    if d < 1.0 {
+        return 0.0;
+    }
+    let dh = h_obs - h_radar;
+    let curv_drop = d * d / (2.0 * R_EFF);
+    ((dh - curv_drop) / d).atan().to_degrees()
+}
+
+/// Haversine 거리 (m)
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6_371_000.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    r * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
+}
+
+/// 레이더→방위/거리 지점의 WGS84 좌표 계산
+fn destination_point(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
+    let r = 6_371_000.0;
+    let lat1 = lat.to_radians();
+    let lon1 = lon.to_radians();
+    let brg = bearing_deg.to_radians();
+    let d_r = distance_m / r;
+
+    let lat2 = (lat1.sin() * d_r.cos() + lat1.cos() * d_r.sin() * brg.cos()).asin();
+    let lon2 = lon1 + (brg.sin() * d_r.sin() * lat1.cos())
+        .atan2(d_r.cos() - lat1.sin() * lat2.sin());
+
+    (lat2.to_degrees(), lon2.to_degrees())
+}
+
+/// 레이더에서 대상까지의 방위 (°, 정북=0, 시계방향)
+fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let lat1 = lat1.to_radians();
+    let lat2 = lat2.to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    let brg = y.atan2(x).to_degrees();
+    (brg + 360.0) % 360.0
+}
+
+/// DB에서 건물 후보 조회 (GIS + 수동)
+fn query_building_candidates(
+    conn: &Connection,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: f64,
+) -> Vec<BuildingCandidate> {
+    let mut result = Vec::new();
+
+    // GIS 건물
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT centroid_lat, centroid_lon, height, building_name, address, usage
+         FROM buildings
+         WHERE centroid_lat BETWEEN ?1 AND ?2
+           AND centroid_lon BETWEEN ?3 AND ?4
+           AND height >= ?5"
+    ) {
+        if let Ok(rows) = stmt.query_map(
+            params![min_lat, max_lat, min_lon, max_lon, min_height_m],
+            |row| {
+                Ok(BuildingCandidate {
+                    lat: row.get(0)?,
+                    lon: row.get(1)?,
+                    height_m: row.get(2)?,
+                    ground_elev: 0.0,
+                    name: row.get(3)?,
+                    address: row.get(4)?,
+                    usage: row.get(5)?,
+                    is_manual: false,
+                })
+            },
+        ) {
+            for row in rows.flatten() {
+                result.push(row);
+            }
+        }
+    }
+
+    // 수동 등록 건물
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT latitude, longitude, height, ground_elev, name, memo
+         FROM manual_buildings
+         WHERE latitude BETWEEN ?1 AND ?2
+           AND longitude BETWEEN ?3 AND ?4"
+    ) {
+        if let Ok(rows) = stmt.query_map(
+            params![min_lat, max_lat, min_lon, max_lon],
+            |row| {
+                Ok(BuildingCandidate {
+                    lat: row.get(0)?,
+                    lon: row.get(1)?,
+                    height_m: row.get(2)?,
+                    ground_elev: row.get(3)?,
+                    name: row.get(4)?,
+                    address: None,
+                    usage: row.get::<_, Option<String>>(5)?,
+                    is_manual: true,
+                })
+            },
+        ) {
+            for row in rows.flatten() {
+                result.push(row);
+            }
+        }
+    }
+
+    result
+}
+
+/// 360° LoS 파노라마 계산
+pub fn calculate_panorama(
+    srtm: &mut SrtmReader,
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    max_range_km: f64,
+    azimuth_step_deg: f64,
+    range_step_m: f64,
+) -> Vec<PanoramaPoint> {
+    let max_range_m = max_range_km * 1000.0;
+    let num_azimuths = (360.0 / azimuth_step_deg).round() as usize;
+
+    // 초기화: 각 방위의 최대 앙각 장애물
+    let mut panorama: Vec<PanoramaPoint> = (0..num_azimuths)
+        .map(|i| {
+            let az = i as f64 * azimuth_step_deg;
+            PanoramaPoint {
+                azimuth_deg: az,
+                elevation_angle_deg: -90.0,
+                distance_km: 0.0,
+                obstacle_height_m: 0.0,
+                ground_elev_m: 0.0,
+                obstacle_type: "terrain".to_string(),
+                name: None,
+                address: None,
+                usage: None,
+                lat: radar_lat,
+                lon: radar_lon,
+            }
+        })
+        .collect();
+
+    // Phase 1: 지형 스캔 (SRTM)
+    for (idx, point) in panorama.iter_mut().enumerate() {
+        let az = idx as f64 * azimuth_step_deg;
+        let mut d = range_step_m;
+
+        while d <= max_range_m {
+            let (lat, lon) = destination_point(radar_lat, radar_lon, az, d);
+            let elev = srtm.get_elevation(lat, lon).unwrap_or(0.0);
+
+            let angle = elevation_angle_deg(d, elev, radar_height_m);
+            if angle > point.elevation_angle_deg {
+                point.elevation_angle_deg = angle;
+                point.distance_km = d / 1000.0;
+                point.obstacle_height_m = elev;
+                point.ground_elev_m = elev;
+                point.obstacle_type = "terrain".to_string();
+                point.name = None;
+                point.address = None;
+                point.usage = None;
+                point.lat = lat;
+                point.lon = lon;
+            }
+
+            d += range_step_m;
+        }
+
+        // 앙각이 여전히 초기값이면 0으로
+        if point.elevation_angle_deg < -89.0 {
+            point.elevation_angle_deg = 0.0;
+        }
+    }
+
+    // Phase 2: 건물 조회 + 병합
+    // bbox 계산 (max_range를 degree로 근사)
+    let cos_lat = radar_lat.to_radians().cos().max(0.5);
+
+    // 거리 기반 높이 필터: 가까우면 낮은 건물도, 멀면 높은 건물만
+    // 10km 이내: 10m+, 10-30km: 30m+, 30km+: 60m+
+    let tiers: [(f64, f64, f64); 3] = [
+        (0.0, 10_000.0, 10.0),
+        (10_000.0, 30_000.0, 30.0),
+        (30_000.0, max_range_m, 60.0),
+    ];
+
+    for &(min_d, max_d, min_h) in &tiers {
+        let outer_deg = max_d / 111_000.0;
+        let outer_deg_lon = max_d / (111_000.0 * cos_lat);
+
+        let min_lat = radar_lat - outer_deg;
+        let max_lat = radar_lat + outer_deg;
+        let min_lon = radar_lon - outer_deg_lon;
+        let max_lon = radar_lon + outer_deg_lon;
+
+        let buildings = query_building_candidates(conn, min_lat, max_lat, min_lon, max_lon, min_h);
+
+        for bld in &buildings {
+            let dist_m = haversine_m(radar_lat, radar_lon, bld.lat, bld.lon);
+            if dist_m < min_d || dist_m > max_d {
+                continue;
+            }
+
+            // 건물 지면 표고 (수동 건물은 저장된 값, GIS 건물은 SRTM 조회)
+            let ground = if bld.is_manual {
+                bld.ground_elev
+            } else {
+                srtm.get_elevation(bld.lat, bld.lon).unwrap_or(0.0)
+            };
+
+            let total_h = ground + bld.height_m;
+            let angle = elevation_angle_deg(dist_m, total_h, radar_height_m);
+
+            // 방위 계산 → 가장 가까운 azimuth bin
+            let az = bearing_deg(radar_lat, radar_lon, bld.lat, bld.lon);
+            let bin = ((az / azimuth_step_deg).round() as usize) % num_azimuths;
+
+            if angle > panorama[bin].elevation_angle_deg {
+                let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
+                panorama[bin] = PanoramaPoint {
+                    azimuth_deg: bin as f64 * azimuth_step_deg,
+                    elevation_angle_deg: angle,
+                    distance_km: dist_m / 1000.0,
+                    obstacle_height_m: bld.height_m,
+                    ground_elev_m: ground,
+                    obstacle_type: obs_type.to_string(),
+                    name: bld.name.clone(),
+                    address: bld.address.clone(),
+                    usage: bld.usage.clone(),
+                    lat: bld.lat,
+                    lon: bld.lon,
+                };
+            }
+
+            // 가까운 큰 건물은 인접 bin에도 영향
+            if dist_m < 5000.0 && bld.height_m > 20.0 {
+                // 건물 각폭 추정 (건물 폭 ~30m 가정)
+                let angular_width = (30.0 / dist_m).atan().to_degrees();
+                let spread_bins = (angular_width / azimuth_step_deg).ceil() as usize;
+                for offset in 1..=spread_bins {
+                    for &dir in &[-1i32, 1] {
+                        let adj_bin = ((bin as i32 + dir * offset as i32).rem_euclid(num_azimuths as i32)) as usize;
+                        if angle > panorama[adj_bin].elevation_angle_deg {
+                            let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
+                            panorama[adj_bin] = PanoramaPoint {
+                                azimuth_deg: adj_bin as f64 * azimuth_step_deg,
+                                elevation_angle_deg: angle,
+                                distance_km: dist_m / 1000.0,
+                                obstacle_height_m: bld.height_m,
+                                ground_elev_m: ground,
+                                obstacle_type: obs_type.to_string(),
+                                name: bld.name.clone(),
+                                address: bld.address.clone(),
+                                usage: bld.usage.clone(),
+                                lat: bld.lat,
+                                lon: bld.lon,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    panorama
+}

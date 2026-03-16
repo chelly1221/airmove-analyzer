@@ -1,4 +1,5 @@
 import type { Aircraft, Flight, FlightRecord, RadarSite, TrackPoint } from "../types";
+import { correctAnomalousAltitudes } from "./altitudeCorrection";
 import { detectLoss } from "./lossDetection";
 
 /** 4시간 gap으로 비행 분리 */
@@ -108,13 +109,14 @@ export function consolidateFlights(
   // OpenSky 비행 기록 병합 (같은 날 4시간 이내)
   const mergedHistory = mergeFlightRecords(flightHistory);
 
-  // mode_s별 그룹핑
+  // mode_s별 그룹핑 (대소문자 정규화)
   const byModeS = new Map<string, TrackPoint[]>();
   for (const p of allTrackPoints) {
-    let arr = byModeS.get(p.mode_s);
+    const key = p.mode_s.toUpperCase();
+    let arr = byModeS.get(key);
     if (!arr) {
       arr = [];
-      byModeS.set(p.mode_s, arr);
+      byModeS.set(key, arr);
     }
     arr.push(p);
   }
@@ -197,7 +199,7 @@ function buildFlight(
   modeS: string,
   points: TrackPoint[],
   radarSite: RadarSite,
-  matchType: "opensky" | "gap",
+  matchType: "opensky" | "gap" | "manual",
   aircraftName?: string,
   callsign?: string,
   departure?: string,
@@ -205,17 +207,28 @@ function buildFlight(
 ): Flight {
   points.sort((a, b) => a.timestamp - b.timestamp);
 
-  const { lossSegments, maxRadarRangeKm } = detectLoss(
-    points, radarSite.latitude, radarSite.longitude,
+  // 이상고도 보정 (앞뒤 정상 포인트 기준 선형 보간)
+  const { points: correctedPoints, correctedCount } = correctAnomalousAltitudes(points);
+  if (correctedCount > 0) {
+    console.log(`[고도보정] ${modeS}: ${correctedCount}개 포인트 보정됨`);
+  }
+
+  const { lossPoints, lossSegments, maxRadarRangeKm } = detectLoss(
+    correctedPoints, radarSite.latitude, radarSite.longitude,
   );
 
-  const startTime = points[0].timestamp;
-  const endTime = points[points.length - 1].timestamp;
+  const startTime = correctedPoints[0].timestamp;
+  const endTime = correctedPoints[correctedPoints.length - 1].timestamp;
   const totalTrackTime = endTime - startTime;
 
-  const totalLossTime = lossSegments
-    .filter((s) => s.loss_type === "signal_loss")
-    .reduce((sum, s) => sum + s.duration_secs, 0);
+  // gap별 고유 지속시간 합산 (signal_loss만)
+  const gapDurations = new Map<string, number>();
+  for (const lp of lossPoints) {
+    if (lp.loss_type === "out_of_range") continue;
+    const key = `${lp.mode_s}_${lp.gap_start_time}`;
+    if (!gapDurations.has(key)) gapDurations.set(key, lp.gap_duration_secs);
+  }
+  const totalLossTime = Array.from(gapDurations.values()).reduce((s, d) => s + d, 0);
 
   const lossPercentage = totalTrackTime > 0 ? (totalLossTime / totalTrackTime) * 100 : 0;
 
@@ -228,7 +241,8 @@ function buildFlight(
     arrival_airport: arrival,
     start_time: startTime,
     end_time: endTime,
-    track_points: points,
+    track_points: correctedPoints,
+    loss_points: lossPoints,
     loss_segments: lossSegments,
     total_loss_time: totalLossTime,
     total_track_time: totalTrackTime,
@@ -236,6 +250,35 @@ function buildFlight(
     max_radar_range_km: maxRadarRangeKm,
     match_type: matchType,
   };
+}
+
+/**
+ * 수동 병합: 선택된 Flight들을 하나로 합침.
+ * - track_points 합산 후 시간순 정렬
+ * - loss 재탐지
+ * - callsign/공항 정보는 가장 먼저 존재하는 값 사용
+ */
+export function manualMergeFlights(
+  selectedFlights: Flight[],
+  radarSite: RadarSite,
+): Flight {
+  // 시간순으로 정렬
+  const sorted = [...selectedFlights].sort((a, b) => a.start_time - b.start_time);
+
+  // 모든 track_points 합산
+  const allPoints = sorted.flatMap((f) => f.track_points);
+  const modeS = sorted[0].mode_s;
+
+  // 메타 정보: 첫 번째로 존재하는 값 사용
+  const aircraftName = sorted.find((f) => f.aircraft_name)?.aircraft_name;
+  const callsign = sorted.find((f) => f.callsign)?.callsign;
+  const departure = sorted.find((f) => f.departure_airport)?.departure_airport;
+  const arrival = [...sorted].reverse().find((f) => f.arrival_airport)?.arrival_airport;
+
+  return buildFlight(
+    modeS, allPoints, radarSite, "manual", aircraftName,
+    callsign, departure, arrival,
+  );
 }
 
 /** 정렬된 포인트를 gap 기준으로 분리 */

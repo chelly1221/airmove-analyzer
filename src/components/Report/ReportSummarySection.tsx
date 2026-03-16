@@ -26,7 +26,7 @@ export default function ReportSummarySection({
   commentary,
   onCommentaryChange,
 }: SummarySectionProps) {
-  const totalLoss = flights.reduce((s, f) => s + f.loss_segments.length, 0);
+  const totalLoss = flights.reduce((s, f) => s + f.loss_points.length, 0);
   const avgLossPercent =
     flights.length > 0
       ? flights.reduce((s, f) => s + f.loss_percentage, 0) / flights.length

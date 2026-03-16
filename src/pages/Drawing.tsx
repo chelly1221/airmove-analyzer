@@ -1,8 +1,9 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from "react";
-import { Filter, ChevronDown } from "lucide-react";
+import { Filter, ChevronDown, Plane } from "lucide-react";
 import { format } from "date-fns";
 import MapGL, { Source, Layer, Marker } from "react-map-gl/maplibre";
 import { useAppStore } from "../store";
+import { flightLabel } from "../utils/flightConsolidation";
 import type { TrackPoint } from "../types";
 
 /** 항공기별 색상 팔레트 */
@@ -51,6 +52,7 @@ export default function Drawing() {
   const selectedModeS = useAppStore((s) => s.selectedModeS);
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [selectedFlightId, setSelectedFlightId] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const sideCanvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -141,8 +143,12 @@ export default function Drawing() {
     [timeRange]
   );
 
-  const fmtTs = useCallback(
-    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "yyyy-MM-dd HH:mm:ss") : "----/--/-- --:--:--"),
+  const fmtDate = useCallback(
+    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "yyyy-MM-dd") : "----/--/--"),
+    []
+  );
+  const fmtTime = useCallback(
+    (ts: number) => (ts > 0 ? format(new Date(ts * 1000), "HH:mm:ss") : "--:--:--"),
     []
   );
 
@@ -201,9 +207,35 @@ export default function Drawing() {
     return valid.sort();
   }, [flights, registeredModeSSet]);
 
+  // Mode-S 필터 적용된 비행 목록
+  const filteredFlights = useMemo(() => {
+    const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
+    const showAll = selectedModeS === "__ALL__";
+    return flights.filter((f) => {
+      if (showAll) return true;
+      if (!selectedModeS) return registeredModeS.has(f.mode_s.toUpperCase());
+      return f.mode_s === selectedModeS;
+    });
+  }, [flights, aircraft, selectedModeS]);
+
+  // 비행 선택 시 해당 비행만 필터, 선택 해제 시 전체
+  const flightFilteredPoints = useMemo(() => {
+    if (!selectedFlightId) return displayPoints;
+    const flight = filteredFlights.find((f) => f.id === selectedFlightId);
+    if (!flight) return displayPoints;
+    return flight.track_points;
+  }, [selectedFlightId, filteredFlights, displayPoints]);
+
+  // selectedFlightId가 filteredFlights에 없으면 초기화
+  useEffect(() => {
+    if (selectedFlightId && !filteredFlights.find((f) => f.id === selectedFlightId)) {
+      setSelectedFlightId(null);
+    }
+  }, [filteredFlights, selectedFlightId]);
+
   // ── 측면도 캔버스 (NM / ft) ──
   useEffect(() => {
-    if (displayPoints.length === 0) return;
+    if (flightFilteredPoints.length === 0) return;
 
     const PAD = 50;
     const DOT_R = 2;
@@ -230,7 +262,7 @@ export default function Drawing() {
     let minEW = 0, maxEW = 0;
     let minAlt = Infinity, maxAlt = -Infinity;
     const ewDists: number[] = [];
-    for (const p of displayPoints) {
+    for (const p of flightFilteredPoints) {
       const dEW = (p.longitude - radarLon) * 111.32 * cosLat;
       ewDists.push(dEW);
       if (dEW < minEW) minEW = dEW;
@@ -296,8 +328,8 @@ export default function Drawing() {
     ctx.restore();
 
     // 포인트
-    for (let i = 0; i < displayPoints.length; i++) {
-      const p = displayPoints[i];
+    for (let i = 0; i < flightFilteredPoints.length; i++) {
+      const p = flightFilteredPoints[i];
       const c = colorMap.get(p.mode_s) ?? [128, 128, 128];
       ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.7)`;
       ctx.beginPath();
@@ -316,35 +348,35 @@ export default function Drawing() {
     ctx.fillText(radarSite.name, centerX + 6, yScale(radarSite.altitude + radarSite.antenna_height) - 4);
 
     // (제목 없음 — 탭 타이틀로 충분)
-  }, [displayPoints, colorMap, radarSite]);
+  }, [flightFilteredPoints, colorMap, radarSite]);
 
   // ── 평면도 지도 데이터 ──
   const planViewState = useMemo(() => {
-    if (filteredPoints.length === 0) {
+    if (flightFilteredPoints.length === 0) {
       return { longitude: radarSite.longitude, latitude: radarSite.latitude, zoom: 8 };
     }
     let maxDist = 0;
-    for (const p of filteredPoints) {
+    for (const p of flightFilteredPoints) {
       const d = haversine(radarSite.latitude, radarSite.longitude, p.latitude, p.longitude);
       if (d > maxDist) maxDist = d;
     }
     maxDist = Math.max(maxDist, 1);
     const zoom = Math.max(4, Math.min(13, Math.log2(40000 / (maxDist * 2.5))));
     return { longitude: radarSite.longitude, latitude: radarSite.latitude, zoom };
-  }, [filteredPoints, radarSite]);
+  }, [flightFilteredPoints, radarSite]);
 
   const trackPointsGeoJSON = useMemo((): GeoJSON.FeatureCollection => ({
     type: "FeatureCollection",
-    features: displayPoints.map((p) => ({
+    features: flightFilteredPoints.map((p) => ({
       type: "Feature" as const,
       geometry: { type: "Point" as const, coordinates: [p.longitude, p.latitude] },
       properties: { mode_s: p.mode_s },
     })),
-  }), [displayPoints]);
+  }), [flightFilteredPoints]);
 
   const { rangeRingsGeoJSON, ringLabelsGeoJSON } = useMemo(() => {
     let maxDistKm = 0;
-    for (const p of filteredPoints) {
+    for (const p of flightFilteredPoints) {
       const d = haversine(radarSite.latitude, radarSite.longitude, p.latitude, p.longitude);
       if (d > maxDistKm) maxDistKm = d;
     }
@@ -372,7 +404,7 @@ export default function Drawing() {
       rangeRingsGeoJSON: { type: "FeatureCollection" as const, features: ringFeatures },
       ringLabelsGeoJSON: { type: "FeatureCollection" as const, features: labelFeatures },
     };
-  }, [filteredPoints, radarSite]);
+  }, [flightFilteredPoints, radarSite]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const colorExpression = useMemo((): any => {
@@ -386,8 +418,8 @@ export default function Drawing() {
   }, [colorMap]);
 
   const mapKey = useMemo(
-    () => `${radarSite.latitude}-${radarSite.longitude}-${filteredPoints.length}`,
-    [radarSite, filteredPoints.length]
+    () => `${radarSite.latitude}-${radarSite.longitude}-${flightFilteredPoints.length}-${selectedFlightId ?? "all"}`,
+    [radarSite, flightFilteredPoints.length, selectedFlightId]
   );
 
   // 타임라인 밀도 바 (항적 지도 참고)
@@ -396,6 +428,7 @@ export default function Drawing() {
     const NUM_BUCKETS = 200;
     const buckets = new Array(NUM_BUCKETS).fill(0);
     const span = timeRange.max - timeRange.min;
+    // 밀도 바는 전체 filteredPoints 기준 (구간 선택 참조용)
     for (const p of filteredPoints) {
       const idx = Math.min(NUM_BUCKETS - 1, Math.floor(((p.timestamp - timeRange.min) / span) * NUM_BUCKETS));
       buckets[idx]++;
@@ -489,12 +522,65 @@ export default function Drawing() {
                   <span className="text-gray-600">{e.label}</span>
                 </div>
               ))}
-              <span className="text-gray-500">({displayPoints.length.toLocaleString()} 포인트)</span>
+              <span className="text-gray-500">({flightFilteredPoints.length.toLocaleString()} 포인트)</span>
             </div>
           )}
 
-          {/* 캔버스 + 지도 영역 */}
+          {/* 비행 목록 + 캔버스 + 지도 영역 */}
           <div className="flex flex-1 gap-4 min-h-0">
+            {/* 비행 목록 사이드바 */}
+            <div className="w-52 flex-shrink-0 rounded-xl border border-gray-200 bg-white flex flex-col overflow-hidden">
+              <div className="px-3 py-2 border-b border-gray-100 flex items-center gap-2">
+                <Plane size={14} className="text-gray-400" />
+                <span className="text-xs font-medium text-gray-600">비행 목록</span>
+                <span className="ml-auto text-[10px] text-gray-400">{filteredFlights.length}건</span>
+              </div>
+              <div className="flex-1 overflow-y-auto">
+                {/* 전체 보기 */}
+                <button
+                  onClick={() => setSelectedFlightId(null)}
+                  className={`w-full px-3 py-2 text-left text-xs border-b border-gray-50 transition-colors ${
+                    !selectedFlightId ? "bg-[#a60739]/10 text-[#a60739] font-medium" : "text-gray-500 hover:bg-gray-50"
+                  }`}
+                >
+                  전체 보기
+                </button>
+                {filteredFlights
+                  .sort((a, b) => a.start_time - b.start_time)
+                  .map((f) => {
+                    const label = flightLabel(f, aircraft);
+                    const startDate = format(new Date(f.start_time * 1000), "MM/dd HH:mm");
+                    const duration = f.end_time - f.start_time;
+                    const durationMin = Math.round(duration / 60);
+                    const color = colorMap.get(f.mode_s);
+                    return (
+                      <button
+                        key={f.id}
+                        onClick={() => setSelectedFlightId(f.id === selectedFlightId ? null : f.id)}
+                        className={`w-full px-3 py-2 text-left border-b border-gray-50 transition-colors ${
+                          f.id === selectedFlightId ? "bg-[#a60739]/10" : "hover:bg-gray-50"
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          {color && (
+                            <div
+                              className="h-2 w-2 rounded-full flex-shrink-0"
+                              style={{ backgroundColor: `rgb(${color[0]},${color[1]},${color[2]})` }}
+                            />
+                          )}
+                          <span className={`text-xs truncate ${f.id === selectedFlightId ? "text-[#a60739] font-medium" : "text-gray-700"}`}>
+                            {label}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-gray-400 pl-3.5">
+                          {startDate} · {durationMin}분 · {f.track_points.length.toLocaleString()}pt
+                        </div>
+                      </button>
+                    );
+                  })}
+              </div>
+            </div>
+
             {/* 측면도 */}
             <div className="flex-1 rounded-xl border border-gray-200 bg-gray-100 p-2">
               <canvas ref={sideCanvasRef} className="h-full w-full" />
@@ -556,9 +642,10 @@ export default function Drawing() {
           {/* 구간 선택 슬라이더 (밀도 바 포함) */}
           <div className="rounded-xl border border-gray-200 bg-white">
             <div className="flex items-center gap-3 px-4 py-2">
-              <span className="min-w-[110px] text-center font-mono text-[10px] text-gray-500">
-                {fmtTs(pctToTs(rangeStart))}
-              </span>
+              <div className="min-w-[62px] text-center font-mono leading-tight">
+                <div className="text-[9px] text-gray-300">{fmtDate(pctToTs(rangeStart))}</div>
+                <div className="text-[10px] text-gray-500">{fmtTime(pctToTs(rangeStart))}</div>
+              </div>
 
               <div
                 ref={rangeBarRef}
@@ -616,9 +703,10 @@ export default function Drawing() {
                 </div>
               </div>
 
-              <span className="min-w-[110px] text-center font-mono text-[10px] text-gray-500">
-                {fmtTs(pctToTs(rangeEnd))}
-              </span>
+              <div className="min-w-[62px] text-center font-mono leading-tight">
+                <div className="text-[9px] text-gray-300">{fmtDate(pctToTs(rangeEnd))}</div>
+                <div className="text-[10px] text-gray-500">{fmtTime(pctToTs(rangeEnd))}</div>
+              </div>
             </div>
           </div>
         </>

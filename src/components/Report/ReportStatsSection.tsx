@@ -31,7 +31,7 @@ function getWeekStats(flights: Flight[], weeksAgo: number): WeekStats {
     return isWithinInterval(d, { start: weekStart, end: weekEnd });
   });
 
-  const totalLoss = weekFlights.reduce((s, f) => s + f.loss_segments.length, 0);
+  const totalLoss = weekFlights.reduce((s, f) => s + f.loss_points.length, 0);
   const avgLossPercent = weekFlights.length > 0
     ? weekFlights.reduce((s, f) => s + f.loss_percentage, 0) / weekFlights.length
     : 0;
@@ -138,7 +138,7 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
                   <tr key={i} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
                     <td className="border border-gray-200 px-2 py-1.5">{label}</td>
                     <td className="border border-gray-200 px-2 py-1.5 text-right">{f.track_points.length.toLocaleString()}</td>
-                    <td className="border border-gray-200 px-2 py-1.5 text-right">{f.loss_segments.length}</td>
+                    <td className="border border-gray-200 px-2 py-1.5 text-right">{f.loss_points.length}</td>
                     <td className="border border-gray-200 px-2 py-1.5 text-right">{f.total_loss_time.toFixed(1)}</td>
                     <td className="border border-gray-200 px-2 py-1.5 text-right">{(f.total_track_time / 60).toFixed(1)}</td>
                     <td className="border border-gray-200 px-2 py-1.5 text-right font-medium">

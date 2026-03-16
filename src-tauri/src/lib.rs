@@ -1,23 +1,33 @@
 pub mod analysis;
+pub mod building;
+pub mod coord;
 pub mod db;
 pub mod models;
 pub mod parser;
+pub mod srtm;
 
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use log::info;
-use rayon::prelude::*;
+
 use tauri::{Emitter, Manager};
 
-use models::{AdsbTrack, Aircraft, AnalysisResult, FlightRecord, ParsedFile, TrackPoint};
+use models::{AdsbTrack, Aircraft, AnalysisResult, FlightRecord, GarblePoint, ParsedFile, TrackPoint};
 
 /// TrackPoint 청크 스트리밍 이벤트 페이로드
 #[derive(Clone, serde::Serialize)]
 struct TrackPointsChunk {
     file_path: String,
     points: Vec<TrackPoint>,
+}
+
+/// GarblePoint 청크 스트리밍 이벤트 페이로드
+#[derive(Clone, serde::Serialize)]
+struct GarblePointsChunk {
+    file_path: String,
+    points: Vec<GarblePoint>,
 }
 
 /// TrackPoints를 청크 단위로 이벤트 emit한 뒤, 원본에서 제거
@@ -39,6 +49,23 @@ fn emit_and_drain_track_points(
     points.shrink_to_fit();
 }
 
+/// GarblePoints를 이벤트 emit한 뒤, 원본에서 제거
+fn emit_and_drain_garble_points(
+    handle: &tauri::AppHandle,
+    file_path: &str,
+    points: &mut Vec<GarblePoint>,
+) {
+    if points.is_empty() {
+        return;
+    }
+    let _ = handle.emit("garble-points-chunk", GarblePointsChunk {
+        file_path: file_path.to_string(),
+        points: points.clone(),
+    });
+    points.clear();
+    points.shrink_to_fit();
+}
+
 /// OAuth2 토큰 캐시
 struct OAuthToken {
     access_token: String,
@@ -50,6 +77,7 @@ struct AppState {
     aircraft_path: Mutex<PathBuf>,
     db: Mutex<db::Db>,
     oauth_token: Mutex<Option<OAuthToken>>,
+    srtm: Mutex<srtm::SrtmReader>,
 }
 
 /// OAuth2 토큰 응답
@@ -310,8 +338,7 @@ struct BatchDoneEvent {
 }
 
 /// 여러 ASS 파일을 병렬로 파싱+분석.
-/// 1단계: rayon으로 모든 파일을 병렬 파싱 (CPU-bound, emit 없음)
-/// 2단계: 완료된 결과를 순차적으로 청크 스트리밍 (IPC 락 경합 없음)
+/// rayon 병렬 파싱 + 채널 기반 즉시 스트리밍 (파일 완료 즉시 메모리 해제)
 #[tauri::command]
 async fn parse_and_analyze_batch(
     app_handle: tauri::AppHandle,
@@ -332,52 +359,72 @@ async fn parse_and_analyze_batch(
     let total = file_paths.len();
 
     tauri::async_runtime::spawn_blocking(move || {
-        // 1단계: 병렬 파싱 (emit 없음 → 락 경합 없음, 순수 CPU 활용)
-        let filter = &mode_s_filter;
-        let mut results: Vec<(String, Result<AnalysisResult, String>)> = file_paths
-            .par_iter()
-            .map(|path| {
-                let r = parser::ass::parse_ass_file(path, radar_lat, radar_lon, filter, |_| {})
-                    .map_err(|e| e.to_string())
-                    .map(|parsed| {
-                        analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)
-                    });
-                (path.clone(), r)
-            })
-            .collect();
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Result<AnalysisResult, String>)>();
 
-        // 2단계: 순차적으로 결과 스트리밍 (IPC 병목 최소화)
+        // 병렬 파싱 스레드: 완료 즉시 채널로 전송 (메모리 일괄 보유 방지)
+        let filter = mode_s_filter;
+        let filter_ref = &filter;
+        rayon::scope(|s| {
+            let tx = &tx;
+            for path in &file_paths {
+                let path = path.clone();
+                s.spawn(move |_| {
+                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, filter_ref, |_| {})
+                        .map_err(|e| e.to_string())
+                        .map(|parsed| {
+                            analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)
+                        });
+                    let _ = tx.send((path, r));
+                });
+            }
+        });
+        // rayon scope 완료 후 sender drop → rx 종료
+        drop(tx);
+
+        // 수신 스레드: 결과 도착 즉시 DB 저장 + 스트리밍 + 메모리 해제
         let mut succeeded = 0usize;
         let mut failed = 0usize;
 
-        for (path, result) in results.iter_mut() {
+        for (path, result) in rx {
             let event = match result {
-                Ok(ref mut analysis) => {
+                Ok(mut analysis) => {
                     succeeded += 1;
                     // DB에 자동 저장 (메모리 해제 전)
                     let state = handle.state::<AppState>();
                     if let Ok(conn) = state.db.lock() {
-                        let name = path.split(['/', '\\']).last().unwrap_or(path).to_string();
-                        if let Err(e) = db::save_parsed_file_data(&conn, path, &name, analysis) {
+                        let name = path.split(['/', '\\']).last().unwrap_or(&path).to_string();
+                        if let Err(e) = db::save_parsed_file_data(&conn, &path, &name, &analysis) {
                             log::warn!("Failed to save parsed data to DB: {}", e);
+                            analysis.file_info.parse_errors.push(
+                                format!("DB 저장 실패: {}", e)
+                            );
                         }
+                    } else {
+                        analysis.file_info.parse_errors.push(
+                            "DB 잠금 획득 실패: 파싱 데이터가 저장되지 않았습니다".to_string()
+                        );
                     }
+                    // BatchResultEvent에 포함할 결과를 drain 전에 clone
+                    let result_for_event = analysis.clone();
                     // track_points를 청크로 스트리밍 후 메모리 해제
-                    emit_and_drain_track_points(&handle, path, &mut analysis.file_info.track_points);
+                    emit_and_drain_track_points(&handle, &path, &mut analysis.file_info.track_points);
+                    // garble_points 스트리밍 후 메모리 해제
+                    emit_and_drain_garble_points(&handle, &path, &mut analysis.file_info.garble_points);
+                    // analysis는 여기서 drop → 메모리 즉시 해제
                     BatchResultEvent {
-                        file_path: path.clone(),
+                        file_path: path,
                         success: true,
-                        result: Some(analysis.clone()),
+                        result: Some(result_for_event),
                         error: None,
                     }
                 }
-                Err(ref e) => {
+                Err(e) => {
                     failed += 1;
                     BatchResultEvent {
-                        file_path: path.clone(),
+                        file_path: path,
                         success: false,
                         result: None,
-                        error: Some(e.clone()),
+                        error: Some(e),
                     }
                 }
             };
@@ -525,10 +572,15 @@ async fn fetch_adsb_tracks(
                     break;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 && retries < 3 => {
-                    // 429 Too Many Requests → 백오프 후 재시도
+                    // X-Rate-Limit-Retry-After-Seconds 헤더 활용
+                    let retry_after = resp.headers()
+                        .get("X-Rate-Limit-Retry-After-Seconds")
+                        .or_else(|| resp.headers().get("x-rate-limit-retry-after-seconds"))
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
                     retries += 1;
-                    let wait = 10 * retries as u64;
-                    info!("Rate limited, retry {}/3 after {}s", retries, wait);
+                    let wait = retry_after.unwrap_or(10 * retries as u64);
+                    info!("Rate limited, retry {}/3 after {}s (header: {:?})", retries, wait, retry_after);
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     continue;
                 }
@@ -651,6 +703,15 @@ async fn fetch_flight_history(
             }
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
+                    // 남은 크레딧 로깅
+                    let remaining_credits = resp.headers()
+                        .get("X-Rate-Limit-Remaining")
+                        .or_else(|| resp.headers().get("x-rate-limit-remaining"))
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<i64>().ok());
+                    if let Some(rem) = remaining_credits {
+                        info!("OpenSky credits remaining: {}", rem);
+                    }
                     if let Ok(flights) = resp.json::<Vec<OpenSkyFlight>>().await {
                         let state = app_handle.state::<AppState>();
                         let conn =
@@ -696,17 +757,47 @@ async fn fetch_flight_history(
                     log::warn!("Flight history 403 Forbidden for {}: {}", icao24, body);
                     return Err(format!("OpenSky 접근 거부: {}. 인증정보를 확인하세요.", body.trim()));
                 }
-                Ok(resp) if resp.status().as_u16() == 429 && retries < 3 => {
-                    retries += 1;
-                    let wait = 10 * retries as u64;
-                    info!("Flight history rate limited, retry {}/3 after {}s", retries, wait);
-                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                    continue;
-                }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    // 일일 한도 초과 — 이 항공기 중단
-                    info!("Daily rate limit reached for {}, stopping", icao24);
+                    // X-Rate-Limit-Retry-After-Seconds 헤더에서 대기 시간 읽기
+                    let retry_after_secs = resp.headers()
+                        .get("X-Rate-Limit-Retry-After-Seconds")
+                        .or_else(|| resp.headers().get("x-rate-limit-retry-after-seconds"))
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+
+                    let remaining = resp.headers()
+                        .get("X-Rate-Limit-Remaining")
+                        .or_else(|| resp.headers().get("x-rate-limit-remaining"))
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<i64>().ok());
+
+                    info!("Flight history 429 for {}: retry_after={}s, remaining={:?}",
+                        icao24,
+                        retry_after_secs.unwrap_or(0),
+                        remaining,
+                    );
+
+                    if retries < 3 {
+                        retries += 1;
+                        let wait = retry_after_secs.unwrap_or(10 * retries as u64);
+                        info!("Flight history rate limited, retry {}/3 after {}s", retries, wait);
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+
+                    // 일일 한도 초과 — 이 항공기 중단, retry_after 정보 포함
+                    info!("Daily rate limit reached for {}, stopping (retry_after={}s)",
+                        icao24, retry_after_secs.unwrap_or(0));
                     rate_limited = true;
+                    // rate_limit_retry_after를 에러 메시지에 포함하여 프론트엔드가 활용
+                    if let Some(secs) = retry_after_secs {
+                        let _ = app_handle.emit("flight-history-progress", serde_json::json!({
+                            "current": window_idx,
+                            "total": total_windows,
+                            "icao24": &icao24,
+                            "retry_after_secs": secs,
+                        }));
+                    }
                     break;
                 }
                 Ok(resp) => {
@@ -746,7 +837,7 @@ async fn fetch_flight_history(
 
     // Rate limit 시 에러 반환 (프론트엔드가 재시도 스케줄링)
     if rate_limited {
-        return Err("rate limit reached".to_string());
+        return Err("rate_limit_reached".to_string());
     }
 
     // DB에서 전체 결과 로드
@@ -829,6 +920,17 @@ fn load_saved_data(
     db::load_all_parsed_data(&conn).map_err(|e| format!("DB load error: {}", e))
 }
 
+/// DB에서 garble points 로드 (mode_s 필터 옵션)
+#[tauri::command]
+fn load_garble_points(
+    mode_s: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<GarblePoint>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_garble_points(&conn, mode_s.as_deref())
+        .map_err(|e| format!("Failed to load garble points: {}", e))
+}
+
 /// 저장된 파싱 데이터 전체 삭제
 #[tauri::command]
 fn clear_saved_data(
@@ -836,6 +938,75 @@ fn clear_saved_data(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     db::clear_all_parsed_data(&conn).map_err(|e| format!("DB clear error: {}", e))
+}
+
+// ========== 기상 데이터 캐시 ==========
+
+/// 일 단위 기상 데이터 저장
+#[tauri::command]
+fn save_weather_day(
+    date: String,
+    radar_lat: f64,
+    radar_lon: f64,
+    hourly_json: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_weather_day(&conn, &date, radar_lat, radar_lon, &hourly_json)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+/// 일 단위 구름 그리드 저장
+#[tauri::command]
+fn save_cloud_grid_day(
+    date: String,
+    radar_lat: f64,
+    radar_lon: f64,
+    grid_spacing_km: f64,
+    frames_json: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_cloud_grid_day(&conn, &date, radar_lat, radar_lon, grid_spacing_km, &frames_json)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+/// 캐시된 기상/구름 날짜 목록 조회
+#[tauri::command]
+fn get_weather_cached_dates(
+    radar_lat: f64,
+    radar_lon: f64,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::get_weather_cached_dates(&conn, radar_lat, radar_lon)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+/// 캐시된 기상 데이터 로드 (날짜 목록)
+#[tauri::command]
+fn load_weather_cache(
+    radar_lat: f64,
+    radar_lon: f64,
+    dates: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<(String, String)>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_weather_cache(&conn, radar_lat, radar_lon, &dates)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+/// 캐시된 구름 그리드 로드 (날짜 목록)
+#[tauri::command]
+fn load_cloud_grid_cache(
+    radar_lat: f64,
+    radar_lon: f64,
+    dates: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<(String, String, f64)>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_cloud_grid_cache(&conn, radar_lat, radar_lon, &dates)
+        .map_err(|e| format!("DB error: {}", e))
 }
 
 /// DB 파일 경로 반환 (내보내기/가져오기 용)
@@ -900,6 +1071,298 @@ fn import_database(
     Ok(())
 }
 
+/// 360° LoS 파노라마 계산 (지형 + GIS건물 + 수동건물)
+#[tauri::command]
+fn calculate_los_panorama(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    max_range_km: Option<f64>,
+    azimuth_step_deg: Option<f64>,
+    range_step_m: Option<f64>,
+) -> Result<Vec<analysis::panorama::PanoramaPoint>, String> {
+    let max_range = max_range_km.unwrap_or(100.0);
+    let az_step = azimuth_step_deg.unwrap_or(0.5);
+    let r_step = range_step_m.unwrap_or(200.0);
+
+    // DB 먼저 잠금 해제하고 건물 조회, 그 다음 SRTM
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+
+    Ok(analysis::panorama::calculate_panorama(
+        &mut srtm, &conn,
+        radar_lat, radar_lon, radar_height_m,
+        max_range, az_step, r_step,
+    ))
+}
+
+/// SRTM HGT 기반 고도 조회 (30m 해상도, 로컬 파일)
+#[tauri::command]
+fn fetch_elevation(
+    app_handle: tauri::AppHandle,
+    latitudes: Vec<f64>,
+    longitudes: Vec<f64>,
+) -> Result<Vec<f64>, String> {
+    if latitudes.len() != longitudes.len() {
+        return Err("latitudes/longitudes 길이가 다릅니다".to_string());
+    }
+    if latitudes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let state = app_handle.state::<AppState>();
+    let mut reader = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+    Ok(reader.get_elevations(&latitudes, &longitudes))
+}
+
+/// 한국 SRTM 타일 다운로드 (AWS Terrain Tiles, 인증 불필요)
+/// lat 33~38, lon 124~131 → 최대 42타일 (~250MB)
+#[tauri::command]
+async fn download_srtm_korea(
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let srtm_dir = {
+        let state = app_handle.state::<AppState>();
+        let reader = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        reader.data_dir().to_path_buf()
+    };
+
+    // 한국 영역 타일 목록
+    let mut tiles: Vec<(i32, i32, String)> = Vec::new();
+    for lat in 33..=38 {
+        for lon in 124..=131 {
+            let name = srtm::SrtmReader::tile_name(lat, lon);
+            let path = srtm_dir.join(format!("{}.hgt", name));
+            if !path.exists() {
+                tiles.push((lat, lon, name));
+            }
+        }
+    }
+
+    if tiles.is_empty() {
+        return Ok("모든 SRTM 타일이 이미 다운로드되어 있습니다.".to_string());
+    }
+
+    let total = tiles.len();
+    info!("SRTM download: {} tiles to fetch", total);
+
+    let _ = app_handle.emit("srtm-download-progress", serde_json::json!({
+        "total": total,
+        "downloaded": 0,
+        "status": "started",
+    }));
+
+    let client = reqwest::Client::builder()
+        .user_agent("AirMoveAnalyzer/0.1")
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+
+    for (lat, _lon, name) in &tiles {
+        let ns = if *lat >= 0 { "N" } else { "S" };
+        let url = format!(
+            "https://s3.amazonaws.com/elevation-tiles-prod/skadi/{}{:02}/{}.hgt.gz",
+            ns, lat.abs(), name
+        );
+
+        let _ = app_handle.emit("srtm-download-progress", serde_json::json!({
+            "total": total,
+            "downloaded": downloaded,
+            "current_tile": name,
+            "status": "downloading",
+        }));
+
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let gz_bytes = resp.bytes().await
+                    .map_err(|e| format!("Download error for {}: {}", name, e))?;
+
+                // gzip 해제
+                let mut decoder = GzDecoder::new(&gz_bytes[..]);
+                let mut hgt_bytes = Vec::new();
+                decoder.read_to_end(&mut hgt_bytes)
+                    .map_err(|e| format!("Decompress error for {}: {}", name, e))?;
+
+                let dest = srtm_dir.join(format!("{}.hgt", name));
+                std::fs::write(&dest, &hgt_bytes)
+                    .map_err(|e| format!("Write error for {}: {}", name, e))?;
+
+                downloaded += 1;
+                info!("[SRTM] Downloaded: {} ({:.1}MB)", name, gz_bytes.len() as f64 / 1_048_576.0);
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                // 해양 타일 (데이터 없음) — 정상
+                skipped += 1;
+                info!("[SRTM] Skipped (ocean): {}", name);
+            }
+            Ok(resp) => {
+                log::warn!("[SRTM] HTTP {} for {}", resp.status(), name);
+                skipped += 1;
+            }
+            Err(e) => {
+                log::warn!("[SRTM] Download failed for {}: {}", name, e);
+                skipped += 1;
+            }
+        }
+
+        let _ = app_handle.emit("srtm-download-progress", serde_json::json!({
+            "total": total,
+            "downloaded": downloaded,
+            "skipped": skipped,
+            "status": "downloading",
+        }));
+    }
+
+    // 캐시 초기화 (새 타일 반영)
+    {
+        let state = app_handle.state::<AppState>();
+        let mut reader = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        *reader = srtm::SrtmReader::new(srtm_dir);
+    }
+
+    let msg = format!(
+        "완료: {}개 타일 다운로드, {}개 스킵 (해양)",
+        downloaded, skipped
+    );
+    let _ = app_handle.emit("srtm-download-progress", serde_json::json!({
+        "total": total,
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "status": "done",
+    }));
+    Ok(msg)
+}
+
+// ---------- 건물 데이터 (GIS건물통합정보) ----------
+
+#[tauri::command]
+async fn import_building_data(
+    app_handle: tauri::AppHandle,
+    zip_path: String,
+    region: String,
+) -> Result<String, String> {
+    let state = app_handle.state::<AppState>();
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    let handle = app_handle.clone();
+    let region_clone = region.clone();
+
+    let count = building::import_from_zip(&conn, &zip_path, &region, &|progress| {
+        let _ = handle.emit("building-import-progress", progress);
+    })?;
+
+    Ok(format!("{} 건물 {}건 임포트 완료", region_clone, count))
+}
+
+#[tauri::command]
+fn query_buildings_along_path(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+    target_lat: f64,
+    target_lon: f64,
+    corridor_width_m: Option<f64>,
+) -> Result<Vec<building::BuildingOnPath>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let width = corridor_width_m.unwrap_or(100.0);
+    building::query_buildings_along_path(&conn, radar_lat, radar_lon, target_lat, target_lon, width)
+}
+
+#[tauri::command]
+fn get_building_import_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<building::BuildingImportStatus>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::get_import_status(&conn)
+}
+
+#[tauri::command]
+fn clear_building_data(
+    state: tauri::State<'_, AppState>,
+    region: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::clear_building_data(&conn, region.as_deref())
+}
+
+// ---------- 영역 내 건물 조회 (커버리지 맵용) ----------
+
+#[tauri::command]
+fn query_buildings_in_bbox(
+    state: tauri::State<'_, AppState>,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: Option<f64>,
+) -> Result<Vec<building::BuildingInArea>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::query_buildings_in_bbox(&conn, min_lat, max_lat, min_lon, max_lon, min_height_m.unwrap_or(3.0))
+}
+
+// ---------- 수동 등록 건물 ----------
+
+#[tauri::command]
+fn list_manual_buildings(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<building::ManualBuilding>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::list_manual_buildings(&conn)
+}
+
+#[tauri::command]
+fn add_manual_building(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    latitude: f64,
+    longitude: f64,
+    height: f64,
+    ground_elev: f64,
+    memo: String,
+    geometry_type: Option<String>,
+    geometry_json: Option<String>,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let gt = geometry_type.as_deref().unwrap_or("point");
+    let gj = geometry_json.as_deref();
+    building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &memo, gt, gj)
+}
+
+#[tauri::command]
+fn update_manual_building(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    name: String,
+    latitude: f64,
+    longitude: f64,
+    height: f64,
+    ground_elev: f64,
+    memo: String,
+    geometry_type: Option<String>,
+    geometry_json: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let gt = geometry_type.as_deref().unwrap_or("point");
+    let gj = geometry_json.as_deref();
+    building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &memo, gt, gj)
+}
+
+#[tauri::command]
+fn delete_manual_building(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::delete_manual_building(&conn, id)
+}
+
 // ---------- App Entry Point ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -934,10 +1397,18 @@ pub fn run() {
                 }
             }
 
+            // SRTM 데이터 디렉토리 초기화
+            let srtm_dir = aircraft_path.with_file_name("srtm");
+            if !srtm_dir.exists() {
+                let _ = fs::create_dir_all(&srtm_dir);
+            }
+            info!("SRTM data dir: {:?}", srtm_dir);
+
             app.manage(AppState {
                 aircraft_path: Mutex::new(aircraft_path),
                 db: Mutex::new(db_conn),
                 oauth_token: Mutex::new(None),
+                srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir)),
             });
 
             Ok(())
@@ -960,11 +1431,29 @@ pub fn run() {
             save_opensky_credentials,
             load_opensky_credentials,
             load_saved_data,
+            load_garble_points,
             clear_saved_data,
             load_setting,
             save_setting,
             export_database,
             import_database,
+            calculate_los_panorama,
+            fetch_elevation,
+            download_srtm_korea,
+            import_building_data,
+            query_buildings_along_path,
+            query_buildings_in_bbox,
+            get_building_import_status,
+            clear_building_data,
+            list_manual_buildings,
+            add_manual_building,
+            update_manual_building,
+            delete_manual_building,
+            save_weather_day,
+            save_cloud_grid_day,
+            get_weather_cached_dates,
+            load_weather_cache,
+            load_cloud_grid_cache,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

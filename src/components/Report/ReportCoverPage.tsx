@@ -2,10 +2,12 @@ import { format } from "date-fns";
 import EditableText from "./EditableText";
 import ReportPage from "./ReportPage";
 import { forwardRef } from "react";
+import type { ReportMetadata } from "../../types";
 
 interface CoverPageProps {
   template: "weekly" | "monthly";
   radarName: string;
+  metadata: ReportMetadata;
   editable: boolean;
   title: string;
   onTitleChange: (v: string) => void;
@@ -14,10 +16,9 @@ interface CoverPageProps {
 }
 
 const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
-  ({ template, radarName, editable, title, onTitleChange, subtitle, onSubtitleChange }, ref) => {
+  ({ template: _template, radarName, metadata, editable, title, onTitleChange, subtitle, onSubtitleChange }, ref) => {
     const now = new Date();
-    const templateLabel = template === "weekly" ? "주간" : "월간";
-    const docNum = `레이더분석-${format(now, "yyyy")}-${String(now.getMonth() + 1).padStart(3, "0")}`;
+    const docNum = `${metadata.docPrefix}-${format(now, "yyyy")}-${String(now.getMonth() + 1).padStart(3, "0")}`;
 
     return (
       <ReportPage ref={ref}>
@@ -26,7 +27,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
 
         {/* 문서 헤더 */}
         <div className="mt-3 flex justify-between text-[11px] text-gray-500">
-          <span>비행점검센터</span>
+          <span>{metadata.department}</span>
           <span>문서번호: {docNum}</span>
         </div>
         <div className="mt-1 flex justify-between text-[11px] text-gray-500">
@@ -39,7 +40,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
         {/* 중앙 제목 영역 */}
         <div className="flex flex-col items-center justify-center" style={{ marginTop: "80mm" }}>
           <div className="mb-6 text-[13px] tracking-[0.3em] text-gray-400">
-            비행검사기 항적 분석 체계
+            {metadata.organization}
           </div>
 
           <EditableText
@@ -63,13 +64,18 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
           <div className="mt-12 text-[13px] text-gray-400">
             {format(now, "yyyy년 MM월 dd일")}
           </div>
+          {metadata.author && (
+            <div className="mt-2 text-[12px] text-gray-400">
+              작성: {metadata.author}
+            </div>
+          )}
         </div>
 
         {/* 하단 */}
         <div className="absolute bottom-[20mm] left-[20mm] right-[20mm]">
           <div className="border-t-[2px] border-gray-300" />
           <p className="mt-2 text-center text-[9px] text-gray-400">
-            비행검사기 항적 분석 체계 - 자동 생성 {templateLabel} 보고서
+            {metadata.footer}
           </p>
         </div>
       </ReportPage>

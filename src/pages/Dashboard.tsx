@@ -21,8 +21,8 @@ export default function Dashboard() {
   const setActivePage = useAppStore((s) => s.setActivePage);
 
   const totalFlights = flights.length;
-  const totalLossSegments = flights.reduce(
-    (sum, f) => sum + f.loss_segments.length,
+  const totalLossPoints = flights.reduce(
+    (sum, f) => sum + f.loss_points.length,
     0
   );
   const avgLossPercentage =
@@ -60,8 +60,8 @@ export default function Dashboard() {
           accent="#3b82f6"
         />
         <Card
-          title="Loss 구간 수"
-          value={totalLossSegments}
+          title="미탐지 포인트"
+          value={totalLossPoints}
           subtitle="탐지된 전체 Loss"
           icon={AlertTriangle}
           accent="#a60739"
@@ -153,7 +153,7 @@ export default function Dashboard() {
                       {f.loss_percentage.toFixed(1)}%
                     </p>
                     <p className="text-xs text-gray-500">
-                      Loss {f.loss_segments.length}건
+                      Loss {f.loss_points.length}pt
                     </p>
                   </div>
                 </div>

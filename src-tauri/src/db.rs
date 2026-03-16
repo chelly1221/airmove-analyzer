@@ -93,8 +93,106 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_track_points_file ON track_points(file_id);
+
+        CREATE TABLE IF NOT EXISTS garble_points (
+            file_id INTEGER NOT NULL REFERENCES parsed_files(id) ON DELETE CASCADE,
+            timestamp REAL NOT NULL,
+            mode_s TEXT NOT NULL,
+            track_number INTEGER NOT NULL,
+            rho_nm REAL NOT NULL,
+            theta_deg REAL NOT NULL,
+            ghost_lat REAL NOT NULL,
+            ghost_lon REAL NOT NULL,
+            ghost_altitude REAL NOT NULL,
+            real_lat REAL NOT NULL,
+            real_lon REAL NOT NULL,
+            real_altitude REAL NOT NULL,
+            real_rho_nm REAL NOT NULL,
+            real_theta_deg REAL NOT NULL,
+            garble_type TEXT NOT NULL,
+            bearing_diff_deg REAL NOT NULL,
+            range_diff_nm REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_garble_points_file ON garble_points(file_id);
+        CREATE INDEX IF NOT EXISTS idx_garble_points_modes ON garble_points(mode_s);
+
+        -- 고도 프로파일 캐시 (open-meteo API 결과)
+        CREATE TABLE IF NOT EXISTS elevation_cache (
+            lat_key TEXT NOT NULL,
+            lon_key TEXT NOT NULL,
+            elevation REAL NOT NULL,
+            PRIMARY KEY (lat_key, lon_key)
+        );
+
+        -- GIS 건물통합정보 (vworld SHP 임포트)
+        CREATE TABLE IF NOT EXISTS buildings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT NOT NULL,
+            centroid_lat REAL NOT NULL,
+            centroid_lon REAL NOT NULL,
+            bbox_min_lat REAL NOT NULL,
+            bbox_min_lon REAL NOT NULL,
+            bbox_max_lat REAL NOT NULL,
+            bbox_max_lon REAL NOT NULL,
+            height REAL NOT NULL,
+            ground_floors INTEGER,
+            building_name TEXT,
+            address TEXT,
+            usage TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_buildings_lat ON buildings(centroid_lat);
+        CREATE INDEX IF NOT EXISTS idx_buildings_lon ON buildings(centroid_lon);
+        CREATE INDEX IF NOT EXISTS idx_buildings_region ON buildings(region);
+
+        CREATE TABLE IF NOT EXISTS building_import_log (
+            region TEXT PRIMARY KEY,
+            file_date TEXT NOT NULL,
+            imported_at INTEGER NOT NULL,
+            record_count INTEGER NOT NULL
+        );
+
+        -- 기상 데이터 캐시 (일 단위, 레이더 좌표 기준)
+        CREATE TABLE IF NOT EXISTS weather_cache (
+            date TEXT NOT NULL,
+            radar_lat TEXT NOT NULL,
+            radar_lon TEXT NOT NULL,
+            hourly_json TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            PRIMARY KEY (date, radar_lat, radar_lon)
+        );
+
+        -- 구름 그리드 캐시 (일 단위)
+        CREATE TABLE IF NOT EXISTS cloud_grid_cache (
+            date TEXT NOT NULL,
+            radar_lat TEXT NOT NULL,
+            radar_lon TEXT NOT NULL,
+            grid_spacing_km REAL NOT NULL,
+            frames_json TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            PRIMARY KEY (date, radar_lat, radar_lon)
+        );
+
+        -- 수동 등록 건물
+        CREATE TABLE IF NOT EXISTS manual_buildings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            height REAL NOT NULL,
+            ground_elev REAL NOT NULL DEFAULT 0,
+            memo TEXT NOT NULL DEFAULT ''
+        );
         ",
     )?;
+
+    // 기존 DB 마이그레이션: buildings 테이블에 컬럼 추가
+    let _ = conn.execute("ALTER TABLE buildings ADD COLUMN address TEXT", []);
+    let _ = conn.execute("ALTER TABLE buildings ADD COLUMN usage TEXT", []);
+
+    // 수동 건물에 도형 컬럼 추가
+    let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_type TEXT NOT NULL DEFAULT 'point'", []);
+    let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_json TEXT", []);
+
     Ok(conn)
 }
 
@@ -300,7 +398,7 @@ pub fn get_setting(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
 
 // ========== 파싱 데이터 영속화 ==========
 
-use crate::models::{AnalysisResult, ParseStatistics, RadarDetectionType, TrackPoint};
+use crate::models::{AnalysisResult, GarblePoint, ParseStatistics, RadarDetectionType, TrackPoint};
 
 fn radar_type_to_str(rt: &RadarDetectionType) -> &'static str {
     match rt {
@@ -321,7 +419,10 @@ fn str_to_radar_type(s: &str) -> RadarDetectionType {
         "mode_s_rollcall" => RadarDetectionType::ModeSRollCall,
         "mode_s_allcall_psr" => RadarDetectionType::ModeSAllCallPsr,
         "mode_s_rollcall_psr" => RadarDetectionType::ModeSRollCallPsr,
-        _ => RadarDetectionType::ModeSRollCall,
+        other => {
+            log::warn!("[DB] 알 수 없는 radar_type '{}', ModeSRollCall로 대체", other);
+            RadarDetectionType::ModeSRollCall
+        }
     }
 }
 
@@ -386,6 +487,39 @@ pub fn save_parsed_file_data(
     }
     conn.execute_batch("COMMIT")?;
 
+    // 트랜잭션으로 garble_points 일괄 삽입
+    if !analysis.file_info.garble_points.is_empty() {
+        conn.execute_batch("BEGIN")?;
+        {
+            let mut stmt = conn.prepare(
+                "INSERT INTO garble_points (file_id, timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            )?;
+            for gp in &analysis.file_info.garble_points {
+                stmt.execute(params![
+                    file_id,
+                    gp.timestamp,
+                    gp.mode_s,
+                    gp.track_number as i64,
+                    gp.rho_nm,
+                    gp.theta_deg,
+                    gp.ghost_lat,
+                    gp.ghost_lon,
+                    gp.ghost_altitude,
+                    gp.real_lat,
+                    gp.real_lon,
+                    gp.real_altitude,
+                    gp.real_rho_nm,
+                    gp.real_theta_deg,
+                    gp.garble_type,
+                    gp.bearing_diff_deg,
+                    gp.range_diff_nm,
+                ])?;
+            }
+        }
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 
@@ -409,6 +543,7 @@ pub struct SavedFileInfo {
 pub struct SavedParsedData {
     pub files: Vec<SavedFileInfo>,
     pub track_points: Vec<TrackPoint>,
+    pub garble_points: Vec<GarblePoint>,
 }
 
 /// DB에서 모든 파싱 데이터 로드
@@ -431,6 +566,7 @@ pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
 
     let mut files = Vec::new();
     let mut all_points = Vec::new();
+    let mut all_garble_points = Vec::new();
 
     for (file_id, path, name, total_records, start_time, end_time, radar_lat, radar_lon, errors_json, stats_json) in &file_rows {
         let parse_errors: Vec<String> = serde_json::from_str(errors_json).unwrap_or_default();
@@ -475,18 +611,138 @@ pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
             .collect::<SqlResult<Vec<_>>>()?;
 
         all_points.extend(points);
+
+        // 해당 파일의 garble_points 로드
+        let mut gp_stmt = conn.prepare(
+            "SELECT timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm
+             FROM garble_points WHERE file_id = ?1 ORDER BY timestamp",
+        )?;
+
+        let garble_pts: Vec<GarblePoint> = gp_stmt
+            .query_map(params![file_id], |row| {
+                Ok(GarblePoint {
+                    timestamp: row.get(0)?,
+                    mode_s: row.get(1)?,
+                    track_number: row.get::<_, i64>(2)? as u16,
+                    rho_nm: row.get(3)?,
+                    theta_deg: row.get(4)?,
+                    ghost_lat: row.get(5)?,
+                    ghost_lon: row.get(6)?,
+                    ghost_altitude: row.get(7)?,
+                    real_lat: row.get(8)?,
+                    real_lon: row.get(9)?,
+                    real_altitude: row.get(10)?,
+                    real_rho_nm: row.get(11)?,
+                    real_theta_deg: row.get(12)?,
+                    garble_type: row.get(13)?,
+                    bearing_diff_deg: row.get(14)?,
+                    range_diff_nm: row.get(15)?,
+                })
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        all_garble_points.extend(garble_pts);
     }
 
     Ok(SavedParsedData {
         files,
         track_points: all_points,
+        garble_points: all_garble_points,
     })
+}
+
+/// DB에서 garble points 로드 (mode_s 필터 옵션)
+pub fn load_garble_points(conn: &Connection, mode_s: Option<&str>) -> SqlResult<Vec<GarblePoint>> {
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match mode_s {
+        Some(ms) => (
+            "SELECT timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm
+             FROM garble_points WHERE mode_s = ?1 ORDER BY timestamp".to_string(),
+            vec![Box::new(ms.to_string())],
+        ),
+        None => (
+            "SELECT timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm
+             FROM garble_points ORDER BY timestamp".to_string(),
+            vec![],
+        ),
+    };
+
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let points = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            Ok(GarblePoint {
+                timestamp: row.get(0)?,
+                mode_s: row.get(1)?,
+                track_number: row.get::<_, i64>(2)? as u16,
+                rho_nm: row.get(3)?,
+                theta_deg: row.get(4)?,
+                ghost_lat: row.get(5)?,
+                ghost_lon: row.get(6)?,
+                ghost_altitude: row.get(7)?,
+                real_lat: row.get(8)?,
+                real_lon: row.get(9)?,
+                real_altitude: row.get(10)?,
+                real_rho_nm: row.get(11)?,
+                real_theta_deg: row.get(12)?,
+                garble_type: row.get(13)?,
+                bearing_diff_deg: row.get(14)?,
+                range_diff_nm: row.get(15)?,
+            })
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+
+    Ok(points)
 }
 
 /// 모든 파싱 데이터 삭제
 pub fn clear_all_parsed_data(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM garble_points", [])?;
     conn.execute("DELETE FROM track_points", [])?;
     conn.execute("DELETE FROM parsed_files", [])?;
+    Ok(())
+}
+
+// ========== 고도 프로파일 캐시 ==========
+
+/// 캐시에서 고도 조회 (lat/lon을 소수점 4자리 문자열 키로 사용)
+pub fn get_cached_elevations(
+    conn: &Connection,
+    lats: &[f64],
+    lons: &[f64],
+) -> SqlResult<Vec<Option<f64>>> {
+    let mut results = vec![None; lats.len()];
+    let mut stmt = conn.prepare(
+        "SELECT elevation FROM elevation_cache WHERE lat_key = ?1 AND lon_key = ?2",
+    )?;
+    for (i, (lat, lon)) in lats.iter().zip(lons.iter()).enumerate() {
+        let lat_key = format!("{:.2}", lat);
+        let lon_key = format!("{:.2}", lon);
+        if let Ok(elev) = stmt.query_row(params![lat_key, lon_key], |row| row.get::<_, f64>(0)) {
+            results[i] = Some(elev);
+        }
+    }
+    Ok(results)
+}
+
+/// 고도 데이터를 캐시에 저장
+pub fn save_elevations_to_cache(
+    conn: &Connection,
+    lats: &[f64],
+    lons: &[f64],
+    elevations: &[f64],
+) -> SqlResult<()> {
+    conn.execute_batch("BEGIN")?;
+    {
+        let mut stmt = conn.prepare(
+            "INSERT OR REPLACE INTO elevation_cache (lat_key, lon_key, elevation) VALUES (?1, ?2, ?3)",
+        )?;
+        for i in 0..lats.len() {
+            let lat_key = format!("{:.2}", lats[i]);
+            let lon_key = format!("{:.2}", lons[i]);
+            stmt.execute(params![lat_key, lon_key, elevations[i]])?;
+        }
+    }
+    conn.execute_batch("COMMIT")?;
     Ok(())
 }
 
@@ -513,4 +769,131 @@ pub fn migrate_json_cache(conn: &Connection, cache_path: &Path) -> SqlResult<()>
     // 마이그레이션 완료 후 삭제
     let _ = std::fs::remove_file(cache_path);
     Ok(())
+}
+
+// ========== 기상 데이터 캐시 ==========
+
+/// 일 단위 기상 데이터 저장 (중복 시 덮어쓰기)
+pub fn save_weather_day(
+    conn: &Connection,
+    date: &str,
+    radar_lat: f64,
+    radar_lon: f64,
+    hourly_json: &str,
+) -> SqlResult<()> {
+    let lat_key = format!("{:.2}", radar_lat);
+    let lon_key = format!("{:.2}", radar_lon);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO weather_cache (date, radar_lat, radar_lon, hourly_json, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![date, lat_key, lon_key, hourly_json, now],
+    )?;
+    Ok(())
+}
+
+/// 일 단위 구름 그리드 저장
+pub fn save_cloud_grid_day(
+    conn: &Connection,
+    date: &str,
+    radar_lat: f64,
+    radar_lon: f64,
+    grid_spacing_km: f64,
+    frames_json: &str,
+) -> SqlResult<()> {
+    let lat_key = format!("{:.2}", radar_lat);
+    let lon_key = format!("{:.2}", radar_lon);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO cloud_grid_cache (date, radar_lat, radar_lon, grid_spacing_km, frames_json, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![date, lat_key, lon_key, grid_spacing_km, frames_json, now],
+    )?;
+    Ok(())
+}
+
+/// 캐시된 기상 날짜 목록 조회
+pub fn get_weather_cached_dates(
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> SqlResult<Vec<String>> {
+    let lat_key = format!("{:.2}", radar_lat);
+    let lon_key = format!("{:.2}", radar_lon);
+    let mut stmt = conn.prepare(
+        "SELECT date FROM weather_cache WHERE radar_lat = ?1 AND radar_lon = ?2 ORDER BY date",
+    )?;
+    let dates = stmt
+        .query_map(params![lat_key, lon_key], |row| row.get::<_, String>(0))?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(dates)
+}
+
+/// 캐시된 구름 그리드 날짜 목록 조회
+pub fn get_cloud_grid_cached_dates(
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> SqlResult<Vec<String>> {
+    let lat_key = format!("{:.2}", radar_lat);
+    let lon_key = format!("{:.2}", radar_lon);
+    let mut stmt = conn.prepare(
+        "SELECT date FROM cloud_grid_cache WHERE radar_lat = ?1 AND radar_lon = ?2 ORDER BY date",
+    )?;
+    let dates = stmt
+        .query_map(params![lat_key, lon_key], |row| row.get::<_, String>(0))?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(dates)
+}
+
+/// 캐시된 기상 데이터 로드 (날짜 범위)
+pub fn load_weather_cache(
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+    dates: &[String],
+) -> SqlResult<Vec<(String, String)>> {
+    let lat_key = format!("{:.2}", radar_lat);
+    let lon_key = format!("{:.2}", radar_lon);
+    let mut results = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT date, hourly_json FROM weather_cache WHERE radar_lat = ?1 AND radar_lon = ?2 AND date = ?3",
+    )?;
+    for date in dates {
+        if let Ok(row) = stmt.query_row(params![lat_key, lon_key, date], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            results.push(row);
+        }
+    }
+    Ok(results)
+}
+
+/// 캐시된 구름 그리드 로드 (날짜 범위)
+pub fn load_cloud_grid_cache(
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+    dates: &[String],
+) -> SqlResult<Vec<(String, String, f64)>> {
+    let lat_key = format!("{:.2}", radar_lat);
+    let lon_key = format!("{:.2}", radar_lon);
+    let mut results = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT date, frames_json, grid_spacing_km FROM cloud_grid_cache WHERE radar_lat = ?1 AND radar_lon = ?2 AND date = ?3",
+    )?;
+    for date in dates {
+        if let Ok(row) = stmt.query_row(params![lat_key, lon_key, date], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?))
+        }) {
+            results.push(row);
+        }
+    }
+    Ok(results)
 }
