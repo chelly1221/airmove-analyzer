@@ -187,13 +187,19 @@ export default function TrackMap() {
   const fittedRef = useRef(false);
   const prevPointsLen = useRef(0);
 
+  // 선택된 레이더용 비행만 필터 (radar_name이 없는 레거시 데이터는 항상 표시)
+  const radarFilteredFlights = useMemo(() => {
+    const name = radarSite.name;
+    return flights.filter((f) => !f.radar_name || f.radar_name === name);
+  }, [flights, radarSite.name]);
+
   // DB에서 ADS-B 트랙 로드 (비행 데이터 변경 시)
   useEffect(() => {
-    if (flights.length === 0) return;
+    if (radarFilteredFlights.length === 0) return;
     const icao24List = aircraft.filter((a) => a.active).map((a) => a.mode_s_code);
     if (icao24List.length === 0) return;
     let minTs = Infinity, maxTs = -Infinity;
-    for (const f of flights) {
+    for (const f of radarFilteredFlights) {
       if (f.start_time < minTs) minTs = f.start_time;
       if (f.end_time > maxTs) maxTs = f.end_time;
     }
@@ -203,12 +209,12 @@ export default function TrackMap() {
     }).then((tracks) => {
       if (tracks.length > 0) setAdsbTracks(tracks);
     }).catch(() => {});
-  }, [flights, aircraft]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [radarFilteredFlights, aircraft]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 레이더 정보
   const radarInfo = useMemo(() => {
-    if (flights.length === 0) return null;
-    const maxRange = Math.max(...flights.map((f) => f.max_radar_range_km));
+    if (radarFilteredFlights.length === 0) return null;
+    const maxRange = Math.max(...radarFilteredFlights.map((f) => f.max_radar_range_km));
     const rangeKm = radarSite.range_nm > 0
       ? radarSite.range_nm * 1.852
       : maxRange;
@@ -219,12 +225,12 @@ export default function TrackMap() {
       rangeNm: radarSite.range_nm,
       name: radarSite.name,
     };
-  }, [flights, radarSite]);
+  }, [radarFilteredFlights, radarSite]);
 
   // 비정상 항적 제거용: Mode-S별 포인트 수 카운트
   const validModeS = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const f of flights) {
+    for (const f of radarFilteredFlights) {
       for (const p of f.track_points) {
         counts.set(p.mode_s, (counts.get(p.mode_s) ?? 0) + 1);
       }
@@ -234,7 +240,7 @@ export default function TrackMap() {
         .filter(([, count]) => count >= 10)
         .map(([ms]) => ms)
     );
-  }, [flights]);
+  }, [radarFilteredFlights]);
 
   // 등록된 비행검사기 Mode-S 코드 집합
   const registeredModeS = useMemo(
@@ -251,13 +257,13 @@ export default function TrackMap() {
 
     // 특정 비행 선택 시 해당 비행 + 앞뒤 1시간 여유 시간 범위 표시
     if (selectedFlightId) {
-      const targetFlight = flights.find((f) => f.id === selectedFlightId);
+      const targetFlight = radarFilteredFlights.find((f) => f.id === selectedFlightId);
       if (targetFlight) {
         const padding = 3600;
         const tMin = targetFlight.start_time - padding;
         const tMax = targetFlight.end_time + padding;
         const targetModeS = targetFlight.mode_s;
-        for (const f of flights) {
+        for (const f of radarFilteredFlights) {
           for (const p of f.track_points) {
             if (!validModeS.has(p.mode_s)) continue;
             if (p.mode_s === targetModeS && p.timestamp >= tMin && p.timestamp <= tMax) {
@@ -273,7 +279,7 @@ export default function TrackMap() {
         }
       }
       pts.sort((a, b) => a.timestamp - b.timestamp);
-      const tFlight = flights.find((f) => f.id === selectedFlightId);
+      const tFlight = radarFilteredFlights.find((f) => f.id === selectedFlightId);
       const padded = tFlight ? { min: tFlight.start_time - 3600, max: tFlight.end_time + 3600 } : undefined;
       return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: padded };
     }
@@ -284,7 +290,7 @@ export default function TrackMap() {
       const tMin = selectedFlight.first_seen - padding;
       const tMax = selectedFlight.last_seen + padding;
       const modeS = selectedModeS;
-      for (const f of flights) {
+      for (const f of radarFilteredFlights) {
         for (const p of f.track_points) {
           if (!validModeS.has(p.mode_s)) continue;
           if (p.mode_s === modeS && p.timestamp >= tMin && p.timestamp <= tMax) {
@@ -303,7 +309,7 @@ export default function TrackMap() {
     }
 
     const showAll = selectedModeS === "__ALL__";
-    for (const f of flights) {
+    for (const f of radarFilteredFlights) {
       for (const p of f.track_points) {
         if (!validModeS.has(p.mode_s)) continue;
         if (showAll) {
@@ -331,12 +337,12 @@ export default function TrackMap() {
     }
     pts.sort((a, b) => a.timestamp - b.timestamp);
     return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: undefined as { min: number; max: number } | undefined };
-  }, [flights, selectedModeS, selectedFlightId, selectedFlight, validModeS, registeredModeS]);
+  }, [radarFilteredFlights, selectedModeS, selectedFlightId, selectedFlight, validModeS, registeredModeS]);
 
   // 고유 Mode-S 목록
   const uniqueModeS = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const f of flights) {
+    for (const f of radarFilteredFlights) {
       for (const p of f.track_points) {
         counts.set(p.mode_s, (counts.get(p.mode_s) ?? 0) + 1);
       }
@@ -352,7 +358,7 @@ export default function TrackMap() {
       })
       .slice(0, 200)
       .map(([ms]) => ms);
-  }, [flights, aircraft]);
+  }, [radarFilteredFlights, aircraft]);
 
   // 시간 범위 (비행 선택 시 ±1시간 패딩 포함)
   const timeRange = useMemo(() => {
@@ -537,25 +543,38 @@ export default function TrackMap() {
     return [Math.round((r1 + m) * 255), Math.round((g1 + m) * 255), Math.round((b1 + m) * 255)];
   }, []);
 
-  // 커버리지 deck.gl 데이터 (범위 내 다중 레이어 → 겹침 3D 폴리곤)
+  // 커버리지 deck.gl 데이터 (합성 스펙트럼: 동심 링 방식)
   const coveragePolygonsList = useMemo(() => {
     if (!coverageVisible || coverageLayers.length === 0) return null;
     const rLat = radarSite.latitude;
     const rLon = radarSite.longitude;
     const CONE_PTS = 72;
 
-    const isRange = coverageLayers.length > 1;
-    return coverageLayers.map((layer) => {
+    const isSingle = coverageLayers.length === 1;
+
+    // 고도순 정렬 (낮→높 = 좁→넓)
+    const sorted = [...coverageLayers].sort((a, b) => a.altitudeFt - b.altitudeFt);
+
+    return sorted.map((layer, idx) => {
       const altM = layer.altitudeM;
-      // 범위 모드면 평면(0), 단일 고도면 3D 높이 적용
-      const zVal = isRange ? 0 : altM * altScale;
+      const zVal = isSingle ? altM * altScale : 0;
       const outerRing: [number, number, number][] = layer.bearings.map((b) => [b.lon, b.lat, zVal]);
       if (outerRing.length > 0) outerRing.push(outerRing[0]);
 
       const polygon: [number, number, number][][] = [outerRing];
       let coneRing: [number, number, number][] | null = null;
 
-      if (showConeOfSilence && layer.coneRadiusKm > 0.5) {
+      // 범위 모드: 안쪽 레이어(이전 고도)를 구멍으로 뚫어 동심 링 생성
+      const innerLayer = !isSingle && idx > 0 ? sorted[idx - 1] : null;
+      if (innerLayer) {
+        const innerHole: [number, number, number][] = innerLayer.bearings.map((b) => [b.lon, b.lat, zVal]);
+        if (innerHole.length > 0) innerHole.push(innerHole[0]);
+        innerHole.reverse(); // 홀은 반시계 방향
+        polygon.push(innerHole);
+      }
+
+      // 최내곽 레이어(idx===0)에만 Cone of Silence 구멍 적용
+      if (showConeOfSilence && layer.coneRadiusKm > 0.5 && (isSingle || idx === 0)) {
         const hole: [number, number, number][] = [];
         for (let i = CONE_PTS; i >= 0; i--) {
           const deg = (i / CONE_PTS) * 360;
@@ -620,9 +639,9 @@ export default function TrackMap() {
 
   /** 구름 그리드 조회 시작 */
   const startCloudFetch = useCallback(async () => {
-    if (flights.length === 0) return;
+    if (radarFilteredFlights.length === 0) return;
     let minTs = Infinity, maxTs = -Infinity;
-    for (const f of flights) {
+    for (const f of radarFilteredFlights) {
       if (f.start_time < minTs) minTs = f.start_time;
       if (f.end_time > maxTs) maxTs = f.end_time;
     }
@@ -658,7 +677,7 @@ export default function TrackMap() {
       setCloudGridLoading(false);
       setCloudGridProgress("");
     }
-  }, [flights, radarSite, setCloudGrid, setCloudGridVisible, setCloudGridLoading, setCloudGridProgress, setWeatherData, setWeatherLoading]);
+  }, [radarFilteredFlights, radarSite, setCloudGrid, setCloudGridVisible, setCloudGridLoading, setCloudGridProgress, setWeatherData, setWeatherLoading]);
 
   /** 건물 오버레이 데이터 로드 (레이더 주변 bbox) */
   const fetchBuildingOverlay = useCallback(async () => {
@@ -1026,11 +1045,11 @@ export default function TrackMap() {
   // LOS mode map click handler (카메라 조정은 단면도 로딩 완료 후)
   const handleMapClick = useCallback(
     (evt: any) => {
-      if (!losMode) return;
+      if (!losMode || losTarget) return; // 타겟이 이미 설정되면 재설정 방지
       const { lngLat } = evt;
       setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
     },
-    [losMode]
+    [losMode, losTarget]
   );
 
   // LOS 단면도 로딩 완료 → 카메라 자동 정렬
@@ -1432,6 +1451,38 @@ export default function TrackMap() {
         );
       }
 
+      // LOS 선상 항적/Loss 포인트 (맵에서 클릭 가능)
+      if (losTrackPoints.length > 0) {
+        const losTPData = losTrackPoints.map((tp, idx) => ({
+          position: [tp.longitude, tp.latitude],
+          idx,
+          isLoss: tp.isLoss,
+          radar_type: tp.radar_type,
+        }));
+        layers.push(
+          new ScatterplotLayer({
+            id: "los-track-points",
+            data: losTPData,
+            getPosition: (d: any) => d.position,
+            getFillColor: (d: any) => d.isLoss ? [239, 68, 68, 180] : [...detectionTypeColor(d.radar_type), 140],
+            getLineColor: [255, 255, 255, 100],
+            getRadius: 3,
+            radiusMinPixels: 2,
+            radiusMaxPixels: 6,
+            radiusUnits: "pixels",
+            lineWidthMinPixels: 0.5,
+            stroked: true,
+            pickable: true,
+            onClick: (info: any) => {
+              if (info.object) {
+                const clickedIdx = info.object.idx;
+                setLosHighlightIdx((prev) => prev === clickedIdx ? null : clickedIdx);
+              }
+            },
+          })
+        );
+      }
+
       // LOS 단면도 항적 포인트 하이라이트 → 지도 위 마커
       if (losHighlightIdx !== null && losTrackPoints[losHighlightIdx]) {
         const tp = losTrackPoints[losHighlightIdx];
@@ -1455,20 +1506,20 @@ export default function TrackMap() {
 
     }
 
-    // 커버리지 맵 (범위 내 다중 고도 폴리곤 겹침)
+    // 커버리지 맵 (합성 스펙트럼: 동심 링 — 겹침 없이 각 링 고유 색상)
     if (coveragePolygonsList && coveragePolygonsList.length > 0) {
       const n = coveragePolygonsList.length;
-      const baseAlpha = Math.max(12, Math.min(40, Math.round(120 / n))); // 레이어 수에 따라 투명도 조절
+      const isSingle = n === 1;
+      const fillAlpha = isSingle ? 40 : 100; // 단일: 반투명, 범위: 고체 스펙트럼
 
       coveragePolygonsList.forEach((cp, idx) => {
         const { polygon, outerRing, coneRing, fillColor, altFt } = cp;
-        // 반투명 채우기
         layers.push(
           new PolygonLayer({
             id: `coverage-fill-${altFt}`,
             data: [{ polygon }],
             getPolygon: (d: any) => d.polygon,
-            getFillColor: [...fillColor, baseAlpha],
+            getFillColor: [...fillColor, fillAlpha],
             getLineColor: [0, 0, 0, 0],
             filled: true,
             stroked: false,
@@ -1477,9 +1528,8 @@ export default function TrackMap() {
             parameters: { depthWriteEnabled: false },
           })
         );
-        // 단일 고도: 해당 레이어 경계선, 범위: 최상단 경계선만 표시
-        const isSingle = n === 1;
-        if (isSingle ? (idx === 0) : (idx === n - 1)) {
+        // 최외곽 경계선 표시
+        if (isSingle || idx === n - 1) {
           layers.push(
             new PathLayer({
               id: `coverage-outline-${altFt}`,
@@ -2168,7 +2218,7 @@ export default function TrackMap() {
                                 handleCoverageAltMinChange(Math.min(v, coverageAltInput));
                               }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 30 : 20 }}
-                              className="coverage-range-thumb absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:relative [&::-moz-range-thumb]:pointer-events-auto"
+                              className="coverage-range-thumb absolute top-1/2 -translate-y-1/2 left-0 h-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
                               aria-label="최소 고도"
                             />
                             {/* 최대 핸들 */}
@@ -2183,7 +2233,7 @@ export default function TrackMap() {
                                 handleCoverageAltChange(Math.max(v, coverageAltMinInput));
                               }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 20 : 30 }}
-                              className="coverage-range-thumb absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:relative [&::-moz-range-thumb]:pointer-events-auto"
+                              className="coverage-range-thumb absolute top-1/2 -translate-y-1/2 left-0 h-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
                               aria-label="최대 고도"
                             />
                           </div>
@@ -2396,6 +2446,7 @@ export default function TrackMap() {
           losTrackPoints={losTrackPoints}
           onLoaded={handleLosLoaded}
           onTrackPointHighlight={setLosHighlightIdx}
+          externalHighlightIdx={losHighlightIdx}
         />
       )}
 

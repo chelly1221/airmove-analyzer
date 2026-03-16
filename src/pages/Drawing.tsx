@@ -45,9 +45,13 @@ function circleCoords(lat: number, lon: number, radiusKm: number, steps = 64): [
 }
 
 export default function Drawing() {
-  const flights = useAppStore((s) => s.flights);
+  const allFlights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const radarSite = useAppStore((s) => s.radarSite);
+  const flights = useMemo(
+    () => allFlights.filter((f) => !f.radar_name || f.radar_name === radarSite.name),
+    [allFlights, radarSite.name],
+  );
   const selectedModeS = useAppStore((s) => s.selectedModeS);
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
   const selectedFlightId = useAppStore((s) => s.selectedFlightId);

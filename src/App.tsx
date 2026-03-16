@@ -27,11 +27,11 @@ interface SavedFileInfo {
   radar_lon: number;
   parse_errors: string[];
   parse_stats: ParseStatistics | null;
+  track_points: TrackPoint[];
 }
 
 interface SavedParsedData {
   files: SavedFileInfo[];
-  track_points: TrackPoint[];
 }
 
 /** 앱 시작 시 DB에서 저장된 파싱 데이터 + 설정 복원 */
@@ -69,22 +69,25 @@ function useRestoreSavedData() {
         const data = await invoke<SavedParsedData>("load_saved_data");
         if (data.files.length === 0) return;
 
-        console.log(`[Restore] DB에서 ${data.files.length}개 파일, ${data.track_points.length}개 포인트 복원`);
+        const totalPoints = data.files.reduce((sum, f) => sum + f.track_points.length, 0);
+        console.log(`[Restore] DB에서 ${data.files.length}개 파일, ${totalPoints}개 포인트 복원`);
 
         const store = useAppStore.getState();
 
-        // uploadedFiles 복원 (radar_lat/lon → radarName 매칭)
+        // uploadedFiles 복원 (radar_lat/lon → radarName 매칭) + 포인트에 radar_name 태깅
         const radarSites = store.customRadarSites;
+        const allPoints: TrackPoint[] = [];
         for (const f of data.files) {
           // 좌표로 레이더 사이트 이름 매칭 (0.01° 이내)
           const matchedSite = radarSites.find(
             (s) => Math.abs(s.latitude - f.radar_lat) < 0.01 && Math.abs(s.longitude - f.radar_lon) < 0.01
           );
+          const radarName = matchedSite?.name;
           store.addUploadedFile({
             path: f.path,
             name: f.name,
             status: "done",
-            radarName: matchedSite?.name,
+            radarName,
             parsedFile: {
               filename: f.filename,
               total_records: f.total_records,
@@ -102,10 +105,18 @@ function useRestoreSavedData() {
           if (f.parse_stats) {
             store.addParseStats(f.filename, f.parse_stats, f.total_records);
           }
+
+          // 포인트에 radar_name 태깅 후 축적
+          if (radarName) {
+            for (const p of f.track_points) {
+              p.radar_name = radarName;
+            }
+          }
+          allPoints.push(...f.track_points);
         }
 
         // rawTrackPoints 복원
-        store.appendRawTrackPoints(data.track_points);
+        store.appendRawTrackPoints(allPoints);
 
         // 3) flightHistory를 DB에서 먼저 로드 (consolidateFlights 전에 필요)
         try {

@@ -158,20 +158,24 @@ public/                 # 정적 자산
 29. 360° LoS 파노라마 (방위별 최대 앙각 장애물 탐색, 지형+건물 통합)
 30. 이상고도 보정 (수직속도 기반 탐지 + 선형 보간)
 31. 파노라마 캐시 (계산 결과 DB 영속화, 보고서 생성 시 재활용)
+32. 다중 레이더 필터링 (TrackPoint/Flight에 radar_name 태깅, 선택 레이더별 데이터 분리 표시)
+33. LOS 맵↔차트 양방향 포인트 클릭 (맵에서 항적 포인트 클릭→차트 핀 동기화, 차트 핀→맵 하이라이트)
+34. 커버리지 동심 링 시각화 (다중 고도 범위 시 겹침 없는 스펙트럼 링 방식)
 
 ## 핵심 아키텍처: 비행(Flight) 기반 분석
 분석 단위가 "파싱 파일(`AnalysisResult`)"에서 "**비행(`Flight`)**"으로 전환됨.
 
 ### 데이터 흐름
-1. ASS 파일 파싱 → DB `track_points`/`parsed_files` 자동 저장
-2. `rawTrackPoints` 축적 → `consolidateFlights()` 실행
+1. ASS 파일 파싱 → DB `track_points`/`parsed_files` 자동 저장 + 포인트에 `radar_name` 태깅
+2. `rawTrackPoints` 축적 → `consolidateFlights()` 실행 (mode_s + radar_name 별 그룹핑)
 3. OpenSky 운항이력 매칭 (±5분 허용) + 미매칭 포인트 4시간 gap 분리
-4. 각 비행에 `detectLoss()` 적용 → `flights[]` 생성 (LossPoint 포함)
-5. 모든 UI가 `flights[]` 기반으로 표시
+4. 각 비행에 `detectLoss()` 적용 → `flights[]` 생성 (LossPoint 포함, `radar_name` 전파)
+5. 각 페이지에서 `radarSite.name`으로 필터링하여 선택 레이더 데이터만 표시
 
 ### 앱 재시작 복원
 - `useRestoreSavedData()` 훅: DB에서 파싱 데이터 + 레이더 설정 자동 복원
-- 복원 후 `consolidateFlights()` 재실행하여 `flights` 재생성
+- DB 반환 구조: `SavedParsedData.files[].track_points[]` (파일별 포인트 포함)
+- 복원 시 좌표 매칭으로 `radar_name` 태깅 후 `consolidateFlights()` 재실행
 
 ## Tauri IPC 명령
 | 명령 | 설명 |
@@ -268,6 +272,7 @@ public/                 # 정적 자산
 - **다중 고도**: 100ft 단위 200층 사전 계산 → 슬라이더로 실시간 전환
 - **Cone of Silence**: `heightAboveRadar / tan(maxElevDeg)` → 반경 계산
 - **GeoJSON 변환**: MapLibre fill-extrusion 레이어로 시각화
+- **동심 링 시각화**: 다중 고도 범위 시 안쪽 레이어를 홀(hole)로 뚫어 겹침 없는 스펙트럼 링 생성
 
 ## 기상 데이터 분석
 - **API**: Open-Meteo Archive (무료, 제한 없음)
@@ -308,10 +313,10 @@ public/                 # 정적 자산
 `id`, `name`, `registration`, `model`, `mode_s_code`, `organization`, `memo`, `active`
 
 ### TrackPoint
-`timestamp`, `mode_s`, `latitude`, `longitude`, `altitude`, `speed`, `heading`, `radar_type`(ssr/combined/psr/modes), `raw_data`
+`timestamp`, `mode_s`, `latitude`, `longitude`, `altitude`, `speed`, `heading`, `radar_type`(ssr/combined/psr/modes), `raw_data`, `radar_name?`(파싱 시 레이더 사이트명)
 
 ### Flight (핵심 분석 단위)
-`id`, `mode_s`, `aircraft_name?`, `callsign?`, `departure_airport?`, `arrival_airport?`, `start_time`, `end_time`, `track_points[]`, `loss_segments[]`, `loss_points[]`, `total_loss_time`, `total_track_time`, `loss_percentage`, `max_radar_range_km`, `match_type`("opensky"|"gap"|"manual")
+`id`, `mode_s`, `aircraft_name?`, `callsign?`, `departure_airport?`, `arrival_airport?`, `start_time`, `end_time`, `track_points[]`, `loss_segments[]`, `loss_points[]`, `total_loss_time`, `total_track_time`, `loss_percentage`, `max_radar_range_km`, `match_type`("opensky"|"gap"|"manual"), `radar_name?`(파싱 시 레이더 사이트명)
 
 ### RadarSite
 `name`, `latitude`, `longitude`, `altitude`, `antenna_height`, `range_nm`(제원상 지원범위 NM)
@@ -369,7 +374,8 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 - **Loss 호버**: 시작/종료 시각, 지속시간, 거리, 고도 상세 표시
 - **레이더 호버**: 사이트명, 지원범위, 좌표
 - **LOS 차트 크로스헤어**: SVG 마우스 추적 → 수직선 + 거리/지형고도/굴절선높이/여유고 실시간 표시
-- **LOS 포인트 핀**: 클릭 시 고정, 황색 stroke, 지도 위 해당 위치 하이라이트 연동
+- **LOS 포인트 핀**: 클릭 시 고정, 황색 stroke, 지도↔차트 양방향 하이라이트 연동
+- **LOS 맵 항적 포인트**: deck.gl ScatterplotLayer, 클릭 시 차트 핀 동기화 (externalHighlightIdx)
 - **LOS 건물 표시**: 경로 상 건물 높이/주소/용도 시각화
 - **소실분석 미니맵**: Leaflet Tooltip (시작/종료 마커에 시각, 고도, 좌표)
 - **데이터 테이블**: 선택 행 시각적 강조 (ring + 배경색)
@@ -417,7 +423,7 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 
 ## 비행 통합 로직 (src/utils/flightConsolidation.ts)
 - **`mergeFlightRecords()`**: OpenSky 같은 날 4시간 이내 출발/도착 분리 레코드 병합
-- **`consolidateFlights()`**: mode_s별 TrackPoint 그룹핑 → OpenSky 시간 매칭(±5분) → 미매칭 포인트 4시간 gap 분리
+- **`consolidateFlights()`**: mode_s+radar_name별 TrackPoint 그룹핑 → OpenSky 시간 매칭(±5분) → 미매칭 포인트 4시간 gap 분리
 - **`manualMergeFlights()`**: 사용자가 선택한 비행 수동 병합 (match_type="manual")
 - **`flightLabel()`**: `기체명 · 콜사인 · 출발→도착` 형식 비행 라벨
 

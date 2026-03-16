@@ -139,10 +139,14 @@ function templateDisplayLabel(tpl: ReportTemplate): string {
 }
 
 export default function ReportGeneration() {
-  const flights = useAppStore((s) => s.flights);
+  const allFlights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const losResults = useAppStore((s) => s.losResults);
   const radarSite = useAppStore((s) => s.radarSite);
+  const flights = useMemo(
+    () => allFlights.filter((f) => !f.radar_name || f.radar_name === radarSite.name),
+    [allFlights, radarSite.name],
+  );
   const weatherData = useAppStore((s) => s.weatherData);
   const reportMetadata = useAppStore((s) => s.reportMetadata);
 

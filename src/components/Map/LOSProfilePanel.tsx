@@ -44,6 +44,8 @@ interface Props {
   onLoaded?: () => void;
   /** 차트에서 항적 포인트 하이라이트 시 인덱스 콜백 (null이면 해제) */
   onTrackPointHighlight?: (idx: number | null) => void;
+  /** 맵에서 클릭한 항적 포인트 인덱스 (외부→차트 하이라이트) */
+  externalHighlightIdx?: number | null;
 }
 
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -90,7 +92,7 @@ function curvDrop43(dKm: number): number {
 
 
 
-export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight }: Props) {
+export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx }: Props) {
   const addLOSResult = useAppStore((s) => s.addLOSResult);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
@@ -106,6 +108,17 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const [hoveredTrackIdx, setHoveredTrackIdx] = useState<number | null>(null);
   const [pinnedTrackIdx, setPinnedTrackIdx] = useState<number | null>(null);
   const [hoveredBldgIdx, setHoveredBldgIdx] = useState<number | null>(null);
+  // 맵에서 클릭한 포인트 → 차트 핀 동기화
+  const prevExternalIdx = useRef<number | null | undefined>(undefined);
+  useEffect(() => {
+    if (externalHighlightIdx === prevExternalIdx.current) return;
+    prevExternalIdx.current = externalHighlightIdx;
+    if (externalHighlightIdx != null && externalHighlightIdx !== pinnedTrackIdx) {
+      setPinnedTrackIdx(externalHighlightIdx);
+    } else if (externalHighlightIdx == null && pinnedTrackIdx !== null) {
+      setPinnedTrackIdx(null);
+    }
+  }, [externalHighlightIdx]);
   // 드래그 패닝
   const isDragging = useRef(false);
   const dragStartX = useRef(0);

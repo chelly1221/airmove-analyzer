@@ -677,13 +677,13 @@ pub struct SavedFileInfo {
     pub radar_lon: f64,
     pub parse_errors: Vec<String>,
     pub parse_stats: Option<ParseStatistics>,
+    pub track_points: Vec<TrackPoint>,
 }
 
 /// 저장된 전체 데이터 (프론트엔드 반환용)
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct SavedParsedData {
     pub files: Vec<SavedFileInfo>,
-    pub track_points: Vec<TrackPoint>,
 }
 
 /// DB에서 모든 파싱 데이터 로드
@@ -705,26 +705,11 @@ pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
         .collect::<SqlResult<Vec<_>>>()?;
 
     let mut files = Vec::new();
-    let mut all_points = Vec::new();
 
     for (file_id, path, name, total_records, start_time, end_time, radar_lat, radar_lon, errors_json, stats_json) in &file_rows {
         let parse_errors: Vec<String> = serde_json::from_str(errors_json).unwrap_or_default();
         let parse_stats: Option<ParseStatistics> = stats_json.as_ref()
             .and_then(|s| serde_json::from_str(s).ok());
-
-        // name을 filename으로도 사용 (basename)
-        files.push(SavedFileInfo {
-            path: path.clone(),
-            name: name.clone(),
-            filename: name.clone(),
-            total_records: *total_records as usize,
-            start_time: *start_time,
-            end_time: *end_time,
-            radar_lat: *radar_lat,
-            radar_lon: *radar_lon,
-            parse_errors,
-            parse_stats,
-        });
 
         // 해당 파일의 track_points 로드
         let mut pt_stmt = conn.prepare(
@@ -749,12 +734,23 @@ pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
             })?
             .collect::<SqlResult<Vec<_>>>()?;
 
-        all_points.extend(points);
+        files.push(SavedFileInfo {
+            path: path.clone(),
+            name: name.clone(),
+            filename: name.clone(),
+            total_records: *total_records as usize,
+            start_time: *start_time,
+            end_time: *end_time,
+            radar_lat: *radar_lat,
+            radar_lon: *radar_lon,
+            parse_errors,
+            parse_stats,
+            track_points: points,
+        });
     }
 
     Ok(SavedParsedData {
         files,
-        track_points: all_points,
     })
 }
 

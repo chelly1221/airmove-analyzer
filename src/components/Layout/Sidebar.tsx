@@ -27,20 +27,6 @@ import { useAppStore } from "../../store";
 import { mergeFlightRecords } from "../../utils/flightConsolidation";
 import type { FlightRecord, PageId } from "../../types";
 
-/** 항공기별 색상 팔레트 (TrackMap과 동일) */
-const AIRCRAFT_COLORS: [number, number, number][] = [
-  [59, 130, 246],   // blue
-  [16, 185, 129],   // emerald
-  [139, 92, 246],   // violet
-  [6, 182, 212],    // cyan
-  [249, 115, 22],   // orange
-  [236, 72, 153],   // pink
-  [132, 204, 22],   // lime
-  [245, 158, 11],   // amber
-  [99, 102, 241],   // indigo
-  [20, 184, 166],   // teal
-];
-
 interface NavItem {
   id: PageId;
   label: string;
@@ -164,26 +150,24 @@ function MapFlightPanel() {
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
   const setSelectedFlightId = useAppStore((s) => s.setSelectedFlightId);
   const storeFlights = useAppStore((s) => s.flights);
+  const radarSiteName = useAppStore((s) => s.radarSite.name);
 
-  // 항공기 인덱스 → 색상 매핑
-  const acColorMap = useMemo(() => {
-    const m: Record<string, [number, number, number]> = {};
-    activeAircraft.forEach((ac, i) => {
-      m[ac.mode_s_code.toLowerCase()] = AIRCRAFT_COLORS[i % AIRCRAFT_COLORS.length];
-    });
-    return m;
-  }, [activeAircraft]);
+  // 선택된 레이더용 비행만 필터
+  const radarFilteredStoreFlights = useMemo(
+    () => storeFlights.filter((f) => !f.radar_name || f.radar_name === radarSiteName),
+    [storeFlights, radarSiteName],
+  );
 
   // FlightRecord → 대응하는 store Flight ID 찾기
   const findStoreFlightId = useCallback((f: FlightRecord): string | null => {
     const modeS = f.icao24.toUpperCase();
-    const matched = storeFlights.find((sf) =>
+    const matched = radarFilteredStoreFlights.find((sf) =>
       sf.mode_s.toUpperCase() === modeS &&
       sf.start_time <= f.last_seen + 300 &&
       sf.end_time >= f.first_seen - 300
     );
     return matched?.id ?? null;
-  }, [storeFlights]);
+  }, [radarFilteredStoreFlights]);
 
   // FlightRecord 고유 키 (병합 선택용)
   const flightRecordKey = useCallback(
@@ -463,7 +447,6 @@ function MapFlightPanel() {
               const acName = selectedAcId === "__ALL__"
                 ? icaoToName[f.icao24.toLowerCase()]
                 : undefined;
-              const pointColor = acColorMap[f.icao24.toLowerCase()] ?? [128, 128, 128];
               return (
                 <button
                   key={`${f.icao24}_${f.first_seen}`}
@@ -473,7 +456,7 @@ function MapFlightPanel() {
                       ? "ring-2 ring-[#a60739] bg-[#a60739]/10"
                       : isSelected ? "" : "hover:bg-gray-50"
                   }`}
-                  style={isSelected && !mergeMode ? { backgroundColor: `rgb(${pointColor[0]},${pointColor[1]},${pointColor[2]})` } : undefined}
+                  style={isSelected && !mergeMode ? { backgroundColor: '#e94560' } : undefined}
                 >
                   {/* 날짜 + 시각 + 시간 + 콜사인/항공기명 */}
                   <div className="flex items-center justify-between">

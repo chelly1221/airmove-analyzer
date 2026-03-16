@@ -1159,14 +1159,14 @@ export function BuildingDataSection() {
           <h2 className="text-lg font-semibold text-gray-800">건물 데이터 (GIS건물통합정보)</h2>
         </div>
         <a
-          href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?dsId=18"
+          href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=NA&dsId=18&listPageIndex=1"
           target="_blank"
           rel="noopener noreferrer"
           className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 transition-colors"
           onClick={(e) => {
             e.preventDefault();
             import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
-              openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?dsId=18")
+              openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=NA&dsId=18&listPageIndex=1")
             );
           }}
         >

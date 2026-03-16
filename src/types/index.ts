@@ -36,6 +36,8 @@ export interface TrackPoint {
   radar_type: "mode_ac" | "mode_ac_psr" | "mode_s_allcall" | "mode_s_rollcall" | "mode_s_allcall_psr" | "mode_s_rollcall_psr";
   /** Original bytes as number array */
   raw_data: number[];
+  /** 파싱 시 사용된 레이더 사이트 이름 (필터링용) */
+  radar_name?: string;
 }
 
 /** Loss 포인트 (개별 미탐지 스캔) */
@@ -290,6 +292,8 @@ export interface Flight {
   max_radar_range_km: number;
   /** 매칭 방식 */
   match_type: "opensky" | "gap" | "manual";
+  /** 파싱 시 사용된 레이더 사이트 이름 (필터링용) */
+  radar_name?: string;
 }
 
 /** 시간별 기상 데이터 (Open-Meteo Archive API) */

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Plane,
@@ -16,9 +17,14 @@ import { flightLabel } from "../utils/flightConsolidation";
 
 export default function Dashboard() {
   const navigate = useNavigate();
-  const flights = useAppStore((s) => s.flights);
+  const allFlights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const setActivePage = useAppStore((s) => s.setActivePage);
+  const radarSiteName = useAppStore((s) => s.radarSite.name);
+  const flights = useMemo(
+    () => allFlights.filter((f) => !f.radar_name || f.radar_name === radarSiteName),
+    [allFlights, radarSiteName],
+  );
 
   const totalFlights = flights.length;
   const totalLossPoints = flights.reduce(

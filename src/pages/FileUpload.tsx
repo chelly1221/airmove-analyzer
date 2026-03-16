@@ -1319,7 +1319,11 @@ export default function FileUpload() {
         modeSFilter,
       });
 
-      // 원시 포인트 축적
+      // 원시 포인트에 radar_name 태깅 후 축적
+      const radarName = useAppStore.getState().radarSite.name;
+      for (const p of result.file_info.track_points) {
+        p.radar_name = radarName;
+      }
       appendRawTrackPoints(result.file_info.track_points);
 
       // 파싱 통계 저장

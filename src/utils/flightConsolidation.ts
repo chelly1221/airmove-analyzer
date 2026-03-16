@@ -109,14 +109,14 @@ export function consolidateFlights(
   // OpenSky 비행 기록 병합 (같은 날 4시간 이내)
   const mergedHistory = mergeFlightRecords(flightHistory);
 
-  // mode_s별 그룹핑 (대소문자 정규화)
-  const byModeS = new Map<string, TrackPoint[]>();
+  // mode_s + radar_name 별 그룹핑 (대소문자 정규화)
+  const byModeSRadar = new Map<string, TrackPoint[]>();
   for (const p of allTrackPoints) {
-    const key = p.mode_s.toUpperCase();
-    let arr = byModeS.get(key);
+    const key = `${p.mode_s.toUpperCase()}|${p.radar_name ?? ""}`;
+    let arr = byModeSRadar.get(key);
     if (!arr) {
       arr = [];
-      byModeS.set(key, arr);
+      byModeSRadar.set(key, arr);
     }
     arr.push(p);
   }
@@ -131,7 +131,8 @@ export function consolidateFlights(
 
   const flights: Flight[] = [];
 
-  for (const [modeS, points] of byModeS) {
+  for (const [groupKey, points] of byModeSRadar) {
+    const [modeS, radarName] = groupKey.split("|");
     points.sort((a, b) => a.timestamp - b.timestamp);
 
     const ac = aircraftByModeS.get(modeS.toUpperCase());
@@ -173,6 +174,7 @@ export function consolidateFlights(
         fr.callsign?.trim() || undefined,
         fr.est_departure_airport ?? undefined,
         fr.est_arrival_airport ?? undefined,
+        radarName || undefined,
       );
       flights.push(flight);
     }
@@ -182,7 +184,8 @@ export function consolidateFlights(
     if (unmatched.length > 0) {
       const groups = splitByGap(unmatched, GAP_THRESHOLD_SECS);
       for (const group of groups) {
-        const flight = buildFlight(modeS, group, radarSite, "gap", ac?.name);
+        const flight = buildFlight(modeS, group, radarSite, "gap", ac?.name,
+          undefined, undefined, undefined, radarName || undefined);
         flights.push(flight);
       }
     }
@@ -204,6 +207,7 @@ function buildFlight(
   callsign?: string,
   departure?: string,
   arrival?: string,
+  radarName?: string,
 ): Flight {
   points.sort((a, b) => a.timestamp - b.timestamp);
 
@@ -222,7 +226,7 @@ function buildFlight(
       start_time: 0, end_time: 0,
       track_points: [], loss_points: [], loss_segments: [],
       total_loss_time: 0, total_track_time: 0, loss_percentage: 0,
-      max_radar_range_km: 0, match_type: matchType,
+      max_radar_range_km: 0, match_type: matchType, radar_name: radarName,
     };
   }
 
@@ -262,6 +266,7 @@ function buildFlight(
     loss_percentage: lossPercentage,
     max_radar_range_km: maxRadarRangeKm,
     match_type: matchType,
+    radar_name: radarName,
   };
 }
 
@@ -288,9 +293,10 @@ export function manualMergeFlights(
   const departure = sorted.find((f) => f.departure_airport)?.departure_airport;
   const arrival = [...sorted].reverse().find((f) => f.arrival_airport)?.arrival_airport;
 
+  const radarNameVal = sorted.find((f) => f.radar_name)?.radar_name;
   return buildFlight(
     modeS, allPoints, radarSite, "manual", aircraftName,
-    callsign, departure, arrival,
+    callsign, departure, arrival, radarNameVal,
   );
 }
 

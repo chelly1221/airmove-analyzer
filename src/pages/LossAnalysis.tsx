@@ -49,9 +49,13 @@ function haversineKm(
 
 
 export default function LossAnalysis() {
-  const flights = useAppStore((s) => s.flights);
+  const allFlights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
   const radarSite = useAppStore((s) => s.radarSite);
+  const flights = useMemo(
+    () => allFlights.filter((f) => !f.radar_name || f.radar_name === radarSite.name),
+    [allFlights, radarSite.name],
+  );
   const setPanoramaViewActive = useAppStore((s) => s.setPanoramaViewActive);
   const setPanoramaActivePointStore = useAppStore((s) => s.setPanoramaActivePoint);
   const setPanoramaPinnedStore = useAppStore((s) => s.setPanoramaPinned);
