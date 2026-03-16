@@ -497,5 +497,5 @@ export default function App() {
 
 /** 페이지 래퍼 - 패딩과 스크롤 */
 function PageWrapper({ children }: { children: React.ReactNode }) {
-  return <div className="h-full overflow-auto p-6">{children}</div>;
+  return <div className="relative h-full overflow-auto p-6">{children}</div>;
 }

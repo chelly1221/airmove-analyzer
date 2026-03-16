@@ -35,7 +35,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, AdsbTrack, GarblePoint } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
-import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrainProfile, invalidateTerrainCache, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
+import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
 import { fetchCloudGrid, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 
 /**
@@ -148,6 +148,7 @@ export default function TrackMap() {
 
   // 레이더 커버리지 (범위 슬라이더: min~max)
   const [coverageAlt, setCoverageAlt] = useState(10000); // 커버리지 고도 (ft)
+  const [coverageAltInput, setCoverageAltInput] = useState(10000); // 디바운스용 입력값
   const [terrainProfile, setTerrainProfile] = useState<CoverageTerrainProfile | null>(null);
   const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
   const coverageVisible = useAppStore((s) => s.coverageVisible);
@@ -156,8 +157,15 @@ export default function TrackMap() {
   const setCoverageLoading = useAppStore((s) => s.setCoverageLoading);
   const coverageProgress = useAppStore((s) => s.coverageProgress);
   const setCoverageProgress = useAppStore((s) => s.setCoverageProgress);
+  const coverageProgressPct = useAppStore((s) => s.coverageProgressPct);
+  const setCoverageProgressPct = useAppStore((s) => s.setCoverageProgressPct);
+  const coverageError = useAppStore((s) => s.coverageError);
+  const setCoverageError = useAppStore((s) => s.setCoverageError);
+  const setCoverageData = useAppStore((s) => s.setCoverageData);
+  const [showConeOfSilence, setShowConeOfSilence] = useState(true);
   const coverageAltRef = useRef<HTMLDivElement>(null);
   const [coverageModalOpen, setCoverageModalOpen] = useState(false);
+  const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // LOS Analysis state
   const [losMode, setLosMode] = useState(false);
@@ -501,16 +509,19 @@ export default function TrackMap() {
     }
   }, [terrainEnabled]);
 
-  // 레이더 사이트 변경 시 커버리지 캐시 무효화
+  // 레이더 사이트 변경 시 커버리지 캐시 무효화 (이름+좌표+고도 모두 비교)
   useEffect(() => {
-    setTerrainProfile(null);
-    setCoverageLayers([]);
-    setCoverageVisible(false);
-  }, [radarSite.name]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!isCacheValidFor(radarSite)) {
+      setTerrainProfile(null);
+      setCoverageLayers([]);
+      setCoverageVisible(false);
+      setCoverageError("");
+    }
+  }, [radarSite.name, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** 고도 비율 → 색상 매핑 */
   const altToColor = useCallback((altFt: number): [number, number, number] => {
-    const r = Math.min(1, Math.max(0, (altFt - 100) / 19900));
+    const r = Math.min(1, Math.max(0, (altFt - COVERAGE_MIN_ALT_FT) / (COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT)));
     return r < 0.25 ? [239, 68, 68]
       : r < 0.5 ? [249, 115, 22]
       : r < 0.75 ? [234, 179, 8]
@@ -533,7 +544,7 @@ export default function TrackMap() {
       const polygon: [number, number, number][][] = [outerRing];
       let coneRing: [number, number, number][] | null = null;
 
-      if (layer.coneRadiusKm > 0.5) {
+      if (showConeOfSilence && layer.coneRadiusKm > 0.5) {
         const hole: [number, number, number][] = [];
         for (let i = CONE_PTS; i >= 0; i--) {
           const deg = (i / CONE_PTS) * 360;
@@ -558,7 +569,7 @@ export default function TrackMap() {
       const fillColor = altToColor(layer.altitudeFt);
       return { polygon, outerRing, coneRing, fillColor, altM, altFt: layer.altitudeFt };
     });
-  }, [coverageLayers, coverageVisible, altScale, radarSite, altToColor]);
+  }, [coverageLayers, coverageVisible, altScale, radarSite, altToColor, showConeOfSilence]);
 
   // Garble 포인트 시간 필터링 (가시 범위 내만 표시)
   const filteredGarblePoints = useMemo(() => {
@@ -637,47 +648,77 @@ export default function TrackMap() {
     }
   }, [flights, radarSite, setCloudGrid, setCloudGridVisible, setCloudGridLoading, setCloudGridProgress, setWeatherData, setWeatherLoading]);
 
-  /** 커버리지 맵 계산 시작 — 지형 프로파일 한번 계산 후 캐시 */
+  /** 커버리지 맵 계산 시작 — 지형 프로파일 한번 계산 후 캐시 (백그라운드 작동) */
   const startCoverageCompute = useCallback(async (force = false) => {
     setCoverageLoading(true);
+    setCoverageError("");
+    setCoverageProgressPct(0);
     setCoverageProgress("준비 중...");
     try {
-      // 강제 재계산이면 캐시 무효화
       if (force) invalidateTerrainCache();
 
-      const profile = await computeCoverageTerrainProfile(radarSite, (_pct, msg) => {
+      const profile = await computeCoverageTerrainProfile(radarSite, (pct, msg) => {
+        setCoverageProgressPct(pct);
         setCoverageProgress(msg);
       });
       setTerrainProfile(profile);
-
-      // useEffect에서 범위 내 레이어 자동 생성됨
       setCoverageVisible(true);
+
+      // DB에 대표 레이어 저장 (보고서 재활용)
+      const repAlts = [500, 1000, 2000, 3000, 5000, 10000, 15000, 20000];
+      const repLayers = repAlts.map((alt) => computeLayerFromProfile(profile, alt));
+      setCoverageData({
+        radarName: radarSite.name,
+        radarLat: radarSite.latitude,
+        radarLon: radarSite.longitude,
+        radarAltitude: radarSite.altitude,
+        antennaHeight: radarSite.antenna_height,
+        maxElevDeg: profile.maxElevDeg,
+        layers: repLayers,
+        computedAt: Date.now(),
+      });
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
       console.error("커버리지 계산 실패:", err);
-      setCoverageProgress("");
+      setCoverageError(`계산 실패: ${errMsg}`);
     } finally {
       setCoverageLoading(false);
       setCoverageProgress("");
+      setCoverageProgressPct(0);
     }
-  }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageVisible]);
+  }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
+
+  // 슬라이더 디바운스: 입력값 변경 → 300ms 후 실제 고도 반영
+  const handleCoverageAltChange = useCallback((val: number) => {
+    setCoverageAltInput(val);
+    if (coverageAltTimerRef.current) clearTimeout(coverageAltTimerRef.current);
+    coverageAltTimerRef.current = setTimeout(() => setCoverageAlt(val), 150);
+  }, []);
+
+  // ESC 키로 모달 닫기
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && coverageModalOpen) setCoverageModalOpen(false);
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [coverageModalOpen]);
 
   // 고도 슬라이더 변경 시 레이어들 재계산 (100ft ~ 선택 고도까지 전부 겹침)
   useEffect(() => {
     const profile = terrainProfile || getCachedTerrainProfile();
     if (!profile || !coverageVisible) return;
 
-    // 100ft부터 선택 고도까지 적절한 간격으로 레이어 생성 (최대 20개)
-    const range = coverageAlt - 100;
+    const range = coverageAlt - COVERAGE_MIN_ALT_FT;
     let step: number;
-    if (range <= 2000) step = 100;
+    if (range <= 2000) step = COVERAGE_ALT_STEP_FT;
     else if (range <= 5000) step = 500;
     else step = 1000;
 
     const layers: CoverageLayer[] = [];
-    for (let alt = 100; alt <= coverageAlt; alt += step) {
+    for (let alt = COVERAGE_MIN_ALT_FT; alt <= coverageAlt; alt += step) {
       layers.push(computeLayerFromProfile(profile, alt));
     }
-    // 선택 고도가 정확히 포함되지 않았으면 추가
     if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== coverageAlt) {
       layers.push(computeLayerFromProfile(profile, coverageAlt));
     }
@@ -2013,94 +2054,161 @@ export default function TrackMap() {
 
         {/* 레이더 커버리지 맵 */}
         <div ref={coverageAltRef} className="relative">
-          {coverageLoading ? (
-            <div className="flex items-center gap-1 rounded-lg bg-red-50 px-2 py-1.5 text-[10px] text-[#a60739]">
-              <Loader2 size={14} className="animate-spin" />
-              <span className="max-w-[140px] truncate">{coverageProgress}</span>
-            </div>
-          ) : (
-            <button
-              onClick={() => {
-                if (terrainProfile && terrainProfile.radarName === radarSite.name) {
-                  setCoverageModalOpen(true);
-                } else {
-                  startCoverageCompute().then(() => setCoverageModalOpen(true));
-                }
-              }}
-              className={`rounded-lg p-1.5 transition-colors ${
-                coverageVisible && coverageLayers.length > 0
-                  ? "bg-[#a60739] text-white shadow-sm"
-                  : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-              }`}
-              title="레이더 커버리지 맵"
-            >
-              <CoverageIcon size={16} />
-            </button>
-          )}
+          <button
+            onClick={() => setCoverageModalOpen(true)}
+            className={`rounded-lg p-1.5 transition-colors relative ${
+              coverageVisible && coverageLayers.length > 0
+                ? "bg-[#a60739] text-white shadow-sm"
+                : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+            }`}
+            title="레이더 커버리지 맵"
+          >
+            <CoverageIcon size={16} />
+            {coverageLoading && (
+              <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#a60739] opacity-60" />
+                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[#a60739]" />
+              </span>
+            )}
+          </button>
         </div>
 
         {/* 커버리지 모달 */}
         {coverageModalOpen && (
-          <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40" onClick={() => setCoverageModalOpen(false)}>
+          <div
+            className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="coverage-modal-title"
+            onClick={() => setCoverageModalOpen(false)}
+          >
             <div className="w-80 rounded-xl bg-white shadow-2xl border border-gray-200" onClick={(e) => e.stopPropagation()}>
               {/* 헤더 */}
               <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3">
-                <h3 className="text-sm font-semibold text-gray-800">레이더 커버리지 맵</h3>
-                <button onClick={() => setCoverageModalOpen(false)} className="text-gray-400 hover:text-gray-600 text-lg leading-none">&times;</button>
+                <h3 id="coverage-modal-title" className="text-sm font-semibold text-gray-800">레이더 커버리지 맵</h3>
+                <button
+                  onClick={() => setCoverageModalOpen(false)}
+                  className="text-gray-400 hover:text-gray-600 text-lg leading-none focus:outline-2 focus:outline-[#a60739] rounded"
+                  aria-label="커버리지 모달 닫기"
+                >
+                  &times;
+                </button>
               </div>
               {/* 본문 */}
               <div className="space-y-4 px-5 py-4">
-                {/* 표시/숨기기 토글 */}
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-600">커버리지 표시</span>
-                  <button
-                    onClick={() => setCoverageVisible(!coverageVisible)}
-                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${coverageVisible ? "bg-[#a60739]" : "bg-gray-300"}`}
-                  >
-                    <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${coverageVisible ? "translate-x-4.5" : "translate-x-0.5"}`} />
-                  </button>
-                </div>
 
-                {/* 고도 슬라이더 */}
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-600">표시 고도</span>
-                    <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-xs font-semibold text-[#a60739]">
-                      {coverageAlt.toLocaleString()}ft ({Math.round(coverageAlt * 0.3048)}m)
-                    </span>
+                {/* 계산 버튼 + 프로그레스 */}
+                {coverageLoading ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-xs text-[#a60739]">
+                      <Loader2 size={14} className="animate-spin flex-shrink-0" />
+                      <span className="truncate">{coverageProgress || "계산 중..."}</span>
+                    </div>
+                    <div className="h-2 w-full rounded-full bg-gray-200 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                        style={{ width: `${Math.max(2, coverageProgressPct)}%` }}
+                      />
+                    </div>
+                    <div className="text-right text-[10px] text-gray-400">{coverageProgressPct}%</div>
                   </div>
-                  <div className="relative h-6">
-                    <div className="absolute top-1/2 left-0 right-0 h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
-                    <div
-                      className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
-                      style={{ left: "0%", right: `${100 - ((coverageAlt - 100) / 19900) * 100}%` }}
-                    />
-                    <input
-                      type="range"
-                      min={100}
-                      max={20000}
-                      step={100}
-                      value={coverageAlt}
-                      onChange={(e) => setCoverageAlt(Number(e.target.value))}
-                      className="absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer"
-                    />
+                ) : (
+                  <div className="space-y-2">
+                    {!terrainProfile || !isCacheValidFor(radarSite) ? (
+                      <button
+                        onClick={() => startCoverageCompute(false)}
+                        className="w-full rounded-lg bg-[#a60739] py-2.5 text-xs font-medium text-white hover:bg-[#8a0630] transition-colors"
+                      >
+                        커버리지 계산 시작
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => startCoverageCompute(true)}
+                        className="w-full rounded-lg border border-gray-200 py-2 text-xs text-gray-600 hover:bg-gray-50 transition-colors"
+                      >
+                        지형 프로파일 재계산
+                      </button>
+                    )}
                   </div>
-                  <div className="flex justify-between text-[9px] text-gray-400">
-                    <span>100ft</span>
-                    <span>20,000ft</span>
-                  </div>
-                </div>
+                )}
 
-                {/* 재생성 버튼 */}
-                <button
-                  onClick={() => {
-                    setCoverageModalOpen(false);
-                    startCoverageCompute(true).then(() => setCoverageModalOpen(true));
-                  }}
-                  className="w-full rounded-lg border border-gray-200 py-2 text-xs text-gray-600 hover:bg-gray-50 transition-colors"
-                >
-                  지형 프로파일 재생성
-                </button>
+                {/* 에러 메시지 */}
+                {coverageError && (
+                  <div className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600">
+                    {coverageError}
+                  </div>
+                )}
+
+                {/* 아래 컨트롤은 프로파일 계산 완료 후 활성화 */}
+                {terrainProfile && isCacheValidFor(radarSite) && (
+                  <>
+                    {/* 구분선 */}
+                    <div className="border-t border-gray-100" />
+
+                    {/* 표시/숨기기 토글 */}
+                    <div className="flex items-center justify-between">
+                      <label htmlFor="coverage-toggle" className="text-xs text-gray-600">커버리지 표시</label>
+                      <button
+                        id="coverage-toggle"
+                        onClick={() => setCoverageVisible(!coverageVisible)}
+                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${coverageVisible ? "bg-[#a60739]" : "bg-gray-300"}`}
+                        role="switch"
+                        aria-checked={coverageVisible}
+                      >
+                        <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${coverageVisible ? "translate-x-4.5" : "translate-x-0.5"}`} />
+                      </button>
+                    </div>
+
+                    {/* Cone of Silence 토글 */}
+                    <div className="flex items-center justify-between">
+                      <label htmlFor="cone-toggle" className="text-xs text-gray-600">Cone of Silence 표시</label>
+                      <button
+                        id="cone-toggle"
+                        onClick={() => setShowConeOfSilence(!showConeOfSilence)}
+                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showConeOfSilence ? "bg-[#a60739]" : "bg-gray-300"}`}
+                        role="switch"
+                        aria-checked={showConeOfSilence}
+                      >
+                        <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${showConeOfSilence ? "translate-x-4.5" : "translate-x-0.5"}`} />
+                      </button>
+                    </div>
+
+                    {/* 고도 슬라이더 */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label htmlFor="coverage-altitude-slider" className="text-xs text-gray-600">표시 고도</label>
+                        <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-xs font-semibold text-[#a60739]">
+                          {coverageAltInput.toLocaleString()}ft ({Math.round(coverageAltInput * 0.3048).toLocaleString()}m)
+                        </span>
+                      </div>
+                      <div className="relative h-6">
+                        <div className="absolute top-1/2 left-0 right-0 h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
+                        <div
+                          className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
+                          style={{ left: "0%", right: `${100 - ((coverageAltInput - COVERAGE_MIN_ALT_FT) / (COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT)) * 100}%` }}
+                        />
+                        <input
+                          id="coverage-altitude-slider"
+                          type="range"
+                          min={COVERAGE_MIN_ALT_FT}
+                          max={COVERAGE_MAX_ALT_FT}
+                          step={COVERAGE_ALT_STEP_FT}
+                          value={coverageAltInput}
+                          onChange={(e) => handleCoverageAltChange(Number(e.target.value))}
+                          className="absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer"
+                          aria-valuemin={COVERAGE_MIN_ALT_FT}
+                          aria-valuemax={COVERAGE_MAX_ALT_FT}
+                          aria-valuenow={coverageAltInput}
+                          aria-valuetext={`${coverageAltInput.toLocaleString()}ft`}
+                        />
+                      </div>
+                      <div className="flex justify-between text-[9px] text-gray-400">
+                        <span>{COVERAGE_MIN_ALT_FT.toLocaleString()}ft</span>
+                        <span>{COVERAGE_MAX_ALT_FT.toLocaleString()}ft</span>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -2250,7 +2358,7 @@ export default function TrackMap() {
                 )}
                 {coverageVisible && coverageLayers.length > 0 && (() => {
                   const fmtAlt = (ft: number) => ft >= 1000 ? `${(ft / 1000).toFixed(ft % 1000 === 0 ? 0 : 1)}kft` : `${ft}ft`;
-                  const colorMin = altToColor(100);
+                  const colorMin = altToColor(COVERAGE_MIN_ALT_FT);
                   const colorMax = altToColor(coverageAlt);
                   return (
                     <div className="flex items-center gap-1.5">

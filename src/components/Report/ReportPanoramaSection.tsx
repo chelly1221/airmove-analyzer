@@ -220,39 +220,46 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
       </div>
 
       {/* 방위별 요약 테이블 */}
-      <div className="mb-4">
+      <div className="mb-4 overflow-hidden">
         <p className="mb-1.5 text-[10px] font-semibold text-gray-600">방위별 장애물 요약 (8방위)</p>
-        <table className="w-full border-collapse text-[9px]">
+        <table className="w-full table-fixed border-collapse text-[9px]">
+          <colgroup>
+            <col style={{ width: "10%" }} />
+            <col style={{ width: "13%" }} />
+            <col style={{ width: "15%" }} />
+            <col style={{ width: "12%" }} />
+            <col style={{ width: "50%" }} />
+          </colgroup>
           <thead>
             <tr className="bg-[#28283c] text-white">
-              <th className="border border-gray-300 px-2 py-1 text-center font-medium">방위</th>
-              <th className="border border-gray-300 px-2 py-1 text-center font-medium">범위</th>
-              <th className="border border-gray-300 px-2 py-1 text-right font-medium">최대 앙각(°)</th>
-              <th className="border border-gray-300 px-2 py-1 text-right font-medium">건물 수</th>
-              <th className="border border-gray-300 px-2 py-1 text-left font-medium">최대 장애물</th>
+              <th className="border border-gray-300 px-1.5 py-1 text-center font-medium">방위</th>
+              <th className="border border-gray-300 px-1.5 py-1 text-center font-medium">범위</th>
+              <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">최대 앙각(°)</th>
+              <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">건물 수</th>
+              <th className="border border-gray-300 px-1.5 py-1 text-left font-medium">최대 장애물</th>
             </tr>
           </thead>
           <tbody>
             {sectorStats.map((s, i) => (
               <tr key={s.label} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
-                <td className="border border-gray-200 px-2 py-1 text-center font-semibold">{s.label}</td>
-                <td className="border border-gray-200 px-2 py-1 text-center font-mono text-[8px] text-gray-500">
+                <td className="border border-gray-200 px-1.5 py-1 text-center font-semibold">{s.label}</td>
+                <td className="border border-gray-200 px-1.5 py-1 text-center font-mono text-[8px] text-gray-500">
                   {s.start}°–{s.end}°
                 </td>
-                <td className="border border-gray-200 px-2 py-1 text-right font-mono">
+                <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">
                   {s.maxAngle.toFixed(3)}
                 </td>
-                <td className="border border-gray-200 px-2 py-1 text-right">
+                <td className="border border-gray-200 px-1.5 py-1 text-right">
                   {s.buildings > 0 ? (
                     <span className="text-orange-600 font-medium">{s.buildings}</span>
                   ) : (
                     <span className="text-gray-400">0</span>
                   )}
                 </td>
-                <td className="border border-gray-200 px-2 py-1">
+                <td className="border border-gray-200 px-1.5 py-1 truncate">
                   {s.maxPt ? (
-                    <span>
-                      <span className={`inline-block rounded px-1 py-0.5 text-[8px] font-medium ${
+                    <span className="flex items-center gap-1">
+                      <span className={`inline-block shrink-0 rounded px-1 py-0.5 text-[8px] font-medium ${
                         s.maxPt.obstacle_type === "terrain"
                           ? "bg-green-50 text-green-600"
                           : s.maxPt.obstacle_type === "gis_building"
@@ -261,7 +268,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
                       }`}>
                         {obstacleLabel(s.maxPt.obstacle_type)}
                       </span>
-                      <span className="ml-1 text-gray-600">
+                      <span className="truncate text-gray-600">
                         {s.maxPt.distance_km.toFixed(1)}km
                         {s.maxPt.name ? ` · ${s.maxPt.name}` : ""}
                       </span>

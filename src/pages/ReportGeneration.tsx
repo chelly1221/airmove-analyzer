@@ -101,7 +101,6 @@ function getSectionToggles(template: ReportTemplate, _sections: ReportSections):
       { key: "cover", label: "표지" },
       { key: "obstacleSummary", label: "요약" },
       { key: "coverageMap", label: "커버리지" },
-      { key: "trackMap", label: "지도" },
       { key: "los", label: "LOS" },
       { key: "panorama", label: "파노라마" },
     ];
@@ -311,8 +310,8 @@ export default function ReportGeneration() {
       }
     }
 
-    // 맵 캡처 (선택 비행 기준)
-    if (sects.trackMap) {
+    // 맵 캡처 (선택 비행 기준, 장애물 보고서는 항적지도 불포함)
+    if (sects.trackMap && tpl !== "obstacle") {
       let targetFlights: Flight[];
       if (tpl === "flights" && flightIds) {
         targetFlights = flights.filter((f) => flightIds.has(f.id));
@@ -365,7 +364,6 @@ export default function ReportGeneration() {
     } else if (template === "obstacle") {
       if (sections.obstacleSummary) nums.obstacleSummary = n++;
       if (sections.coverageMap && coverageLayers.length > 0) nums.coverageMap = n++;
-      if (sections.trackMap) nums.trackMap = n++;
       if (sections.los && losResults.length > 0) nums.los = n++;
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else if (template === "single") {
@@ -494,9 +492,9 @@ export default function ReportGeneration() {
   const singleFlight = template === "single" ? reportFlights[0] : null;
 
   return (
-    <div className="-m-6 flex h-[calc(100%+48px)] flex-col">
+    <div className="absolute inset-0 z-10 flex flex-col">
       {/* 상단 툴바 */}
-      <div className="sticky top-0 z-20 flex items-center gap-3 border-b border-gray-200 bg-white px-4 py-2">
+      <div className="z-20 flex shrink-0 items-center gap-3 border-b border-gray-200 bg-white px-4 py-2">
         <button
           onClick={() => setMode("config")}
           className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-600 transition-colors hover:bg-gray-100"
@@ -638,22 +636,14 @@ export default function ReportGeneration() {
         {/* ─── 전파 장애물 ─── */}
         {template === "obstacle" && (
           <>
-            {(sections.obstacleSummary || sections.trackMap) && (
+            {sections.obstacleSummary && radarSite && (
               <ReportPage>
-                {sections.obstacleSummary && radarSite && (
-                  <ReportObstacleSummarySection
-                    sectionNum={sectionNumbers.obstacleSummary ?? 1}
-                    losResults={losResults}
-                    panoramaData={panoramaData}
-                    radarSite={radarSite}
-                  />
-                )}
-                {sections.trackMap && (
-                  <ReportMapSection
-                    sectionNum={sectionNumbers.trackMap ?? 2}
-                    mapImage={mapImage}
-                  />
-                )}
+                <ReportObstacleSummarySection
+                  sectionNum={sectionNumbers.obstacleSummary ?? 1}
+                  losResults={losResults}
+                  panoramaData={panoramaData}
+                  radarSite={radarSite}
+                />
               </ReportPage>
             )}
 
@@ -926,7 +916,6 @@ function TemplateConfigModal({
         { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
         { key: "obstacleSummary", label: "장애물 종합 요약", icon: Radio, desc: "LOS·파노라마 통합 KPI, 주요 장애물 TOP 5", available: losResults.length > 0 || panoramaData.length > 0 },
         { key: "coverageMap", label: "커버리지 맵", icon: Radio, desc: "고도별 스펙트럼 커버리지 극좌표 시각화", available: hasCoverage },
-        { key: "trackMap", label: "항적 지도", icon: Map, desc: "LOS 경로 및 장애물 위치 시각화", available: true },
         { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단/양호 상세 결과", available: losResults.length > 0 },
         { key: "panorama", label: "360° 파노라마", icon: Mountain, desc: "방위별 최대 앙각 장애물 및 건물 목록", available: panoramaData.length > 0 },
       ];
@@ -954,7 +943,8 @@ function TemplateConfigModal({
     ];
   })();
 
-  const canGenerate = isFlightsMode ? checkedIds.size > 0 : isSingleMode ? !!radioId : true;
+  const hasRadar = radarName.length > 0;
+  const canGenerate = hasRadar && (isFlightsMode ? checkedIds.size > 0 : isSingleMode ? !!radioId : true);
 
   return (
     <Modal open onClose={onClose} title={`${tplLabel} 보고서 설정`} width={needsFlightSelect ? "max-w-2xl" : "max-w-lg"}>
@@ -963,16 +953,20 @@ function TemplateConfigModal({
         <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
           <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12px]">
             <div className="flex justify-between">
+              <span className="text-gray-400">기관</span>
+              <span className="font-medium text-gray-700">{metadata.organization}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">레이더</span>
+              <span className="font-medium text-gray-700">{radarName || <span className="text-red-500">미선택</span>}</span>
+            </div>
+            <div className="flex justify-between">
               <span className="text-gray-400">부서</span>
               <span className="font-medium text-gray-700">{metadata.department}</span>
             </div>
             <div className="flex justify-between">
-              <span className="text-gray-400">레이더</span>
-              <span className="font-medium text-gray-700">{radarName}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-gray-400">기관</span>
-              <span className="font-medium text-gray-700">{metadata.organization}</span>
+              <span className="text-gray-400">현장</span>
+              <span className="font-medium text-gray-700">{metadata.siteName || "—"}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-gray-400">작성자</span>
@@ -1113,7 +1107,10 @@ function TemplateConfigModal({
         </div>
 
         {/* 생성 버튼 */}
-        <div className="flex justify-end gap-2 pt-1">
+        <div className="flex items-center justify-end gap-2 pt-1">
+          {!hasRadar && (
+            <span className="mr-auto text-xs text-red-500">레이더를 먼저 선택해 주세요 (설정 &gt; 레이더 사이트)</span>
+          )}
           <button
             onClick={onClose}
             className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 transition-colors"

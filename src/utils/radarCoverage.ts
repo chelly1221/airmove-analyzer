@@ -62,6 +62,11 @@ const MAX_ELEVATION_DEG = 40;
 /** ft → m 변환 */
 const FT_TO_M = 0.3048;
 
+/** 커버리지 고도 범위 상수 */
+export const COVERAGE_MIN_ALT_FT = 100;
+export const COVERAGE_MAX_ALT_FT = 20000;
+export const COVERAGE_ALT_STEP_FT = 100;
+
 // ─── 지형 프로파일 캐시 기반 아키텍처 ─────────────────────────────
 
 /** 건물 정보 (커버리지 계산용) */
@@ -244,6 +249,17 @@ export function getCachedTerrainProfile(): CoverageTerrainProfile | null {
   return _cachedProfile;
 }
 
+/** 캐시가 해당 레이더 사이트에 유효한지 확인 (이름+좌표+고도 기반) */
+export function isCacheValidFor(radar: RadarSite): boolean {
+  if (!_cachedProfile) return false;
+  return (
+    _cachedProfile.radarName === radar.name &&
+    _cachedProfile.radarLat === radar.latitude &&
+    _cachedProfile.radarLon === radar.longitude &&
+    _cachedProfile.radarHeight === radar.altitude + radar.antenna_height
+  );
+}
+
 /** 캐시 무효화 */
 export function invalidateTerrainCache(): void {
   _cachedProfile = null;
@@ -322,9 +338,8 @@ export async function computeMultiAltitudeCoverage(
 ): Promise<MultiCoverageResult> {
   const profile = await computeCoverageTerrainProfile(radar, onProgress);
 
-  // 100ft 단위로 200개 레이어 (100ft ~ 20000ft)
   const layers: CoverageLayer[] = [];
-  for (let altFt = 100; altFt <= 20000; altFt += 100) {
+  for (let altFt = COVERAGE_MIN_ALT_FT; altFt <= COVERAGE_MAX_ALT_FT; altFt += COVERAGE_ALT_STEP_FT) {
     layers.push(computeLayerFromProfile(profile, altFt));
   }
 

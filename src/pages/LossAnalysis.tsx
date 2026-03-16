@@ -556,11 +556,20 @@ export default function LossAnalysis() {
   const panoramaActiveIdx = panoramaPinnedIdx ?? panoramaHoverIdx;
   const panoramaActivePoint = panoramaActiveIdx !== null ? filteredPanoramaData[panoramaActiveIdx] : null;
 
-  // 활성 포인트를 스토어에 동기화 (사이드바 표시용)
+  // 활성 포인트를 스토어에 동기화 (사이드바 표시용) — 지형인 경우 산 이름 보강
   useEffect(() => {
-    setPanoramaActivePointStore(panoramaActivePoint);
+    if (panoramaActivePoint && panoramaActivePoint.obstacle_type === "terrain" && panoramaActiveIdx !== null) {
+      const peakName = panoramaPeakNames.get(panoramaActiveIdx);
+      if (peakName) {
+        setPanoramaActivePointStore({ ...panoramaActivePoint, name: peakName });
+      } else {
+        setPanoramaActivePointStore(panoramaActivePoint);
+      }
+    } else {
+      setPanoramaActivePointStore(panoramaActivePoint);
+    }
     setPanoramaPinnedStore(panoramaPinnedIdx !== null);
-  }, [panoramaActivePoint, panoramaPinnedIdx, setPanoramaActivePointStore, setPanoramaPinnedStore]);
+  }, [panoramaActivePoint, panoramaActiveIdx, panoramaPinnedIdx, panoramaPeakNames, setPanoramaActivePointStore, setPanoramaPinnedStore]);
 
   const handlePanoramaMouseMove = useCallback(
     (e: React.MouseEvent<SVGSVGElement>) => {

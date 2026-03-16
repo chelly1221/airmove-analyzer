@@ -118,6 +118,7 @@ function MapFlightPanel() {
   const openskySync = useAppStore((s) => s.openskySync);
   const openskySyncProgress = useAppStore((s) => s.openskySyncProgress);
   const mergeFlights = useAppStore((s) => s.mergeFlights);
+  const setFlightHistory = useAppStore((s) => s.setFlightHistory);
 
   const activeAircraft = useMemo(
     () => aircraft.filter((a) => a.active && a.mode_s_code),
@@ -221,6 +222,26 @@ function MapFlightPanel() {
     }
   };
 
+  // flightHistory에서 선택된 FlightRecord들을 하나로 병합
+  const mergeSelectedFlightHistory = () => {
+    const selectedRecords = flights.filter((f) => mergeSelection.has(flightRecordKey(f)));
+    if (selectedRecords.length < 2) return;
+    const selectedKeys = new Set(selectedRecords.map((r) => flightRecordKey(r)));
+    const sorted = [...selectedRecords].sort((a, b) => a.first_seen - b.first_seen);
+    const mergedRecord: FlightRecord = {
+      ...sorted[0],
+      first_seen: Math.min(...sorted.map((r) => r.first_seen)),
+      last_seen: Math.max(...sorted.map((r) => r.last_seen)),
+      est_departure_airport: sorted.find((r) => r.est_departure_airport)?.est_departure_airport ?? null,
+      est_arrival_airport: [...sorted].reverse().find((r) => r.est_arrival_airport)?.est_arrival_airport ?? null,
+      callsign: sorted.find((r) => r.callsign)?.callsign ?? null,
+    };
+    // 원본 flightHistory에서 선택된 레코드 제거 + 병합본 추가
+    const currentHistory = useAppStore.getState().flightHistory;
+    const remaining = currentHistory.filter((r) => !selectedKeys.has(flightRecordKey(r)));
+    setFlightHistory([...remaining, mergedRecord]);
+  };
+
   // 병합 실행: FlightRecord 키 → store Flight ID 매핑 후 병합
   const handleMerge = () => {
     if (mergeSelection.size < 2) return;
@@ -313,6 +334,7 @@ function MapFlightPanel() {
           .map((sf) => sf.id));
         const remaining = currentFlights.filter((f) => !overlapping.has(f.id));
         state.setFlights([...remaining, mergedFlight].sort((a, b) => a.start_time - b.start_time));
+        mergeSelectedFlightHistory();
         setMergeMode(false);
         setMergeSelection(new Set());
         setSelectedFlightId(null);
@@ -327,6 +349,7 @@ function MapFlightPanel() {
       return;
     }
     mergeFlights(Array.from(storeFlightIds));
+    mergeSelectedFlightHistory();
     setMergeMode(false);
     setMergeSelection(new Set());
     setSelectedFlightId(null);
@@ -682,8 +705,9 @@ function ReportMetadataPanel() {
   const [modalOpen, setModalOpen] = useState(false);
 
   const fields = [
-    { label: "부서", value: reportMetadata.department },
     { label: "기관", value: reportMetadata.organization },
+    { label: "부서", value: reportMetadata.department },
+    { label: "현장", value: reportMetadata.siteName },
     { label: "작성자", value: reportMetadata.author || "—" },
     { label: "문서접두", value: reportMetadata.docPrefix },
   ];
@@ -725,17 +749,18 @@ function ReportMetadataModal({
   onSave,
   onClose,
 }: {
-  metadata: { department: string; author: string; docPrefix: string; organization: string; footer: string };
+  metadata: { department: string; author: string; docPrefix: string; organization: string; siteName: string; footer: string };
   onSave: (meta: Partial<typeof metadata>) => void;
   onClose: () => void;
 }) {
   const [form, setForm] = useState({ ...metadata });
 
   const fields: { key: keyof typeof form; label: string; placeholder: string }[] = [
-    { key: "department", label: "부서명", placeholder: "예: 비행점검센터" },
-    { key: "organization", label: "기관명", placeholder: "예: 항공교통본부" },
+    { key: "organization", label: "기관명", placeholder: "예: 김포공항" },
+    { key: "department", label: "부서명", placeholder: "예: 레이더관제부" },
+    { key: "siteName", label: "현장명", placeholder: "예: 레이더송신소" },
     { key: "author", label: "작성자", placeholder: "예: 홍길동" },
-    { key: "docPrefix", label: "문서번호 접두사", placeholder: "예: 레이더분석" },
+    { key: "docPrefix", label: "문서번호 접두사", placeholder: "예: RDR-RPT" },
     { key: "footer", label: "하단 푸터", placeholder: "보고서 하단 문구" },
   ];
 
@@ -806,17 +831,17 @@ function PanoramaObstaclePanel() {
   return (
     <div className="flex flex-col gap-2 px-3 py-2">
       {/* 유형 뱃지 + 이름 + 고정 상태 */}
-      <div className="flex items-center gap-1.5">
-        <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${typeColor}`}>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className={`shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium ${typeColor}`}>
           {typeLabel}
         </span>
         {pinned && (
-          <span className="rounded bg-yellow-100 px-1 py-0.5 text-[9px] text-yellow-700">
+          <span className="shrink-0 whitespace-nowrap rounded bg-yellow-100 px-1 py-0.5 text-[9px] text-yellow-700">
             고정
           </span>
         )}
         {pt.name && (
-          <span className="text-[11px] font-semibold text-gray-800 truncate" title={pt.name}>
+          <span className="min-w-0 text-[11px] font-semibold text-gray-800 truncate" title={pt.name}>
             {pt.name}
           </span>
         )}

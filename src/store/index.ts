@@ -136,6 +136,10 @@ interface AppState {
   setCoverageLoading: (v: boolean) => void;
   coverageProgress: string;
   setCoverageProgress: (msg: string) => void;
+  coverageProgressPct: number;
+  setCoverageProgressPct: (pct: number) => void;
+  coverageError: string;
+  setCoverageError: (msg: string) => void;
 
   // 기상 데이터
   weatherData: WeatherSnapshot | null;
@@ -402,6 +406,10 @@ export const useAppStore = create<AppState>((set) => ({
   setCoverageLoading: (v) => set({ coverageLoading: v }),
   coverageProgress: "",
   setCoverageProgress: (msg) => set({ coverageProgress: msg }),
+  coverageProgressPct: 0,
+  setCoverageProgressPct: (pct) => set({ coverageProgressPct: pct }),
+  coverageError: "",
+  setCoverageError: (msg) => set({ coverageError: msg }),
 
   // 기상 데이터
   weatherData: null,
@@ -421,10 +429,11 @@ export const useAppStore = create<AppState>((set) => ({
 
   // 보고서 메타데이터
   reportMetadata: {
-    department: "비행점검센터",
+    department: "레이더관제부",
     author: "",
-    docPrefix: "레이더분석",
-    organization: "항공교통본부",
+    docPrefix: "RDR-RPT",
+    organization: "김포공항",
+    siteName: "레이더송신소",
     footer: "비행검사기 항적 분석 체계 - 자동 생성 보고서",
   },
   setReportMetadata: (meta) =>

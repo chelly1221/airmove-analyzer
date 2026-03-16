@@ -18,7 +18,7 @@ interface CoverPageProps {
 const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
   ({ template: _template, radarName, metadata, editable, title, onTitleChange, subtitle, onSubtitleChange }, ref) => {
     const now = new Date();
-    const docNum = `${metadata.docPrefix}-${format(now, "yyyy")}-${String(now.getMonth() + 1).padStart(3, "0")}`;
+    const docNum = `${metadata.docPrefix}-${format(now, "yyyyMMdd")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
 
     return (
       <ReportPage ref={ref}>
@@ -27,7 +27,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
 
         {/* 문서 헤더 */}
         <div className="mt-3 flex justify-between text-[11px] text-gray-500">
-          <span>{metadata.department}</span>
+          <span>{metadata.organization} {metadata.department}{metadata.siteName ? ` · ${metadata.siteName}` : ""}</span>
           <span>문서번호: {docNum}</span>
         </div>
         <div className="mt-1 flex justify-between text-[11px] text-gray-500">
@@ -40,7 +40,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
         {/* 중앙 제목 영역 */}
         <div className="flex flex-col items-center justify-center" style={{ marginTop: "80mm" }}>
           <div className="mb-6 text-[13px] tracking-[0.3em] text-gray-400">
-            {metadata.organization}
+            {metadata.organization}{metadata.siteName ? ` ${metadata.siteName}` : ""}
           </div>
 
           <EditableText
