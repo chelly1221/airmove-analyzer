@@ -833,6 +833,30 @@ export default function LossAnalysis() {
                             pickable: true,
                             radiusMinPixels: 4,
                             radiusMaxPixels: 20,
+                            onHover: (info: { object?: PanoramaPoint }) => {
+                              if (panoramaPinnedIdx !== null) return; // 핀 고정 시 호버 무시
+                              if (!info.object) {
+                                setPanoramaHoverIdx(null);
+                                return;
+                              }
+                              const hovered = info.object;
+                              let bestIdx = -1;
+                              let bestDist = Infinity;
+                              for (let i = 0; i < filteredPanoramaData.length; i++) {
+                                const pt = filteredPanoramaData[i];
+                                if (pt.obstacle_type === "terrain") continue;
+                                const dlat = pt.lat - hovered.lat;
+                                const dlon = pt.lon - hovered.lon;
+                                const dist = dlat * dlat + dlon * dlon;
+                                if (dist < bestDist) {
+                                  bestDist = dist;
+                                  bestIdx = i;
+                                }
+                              }
+                              if (bestIdx >= 0) {
+                                setPanoramaHoverIdx(bestIdx);
+                              }
+                            },
                             onClick: (info: { object?: PanoramaPoint }) => {
                               if (!info.object) return;
                               // 클릭한 건물의 좌표로 filteredPanoramaData에서 가장 가까운 인덱스 찾기

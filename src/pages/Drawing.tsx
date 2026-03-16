@@ -65,6 +65,14 @@ export default function Drawing() {
   const [draggingHandle, setDraggingHandle] = useState<"start" | "end" | null>(null);
   const rangeBarRef = useRef<HTMLDivElement>(null);
 
+  // 타임라인 줌 (스크롤로 확대/축소)
+  const [zoomView, setZoomView] = useState<[number, number]>([0, 100]);
+  const zoomViewRef = useRef<[number, number]>([0, 100]);
+  const zoomVStart = zoomView[0];
+  const zoomVEnd = zoomView[1];
+  const zoomRange = zoomVEnd - zoomVStart;
+  const absToScreen = (abs: number) => zoomRange > 0 ? ((abs - zoomVStart) / zoomRange) * 100 : 0;
+
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
@@ -75,11 +83,36 @@ export default function Drawing() {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  // 비행 선택 변경 시 구간 핸들 초기화
+  // 비행 선택 변경 시 구간 핸들 + 줌 초기화
   useEffect(() => {
     setRangeStart(0);
     setRangeEnd(100);
+    zoomViewRef.current = [0, 100];
+    setZoomView([0, 100]);
   }, [selectedFlightId]);
+
+  // 타임라인 스크롤 줌
+  useEffect(() => {
+    const el = rangeBarRef.current;
+    if (!el) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const mouseRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const [vs, ve] = zoomViewRef.current;
+      const cursorAbs = vs + mouseRatio * (ve - vs);
+      const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+      let newRange = Math.max(0.005, Math.min(100, (ve - vs) * factor));
+      let ns = cursorAbs - mouseRatio * newRange;
+      let ne = ns + newRange;
+      if (ns < 0) { ns = 0; ne = Math.min(100, newRange); }
+      if (ne > 100) { ne = 100; ns = Math.max(0, 100 - newRange); }
+      zoomViewRef.current = [ns, ne];
+      setZoomView([ns, ne]);
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
+  }, []);
 
   // 포인트 필터링
   const { filteredPoints, colorMap, legendEntries } = useMemo(() => {
@@ -217,11 +250,14 @@ export default function Drawing() {
     (e: React.PointerEvent) => {
       if (!draggingHandle || !rangeBarRef.current) return;
       const rect = rangeBarRef.current.getBoundingClientRect();
-      const pct = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+      const scrPct = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+      // 화면 좌표 → 절대 좌표 변환
+      const [vs, ve] = zoomViewRef.current;
+      const absPct = Math.max(0, Math.min(100, vs + (scrPct / 100) * (ve - vs)));
       if (draggingHandle === "start") {
-        setRangeStart(Math.min(pct, rangeEnd - 0.5));
+        setRangeStart(Math.min(absPct, rangeEnd - 0.5));
       } else {
-        setRangeEnd(Math.max(pct, rangeStart + 0.5));
+        setRangeEnd(Math.max(absPct, rangeStart + 0.5));
       }
     },
     [draggingHandle, rangeStart, rangeEnd]
@@ -250,6 +286,13 @@ export default function Drawing() {
     }
     return valid.sort();
   }, [flights, registeredModeSSet]);
+
+  // 비행 선택 시 해당 비행 전체 포인트 (구간 미적용, 맵 뷰/줌 고정용)
+  const flightBasePoints = useMemo(() => {
+    if (!selectedFlightId) return filteredPoints;
+    const flight = filteredFlights.find((f) => f.id === selectedFlightId);
+    return flight ? flight.track_points : filteredPoints;
+  }, [selectedFlightId, filteredFlights, filteredPoints]);
 
   // 비행 선택 시 해당 비행만 필터 + 구간 선택 적용, 선택 해제 시 전체
   const flightFilteredPoints = useMemo(() => {
@@ -383,20 +426,20 @@ export default function Drawing() {
     // (제목 없음 — 탭 타이틀로 충분)
   }, [flightFilteredPoints, colorMap, radarSite]);
 
-  // ── 평면도 지도 데이터 ──
+  // ── 평면도 지도 데이터 (구간 필터 전 전체 포인트 기준 — 줌/뷰 고정) ──
   const planViewState = useMemo(() => {
-    if (flightFilteredPoints.length === 0) {
+    if (flightBasePoints.length === 0) {
       return { longitude: radarSite.longitude, latitude: radarSite.latitude, zoom: 8 };
     }
     let maxDist = 0;
-    for (const p of flightFilteredPoints) {
+    for (const p of flightBasePoints) {
       const d = haversine(radarSite.latitude, radarSite.longitude, p.latitude, p.longitude);
       if (d > maxDist) maxDist = d;
     }
     maxDist = Math.max(maxDist, 1);
     const zoom = Math.max(4, Math.min(13, Math.log2(40000 / (maxDist * 2.5))));
     return { longitude: radarSite.longitude, latitude: radarSite.latitude, zoom };
-  }, [flightFilteredPoints, radarSite]);
+  }, [flightBasePoints, radarSite]);
 
   const trackPointsGeoJSON = useMemo((): GeoJSON.FeatureCollection => ({
     type: "FeatureCollection",
@@ -409,7 +452,7 @@ export default function Drawing() {
 
   const { rangeRingsGeoJSON, ringLabelsGeoJSON } = useMemo(() => {
     let maxDistKm = 0;
-    for (const p of flightFilteredPoints) {
+    for (const p of flightBasePoints) {
       const d = haversine(radarSite.latitude, radarSite.longitude, p.latitude, p.longitude);
       if (d > maxDistKm) maxDistKm = d;
     }
@@ -437,7 +480,7 @@ export default function Drawing() {
       rangeRingsGeoJSON: { type: "FeatureCollection" as const, features: ringFeatures },
       ringLabelsGeoJSON: { type: "FeatureCollection" as const, features: labelFeatures },
     };
-  }, [flightFilteredPoints, radarSite]);
+  }, [flightBasePoints, radarSite]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const colorExpression = useMemo((): any => {
@@ -451,27 +494,33 @@ export default function Drawing() {
   }, [colorMap]);
 
   const mapKey = useMemo(
-    () => `${radarSite.latitude}-${radarSite.longitude}-${flightFilteredPoints.length}-${selectedFlightId ?? "all"}`,
-    [radarSite, flightFilteredPoints.length, selectedFlightId]
+    () => `${radarSite.latitude}-${radarSite.longitude}-${selectedFlightId ?? "all"}`,
+    [radarSite, selectedFlightId]
   );
 
-  // 타임라인 밀도 바 — 비행 선택 시 해당 비행 포인트 기준 (displayTimeRange)
+  // 타임라인 밀도 바 — 줌 뷰포트 범위 기준
   const densityBuckets = useMemo(() => {
     const range = selectedFlightId ? displayTimeRange : timeRange;
     const pts = selectedFlightId
       ? (filteredFlights.find((f) => f.id === selectedFlightId)?.track_points ?? filteredPoints)
       : filteredPoints;
     if (pts.length === 0 || range.max <= range.min) return [];
+    const fullSpan = range.max - range.min;
+    // 줌 뷰포트의 시간 범위
+    const viewMinTs = range.min + (zoomVStart / 100) * fullSpan;
+    const viewMaxTs = range.min + (zoomVEnd / 100) * fullSpan;
+    const viewSpan = viewMaxTs - viewMinTs;
+    if (viewSpan <= 0) return [];
     const NUM_BUCKETS = 200;
     const buckets = new Array(NUM_BUCKETS).fill(0);
-    const span = range.max - range.min;
     for (const p of pts) {
-      const idx = Math.min(NUM_BUCKETS - 1, Math.floor(((p.timestamp - range.min) / span) * NUM_BUCKETS));
+      if (p.timestamp < viewMinTs || p.timestamp > viewMaxTs) continue;
+      const idx = Math.min(NUM_BUCKETS - 1, Math.floor(((p.timestamp - viewMinTs) / viewSpan) * NUM_BUCKETS));
       if (idx >= 0) buckets[idx]++;
     }
     const maxCount = Math.max(1, ...buckets);
     return buckets.map((c: number) => c / maxCount);
-  }, [filteredPoints, filteredFlights, selectedFlightId, timeRange, displayTimeRange]);
+  }, [filteredPoints, filteredFlights, selectedFlightId, timeRange, displayTimeRange, zoomVStart, zoomVEnd]);
 
   const getFilterLabel = () => {
     if (!selectedModeS) return "비행검사기 (등록)";
@@ -626,13 +675,13 @@ export default function Drawing() {
           <div className="rounded-xl border border-gray-200 bg-white">
             <div className="flex items-center gap-3 px-4 py-2">
               <div className="min-w-[62px] text-center font-mono leading-tight">
-                <div className="text-[9px] text-gray-300">{fmtDate(displayPctToTs(rangeStart))}</div>
-                <div className="text-[10px] text-gray-500">{fmtTime(displayPctToTs(rangeStart))}</div>
+                <div className="text-[9px] text-gray-300">{fmtDate(displayPctToTs(zoomVStart))}</div>
+                <div className="text-[10px] text-gray-500">{fmtTime(displayPctToTs(zoomVStart))}</div>
               </div>
 
               <div
                 ref={rangeBarRef}
-                className="relative flex-1 h-8 select-none"
+                className="relative flex-1 h-8 select-none cursor-crosshair"
                 onPointerMove={handleRangeMove}
                 onPointerUp={handleRangeUp}
               >
@@ -651,19 +700,19 @@ export default function Drawing() {
                 </div>
                 {/* 선택 구간 하이라이트 */}
                 <div className="absolute inset-0 rounded overflow-hidden pointer-events-none">
-                  {rangeStart > 0 && (
+                  {absToScreen(rangeStart) > 0 && (
                     <div className="absolute top-0 bottom-0 left-0 bg-gray-200/60"
-                      style={{ width: `${rangeStart}%` }} />
+                      style={{ width: `${Math.max(0, absToScreen(rangeStart))}%` }} />
                   )}
-                  {rangeEnd < 100 && (
+                  {absToScreen(rangeEnd) < 100 && (
                     <div className="absolute top-0 bottom-0 right-0 bg-gray-200/60"
-                      style={{ width: `${100 - rangeEnd}%` }} />
+                      style={{ width: `${Math.max(0, 100 - absToScreen(rangeEnd))}%` }} />
                   )}
                 </div>
                 {/* 구간 핸들 - 시작 */}
                 <div
                   className="absolute top-0 bottom-0 -translate-x-1/2 cursor-ew-resize z-10 w-3"
-                  style={{ left: `${rangeStart}%` }}
+                  style={{ left: `${absToScreen(rangeStart)}%` }}
                   onPointerDown={(e) => handleRangePointer(e, "start")}
                 >
                   <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-5 w-1.5 rounded-full transition-colors ${
@@ -675,7 +724,7 @@ export default function Drawing() {
                 {/* 구간 핸들 - 끝 */}
                 <div
                   className="absolute top-0 bottom-0 -translate-x-1/2 cursor-ew-resize z-10 w-3"
-                  style={{ left: `${rangeEnd}%` }}
+                  style={{ left: `${absToScreen(rangeEnd)}%` }}
                   onPointerDown={(e) => handleRangePointer(e, "end")}
                 >
                   <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-5 w-1.5 rounded-full transition-colors ${
@@ -687,8 +736,8 @@ export default function Drawing() {
               </div>
 
               <div className="min-w-[62px] text-center font-mono leading-tight">
-                <div className="text-[9px] text-gray-300">{fmtDate(displayPctToTs(rangeEnd))}</div>
-                <div className="text-[10px] text-gray-500">{fmtTime(displayPctToTs(rangeEnd))}</div>
+                <div className="text-[9px] text-gray-300">{fmtDate(displayPctToTs(zoomVEnd))}</div>
+                <div className="text-[10px] text-gray-500">{fmtTime(displayPctToTs(zoomVEnd))}</div>
               </div>
             </div>
           </div>

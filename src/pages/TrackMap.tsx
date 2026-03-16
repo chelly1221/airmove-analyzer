@@ -173,6 +173,7 @@ export default function TrackMap() {
   const [losCursor, setLosCursor] = useState<{ lat: number; lon: number } | null>(null);
   const [losHoverRatio, setLosHoverRatio] = useState<number | null>(null);
   const [losHighlightIdx, setLosHighlightIdx] = useState<number | null>(null);
+  const [losHoverIdx, setLosHoverIdx] = useState<number | null>(null);
   const savedTerrainRef = useRef(true); // LOS 모드 진입 전 지형 상태 저장
   const savedPitchRef = useRef(45);
   const savedBearingRef = useRef(0);
@@ -1479,11 +1480,36 @@ export default function TrackMap() {
                 setLosHighlightIdx((prev) => prev === clickedIdx ? null : clickedIdx);
               }
             },
+            onHover: (info: any) => {
+              setLosHoverIdx(info.object ? info.object.idx : null);
+            },
           })
         );
       }
 
-      // LOS 단면도 항적 포인트 하이라이트 → 지도 위 마커
+      // LOS 맵 호버 마커 (핀과 별도)
+      const effectiveHoverIdx = losHoverIdx !== null ? losHoverIdx : null;
+      if (effectiveHoverIdx !== null && effectiveHoverIdx !== losHighlightIdx && losTrackPoints[effectiveHoverIdx]) {
+        const htp = losTrackPoints[effectiveHoverIdx];
+        layers.push(
+          new ScatterplotLayer({
+            id: "los-track-hover",
+            data: [{ position: [htp.longitude, htp.latitude] }],
+            getPosition: (d: any) => d.position,
+            getFillColor: htp.isLoss ? [239, 68, 68, 200] : [...detectionTypeColor(htp.radar_type), 200],
+            getLineColor: [255, 255, 255, 200],
+            getRadius: 6,
+            radiusMinPixels: 5,
+            radiusMaxPixels: 11,
+            radiusUnits: "pixels",
+            lineWidthMinPixels: 1.5,
+            stroked: true,
+            pickable: false,
+          })
+        );
+      }
+
+      // LOS 단면도 항적 포인트 하이라이트 (핀) → 지도 위 마커
       if (losHighlightIdx !== null && losTrackPoints[losHighlightIdx]) {
         const tp = losTrackPoints[losHighlightIdx];
         layers.push(
@@ -1621,7 +1647,7 @@ export default function TrackMap() {
     }
 
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2320,6 +2346,8 @@ export default function TrackMap() {
           style={{ width: "100%", height: "100%" }}
           cursor={losMode ? "crosshair" : undefined}
           attributionControl={false}
+          // @ts-expect-error preserveDrawingBuffer is a valid maplibre option but not typed in react-map-gl
+          preserveDrawingBuffer={true}
         >
           <DeckGLOverlay layers={deckLayers} />
           <NavigationControl position="top-right" showZoom={false} />
@@ -2441,12 +2469,14 @@ export default function TrackMap() {
           radarSite={radarSite}
           targetLat={losTarget.lat}
           targetLon={losTarget.lon}
-          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); }}
+          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); }}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
           onLoaded={handleLosLoaded}
           onTrackPointHighlight={setLosHighlightIdx}
           externalHighlightIdx={losHighlightIdx}
+          onTrackPointHover={setLosHoverIdx}
+          externalHoverIdx={losHoverIdx}
         />
       )}
 

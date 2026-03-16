@@ -46,6 +46,10 @@ interface Props {
   onTrackPointHighlight?: (idx: number | null) => void;
   /** 맵에서 클릭한 항적 포인트 인덱스 (외부→차트 하이라이트) */
   externalHighlightIdx?: number | null;
+  /** 차트에서 항적 포인트 호버 시 인덱스 콜백 (null이면 해제) */
+  onTrackPointHover?: (idx: number | null) => void;
+  /** 맵에서 호버한 항적 포인트 인덱스 (외부→차트 호버) */
+  externalHoverIdx?: number | null;
 }
 
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -92,7 +96,7 @@ function curvDrop43(dKm: number): number {
 
 
 
-export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx }: Props) {
+export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx }: Props) {
   const addLOSResult = useAppStore((s) => s.addLOSResult);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
@@ -985,22 +989,25 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           const tpX = xScale(tpDist);
           const tpY = yScale(tpAdjAlt);
           const isPinned = pinnedTrackIdx === tpIdx;
-          const isActive = hoveredTrackIdx === tpIdx || isPinned;
+          const isExternalHover = externalHoverIdx === tpIdx && hoveredTrackIdx !== tpIdx;
+          const isActive = hoveredTrackIdx === tpIdx || isPinned || isExternalHover;
           return (
             <circle key={`tp-${tpIdx}`}
               cx={tpX} cy={tpY}
               r={isActive ? 4 : tp.isLoss ? 2.5 : 1.5}
               fill={tp.isLoss ? "#ff1744" : (() => { const c = detectionTypeColor(tp.radar_type); return `rgba(${c[0]},${c[1]},${c[2]},0.85)`; })()}
               fillOpacity={isActive ? 1 : tp.isLoss ? 0.9 : 0.7}
-              stroke={isPinned ? "#facc15" : isActive ? "white" : tp.isLoss ? "#ff1744" : PSR_TYPES.has(tp.radar_type) ? "rgba(255,255,255,0.6)" : "none"}
-              strokeWidth={isPinned ? 2 : isActive ? 1.5 : tp.isLoss ? 0.5 : PSR_TYPES.has(tp.radar_type) ? 1 : 0}
+              stroke={isPinned ? "#facc15" : isExternalHover ? "#38bdf8" : isActive ? "white" : tp.isLoss ? "#ff1744" : PSR_TYPES.has(tp.radar_type) ? "rgba(255,255,255,0.6)" : "none"}
+              strokeWidth={isPinned ? 2 : isExternalHover ? 2 : isActive ? 1.5 : tp.isLoss ? 0.5 : PSR_TYPES.has(tp.radar_type) ? 1 : 0}
               style={{ cursor: "pointer" }}
               onMouseEnter={() => {
                 setHoveredTrackIdx(tpIdx);
+                onTrackPointHover?.(tpIdx);
                 if (pinnedTrackIdx === null) onTrackPointHighlight?.(tpIdx);
               }}
               onMouseLeave={() => {
                 setHoveredTrackIdx(null);
+                onTrackPointHover?.(null);
                 if (pinnedTrackIdx === null) onTrackPointHighlight?.(null);
               }}
               onClick={() => {
@@ -1061,7 +1068,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         </g>
 
         {/* 인터랙티브 크로스헤어 + 호버 툴팁 */}
-        {hoverData && hoveredTrackIdx === null && pinnedTrackIdx === null && hoveredBldgIdx === null && (() => {
+        {hoverData && hoveredTrackIdx === null && externalHoverIdx == null && pinnedTrackIdx === null && hoveredBldgIdx === null && (() => {
           const hXPos = xScale(hoverData.dist);
           const tooltipW = 195;
           const tooltipH = 118;
@@ -1176,7 +1183,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
         {/* 항적/Loss 포인트 호버/핀 툴팁 */}
         {(() => {
-          const activeIdx = hoveredTrackIdx ?? pinnedTrackIdx;
+          const activeIdx = hoveredTrackIdx ?? externalHoverIdx ?? pinnedTrackIdx;
           if (activeIdx === null || !losTrackPoints || !losTrackPoints[activeIdx]) return null;
           const tp = losTrackPoints[activeIdx];
           const tpDist = tp.distRatio * maxDistance;
