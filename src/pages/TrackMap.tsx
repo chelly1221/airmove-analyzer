@@ -14,6 +14,7 @@ import {
   Loader2,
   Zap,
   Cloud,
+  Building2,
 } from "lucide-react";
 
 /** Dot 모드 핀 아이콘 (가느다란 선 위에 원) */
@@ -120,6 +121,9 @@ export default function TrackMap() {
   const altScale = 1;
   const [dotMode, setDotMode] = useState(false);
   const [showGarble, setShowGarble] = useState(false);
+  const [showBuildings, setShowBuildings] = useState(false);
+  const [buildingOverlayData, setBuildingOverlayData] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; source: string }[]>([]);
+  const [buildingsLoading, setBuildingsLoading] = useState(false);
   const [playSpeed, setPlaySpeed] = useState(1);
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
@@ -519,14 +523,22 @@ export default function TrackMap() {
     }
   }, [radarSite.name, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /** 고도 비율 → 색상 매핑 */
+  /** 고도 비율 → 색상 스펙트럼 매핑 (HSL 0°→240° : 빨강→파랑) */
   const altToColor = useCallback((altFt: number): [number, number, number] => {
-    const r = Math.min(1, Math.max(0, (altFt - COVERAGE_MIN_ALT_FT) / (COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT)));
-    return r < 0.25 ? [239, 68, 68]
-      : r < 0.5 ? [249, 115, 22]
-      : r < 0.75 ? [234, 179, 8]
-      : r < 0.9 ? [34, 197, 94]
-      : [6, 182, 212];
+    const t = Math.min(1, Math.max(0, (altFt - COVERAGE_MIN_ALT_FT) / (COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT)));
+    const hue = t * 240; // 0°(red) → 60°(yellow) → 120°(green) → 180°(cyan) → 240°(blue)
+    const s = 0.85, l = 0.5;
+    // HSL → RGB 변환
+    const c = (1 - Math.abs(2 * l - 1)) * s;
+    const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+    const m = l - c / 2;
+    let r1: number, g1: number, b1: number;
+    if (hue < 60)       { r1 = c; g1 = x; b1 = 0; }
+    else if (hue < 120) { r1 = x; g1 = c; b1 = 0; }
+    else if (hue < 180) { r1 = 0; g1 = c; b1 = x; }
+    else if (hue < 240) { r1 = 0; g1 = x; b1 = c; }
+    else                { r1 = 0; g1 = 0; b1 = c; }
+    return [Math.round((r1 + m) * 255), Math.round((g1 + m) * 255), Math.round((b1 + m) * 255)];
   }, []);
 
   // 커버리지 deck.gl 데이터 (범위 내 다중 레이어 → 겹침 3D 폴리곤)
@@ -579,7 +591,7 @@ export default function TrackMap() {
     );
   }, [showGarble, garblePoints, visibleMinTs, visibleMaxTs]);
 
-  // 구름 오버레이 데이터 — 점화(stippling) 방식: 운량에 비례하여 검은 점 생성
+  // 구름 오버레이 데이터 — 규칙적 격자(grid) 방식: 운량에 비례하여 점 밀도 조절
   const cloudDots = useMemo(() => {
     if (!cloudGrid || !cloudGridVisible) return null;
     const currentTs = sliderValue >= 100 ? timeRange.max : pctToTs(sliderValue);
@@ -590,29 +602,26 @@ export default function TrackMap() {
     const cosLat = Math.cos((cloudGrid.radarLat * Math.PI) / 180);
     const halfStepLon = halfStep / cosLat;
 
-    // 시드 기반 의사 난수 (프레임 간 점 위치 안정화)
-    const seededRandom = (seed: number) => {
-      let s = seed | 0;
-      s = ((s + 0x6d2b79f5) | 0);
-      let t = Math.imul(s ^ (s >>> 15), 1 | s);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-
     const dots: { position: [number, number]; cover: number }[] = [];
-    const MAX_DOTS_PER_CELL = 25; // 운량 100%일 때 최대 점 수
+    const GRID_SIZE = 12; // 셀당 12×12 = 144개 격자점 (운량 100%일 때)
 
     for (const c of frame.cells) {
       if (c.cloud_cover <= 10) continue;
-      const numDots = Math.round((c.cloud_cover / 100) * MAX_DOTS_PER_CELL);
-      const baseSeed = Math.round(c.lat * 10000) * 100000 + Math.round(c.lon * 10000);
-      for (let i = 0; i < numDots; i++) {
-        const rx = seededRandom(baseSeed + i * 2) * 2 - 1; // -1~1
-        const ry = seededRandom(baseSeed + i * 2 + 1) * 2 - 1;
-        dots.push({
-          position: [c.lon + rx * halfStepLon, c.lat + ry * halfStep],
-          cover: c.cloud_cover,
-        });
+      // 운량에 따라 격자 해상도 조절: 운량 낮으면 간격 넓게 (점 적게)
+      const ratio = c.cloud_cover / 100;
+      const effectiveSize = Math.max(3, Math.round(GRID_SIZE * Math.sqrt(ratio)));
+      const stepLat = (halfStep * 2) / effectiveSize;
+      const stepLon = (halfStepLon * 2) / effectiveSize;
+      const baseLat = c.lat - halfStep + stepLat * 0.5;
+      const baseLon = c.lon - halfStepLon + stepLon * 0.5;
+
+      for (let row = 0; row < effectiveSize; row++) {
+        for (let col = 0; col < effectiveSize; col++) {
+          dots.push({
+            position: [baseLon + col * stepLon, baseLat + row * stepLat],
+            cover: c.cloud_cover,
+          });
+        }
       }
     }
     return dots;
@@ -659,6 +668,40 @@ export default function TrackMap() {
       setCloudGridProgress("");
     }
   }, [flights, radarSite, setCloudGrid, setCloudGridVisible, setCloudGridLoading, setCloudGridProgress, setWeatherData, setWeatherLoading]);
+
+  /** 건물 오버레이 데이터 로드 (레이더 주변 bbox) */
+  const fetchBuildingOverlay = useCallback(async () => {
+    setBuildingsLoading(true);
+    try {
+      // 레이더 주변 약 30km bbox
+      const bufferDeg = 0.27; // ~30km
+      const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
+      const bufferLon = bufferDeg / cosLat;
+      const data = await invoke<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; source: string }[]>(
+        "query_buildings_for_overlay",
+        {
+          minLat: radarSite.latitude - bufferDeg,
+          maxLat: radarSite.latitude + bufferDeg,
+          minLon: radarSite.longitude - bufferLon,
+          maxLon: radarSite.longitude + bufferLon,
+          minHeightM: 3.0,
+        }
+      );
+      setBuildingOverlayData(data);
+      setShowBuildings(true);
+    } catch (err) {
+      console.error("건물 오버레이 로드 실패:", err);
+    } finally {
+      setBuildingsLoading(false);
+    }
+  }, [radarSite]);
+
+  // 레이더 사이트 변경 시 건물 오버레이 초기화
+  useEffect(() => {
+    if (showBuildings && buildingOverlayData.length > 0) {
+      fetchBuildingOverlay();
+    }
+  }, [radarSite.latitude, radarSite.longitude]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** 커버리지 맵 계산 시작 — 지형 프로파일 한번 계산 후 캐시 (백그라운드 작동) */
   const startCoverageCompute = useCallback(async (force = false) => {
@@ -1483,16 +1526,54 @@ export default function TrackMap() {
           id: "cloud-overlay",
           data: cloudDots,
           getPosition: (d: any) => d.position,
-          getRadius: 300,
+          getRadius: 200,
           radiusUnits: "meters" as const,
-          radiusMinPixels: 1,
-          radiusMaxPixels: 2.5,
+          radiusMinPixels: 0.8,
+          radiusMaxPixels: 2,
           getFillColor: (d: any) => {
             const alpha = Math.min(200, 80 + Math.round(d.cover * 1.2));
             return [30, 30, 40, alpha];
           },
           pickable: false,
           parameters: { depthWriteEnabled: false },
+        })
+      );
+    }
+
+    // 건물 오버레이
+    if (showBuildings && buildingOverlayData.length > 0) {
+      layers.push(
+        new ScatterplotLayer({
+          id: "building-overlay",
+          data: buildingOverlayData,
+          getPosition: (d: (typeof buildingOverlayData)[0]) => [d.lon, d.lat],
+          getRadius: (d: (typeof buildingOverlayData)[0]) => Math.max(3, Math.min(8, d.height_m / 15)),
+          radiusMinPixels: 2,
+          radiusMaxPixels: 10,
+          radiusUnits: "pixels" as const,
+          getFillColor: (d: (typeof buildingOverlayData)[0]) =>
+            d.source === "manual" ? [249, 115, 22, 160] : [139, 92, 246, 120],
+          getLineColor: (d: (typeof buildingOverlayData)[0]) =>
+            d.source === "manual" ? [249, 115, 22, 255] : [139, 92, 246, 200],
+          stroked: true,
+          lineWidthMinPixels: 1,
+          pickable: true,
+          onHover: (info: { object?: (typeof buildingOverlayData)[0]; x: number; y: number }) => {
+            if (info.object) {
+              const d = info.object;
+              const lines: { label: string; value: string; color?: string }[] = [
+                { label: "건물", value: d.name || "(이름 없음)", color: d.source === "manual" ? "#f97316" : "#8b5cf6" },
+                { label: "높이", value: `${d.height_m.toFixed(1)}m` },
+              ];
+              if (d.address) lines.push({ label: "주소", value: d.address });
+              if (d.usage) lines.push({ label: "용도", value: d.usage });
+              lines.push({ label: "출처", value: d.source === "manual" ? "수동 등록" : "GIS 건물" });
+              lines.push({ label: "좌표", value: `${d.lat.toFixed(5)}°N ${d.lon.toFixed(5)}°E` });
+              setHoverInfo({ x: info.x, y: info.y, lines });
+            } else {
+              setHoverInfo(null);
+            }
+          },
         })
       );
     }
@@ -1572,7 +1653,7 @@ export default function TrackMap() {
     }
 
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showGarble, filteredGarblePoints, cloudDots]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, showGarble, filteredGarblePoints, cloudDots]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -1999,6 +2080,37 @@ export default function TrackMap() {
           )}
         </button>
 
+        {/* 건물 오버레이 토글 */}
+        {buildingsLoading ? (
+          <div className="flex items-center gap-1 rounded-lg bg-violet-50 px-2 py-1.5 text-[10px] text-violet-600">
+            <Loader2 size={14} className="animate-spin" />
+            <span>건물...</span>
+          </div>
+        ) : (
+          <button
+            onClick={() => {
+              if (buildingOverlayData.length > 0) {
+                setShowBuildings(!showBuildings);
+              } else {
+                fetchBuildingOverlay();
+              }
+            }}
+            className={`relative rounded-lg p-1.5 transition-colors ${
+              showBuildings && buildingOverlayData.length > 0
+                ? "bg-[#a60739] text-white shadow-sm"
+                : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+            }`}
+            title={buildingOverlayData.length > 0 ? "건물 오버레이 토글" : "GIS+수동 건물 표시"}
+          >
+            <Building2 size={16} />
+            {showBuildings && buildingOverlayData.length > 0 && (
+              <span className="absolute -top-1 -right-1 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-violet-500 px-0.5 text-[8px] font-bold text-white leading-none">
+                {buildingOverlayData.length > 999 ? "999+" : buildingOverlayData.length}
+              </span>
+            )}
+          </button>
+        )}
+
         {/* 레이더 커버리지 맵 */}
         <div ref={coverageAltRef} className="relative">
           <button
@@ -2325,6 +2437,18 @@ export default function TrackMap() {
                     </div>
                   </>
                 )}
+                {showBuildings && buildingOverlayData.length > 0 && (
+                  <>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "#8b5cf6" }} />
+                      <span className="text-gray-600">GIS 건물</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "#f97316" }} />
+                      <span className="text-gray-600">수동 등록 건물</span>
+                    </div>
+                  </>
+                )}
                 {cloudGridVisible && cloudGrid && (
                   <div className="flex items-center gap-1.5">
                     <span className="inline-flex items-center justify-center h-3 w-4">
@@ -2342,10 +2466,13 @@ export default function TrackMap() {
                   const colorMax = altToColor(effMax);
                   return (
                     <div className="flex items-center gap-1.5">
-                      <span className="inline-flex h-3 w-5 rounded-sm overflow-hidden">
-                        <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMin})`, opacity: 0.7 }} />
-                        <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMax})`, opacity: 0.7 }} />
-                      </span>
+                      <span
+                        className="inline-block h-3 w-5 rounded-sm"
+                        style={{
+                          background: `linear-gradient(to right, rgb(${colorMin}), rgb(${altToColor(effMin + (effMax - effMin) * 0.5)}), rgb(${colorMax}))`,
+                          opacity: 0.7,
+                        }}
+                      />
                       <span className="text-gray-600">커버리지 ({fmtAlt(effMin)}~{fmtAlt(effMax)})</span>
                     </div>
                   );

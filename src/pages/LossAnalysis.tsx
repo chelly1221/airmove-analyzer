@@ -346,6 +346,8 @@ export default function LossAnalysis() {
   const panoramaSvgRef = useRef<SVGSVGElement>(null);
   const [panoramaBldgMaxHeight, setPanoramaBldgMaxHeight] = useState<number | null>(null); // 건물 높이 필터 (null=미적용)
   const [panoramaPeakNames, setPanoramaPeakNames] = useState<Map<number, string>>(new Map()); // 파노라마 인덱스 → 산 이름
+  // 파노라마 X축 줌 (방위 범위)
+  const [panoramaAzRange, setPanoramaAzRange] = useState<[number, number]>([0, 360]);
 
   // Garble 뷰 활성 상태를 스토어에 동기화
   useEffect(() => {
@@ -364,6 +366,7 @@ export default function LossAnalysis() {
     setPanoramaLoading(true);
     setPanoramaPinnedIdx(null);
     setPanoramaHoverIdx(null);
+    setPanoramaAzRange([0, 360]);
     const radarH = radarSite.altitude + radarSite.antenna_height;
     invoke<PanoramaPoint[]>("calculate_los_panorama", {
       radarLat: radarSite.latitude,
@@ -541,17 +544,30 @@ export default function LossAnalysis() {
   const panoramaChartW = panoramaSvgW - panoramaMargin.left - panoramaMargin.right;
   const panoramaChartH = panoramaSvgH - panoramaMargin.top - panoramaMargin.bottom;
 
+  // 줌 범위에 해당하는 인덱스 범위
+  const panoramaVisibleRange = useMemo(() => {
+    const n = filteredPanoramaData.length;
+    if (n === 0) return { startIdx: 0, endIdx: 0 };
+    const startIdx = Math.max(0, Math.floor((panoramaAzRange[0] / 360) * (n - 1)));
+    const endIdx = Math.min(n - 1, Math.ceil((panoramaAzRange[1] / 360) * (n - 1)));
+    return { startIdx, endIdx };
+  }, [filteredPanoramaData.length, panoramaAzRange]);
+
   const panoramaMaxAngle = useMemo(() => {
     if (filteredPanoramaData.length === 0) return 1.0;
-    const maxA = Math.max(...filteredPanoramaData.map((p) => p.elevation_angle_deg));
+    const { startIdx, endIdx } = panoramaVisibleRange;
+    let maxA = 0;
+    for (let i = startIdx; i <= endIdx; i++) maxA = Math.max(maxA, filteredPanoramaData[i].elevation_angle_deg);
     return Math.max(0.5, Math.ceil(maxA * 10) / 10 + 0.1);
-  }, [filteredPanoramaData]);
+  }, [filteredPanoramaData, panoramaVisibleRange]);
 
   const panoramaMinAngle = useMemo(() => {
     if (filteredPanoramaData.length === 0) return -0.2;
-    const minA = Math.min(...filteredPanoramaData.map((p) => p.elevation_angle_deg));
+    const { startIdx, endIdx } = panoramaVisibleRange;
+    let minA = Infinity;
+    for (let i = startIdx; i <= endIdx; i++) minA = Math.min(minA, filteredPanoramaData[i].elevation_angle_deg);
     return Math.min(-0.1, Math.floor(minA * 10) / 10 - 0.1);
-  }, [filteredPanoramaData]);
+  }, [filteredPanoramaData, panoramaVisibleRange]);
 
   const panoramaActiveIdx = panoramaPinnedIdx ?? panoramaHoverIdx;
   const panoramaActivePoint = panoramaActiveIdx !== null ? filteredPanoramaData[panoramaActiveIdx] : null;
@@ -571,6 +587,20 @@ export default function LossAnalysis() {
     setPanoramaPinnedStore(panoramaPinnedIdx !== null);
   }, [panoramaActivePoint, panoramaActiveIdx, panoramaPinnedIdx, panoramaPeakNames, setPanoramaActivePointStore, setPanoramaPinnedStore]);
 
+  // 방위 → SVG x 좌표 변환 (줌 반영)
+  const azToX = useCallback((az: number) => {
+    const frac = (az - panoramaAzRange[0]) / (panoramaAzRange[1] - panoramaAzRange[0]);
+    return panoramaMargin.left + frac * panoramaChartW;
+  }, [panoramaAzRange, panoramaChartW, panoramaMargin.left]);
+
+  // 인덱스 → SVG x 좌표
+  const idxToX = useCallback((idx: number) => {
+    const n = filteredPanoramaData.length;
+    if (n <= 1) return panoramaMargin.left;
+    const az = (idx / (n - 1)) * 360;
+    return azToX(az);
+  }, [filteredPanoramaData.length, azToX, panoramaMargin.left]);
+
   const handlePanoramaMouseMove = useCallback(
     (e: React.MouseEvent<SVGSVGElement>) => {
       if (filteredPanoramaData.length === 0) return;
@@ -583,11 +613,13 @@ export default function LossAnalysis() {
         setPanoramaHoverIdx(null);
         return;
       }
+      // 줌 범위 기준으로 방위 계산
       const azFrac = mx / panoramaChartW;
-      const idx = Math.round(azFrac * (filteredPanoramaData.length - 1));
+      const az = panoramaAzRange[0] + azFrac * (panoramaAzRange[1] - panoramaAzRange[0]);
+      const idx = Math.round((az / 360) * (filteredPanoramaData.length - 1));
       setPanoramaHoverIdx(Math.max(0, Math.min(filteredPanoramaData.length - 1, idx)));
     },
-    [filteredPanoramaData.length, panoramaChartW, panoramaMargin.left]
+    [filteredPanoramaData.length, panoramaChartW, panoramaMargin.left, panoramaAzRange]
   );
 
   const handlePanoramaClick = useCallback(
@@ -597,6 +629,40 @@ export default function LossAnalysis() {
     },
     [panoramaHoverIdx]
   );
+
+
+  // 파노라마 SVG에 non-passive wheel 리스너 등록 (preventDefault 사용을 위해)
+  useEffect(() => {
+    const svg = panoramaSvgRef.current;
+    if (!svg) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      if (filteredPanoramaData.length === 0) return;
+      const rect = svg.getBoundingClientRect();
+      const scaleX = panoramaSvgW / rect.width;
+      const mx = (e.clientX - rect.left) * scaleX - panoramaMargin.left;
+      const frac = Math.max(0, Math.min(1, mx / panoramaChartW));
+
+      const [azMin, azMax] = panoramaAzRange;
+      const azSpan = azMax - azMin;
+      const azAtCursor = azMin + frac * azSpan;
+
+      const zoomFactor = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+      let newSpan = Math.min(360, Math.max(10, azSpan * zoomFactor));
+
+      let newMin = azAtCursor - frac * newSpan;
+      let newMax = azAtCursor + (1 - frac) * newSpan;
+
+      if (newMin < 0) { newMax -= newMin; newMin = 0; }
+      if (newMax > 360) { newMin -= (newMax - 360); newMax = 360; }
+      newMin = Math.max(0, newMin);
+      newMax = Math.min(360, newMax);
+
+      setPanoramaAzRange([newMin, newMax]);
+    };
+    svg.addEventListener("wheel", handler, { passive: false });
+    return () => svg.removeEventListener("wheel", handler);
+  }, [filteredPanoramaData.length, panoramaChartW, panoramaMargin.left, panoramaAzRange]);
 
   // 등록된 비행검사기 Mode-S 코드 집합
   const registeredModeSCodes = useMemo(() => {
@@ -949,6 +1015,14 @@ export default function LossAnalysis() {
                     >
                       갱신
                     </button>
+                    {(panoramaAzRange[0] > 0.1 || panoramaAzRange[1] < 359.9) && (
+                      <button
+                        onClick={() => setPanoramaAzRange([0, 360])}
+                        className="rounded-md border border-blue-200 bg-blue-50 px-2.5 py-1 text-xs text-blue-600 hover:bg-blue-100"
+                      >
+                        {Math.round(panoramaAzRange[0])}°–{Math.round(panoramaAzRange[1])}° 초기화
+                      </button>
+                    )}
                   </div>
                 </div>
                 <div className="shrink-0 px-4 py-2">
@@ -991,36 +1065,45 @@ export default function LossAnalysis() {
                       return lines;
                     })()}
 
-                    {/* X축 방위 그리드 */}
-                    {[0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360].map((az) => {
-                      const x = panoramaMargin.left + (az / 360) * panoramaChartW;
+                    {/* X축 방위 그리드 (줌 반영) */}
+                    {(() => {
+                      const [azMin, azMax] = panoramaAzRange;
+                      const azSpan = azMax - azMin;
+                      // 줌 수준에 따른 그리드 간격 결정
+                      const step = azSpan > 300 ? 30 : azSpan > 120 ? 15 : azSpan > 60 ? 10 : azSpan > 30 ? 5 : azSpan > 15 ? 2 : 1;
                       const labels: Record<number, string> = { 0: "N", 90: "E", 180: "S", 270: "W", 360: "N" };
-                      const isCardinal = az % 90 === 0;
-                      return (
-                        <g key={`xgrid-${az}`}>
-                          <line x1={x} y1={panoramaMargin.top} x2={x} y2={panoramaMargin.top + panoramaChartH}
-                            stroke={isCardinal ? "#d1d5db" : "#e5e7eb"} strokeWidth={isCardinal ? 0.8 : 0.5}
-                            strokeDasharray={isCardinal ? undefined : "2,4"} />
-                          <text x={x} y={panoramaMargin.top + panoramaChartH + 16} textAnchor="middle"
-                            fill={isCardinal ? "#374151" : "#9ca3af"} fontSize={isCardinal ? 11 : 9} fontWeight={isCardinal ? 600 : 400}>
-                            {labels[az] ?? `${az}°`}
-                          </text>
-                        </g>
-                      );
-                    })}
+                      const grids: React.JSX.Element[] = [];
+                      const startAz = Math.ceil(azMin / step) * step;
+                      for (let az = startAz; az <= azMax; az += step) {
+                        const x = azToX(az);
+                        const isCardinal = az % 90 === 0;
+                        grids.push(
+                          <g key={`xgrid-${az}`}>
+                            <line x1={x} y1={panoramaMargin.top} x2={x} y2={panoramaMargin.top + panoramaChartH}
+                              stroke={isCardinal ? "#d1d5db" : "#e5e7eb"} strokeWidth={isCardinal ? 0.8 : 0.5}
+                              strokeDasharray={isCardinal ? undefined : "2,4"} />
+                            <text x={x} y={panoramaMargin.top + panoramaChartH + 16} textAnchor="middle"
+                              fill={isCardinal ? "#374151" : "#9ca3af"} fontSize={isCardinal ? 11 : 9} fontWeight={isCardinal ? 600 : 400}>
+                              {labels[az] ?? `${az}°`}
+                            </text>
+                          </g>
+                        );
+                      }
+                      return grids;
+                    })()}
 
                     {/* 지형/건물 면 채우기 */}
                     <g clipPath="url(#panorama-clip)">
                       {/* 지형 영역 (녹색) */}
                       <path
                         d={(() => {
+                          const { startIdx, endIdx } = panoramaVisibleRange;
                           const yBase = panoramaMargin.top + panoramaChartH;
                           const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                           let d = `M ${panoramaMargin.left} ${yBase}`;
-                          for (let i = 0; i < filteredPanoramaData.length; i++) {
-                            const x = panoramaMargin.left + (i / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                          for (let i = startIdx; i <= endIdx; i++) {
+                            const x = idxToX(i);
                             const pt = filteredPanoramaData[i];
-                            // 지형 부분만: 건물인 경우 건물 없는 지면 앙각 추정 (지면표고 사용)
                             const terrainAngle = pt.obstacle_type === "terrain"
                               ? pt.elevation_angle_deg
                               : Math.max(0, pt.elevation_angle_deg - (pt.obstacle_height_m / (pt.distance_km * 1000)) * (180 / Math.PI));
@@ -1036,12 +1119,13 @@ export default function LossAnalysis() {
                       {/* 전체 실루엣 (건물 포함, 라인) */}
                       <path
                         d={(() => {
+                          const { startIdx, endIdx } = panoramaVisibleRange;
                           const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                           let d = "";
-                          for (let i = 0; i < filteredPanoramaData.length; i++) {
-                            const x = panoramaMargin.left + (i / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                          for (let i = startIdx; i <= endIdx; i++) {
+                            const x = idxToX(i);
                             const y = toY(filteredPanoramaData[i].elevation_angle_deg);
-                            d += i === 0 ? `M ${x} ${y}` : ` L ${x} ${y}`;
+                            d += i === startIdx ? `M ${x} ${y}` : ` L ${x} ${y}`;
                           }
                           return d;
                         })()}
@@ -1053,10 +1137,11 @@ export default function LossAnalysis() {
                       {/* 건물 포인트 (건물인 경우 오렌지 세로선) */}
                       {filteredPanoramaData.map((pt, i) => {
                         if (pt.obstacle_type === "terrain") return null;
-                        const x = panoramaMargin.left + (i / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                        const { startIdx, endIdx } = panoramaVisibleRange;
+                        if (i < startIdx || i > endIdx) return null;
+                        const x = idxToX(i);
                         const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                         const yTop = toY(pt.elevation_angle_deg);
-                        // 지면 앙각 추정
                         const terrainAngle = Math.max(0, pt.elevation_angle_deg - (pt.obstacle_height_m / (pt.distance_km * 1000)) * (180 / Math.PI));
                         const yBottom = toY(Math.max(terrainAngle, panoramaMinAngle));
                         const color = pt.obstacle_type === "manual_building" ? "#ef4444" : "#f97316";
@@ -1072,7 +1157,7 @@ export default function LossAnalysis() {
                       <g>
                         {(() => {
                           const pt = filteredPanoramaData[panoramaActiveIdx];
-                          const x = panoramaMargin.left + (panoramaActiveIdx / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                          const x = idxToX(panoramaActiveIdx);
                           const y = panoramaMargin.top + panoramaChartH * (1 - (pt.elevation_angle_deg - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                           const isPinned = panoramaPinnedIdx === panoramaActiveIdx;
                           const peakName = pt.obstacle_type === "terrain" ? panoramaPeakNames.get(panoramaActiveIdx) : null;
@@ -1130,8 +1215,10 @@ export default function LossAnalysis() {
                         }
                       }
                       return Array.from(shown.entries()).map(([name, idx]) => {
+                        const { startIdx: visStart, endIdx: visEnd } = panoramaVisibleRange;
+                        if (idx < visStart || idx > visEnd) return null;
                         const pt = filteredPanoramaData[idx];
-                        const px = panoramaMargin.left + (idx / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                        const px = idxToX(idx);
                         const py = panoramaMargin.top + panoramaChartH * (1 - (pt.elevation_angle_deg - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                         return (
                           <g key={`peak-${idx}`}>
@@ -1204,6 +1291,28 @@ export default function LossAnalysis() {
                             pickable: true,
                             radiusMinPixels: 4,
                             radiusMaxPixels: 20,
+                            onClick: (info: { object?: PanoramaPoint }) => {
+                              if (!info.object) return;
+                              // 클릭한 건물의 좌표로 filteredPanoramaData에서 가장 가까운 인덱스 찾기
+                              const clicked = info.object;
+                              let bestIdx = -1;
+                              let bestDist = Infinity;
+                              for (let i = 0; i < filteredPanoramaData.length; i++) {
+                                const pt = filteredPanoramaData[i];
+                                if (pt.obstacle_type === "terrain") continue;
+                                const dlat = pt.lat - clicked.lat;
+                                const dlon = pt.lon - clicked.lon;
+                                const dist = dlat * dlat + dlon * dlon;
+                                if (dist < bestDist) {
+                                  bestDist = dist;
+                                  bestIdx = i;
+                                }
+                              }
+                              if (bestIdx >= 0) {
+                                setPanoramaPinnedIdx((prev) => (prev === bestIdx ? null : bestIdx));
+                                setPanoramaHoverIdx(bestIdx);
+                              }
+                            },
                           }),
                           // 레이더 위치
                           new ScatterplotLayer({
@@ -1218,14 +1327,14 @@ export default function LossAnalysis() {
                             radiusMinPixels: 8,
                             radiusMaxPixels: 12,
                           }),
-                          // 활성 건물 하이라이트
+                          // 활성 건물 하이라이트 (빨간색)
                           ...(panoramaActivePoint && panoramaActivePoint.obstacle_type !== "terrain"
                             ? [
                                 new ScatterplotLayer({
                                   id: "panorama-bldg-highlight",
                                   data: [panoramaActivePoint],
                                   getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
-                                  getFillColor: [234, 179, 8, 220],
+                                  getFillColor: [239, 68, 68, 240],
                                   getLineColor: [255, 255, 255, 255],
                                   getRadius: 300,
                                   stroked: true,

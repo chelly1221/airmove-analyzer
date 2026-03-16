@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, Result as SqlResult};
 
-use crate::models::{AdsbPoint, AdsbTrack, FlightRecord};
+use crate::models::{AdsbPoint, AdsbTrack, Aircraft, FlightRecord};
 
 /// DB 연결 타입 (lib.rs에서 사용)
 pub type Db = Connection;
@@ -259,6 +259,18 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             result_json TEXT NOT NULL,
             computed_at INTEGER NOT NULL
         );
+
+        -- 비행검사기 (aircraft.json → DB 이식)
+        CREATE TABLE IF NOT EXISTS aircraft (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            registration TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            mode_s_code TEXT NOT NULL,
+            organization TEXT NOT NULL DEFAULT '',
+            memo TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1
+        );
         ",
     )?;
 
@@ -271,6 +283,85 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_json TEXT", []);
 
     Ok(conn)
+}
+
+// ========== 비행검사기 (Aircraft) ==========
+
+/// 비행검사기 목록 조회
+pub fn get_aircraft_list(conn: &Connection) -> SqlResult<Vec<Aircraft>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, registration, model, mode_s_code, organization, memo, active FROM aircraft ORDER BY name",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Aircraft {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                registration: row.get(2)?,
+                model: row.get(3)?,
+                mode_s_code: row.get(4)?,
+                organization: row.get(5)?,
+                memo: row.get(6)?,
+                active: row.get::<_, i32>(7)? != 0,
+            })
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 비행검사기 저장 (추가/수정)
+pub fn save_aircraft(conn: &Connection, aircraft: &Aircraft) -> SqlResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO aircraft (id, name, registration, model, mode_s_code, organization, memo, active)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            aircraft.id,
+            aircraft.name,
+            aircraft.registration,
+            aircraft.model,
+            aircraft.mode_s_code,
+            aircraft.organization,
+            aircraft.memo,
+            aircraft.active as i32,
+        ],
+    )?;
+    Ok(())
+}
+
+/// 비행검사기 삭제
+pub fn delete_aircraft(conn: &Connection, id: &str) -> SqlResult<usize> {
+    let changed = conn.execute("DELETE FROM aircraft WHERE id = ?1", params![id])?;
+    Ok(changed)
+}
+
+/// aircraft.json → DB 마이그레이션
+pub fn migrate_aircraft_json(conn: &Connection, json_path: &Path) -> SqlResult<()> {
+    // DB에 이미 데이터가 있으면 마이그레이션 건너뛰기
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM aircraft", [], |row| row.get(0))?;
+    if count > 0 {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(json_path).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e,
+        )))
+    })?;
+
+    let aircraft_list: Vec<Aircraft> = serde_json::from_str(&content).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e,
+        )))
+    })?;
+
+    for a in &aircraft_list {
+        save_aircraft(conn, a)?;
+    }
+
+    log::info!("Migrated {} aircraft from JSON to DB", aircraft_list.len());
+    Ok(())
 }
 
 /// ADS-B 트랙 1건 저장 (중복 시 무시)

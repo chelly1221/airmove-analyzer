@@ -143,11 +143,11 @@ input.coverage-range-thumb {
 }
 input.coverage-range-thumb::-webkit-slider-runnable-track {
   background: transparent !important;
-  height: 0 !important;
+  height: 100% !important;
 }
 input.coverage-range-thumb::-moz-range-track {
   background: transparent !important;
-  height: 0 !important;
+  height: 100% !important;
 }
 
 /* Select styling */

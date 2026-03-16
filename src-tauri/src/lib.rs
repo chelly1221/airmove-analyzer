@@ -74,7 +74,7 @@ struct OAuthToken {
 
 /// Application state for managing aircraft data.
 struct AppState {
-    aircraft_path: Mutex<PathBuf>,
+    app_data_dir: Mutex<PathBuf>,
     db: Mutex<db::Db>,
     oauth_token: Mutex<Option<OAuthToken>>,
     srtm: Mutex<srtm::SrtmReader>,
@@ -166,8 +166,8 @@ async fn ensure_opensky_token(
     Ok(Some(access_token))
 }
 
-/// Get the path to the aircraft data JSON file.
-fn get_aircraft_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+/// 앱 데이터 디렉토리 경로 확보
+fn get_app_data_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
@@ -179,33 +179,7 @@ fn get_aircraft_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, Stri
             .map_err(|e| format!("Failed to create app data directory: {}", e))?;
     }
 
-    Ok(app_data_dir.join("aircraft.json"))
-}
-
-/// Load aircraft list from the JSON data file.
-fn load_aircraft_from_file(path: &PathBuf) -> Vec<Aircraft> {
-    if !path.exists() {
-        return Vec::new();
-    }
-
-    match fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
-            log::warn!("Failed to parse aircraft file: {}. Starting fresh.", e);
-            Vec::new()
-        }),
-        Err(e) => {
-            log::warn!("Failed to read aircraft file: {}. Starting fresh.", e);
-            Vec::new()
-        }
-    }
-}
-
-/// Save aircraft list to the JSON data file.
-fn save_aircraft_to_file(path: &PathBuf, aircraft: &[Aircraft]) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(aircraft)
-        .map_err(|e| format!("Failed to serialize aircraft data: {}", e))?;
-
-    fs::write(path, json).map_err(|e| format!("Failed to write aircraft file: {}", e))
+    Ok(app_data_dir)
 }
 
 // ---------- Tauri Commands ----------
@@ -239,53 +213,28 @@ fn analyze_tracks(parsed: ParsedFile, threshold: f64) -> Result<AnalysisResult, 
 /// Get the list of registered aircraft.
 #[tauri::command]
 fn get_aircraft_list(state: tauri::State<'_, AppState>) -> Result<Vec<Aircraft>, String> {
-    let path = state
-        .aircraft_path
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
-    Ok(load_aircraft_from_file(&path))
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::get_aircraft_list(&conn).map_err(|e| format!("DB error: {}", e))
 }
 
 /// Save (add or update) an aircraft to the persistent store.
 #[tauri::command]
 fn save_aircraft(aircraft: Aircraft, state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("Command: save_aircraft(id={}, name={})", aircraft.id, aircraft.name);
-
-    let path = state
-        .aircraft_path
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
-    let mut list = load_aircraft_from_file(&path);
-
-    // Check if aircraft already exists (update) or is new (insert)
-    if let Some(existing) = list.iter_mut().find(|a| a.id == aircraft.id) {
-        *existing = aircraft;
-    } else {
-        list.push(aircraft);
-    }
-
-    save_aircraft_to_file(&path, &list)
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_aircraft(&conn, &aircraft).map_err(|e| format!("DB error: {}", e))
 }
 
 /// Delete an aircraft by its ID.
 #[tauri::command]
 fn delete_aircraft(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("Command: delete_aircraft(id={})", id);
-
-    let path = state
-        .aircraft_path
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
-    let mut list = load_aircraft_from_file(&path);
-
-    let original_len = list.len();
-    list.retain(|a| a.id != id);
-
-    if list.len() == original_len {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let changed = db::delete_aircraft(&conn, &id).map_err(|e| format!("DB error: {}", e))?;
+    if changed == 0 {
         return Err(format!("Aircraft with id '{}' not found", id));
     }
-
-    save_aircraft_to_file(&path, &list)
+    Ok(())
 }
 
 /// Parse an ASS file and immediately analyze it (결과를 DB에 자동 저장).
@@ -1031,8 +980,8 @@ fn load_cloud_grid_cache(
 
 /// DB 파일 경로 반환 (내보내기/가져오기 용)
 fn get_db_path(state: &AppState) -> Result<PathBuf, String> {
-    let aircraft_path = state.aircraft_path.lock().map_err(|e| format!("Lock error: {}", e))?;
-    Ok(aircraft_path.with_file_name("adsb.db"))
+    let app_data_dir = state.app_data_dir.lock().map_err(|e| format!("Lock error: {}", e))?;
+    Ok(app_data_dir.join("adsb.db"))
 }
 
 /// DB 내보내기 (현재 DB를 지정 경로로 복사)
@@ -1365,6 +1314,21 @@ fn query_buildings_in_bbox(
     building::query_buildings_in_bbox(&conn, min_lat, max_lat, min_lon, max_lon, min_height_m.unwrap_or(3.0))
 }
 
+// ---------- 영역 내 건물 조회 (맵 오버레이용) ----------
+
+#[tauri::command]
+fn query_buildings_for_overlay(
+    state: tauri::State<'_, AppState>,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: Option<f64>,
+) -> Result<Vec<building::BuildingForOverlay>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::query_buildings_for_overlay(&conn, min_lat, max_lat, min_lon, max_lon, min_height_m.unwrap_or(3.0))
+}
+
 // ---------- 수동 등록 건물 ----------
 
 #[tauri::command]
@@ -1687,12 +1651,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
-            let aircraft_path = get_aircraft_file_path(app.handle())
+            let app_data_dir = get_app_data_dir(app.handle())
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            info!("Aircraft data path: {:?}", aircraft_path);
+            info!("App data dir: {:?}", app_data_dir);
 
             // SQLite DB 초기화
-            let db_path = aircraft_path.with_file_name("adsb.db");
+            let db_path = app_data_dir.join("adsb.db");
             let db_conn = db::init_db(&db_path).map_err(|e| {
                 Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -1702,7 +1666,7 @@ pub fn run() {
             info!("Database path: {:?}", db_path);
 
             // 기존 JSON 캐시 → DB 마이그레이션
-            let cache_path = aircraft_path.with_file_name("adsb_cache.json");
+            let cache_path = app_data_dir.join("adsb_cache.json");
             if cache_path.exists() {
                 info!("Migrating adsb_cache.json to SQLite...");
                 if let Err(e) = db::migrate_json_cache(&db_conn, &cache_path) {
@@ -1710,15 +1674,24 @@ pub fn run() {
                 }
             }
 
+            // 기존 aircraft.json → DB 마이그레이션
+            let aircraft_json_path = app_data_dir.join("aircraft.json");
+            if aircraft_json_path.exists() {
+                info!("Migrating aircraft.json to SQLite...");
+                if let Err(e) = db::migrate_aircraft_json(&db_conn, &aircraft_json_path) {
+                    log::warn!("Aircraft migration failed: {}", e);
+                }
+            }
+
             // SRTM 데이터 디렉토리 초기화
-            let srtm_dir = aircraft_path.with_file_name("srtm");
+            let srtm_dir = app_data_dir.join("srtm");
             if !srtm_dir.exists() {
                 let _ = fs::create_dir_all(&srtm_dir);
             }
             info!("SRTM data dir: {:?}", srtm_dir);
 
             app.manage(AppState {
-                aircraft_path: Mutex::new(aircraft_path),
+                app_data_dir: Mutex::new(app_data_dir),
                 db: Mutex::new(db_conn),
                 oauth_token: Mutex::new(None),
                 srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir)),
@@ -1761,6 +1734,7 @@ pub fn run() {
             import_building_data,
             query_buildings_along_path,
             query_buildings_in_bbox,
+            query_buildings_for_overlay,
             get_building_import_status,
             clear_building_data,
             list_manual_buildings,

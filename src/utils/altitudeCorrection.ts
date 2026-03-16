@@ -80,8 +80,8 @@ export function correctAnomalousAltitudes(
     }
   }
 
-  // 첫 포인트 검사: 인접 정상 포인트 2개의 추세와 비교
-  if (!isAnomalous[0] && n >= 3) {
+  // 첫 포인트 검사: 인접 정상 포인트와 비교
+  if (!isAnomalous[0] && n >= 2) {
     // 첫 번째, 두 번째 정상 포인트 찾기
     let firstNormal = -1;
     let secondNormal = -1;
@@ -92,22 +92,29 @@ export function correctAnomalousAltitudes(
       }
     }
 
-    if (firstNormal >= 0 && secondNormal >= 0) {
+    if (firstNormal >= 0) {
       const dt01 = points[firstNormal].timestamp - points[0].timestamp;
-      const dt12 = points[secondNormal].timestamp - points[firstNormal].timestamp;
-      if (dt01 > 0 && dt12 > 0) {
+      if (dt01 > 0) {
         const vr01 = Math.abs(points[firstNormal].altitude - points[0].altitude) / dt01;
-        const vr12 = Math.abs(points[secondNormal].altitude - points[firstNormal].altitude) / dt12;
-        // 0→1 비정상이고 1→2 정상이면, 0이 튄 것 (방향 확인)
-        if (vr01 > MAX_VERTICAL_RATE_MS && vr12 <= MAX_VERTICAL_RATE_MS) {
-          isAnomalous[0] = true;
+        if (vr01 > MAX_VERTICAL_RATE_MS) {
+          if (secondNormal >= 0) {
+            // 정상 포인트 2개 있으면 추세 비교: 1→2 정상이면 0이 튄 것
+            const dt12 = points[secondNormal].timestamp - points[firstNormal].timestamp;
+            const vr12 = dt12 > 0 ? Math.abs(points[secondNormal].altitude - points[firstNormal].altitude) / dt12 : 0;
+            if (vr12 <= MAX_VERTICAL_RATE_MS) {
+              isAnomalous[0] = true;
+            }
+          } else {
+            // 정상 포인트가 1개뿐이면 수직속도만으로 판정
+            isAnomalous[0] = true;
+          }
         }
       }
     }
   }
 
-  // 끝 포인트 검사: 인접 정상 포인트 2개의 추세와 비교
-  if (!isAnomalous[n - 1] && n >= 3) {
+  // 끝 포인트 검사: 인접 정상 포인트와 비교
+  if (!isAnomalous[n - 1] && n >= 2) {
     // 끝에서부터 첫 번째, 두 번째 정상 포인트 찾기
     let firstNormal = -1;
     let secondNormal = -1;
@@ -118,16 +125,84 @@ export function correctAnomalousAltitudes(
       }
     }
 
-    if (firstNormal >= 0 && secondNormal >= 0) {
+    if (firstNormal >= 0) {
       const dtLast = points[n - 1].timestamp - points[firstNormal].timestamp;
-      const dtPrev = points[firstNormal].timestamp - points[secondNormal].timestamp;
-      if (dtLast > 0 && dtPrev > 0) {
+      if (dtLast > 0) {
         const vrLast = Math.abs(points[n - 1].altitude - points[firstNormal].altitude) / dtLast;
-        const vrPrev = Math.abs(points[firstNormal].altitude - points[secondNormal].altitude) / dtPrev;
-        // n-2→n-1 비정상이고 n-3→n-2 정상이면, n-1이 튄 것
-        if (vrLast > MAX_VERTICAL_RATE_MS && vrPrev <= MAX_VERTICAL_RATE_MS) {
-          isAnomalous[n - 1] = true;
+        if (vrLast > MAX_VERTICAL_RATE_MS) {
+          if (secondNormal >= 0) {
+            const dtPrev = points[firstNormal].timestamp - points[secondNormal].timestamp;
+            const vrPrev = dtPrev > 0 ? Math.abs(points[firstNormal].altitude - points[secondNormal].altitude) / dtPrev : 0;
+            if (vrPrev <= MAX_VERTICAL_RATE_MS) {
+              isAnomalous[n - 1] = true;
+            }
+          } else {
+            // 정상 포인트가 1개뿐이면 수직속도만으로 판정
+            isAnomalous[n - 1] = true;
+          }
         }
+      }
+    }
+  }
+
+  // 앞쪽 연속 이상값 전파: 첫 포인트가 이상값이면 뒤따르는 포인트도 검사
+  // (2단계에서 prevIdx < 0으로 건너뛴 포인트들)
+  if (isAnomalous[0]) {
+    for (let i = 1; i < n - 1; i++) {
+      if (isAnomalous[i]) continue;
+
+      // 이전에 정상 포인트가 없으면 → 다음 정상 포인트와 비교
+      let hasPrevNormal = false;
+      for (let j = i - 1; j >= 0; j--) {
+        if (!isAnomalous[j]) { hasPrevNormal = true; break; }
+      }
+      if (hasPrevNormal) break; // 정상 포인트 나오면 전파 중단
+
+      // 다음 정상 포인트 찾기
+      let nextIdx = -1;
+      for (let j = i + 1; j < n; j++) {
+        if (!isAnomalous[j]) { nextIdx = j; break; }
+      }
+      if (nextIdx < 0) continue;
+
+      const dtNext = points[nextIdx].timestamp - points[i].timestamp;
+      if (dtNext <= 0) continue;
+
+      const vrNext = Math.abs(points[nextIdx].altitude - points[i].altitude) / dtNext;
+      // 다음 정상 포인트와도 수직속도 이상 → 이 포인트도 이상값
+      if (vrNext > MAX_VERTICAL_RATE_MS) {
+        isAnomalous[i] = true;
+      } else {
+        break; // 정상 포인트 도달, 전파 중단
+      }
+    }
+  }
+
+  // 뒤쪽 연속 이상값 전파: 끝 포인트가 이상값이면 앞쪽 포인트도 검사
+  if (isAnomalous[n - 1]) {
+    for (let i = n - 2; i > 0; i--) {
+      if (isAnomalous[i]) continue;
+
+      let hasNextNormal = false;
+      for (let j = i + 1; j < n; j++) {
+        if (!isAnomalous[j]) { hasNextNormal = true; break; }
+      }
+      if (hasNextNormal) break;
+
+      let prevIdx = -1;
+      for (let j = i - 1; j >= 0; j--) {
+        if (!isAnomalous[j]) { prevIdx = j; break; }
+      }
+      if (prevIdx < 0) continue;
+
+      const dtPrev = points[i].timestamp - points[prevIdx].timestamp;
+      if (dtPrev <= 0) continue;
+
+      const vrPrev = Math.abs(points[i].altitude - points[prevIdx].altitude) / dtPrev;
+      if (vrPrev > MAX_VERTICAL_RATE_MS) {
+        isAnomalous[i] = true;
+      } else {
+        break;
       }
     }
   }

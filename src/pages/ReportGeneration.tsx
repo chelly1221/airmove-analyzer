@@ -5,7 +5,7 @@ import {
   Loader2,
   CheckSquare,
   Square,
-  Map,
+  Map as MapIcon,
   BarChart3,
   Crosshair,
   ArrowLeft,
@@ -156,6 +156,7 @@ export default function ReportGeneration() {
 
   // 파노라마 데이터 (캐시에서 로드)
   const [panoramaData, setPanoramaData] = useState<PanoramaPoint[]>([]);
+  const [panoramaPeakNames, setPanoramaPeakNames] = useState<Map<number, string>>(new Map());
 
   useEffect(() => {
     if (!radarSite) return;
@@ -171,6 +172,85 @@ export default function ReportGeneration() {
       })
       .catch(() => {});
   }, [radarSite]);
+
+  // 파노라마 지형 장애물 산 이름 조회 (Overpass API)
+  useEffect(() => {
+    if (panoramaData.length === 0) return;
+    let cancelled = false;
+
+    const haversineKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+      const R = 6371;
+      const dLat = ((lat2 - lat1) * Math.PI) / 180;
+      const dLon = ((lon2 - lon1) * Math.PI) / 180;
+      const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    };
+
+    const terrainPeaks: { idx: number; lat: number; lon: number; angle: number }[] = [];
+    for (let i = 0; i < panoramaData.length; i++) {
+      const pt = panoramaData[i];
+      if (pt.obstacle_type !== "terrain" || pt.elevation_angle_deg <= 0.01) continue;
+      let isLocalMax = true;
+      for (let d = 1; d <= 5; d++) {
+        const li = (i - d + panoramaData.length) % panoramaData.length;
+        const ri = (i + d) % panoramaData.length;
+        if (panoramaData[li].elevation_angle_deg > pt.elevation_angle_deg ||
+            panoramaData[ri].elevation_angle_deg > pt.elevation_angle_deg) {
+          isLocalMax = false;
+          break;
+        }
+      }
+      if (isLocalMax) {
+        const isDup = terrainPeaks.some((p) => haversineKm(p.lat, p.lon, pt.lat, pt.lon) < 3);
+        if (!isDup) terrainPeaks.push({ idx: i, lat: pt.lat, lon: pt.lon, angle: pt.elevation_angle_deg });
+      }
+    }
+
+    terrainPeaks.sort((a, b) => b.angle - a.angle);
+    const targets = terrainPeaks.slice(0, 15);
+    if (targets.length === 0) return;
+
+    (async () => {
+      const names = new Map<number, string>();
+      const aroundClauses = targets.map((t) => `node["natural"="peak"](around:3000,${t.lat},${t.lon})`).join(";");
+      try {
+        const url = `https://overpass-api.de/api/interpreter?data=[out:json];(${aroundClauses};);out body;`;
+        const resp = await fetch(url);
+        if (!resp.ok || cancelled) return;
+        const data = await resp.json();
+        const peaks = data.elements ?? [];
+
+        for (const target of targets) {
+          let closestName = "";
+          let closestDist = Infinity;
+          for (const el of peaks) {
+            const d = haversineKm(target.lat, target.lon, el.lat, el.lon);
+            if (d < closestDist && d < 3) {
+              closestDist = d;
+              closestName = el.tags?.["name:ko"] || el.tags?.name || "";
+            }
+          }
+          if (closestName) {
+            names.set(target.idx, closestName);
+            for (let d = 1; d <= 10; d++) {
+              for (const dir of [-1, 1]) {
+                const adj = (target.idx + dir * d + panoramaData.length) % panoramaData.length;
+                const adjPt = panoramaData[adj];
+                if (adjPt.obstacle_type === "terrain" && haversineKm(adjPt.lat, adjPt.lon, target.lat, target.lon) < 3) {
+                  names.set(adj, closestName);
+                } else break;
+              }
+            }
+          }
+        }
+        if (!cancelled && names.size > 0) setPanoramaPeakNames(names);
+      } catch (e) {
+        console.error("파노라마 산 이름 조회 실패:", e);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [panoramaData]);
 
   // 커버리지 레이어 (캐시된 지형 프로파일에서 계산)
   const coverageLayers = useMemo<CoverageLayer[]>(() => {
@@ -645,6 +725,7 @@ export default function ReportGeneration() {
                   sectionNum={sectionNumbers.panorama ?? 6}
                   panoramaData={panoramaData}
                   radarSite={radarSite}
+                  peakNames={panoramaPeakNames}
                 />
               </ReportPage>
             )}
@@ -705,6 +786,7 @@ export default function ReportGeneration() {
                   sectionNum={sectionNumbers.panorama ?? 4}
                   panoramaData={panoramaData}
                   radarSite={radarSite}
+                  peakNames={panoramaPeakNames}
                 />
               </ReportPage>
             )}
@@ -767,6 +849,7 @@ export default function ReportGeneration() {
                   sectionNum={sectionNumbers.panorama ?? 6}
                   panoramaData={panoramaData}
                   radarSite={radarSite}
+                  peakNames={panoramaPeakNames}
                 />
               </ReportPage>
             )}
@@ -828,6 +911,7 @@ export default function ReportGeneration() {
                   sectionNum={sectionNumbers.panorama ?? 6}
                   panoramaData={panoramaData}
                   radarSite={radarSite}
+                  peakNames={panoramaPeakNames}
                 />
               </ReportPage>
             )}
@@ -931,12 +1015,12 @@ function TemplateConfigModal({
       : 0;
 
   // 템플릿별 섹션 항목
-  const sectionItems: { key: keyof ReportSections; label: string; icon: typeof Map; desc: string; available: boolean }[] = (() => {
+  const sectionItems: { key: keyof ReportSections; label: string; icon: typeof MapIcon; desc: string; available: boolean }[] = (() => {
     if (isFlightsMode) {
       return [
         { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
         { key: "flightComparison", label: "비행 비교", icon: BarChart3, desc: "선택 비행 비교 테이블 및 차트", available: true },
-        { key: "trackMap", label: "항적 지도", icon: Map, desc: "선택 비행 항적 경로 시각화", available: true },
+        { key: "trackMap", label: "항적 지도", icon: MapIcon, desc: "선택 비행 항적 경로 시각화", available: true },
         { key: "lossDetail", label: "소실 상세", icon: Crosshair, desc: "소실 포인트 상세 목록", available: true },
         { key: "weather", label: "기상 분석", icon: Cloud, desc: "기상 조건 및 영향 분석", available: !!weatherData },
         { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
@@ -957,7 +1041,7 @@ function TemplateConfigModal({
       return [
         { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
         { key: "flightProfile", label: "비행 프로파일", icon: Plane, desc: "기본정보, KPI, 고도 추이 차트", available: true },
-        { key: "trackMap", label: "항적 지도", icon: Map, desc: "해당 비행 항적 경로 시각화", available: true },
+        { key: "trackMap", label: "항적 지도", icon: MapIcon, desc: "해당 비행 항적 경로 시각화", available: true },
         { key: "flightLossAnalysis", label: "소실 구간 분석", icon: BarChart3, desc: "구간별 상세, 분포 분석 차트", available: true },
         { key: "weather", label: "기상 분석", icon: Cloud, desc: "기상 조건 및 영향 분석", available: !!weatherData },
         { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
@@ -967,7 +1051,7 @@ function TemplateConfigModal({
     return [
       { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
       { key: "summary", label: "분석 요약", icon: BarChart3, desc: "KPI 그리드, 종합 판정, 소견", available: true },
-      { key: "trackMap", label: "항적 지도", icon: Map, desc: "항적 경로 및 Loss 구간 시각화", available: true },
+      { key: "trackMap", label: "항적 지도", icon: MapIcon, desc: "항적 경로 및 Loss 구간 시각화", available: true },
       { key: "stats", label: "분석 통계", icon: BarChart3, desc: `비행별 상세 ${template === "weekly" ? "통계" : "추이 차트"}`, available: flights.length > 0 },
       { key: "weather", label: "기상 분석", icon: Cloud, desc: "기상 조건 및 영향 분석", available: !!weatherData },
       { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },

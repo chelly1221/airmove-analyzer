@@ -444,6 +444,97 @@ pub struct BuildingInArea {
     pub height_m: f64,
 }
 
+/// 건물 오버레이용 상세 정보 (이름/주소/용도 포함)
+#[derive(Serialize, Clone, Debug)]
+pub struct BuildingForOverlay {
+    pub lat: f64,
+    pub lon: f64,
+    pub height_m: f64,
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub usage: Option<String>,
+    /// "gis" | "manual"
+    pub source: String,
+}
+
+/// 바운딩 박스 내 건물 조회 (오버레이용, 이름/주소/용도 포함)
+pub fn query_buildings_for_overlay(
+    conn: &Connection,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: f64,
+) -> Result<Vec<BuildingForOverlay>, String> {
+    let mut result = Vec::new();
+
+    // 1) GIS 건물
+    let mut stmt = conn.prepare(
+        "SELECT centroid_lat, centroid_lon, height, building_name, address, usage
+         FROM buildings
+         WHERE centroid_lat BETWEEN ?1 AND ?2
+           AND centroid_lon BETWEEN ?3 AND ?4
+           AND height >= ?5
+           AND height <= ?6"
+    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
+
+    let rows = stmt.query_map(
+        params![min_lat, max_lat, min_lon, max_lon, min_height_m, MAX_BUILDING_HEIGHT_M],
+        |row| {
+            Ok(BuildingForOverlay {
+                lat: row.get(0)?,
+                lon: row.get(1)?,
+                height_m: row.get(2)?,
+                name: row.get(3)?,
+                address: row.get(4)?,
+                usage: row.get(5)?,
+                source: "gis".to_string(),
+            })
+        },
+    ).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
+
+    for row in rows {
+        result.push(row.map_err(|e| format!("행 읽기 실패: {}", e))?);
+    }
+
+    // 2) 수동 등록 건물
+    let mut stmt2 = conn.prepare(
+        "SELECT name, latitude, longitude, height, ground_elev, memo
+         FROM manual_buildings
+         WHERE latitude BETWEEN ?1 AND ?2
+           AND longitude BETWEEN ?3 AND ?4"
+    ).map_err(|e| format!("수동 건물 쿼리 준비 실패: {}", e))?;
+
+    let rows2 = stmt2.query_map(
+        params![min_lat, max_lat, min_lon, max_lon],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
+    ).map_err(|e| format!("수동 건물 쿼리 실행 실패: {}", e))?;
+
+    for row in rows2 {
+        let (name, lat, lon, height, ground_elev, memo) = row.map_err(|e| format!("수동 건물 행 읽기 실패: {}", e))?;
+        result.push(BuildingForOverlay {
+            lat,
+            lon,
+            height_m: height + ground_elev,
+            name: if name.is_empty() { None } else { Some(name) },
+            address: None,
+            usage: if memo.is_empty() { None } else { Some(memo) },
+            source: "manual".to_string(),
+        });
+    }
+
+    Ok(result)
+}
+
 /// 바운딩 박스 내 건물 조회 (GIS건물통합정보 + 수동 등록 건물 통합)
 pub fn query_buildings_in_bbox(
     conn: &Connection,

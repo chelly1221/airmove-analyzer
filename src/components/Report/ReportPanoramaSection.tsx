@@ -4,6 +4,7 @@ interface PanoramaSectionProps {
   sectionNum: number;
   panoramaData: PanoramaPoint[];
   radarSite: RadarSite;
+  peakNames?: Map<number, string>;
 }
 
 /** 방위 라벨 */
@@ -26,7 +27,7 @@ function obstacleLabel(type: string): string {
   return type;
 }
 
-export default function ReportPanoramaSection({ sectionNum, panoramaData, radarSite }: PanoramaSectionProps) {
+export default function ReportPanoramaSection({ sectionNum, panoramaData, radarSite, peakNames }: PanoramaSectionProps) {
   if (panoramaData.length === 0) return null;
 
   // 통계 계산
@@ -47,10 +48,11 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
   const sectorStats = sectorLabels.map((label, i) => {
     const start = i * sectorSize;
     const end = start + sectorSize;
-    const pts = panoramaData.filter((p) => p.azimuth_deg >= start && p.azimuth_deg < end);
-    const bldgs = pts.filter((p) => p.obstacle_type !== "terrain");
-    const maxPt = pts.length > 0 ? pts.reduce((a, b) => a.elevation_angle_deg > b.elevation_angle_deg ? a : b) : null;
-    return { label, start, end, count: pts.length, buildings: bldgs.length, maxAngle: maxPt?.elevation_angle_deg ?? 0, maxPt };
+    const ptsWithIdx = panoramaData.map((p, idx) => ({ ...p, _idx: idx })).filter((p) => p.azimuth_deg >= start && p.azimuth_deg < end);
+    const bldgs = ptsWithIdx.filter((p) => p.obstacle_type !== "terrain");
+    const maxPtWithIdx = ptsWithIdx.length > 0 ? ptsWithIdx.reduce((a, b) => a.elevation_angle_deg > b.elevation_angle_deg ? a : b) : null;
+    const maxPt = maxPtWithIdx as (PanoramaPoint & { _idx: number }) | null;
+    return { label, start, end, count: ptsWithIdx.length, buildings: bldgs.length, maxAngle: maxPt?.elevation_angle_deg ?? 0, maxPt };
   });
 
   // SVG 파노라마 차트 (보고서용 간소화)
@@ -270,7 +272,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
                       </span>
                       <span className="truncate text-gray-600">
                         {s.maxPt.distance_km.toFixed(1)}km
-                        {s.maxPt.name ? ` · ${s.maxPt.name}` : ""}
+                        {(s.maxPt.name || peakNames?.get(s.maxPt._idx)) ? ` · ${s.maxPt.name || peakNames?.get(s.maxPt._idx)}` : ""}
                       </span>
                     </span>
                   ) : "—"}

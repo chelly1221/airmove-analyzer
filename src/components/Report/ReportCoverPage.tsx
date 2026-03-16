@@ -31,7 +31,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
           <span>문서번호: {docNum}</span>
         </div>
         <div className="mt-1 flex justify-between text-[11px] text-gray-500">
-          <span>시행일자: {format(now, "yyyy년 MM월 dd일")}</span>
+          <span>작성일자: {format(now, "yyyy년 MM월 dd일")}</span>
           <span>레이더: {radarName}</span>
         </div>
 
@@ -61,11 +61,8 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
             className="mt-6 text-center text-[14px] text-gray-500"
           />
 
-          <div className="mt-12 text-[13px] text-gray-400">
-            {format(now, "yyyy년 MM월 dd일")}
-          </div>
           {metadata.author && (
-            <div className="mt-2 text-[12px] text-gray-400">
+            <div className="mt-12 text-[12px] text-gray-400">
               작성: {metadata.author}
             </div>
           )}
