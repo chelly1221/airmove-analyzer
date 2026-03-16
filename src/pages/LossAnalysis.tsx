@@ -345,6 +345,7 @@ export default function LossAnalysis() {
   const [panoramaPinnedIdx, setPanoramaPinnedIdx] = useState<number | null>(null);
   const panoramaSvgRef = useRef<SVGSVGElement>(null);
   const [panoramaBldgMaxHeight, setPanoramaBldgMaxHeight] = useState<number | null>(null); // 건물 높이 필터 (null=미적용)
+  const [panoramaPeakNames, setPanoramaPeakNames] = useState<Map<number, string>>(new Map()); // 파노라마 인덱스 → 산 이름
 
   // Garble 뷰 활성 상태를 스토어에 동기화
   useEffect(() => {
@@ -420,8 +421,87 @@ export default function LossAnalysis() {
       setPanoramaData([]);
       setPanoramaPinnedIdx(null);
       setPanoramaHoverIdx(null);
+      setPanoramaPeakNames(new Map());
     }
   }, [radarSite.name]);
+
+  // 파노라마 지형 장애물 산 이름 조회 (Overpass API)
+  useEffect(() => {
+    if (panoramaData.length === 0) return;
+    let cancelled = false;
+
+    // 지형 포인트 중 로컬 극대값(주변 ±5 bin보다 앙각이 큰 점) 추출
+    const terrainPeaks: { idx: number; lat: number; lon: number; angle: number }[] = [];
+    for (let i = 0; i < panoramaData.length; i++) {
+      const pt = panoramaData[i];
+      if (pt.obstacle_type !== "terrain" || pt.elevation_angle_deg <= 0.01) continue;
+      // 로컬 극대값 검사 (±5 bin)
+      let isLocalMax = true;
+      for (let d = 1; d <= 5; d++) {
+        const li = (i - d + panoramaData.length) % panoramaData.length;
+        const ri = (i + d) % panoramaData.length;
+        if (panoramaData[li].elevation_angle_deg > pt.elevation_angle_deg ||
+            panoramaData[ri].elevation_angle_deg > pt.elevation_angle_deg) {
+          isLocalMax = false;
+          break;
+        }
+      }
+      if (isLocalMax) {
+        // 인근 3km 이내 중복 제거
+        const isDup = terrainPeaks.some((p) => haversineKm(p.lat, p.lon, pt.lat, pt.lon) < 3);
+        if (!isDup) terrainPeaks.push({ idx: i, lat: pt.lat, lon: pt.lon, angle: pt.elevation_angle_deg });
+      }
+    }
+
+    // 앙각 높은 순으로 최대 15개만 조회
+    terrainPeaks.sort((a, b) => b.angle - a.angle);
+    const targets = terrainPeaks.slice(0, 15);
+    if (targets.length === 0) return;
+
+    (async () => {
+      const names = new Map<number, string>();
+      // Overpass 배치 쿼리: 모든 대상 좌표를 하나의 union 쿼리로 처리
+      const aroundClauses = targets.map((t) => `node["natural"="peak"](around:3000,${t.lat},${t.lon})`).join(";");
+      try {
+        const url = `https://overpass-api.de/api/interpreter?data=[out:json];(${aroundClauses};);out body;`;
+        const resp = await fetch(url);
+        if (!resp.ok || cancelled) return;
+        const data = await resp.json();
+        const peaks = data.elements ?? [];
+
+        // 각 대상 좌표에 가장 가까운 peak 매칭
+        for (const target of targets) {
+          let closestName = "";
+          let closestDist = Infinity;
+          for (const el of peaks) {
+            const d = haversineKm(target.lat, target.lon, el.lat, el.lon);
+            if (d < closestDist && d < 3) {
+              closestDist = d;
+              closestName = el.tags?.["name:ko"] || el.tags?.name || "";
+            }
+          }
+          if (closestName) {
+            names.set(target.idx, closestName);
+            // 인접 bin(같은 산을 가리키는 bin)에도 이름 전파
+            for (let d = 1; d <= 10; d++) {
+              for (const dir of [-1, 1]) {
+                const adj = (target.idx + dir * d + panoramaData.length) % panoramaData.length;
+                const adjPt = panoramaData[adj];
+                if (adjPt.obstacle_type === "terrain" && haversineKm(adjPt.lat, adjPt.lon, target.lat, target.lon) < 3) {
+                  names.set(adj, closestName);
+                } else break;
+              }
+            }
+          }
+        }
+        if (!cancelled && names.size > 0) setPanoramaPeakNames(names);
+      } catch (e) {
+        console.error("파노라마 산 이름 조회 실패:", e);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [panoramaData]);
 
   // 건물 높이 필터 적용된 파노라마 데이터
   const filteredPanoramaData = useMemo(() => {
@@ -456,8 +536,8 @@ export default function LossAnalysis() {
 
   // 파노라마 SVG 마우스 핸들러
   const panoramaSvgW = 1200;
-  const panoramaSvgH = 400;
-  const panoramaMargin = { top: 20, right: 30, bottom: 40, left: 60 };
+  const panoramaSvgH = 200;
+  const panoramaMargin = { top: 16, right: 30, bottom: 28, left: 50 };
   const panoramaChartW = panoramaSvgW - panoramaMargin.left - panoramaMargin.right;
   const panoramaChartH = panoramaSvgH - panoramaMargin.top - panoramaMargin.bottom;
 
@@ -752,14 +832,16 @@ export default function LossAnalysis() {
   const barW = chartW / garbleBearingHistogram.length;
 
   return (
-    <div className="space-y-6">
+    <div className={viewMode === "los-panorama" ? "flex h-full flex-col gap-3" : "space-y-6"}>
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex shrink-0 items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-800">통계 / 분석</h1>
-          <p className="mt-1 text-sm text-gray-500">
-            비행검사기 항적 통계 및 표적소실 구간 분석
-          </p>
+          {viewMode !== "los-panorama" && (
+            <p className="mt-1 text-sm text-gray-500">
+              비행검사기 항적 통계 및 표적소실 구간 분석
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-1 rounded-lg border border-gray-200 bg-gray-50 p-1">
           {(
@@ -804,16 +886,19 @@ export default function LossAnalysis() {
             </SimpleCard>
           ) : (
             <>
-              {/* Row 1: 파노라마 차트 */}
-              <SimpleCard className="p-0">
-                <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+              {/* 파노라마 차트 + 건물 지도 통합 카드 */}
+              <SimpleCard className="flex min-h-0 flex-1 flex-col p-0">
+                <div className="flex shrink-0 items-center justify-between border-b border-gray-200 px-4 py-2">
                   <div>
                     <h3 className="text-sm font-semibold text-gray-800">
                       360° LoS 파노라마 — {radarSite.name}
+                      {panoramaBuildingPoints.length > 0 && (
+                        <span className="ml-2 text-xs font-normal text-gray-500">
+                          · 건물 {panoramaBuildingPoints.length}개
+                          {panoramaBldgMaxHeight !== null && ` (≤ ${panoramaBldgMaxHeight}m)`}
+                        </span>
+                      )}
                     </h3>
-                    <p className="mt-0.5 text-xs text-gray-500">
-                      레이더 안테나 ({(radarSite.altitude + radarSite.antenna_height).toFixed(0)}m ASL) 기준 전방위 최대 장애물 앙각
-                    </p>
                   </div>
                   <div className="flex items-center gap-3">
                     <div className="flex items-center gap-1.5">
@@ -848,6 +933,7 @@ export default function LossAnalysis() {
                           radarLon: radarSite.longitude,
                         }).catch(() => {});
                         setPanoramaData([]);
+                        setPanoramaPeakNames(new Map());
                         computePanorama();
                       }}
                       className="rounded-md border border-gray-200 px-2.5 py-1 text-xs text-gray-500 hover:bg-gray-50"
@@ -856,7 +942,7 @@ export default function LossAnalysis() {
                     </button>
                   </div>
                 </div>
-                <div className="p-4">
+                <div className="shrink-0 px-4 py-2">
                   <svg
                     ref={panoramaSvgRef}
                     viewBox={`0 0 ${panoramaSvgW} ${panoramaSvgH}`}
@@ -980,6 +1066,23 @@ export default function LossAnalysis() {
                           const x = panoramaMargin.left + (panoramaActiveIdx / (filteredPanoramaData.length - 1)) * panoramaChartW;
                           const y = panoramaMargin.top + panoramaChartH * (1 - (pt.elevation_angle_deg - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                           const isPinned = panoramaPinnedIdx === panoramaActiveIdx;
+                          const peakName = pt.obstacle_type === "terrain" ? panoramaPeakNames.get(panoramaActiveIdx) : null;
+                          const labelName = pt.name || peakName || null;
+                          // 툴팁 내용: 방위/앙각 + 이름/거리/높이
+                          const line1 = `${pt.azimuth_deg.toFixed(1)}° / ${pt.elevation_angle_deg.toFixed(3)}°`;
+                          const line2Parts: string[] = [];
+                          if (labelName) line2Parts.push(labelName);
+                          line2Parts.push(`${pt.distance_km.toFixed(1)}km`);
+                          if (pt.obstacle_type === "terrain") {
+                            line2Parts.push(`${Math.round(pt.obstacle_height_m)}m`);
+                          } else {
+                            line2Parts.push(`${Math.round(pt.obstacle_height_m)}m(건물)`);
+                          }
+                          const line2 = line2Parts.join(" · ");
+                          const tooltipW = Math.max(90, Math.max(line1.length, line2.length) * 6.5 + 16);
+                          const tooltipH = 30;
+                          // 좌우 경계 보정
+                          const tooltipX = x + tooltipW + 12 > panoramaSvgW ? x - tooltipW - 8 : x + 8;
                           return (
                             <>
                               <line x1={x} y1={panoramaMargin.top} x2={x} y2={panoramaMargin.top + panoramaChartH}
@@ -989,17 +1092,48 @@ export default function LossAnalysis() {
                               <circle cx={x} cy={y} r={4}
                                 fill={pt.obstacle_type !== "terrain" ? "#f97316" : "#22c55e"}
                                 stroke={isPinned ? "#eab308" : "#fff"} strokeWidth={2} />
-                              {/* 방위/앙각 라벨 */}
-                              <rect x={x + 8} y={panoramaMargin.top - 2} width={80} height={16} rx={3}
-                                fill="rgba(0,0,0,0.75)" />
-                              <text x={x + 12} y={panoramaMargin.top + 10} fill="white" fontSize={10}>
-                                {pt.azimuth_deg.toFixed(1)}° / {pt.elevation_angle_deg.toFixed(3)}°
+                              {/* 상세 툴팁 */}
+                              <rect x={tooltipX} y={panoramaMargin.top - 2} width={tooltipW} height={tooltipH} rx={3}
+                                fill="rgba(0,0,0,0.8)" />
+                              <text x={tooltipX + 6} y={panoramaMargin.top + 10} fill="white" fontSize={10}>
+                                {line1}
+                              </text>
+                              <text x={tooltipX + 6} y={panoramaMargin.top + 22} fill="#d1d5db" fontSize={9}>
+                                {line2}
                               </text>
                             </>
                           );
                         })()}
                       </g>
                     )}
+
+                    {/* 이름 있는 산 마커 */}
+                    {(() => {
+                      // 중복 이름 제거: 같은 이름의 산은 가장 높은 앙각 bin만 표시
+                      const shown = new Map<string, number>();
+                      for (const [idx, name] of panoramaPeakNames.entries()) {
+                        if (idx >= filteredPanoramaData.length) continue;
+                        const pt = filteredPanoramaData[idx];
+                        if (pt.obstacle_type !== "terrain") continue;
+                        const prev = shown.get(name);
+                        if (prev === undefined || pt.elevation_angle_deg > filteredPanoramaData[prev].elevation_angle_deg) {
+                          shown.set(name, idx);
+                        }
+                      }
+                      return Array.from(shown.entries()).map(([name, idx]) => {
+                        const pt = filteredPanoramaData[idx];
+                        const px = panoramaMargin.left + (idx / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                        const py = panoramaMargin.top + panoramaChartH * (1 - (pt.elevation_angle_deg - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
+                        return (
+                          <g key={`peak-${idx}`}>
+                            <circle cx={px} cy={py} r={2.5} fill="#f59e0b" stroke="#fff" strokeWidth={0.5} />
+                            <text x={px} y={py - 6} textAnchor="middle" fill="#92400e" fontSize={8} fontWeight="bold">
+                              {name}
+                            </text>
+                          </g>
+                        );
+                      });
+                    })()}
 
                     {/* 축 라벨 */}
                     <text x={panoramaSvgW / 2} y={panoramaSvgH - 4} textAnchor="middle" fill="#6b7280" fontSize={11}>
@@ -1021,25 +1155,11 @@ export default function LossAnalysis() {
                     </g>
                   </svg>
                 </div>
-              </SimpleCard>
 
-
-              {/* Row 3: 건물 위치 지도 */}
+              {/* 건물 위치 지도 (카드 내부, 나머지 공간 채움) */}
               {panoramaBuildingPoints.length > 0 && (
-                <SimpleCard className="p-0">
-                  <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
-                    <div>
-                      <h3 className="text-sm font-semibold text-gray-800">
-                        파노라마 건물 위치
-                      </h3>
-                      <p className="mt-0.5 text-xs text-gray-500">
-                        {panoramaBuildingPoints.length}개 건물 표시
-                        {panoramaBldgMaxHeight !== null && ` (≤ ${panoramaBldgMaxHeight}m 필터 적용)`}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="h-[400px]">
-                    <MapGL
+                <div className="min-h-0 flex-1 border-t border-gray-200">
+                  <MapGL
                       ref={panoramaMapRef}
                       initialViewState={{
                         latitude: radarSite.latitude,
@@ -1109,9 +1229,9 @@ export default function LossAnalysis() {
                         ]}
                       />
                     </MapGL>
-                  </div>
-                </SimpleCard>
+                </div>
               )}
+              </SimpleCard>
             </>
           )}
         </>

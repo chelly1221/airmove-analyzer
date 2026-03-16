@@ -728,7 +728,7 @@ function PanoramaObstaclePanel() {
 
   if (!pt) {
     return (
-      <div className="flex flex-col items-center justify-center gap-1.5 text-center" style={{ minHeight: 260 }}>
+      <div className="flex flex-col items-center justify-center gap-1.5 py-4 text-center">
         <Eye size={16} className="text-gray-300" />
         <p className="text-[10px] text-gray-400">
           차트 위를 호버하거나 클릭하여<br />장애물 정보를 확인하세요
@@ -746,9 +746,12 @@ function PanoramaObstaclePanel() {
     pt.obstacle_type === "terrain" ? "bg-green-100 text-green-700"
     : pt.obstacle_type === "gis_building" ? "bg-orange-100 text-orange-700"
     : "bg-red-100 text-red-700";
+  const elevASL = isBuilding
+    ? pt.ground_elev_m + pt.obstacle_height_m
+    : pt.ground_elev_m;
 
   return (
-    <div className="flex flex-col gap-2 px-3 py-2" style={{ minHeight: 260 }}>
+    <div className="flex flex-col gap-2 px-3 py-2">
       {/* 유형 뱃지 + 이름 + 고정 상태 */}
       <div className="flex items-center gap-1.5">
         <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${typeColor}`}>
@@ -759,15 +762,15 @@ function PanoramaObstaclePanel() {
             고정
           </span>
         )}
+        {pt.name && (
+          <span className="text-[11px] font-semibold text-gray-800 truncate" title={pt.name}>
+            {pt.name}
+          </span>
+        )}
       </div>
-      {pt.name && (
-        <p className="text-[11px] font-semibold text-gray-800 truncate" title={pt.name}>
-          {pt.name}
-        </p>
-      )}
 
-      {/* 수치 정보 */}
-      <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+      {/* 공통 수치 — 모든 유형 동일 위치 */}
+      <div className="grid grid-cols-3 gap-x-2 gap-y-1">
         <div>
           <span className="text-[9px] text-gray-400">방위</span>
           <p className="font-mono text-[11px] font-medium text-gray-700">{pt.azimuth_deg.toFixed(1)}°</p>
@@ -780,29 +783,25 @@ function PanoramaObstaclePanel() {
           <span className="text-[9px] text-gray-400">거리</span>
           <p className="font-mono text-[11px] font-medium text-gray-700">{pt.distance_km.toFixed(2)} km</p>
         </div>
+      </div>
+
+      {/* 높이 정보 — 동일 그리드, 유형별 추가 필드 */}
+      <div className="grid grid-cols-3 gap-x-2 gap-y-1">
         <div>
-          <span className="text-[9px] text-gray-400">표고</span>
+          <span className="text-[9px] text-gray-400">해발고도</span>
+          <p className="font-mono text-[11px] font-medium text-gray-700">{elevASL.toFixed(0)} m</p>
+        </div>
+        <div>
+          <span className="text-[9px] text-gray-400">지면표고</span>
           <p className="font-mono text-[11px] font-medium text-gray-700">{pt.ground_elev_m.toFixed(0)} m</p>
         </div>
-        {isBuilding && (
-          <>
-            <div>
-              <span className="text-[9px] text-gray-400">건물 높이</span>
-              <p className="font-mono text-[11px] font-medium text-gray-700">{pt.obstacle_height_m.toFixed(1)} m</p>
-            </div>
-            <div>
-              <span className="text-[9px] text-gray-400">총 높이</span>
-              <p className="font-mono text-[11px] font-medium text-gray-700">
-                {(pt.ground_elev_m + pt.obstacle_height_m).toFixed(0)} m
-              </p>
-            </div>
-          </>
-        )}
-        {!isBuilding && (
+        {isBuilding ? (
           <div>
-            <span className="text-[9px] text-gray-400">지형 높이</span>
-            <p className="font-mono text-[11px] font-medium text-gray-700">{pt.obstacle_height_m.toFixed(0)} m</p>
+            <span className="text-[9px] text-gray-400">건물높이</span>
+            <p className="font-mono text-[11px] font-medium text-gray-700">{pt.obstacle_height_m.toFixed(1)} m</p>
           </div>
+        ) : (
+          <div />
         )}
       </div>
 
@@ -812,7 +811,7 @@ function PanoramaObstaclePanel() {
         <span className="font-mono">{pt.lat.toFixed(5)}°N {pt.lon.toFixed(5)}°E</span>
       </div>
 
-      {/* 건물 주소/용도 */}
+      {/* 건물 추가 정보: 주소/용도 */}
       {isBuilding && (pt.address || pt.usage) && (
         <div className="border-t border-gray-100 pt-1.5 space-y-0.5">
           {pt.address && (
@@ -915,6 +914,13 @@ export default function Sidebar() {
           </div>
         </nav>
 
+        {/* 전파 장애물 (파노라마) 활성 시 장애물 정보 패널 — nav 바로 아래 */}
+        {!collapsed && panoramaViewActive && (
+          <div className="border-t border-gray-100 overflow-y-auto">
+            <PanoramaObstaclePanel />
+          </div>
+        )}
+
         {/* 업로드 탭: 데이터 관리 버튼 */}
         {!collapsed && isUploadPage && (
           <div className="mt-auto border-t border-gray-100">
@@ -940,13 +946,6 @@ export default function Sidebar() {
         {!collapsed && garbleViewActive && (
           <div className="flex flex-1 flex-col overflow-hidden border-t border-gray-100">
             <GarbleAircraftPanel />
-          </div>
-        )}
-
-        {/* 전파 장애물 (파노라마) 활성 시 장애물 정보 패널 */}
-        {!collapsed && panoramaViewActive && (
-          <div className="mt-auto border-t border-gray-100 overflow-y-auto" style={{ minHeight: 280 }}>
-            <PanoramaObstaclePanel />
           </div>
         )}
       </aside>

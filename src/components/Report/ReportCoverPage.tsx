@@ -5,7 +5,7 @@ import { forwardRef } from "react";
 import type { ReportMetadata } from "../../types";
 
 interface CoverPageProps {
-  template: "weekly" | "monthly" | "flights" | "single";
+  template: "weekly" | "monthly" | "flights" | "single" | "obstacle";
   radarName: string;
   metadata: ReportMetadata;
   editable: boolean;

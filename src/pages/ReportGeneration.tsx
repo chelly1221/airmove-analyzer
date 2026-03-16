@@ -17,6 +17,7 @@ import {
   ScanSearch,
   ListChecks,
   Mountain,
+  Radio,
 } from "lucide-react";
 import { format } from "date-fns";
 import { useAppStore } from "../store";
@@ -34,12 +35,13 @@ import ReportFlightComparisonSection from "../components/Report/ReportFlightComp
 import ReportFlightProfileSection from "../components/Report/ReportFlightProfileSection";
 import ReportFlightLossAnalysisSection from "../components/Report/ReportFlightLossAnalysisSection";
 import ReportPanoramaSection from "../components/Report/ReportPanoramaSection";
+import ReportObstacleSummarySection from "../components/Report/ReportObstacleSummarySection";
 import { useReportExport } from "../components/Report/useReportExport";
 import { invoke } from "@tauri-apps/api/core";
 import { flightLabel } from "../utils/flightConsolidation";
 import type { Flight, LOSProfileData, WeatherSnapshot, Aircraft as AircraftType, ReportMetadata, PanoramaPoint } from "../types";
 
-type ReportTemplate = "weekly" | "monthly" | "flights" | "single";
+type ReportTemplate = "weekly" | "monthly" | "flights" | "single" | "obstacle";
 type ReportMode = "config" | "preview";
 
 interface ReportSections {
@@ -57,6 +59,8 @@ interface ReportSections {
   // 단일 상세 전용
   flightProfile: boolean;
   flightLossAnalysis: boolean;
+  // 장애물 보고서 전용
+  obstacleSummary: boolean;
 }
 
 const DEFAULT_SECTIONS: ReportSections = {
@@ -72,6 +76,7 @@ const DEFAULT_SECTIONS: ReportSections = {
   lossDetail: true,
   flightProfile: true,
   flightLossAnalysis: true,
+  obstacleSummary: true,
 };
 
 /** 템플릿별 표시할 섹션 토글 목록 */
@@ -85,6 +90,15 @@ function getSectionToggles(template: ReportTemplate, _sections: ReportSections):
       { key: "weather", label: "기상" },
       { key: "los", label: "LOS" },
       { key: "panorama", label: "장애물" },
+    ];
+  }
+  if (template === "obstacle") {
+    return [
+      { key: "cover", label: "표지" },
+      { key: "obstacleSummary", label: "요약" },
+      { key: "trackMap", label: "지도" },
+      { key: "los", label: "LOS" },
+      { key: "panorama", label: "파노라마" },
     ];
   }
   if (template === "single") {
@@ -116,6 +130,7 @@ function templateDisplayLabel(tpl: ReportTemplate): string {
     case "monthly": return "월간";
     case "flights": return "건별";
     case "single": return "상세";
+    case "obstacle": return "장애물";
   }
 }
 
@@ -262,6 +277,9 @@ export default function ReportGeneration() {
       const ids = flightIds ?? selectedFlightIds;
       setCoverTitle("비행 건별 분석 보고서");
       setCoverSubtitle(`${format(new Date(), "yyyy년 MM월 dd일")} · 선택 ${ids.size}건 비행 분석`);
+    } else if (tpl === "obstacle") {
+      setCoverTitle("전파 장애물 분석 보고서");
+      setCoverSubtitle(`${radarSite?.name ?? ""} 레이더 장애물 종합 분석 · ${format(new Date(), "yyyy년 MM월 dd일")}`);
     } else if (tpl === "single") {
       const f = flights.find((fl) => fl.id === (singleId ?? singleFlightId));
       if (f) {
@@ -290,7 +308,7 @@ export default function ReportGeneration() {
     setSections(sects);
     setTemplateModalOpen(null);
     setMode("preview");
-  }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId]);
+  }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite]);
 
   // PDF 내보내기
   const handleExportPDF = useCallback(async () => {
@@ -320,6 +338,11 @@ export default function ReportGeneration() {
       if (sections.trackMap) nums.trackMap = n++;
       if (sections.lossDetail) nums.lossDetail = n++;
       if (sections.weather && weatherData) nums.weather = n++;
+      if (sections.los && losResults.length > 0) nums.los = n++;
+      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
+    } else if (template === "obstacle") {
+      if (sections.obstacleSummary) nums.obstacleSummary = n++;
+      if (sections.trackMap) nums.trackMap = n++;
       if (sections.los && losResults.length > 0) nums.los = n++;
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else if (template === "single") {
@@ -399,6 +422,17 @@ export default function ReportGeneration() {
             ]}
             disabled={flights.length === 0}
             onClick={() => setTemplateModalOpen("single")}
+          />
+          <TemplateCard
+            icon={Radio}
+            title="전파 장애물 보고서"
+            description="레이더 전파 장애물을 종합 분석합니다. LOS 차단 분석, 360° 파노라마 장애물 탐색, 건물 목록이 포함됩니다."
+            stats={[
+              { label: "LOS 분석", value: `${losResults.length}건` },
+              { label: "파노라마", value: panoramaData.length > 0 ? "있음" : "없음" },
+            ]}
+            disabled={losResults.length === 0 && panoramaData.length === 0}
+            onClick={() => setTemplateModalOpen("obstacle")}
           />
         </div>
 
@@ -572,6 +606,49 @@ export default function ReportGeneration() {
                     {reportMetadata.footer}
                   </p>
                 </div>
+              </ReportPage>
+            )}
+          </>
+        )}
+
+        {/* ─── 전파 장애물 ─── */}
+        {template === "obstacle" && (
+          <>
+            {(sections.obstacleSummary || sections.trackMap) && (
+              <ReportPage>
+                {sections.obstacleSummary && radarSite && (
+                  <ReportObstacleSummarySection
+                    sectionNum={sectionNumbers.obstacleSummary ?? 1}
+                    losResults={losResults}
+                    panoramaData={panoramaData}
+                    radarSite={radarSite}
+                  />
+                )}
+                {sections.trackMap && (
+                  <ReportMapSection
+                    sectionNum={sectionNumbers.trackMap ?? 2}
+                    mapImage={mapImage}
+                  />
+                )}
+              </ReportPage>
+            )}
+
+            {sections.los && losResults.length > 0 && (
+              <ReportPage>
+                <ReportLOSSection
+                  sectionNum={sectionNumbers.los ?? 3}
+                  losResults={losResults}
+                />
+              </ReportPage>
+            )}
+
+            {sections.panorama && panoramaData.length > 0 && radarSite && (
+              <ReportPage>
+                <ReportPanoramaSection
+                  sectionNum={sectionNumbers.panorama ?? 4}
+                  panoramaData={panoramaData}
+                  radarSite={radarSite}
+                />
               </ReportPage>
             )}
           </>
@@ -807,6 +884,15 @@ function TemplateConfigModal({
         { key: "weather", label: "기상 분석", icon: Cloud, desc: "기상 조건 및 영향 분석", available: !!weatherData },
         { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
         { key: "panorama", label: "전파 장애물", icon: Mountain, desc: "360° 파노라마 장애물 분석", available: panoramaData.length > 0 },
+      ];
+    }
+    if (template === "obstacle") {
+      return [
+        { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
+        { key: "obstacleSummary", label: "장애물 종합 요약", icon: Radio, desc: "LOS·파노라마 통합 KPI, 주요 장애물 TOP 5", available: losResults.length > 0 || panoramaData.length > 0 },
+        { key: "trackMap", label: "항적 지도", icon: Map, desc: "LOS 경로 및 장애물 위치 시각화", available: true },
+        { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단/양호 상세 결과", available: losResults.length > 0 },
+        { key: "panorama", label: "360° 파노라마", icon: Mountain, desc: "방위별 최대 앙각 장애물 및 건물 목록", available: panoramaData.length > 0 },
       ];
     }
     if (isSingleMode) {
