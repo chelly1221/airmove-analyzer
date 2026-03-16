@@ -46,8 +46,10 @@ async function fetchWeatherForDay(lat: number, lon: number, date: string): Promi
   const hourly: WeatherHourly[] = [];
   if (h && h.time) {
     for (let i = 0; i < h.time.length; i++) {
+      const ts = new Date(h.time[i] + "Z").getTime() / 1000;
+      if (Number.isNaN(ts)) continue;
       hourly.push({
-        timestamp: new Date(h.time[i] + "Z").getTime() / 1000,
+        timestamp: ts,
         temperature: h.temperature_2m?.[i] ?? 0,
         precipitation: h.precipitation?.[i] ?? 0,
         cloud_cover: h.cloud_cover?.[i] ?? 0,

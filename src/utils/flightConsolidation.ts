@@ -213,6 +213,19 @@ function buildFlight(
     console.log(`[고도보정] ${modeS}: ${correctedCount}개 포인트 보정됨`);
   }
 
+  if (correctedPoints.length === 0) {
+    return {
+      id: `${modeS}_0`,
+      mode_s: modeS,
+      aircraft_name: aircraftName,
+      callsign, departure_airport: departure, arrival_airport: arrival,
+      start_time: 0, end_time: 0,
+      track_points: [], loss_points: [], loss_segments: [],
+      total_loss_time: 0, total_track_time: 0, loss_percentage: 0,
+      max_radar_range_km: 0, match_type: matchType,
+    };
+  }
+
   const { lossPoints, lossSegments, maxRadarRangeKm } = detectLoss(
     correctedPoints, radarSite.latitude, radarSite.longitude,
   );

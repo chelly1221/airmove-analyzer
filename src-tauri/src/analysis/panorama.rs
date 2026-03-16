@@ -52,7 +52,7 @@ struct BuildingCandidate {
 /// 4/3 유효지구 모델 앙각 계산
 /// d: 지표 거리 (m), h_obs: 장애물 해발고 (m), h_radar: 레이더 안테나 해발고 (m)
 fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
-    if d < 1.0 {
+    if d < 1.0 || !d.is_finite() {
         return 0.0;
     }
     let dh = h_obs - h_radar;

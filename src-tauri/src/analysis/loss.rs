@@ -126,7 +126,7 @@ pub fn calculate_haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) 
 
     let a = (dlat / 2.0).sin().powi(2)
         + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().asin();
+    let c = 2.0 * a.clamp(0.0, 1.0).sqrt().asin();
 
     EARTH_RADIUS_KM * c
 }
@@ -224,8 +224,9 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Loss 시간 전체 합산
+    // Loss 시간 합산 (signal_loss만 — 범위이탈은 예상된 동작이므로 소실율에서 제외)
     let total_loss_time: f64 = all_loss_segments.iter()
+        .filter(|s| s.loss_type == "signal_loss")
         .map(|s| s.duration_secs)
         .sum();
 

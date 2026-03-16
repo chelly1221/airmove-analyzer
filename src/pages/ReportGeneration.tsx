@@ -99,15 +99,17 @@ export default function ReportGeneration() {
       const map = (window as any).__maplibreInstance;
       if (map && flights.length > 0) {
         let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+        let hasPoints = false;
         for (const f of flights) {
           for (const p of f.track_points) {
+            hasPoints = true;
             if (p.latitude < minLat) minLat = p.latitude;
             if (p.latitude > maxLat) maxLat = p.latitude;
             if (p.longitude < minLon) minLon = p.longitude;
             if (p.longitude > maxLon) maxLon = p.longitude;
           }
         }
-        if (minLat < maxLat && minLon < maxLon) {
+        if (hasPoints && minLat < maxLat && minLon < maxLon) {
           map.fitBounds([[minLon, minLat], [maxLon, maxLat]], {
             padding: 60, duration: 0, bearing: 0, pitch: 0,
           });
@@ -247,7 +249,7 @@ export default function ReportGeneration() {
             weatherData={weatherData}
             aircraft={aircraft}
             metadata={reportMetadata}
-            radarName={radarSite.name}
+            radarName={radarSite?.name ?? ""}
             onClose={() => setTemplateModalOpen(null)}
             onGenerate={handleGenerate}
           />
@@ -315,7 +317,7 @@ export default function ReportGeneration() {
         {sections.cover && (
           <ReportCoverPage
             template={template}
-            radarName={radarSite.name}
+            radarName={radarSite?.name ?? ""}
             metadata={reportMetadata}
             editable
             title={coverTitle}

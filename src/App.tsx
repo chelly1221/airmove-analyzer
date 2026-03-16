@@ -273,8 +273,9 @@ function useOpenskyAutoSync() {
         console.log("[OpenSky] DB 캐시 로드 실패:", e);
       }
 
-      // 3) API 동기화 시작
+      // 3) API 동기화 시작 (이중 실행 방지)
       if (cancelled || syncingRef.current) return;
+      syncingRef.current = true;
 
       // 인증정보 확인
       let creds: [string, string];
@@ -290,9 +291,10 @@ function useOpenskyAutoSync() {
       }
 
       const activeAircraft = useAppStore.getState().aircraft.filter((a) => a.active && a.mode_s_code);
-      if (activeAircraft.length === 0) return;
-
-      syncingRef.current = true;
+      if (activeAircraft.length === 0) {
+        syncingRef.current = false;
+        return;
+      }
       useAppStore.getState().setOpenskySync(true);
       const now = Math.floor(Date.now() / 1000);
       const fiveYears = 5 * 365 * 86400;

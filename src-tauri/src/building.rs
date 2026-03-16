@@ -542,6 +542,9 @@ fn parse_dbf_euckr_field(dbf_path: &Path, field_names: &[&str]) -> Option<Vec<Op
     let num_records = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
     let header_size = u16::from_le_bytes(data[8..10].try_into().ok()?) as usize;
     let record_size = u16::from_le_bytes(data[10..12].try_into().ok()?) as usize;
+    if record_size == 0 || header_size == 0 || header_size > data.len() {
+        return None;
+    }
 
     // 필드 디스크립터 파싱: 오프셋 32부터 32바이트씩, 0x0D 터미네이터
     // field_names 리스트 순서를 우선순위로 사용 (앞쪽이 높은 우선순위)

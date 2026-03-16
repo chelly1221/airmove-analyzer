@@ -24,7 +24,7 @@ export function haversine(lat1: number, lon1: number, lat2: number, lon2: number
   const a =
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.asin(Math.sqrt(a));
+  return R * 2 * Math.asin(Math.sqrt(Math.min(a, 1)));
 }
 
 /** 트랙의 중앙값 스캔 간격 추정 */
@@ -37,7 +37,7 @@ function estimateScanInterval(points: TrackPoint[]): number | null {
   }
   if (gaps.length < 3) return null;
   gaps.sort((a, b) => a - b);
-  return gaps[Math.floor(gaps.length / 2)];
+  return gaps[Math.floor(gaps.length / 2)] ?? null;
 }
 
 /** 레이더 최대 탐지거리 추정 (95th percentile) */
@@ -74,6 +74,7 @@ function detectLossForTrack(
     const gap = next.timestamp - prev.timestamp;
 
     if (gap > thresholdSecs && gap <= MAX_LOSS_DURATION_SECS) {
+      if (gap <= 0) continue; // 0 나누기 방지
       const startRadarDist = haversine(radarLat, radarLon, prev.latitude, prev.longitude);
       const endRadarDist = haversine(radarLat, radarLon, next.latitude, next.longitude);
       const missedScans = gap / scanIntervalSecs;

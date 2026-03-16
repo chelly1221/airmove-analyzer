@@ -250,7 +250,7 @@ public/                 # 정적 자산
 - I200: Ground Speed + Heading, I220: 24비트 ICAO Mode-S 주소
 - NEC 프레임 탐지: 월+일만 매칭 (시/분은 유효범위 검증만)
 - 자정 경과 보정 (prev_tod > 70000 && curr_tod < 16000 → +86400s)
-- 유효성 필터: 한국 영공 (lat 30-45°, lon 120-135°)
+- 유효성 필터: 동아시아 확장 범위 (lat 25-50°, lon 115-145°) — 국제선 진입/이탈 구간 포함
 
 ## Loss 탐지 알고리즘
 - **구현**: Rust (서버사이드) + TypeScript (클라이언트사이드, `src/utils/lossDetection.ts`)

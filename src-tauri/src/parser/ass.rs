@@ -328,7 +328,7 @@ impl TrackAssembler {
                     deltas.push(dt);
                 }
             }
-            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median_scan = if deltas.is_empty() {
                 7.0
             } else {
@@ -616,7 +616,7 @@ impl TrackAssembler {
                     deltas.push(dt);
                 }
             }
-            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median_scan = if deltas.is_empty() {
                 7.0
             } else {
@@ -683,7 +683,13 @@ impl TrackAssembler {
 
             for &oi in &outlier_indices {
                 let ghost = &points[oi];
-                let real = if oi > 0 { &points[oi - 1] } else { &points[oi + 1] };
+                let real = if oi > 0 {
+                    &points[oi - 1]
+                } else if oi + 1 < points.len() {
+                    &points[oi + 1]
+                } else {
+                    continue;
+                };
 
                 let mut bearing_diff = ghost.theta_deg - real.theta_deg;
                 if bearing_diff > 180.0 { bearing_diff -= 360.0; }

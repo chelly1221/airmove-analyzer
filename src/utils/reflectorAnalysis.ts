@@ -154,6 +154,7 @@ export function summarizeGarbleByModeS(
 
   const summaries: GarbleSummary[] = [];
   for (const [modeS, pts] of groups) {
+    if (pts.length === 0) continue;
     const sidelobe = pts.filter((p) => p.garble_type === "sidelobe");
     const multipath = pts.filter((p) => p.garble_type === "multipath");
     const timestamps = pts.map((p) => p.timestamp);
