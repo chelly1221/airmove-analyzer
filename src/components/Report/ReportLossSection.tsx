@@ -6,7 +6,7 @@ import { useAppStore } from "../../store";
 interface LossSectionProps {
   sectionNum: number;
   flights: Flight[];
-  template: "weekly" | "monthly";
+  template: "weekly" | "monthly" | "flights" | "single";
 }
 
 export default function ReportLossSection({ sectionNum, flights, template }: LossSectionProps) {

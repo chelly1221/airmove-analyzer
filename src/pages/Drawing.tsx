@@ -1,9 +1,8 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from "react";
-import { Filter, ChevronDown, Plane } from "lucide-react";
+import { Filter, ChevronDown } from "lucide-react";
 import { format } from "date-fns";
 import MapGL, { Source, Layer, Marker } from "react-map-gl/maplibre";
 import { useAppStore } from "../store";
-import { flightLabel } from "../utils/flightConsolidation";
 import type { TrackPoint } from "../types";
 
 /** 항공기별 색상 팔레트 */
@@ -51,8 +50,8 @@ export default function Drawing() {
   const radarSite = useAppStore((s) => s.radarSite);
   const selectedModeS = useAppStore((s) => s.selectedModeS);
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
+  const selectedFlightId = useAppStore((s) => s.selectedFlightId);
   const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [selectedFlightId, setSelectedFlightId] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const sideCanvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -225,13 +224,6 @@ export default function Drawing() {
     if (!flight) return displayPoints;
     return flight.track_points;
   }, [selectedFlightId, filteredFlights, displayPoints]);
-
-  // selectedFlightId가 filteredFlights에 없으면 초기화
-  useEffect(() => {
-    if (selectedFlightId && !filteredFlights.find((f) => f.id === selectedFlightId)) {
-      setSelectedFlightId(null);
-    }
-  }, [filteredFlights, selectedFlightId]);
 
   // ── 측면도 캔버스 (NM / ft) ──
   useEffect(() => {
@@ -526,61 +518,8 @@ export default function Drawing() {
             </div>
           )}
 
-          {/* 비행 목록 + 캔버스 + 지도 영역 */}
+          {/* 캔버스 + 지도 영역 */}
           <div className="flex flex-1 gap-4 min-h-0">
-            {/* 비행 목록 사이드바 */}
-            <div className="w-52 flex-shrink-0 rounded-xl border border-gray-200 bg-white flex flex-col overflow-hidden">
-              <div className="px-3 py-2 border-b border-gray-100 flex items-center gap-2">
-                <Plane size={14} className="text-gray-400" />
-                <span className="text-xs font-medium text-gray-600">비행 목록</span>
-                <span className="ml-auto text-[10px] text-gray-400">{filteredFlights.length}건</span>
-              </div>
-              <div className="flex-1 overflow-y-auto">
-                {/* 전체 보기 */}
-                <button
-                  onClick={() => setSelectedFlightId(null)}
-                  className={`w-full px-3 py-2 text-left text-xs border-b border-gray-50 transition-colors ${
-                    !selectedFlightId ? "bg-[#a60739]/10 text-[#a60739] font-medium" : "text-gray-500 hover:bg-gray-50"
-                  }`}
-                >
-                  전체 보기
-                </button>
-                {filteredFlights
-                  .sort((a, b) => a.start_time - b.start_time)
-                  .map((f) => {
-                    const label = flightLabel(f, aircraft);
-                    const startDate = format(new Date(f.start_time * 1000), "MM/dd HH:mm");
-                    const duration = f.end_time - f.start_time;
-                    const durationMin = Math.round(duration / 60);
-                    const color = colorMap.get(f.mode_s);
-                    return (
-                      <button
-                        key={f.id}
-                        onClick={() => setSelectedFlightId(f.id === selectedFlightId ? null : f.id)}
-                        className={`w-full px-3 py-2 text-left border-b border-gray-50 transition-colors ${
-                          f.id === selectedFlightId ? "bg-[#a60739]/10" : "hover:bg-gray-50"
-                        }`}
-                      >
-                        <div className="flex items-center gap-1.5">
-                          {color && (
-                            <div
-                              className="h-2 w-2 rounded-full flex-shrink-0"
-                              style={{ backgroundColor: `rgb(${color[0]},${color[1]},${color[2]})` }}
-                            />
-                          )}
-                          <span className={`text-xs truncate ${f.id === selectedFlightId ? "text-[#a60739] font-medium" : "text-gray-700"}`}>
-                            {label}
-                          </span>
-                        </div>
-                        <div className="mt-0.5 text-[10px] text-gray-400 pl-3.5">
-                          {startDate} · {durationMin}분 · {f.track_points.length.toLocaleString()}pt
-                        </div>
-                      </button>
-                    );
-                  })}
-              </div>
-            </div>
-
             {/* 측면도 */}
             <div className="flex-1 rounded-xl border border-gray-200 bg-gray-100 p-2">
               <canvas ref={sideCanvasRef} className="h-full w-full" />

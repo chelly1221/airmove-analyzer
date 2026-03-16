@@ -18,6 +18,8 @@ import {
   Database,
   Key,
   Pencil,
+  Eye,
+  MapPin,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { format } from "date-fns";
@@ -210,9 +212,11 @@ function MapFlightPanel() {
       max_radar_range_km: 0,
       match_type: "opensky",
     };
-    setFlights([...storeFlights, placeholder]);
+    // 최신 store 상태 사용 (클로저 stale 방지)
+    const currentFlights = useAppStore.getState().flights;
+    setFlights([...currentFlights, placeholder]);
     return id;
-  }, [storeFlights, setFlights, icaoToName]);
+  }, [setFlights, icaoToName]);
 
   const handleSelect = (f: FlightRecord) => {
     // 병합 모드: 다중 선택 토글
@@ -249,8 +253,9 @@ function MapFlightPanel() {
   // 병합 실행
   const handleMerge = () => {
     if (mergeSelection.size < 2) return;
-    // 같은 mode_s 검증
-    const selected = storeFlights.filter((f) => mergeSelection.has(f.id));
+    // 최신 store 상태로 검증 (클로저 stale 방지)
+    const currentFlights = useAppStore.getState().flights;
+    const selected = currentFlights.filter((f) => mergeSelection.has(f.id));
     if (selected.length < 2) return;
     const modeS = selected[0].mode_s.toUpperCase();
     if (!selected.every((f) => f.mode_s.toUpperCase() === modeS)) {
@@ -705,6 +710,119 @@ function ReportMetadataModal({
   );
 }
 
+// ─── 전파 장애물 (파노라마) 패널 ─────────────────────────────────────
+
+function PanoramaObstaclePanel() {
+  const pt = useAppStore((s) => s.panoramaActivePoint);
+  const pinned = useAppStore((s) => s.panoramaPinned);
+
+  if (!pt) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-1.5 py-6 text-center">
+        <Eye size={16} className="text-gray-300" />
+        <p className="text-[10px] text-gray-400">
+          차트 위를 호버하거나 클릭하여<br />장애물 정보를 확인하세요
+        </p>
+      </div>
+    );
+  }
+
+  const isBuilding = pt.obstacle_type !== "terrain";
+  const typeLabel =
+    pt.obstacle_type === "terrain" ? "지형"
+    : pt.obstacle_type === "gis_building" ? "GIS 건물"
+    : "수동 건물";
+  const typeColor =
+    pt.obstacle_type === "terrain" ? "bg-green-100 text-green-700"
+    : pt.obstacle_type === "gis_building" ? "bg-orange-100 text-orange-700"
+    : "bg-red-100 text-red-700";
+
+  return (
+    <div className="flex flex-col gap-2 px-3 py-2">
+      {/* 유형 뱃지 + 이름 + 고정 상태 */}
+      <div className="flex items-center gap-1.5">
+        <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${typeColor}`}>
+          {typeLabel}
+        </span>
+        {pinned && (
+          <span className="rounded bg-yellow-100 px-1 py-0.5 text-[9px] text-yellow-700">
+            고정
+          </span>
+        )}
+      </div>
+      {pt.name && (
+        <p className="text-[11px] font-semibold text-gray-800 truncate" title={pt.name}>
+          {pt.name}
+        </p>
+      )}
+
+      {/* 수치 정보 */}
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+        <div>
+          <span className="text-[9px] text-gray-400">방위</span>
+          <p className="font-mono text-[11px] font-medium text-gray-700">{pt.azimuth_deg.toFixed(1)}°</p>
+        </div>
+        <div>
+          <span className="text-[9px] text-gray-400">앙각</span>
+          <p className="font-mono text-[11px] font-medium text-gray-700">{pt.elevation_angle_deg.toFixed(3)}°</p>
+        </div>
+        <div>
+          <span className="text-[9px] text-gray-400">거리</span>
+          <p className="font-mono text-[11px] font-medium text-gray-700">{pt.distance_km.toFixed(2)} km</p>
+        </div>
+        <div>
+          <span className="text-[9px] text-gray-400">표고</span>
+          <p className="font-mono text-[11px] font-medium text-gray-700">{pt.ground_elev_m.toFixed(0)} m</p>
+        </div>
+        {isBuilding && (
+          <>
+            <div>
+              <span className="text-[9px] text-gray-400">건물 높이</span>
+              <p className="font-mono text-[11px] font-medium text-gray-700">{pt.obstacle_height_m.toFixed(1)} m</p>
+            </div>
+            <div>
+              <span className="text-[9px] text-gray-400">총 높이</span>
+              <p className="font-mono text-[11px] font-medium text-gray-700">
+                {(pt.ground_elev_m + pt.obstacle_height_m).toFixed(0)} m
+              </p>
+            </div>
+          </>
+        )}
+        {!isBuilding && (
+          <div>
+            <span className="text-[9px] text-gray-400">지형 높이</span>
+            <p className="font-mono text-[11px] font-medium text-gray-700">{pt.obstacle_height_m.toFixed(0)} m</p>
+          </div>
+        )}
+      </div>
+
+      {/* 좌표 */}
+      <div className="flex items-center gap-1 text-[10px] text-gray-500">
+        <MapPin size={10} className="shrink-0 text-gray-400" />
+        <span className="font-mono">{pt.lat.toFixed(5)}°N {pt.lon.toFixed(5)}°E</span>
+      </div>
+
+      {/* 건물 주소/용도 */}
+      {isBuilding && (pt.address || pt.usage) && (
+        <div className="border-t border-gray-100 pt-1.5 space-y-0.5">
+          {pt.address && (
+            <div>
+              <span className="text-[9px] text-gray-400">주소</span>
+              <p className="text-[10px] text-gray-600 break-words">{pt.address}</p>
+            </div>
+          )}
+          {pt.usage && (
+            <div>
+              <span className="text-[9px] text-gray-400">용도</span>
+              <p className="text-[10px] text-gray-600">{pt.usage}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── 사이드바 메인 ───────────────────────────────────────────────────
 
 export default function Sidebar() {
@@ -736,6 +854,7 @@ export default function Sidebar() {
   const isDrawingPage = location.pathname === "/drawing";
   const isReportPage = location.pathname === "/report";
   const garbleViewActive = useAppStore((s) => s.garbleViewActive);
+  const panoramaViewActive = useAppStore((s) => s.panoramaViewActive);
 
   return (
     <div className="relative flex h-full shrink-0">
@@ -811,6 +930,13 @@ export default function Sidebar() {
         {!collapsed && garbleViewActive && (
           <div className="flex flex-1 flex-col overflow-hidden border-t border-gray-100">
             <GarbleAircraftPanel />
+          </div>
+        )}
+
+        {/* 전파 장애물 (파노라마) 활성 시 장애물 정보 패널 */}
+        {!collapsed && panoramaViewActive && (
+          <div className="mt-auto border-t border-gray-100 overflow-y-auto">
+            <PanoramaObstaclePanel />
           </div>
         )}
       </aside>

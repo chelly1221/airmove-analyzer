@@ -7,7 +7,7 @@ import { useAppStore } from "../../store";
 interface StatsSectionProps {
   sectionNum: number;
   flights: Flight[];
-  template?: "weekly" | "monthly";
+  template?: "weekly" | "monthly" | "flights" | "single";
 }
 
 interface WeekStats {

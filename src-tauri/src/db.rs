@@ -172,6 +172,16 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             PRIMARY KEY (date, radar_lat, radar_lon)
         );
 
+        -- LoS 파노라마 캐시 (레이더별, JSON)
+        CREATE TABLE IF NOT EXISTS panorama_cache (
+            radar_lat TEXT NOT NULL,
+            radar_lon TEXT NOT NULL,
+            radar_height_m REAL NOT NULL,
+            data_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (radar_lat, radar_lon)
+        );
+
         -- 수동 등록 건물
         CREATE TABLE IF NOT EXISTS manual_buildings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -896,4 +906,61 @@ pub fn load_cloud_grid_cache(
         }
     }
     Ok(results)
+}
+
+// ========== LoS 파노라마 캐시 ==========
+
+/// 파노라마 데이터 저장
+pub fn save_panorama_cache(
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    data_json: &str,
+) -> SqlResult<()> {
+    let lat_key = format!("{:.4}", radar_lat);
+    let lon_key = format!("{:.4}", radar_lon);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO panorama_cache (radar_lat, radar_lon, radar_height_m, data_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![lat_key, lon_key, radar_height_m, data_json, now],
+    )?;
+    Ok(())
+}
+
+/// 파노라마 캐시 로드
+pub fn load_panorama_cache(
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> SqlResult<Option<String>> {
+    let lat_key = format!("{:.4}", radar_lat);
+    let lon_key = format!("{:.4}", radar_lon);
+    let mut stmt = conn.prepare(
+        "SELECT data_json FROM panorama_cache WHERE radar_lat = ?1 AND radar_lon = ?2",
+    )?;
+    match stmt.query_row(params![lat_key, lon_key], |row| row.get::<_, String>(0)) {
+        Ok(json) => Ok(Some(json)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 파노라마 캐시 삭제
+pub fn clear_panorama_cache(
+    conn: &Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> SqlResult<()> {
+    let lat_key = format!("{:.4}", radar_lat);
+    let lon_key = format!("{:.4}", radar_lon);
+    conn.execute(
+        "DELETE FROM panorama_cache WHERE radar_lat = ?1 AND radar_lon = ?2",
+        params![lat_key, lon_key],
+    )?;
+    Ok(())
 }

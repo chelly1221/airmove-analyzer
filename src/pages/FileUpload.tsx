@@ -923,7 +923,7 @@ export default function FileUpload() {
     return ranges;
   }, [aircraft, rawTrackPoints]);
 
-  // 비행 통합 실행
+  // 비행 통합 실행 (수동 병합 비행 보존)
   const runConsolidation = useCallback(() => {
     const state = useAppStore.getState();
     if (state.rawTrackPoints.length === 0) return;
@@ -933,7 +933,25 @@ export default function FileUpload() {
       state.aircraft,
       state.radarSite,
     );
-    setFlights(consolidated);
+    // 수동 병합된 비행은 재통합에서 보존 (사용자 의도 유지)
+    const manualFlights = state.flights.filter((f) => f.match_type === "manual");
+    if (manualFlights.length > 0) {
+      // 수동 병합에 포함된 포인트의 시간 범위와 겹치는 자동 비행 제거
+      const manualRanges = manualFlights.map((mf) => ({
+        mode_s: mf.mode_s.toUpperCase(),
+        start: mf.start_time,
+        end: mf.end_time,
+      }));
+      const filtered = consolidated.filter((cf) => {
+        const ms = cf.mode_s.toUpperCase();
+        return !manualRanges.some((mr) =>
+          mr.mode_s === ms && cf.start_time >= mr.start - 300 && cf.end_time <= mr.end + 300
+        );
+      });
+      setFlights([...filtered, ...manualFlights].sort((a, b) => a.start_time - b.start_time));
+    } else {
+      setFlights(consolidated);
+    }
   }, [setFlights]);
 
   // flightHistory가 변경되면 재통합 (DB 캐시 로드 또는 API 동기화 결과 반영)

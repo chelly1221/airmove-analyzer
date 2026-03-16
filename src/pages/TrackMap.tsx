@@ -234,22 +234,38 @@ export default function TrackMap() {
     const loss: LossSegment[] = [];
     const lossP: LossPoint[] = [];
 
-    // 특정 비행 선택 시 해당 비행만 표시
+    // 특정 비행 선택 시 해당 비행 + 앞뒤 1시간 여유 시간 범위 표시
     if (selectedFlightId) {
       const targetFlight = flights.find((f) => f.id === selectedFlightId);
       if (targetFlight) {
-        pts.push(...targetFlight.track_points.filter((p) => validModeS.has(p.mode_s)));
-        loss.push(...targetFlight.loss_segments.filter((s) => validModeS.has(s.mode_s)));
-        lossP.push(...targetFlight.loss_points.filter((p) => validModeS.has(p.mode_s)));
+        const padding = 3600;
+        const tMin = targetFlight.start_time - padding;
+        const tMax = targetFlight.end_time + padding;
+        const targetModeS = targetFlight.mode_s;
+        for (const f of flights) {
+          for (const p of f.track_points) {
+            if (!validModeS.has(p.mode_s)) continue;
+            if (p.mode_s === targetModeS && p.timestamp >= tMin && p.timestamp <= tMax) {
+              pts.push(p);
+            }
+          }
+          loss.push(...f.loss_segments.filter((s) =>
+            validModeS.has(s.mode_s) && s.mode_s === targetModeS && s.start_time >= tMin && s.end_time <= tMax
+          ));
+          lossP.push(...f.loss_points.filter((p) =>
+            validModeS.has(p.mode_s) && p.mode_s === targetModeS && p.timestamp >= tMin && p.timestamp <= tMax
+          ));
+        }
       }
       pts.sort((a, b) => a.timestamp - b.timestamp);
       return { allPoints: pts, allLoss: loss, allLossPoints: lossP };
     }
 
-    // 사이드바에서 비행 선택했지만 store Flight 매칭 실패 시 → 시간 범위로 필터링
+    // 사이드바에서 비행 선택했지만 store Flight 매칭 실패 시 → 시간 범위로 필터링 (1시간 여유)
     if (selectedFlight && selectedModeS) {
-      const tMin = selectedFlight.first_seen - 300;
-      const tMax = selectedFlight.last_seen + 300;
+      const padding = 3600;
+      const tMin = selectedFlight.first_seen - padding;
+      const tMax = selectedFlight.last_seen + padding;
       const modeS = selectedModeS;
       for (const f of flights) {
         for (const p of f.track_points) {

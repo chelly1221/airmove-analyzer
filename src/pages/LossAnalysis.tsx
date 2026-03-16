@@ -327,6 +327,9 @@ export default function LossAnalysis() {
   const radarSite = useAppStore((s) => s.radarSite);
   const garbleSelectedModeS = useAppStore((s) => s.garbleSelectedModeS);
   const setGarbleViewActive = useAppStore((s) => s.setGarbleViewActive);
+  const setPanoramaViewActive = useAppStore((s) => s.setPanoramaViewActive);
+  const setPanoramaActivePointStore = useAppStore((s) => s.setPanoramaActivePoint);
+  const setPanoramaPinnedStore = useAppStore((s) => s.setPanoramaPinned);
   const weatherData = useAppStore((s) => s.weatherData);
   const [viewMode, setViewMode] = useState<"by-flight" | "garble" | "los-panorama">(
     "by-flight"
@@ -341,6 +344,7 @@ export default function LossAnalysis() {
   const [panoramaHoverIdx, setPanoramaHoverIdx] = useState<number | null>(null);
   const [panoramaPinnedIdx, setPanoramaPinnedIdx] = useState<number | null>(null);
   const panoramaSvgRef = useRef<SVGSVGElement>(null);
+  const [panoramaBldgMaxHeight, setPanoramaBldgMaxHeight] = useState<number | null>(null); // 건물 높이 필터 (null=미적용)
 
   // Garble 뷰 활성 상태를 스토어에 동기화
   useEffect(() => {
@@ -348,11 +352,17 @@ export default function LossAnalysis() {
     return () => setGarbleViewActive(false);
   }, [viewMode, setGarbleViewActive]);
 
-  // LoS 파노라마 탭 선택 시 데이터 로드
+  // 파노라마 뷰 활성 상태를 스토어에 동기화
   useEffect(() => {
-    if (viewMode !== "los-panorama") return;
-    if (panoramaData.length > 0) return; // 이미 로드됨
+    setPanoramaViewActive(viewMode === "los-panorama");
+    return () => setPanoramaViewActive(false);
+  }, [viewMode, setPanoramaViewActive]);
+
+  // 파노라마 계산 함수 (DB 저장 포함)
+  const computePanorama = useCallback(() => {
     setPanoramaLoading(true);
+    setPanoramaPinnedIdx(null);
+    setPanoramaHoverIdx(null);
     const radarH = radarSite.altitude + radarSite.antenna_height;
     invoke<PanoramaPoint[]>("calculate_los_panorama", {
       radarLat: radarSite.latitude,
@@ -362,10 +372,45 @@ export default function LossAnalysis() {
       azimuthStepDeg: 0.5,
       rangeStepM: 200.0,
     })
-      .then((data) => setPanoramaData(data))
+      .then((data) => {
+        setPanoramaData(data);
+        // DB에 캐시 저장
+        invoke("save_panorama_cache", {
+          radarLat: radarSite.latitude,
+          radarLon: radarSite.longitude,
+          radarHeightM: radarH,
+          dataJson: JSON.stringify(data),
+        }).catch((e) => console.error("파노라마 캐시 저장 실패:", e));
+      })
       .catch((e) => console.error("파노라마 계산 실패:", e))
       .finally(() => setPanoramaLoading(false));
-  }, [viewMode, radarSite, panoramaData.length]);
+  }, [radarSite]);
+
+  // LoS 파노라마 탭 선택 시 DB 캐시 로드 또는 계산
+  useEffect(() => {
+    if (viewMode !== "los-panorama") return;
+    if (panoramaData.length > 0) return;
+    setPanoramaLoading(true);
+    invoke<string | null>("load_panorama_cache", {
+      radarLat: radarSite.latitude,
+      radarLon: radarSite.longitude,
+    })
+      .then((cached) => {
+        if (cached) {
+          try {
+            const data = JSON.parse(cached) as PanoramaPoint[];
+            if (data.length > 0) {
+              setPanoramaData(data);
+              setPanoramaLoading(false);
+              return;
+            }
+          } catch { /* 파싱 실패 시 재계산 */ }
+        }
+        // 캐시 없으면 계산
+        computePanorama();
+      })
+      .catch(() => computePanorama());
+  }, [viewMode, radarSite, panoramaData.length, computePanorama]);
 
   // 레이더 변경 시 파노라마 데이터 초기화
   const prevRadarRef = useRef(radarSite.name);
@@ -378,6 +423,37 @@ export default function LossAnalysis() {
     }
   }, [radarSite.name]);
 
+  // 건물 높이 필터 적용된 파노라마 데이터
+  const filteredPanoramaData = useMemo(() => {
+    if (panoramaBldgMaxHeight === null || panoramaData.length === 0) return panoramaData;
+    return panoramaData.map((pt) => {
+      if (pt.obstacle_type === "terrain") return pt;
+      if (pt.obstacle_height_m <= panoramaBldgMaxHeight) return pt;
+      // 초과 건물 → 지형으로 대체 (건물 높이 제거한 앙각 추정)
+      const terrainAngle = Math.max(0, pt.elevation_angle_deg - (pt.obstacle_height_m / (pt.distance_km * 1000)) * (180 / Math.PI));
+      return { ...pt, obstacle_type: "terrain" as const, elevation_angle_deg: terrainAngle, obstacle_height_m: 0, name: null, address: null, usage: null };
+    });
+  }, [panoramaData, panoramaBldgMaxHeight]);
+
+  // 파노라마에 표시되는 건물 포인트 (지도 표시용)
+  const panoramaBuildingPoints = useMemo(() => {
+    if (filteredPanoramaData.length === 0) return [];
+    const seen = new Set<string>();
+    const buildings: PanoramaPoint[] = [];
+    for (const pt of filteredPanoramaData) {
+      if (pt.obstacle_type === "terrain") continue;
+      // 같은 좌표 중복 제거
+      const key = `${pt.lat.toFixed(5)}_${pt.lon.toFixed(5)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      buildings.push(pt);
+    }
+    return buildings;
+  }, [filteredPanoramaData]);
+
+  // 파노라마 건물 지도용 ref
+  const panoramaMapRef = useRef<MapRef>(null);
+
   // 파노라마 SVG 마우스 핸들러
   const panoramaSvgW = 1200;
   const panoramaSvgH = 400;
@@ -386,23 +462,29 @@ export default function LossAnalysis() {
   const panoramaChartH = panoramaSvgH - panoramaMargin.top - panoramaMargin.bottom;
 
   const panoramaMaxAngle = useMemo(() => {
-    if (panoramaData.length === 0) return 1.0;
-    const maxA = Math.max(...panoramaData.map((p) => p.elevation_angle_deg));
+    if (filteredPanoramaData.length === 0) return 1.0;
+    const maxA = Math.max(...filteredPanoramaData.map((p) => p.elevation_angle_deg));
     return Math.max(0.5, Math.ceil(maxA * 10) / 10 + 0.1);
-  }, [panoramaData]);
+  }, [filteredPanoramaData]);
 
   const panoramaMinAngle = useMemo(() => {
-    if (panoramaData.length === 0) return -0.2;
-    const minA = Math.min(...panoramaData.map((p) => p.elevation_angle_deg));
+    if (filteredPanoramaData.length === 0) return -0.2;
+    const minA = Math.min(...filteredPanoramaData.map((p) => p.elevation_angle_deg));
     return Math.min(-0.1, Math.floor(minA * 10) / 10 - 0.1);
-  }, [panoramaData]);
+  }, [filteredPanoramaData]);
 
   const panoramaActiveIdx = panoramaPinnedIdx ?? panoramaHoverIdx;
-  const panoramaActivePoint = panoramaActiveIdx !== null ? panoramaData[panoramaActiveIdx] : null;
+  const panoramaActivePoint = panoramaActiveIdx !== null ? filteredPanoramaData[panoramaActiveIdx] : null;
+
+  // 활성 포인트를 스토어에 동기화 (사이드바 표시용)
+  useEffect(() => {
+    setPanoramaActivePointStore(panoramaActivePoint);
+    setPanoramaPinnedStore(panoramaPinnedIdx !== null);
+  }, [panoramaActivePoint, panoramaPinnedIdx, setPanoramaActivePointStore, setPanoramaPinnedStore]);
 
   const handlePanoramaMouseMove = useCallback(
     (e: React.MouseEvent<SVGSVGElement>) => {
-      if (panoramaData.length === 0) return;
+      if (filteredPanoramaData.length === 0) return;
       const svg = panoramaSvgRef.current;
       if (!svg) return;
       const rect = svg.getBoundingClientRect();
@@ -413,10 +495,10 @@ export default function LossAnalysis() {
         return;
       }
       const azFrac = mx / panoramaChartW;
-      const idx = Math.round(azFrac * (panoramaData.length - 1));
-      setPanoramaHoverIdx(Math.max(0, Math.min(panoramaData.length - 1, idx)));
+      const idx = Math.round(azFrac * (filteredPanoramaData.length - 1));
+      setPanoramaHoverIdx(Math.max(0, Math.min(filteredPanoramaData.length - 1, idx)));
     },
-    [panoramaData.length, panoramaChartW, panoramaMargin.left]
+    [filteredPanoramaData.length, panoramaChartW, panoramaMargin.left]
   );
 
   const handlePanoramaClick = useCallback(
@@ -674,7 +756,7 @@ export default function LossAnalysis() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-800">통계/분석</h1>
+          <h1 className="text-2xl font-bold text-gray-800">통계 / 분석</h1>
           <p className="mt-1 text-sm text-gray-500">
             비행검사기 항적 통계 및 표적소실 구간 분석
           </p>
@@ -684,7 +766,7 @@ export default function LossAnalysis() {
             [
               ["by-flight", "비행별"],
               ["garble", "Garble 분석"],
-              ["los-panorama", "LoS 파노라마"],
+              ["los-panorama", "전파 장애물"],
             ] as const
           ).map(([mode, label]) => (
             <button
@@ -733,12 +815,46 @@ export default function LossAnalysis() {
                       레이더 안테나 ({(radarSite.altitude + radarSite.antenna_height).toFixed(0)}m ASL) 기준 전방위 최대 장애물 앙각
                     </p>
                   </div>
-                  <button
-                    onClick={() => { setPanoramaData([]); setPanoramaPinnedIdx(null); }}
-                    className="rounded-md border border-gray-200 px-2.5 py-1 text-xs text-gray-500 hover:bg-gray-50"
-                  >
-                    새로고침
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-1.5">
+                      <label className="text-xs text-gray-500 whitespace-nowrap">건물 높이 필터</label>
+                      <select
+                        value={panoramaBldgMaxHeight === null ? "" : String(panoramaBldgMaxHeight)}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setPanoramaBldgMaxHeight(v === "" ? null : Number(v));
+                          setPanoramaPinnedIdx(null);
+                        }}
+                        className="rounded border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700"
+                      >
+                        <option value="">전체</option>
+                        <option value="200">≤ 200m</option>
+                        <option value="150">≤ 150m</option>
+                        <option value="100">≤ 100m</option>
+                        <option value="50">≤ 50m</option>
+                        <option value="30">≤ 30m</option>
+                      </select>
+                      {panoramaBldgMaxHeight !== null && (() => {
+                        const excluded = panoramaData.filter((p) => p.obstacle_type !== "terrain" && p.obstacle_height_m > panoramaBldgMaxHeight).length;
+                        return excluded > 0 ? (
+                          <span className="text-[10px] text-orange-500">{excluded}건 제외</span>
+                        ) : null;
+                      })()}
+                    </div>
+                    <button
+                      onClick={() => {
+                        invoke("clear_panorama_cache", {
+                          radarLat: radarSite.latitude,
+                          radarLon: radarSite.longitude,
+                        }).catch(() => {});
+                        setPanoramaData([]);
+                        computePanorama();
+                      }}
+                      className="rounded-md border border-gray-200 px-2.5 py-1 text-xs text-gray-500 hover:bg-gray-50"
+                    >
+                      갱신
+                    </button>
+                  </div>
                 </div>
                 <div className="p-4">
                   <svg
@@ -806,9 +922,9 @@ export default function LossAnalysis() {
                           const yBase = panoramaMargin.top + panoramaChartH;
                           const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                           let d = `M ${panoramaMargin.left} ${yBase}`;
-                          for (let i = 0; i < panoramaData.length; i++) {
-                            const x = panoramaMargin.left + (i / (panoramaData.length - 1)) * panoramaChartW;
-                            const pt = panoramaData[i];
+                          for (let i = 0; i < filteredPanoramaData.length; i++) {
+                            const x = panoramaMargin.left + (i / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                            const pt = filteredPanoramaData[i];
                             // 지형 부분만: 건물인 경우 건물 없는 지면 앙각 추정 (지면표고 사용)
                             const terrainAngle = pt.obstacle_type === "terrain"
                               ? pt.elevation_angle_deg
@@ -827,9 +943,9 @@ export default function LossAnalysis() {
                         d={(() => {
                           const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                           let d = "";
-                          for (let i = 0; i < panoramaData.length; i++) {
-                            const x = panoramaMargin.left + (i / (panoramaData.length - 1)) * panoramaChartW;
-                            const y = toY(panoramaData[i].elevation_angle_deg);
+                          for (let i = 0; i < filteredPanoramaData.length; i++) {
+                            const x = panoramaMargin.left + (i / (filteredPanoramaData.length - 1)) * panoramaChartW;
+                            const y = toY(filteredPanoramaData[i].elevation_angle_deg);
                             d += i === 0 ? `M ${x} ${y}` : ` L ${x} ${y}`;
                           }
                           return d;
@@ -840,9 +956,9 @@ export default function LossAnalysis() {
                       />
 
                       {/* 건물 포인트 (건물인 경우 오렌지 세로선) */}
-                      {panoramaData.map((pt, i) => {
+                      {filteredPanoramaData.map((pt, i) => {
                         if (pt.obstacle_type === "terrain") return null;
-                        const x = panoramaMargin.left + (i / (panoramaData.length - 1)) * panoramaChartW;
+                        const x = panoramaMargin.left + (i / (filteredPanoramaData.length - 1)) * panoramaChartW;
                         const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                         const yTop = toY(pt.elevation_angle_deg);
                         // 지면 앙각 추정
@@ -860,8 +976,8 @@ export default function LossAnalysis() {
                     {panoramaActiveIdx !== null && (
                       <g>
                         {(() => {
-                          const pt = panoramaData[panoramaActiveIdx];
-                          const x = panoramaMargin.left + (panoramaActiveIdx / (panoramaData.length - 1)) * panoramaChartW;
+                          const pt = filteredPanoramaData[panoramaActiveIdx];
+                          const x = panoramaMargin.left + (panoramaActiveIdx / (filteredPanoramaData.length - 1)) * panoramaChartW;
                           const y = panoramaMargin.top + panoramaChartH * (1 - (pt.elevation_angle_deg - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                           const isPinned = panoramaPinnedIdx === panoramaActiveIdx;
                           return (
@@ -1002,6 +1118,95 @@ export default function LossAnalysis() {
                   </div>
                 )}
               </SimpleCard>
+
+              {/* Row 3: 건물 위치 지도 */}
+              {panoramaBuildingPoints.length > 0 && (
+                <SimpleCard className="p-0">
+                  <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-gray-800">
+                        파노라마 건물 위치
+                      </h3>
+                      <p className="mt-0.5 text-xs text-gray-500">
+                        {panoramaBuildingPoints.length}개 건물 표시
+                        {panoramaBldgMaxHeight !== null && ` (≤ ${panoramaBldgMaxHeight}m 필터 적용)`}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="h-[400px]">
+                    <MapGL
+                      ref={panoramaMapRef}
+                      initialViewState={{
+                        latitude: radarSite.latitude,
+                        longitude: radarSite.longitude,
+                        zoom: 10,
+                      }}
+                      style={{ width: "100%", height: "100%" }}
+                      mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+                    >
+                      <NavigationControl position="top-right" />
+                      <DeckGLOverlay
+                        layers={[
+                          // 레이더 → 건물 연결선
+                          new LineLayer({
+                            id: "panorama-bldg-lines",
+                            data: panoramaBuildingPoints,
+                            getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
+                            getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                            getColor: [100, 100, 100, 40],
+                            getWidth: 1,
+                          }),
+                          // 건물 포인트
+                          new ScatterplotLayer({
+                            id: "panorama-bldg-dots",
+                            data: panoramaBuildingPoints,
+                            getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                            getRadius: (d: PanoramaPoint) => Math.max(30, d.obstacle_height_m * 2),
+                            getFillColor: (d: PanoramaPoint) =>
+                              d.obstacle_type === "manual_building" ? [239, 68, 68, 180] : [249, 115, 22, 180],
+                            getLineColor: [255, 255, 255, 200],
+                            lineWidthMinPixels: 1,
+                            stroked: true,
+                            pickable: true,
+                            radiusMinPixels: 4,
+                            radiusMaxPixels: 20,
+                          }),
+                          // 레이더 위치
+                          new ScatterplotLayer({
+                            id: "panorama-radar-dot",
+                            data: [radarSite],
+                            getPosition: (d: typeof radarSite) => [d.longitude, d.latitude],
+                            getFillColor: [14, 165, 233, 220],
+                            getLineColor: [255, 255, 255, 255],
+                            getRadius: 200,
+                            stroked: true,
+                            lineWidthMinPixels: 2,
+                            radiusMinPixels: 8,
+                            radiusMaxPixels: 12,
+                          }),
+                          // 활성 건물 하이라이트
+                          ...(panoramaActivePoint && panoramaActivePoint.obstacle_type !== "terrain"
+                            ? [
+                                new ScatterplotLayer({
+                                  id: "panorama-bldg-highlight",
+                                  data: [panoramaActivePoint],
+                                  getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                                  getFillColor: [234, 179, 8, 220],
+                                  getLineColor: [255, 255, 255, 255],
+                                  getRadius: 300,
+                                  stroked: true,
+                                  lineWidthMinPixels: 2,
+                                  radiusMinPixels: 8,
+                                  radiusMaxPixels: 24,
+                                }),
+                              ]
+                            : []),
+                        ]}
+                      />
+                    </MapGL>
+                  </div>
+                </SimpleCard>
+              )}
             </>
           )}
         </>
@@ -1419,6 +1624,20 @@ export default function LossAnalysis() {
                   mode_s_rollcall_psr: "S RC+PSR",
                 };
 
+                // 60NM 이내 PSR 탐지율 계산
+                const NM60_KM = 60 * 1.852; // 111.12 km
+                const psrTypes = new Set(["mode_ac_psr", "mode_s_allcall_psr", "mode_s_rollcall_psr"]);
+                let within60Total = 0;
+                let within60Psr = 0;
+                for (const p of f.track_points) {
+                  const dist = haversineKm(radarSite.latitude, radarSite.longitude, p.latitude, p.longitude);
+                  if (dist <= NM60_KM) {
+                    within60Total++;
+                    if (psrTypes.has(p.radar_type)) within60Psr++;
+                  }
+                }
+                const psrRate = within60Total > 0 ? (within60Psr / within60Total) * 100 : null;
+
                 return (
                   <SimpleCard key={`flight-${f.id}`} className="!py-2.5 !px-3">
                     {/* 1행: 비행라벨 + 핵심 수치 */}
@@ -1431,7 +1650,12 @@ export default function LossAnalysis() {
                         <span>소실 <b className="text-gray-700">{f.total_loss_time.toFixed(1)}</b>초</span>
                         <span>추적 <b className="text-gray-700">{(f.total_track_time / 60).toFixed(1)}</b>분</span>
                       </div>
-                      <span className={`shrink-0 rounded px-2 py-0.5 text-xs font-bold ${pct > 5 ? "bg-[#a60739]/15 text-[#a60739]" : "bg-green-100 text-green-700"}`}>
+                      {psrRate !== null && (
+                        <span className="shrink-0 rounded px-2 py-0.5 text-xs font-bold bg-blue-100 text-blue-700" title={`60NM 이내 SSR 대비 PSR 탐지율 (${within60Psr}/${within60Total})`}>
+                          PSR {psrRate.toFixed(1)}%
+                        </span>
+                      )}
+                      <span className="shrink-0 rounded px-2 py-0.5 text-xs font-bold bg-[#a60739]/15 text-[#a60739]">
                         {pct.toFixed(1)}%
                       </span>
                     </div>
@@ -1442,7 +1666,7 @@ export default function LossAnalysis() {
                           className="h-full rounded-full transition-all"
                           style={{
                             width: `${Math.min(pct, 100)}%`,
-                            backgroundColor: pct > 5 ? "#a60739" : "#10b981",
+                            backgroundColor: "#a60739",
                           }}
                         />
                       </div>

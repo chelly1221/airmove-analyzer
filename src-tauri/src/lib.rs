@@ -1097,6 +1097,44 @@ fn calculate_los_panorama(
     ))
 }
 
+/// 파노라마 캐시 저장
+#[tauri::command]
+fn save_panorama_cache(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    data_json: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_panorama_cache(&conn, radar_lat, radar_lon, radar_height_m, &data_json)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+/// 파노라마 캐시 로드
+#[tauri::command]
+fn load_panorama_cache(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_panorama_cache(&conn, radar_lat, radar_lon)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+/// 파노라마 캐시 삭제
+#[tauri::command]
+fn clear_panorama_cache(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::clear_panorama_cache(&conn, radar_lat, radar_lon)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
 /// SRTM HGT 기반 고도 조회 (30m 해상도, 로컬 파일)
 #[tauri::command]
 fn fetch_elevation(
@@ -1438,6 +1476,9 @@ pub fn run() {
             export_database,
             import_database,
             calculate_los_panorama,
+            save_panorama_cache,
+            load_panorama_cache,
+            clear_panorama_cache,
             fetch_elevation,
             download_srtm_korea,
             import_building_data,

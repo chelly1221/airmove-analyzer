@@ -9,6 +9,7 @@ import type {
   GarblePoint,
   LOSProfileData,
   PageId,
+  PanoramaPoint,
   ParseStatistics,
   RadarSite,
   ReportMetadata,
@@ -117,6 +118,14 @@ interface AppState {
   setGarbleViewActive: (v: boolean) => void;
   garbleSelectedModeS: string | null;
   setGarbleSelectedModeS: (v: string | null) => void;
+
+  // 파노라마 (전파 장애물) 뷰
+  panoramaViewActive: boolean;
+  setPanoramaViewActive: (v: boolean) => void;
+  panoramaActivePoint: PanoramaPoint | null;
+  setPanoramaActivePoint: (pt: PanoramaPoint | null) => void;
+  panoramaPinned: boolean;
+  setPanoramaPinned: (v: boolean) => void;
 
   // 레이더 커버리지 (다중 고도 레이어)
   coverageData: MultiCoverageResult | null;
@@ -370,6 +379,14 @@ export const useAppStore = create<AppState>((set) => ({
   setGarbleViewActive: (v) => set({ garbleViewActive: v }),
   garbleSelectedModeS: null,
   setGarbleSelectedModeS: (v) => set({ garbleSelectedModeS: v }),
+
+  // 파노라마 (전파 장애물) 뷰
+  panoramaViewActive: false,
+  setPanoramaViewActive: (v) => set({ panoramaViewActive: v }),
+  panoramaActivePoint: null,
+  setPanoramaActivePoint: (pt) => set({ panoramaActivePoint: pt }),
+  panoramaPinned: false,
+  setPanoramaPinned: (v) => set({ panoramaPinned: v }),
 
   // 레이더 커버리지 (다중 고도 레이어)
   coverageData: null,
