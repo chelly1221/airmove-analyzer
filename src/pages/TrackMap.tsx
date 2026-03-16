@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
-import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, PolygonLayer } from "@deck.gl/layers";
 import {
   Play,
   Pause,
@@ -39,21 +39,19 @@ import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrai
 import { fetchCloudGrid, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 
 /**
- * 탐지 유형 3색 계열:
- *   노랑 = A/C 계열, 초록 = All-Call 계열, 에메랄드 = Roll-Call 계열
- *   PSR 동반 시 동일 색상 + 흰색 glow 효과
+ * 탐지 유형 색상:
+ *   Roll-Call = 파란색, All-Call + PSR = 연두색, All-Call only = 하늘색
+ *   A/C 계열 = 노란색
  */
 const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
   mode_ac:              [234, 179, 8],    // yellow
-  mode_ac_psr:          [234, 179, 8],    // yellow (white glow)
-  mode_s_allcall:       [34, 197, 94],    // green
-  mode_s_allcall_psr:   [34, 197, 94],    // green (white glow)
-  mode_s_rollcall:      [16, 185, 129],   // emerald
-  mode_s_rollcall_psr:  [16, 185, 129],   // emerald (white glow)
+  mode_ac_psr:          [234, 179, 8],    // yellow
+  mode_s_allcall:       [56, 189, 248],   // sky blue (하늘색)
+  mode_s_allcall_psr:   [132, 204, 22],   // lime green (연두색)
+  mode_s_rollcall:      [59, 130, 246],   // blue (파란색)
+  mode_s_rollcall_psr:  [59, 130, 246],   // blue (파란색)
 };
 
-/** PSR 동반 탐지 유형 */
-const PSR_TYPES = new Set(["mode_ac_psr", "mode_s_allcall_psr", "mode_s_rollcall_psr"]);
 
 /** 탐지 유형 라벨 */
 function radarTypeLabel(rt: string): string {
@@ -85,7 +83,6 @@ interface TrackPath {
   color: [number, number, number];
   avgAlt: number;
   pointCount: number;
-  hasPsr: boolean;
 }
 
 export default function TrackMap() {
@@ -579,8 +576,8 @@ export default function TrackMap() {
     );
   }, [showGarble, garblePoints, visibleMinTs, visibleMaxTs]);
 
-  // 구름 오버레이 데이터 (현재 시각 기반 프레임)
-  const cloudPolygons = useMemo(() => {
+  // 구름 오버레이 데이터 — 점화(stippling) 방식: 운량에 비례하여 검은 점 생성
+  const cloudDots = useMemo(() => {
     if (!cloudGrid || !cloudGridVisible) return null;
     const currentTs = sliderValue >= 100 ? timeRange.max : pctToTs(sliderValue);
     const frame = getCloudFrameAtTime(cloudGrid, currentTs);
@@ -590,20 +587,32 @@ export default function TrackMap() {
     const cosLat = Math.cos((cloudGrid.radarLat * Math.PI) / 180);
     const halfStepLon = halfStep / cosLat;
 
-    return frame.cells
-      .filter((c) => c.cloud_cover > 10) // 10% 미만은 무시
-      .map((c) => ({
-        polygon: [
-          [c.lon - halfStepLon, c.lat - halfStep],
-          [c.lon + halfStepLon, c.lat - halfStep],
-          [c.lon + halfStepLon, c.lat + halfStep],
-          [c.lon - halfStepLon, c.lat + halfStep],
-        ] as [number, number][],
-        cover: c.cloud_cover,
-        coverLow: c.cloud_cover_low,
-        coverMid: c.cloud_cover_mid,
-        coverHigh: c.cloud_cover_high,
-      }));
+    // 시드 기반 의사 난수 (프레임 간 점 위치 안정화)
+    const seededRandom = (seed: number) => {
+      let s = seed | 0;
+      s = ((s + 0x6d2b79f5) | 0);
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+
+    const dots: { position: [number, number]; cover: number }[] = [];
+    const MAX_DOTS_PER_CELL = 40; // 운량 100%일 때 최대 점 수
+
+    for (const c of frame.cells) {
+      if (c.cloud_cover <= 10) continue;
+      const numDots = Math.round((c.cloud_cover / 100) * MAX_DOTS_PER_CELL);
+      const baseSeed = Math.round(c.lat * 10000) * 100000 + Math.round(c.lon * 10000);
+      for (let i = 0; i < numDots; i++) {
+        const rx = seededRandom(baseSeed + i * 2) * 2 - 1; // -1~1
+        const ry = seededRandom(baseSeed + i * 2 + 1) * 2 - 1;
+        dots.push({
+          position: [c.lon + rx * halfStepLon, c.lat + ry * halfStep],
+          cover: c.cloud_cover,
+        });
+      }
+    }
+    return dots;
   }, [cloudGrid, cloudGridVisible, sliderValue, timeRange.max, pctToTs]);
 
   /** 구름 그리드 조회 시작 */
@@ -829,7 +838,6 @@ export default function TrackMap() {
             color,
             avgAlt,
             pointCount: slice.length,
-            hasPsr: PSR_TYPES.has(rt),
           });
         } else if (slice.length === 1) {
           // 병합 불가능한 진짜 단독 포인트 (전체 항적이 1포인트)
@@ -1080,42 +1088,6 @@ export default function TrackMap() {
           widthUnits: "pixels" as const,
         })
       );
-      // PSR glow 링 (PSR 동반 포인트만 — 시안 glow로 시인성 확보)
-      const psrDots = dotPoints.filter((d) => PSR_TYPES.has(d.radar_type));
-      if (psrDots.length > 0) {
-        // 외곽 확산 glow
-        layers.push(
-          new ScatterplotLayer<TrackPoint>({
-            id: "dot-psr-glow-outer",
-            data: psrDots,
-            getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
-            updateTriggers: { getPosition: [losMode, altScale] },
-            getFillColor: [0, 255, 255, 50],
-            getRadius: 10,
-            radiusMinPixels: 6,
-            radiusMaxPixels: 14,
-            radiusUnits: "pixels",
-            billboard: true,
-            parameters: { depthWriteEnabled: false },
-          })
-        );
-        // 내곽 밝은 glow
-        layers.push(
-          new ScatterplotLayer<TrackPoint>({
-            id: "dot-psr-glow-inner",
-            data: psrDots,
-            getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
-            updateTriggers: { getPosition: [losMode, altScale] },
-            getFillColor: [0, 255, 255, 100],
-            getRadius: 6,
-            radiusMinPixels: 3,
-            radiusMaxPixels: 8,
-            radiusUnits: "pixels",
-            billboard: true,
-            parameters: { depthWriteEnabled: false },
-          })
-        );
-      }
       // 고도 위치 점
       layers.push(
         new ScatterplotLayer<TrackPoint>({
@@ -1158,44 +1130,6 @@ export default function TrackMap() {
         })
       );
     } else {
-      // PSR glow 레이어 (PSR 동반 세그먼트 — 시안 2중 glow로 시인성 확보)
-      const psrPaths = trackPaths.filter((d) => d.hasPsr);
-      if (psrPaths.length > 0) {
-        // 외곽 확산 glow
-        layers.push(
-          new PathLayer<TrackPath>({
-            id: "track-psr-glow-outer",
-            data: psrPaths,
-            getPath: (d) => d.path,
-            getColor: [0, 255, 255, 50],
-            getWidth: 12,
-            widthMinPixels: 6,
-            widthMaxPixels: 16,
-            widthUnits: "pixels",
-            billboard: true,
-            jointRounded: true,
-            capRounded: true,
-            parameters: { depthWriteEnabled: false },
-          })
-        );
-        // 내곽 밝은 glow
-        layers.push(
-          new PathLayer<TrackPath>({
-            id: "track-psr-glow-inner",
-            data: psrPaths,
-            getPath: (d) => d.path,
-            getColor: [0, 255, 255, 100],
-            getWidth: 6,
-            widthMinPixels: 3,
-            widthMaxPixels: 8,
-            widthUnits: "pixels",
-            billboard: true,
-            jointRounded: true,
-            capRounded: true,
-            parameters: { depthWriteEnabled: false },
-          })
-        );
-      }
       layers.push(
         new PathLayer<TrackPath>({
           id: "track-paths",
@@ -1532,19 +1466,22 @@ export default function TrackMap() {
       });
     }
 
-    // 구름 오버레이
-    if (cloudPolygons && cloudPolygons.length > 0) {
+    // 구름 오버레이 — 점화(stippling) 방식
+    if (cloudDots && cloudDots.length > 0) {
       layers.push(
-        new SolidPolygonLayer({
+        new ScatterplotLayer({
           id: "cloud-overlay",
-          data: cloudPolygons,
-          getPolygon: (d: any) => d.polygon,
+          data: cloudDots,
+          getPosition: (d: any) => d.position,
+          getRadius: 600,
+          radiusUnits: "meters" as const,
+          radiusMinPixels: 1.5,
+          radiusMaxPixels: 4,
           getFillColor: (d: any) => {
-            const cover = d.cover as number;
-            const alpha = Math.min(120, Math.round(cover * 1.2));
-            return [220, 225, 235, alpha];
+            const alpha = Math.min(200, 80 + Math.round(d.cover * 1.2));
+            return [30, 30, 40, alpha];
           },
-          extruded: false,
+          pickable: false,
           parameters: { depthWriteEnabled: false },
         })
       );
@@ -1625,7 +1562,7 @@ export default function TrackMap() {
     }
 
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showGarble, filteredGarblePoints, cloudPolygons]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showGarble, filteredGarblePoints, cloudDots]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2071,18 +2008,21 @@ export default function TrackMap() {
               </span>
             )}
           </button>
-        </div>
 
         {/* 커버리지 모달 */}
         {coverageModalOpen && (
+          <>
           <div
-            className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40"
+            className="fixed inset-0 z-[9998]"
+            onClick={() => setCoverageModalOpen(false)}
+          />
+          <div
+            className="absolute top-full right-0 mt-1 z-[9999] w-80 rounded-xl bg-white shadow-2xl border border-gray-200"
             role="dialog"
             aria-modal="true"
             aria-labelledby="coverage-modal-title"
-            onClick={() => setCoverageModalOpen(false)}
+            onClick={(e) => e.stopPropagation()}
           >
-            <div className="w-80 rounded-xl bg-white shadow-2xl border border-gray-200" onClick={(e) => e.stopPropagation()}>
               {/* 헤더 */}
               <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3">
                 <h3 id="coverage-modal-title" className="text-sm font-semibold text-gray-800">레이더 커버리지 맵</h3>
@@ -2211,8 +2151,9 @@ export default function TrackMap() {
                 )}
               </div>
             </div>
-          </div>
+          </>
         )}
+        </div>
 
         {/* 구름 오버레이 토글 */}
         {cloudGridLoading ? (
@@ -2325,7 +2266,6 @@ export default function TrackMap() {
                       className="inline-block h-[3px] w-4 rounded-sm"
                       style={{
                         backgroundColor: `rgb(${color[0]},${color[1]},${color[2]})`,
-                        boxShadow: PSR_TYPES.has(rt) ? `0 0 6px 2px rgba(0,255,255,0.8)` : undefined,
                       }}
                     />
                     <span className="text-gray-500">{radarTypeLabel(rt)}</span>
@@ -2335,8 +2275,8 @@ export default function TrackMap() {
               {/* 고정 범례 항목 */}
               <div className="border-t border-gray-200 pt-1 mt-1 space-y-1">
                 <div className="flex items-center gap-1.5">
-                  <span className="inline-block h-[3px] w-4 rounded-sm bg-[#a60739]" />
-                  <span className="text-gray-600">표적소실 구간</span>
+                  <span className="inline-block h-2 w-2 rounded-full bg-[#ef4444]" />
+                  <span className="text-gray-600">표적소실</span>
                 </div>
                 {showGarble && filteredGarblePoints.length > 0 && (
                   <>
@@ -2352,7 +2292,10 @@ export default function TrackMap() {
                 )}
                 {cloudGridVisible && cloudGrid && (
                   <div className="flex items-center gap-1.5">
-                    <span className="inline-block h-3 w-4 rounded-sm" style={{ backgroundColor: "rgba(220,225,235,0.7)" }} />
+                    <span className="inline-flex items-center justify-center h-3 w-4">
+                      <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: "rgba(30,30,40,0.8)" }} />
+                      <span className="inline-block h-1 w-1 rounded-full ml-0.5" style={{ backgroundColor: "rgba(30,30,40,0.5)" }} />
+                    </span>
                     <span className="text-gray-600">구름</span>
                   </div>
                 )}

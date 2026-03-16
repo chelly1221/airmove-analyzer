@@ -430,7 +430,7 @@ export const useAppStore = create<AppState>((set) => ({
   // 보고서 메타데이터
   reportMetadata: {
     department: "레이더관제부",
-    author: "",
+    author: "서상현",
     docPrefix: "RDR-RPT",
     organization: "김포공항",
     siteName: "레이더송신소",

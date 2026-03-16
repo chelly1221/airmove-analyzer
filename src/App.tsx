@@ -74,12 +74,18 @@ function useRestoreSavedData() {
 
         const store = useAppStore.getState();
 
-        // uploadedFiles 복원
+        // uploadedFiles 복원 (radar_lat/lon → radarName 매칭)
+        const radarSites = store.customRadarSites;
         for (const f of data.files) {
+          // 좌표로 레이더 사이트 이름 매칭 (0.01° 이내)
+          const matchedSite = radarSites.find(
+            (s) => Math.abs(s.latitude - f.radar_lat) < 0.01 && Math.abs(s.longitude - f.radar_lon) < 0.01
+          );
           store.addUploadedFile({
             path: f.path,
             name: f.name,
             status: "done",
+            radarName: matchedSite?.name,
             parsedFile: {
               filename: f.filename,
               total_records: f.total_records,

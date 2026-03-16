@@ -441,12 +441,10 @@ function MapFlightPanel() {
         </div>
       )}
 
-      {/* 동기화 진행상태/에러 */}
-      {openskySyncProgress && (
+      {/* 동기화 에러만 표시 (진행상태는 숨김) */}
+      {openskySyncProgress && openskySyncProgress.includes("확인하세요") && (
         <div className="px-2 pb-1">
-          <p className={`text-[10px] truncate ${
-            openskySyncProgress.includes("확인하세요") ? "text-red-500" : "text-gray-400"
-          }`}>{openskySyncProgress}</p>
+          <p className="text-[10px] truncate text-red-500">{openskySyncProgress}</p>
         </div>
       )}
 

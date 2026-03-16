@@ -18,6 +18,7 @@ import {
   Square,
   Circle,
   Minus,
+  ChevronRight,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -1080,11 +1081,18 @@ export default function FileUpload() {
   const handleRadarConfirm = async () => {
     setShowRadarModal(false);
     setRadarSite(modalSelectedSite);
+    const radarName = modalSelectedSite.name;
     if (radarModalAction === "single" && pendingParseFileRef.current) {
+      updateUploadedFile(pendingParseFileRef.current.path, { radarName });
       await parseFile(pendingParseFileRef.current);
       // 단일 파일 파싱 후에도 비행 통합 (DB 로드는 registeredTrackRanges useEffect에서 처리)
       runConsolidation();
     } else {
+      // 전체 파싱: 대기 중인 파일에 레이더 이름 할당
+      const pending = useAppStore.getState().uploadedFiles.filter((f) => f.status === "pending");
+      for (const f of pending) {
+        updateUploadedFile(f.path, { radarName });
+      }
       parseAllInternal();
     }
   };
@@ -1166,6 +1174,36 @@ export default function FileUpload() {
     (f) => f.status === "parsing"
   ).length;
 
+  // 레이더별 파일 그룹핑
+  const fileGroups = useMemo(() => {
+    const groups = new Map<string, UploadedFile[]>();
+    for (const file of uploadedFiles) {
+      const key = file.radarName ?? "__pending__";
+      const list = groups.get(key);
+      if (list) list.push(file);
+      else groups.set(key, [file]);
+    }
+    // 대기 중 그룹을 맨 앞, 나머지 레이더 이름 순 정렬
+    const sorted: [string, UploadedFile[]][] = [];
+    const pendingGroup = groups.get("__pending__");
+    if (pendingGroup) sorted.push(["__pending__", pendingGroup]);
+    for (const [key, files] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      if (key !== "__pending__") sorted.push([key, files]);
+    }
+    return sorted;
+  }, [uploadedFiles]);
+
+  // 그룹 접힘 상태 (기본: 접힘)
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const toggleGroup = (key: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
   const statusIcon = (status: UploadedFile["status"]) => {
     switch (status) {
       case "pending":
@@ -1214,7 +1252,7 @@ export default function FileUpload() {
           </button>
         </div>
 
-        {/* File List */}
+        {/* File List — 레이더별 그룹 */}
         {uploadedFiles.length > 0 && (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
@@ -1242,38 +1280,72 @@ export default function FileUpload() {
               </div>
             </div>
 
-            <div className="divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200 bg-gray-50">
-              {uploadedFiles.map((file) => (
-                <div key={file.path} className="flex items-center gap-2 px-3 py-1.5">
-                  {statusIcon(file.status)}
-                  <span className="truncate text-xs font-medium text-gray-800 min-w-0">{file.name}</span>
-                  <span className="text-[10px] text-gray-400 truncate min-w-0 shrink">{file.path.replace(/[/\\][^/\\]+$/, '')}</span>
-                  <span
-                    className={`ml-auto shrink-0 text-[11px] ${
-                      file.status === "done"
-                        ? "text-green-600"
-                        : file.status === "error"
-                          ? "text-red-600"
-                          : file.status === "parsing"
-                            ? "text-blue-600"
-                            : "text-gray-400"
-                    }`}
-                  >
-                    {statusText(file)}
-                  </span>
-                  {file.status === "pending" ? (
+            <div className="space-y-2">
+              {fileGroups.map(([groupKey, files]) => {
+                const isPending = groupKey === "__pending__";
+                const groupLabel = isPending ? "대기 중" : groupKey;
+                const expanded = expandedGroups.has(groupKey);
+                const doneCount = files.filter((f) => f.status === "done").length;
+                return (
+                  <div key={groupKey} className="overflow-hidden rounded-xl border border-gray-200 bg-gray-50">
+                    {/* 그룹 헤더 */}
                     <button
-                      onClick={() => requestParseSingle(file)}
-                      className="shrink-0 rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-900 transition-colors"
-                      title="파싱"
+                      onClick={() => toggleGroup(groupKey)}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-gray-100 transition-colors"
                     >
-                      <Play size={12} />
+                      <ChevronRight
+                        size={14}
+                        className={`shrink-0 text-gray-400 transition-transform ${expanded ? "rotate-90" : ""}`}
+                      />
+                      {isPending ? (
+                        <FileUp size={14} className="shrink-0 text-gray-400" />
+                      ) : (
+                        <Radar size={14} className="shrink-0 text-[#a60739]" />
+                      )}
+                      <span className="text-xs font-semibold text-gray-700">{groupLabel}</span>
+                      <span className="text-[10px] text-gray-400">
+                        {files.length}개{!isPending && doneCount > 0 && ` · ${doneCount}건 완료`}
+                      </span>
                     </button>
-                  ) : (
-                    <span className="w-[22px] shrink-0" />
-                  )}
-                </div>
-              ))}
+                    {/* 파일 목록 */}
+                    {expanded && (
+                      <div className="divide-y divide-gray-100 border-t border-gray-200">
+                        {files.map((file) => (
+                          <div key={file.path} className="flex items-center gap-2 px-3 py-1.5 pl-9">
+                            {statusIcon(file.status)}
+                            <span className="truncate text-xs font-medium text-gray-800 min-w-0">{file.name}</span>
+                            <span className="text-[10px] text-gray-400 truncate min-w-0 shrink">{file.path.replace(/[/\\][^/\\]+$/, '')}</span>
+                            <span
+                              className={`ml-auto shrink-0 text-[11px] ${
+                                file.status === "done"
+                                  ? "text-green-600"
+                                  : file.status === "error"
+                                    ? "text-red-600"
+                                    : file.status === "parsing"
+                                      ? "text-blue-600"
+                                      : "text-gray-400"
+                              }`}
+                            >
+                              {statusText(file)}
+                            </span>
+                            {file.status === "pending" ? (
+                              <button
+                                onClick={() => requestParseSingle(file)}
+                                className="shrink-0 rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-900 transition-colors"
+                                title="파싱"
+                              >
+                                <Play size={12} />
+                              </button>
+                            ) : (
+                              <span className="w-[22px] shrink-0" />
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

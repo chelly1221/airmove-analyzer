@@ -408,4 +408,6 @@ export interface UploadedFile {
   status: "pending" | "parsing" | "done" | "error";
   error?: string;
   parsedFile?: ParsedFile;
+  /** 파싱에 사용된 레이더 사이트 이름 */
+  radarName?: string;
 }
