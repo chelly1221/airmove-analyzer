@@ -493,8 +493,66 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     };
   }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings]);
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!chartData) return;
+
+    // 맵 스크린샷 캡처
+    let mapScreenshot: string | undefined;
+    try {
+      const mapContainer = document.querySelector(".maplibregl-map");
+      if (mapContainer) {
+        const canvases = mapContainer.querySelectorAll("canvas");
+        if (canvases.length > 0) {
+          const w = canvases[0].width;
+          const h = canvases[0].height;
+          const offscreen = document.createElement("canvas");
+          offscreen.width = w;
+          offscreen.height = h;
+          const ctx = offscreen.getContext("2d");
+          if (ctx) {
+            for (const c of canvases) ctx.drawImage(c, 0, 0);
+            mapScreenshot = offscreen.toDataURL("image/jpeg", 0.7);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[LOS] 맵 스크린샷 실패:", e);
+    }
+
+    // SVG 차트 스크린샷 캡처
+    let chartScreenshot: string | undefined;
+    try {
+      const svg = svgRef.current;
+      if (svg) {
+        const serializer = new XMLSerializer();
+        const svgStr = serializer.serializeToString(svg);
+        const svgBlob = new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" });
+        const url = URL.createObjectURL(svgBlob);
+        const img = new Image();
+        chartScreenshot = await new Promise<string | undefined>((resolve) => {
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = W * 2;
+            canvas.height = H * 2;
+            const ctx = canvas.getContext("2d");
+            if (ctx) {
+              ctx.fillStyle = "#fafafa";
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              resolve(canvas.toDataURL("image/png"));
+            } else {
+              resolve(undefined);
+            }
+            URL.revokeObjectURL(url);
+          };
+          img.onerror = () => { URL.revokeObjectURL(url); resolve(undefined); };
+          img.src = url;
+        });
+      }
+    } catch (e) {
+      console.warn("[LOS] 차트 스크린샷 실패:", e);
+    }
+
     const result: LOSProfileData = {
       id: `los-${Date.now()}`,
       radarSiteName: radarSite.name,
@@ -514,6 +572,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
             name: chartData.maxBlockPoint.name,
           }
         : undefined,
+      mapScreenshot,
+      chartScreenshot,
       timestamp: Date.now(),
     };
     addLOSResult(result);

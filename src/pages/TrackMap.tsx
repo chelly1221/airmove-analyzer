@@ -12,7 +12,6 @@ import {
   Radar,
   Plane,
   Loader2,
-  Zap,
   Cloud,
   Building2,
 } from "lucide-react";
@@ -34,7 +33,7 @@ const CoverageIcon = ({ size = 16 }: { size?: number }) => (
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, AdsbTrack, GarblePoint } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, AdsbTrack } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
 import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
 import { fetchCloudGrid, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
@@ -102,8 +101,6 @@ export default function TrackMap() {
   const setAdsbTracks = useAppStore((s) => s.setAdsbTracks);
   const adsbLoading = useAppStore((s) => s.adsbLoading);
   const adsbProgress = useAppStore((s) => s.adsbProgress);
-  const garblePoints = useAppStore((s) => s.garblePoints);
-
   // 기상/구름 데이터
   const cloudGrid = useAppStore((s) => s.cloudGrid);
   const setCloudGrid = useAppStore((s) => s.setCloudGrid);
@@ -120,7 +117,6 @@ export default function TrackMap() {
   const [playing, setPlaying] = useState(false);
   const altScale = 1;
   const [dotMode, setDotMode] = useState(false);
-  const [showGarble, setShowGarble] = useState(false);
   const [showBuildings, setShowBuildings] = useState(false);
   const [buildingOverlayData, setBuildingOverlayData] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; source: string }[]>([]);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
@@ -548,9 +544,12 @@ export default function TrackMap() {
     const rLon = radarSite.longitude;
     const CONE_PTS = 72;
 
+    const isRange = coverageLayers.length > 1;
     return coverageLayers.map((layer) => {
       const altM = layer.altitudeM;
-      const outerRing: [number, number, number][] = layer.bearings.map((b) => [b.lon, b.lat, altM * altScale]);
+      // 범위 모드면 평면(0), 단일 고도면 3D 높이 적용
+      const zVal = isRange ? 0 : altM * altScale;
+      const outerRing: [number, number, number][] = layer.bearings.map((b) => [b.lon, b.lat, zVal]);
       if (outerRing.length > 0) outerRing.push(outerRing[0]);
 
       const polygon: [number, number, number][][] = [outerRing];
@@ -564,7 +563,7 @@ export default function TrackMap() {
           const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
           const lat = rLat + dLat * Math.cos(rad);
           const lon = rLon + (dLat / Math.cos((rLat * Math.PI) / 180)) * Math.sin(rad);
-          hole.push([lon, lat, altM * altScale]);
+          hole.push([lon, lat, zVal]);
         }
         polygon.push(hole);
         coneRing = [];
@@ -574,7 +573,7 @@ export default function TrackMap() {
           const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
           const lat = rLat + dLat * Math.cos(rad);
           const lon = rLon + (dLat / Math.cos((rLat * Math.PI) / 180)) * Math.sin(rad);
-          coneRing.push([lon, lat, altM * altScale]);
+          coneRing.push([lon, lat, zVal]);
         }
       }
 
@@ -582,14 +581,6 @@ export default function TrackMap() {
       return { polygon, outerRing, coneRing, fillColor, altM, altFt: layer.altitudeFt };
     });
   }, [coverageLayers, coverageVisible, altScale, radarSite, altToColor, showConeOfSilence]);
-
-  // Garble 포인트 시간 필터링 (가시 범위 내만 표시)
-  const filteredGarblePoints = useMemo(() => {
-    if (!showGarble || garblePoints.length === 0) return [];
-    return garblePoints.filter(
-      (g) => g.timestamp >= visibleMinTs && g.timestamp <= visibleMaxTs
-    );
-  }, [showGarble, garblePoints, visibleMinTs, visibleMaxTs]);
 
   // 구름 오버레이 데이터 — 규칙적 격자(grid) 방식: 운량에 비례하여 점 밀도 조절
   const cloudDots = useMemo(() => {
@@ -673,8 +664,8 @@ export default function TrackMap() {
   const fetchBuildingOverlay = useCallback(async () => {
     setBuildingsLoading(true);
     try {
-      // 레이더 주변 약 30km bbox
-      const bufferDeg = 0.27; // ~30km
+      // 레이더 제원 범위 전체 (range_nm → degree 변환)
+      const bufferDeg = (radarSite.range_nm * 1.852) / 111.0;
       const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
       const bufferLon = bufferDeg / cosLat;
       const data = await invoke<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; source: string }[]>(
@@ -882,7 +873,7 @@ export default function TrackMap() {
       for (const seg of rawSegs) {
         const slice = pts.slice(seg.start, seg.end);
         if (slice.length >= 2) {
-          const rt = slice[0].radar_type;
+          const rt = slice[slice.length - 1].radar_type;
           const color = detectionTypeColor(rt);
           paths.push({
             modeS,
@@ -1486,22 +1477,23 @@ export default function TrackMap() {
             parameters: { depthWriteEnabled: false },
           })
         );
-        // 최하/최상 레이어만 외부 경계선 표시
-        if (idx === 0 || idx === n - 1) {
+        // 단일 고도: 해당 레이어 경계선, 범위: 최상단 경계선만 표시
+        const isSingle = n === 1;
+        if (isSingle ? (idx === 0) : (idx === n - 1)) {
           layers.push(
             new PathLayer({
               id: `coverage-outline-${altFt}`,
               data: [{ path: outerRing }],
               getPath: (d: any) => d.path,
-              getColor: [...fillColor, idx === 0 ? 255 : 180],
-              getWidth: idx === 0 ? 2.5 : 1.5,
-              widthMinPixels: idx === 0 ? 2 : 1,
-              widthMaxPixels: idx === 0 ? 4 : 3,
+              getColor: [...fillColor, isSingle ? 255 : 180],
+              getWidth: isSingle ? 2.5 : 1.5,
+              widthMinPixels: isSingle ? 2 : 1,
+              widthMaxPixels: isSingle ? 4 : 3,
               widthUnits: "pixels" as const,
             })
           );
         }
-        // 최하 레이어 Cone of Silence 경계선
+        // Cone of Silence 경계선 (단일: 해당 레이어, 범위: 최하 레이어)
         if (idx === 0 && coneRing) {
           layers.push(
             new PathLayer({
@@ -1578,82 +1570,8 @@ export default function TrackMap() {
       );
     }
 
-    // Garble 유령표적 시각화 (고도 반영 + 시간 필터링)
-    if (showGarble && filteredGarblePoints.length > 0) {
-      // Ghost → Real 연결선 (고도 반영)
-      layers.push(
-        new LineLayer<GarblePoint>({
-          id: "garble-connections",
-          data: filteredGarblePoints,
-          getSourcePosition: (d) => losMode
-            ? [d.ghost_lon, d.ghost_lat]
-            : [d.ghost_lon, d.ghost_lat, d.ghost_altitude * altScale],
-          getTargetPosition: (d) => losMode
-            ? [d.real_lon, d.real_lat]
-            : [d.real_lon, d.real_lat, d.real_altitude * altScale],
-          getColor: (d) => d.garble_type === "sidelobe"
-            ? [234, 179, 8, 80]   // 노랑 (사이드로브)
-            : [249, 115, 22, 80], // 주황 (다중경로)
-          getWidth: 1,
-          pickable: false,
-        })
-      );
-      // Garble ghost positions (고도 반영, 유형별 색상)
-      layers.push(
-        new ScatterplotLayer<GarblePoint>({
-          id: "garble-ghost-points",
-          data: filteredGarblePoints,
-          getPosition: (d) => losMode
-            ? [d.ghost_lon, d.ghost_lat]
-            : [d.ghost_lon, d.ghost_lat, d.ghost_altitude * altScale],
-          getRadius: 4,
-          radiusMinPixels: 3,
-          radiusMaxPixels: 8,
-          radiusUnits: "pixels",
-          getFillColor: (d) => d.garble_type === "sidelobe"
-            ? [234, 179, 8, 160]   // 노랑
-            : [249, 115, 22, 160], // 주황
-          getLineColor: (d) => d.garble_type === "sidelobe"
-            ? [234, 179, 8, 255]
-            : [249, 115, 22, 255],
-          stroked: true,
-          lineWidthMinPixels: 1,
-          billboard: true,
-          pickable: true,
-          onHover: (info) => {
-            if (info.object) {
-              const d = info.object;
-              const typeLabel = d.garble_type === "sidelobe" ? "Garble (사이드로브)" : "Garble (다중경로)";
-              const altDiff = Math.abs(d.ghost_altitude - d.real_altitude);
-              const ghostAltFt = Math.round(d.ghost_altitude / 0.3048);
-              const realAltFt = Math.round(d.real_altitude / 0.3048);
-              setHoverInfo({
-                x: info.x,
-                y: info.y,
-                lines: [
-                  { label: "유형", value: typeLabel, color: d.garble_type === "sidelobe" ? "#eab308" : "#f97316" },
-                  { label: "Mode-S", value: d.mode_s },
-                  { label: "Track #", value: String(d.track_number) },
-                  { label: "유령 고도", value: `FL${Math.round(ghostAltFt / 100)} (${Math.round(d.ghost_altitude)}m)` },
-                  { label: "실제 고도", value: `FL${Math.round(realAltFt / 100)} (${Math.round(d.real_altitude)}m)` },
-                  { label: "고도차", value: `${Math.round(altDiff)}m (${Math.round(altDiff / 0.3048)}ft)` },
-                  { label: "방위", value: `${d.theta_deg.toFixed(1)}°` },
-                  { label: "거리", value: `${d.rho_nm.toFixed(1)} NM` },
-                  { label: "방위차", value: `${d.bearing_diff_deg.toFixed(1)}°` },
-                  { label: "거리차", value: `${d.range_diff_nm.toFixed(2)} NM` },
-                  { label: "시각", value: format(new Date(d.timestamp * 1000), "MM-dd HH:mm:ss") },
-                ],
-              });
-            } else {
-              setHoverInfo(null);
-            }
-          },
-        })
-      );
-    }
-
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, showGarble, filteredGarblePoints, cloudDots]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2062,24 +1980,6 @@ export default function TrackMap() {
           <DotPinIcon size={16} />
         </button>
 
-        {/* Garble 시각화 토글 */}
-        <button
-          onClick={() => setShowGarble(!showGarble)}
-          className={`relative rounded-lg p-1.5 transition-colors ${
-            showGarble
-              ? "bg-[#a60739] text-white shadow-sm"
-              : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-          }`}
-          title="Garble 유령표적 표시"
-        >
-          <Zap size={16} />
-          {garblePoints.length > 0 && (
-            <span className="absolute -top-1 -right-1 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-red-500 px-0.5 text-[8px] font-bold text-white leading-none">
-              {garblePoints.length > 999 ? "999+" : garblePoints.length}
-            </span>
-          )}
-        </button>
-
         {/* 건물 오버레이 토글 */}
         {buildingsLoading ? (
           <div className="flex items-center gap-1 rounded-lg bg-violet-50 px-2 py-1.5 text-[10px] text-violet-600">
@@ -2249,12 +2149,12 @@ export default function TrackMap() {
                         const pctMax = ((Math.max(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
                         return (
                           <div className="relative h-6">
-                            {/* 트랙 배경 */}
-                            <div className="absolute top-1/2 left-0 right-0 h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
-                            {/* 활성 범위 */}
+                            {/* 트랙 배경 — 썸 반지름(8px)만큼 좌우 여백 */}
+                            <div className="absolute top-1/2 left-[8px] right-[8px] h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
+                            {/* 활성 범위 — 썸 위치와 동기화 */}
                             <div
                               className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
-                              style={{ left: `${pctMin}%`, right: `${100 - pctMax}%` }}
+                              style={{ left: `calc(8px + (100% - 16px) * ${pctMin / 100})`, right: `calc(8px + (100% - 16px) * ${(100 - pctMax) / 100})` }}
                             />
                             {/* 최소 핸들 */}
                             <input
@@ -2425,18 +2325,6 @@ export default function TrackMap() {
                   <span className="inline-block h-2 w-2 rounded-full bg-[#ef4444]" />
                   <span className="text-gray-600">표적소실</span>
                 </div>
-                {showGarble && filteredGarblePoints.length > 0 && (
-                  <>
-                    <div className="flex items-center gap-1.5">
-                      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "#eab308" }} />
-                      <span className="text-gray-600">Garble (사이드로브)</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "#f97316" }} />
-                      <span className="text-gray-600">Garble (다중경로)</span>
-                    </div>
-                  </>
-                )}
                 {showBuildings && buildingOverlayData.length > 0 && (
                   <>
                     <div className="flex items-center gap-1.5">
@@ -2622,48 +2510,6 @@ export default function TrackMap() {
                     />
                   );
                 })}
-                {/* Garble 마커 (상단 노랑/주황 틱) */}
-                {showGarble && garblePoints.length > 0 && (() => {
-                  const range = timeRange.max - timeRange.min;
-                  if (range <= 0) return null;
-                  // 밀도 기반: 시간 빈으로 집계 (100개 빈)
-                  const BIN_COUNT = 100;
-                  const bins: { sidelobe: number; multipath: number }[] = Array.from(
-                    { length: BIN_COUNT },
-                    () => ({ sidelobe: 0, multipath: 0 }),
-                  );
-                  for (const g of garblePoints) {
-                    const idx = Math.min(BIN_COUNT - 1, Math.floor(((g.timestamp - timeRange.min) / range) * BIN_COUNT));
-                    if (g.garble_type === "sidelobe") bins[idx].sidelobe++;
-                    else bins[idx].multipath++;
-                  }
-                  const maxCount = Math.max(1, ...bins.map((b) => b.sidelobe + b.multipath));
-                  return bins.map((bin, i) => {
-                    const total = bin.sidelobe + bin.multipath;
-                    if (total === 0) return null;
-                    const pctStart = (i / BIN_COUNT) * 100;
-                    const pctEnd = ((i + 1) / BIN_COUNT) * 100;
-                    const l = absToScreen(pctStart);
-                    const r = absToScreen(pctEnd);
-                    if (r < -5 || l > 105) return null;
-                    const alpha = Math.min(0.9, 0.3 + (total / maxCount) * 0.6);
-                    const color = bin.multipath > bin.sidelobe
-                      ? `rgba(249, 115, 22, ${alpha})`
-                      : `rgba(234, 179, 8, ${alpha})`;
-                    return (
-                      <div
-                        key={`garble-${i}`}
-                        className="absolute top-0 rounded-sm"
-                        style={{
-                          left: `${l}%`,
-                          width: `${Math.max(0.3, r - l)}%`,
-                          height: "3px",
-                          backgroundColor: color,
-                        }}
-                      />
-                    );
-                  });
-                })()}
                 {/* 활성 구간 (시작점 ~ 현재위치) — overflow-hidden 안에서 자동 클리핑 */}
                 <div
                   className="absolute top-0 h-full bg-[#a60739]/10 pointer-events-none"

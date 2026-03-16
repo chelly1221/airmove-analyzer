@@ -12,7 +12,7 @@ import ReportGeneration from "./pages/ReportGeneration";
 import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
 import { Loader2 } from "lucide-react";
-import type { ElevationPoint, FlightRecord, GarblePoint, LOSProfileData, ParseStatistics, RadarSite, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
+import type { ElevationPoint, FlightRecord, LOSProfileData, ParseStatistics, RadarSite, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
 import { consolidateFlights } from "./utils/flightConsolidation";
 
 /** DB 저장 데이터 타입 */
@@ -32,7 +32,6 @@ interface SavedFileInfo {
 interface SavedParsedData {
   files: SavedFileInfo[];
   track_points: TrackPoint[];
-  garble_points?: GarblePoint[];
 }
 
 /** 앱 시작 시 DB에서 저장된 파싱 데이터 + 설정 복원 */
@@ -96,7 +95,6 @@ function useRestoreSavedData() {
               radar_lat: f.radar_lat,
               radar_lon: f.radar_lon,
               parse_stats: f.parse_stats ?? undefined,
-              garble_points: [], // 별도 관리
             },
           });
 
@@ -108,12 +106,6 @@ function useRestoreSavedData() {
 
         // rawTrackPoints 복원
         store.appendRawTrackPoints(data.track_points);
-
-        // garblePoints 복원
-        if (data.garble_points && data.garble_points.length > 0) {
-          console.log(`[Restore] DB에서 ${data.garble_points.length}개 Garble 포인트 복원`);
-          store.appendGarblePoints(data.garble_points);
-        }
 
         // 3) flightHistory를 DB에서 먼저 로드 (consolidateFlights 전에 필요)
         try {
@@ -189,6 +181,8 @@ function useRestoreSavedData() {
             elevation_profile_json: string;
             los_blocked: boolean;
             max_blocking_json: string | null;
+            map_screenshot: string | null;
+            chart_screenshot: string | null;
             created_at: number;
           }> = JSON.parse(losJson);
           if (losRows.length > 0) {
@@ -205,6 +199,8 @@ function useRestoreSavedData() {
               elevationProfile: JSON.parse(r.elevation_profile_json) as ElevationPoint[],
               losBlocked: r.los_blocked,
               maxBlockingPoint: r.max_blocking_json ? JSON.parse(r.max_blocking_json) : undefined,
+              mapScreenshot: r.map_screenshot ?? undefined,
+              chartScreenshot: r.chart_screenshot ?? undefined,
               timestamp: r.created_at,
             }));
             // 직접 set (addLOSResult은 DB 재저장을 유발하므로)
@@ -452,35 +448,6 @@ function useOpenskyAutoSync() {
   }, [syncVersion]);
 }
 
-/** Garble 포인트 청크 이벤트 리스너 */
-function useGarbleChunkListener() {
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | null = null;
-
-    (async () => {
-      const unlistenGarble = await listen<{ file_path: string; points: GarblePoint[] }>(
-        "garble-points-chunk",
-        (event) => {
-          if (!cancelled) {
-            console.log(`[Garble] 수신: ${event.payload.points.length}개 garble points (${event.payload.file_path})`);
-            useAppStore.getState().appendGarblePoints(event.payload.points);
-          }
-        }
-      );
-      if (cancelled) {
-        unlistenGarble();
-      } else {
-        unlisten = unlistenGarble;
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
-    };
-  }, []);
-}
 
 export default function App() {
   const loading = useAppStore((s) => s.loading);
@@ -490,7 +457,6 @@ export default function App() {
 
   useRestoreSavedData();
   useOpenskyAutoSync();
-  useGarbleChunkListener();
 
   return (
     <div className="flex h-full bg-white">

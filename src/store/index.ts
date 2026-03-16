@@ -6,8 +6,6 @@ import type {
   CloudGridData,
   Flight,
   FlightRecord,
-  GarblePoint,
-  GarbleSummaryCached,
   LOSProfileData,
   PageId,
   PanoramaPoint,
@@ -114,15 +112,6 @@ interface AppState {
   openskySyncCancelled: boolean;
   cancelOpenskySync: () => void;
 
-  // Garble 분석
-  garblePoints: GarblePoint[];
-  appendGarblePoints: (points: GarblePoint[]) => void;
-  clearGarblePoints: () => void;
-  garbleViewActive: boolean;
-  setGarbleViewActive: (v: boolean) => void;
-  garbleSelectedModeS: string | null;
-  setGarbleSelectedModeS: (v: string | null) => void;
-
   // 파노라마 (전파 장애물) 뷰
   panoramaViewActive: boolean;
   setPanoramaViewActive: (v: boolean) => void;
@@ -170,10 +159,6 @@ interface AppState {
   setSavedReports: (reports: SavedReportSummary[]) => void;
   addSavedReport: (report: SavedReportSummary) => void;
   removeSavedReport: (id: string) => void;
-
-  // Garble 요약 캐시
-  garbleSummaries: GarbleSummaryCached[];
-  setGarbleSummaries: (summaries: GarbleSummaryCached[]) => void;
 
   // UI
   activePage: PageId;
@@ -268,7 +253,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearUploadedFiles: () => {
     invoke("clear_saved_data").catch((e) => console.warn("[DB] clear failed:", e));
     invoke("clear_manual_merges").catch(() => {});
-    invoke("clear_garble_summaries").catch(() => {});
     set({
       uploadedFiles: [],
       rawTrackPoints: [],
@@ -276,8 +260,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       flights: [],
       selectedModeS: null,
       selectedFlightId: null,
-      garblePoints: [],
-      garbleSummaries: [],
     });
   },
 
@@ -394,6 +376,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       elevationProfileJson: JSON.stringify(r.elevationProfile),
       losBlocked: r.losBlocked,
       maxBlockingJson: r.maxBlockingPoint ? JSON.stringify(r.maxBlockingPoint) : null,
+      mapScreenshot: r.mapScreenshot ?? null,
+      chartScreenshot: r.chartScreenshot ?? null,
     }).catch((e) => console.warn("[LOS] DB 저장 실패:", e));
   },
   removeLOSResult: (id) => {
@@ -446,16 +430,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => ({ openskySyncVersion: state.openskySyncVersion + 1, openskySyncCancelled: false })),
   openskySyncCancelled: false,
   cancelOpenskySync: () => set({ openskySyncCancelled: true }),
-
-  // Garble 분석
-  garblePoints: [],
-  appendGarblePoints: (points) =>
-    set((state) => ({ garblePoints: [...state.garblePoints, ...points] })),
-  clearGarblePoints: () => set({ garblePoints: [] }),
-  garbleViewActive: false,
-  setGarbleViewActive: (v) => set({ garbleViewActive: v }),
-  garbleSelectedModeS: null,
-  setGarbleSelectedModeS: (v) => set({ garbleSelectedModeS: v }),
 
   // 파노라마 (전파 장애물) 뷰
   panoramaViewActive: false,
@@ -532,10 +506,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => ({ savedReports: state.savedReports.filter((r) => r.id !== id) }));
     invoke("delete_saved_report", { id }).catch((e) => console.warn("[Report] DB 삭제 실패:", e));
   },
-
-  // Garble 요약 캐시
-  garbleSummaries: [],
-  setGarbleSummaries: (summaries) => set({ garbleSummaries: summaries }),
 
   // UI
   activePage: "upload",

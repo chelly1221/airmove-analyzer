@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use log::{debug, info, warn};
 
-use crate::models::{GarblePoint, ParseStatistics, RadarDetectionType, TrackPoint};
+use crate::models::{ParseStatistics, RadarDetectionType, TrackPoint};
 
 const CAT048: u8 = 0x30;
 const CAT034: u8 = 0x22;
@@ -94,14 +94,14 @@ struct Cat048Record {
     track_number: Option<u16>,
 }
 
-/// Garble 탐지용 추가 데이터 (극좌표 + Track Number)
+/// 유령 표적 탐지용 추가 데이터 (극좌표 + Track Number)
 struct RecordExtra {
     rho_nm: f64,
     theta_deg: f64,
     track_number: Option<u16>,
 }
 
-/// 내부 표현: TrackPoint + garble 탐지용 극좌표/트랙번호
+/// 내부 표현: TrackPoint + 유령 탐지용 극좌표/트랙번호
 struct RichTrackPoint {
     point: TrackPoint,
     track_number: Option<u16>,
@@ -128,7 +128,7 @@ fn quick_dist_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     6371.0 * 2.0 * a.sqrt().asin()
 }
 
-/// 항적 조립기 — Mode-S별 포인트 + ATCRBS 병합 + garble 탐지 + 중복 제거
+/// 항적 조립기 — Mode-S별 포인트 + ATCRBS 병합 + 유령 표적 제거 + 중복 제거
 struct TrackAssembler {
     /// Mode-S별 확정 항적 (mode_s → Vec<RichTrackPoint>)
     tracks: HashMap<String, Vec<RichTrackPoint>>,
@@ -290,21 +290,15 @@ impl TrackAssembler {
         }
     }
 
-    /// Garble 탐지: 동일 Mode-S 동일 스캔(0.5초 이내) 내 공간적으로 불일치하는 포인트만 제거.
-    ///
-    /// 핵심 원칙:
-    /// - "다중 TN = garble"이 아님. 레이더는 정상적으로 TN을 재할당함.
-    /// - 진짜 garble은 **같은 안테나 회전(스캔) 내에 물리적으로 다른 위치**에 나타남.
-    /// - Loss 경계 포인트(항적 끊김 직전/직후)는 절대 garble이 아님.
+    /// 유령 표적 제거: 동일 Mode-S 동일 스캔(0.5초 이내) 내 공간적으로 불일치하는 포인트 제거.
     ///
     /// 판정 조건 (모두 AND):
     /// 1. 동일 Mode-S, 동일 스캔(0.5초 이내)에 2개 이상 포인트 존재
-    /// 2. 포인트 간 공간 거리 > 5km (가까우면 측정 오차 or TN 전환)
+    /// 2. 포인트 간 공간 거리 > 5km
     /// 3. ghost가 전후 정상 궤적 보간 위치로부터 10km 이상 이탈
     /// 4. ghost 제거 시 새로운 gap이 생기지 않음 (Loss 경계 보호)
-    fn detect_garble(&mut self) -> Vec<GarblePoint> {
+    fn detect_and_remove_ghosts(&mut self) {
         use crate::analysis::loss::calculate_haversine_distance;
-        let mut all_garble = Vec::new();
 
         const SCAN_WINDOW_SECS: f64 = 0.5;
         const MIN_SPATIAL_DIST_KM: f64 = 5.0;
@@ -320,7 +314,6 @@ impl TrackAssembler {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            // 중앙값 스캔 주기 계산 (gap 보호용)
             let mut deltas: Vec<f64> = Vec::new();
             for w in points.windows(2) {
                 let dt = (w[1].point.timestamp - w[0].point.timestamp).abs();
@@ -329,15 +322,10 @@ impl TrackAssembler {
                 }
             }
             deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_scan = if deltas.is_empty() {
-                7.0
-            } else {
-                deltas[deltas.len() / 2]
-            };
-            // gap 보호 임계값: 중앙값 스캔 주기의 2배 이상이면 loss 경계로 판정
+            let median_scan = if deltas.is_empty() { 7.0 } else { deltas[deltas.len() / 2] };
             let gap_threshold = median_scan * 2.0;
 
-            let mut garble_indices: Vec<usize> = Vec::new();
+            let mut ghost_indices: Vec<usize> = Vec::new();
 
             let mut cluster_start = 0usize;
             for i in 1..=points.len() {
@@ -370,7 +358,6 @@ impl TrackAssembler {
                             continue;
                         }
 
-                        // 전후 정상 포인트(클러스터 밖)
                         let prev_idx =
                             if cluster_start > 0 { Some(cluster_start - 1) } else { None };
                         let next_idx = if i < points.len() { Some(i) } else { None };
@@ -380,7 +367,6 @@ impl TrackAssembler {
                         let deviation_b =
                             Self::trajectory_deviation(points, b, prev_idx, next_idx);
 
-                        // 궤적 이탈이 큰 쪽이 ghost (최소 TRAJECTORY_DEVIATION_KM 이상)
                         let ghost_idx = if deviation_a > deviation_b
                             && deviation_a > TRAJECTORY_DEVIATION_KM
                         {
@@ -392,15 +378,14 @@ impl TrackAssembler {
                         };
 
                         if let Some(gi) = ghost_idx {
-                            // Loss 경계 보호: 제거하면 전후에 큰 gap이 생기는지 확인
                             let would_create_gap = Self::removal_creates_gap(
                                 points,
                                 gi,
-                                &garble_indices,
+                                &ghost_indices,
                                 gap_threshold,
                             );
-                            if !would_create_gap && !garble_indices.contains(&gi) {
-                                garble_indices.push(gi);
+                            if !would_create_gap && !ghost_indices.contains(&gi) {
+                                ghost_indices.push(gi);
                             }
                         }
                     }
@@ -409,112 +394,24 @@ impl TrackAssembler {
                 cluster_start = i;
             }
 
-            if garble_indices.is_empty() {
+            if ghost_indices.is_empty() {
                 continue;
             }
 
-            // garble 확정 포인트 진단 정보 수집
-            let garble_set: std::collections::HashSet<usize> =
-                garble_indices.iter().cloned().collect();
-
-            for &gi in &garble_indices {
-                let ghost = &points[gi];
-                let ghost_ts = ghost.point.timestamp;
-
-                let closest = (0..points.len())
-                    .filter(|idx| !garble_set.contains(idx))
-                    .filter(|&idx| {
-                        (points[idx].point.timestamp - ghost_ts).abs() <= SCAN_WINDOW_SECS
-                    })
-                    .min_by(|&a, &b| {
-                        let da = calculate_haversine_distance(
-                            points[a].point.latitude,
-                            points[a].point.longitude,
-                            ghost.point.latitude,
-                            ghost.point.longitude,
-                        );
-                        let db = calculate_haversine_distance(
-                            points[b].point.latitude,
-                            points[b].point.longitude,
-                            ghost.point.latitude,
-                            ghost.point.longitude,
-                        );
-                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .or_else(|| {
-                        (0..points.len())
-                            .filter(|idx| !garble_set.contains(idx))
-                            .min_by(|&a, &b| {
-                                let da = (points[a].point.timestamp - ghost_ts).abs();
-                                let db = (points[b].point.timestamp - ghost_ts).abs();
-                                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    });
-
-                if let Some(mi) = closest {
-                    let real = &points[mi];
-                    let mut bearing_diff = ghost.theta_deg - real.theta_deg;
-                    if bearing_diff > 180.0 {
-                        bearing_diff -= 360.0;
-                    }
-                    if bearing_diff < -180.0 {
-                        bearing_diff += 360.0;
-                    }
-                    let range_diff = ghost.rho_nm - real.rho_nm;
-
-                    let garble_type = if range_diff.abs() < 5.0 && bearing_diff.abs() > 3.0 {
-                        "sidelobe"
-                    } else {
-                        "multipath"
-                    };
-
-                    all_garble.push(GarblePoint {
-                        timestamp: ghost.point.timestamp,
-                        mode_s: ms.clone(),
-                        track_number: ghost.track_number.unwrap_or(0),
-                        rho_nm: ghost.rho_nm,
-                        theta_deg: ghost.theta_deg,
-                        ghost_lat: ghost.point.latitude,
-                        ghost_lon: ghost.point.longitude,
-                        ghost_altitude: ghost.point.altitude,
-                        real_lat: real.point.latitude,
-                        real_lon: real.point.longitude,
-                        real_altitude: real.point.altitude,
-                        real_rho_nm: real.rho_nm,
-                        real_theta_deg: real.theta_deg,
-                        garble_type: garble_type.to_string(),
-                        bearing_diff_deg: bearing_diff,
-                        range_diff_nm: range_diff,
-                    });
-                }
-            }
-
-            garble_indices.sort_unstable();
-            garble_indices.dedup();
-            let removed_count = garble_indices.len();
-            for &idx in garble_indices.iter().rev() {
+            ghost_indices.sort_unstable();
+            ghost_indices.dedup();
+            let removed_count = ghost_indices.len();
+            for &idx in ghost_indices.iter().rev() {
                 points.remove(idx);
             }
 
             if removed_count > 0 {
                 info!(
-                    "Garble detected for {}: {} ghost points removed",
+                    "Ghost points removed for {}: {} points",
                     ms, removed_count
                 );
             }
         }
-
-        self.stats.garble_detected = all_garble.len();
-        self.stats.garble_sidelobe = all_garble
-            .iter()
-            .filter(|g| g.garble_type == "sidelobe")
-            .count();
-        self.stats.garble_multipath = all_garble
-            .iter()
-            .filter(|g| g.garble_type == "multipath")
-            .count();
-
-        all_garble
     }
 
     /// 포인트 제거 시 새로운 gap이 생기는지 확인 (Loss 경계 보호)
@@ -595,7 +492,7 @@ impl TrackAssembler {
 
     /// 공간 이상점 제거: 전후 포인트 대비 비정상적으로 먼 단독 ghost 제거.
     /// Loss 경계 보호: 제거 시 gap이 생기면 보존.
-    fn remove_spatial_outliers(&mut self, garble_points: &mut Vec<GarblePoint>) {
+    fn remove_spatial_outliers(&mut self) {
         use crate::analysis::loss::calculate_haversine_distance;
 
         for (ms, points) in self.tracks.iter_mut() {
@@ -681,42 +578,6 @@ impl TrackAssembler {
                 continue;
             }
 
-            for &oi in &outlier_indices {
-                let ghost = &points[oi];
-                let real = if oi > 0 {
-                    &points[oi - 1]
-                } else if oi + 1 < points.len() {
-                    &points[oi + 1]
-                } else {
-                    continue;
-                };
-
-                let mut bearing_diff = ghost.theta_deg - real.theta_deg;
-                if bearing_diff > 180.0 { bearing_diff -= 360.0; }
-                if bearing_diff < -180.0 { bearing_diff += 360.0; }
-                let range_diff = ghost.rho_nm - real.rho_nm;
-                let garble_type = if range_diff.abs() < 3.0 { "sidelobe" } else { "multipath" };
-
-                garble_points.push(GarblePoint {
-                    timestamp: ghost.point.timestamp,
-                    mode_s: ms.clone(),
-                    track_number: ghost.track_number.unwrap_or(0),
-                    rho_nm: ghost.rho_nm,
-                    theta_deg: ghost.theta_deg,
-                    ghost_lat: ghost.point.latitude,
-                    ghost_lon: ghost.point.longitude,
-                    ghost_altitude: ghost.point.altitude,
-                    real_lat: real.point.latitude,
-                    real_lon: real.point.longitude,
-                    real_altitude: real.point.altitude,
-                    real_rho_nm: real.rho_nm,
-                    real_theta_deg: real.theta_deg,
-                    garble_type: garble_type.to_string(),
-                    bearing_diff_deg: bearing_diff,
-                    range_diff_nm: range_diff,
-                });
-            }
-
             for &idx in outlier_indices.iter().rev() {
                 points.remove(idx);
             }
@@ -782,7 +643,7 @@ impl TrackAssembler {
             }
 
             if removed_total > 0 {
-                self.stats.garbled_removed += removed_total;
+                let _ = removed_total;
             }
         }
     }
@@ -1156,16 +1017,9 @@ pub fn parse_ass_file(
         assembler.tracks.retain(|ms, _| filter_set.contains(&ms.to_uppercase()));
     }
 
-    // Garble 탐지 (다중 Track Number → 유령 트랙 분리)
-    let mut garble_points = assembler.detect_garble();
-
-    // 공간 이상점 제거 (garble 탐지 후 남은 단독 ghost)
-    assembler.remove_spatial_outliers(&mut garble_points);
-
-    // garble 통계 갱신 (spatial outlier 포함)
-    assembler.stats.garble_detected = garble_points.len();
-    assembler.stats.garble_sidelobe = garble_points.iter().filter(|g| g.garble_type == "sidelobe").count();
-    assembler.stats.garble_multipath = garble_points.iter().filter(|g| g.garble_type == "multipath").count();
+    // 유령 표적 제거 (동일 스캔 내 공간 불일치 포인트 + 공간 이상점)
+    assembler.detect_and_remove_ghosts();
+    assembler.remove_spatial_outliers();
 
     // 동일 위치 중복 제거
     assembler.dedup_same_position();
@@ -1202,7 +1056,6 @@ pub fn parse_ass_file(
         radar_lat,
         radar_lon,
         parse_stats: Some(stats),
-        garble_points,
     })
 }
 
@@ -1730,19 +1583,9 @@ mod tests {
 
         let result = parse_ass_file(path, 37.5585, 126.7908, &[], |_| {}).unwrap();
         eprintln!("  Parsed points: {}", result.track_points.len());
-        eprintln!("  Garble points: {}", result.garble_points.len());
-        if let Some(ref stats) = result.parse_stats {
-            eprintln!("  Garble stats: detected={}, sidelobe={}, multipath={}",
-                stats.garble_detected, stats.garble_sidelobe, stats.garble_multipath);
-        }
-        // Garble 탐지 검증: 71BF78에 대해 최소 1개 이상 검출
-        assert!(result.garble_points.iter().any(|g| g.mode_s == "71BF78"),
-            "71BF78 garble points should be detected");
         // 공간 이상점 검증: 71BF78 최종 항적에 이상점 없음
         let bf78_pts: Vec<_> = result.track_points.iter().filter(|p| p.mode_s == "71BF78").collect();
-        eprintln!("  71BF78: {} track pts, {} garble pts",
-            bf78_pts.len(),
-            result.garble_points.iter().filter(|g| g.mode_s == "71BF78").count());
+        eprintln!("  71BF78: {} track pts", bf78_pts.len());
 
         if let (Some(first), Some(last)) = (result.track_points.first(), result.track_points.last()) {
             eprintln!("  First ts: {:.0} ({})", first.timestamp, ts_to_date(first.timestamp));

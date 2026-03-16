@@ -85,39 +85,17 @@ export interface LossSegment {
   end_radar_dist_km: number;
 }
 
-/** Garble 포인트 (사이드로브/다중경로 유령 표적) */
-export interface GarblePoint {
-  timestamp: number;
-  mode_s: string;
-  track_number: number;
-  rho_nm: number;
-  theta_deg: number;
-  ghost_lat: number;
-  ghost_lon: number;
-  ghost_altitude: number;
-  real_lat: number;
-  real_lon: number;
-  real_altitude: number;
-  real_rho_nm: number;
-  real_theta_deg: number;
-  garble_type: "sidelobe" | "multipath";
-  bearing_diff_deg: number;
-  range_diff_nm: number;
-}
 
 /** 파싱 통계 */
 export interface ParseStatistics {
   total_asterix_records: number;
   discarded_psr_none: number;
-  garbled_removed: number;
+
   atcrbs_merged: number;
   atcrbs_unmatched: number;
   /** [mode_ac, mode_ac_psr, mode_s_allcall, mode_s_rollcall, mode_s_allcall_psr, mode_s_rollcall_psr] */
   points_by_type: [number, number, number, number, number, number];
   mode3a_invalid: number;
-  garble_detected: number;
-  garble_sidelobe: number;
-  garble_multipath: number;
 }
 
 /** 파싱 결과 (Parse Result) */
@@ -131,7 +109,6 @@ export interface ParsedFile {
   radar_lat: number;
   radar_lon: number;
   parse_stats?: ParseStatistics;
-  garble_points: GarblePoint[];
 }
 
 /** 분석 결과 (Analysis Result) */
@@ -191,6 +168,8 @@ export interface LOSProfileData {
   elevationProfile: ElevationPoint[];
   losBlocked: boolean;
   maxBlockingPoint?: { distance: number; elevation: number; name?: string };
+  mapScreenshot?: string;
+  chartScreenshot?: string;
   timestamp: number;
 }
 
@@ -419,27 +398,6 @@ export interface SavedReportDetail {
   metadata_json?: string;
 }
 
-/** Garble 요약 통계 (캐시용) */
-export interface GarbleSummaryCached {
-  mode_s: string;
-  aircraft_name?: string;
-  total_count: number;
-  sidelobe_count: number;
-  multipath_count: number;
-  time_range_start: number;
-  time_range_end: number;
-}
-
-/** 기상-Garble 상관분석 결과 */
-export interface WeatherGarbleCorrelation {
-  avgCloud: number;
-  avgVis: number;
-  avgPressure: number;
-  sampleCount: number;
-  overallAvgCloud: number;
-  overallAvgVis: number;
-  overallAvgPressure: number;
-}
 
 /** UI 페이지 */
 export type PageId =

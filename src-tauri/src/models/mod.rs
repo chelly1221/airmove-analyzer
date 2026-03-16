@@ -62,19 +62,13 @@ impl fmt::Display for RadarDetectionType {
 pub struct ParseStatistics {
     pub total_asterix_records: usize,
     pub discarded_psr_none: usize,
-    pub garbled_removed: usize,
+
     pub atcrbs_merged: usize,
     pub atcrbs_unmatched: usize,
     /// [mode_ac, mode_ac_psr, mode_s_allcall, mode_s_rollcall, mode_s_allcall_psr, mode_s_rollcall_psr]
     pub points_by_type: [usize; 6],
     /// I070 Mode 3/A: V=1(무효) 또는 G=1(garbled) 레코드 수
     pub mode3a_invalid: usize,
-    /// Garble 탐지 총 수
-    pub garble_detected: usize,
-    /// Garble 중 사이드로브
-    pub garble_sidelobe: usize,
-    /// Garble 중 다중경로
-    pub garble_multipath: usize,
     /// 파싱 에러 후 바이트 스캔으로 복구된 레코드 수
     #[serde(default)]
     pub recovered_records: usize,
@@ -151,36 +145,6 @@ pub struct LossSegment {
     pub end_radar_dist_km: f64,
 }
 
-/// Garble 포인트 (사이드로브/다중경로로 인한 유령 표적)
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct GarblePoint {
-    pub timestamp: f64,
-    pub mode_s: String,
-    /// 유령 트랙의 Track Number (I161)
-    pub track_number: u16,
-    /// 원시 극좌표: 거리 (NM)
-    pub rho_nm: f64,
-    /// 원시 극좌표: 방위 (degrees)
-    pub theta_deg: f64,
-    /// 유령 위치 WGS84
-    pub ghost_lat: f64,
-    pub ghost_lon: f64,
-    pub ghost_altitude: f64,
-    /// 실제 항적 위치
-    pub real_lat: f64,
-    pub real_lon: f64,
-    pub real_altitude: f64,
-    /// 실제 항적의 극좌표
-    pub real_rho_nm: f64,
-    pub real_theta_deg: f64,
-    /// 분류: "sidelobe" | "multipath"
-    pub garble_type: String,
-    /// 방위 차이 (degrees)
-    pub bearing_diff_deg: f64,
-    /// 거리 차이 (NM)
-    pub range_diff_nm: f64,
-}
-
 /// 파싱 결과 (Parse Result)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ParsedFile {
@@ -196,9 +160,6 @@ pub struct ParsedFile {
     /// 파싱 통계 (진단용)
     #[serde(default)]
     pub parse_stats: Option<ParseStatistics>,
-    /// Garble 포인트 (사이드로브/다중경로 유령 표적)
-    #[serde(default)]
-    pub garble_points: Vec<GarblePoint>,
 }
 
 /// 분석 결과 (Analysis Result)

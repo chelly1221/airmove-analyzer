@@ -144,7 +144,6 @@ export default function ReportGeneration() {
   const losResults = useAppStore((s) => s.losResults);
   const radarSite = useAppStore((s) => s.radarSite);
   const weatherData = useAppStore((s) => s.weatherData);
-  const garblePoints = useAppStore((s) => s.garblePoints);
   const reportMetadata = useAppStore((s) => s.reportMetadata);
 
   const [mode, setMode] = useState<ReportMode>("config");
@@ -705,7 +704,6 @@ export default function ReportGeneration() {
                 <ReportWeatherSection
                   sectionNum={sectionNumbers.weather ?? 4}
                   weather={weatherData}
-                  garblePoints={garblePoints}
                 />
               </ReportPage>
             )}
@@ -829,7 +827,6 @@ export default function ReportGeneration() {
                 <ReportWeatherSection
                   sectionNum={sectionNumbers.weather ?? 4}
                   weather={weatherData}
-                  garblePoints={garblePoints}
                 />
               </ReportPage>
             )}
@@ -891,7 +888,6 @@ export default function ReportGeneration() {
                 <ReportWeatherSection
                   sectionNum={sectionNumbers.weather ?? 4}
                   weather={weatherData}
-                  garblePoints={garblePoints}
                 />
               </ReportPage>
             )}

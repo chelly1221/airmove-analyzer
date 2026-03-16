@@ -207,6 +207,8 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             elevation_profile_json TEXT NOT NULL,
             los_blocked INTEGER NOT NULL,
             max_blocking_json TEXT,
+            map_screenshot TEXT,
+            chart_screenshot TEXT,
             created_at INTEGER NOT NULL
         );
 
@@ -281,6 +283,10 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 수동 건물에 도형 컬럼 추가
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_type TEXT NOT NULL DEFAULT 'point'", []);
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_json TEXT", []);
+
+    // LOS 결과에 스크린샷 컬럼 추가
+    let _ = conn.execute("ALTER TABLE los_results ADD COLUMN map_screenshot TEXT", []);
+    let _ = conn.execute("ALTER TABLE los_results ADD COLUMN chart_screenshot TEXT", []);
 
     Ok(conn)
 }
@@ -566,7 +572,7 @@ pub fn get_setting(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
 
 // ========== 파싱 데이터 영속화 ==========
 
-use crate::models::{AnalysisResult, GarblePoint, ParseStatistics, RadarDetectionType, TrackPoint};
+use crate::models::{AnalysisResult, ParseStatistics, RadarDetectionType, TrackPoint};
 
 fn radar_type_to_str(rt: &RadarDetectionType) -> &'static str {
     match rt {
@@ -655,39 +661,6 @@ pub fn save_parsed_file_data(
     }
     conn.execute_batch("COMMIT")?;
 
-    // 트랜잭션으로 garble_points 일괄 삽입
-    if !analysis.file_info.garble_points.is_empty() {
-        conn.execute_batch("BEGIN")?;
-        {
-            let mut stmt = conn.prepare(
-                "INSERT INTO garble_points (file_id, timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            )?;
-            for gp in &analysis.file_info.garble_points {
-                stmt.execute(params![
-                    file_id,
-                    gp.timestamp,
-                    gp.mode_s,
-                    gp.track_number as i64,
-                    gp.rho_nm,
-                    gp.theta_deg,
-                    gp.ghost_lat,
-                    gp.ghost_lon,
-                    gp.ghost_altitude,
-                    gp.real_lat,
-                    gp.real_lon,
-                    gp.real_altitude,
-                    gp.real_rho_nm,
-                    gp.real_theta_deg,
-                    gp.garble_type,
-                    gp.bearing_diff_deg,
-                    gp.range_diff_nm,
-                ])?;
-            }
-        }
-        conn.execute_batch("COMMIT")?;
-    }
-
     Ok(())
 }
 
@@ -711,7 +684,6 @@ pub struct SavedFileInfo {
 pub struct SavedParsedData {
     pub files: Vec<SavedFileInfo>,
     pub track_points: Vec<TrackPoint>,
-    pub garble_points: Vec<GarblePoint>,
 }
 
 /// DB에서 모든 파싱 데이터 로드
@@ -734,7 +706,6 @@ pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
 
     let mut files = Vec::new();
     let mut all_points = Vec::new();
-    let mut all_garble_points = Vec::new();
 
     for (file_id, path, name, total_records, start_time, end_time, radar_lat, radar_lon, errors_json, stats_json) in &file_rows {
         let parse_errors: Vec<String> = serde_json::from_str(errors_json).unwrap_or_default();
@@ -779,92 +750,16 @@ pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
             .collect::<SqlResult<Vec<_>>>()?;
 
         all_points.extend(points);
-
-        // 해당 파일의 garble_points 로드
-        let mut gp_stmt = conn.prepare(
-            "SELECT timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm
-             FROM garble_points WHERE file_id = ?1 ORDER BY timestamp",
-        )?;
-
-        let garble_pts: Vec<GarblePoint> = gp_stmt
-            .query_map(params![file_id], |row| {
-                Ok(GarblePoint {
-                    timestamp: row.get(0)?,
-                    mode_s: row.get(1)?,
-                    track_number: row.get::<_, i64>(2)? as u16,
-                    rho_nm: row.get(3)?,
-                    theta_deg: row.get(4)?,
-                    ghost_lat: row.get(5)?,
-                    ghost_lon: row.get(6)?,
-                    ghost_altitude: row.get(7)?,
-                    real_lat: row.get(8)?,
-                    real_lon: row.get(9)?,
-                    real_altitude: row.get(10)?,
-                    real_rho_nm: row.get(11)?,
-                    real_theta_deg: row.get(12)?,
-                    garble_type: row.get(13)?,
-                    bearing_diff_deg: row.get(14)?,
-                    range_diff_nm: row.get(15)?,
-                })
-            })?
-            .collect::<SqlResult<Vec<_>>>()?;
-
-        all_garble_points.extend(garble_pts);
     }
 
     Ok(SavedParsedData {
         files,
         track_points: all_points,
-        garble_points: all_garble_points,
     })
-}
-
-/// DB에서 garble points 로드 (mode_s 필터 옵션)
-pub fn load_garble_points(conn: &Connection, mode_s: Option<&str>) -> SqlResult<Vec<GarblePoint>> {
-    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match mode_s {
-        Some(ms) => (
-            "SELECT timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm
-             FROM garble_points WHERE mode_s = ?1 ORDER BY timestamp".to_string(),
-            vec![Box::new(ms.to_string())],
-        ),
-        None => (
-            "SELECT timestamp, mode_s, track_number, rho_nm, theta_deg, ghost_lat, ghost_lon, ghost_altitude, real_lat, real_lon, real_altitude, real_rho_nm, real_theta_deg, garble_type, bearing_diff_deg, range_diff_nm
-             FROM garble_points ORDER BY timestamp".to_string(),
-            vec![],
-        ),
-    };
-
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let points = stmt
-        .query_map(params_refs.as_slice(), |row| {
-            Ok(GarblePoint {
-                timestamp: row.get(0)?,
-                mode_s: row.get(1)?,
-                track_number: row.get::<_, i64>(2)? as u16,
-                rho_nm: row.get(3)?,
-                theta_deg: row.get(4)?,
-                ghost_lat: row.get(5)?,
-                ghost_lon: row.get(6)?,
-                ghost_altitude: row.get(7)?,
-                real_lat: row.get(8)?,
-                real_lon: row.get(9)?,
-                real_altitude: row.get(10)?,
-                real_rho_nm: row.get(11)?,
-                real_theta_deg: row.get(12)?,
-                garble_type: row.get(13)?,
-                bearing_diff_deg: row.get(14)?,
-                range_diff_nm: row.get(15)?,
-            })
-        })?
-        .collect::<SqlResult<Vec<_>>>()?;
-
-    Ok(points)
 }
 
 /// 모든 파싱 데이터 삭제
 pub fn clear_all_parsed_data(conn: &Connection) -> SqlResult<()> {
-    conn.execute("DELETE FROM garble_points", [])?;
     conn.execute("DELETE FROM track_points", [])?;
     conn.execute("DELETE FROM parsed_files", [])?;
     Ok(())
@@ -1155,23 +1050,26 @@ pub fn save_los_result(
     elevation_profile_json: &str,
     los_blocked: bool,
     max_blocking_json: Option<&str>,
+    map_screenshot: Option<&str>,
+    chart_screenshot: Option<&str>,
 ) -> SqlResult<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     conn.execute(
-        "INSERT OR REPLACE INTO los_results (id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked as i32, max_blocking_json, now],
+        "INSERT OR REPLACE INTO los_results (id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, map_screenshot, chart_screenshot, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked as i32, max_blocking_json, map_screenshot, chart_screenshot, now],
     )?;
     Ok(())
 }
 
 /// LOS 결과 전체 로드
-pub fn load_all_los_results(conn: &Connection) -> SqlResult<Vec<(String, String, f64, f64, f64, f64, f64, f64, f64, String, bool, Option<String>, i64)>> {
+#[allow(clippy::type_complexity)]
+pub fn load_all_los_results(conn: &Connection) -> SqlResult<Vec<(String, String, f64, f64, f64, f64, f64, f64, f64, String, bool, Option<String>, Option<String>, Option<String>, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, created_at
+        "SELECT id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, map_screenshot, chart_screenshot, created_at
          FROM los_results ORDER BY created_at",
     )?;
     let rows = stmt
@@ -1189,7 +1087,9 @@ pub fn load_all_los_results(conn: &Connection) -> SqlResult<Vec<(String, String,
                 row.get::<_, String>(9)?,
                 row.get::<_, i32>(10)? != 0,
                 row.get::<_, Option<String>>(11)?,
-                row.get::<_, i64>(12)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, i64>(14)?,
             ))
         })?
         .collect::<SqlResult<Vec<_>>>()?;
@@ -1284,85 +1184,6 @@ pub fn clear_coverage_cache(conn: &Connection, radar_name: &str) -> SqlResult<()
     Ok(())
 }
 
-// ========== Garble 요약 캐시 ==========
-
-/// Garble 요약 저장 (전체 교체)
-pub fn save_garble_summaries(conn: &Connection, summaries_json: &str) -> SqlResult<()> {
-    conn.execute("DELETE FROM garble_summary_cache", [])?;
-
-    #[derive(serde::Deserialize)]
-    struct GarbleSummaryRow {
-        mode_s: String,
-        aircraft_name: Option<String>,
-        total_count: i64,
-        sidelobe_count: i64,
-        multipath_count: i64,
-        time_range_start: f64,
-        time_range_end: f64,
-    }
-
-    let summaries: Vec<GarbleSummaryRow> = serde_json::from_str(summaries_json)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    conn.execute_batch("BEGIN")?;
-    {
-        let mut stmt = conn.prepare(
-            "INSERT INTO garble_summary_cache (mode_s, aircraft_name, total_count, sidelobe_count, multipath_count, time_range_start, time_range_end, computed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        )?;
-        for s in &summaries {
-            stmt.execute(params![s.mode_s, s.aircraft_name, s.total_count, s.sidelobe_count, s.multipath_count, s.time_range_start, s.time_range_end, now])?;
-        }
-    }
-    conn.execute_batch("COMMIT")?;
-    Ok(())
-}
-
-/// Garble 요약 로드
-pub fn load_garble_summaries(conn: &Connection) -> SqlResult<String> {
-    let mut stmt = conn.prepare(
-        "SELECT mode_s, aircraft_name, total_count, sidelobe_count, multipath_count, time_range_start, time_range_end FROM garble_summary_cache",
-    )?;
-
-    #[derive(serde::Serialize)]
-    struct Row {
-        mode_s: String,
-        aircraft_name: Option<String>,
-        total_count: i64,
-        sidelobe_count: i64,
-        multipath_count: i64,
-        time_range_start: f64,
-        time_range_end: f64,
-    }
-
-    let rows: Vec<Row> = stmt
-        .query_map([], |row| {
-            Ok(Row {
-                mode_s: row.get(0)?,
-                aircraft_name: row.get(1)?,
-                total_count: row.get(2)?,
-                sidelobe_count: row.get(3)?,
-                multipath_count: row.get(4)?,
-                time_range_start: row.get(5)?,
-                time_range_end: row.get(6)?,
-            })
-        })?
-        .collect::<SqlResult<Vec<_>>>()?;
-
-    serde_json::to_string(&rows).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-}
-
-/// Garble 요약 삭제
-pub fn clear_garble_summaries(conn: &Connection) -> SqlResult<()> {
-    conn.execute("DELETE FROM garble_summary_cache", [])?;
-    Ok(())
-}
-
 // ========== 저장된 보고서 ==========
 
 /// 보고서 저장
@@ -1447,43 +1268,4 @@ pub fn delete_report(conn: &Connection, id: &str) -> SqlResult<()> {
     Ok(())
 }
 
-// ========== 기상-Garble 상관분석 캐시 ==========
 
-/// 상관분석 캐시 저장
-pub fn save_weather_garble_correlation(
-    conn: &Connection,
-    cache_key: &str,
-    result_json: &str,
-) -> SqlResult<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    conn.execute(
-        "INSERT OR REPLACE INTO weather_garble_correlation (cache_key, result_json, computed_at)
-         VALUES (?1, ?2, ?3)",
-        params![cache_key, result_json, now],
-    )?;
-    Ok(())
-}
-
-/// 상관분석 캐시 로드
-pub fn load_weather_garble_correlation(
-    conn: &Connection,
-    cache_key: &str,
-) -> SqlResult<Option<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT result_json FROM weather_garble_correlation WHERE cache_key = ?1",
-    )?;
-    match stmt.query_row(params![cache_key], |row| row.get::<_, String>(0)) {
-        Ok(json) => Ok(Some(json)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// 상관분석 캐시 전체 삭제
-pub fn clear_weather_garble_correlations(conn: &Connection) -> SqlResult<()> {
-    conn.execute("DELETE FROM weather_garble_correlation", [])?;
-    Ok(())
-}

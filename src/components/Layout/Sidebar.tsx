@@ -11,8 +11,6 @@ import {
   ChevronRight,
   ChevronDown,
   Loader2,
-  Radio,
-  Search,
   Mountain,
   Building2,
   Database,
@@ -27,7 +25,6 @@ import { ko } from "date-fns/locale";
 import Modal from "../common/Modal";
 import { useAppStore } from "../../store";
 import { mergeFlightRecords } from "../../utils/flightConsolidation";
-import { summarizeGarbleByModeS } from "../../utils/reflectorAnalysis";
 import type { FlightRecord, PageId } from "../../types";
 
 /** 항공기별 색상 팔레트 (TrackMap과 동일) */
@@ -509,127 +506,6 @@ function MapFlightPanel() {
   );
 }
 
-// ─── Garble 분석 패널 ────────────────────────────────────────────────
-
-function GarbleAircraftPanel() {
-  const aircraft = useAppStore((s) => s.aircraft);
-  const garblePoints = useAppStore((s) => s.garblePoints);
-  const garbleSelectedModeS = useAppStore((s) => s.garbleSelectedModeS);
-  const setGarbleSelectedModeS = useAppStore((s) => s.setGarbleSelectedModeS);
-  const [search, setSearch] = useState("");
-
-  // Mode-S → 항공기 이름 매핑
-  const acNameMap = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const a of aircraft) {
-      if (a.mode_s_code) {
-        m.set(a.mode_s_code.toUpperCase(), a.name);
-      }
-    }
-    return m;
-  }, [aircraft]);
-
-  const summaries = useMemo(
-    () => summarizeGarbleByModeS(garblePoints, acNameMap),
-    [garblePoints, acNameMap]
-  );
-
-  // 검색 필터
-  const filtered = useMemo(() => {
-    if (!search.trim()) return summaries;
-    const q = search.trim().toUpperCase();
-    return summaries.filter(
-      (s) =>
-        s.mode_s.toUpperCase().includes(q) ||
-        (s.aircraftName && s.aircraftName.toUpperCase().includes(q))
-    );
-  }, [summaries, search]);
-
-  return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* 헤더 */}
-      <div className="flex items-center gap-1.5 border-b border-gray-100 px-2 py-1.5">
-        <Radio size={12} className="shrink-0 text-[#e94560]" />
-        <span className="text-[11px] font-semibold text-gray-700">Garble 항공기</span>
-        <span className="ml-auto text-[10px] text-gray-400">{summaries.length}</span>
-      </div>
-
-      {/* 검색 */}
-      <div className="px-2 py-1.5">
-        <div className="relative">
-          <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Mode-S 검색..."
-            className="w-full rounded-md border border-gray-200 bg-white py-1 pl-7 pr-2 text-[11px] text-gray-700 placeholder:text-gray-400 focus:border-gray-300 focus:outline-none"
-          />
-        </div>
-      </div>
-
-      {/* 항공기 목록 */}
-      <div className="flex-1 overflow-y-auto px-1.5 pb-2 scrollbar-thin">
-        {filtered.length === 0 ? (
-          <div className="py-6 text-center text-[11px] text-gray-400">
-            {garblePoints.length === 0 ? "Garble 데이터 없음" : "검색 결과 없음"}
-          </div>
-        ) : (
-          <div className="space-y-0.5">
-            {filtered.map((s) => {
-              const isSelected = garbleSelectedModeS === s.mode_s;
-              // 다중경로가 사이드로브보다 많으면 orange, 아니면 yellow
-              const dominantColor =
-                s.multipathCount > s.sidelobeCount
-                  ? "rgb(249, 115, 22)"  // orange
-                  : "rgb(234, 179, 8)";  // yellow
-              return (
-                <button
-                  key={s.mode_s}
-                  onClick={() =>
-                    setGarbleSelectedModeS(isSelected ? null : s.mode_s)
-                  }
-                  className={`w-full rounded-md px-2 py-1.5 text-left transition-colors ${
-                    isSelected
-                      ? "bg-[#e94560]/10 ring-1 ring-[#e94560]/40"
-                      : "hover:bg-gray-50"
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5">
-                    {/* 유형 색상 점 */}
-                    <div
-                      className="h-2 w-2 shrink-0 rounded-full"
-                      style={{ backgroundColor: dominantColor }}
-                    />
-                    {/* Mode-S 코드 */}
-                    <span
-                      className={`font-mono text-[11px] font-medium ${
-                        isSelected ? "text-[#e94560]" : "text-gray-700"
-                      }`}
-                    >
-                      {s.mode_s}
-                    </span>
-                    {/* 건수 */}
-                    <span className="ml-auto text-[10px] text-gray-400">
-                      {s.totalCount}건
-                    </span>
-                  </div>
-                  {/* 기체명 (있으면) */}
-                  {s.aircraftName && (
-                    <div className="mt-0.5 pl-3.5 text-[10px] text-gray-500">
-                      {s.aircraftName}
-                    </div>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 // ─── 업로드 탭: 데이터 관리 패널 ──────────────────────────────────────
 
 function UploadDataPanel() {
@@ -938,7 +814,6 @@ export default function Sidebar() {
   const isMapPage = location.pathname === "/map";
   const isDrawingPage = location.pathname === "/drawing";
   const isReportPage = location.pathname === "/report";
-  const garbleViewActive = useAppStore((s) => s.garbleViewActive);
   const panoramaViewActive = useAppStore((s) => s.panoramaViewActive);
 
   return (
@@ -1018,12 +893,6 @@ export default function Sidebar() {
           </div>
         )}
 
-        {/* Garble 분석 활성 시 항공기 패널 */}
-        {!collapsed && garbleViewActive && (
-          <div className="flex flex-1 flex-col overflow-hidden border-t border-gray-100">
-            <GarbleAircraftPanel />
-          </div>
-        )}
       </aside>
 
       {/* 경계선 + 호버 토글 핸들 */}

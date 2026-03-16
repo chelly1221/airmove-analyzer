@@ -14,20 +14,13 @@ use log::info;
 
 use tauri::{Emitter, Manager};
 
-use models::{AdsbTrack, Aircraft, AnalysisResult, FlightRecord, GarblePoint, ParsedFile, TrackPoint};
+use models::{AdsbTrack, Aircraft, AnalysisResult, FlightRecord, ParsedFile, TrackPoint};
 
 /// TrackPoint 청크 스트리밍 이벤트 페이로드
 #[derive(Clone, serde::Serialize)]
 struct TrackPointsChunk {
     file_path: String,
     points: Vec<TrackPoint>,
-}
-
-/// GarblePoint 청크 스트리밍 이벤트 페이로드
-#[derive(Clone, serde::Serialize)]
-struct GarblePointsChunk {
-    file_path: String,
-    points: Vec<GarblePoint>,
 }
 
 /// TrackPoints를 청크 단위로 이벤트 emit한 뒤, 원본에서 제거
@@ -45,23 +38,6 @@ fn emit_and_drain_track_points(
         });
     }
     // 메모리 해제 — 이미 프론트엔드로 전송됨
-    points.clear();
-    points.shrink_to_fit();
-}
-
-/// GarblePoints를 이벤트 emit한 뒤, 원본에서 제거
-fn emit_and_drain_garble_points(
-    handle: &tauri::AppHandle,
-    file_path: &str,
-    points: &mut Vec<GarblePoint>,
-) {
-    if points.is_empty() {
-        return;
-    }
-    let _ = handle.emit("garble-points-chunk", GarblePointsChunk {
-        file_path: file_path.to_string(),
-        points: points.clone(),
-    });
     points.clear();
     points.shrink_to_fit();
 }
@@ -357,8 +333,7 @@ async fn parse_and_analyze_batch(
                     let result_for_event = analysis.clone();
                     // track_points를 청크로 스트리밍 후 메모리 해제
                     emit_and_drain_track_points(&handle, &path, &mut analysis.file_info.track_points);
-                    // garble_points 스트리밍 후 메모리 해제
-                    emit_and_drain_garble_points(&handle, &path, &mut analysis.file_info.garble_points);
+
                     // analysis는 여기서 drop → 메모리 즉시 해제
                     BatchResultEvent {
                         file_path: path,
@@ -867,17 +842,6 @@ fn load_saved_data(
 ) -> Result<db::SavedParsedData, String> {
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     db::load_all_parsed_data(&conn).map_err(|e| format!("DB load error: {}", e))
-}
-
-/// DB에서 garble points 로드 (mode_s 필터 옵션)
-#[tauri::command]
-fn load_garble_points(
-    mode_s: Option<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<GarblePoint>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_garble_points(&conn, mode_s.as_deref())
-        .map_err(|e| format!("Failed to load garble points: {}", e))
 }
 
 /// 저장된 파싱 데이터 전체 삭제
@@ -1402,12 +1366,15 @@ fn save_los_result(
     elevation_profile_json: String,
     los_blocked: bool,
     max_blocking_json: Option<String>,
+    map_screenshot: Option<String>,
+    chart_screenshot: Option<String>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     db::save_los_result(
         &conn, &id, &radar_site_name, radar_lat, radar_lon, radar_height,
         target_lat, target_lon, bearing, total_distance,
         &elevation_profile_json, los_blocked, max_blocking_json.as_deref(),
+        map_screenshot.as_deref(), chart_screenshot.as_deref(),
     ).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1432,6 +1399,8 @@ fn load_los_results(
         elevation_profile_json: String,
         los_blocked: bool,
         max_blocking_json: Option<String>,
+        map_screenshot: Option<String>,
+        chart_screenshot: Option<String>,
         created_at: i64,
     }
 
@@ -1439,7 +1408,7 @@ fn load_los_results(
         id: r.0, radar_site_name: r.1, radar_lat: r.2, radar_lon: r.3,
         radar_height: r.4, target_lat: r.5, target_lon: r.6, bearing: r.7,
         total_distance: r.8, elevation_profile_json: r.9, los_blocked: r.10,
-        max_blocking_json: r.11, created_at: r.12,
+        max_blocking_json: r.11, map_screenshot: r.12, chart_screenshot: r.13, created_at: r.14,
     }).collect();
 
     serde_json::to_string(&results).map_err(|e| format!("JSON error: {}", e))
@@ -1526,33 +1495,6 @@ fn clear_coverage_cache(
     db::clear_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
 }
 
-// ========== Garble 요약 캐시 ==========
-
-#[tauri::command]
-fn save_garble_summaries(
-    state: tauri::State<'_, AppState>,
-    summaries_json: String,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::save_garble_summaries(&conn, &summaries_json).map_err(|e| format!("DB error: {}", e))
-}
-
-#[tauri::command]
-fn load_garble_summaries(
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_garble_summaries(&conn).map_err(|e| format!("DB error: {}", e))
-}
-
-#[tauri::command]
-fn clear_garble_summaries(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::clear_garble_summaries(&conn).map_err(|e| format!("DB error: {}", e))
-}
-
 // ========== 저장된 보고서 ==========
 
 #[tauri::command]
@@ -1616,28 +1558,6 @@ fn delete_saved_report(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     db::delete_report(&conn, &id).map_err(|e| format!("DB error: {}", e))
-}
-
-// ========== 기상-Garble 상관분석 캐시 ==========
-
-#[tauri::command]
-fn save_weather_garble_correlation(
-    state: tauri::State<'_, AppState>,
-    cache_key: String,
-    result_json: String,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::save_weather_garble_correlation(&conn, &cache_key, &result_json)
-        .map_err(|e| format!("DB error: {}", e))
-}
-
-#[tauri::command]
-fn load_weather_garble_correlation(
-    state: tauri::State<'_, AppState>,
-    cache_key: String,
-) -> Result<Option<String>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_weather_garble_correlation(&conn, &cache_key).map_err(|e| format!("DB error: {}", e))
 }
 
 // ---------- App Entry Point ----------
@@ -1717,7 +1637,6 @@ pub fn run() {
             save_opensky_credentials,
             load_opensky_credentials,
             load_saved_data,
-            load_garble_points,
             clear_saved_data,
             delete_parsed_file,
             delete_parsed_files,
@@ -1759,18 +1678,11 @@ pub fn run() {
             save_coverage_cache,
             load_coverage_cache,
             clear_coverage_cache,
-            // Garble 요약
-            save_garble_summaries,
-            load_garble_summaries,
-            clear_garble_summaries,
             // 보고서
             save_report,
             list_saved_reports,
             load_report_detail,
             delete_saved_report,
-            // 기상-Garble 상관분석
-            save_weather_garble_correlation,
-            load_weather_garble_correlation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

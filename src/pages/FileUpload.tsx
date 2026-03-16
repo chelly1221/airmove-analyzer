@@ -1203,20 +1203,17 @@ export default function FileUpload() {
     });
   }, [registeredTrackRanges]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // DB에서 rawTrackPoints + garblePoints 재로드 후 비행 재통합
+  // DB에서 rawTrackPoints 재로드 후 비행 재통합
   const reloadAndReconsolidate = useCallback(async () => {
     try {
       const data = await invoke<any>("load_saved_data");
       if (data?.track_points?.length > 0) {
         useAppStore.setState({ rawTrackPoints: data.track_points });
-        if (data.garble_points) {
-          useAppStore.setState({ garblePoints: data.garble_points });
-        }
       } else {
-        useAppStore.setState({ rawTrackPoints: [], garblePoints: [], flights: [] });
+        useAppStore.setState({ rawTrackPoints: [], flights: [] });
       }
     } catch {
-      useAppStore.setState({ rawTrackPoints: [], garblePoints: [], flights: [] });
+      useAppStore.setState({ rawTrackPoints: [], flights: [] });
     }
     // 약간의 딜레이 후 재통합 (state 반영 대기)
     setTimeout(() => runConsolidation(), 50);
@@ -1324,11 +1321,6 @@ export default function FileUpload() {
 
       // 원시 포인트 축적
       appendRawTrackPoints(result.file_info.track_points);
-
-      // garble 포인트 축적
-      if (result.file_info.garble_points && result.file_info.garble_points.length > 0) {
-        useAppStore.getState().appendGarblePoints(result.file_info.garble_points);
-      }
 
       // 파싱 통계 저장
       if (result.file_info.parse_stats) {

@@ -406,7 +406,6 @@ mod tests {
             radar_lat: 37.5585,
             radar_lon: 126.7906,
             parse_stats: None,
-            garble_points: vec![],
         };
 
         let result = analyze_tracks(parsed, 12.0);

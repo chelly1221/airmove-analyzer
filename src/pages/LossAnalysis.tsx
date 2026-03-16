@@ -8,39 +8,24 @@ import {
   Clock,
   Ruler,
   Mountain,
-  Radio,
-  Users,
-  Zap,
-  Waves,
   Eye,
   Loader2,
+  Trash2,
+  MapPin,
+  Crosshair,
 } from "lucide-react";
 import Card from "../components/common/Card";
 import { SimpleCard } from "../components/common/Card";
-import DataTable from "../components/common/DataTable";
+
 import { useAppStore } from "../store";
 import { flightLabel } from "../utils/flightConsolidation";
-import {
-  estimateReflectorPosition,
-} from "../utils/reflectorAnalysis";
-import type { LossPoint, GarblePoint, PanoramaPoint } from "../types";
-import type { ReflectorEstimate } from "../utils/reflectorAnalysis";
-import { getWeatherAtTime, assessDuctingRisk } from "../utils/weatherFetch";
+import type { LossPoint, PanoramaPoint, LOSProfileData } from "../types";
 
 interface FlatLoss {
   index: number;
   flightId: string;
   flightLabel: string;
   point: LossPoint;
-}
-
-/** Unix timestamp → KST HH:mm:ss */
-function toKST(ts: number): string {
-  const d = new Date(ts * 1000);
-  const m = String(d.getUTCMinutes()).padStart(2, "0");
-  const s = String(d.getUTCSeconds()).padStart(2, "0");
-  const hour = (d.getUTCHours() + 9) % 24;
-  return `${String(hour).padStart(2, "0")}:${m}:${s}`;
 }
 
 /** Haversine 거리 (km) */
@@ -61,282 +46,21 @@ function haversineKm(
   return R * 2 * Math.asin(Math.sqrt(a));
 }
 
-type GarbleDetailTab = "table" | "bearing" | "reflector";
 
-/** Dark map style */
-const GARBLE_MAP_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
-
-/** Garble 지도 뷰 — deck.gl + MapLibre */
-function GarbleMapView({
-  garblePoints,
-  selectedModeS,
-  radarSite,
-  reflectorEstimates,
-}: {
-  garblePoints: GarblePoint[];
-  selectedModeS: string | null;
-  radarSite: { latitude: number; longitude: number };
-  reflectorEstimates: (ReflectorEstimate & { sourcePoint: GarblePoint })[];
-}) {
-  const mapRef = useRef<MapRef | null>(null);
-
-  // 선택된 Mode-S의 포인트 또는 전체
-  const displayPoints = useMemo(() => {
-    if (selectedModeS) {
-      return garblePoints.filter((p) => p.mode_s === selectedModeS);
-    }
-    return garblePoints;
-  }, [garblePoints, selectedModeS]);
-
-  const isFiltered = !!selectedModeS;
-  const markerRadius = isFiltered ? 5 : 2.5;
-
-  // 선택 변경 시 자동 fit bounds
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || displayPoints.length === 0) return;
-
-    let minLat = Infinity, maxLat = -Infinity;
-    let minLon = Infinity, maxLon = -Infinity;
-    for (const p of displayPoints) {
-      if (p.ghost_lat < minLat) minLat = p.ghost_lat;
-      if (p.ghost_lat > maxLat) maxLat = p.ghost_lat;
-      if (p.ghost_lon < minLon) minLon = p.ghost_lon;
-      if (p.ghost_lon > maxLon) maxLon = p.ghost_lon;
-      if (p.real_lat < minLat) minLat = p.real_lat;
-      if (p.real_lat > maxLat) maxLat = p.real_lat;
-      if (p.real_lon < minLon) minLon = p.real_lon;
-      if (p.real_lon > maxLon) maxLon = p.real_lon;
-    }
-    // 레이더 포함
-    if (radarSite.latitude < minLat) minLat = radarSite.latitude;
-    if (radarSite.latitude > maxLat) maxLat = radarSite.latitude;
-    if (radarSite.longitude < minLon) minLon = radarSite.longitude;
-    if (radarSite.longitude > maxLon) maxLon = radarSite.longitude;
-
-    map.fitBounds(
-      [[minLon, minLat], [maxLon, maxLat]],
-      { padding: 40, maxZoom: 14, duration: 800 }
-    );
-  }, [displayPoints, radarSite]);
-
-  // Real track points (deduplicated by lat/lon key)
-  const realTrackData = useMemo(() => {
-    const seen = new Set<string>();
-    const pts: { position: [number, number] }[] = [];
-    for (const p of displayPoints) {
-      const key = `${p.real_lat.toFixed(5)}_${p.real_lon.toFixed(5)}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        pts.push({ position: [p.real_lon, p.real_lat] });
-      }
-    }
-    return pts;
-  }, [displayPoints]);
-
-  // Ghost→Real connection lines
-  const connectionData = useMemo(
-    () =>
-      displayPoints.map((p) => ({
-        sourcePosition: [p.ghost_lon, p.ghost_lat] as [number, number],
-        targetPosition: [p.real_lon, p.real_lat] as [number, number],
-      })),
-    [displayPoints]
-  );
-
-  // deck.gl layers
-  const layers = useMemo(() => {
-    const result: (ScatterplotLayer | LineLayer)[] = [];
-
-    // 1. Ghost→Real 접속선 (red, thin)
-    if (connectionData.length > 0) {
-      result.push(
-        new LineLayer({
-          id: "garble-connections",
-          data: connectionData,
-          getSourcePosition: (d: { sourcePosition: [number, number] }) => d.sourcePosition,
-          getTargetPosition: (d: { targetPosition: [number, number] }) => d.targetPosition,
-          getColor: [239, 68, 68, isFiltered ? 120 : 60],
-          getWidth: 1,
-          widthMinPixels: 1,
-        })
-      );
-    }
-
-    // 2. Real track points (white, small)
-    if (realTrackData.length > 0) {
-      result.push(
-        new ScatterplotLayer({
-          id: "garble-real-tracks",
-          data: realTrackData,
-          getPosition: (d: { position: [number, number] }) => d.position,
-          getFillColor: [255, 255, 255, 180],
-          getRadius: isFiltered ? 3 : 1.5,
-          radiusUnits: "pixels" as const,
-          radiusMinPixels: 1,
-        })
-      );
-    }
-
-    // 3. Sidelobe ghost points (yellow)
-    const sidelobeData = displayPoints.filter((p) => p.garble_type === "sidelobe");
-    if (sidelobeData.length > 0) {
-      result.push(
-        new ScatterplotLayer({
-          id: "garble-sidelobe",
-          data: sidelobeData,
-          getPosition: (d: GarblePoint) => [d.ghost_lon, d.ghost_lat],
-          getFillColor: [234, 179, 8, 160],
-          getRadius: markerRadius,
-          radiusUnits: "pixels" as const,
-          radiusMinPixels: 2,
-        })
-      );
-    }
-
-    // 4. Multipath ghost points (orange)
-    const multipathData = displayPoints.filter((p) => p.garble_type === "multipath");
-    if (multipathData.length > 0) {
-      result.push(
-        new ScatterplotLayer({
-          id: "garble-multipath",
-          data: multipathData,
-          getPosition: (d: GarblePoint) => [d.ghost_lon, d.ghost_lat],
-          getFillColor: [249, 115, 22, 160],
-          getRadius: markerRadius,
-          radiusUnits: "pixels" as const,
-          radiusMinPixels: 2,
-        })
-      );
-    }
-
-    // 5. Radar site (cyan)
-    result.push(
-      new ScatterplotLayer({
-        id: "garble-radar",
-        data: [{ position: [radarSite.longitude, radarSite.latitude] }],
-        getPosition: (d: { position: [number, number] }) => d.position,
-        getFillColor: [6, 182, 212, 255],
-        getLineColor: [6, 182, 212, 255],
-        getRadius: 6,
-        radiusUnits: "pixels" as const,
-        radiusMinPixels: 4,
-        stroked: true,
-        lineWidthMinPixels: 2,
-      })
-    );
-
-    // 6. Reflector estimates (magenta, with border)
-    if (isFiltered && reflectorEstimates.length > 0) {
-      result.push(
-        new ScatterplotLayer({
-          id: "garble-reflectors",
-          data: reflectorEstimates,
-          getPosition: (d: ReflectorEstimate) => [d.lon, d.lat],
-          getFillColor: [236, 72, 153, 200],
-          getLineColor: [255, 255, 255, 200],
-          getRadius: 7,
-          radiusUnits: "pixels" as const,
-          radiusMinPixels: 5,
-          stroked: true,
-          lineWidthMinPixels: 2,
-        })
-      );
-    }
-
-    return result;
-  }, [displayPoints, connectionData, realTrackData, reflectorEstimates, isFiltered, markerRadius, radarSite]);
-
-  // 초기 뷰 상태
-  const initialViewState = useMemo(
-    () => ({
-      longitude: radarSite.longitude,
-      latitude: radarSite.latitude,
-      zoom: 7,
-    }),
-    [] // 최초 1회만
-  );
-
-  const onMapRef = useCallback((ref: MapRef | null) => {
-    mapRef.current = ref;
-  }, []);
-
-  if (garblePoints.length === 0) {
-    return (
-      <SimpleCard>
-        <div className="flex items-center justify-center py-12 text-sm text-gray-500">
-          Garble 데이터가 없습니다. 자료를 파싱하세요.
-        </div>
-      </SimpleCard>
-    );
-  }
-
-  return (
-    <SimpleCard className="p-0 overflow-hidden">
-      <div className="relative" style={{ height: 400 }}>
-        <MapGL
-          ref={onMapRef}
-          initialViewState={initialViewState}
-          style={{ width: "100%", height: "100%" }}
-          mapStyle={GARBLE_MAP_STYLE}
-          attributionControl={false}
-        >
-          <DeckGLOverlay layers={layers} />
-          <NavigationControl position="top-right" showCompass={false} />
-        </MapGL>
-        {/* 범례 */}
-        <div className="absolute bottom-3 left-3 flex flex-col gap-1 rounded-lg bg-black/60 px-3 py-2 text-[10px] text-white/80 backdrop-blur-sm">
-          <div className="flex items-center gap-1.5">
-            <div className="h-2 w-2 rounded-full bg-yellow-400" />
-            사이드로브
-          </div>
-          <div className="flex items-center gap-1.5">
-            <div className="h-2 w-2 rounded-full bg-orange-500" />
-            다중경로
-          </div>
-          <div className="flex items-center gap-1.5">
-            <div className="h-2 w-2 rounded-full bg-white" />
-            실제 항적
-          </div>
-          <div className="flex items-center gap-1.5">
-            <div className="h-2 w-2 rounded-full bg-cyan-400" />
-            레이더
-          </div>
-          {isFiltered && reflectorEstimates.length > 0 && (
-            <div className="flex items-center gap-1.5">
-              <div className="h-2 w-2 rounded-full bg-pink-400" />
-              반사체 추정
-            </div>
-          )}
-        </div>
-        {/* 선택 정보 */}
-        {selectedModeS && (
-          <div className="absolute top-3 left-3 rounded-lg bg-black/60 px-3 py-1.5 text-[11px] font-medium text-white/90 backdrop-blur-sm">
-            {selectedModeS} — {displayPoints.length}건
-          </div>
-        )}
-      </div>
-    </SimpleCard>
-  );
-}
 
 export default function LossAnalysis() {
   const flights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
-  const garblePoints = useAppStore((s) => s.garblePoints);
   const radarSite = useAppStore((s) => s.radarSite);
-  const garbleSelectedModeS = useAppStore((s) => s.garbleSelectedModeS);
-  const setGarbleViewActive = useAppStore((s) => s.setGarbleViewActive);
   const setPanoramaViewActive = useAppStore((s) => s.setPanoramaViewActive);
   const setPanoramaActivePointStore = useAppStore((s) => s.setPanoramaActivePoint);
   const setPanoramaPinnedStore = useAppStore((s) => s.setPanoramaPinned);
-  const weatherData = useAppStore((s) => s.weatherData);
-  const [viewMode, setViewMode] = useState<"by-flight" | "garble" | "los-panorama">(
+  const losResults = useAppStore((s) => s.losResults);
+  const removeLOSResult = useAppStore((s) => s.removeLOSResult);
+  const [viewMode, setViewMode] = useState<"by-flight" | "los-panorama" | "los-saved">(
     "by-flight"
   );
-
-  // ── Garble 뷰 상태 ──
-  const [garbleActiveTab, setGarbleActiveTab] = useState<GarbleDetailTab>("table");
+  const [losPreview, setLosPreview] = useState<LOSProfileData | null>(null);
 
   // ── LoS 파노라마 상태 ──
   const [panoramaData, setPanoramaData] = useState<PanoramaPoint[]>([]);
@@ -348,12 +72,6 @@ export default function LossAnalysis() {
   const [panoramaPeakNames, setPanoramaPeakNames] = useState<Map<number, string>>(new Map()); // 파노라마 인덱스 → 산 이름
   // 파노라마 X축 줌 (방위 범위)
   const [panoramaAzRange, setPanoramaAzRange] = useState<[number, number]>([0, 360]);
-
-  // Garble 뷰 활성 상태를 스토어에 동기화
-  useEffect(() => {
-    setGarbleViewActive(viewMode === "garble");
-    return () => setGarbleViewActive(false);
-  }, [viewMode, setGarbleViewActive]);
 
   // 파노라마 뷰 활성 상태를 스토어에 동기화
   useEffect(() => {
@@ -721,200 +439,20 @@ export default function LossAnalysis() {
     [flights, registeredModeSCodes]
   );
 
-  // ── Garble 관련 memo ──
-  const garbleAircraftMap = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const a of aircraft) {
-      if (a.mode_s_code) {
-        m.set(a.mode_s_code.toUpperCase(), a.name);
-      }
-    }
-    return m;
-  }, [aircraft]);
-
-  const garbleStats = useMemo(() => {
-    const uniqueModeS = new Set(garblePoints.map((p) => p.mode_s));
-    const sidelobe = garblePoints.filter((p) => p.garble_type === "sidelobe").length;
-    const multipath = garblePoints.filter((p) => p.garble_type === "multipath").length;
-    return {
-      total: garblePoints.length,
-      uniqueModeS: uniqueModeS.size,
-      sidelobe,
-      multipath,
-    };
-  }, [garblePoints]);
-
-  const garbleSelectedPoints = useMemo(() => {
-    if (!garbleSelectedModeS) return [];
-    return garblePoints.filter((p) => p.mode_s === garbleSelectedModeS);
-  }, [garblePoints, garbleSelectedModeS]);
-
-  const garbleReflectorEstimates = useMemo(() => {
-    if (!garbleSelectedModeS) return [];
-    const multipathPts = garbleSelectedPoints.filter((p) => p.garble_type === "multipath");
-    const estimates: (ReflectorEstimate & { sourcePoint: GarblePoint })[] = [];
-    for (const p of multipathPts) {
-      const est = estimateReflectorPosition(
-        radarSite.latitude,
-        radarSite.longitude,
-        p.rho_nm,
-        p.theta_deg,
-        p.real_lat,
-        p.real_lon
-      );
-      if (est) {
-        estimates.push({ ...est, sourcePoint: p });
-      }
-    }
-    return estimates;
-  }, [garbleSelectedModeS, garbleSelectedPoints, radarSite]);
-
-  const garbleReflectorClusters = useMemo(() => {
-    if (garbleReflectorEstimates.length === 0) return [];
-    const buckets = new Map<number, typeof garbleReflectorEstimates>();
-    for (const e of garbleReflectorEstimates) {
-      const bucket = Math.round(e.bearing / 5) * 5;
-      const arr = buckets.get(bucket) || [];
-      arr.push(e);
-      buckets.set(bucket, arr);
-    }
-    return [...buckets.entries()]
-      .map(([bearing, pts]) => ({
-        bearing,
-        count: pts.length,
-        avgDistanceNm: pts.reduce((s, p) => s + p.distanceNm, 0) / pts.length,
-        avgConfidence: pts.reduce((s, p) => s + p.confidence, 0) / pts.length,
-      }))
-      .sort((a, b) => b.count - a.count);
-  }, [garbleReflectorEstimates]);
-
-  const garbleBearingHistogram = useMemo(() => {
-    const bins: { center: number; sidelobe: number; multipath: number }[] = [];
-    for (let deg = -175; deg <= 175; deg += 10) {
-      bins.push({ center: deg, sidelobe: 0, multipath: 0 });
-    }
-    for (const p of garbleSelectedPoints) {
-      const idx = Math.round((p.bearing_diff_deg + 175) / 10);
-      const clampedIdx = Math.max(0, Math.min(bins.length - 1, idx));
-      if (p.garble_type === "sidelobe") {
-        bins[clampedIdx].sidelobe++;
-      } else {
-        bins[clampedIdx].multipath++;
-      }
-    }
-    return bins;
-  }, [garbleSelectedPoints]);
-
-  const garbleMaxBinCount = useMemo(
-    () => Math.max(1, ...garbleBearingHistogram.map((b) => b.sidelobe + b.multipath)),
-    [garbleBearingHistogram]
-  );
-
-  const garbleDetailColumns = [
-    {
-      key: "time",
-      header: "시각(KST)",
-      render: (row: GarblePoint) => (
-        <span className="font-mono text-xs">{toKST(row.timestamp)}</span>
-      ),
-    },
-    {
-      key: "track_number",
-      header: "TRK#",
-      align: "right" as const,
-      render: (row: GarblePoint) => row.track_number,
-    },
-    {
-      key: "garble_type",
-      header: "유형",
-      render: (row: GarblePoint) => (
-        <span
-          className={`rounded px-1.5 py-0.5 text-xs font-medium ${
-            row.garble_type === "sidelobe"
-              ? "bg-yellow-500/20 text-yellow-400"
-              : "bg-orange-500/20 text-orange-400"
-          }`}
-        >
-          {row.garble_type === "sidelobe" ? "사이드로브" : "다중경로"}
-        </span>
-      ),
-    },
-    {
-      key: "theta_deg",
-      header: "방위",
-      align: "right" as const,
-      render: (row: GarblePoint) => row.theta_deg.toFixed(1),
-    },
-    {
-      key: "rho_nm",
-      header: "거리(NM)",
-      align: "right" as const,
-      render: (row: GarblePoint) => row.rho_nm.toFixed(1),
-    },
-    {
-      key: "bearing_diff_deg",
-      header: "방위차",
-      align: "right" as const,
-      render: (row: GarblePoint) => row.bearing_diff_deg.toFixed(1),
-    },
-    {
-      key: "range_diff_nm",
-      header: "거리차(NM)",
-      align: "right" as const,
-      render: (row: GarblePoint) => row.range_diff_nm.toFixed(2),
-    },
-    {
-      key: "alt_diff",
-      header: "고도차(m)",
-      align: "right" as const,
-      render: (row: GarblePoint) => Math.round(Math.abs(row.ghost_altitude - row.real_altitude)),
-    },
-    {
-      key: "ghost_real_dist",
-      header: "Ghost→Real(km)",
-      align: "right" as const,
-      render: (row: GarblePoint) =>
-        haversineKm(row.ghost_lat, row.ghost_lon, row.real_lat, row.real_lon).toFixed(2),
-    },
-    {
-      key: "weather",
-      header: "기상",
-      render: (row: GarblePoint) => {
-        if (!weatherData) return <span className="text-gray-500">-</span>;
-        const w = getWeatherAtTime(weatherData, row.timestamp);
-        if (!w) return <span className="text-gray-500">-</span>;
-        const ducting = assessDuctingRisk(w);
-        return (
-          <span className="text-[10px]">
-            {w.cloud_cover}% {(w.visibility / 1000).toFixed(0)}km{" "}
-            {ducting !== "low" && (
-              <span className={ducting === "high" ? "text-red-400 font-bold" : "text-yellow-400"}>
-                {ducting === "high" ? "덕팅!" : "덕팅?"}
-              </span>
-            )}
-          </span>
-        );
-      },
-    },
-  ];
-
-  // SVG 차트 크기
-  const svgW = 600;
-  const svgH = 280;
-  const margin = { top: 20, right: 20, bottom: 40, left: 50 };
-  const chartW = svgW - margin.left - margin.right;
-  const chartH = svgH - margin.top - margin.bottom;
-  const barW = chartW / garbleBearingHistogram.length;
-
   return (
     <div className={viewMode === "los-panorama" ? "flex h-full flex-col gap-3" : "space-y-6"}>
       {/* Header */}
       <div className="flex shrink-0 items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-800">통계 / 분석</h1>
-          {viewMode !== "los-panorama" && (
+          {viewMode === "by-flight" && (
             <p className="mt-1 text-sm text-gray-500">
               비행검사기 항적 통계 및 표적소실 구간 분석
+            </p>
+          )}
+          {viewMode === "los-saved" && !losPreview && (
+            <p className="mt-1 text-sm text-gray-500">
+              저장된 LoS 단면도 분석 결과
             </p>
           )}
         </div>
@@ -922,8 +460,8 @@ export default function LossAnalysis() {
           {(
             [
               ["by-flight", "비행별"],
-              ["garble", "Garble 분석"],
               ["los-panorama", "전파 장애물"],
+              ["los-saved", `LoS (${losResults.length})`],
             ] as const
           ).map(([mode, label]) => (
             <button
@@ -1353,364 +891,123 @@ export default function LossAnalysis() {
             </>
           )}
         </>
-      ) : viewMode === "garble" ? (
+      ) : viewMode === "los-saved" ? (
         <>
-          {/* Garble Summary Cards */}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <Card
-              title="총 Garble 탐지"
-              value={garbleStats.total}
-              icon={Radio}
-              accent="#e94560"
-            />
-            <Card
-              title="영향 Mode-S"
-              value={garbleStats.uniqueModeS}
-              icon={Users}
-              accent="#3b82f6"
-            />
-            <Card
-              title="사이드로브"
-              value={garbleStats.sidelobe}
-              icon={Zap}
-              accent="#eab308"
-            />
-            <Card
-              title="다중경로"
-              value={garbleStats.multipath}
-              icon={Waves}
-              accent="#f97316"
-            />
-          </div>
-
-          {/* Garble Map (full width) */}
-          <GarbleMapView
-            garblePoints={garblePoints}
-            selectedModeS={garbleSelectedModeS}
-            radarSite={radarSite}
-            reflectorEstimates={garbleReflectorEstimates}
-          />
-
-          {/* Garble Detail Panel (full width) */}
-          <div>
-            {!garbleSelectedModeS ? (
-              <SimpleCard>
-                <div className="flex items-center justify-center py-12 text-sm text-gray-500">
-                  사이드바에서 항공기를 선택하면 상세 분석이 표시됩니다
-                </div>
-              </SimpleCard>
-            ) : (
-                <SimpleCard className="p-0">
-                  {/* Tab header */}
-                  <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
-                    <div>
-                      <h3 className="text-sm font-semibold text-gray-800">
-                        상세 분석 — {garbleSelectedModeS}
-                        {garbleAircraftMap.get(garbleSelectedModeS.toUpperCase()) &&
-                          ` (${garbleAircraftMap.get(garbleSelectedModeS.toUpperCase())})`}
-                      </h3>
-                      <p className="mt-0.5 text-xs text-gray-500">
-                        {garbleSelectedPoints.length}건 탐지
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1 rounded-lg border border-gray-200 bg-gray-50 p-1">
-                      {(
-                        [
-                          ["table", "상세 테이블"],
-                          ["bearing", "방위 분포"],
-                          ["reflector", "반사체 추정"],
-                        ] as [GarbleDetailTab, string][]
-                      ).map(([tab, label]) => (
-                        <button
-                          key={tab}
-                          onClick={() => setGarbleActiveTab(tab)}
-                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                            garbleActiveTab === tab
-                              ? "bg-[#e94560] text-white"
-                              : "text-gray-500 hover:text-gray-900"
-                          }`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="p-4">
-                    {/* 상세 테이블 */}
-                    {garbleActiveTab === "table" && (
-                      <DataTable
-                        columns={garbleDetailColumns}
-                        data={garbleSelectedPoints}
-                        rowKey={(_, idx) => `detail-${idx}`}
-                        emptyMessage="해당 Mode-S의 Garble 포인트가 없습니다."
-                        maxHeight="max-h-[460px]"
-                      />
-                    )}
-
-                    {/* 방위 분포 히스토그램 */}
-                    {garbleActiveTab === "bearing" && (
-                      <div>
-                        <p className="mb-3 text-xs text-gray-500">
-                          방위차 분포 (10° 단위)
-                        </p>
-                        <svg
-                          viewBox={`0 0 ${svgW} ${svgH}`}
-                          className="w-full"
-                          style={{ maxWidth: svgW }}
-                        >
-                          {/* Grid lines */}
-                          {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
-                            const y = margin.top + chartH * (1 - frac);
-                            return (
-                              <g key={`grid-${frac}`}>
-                                <line
-                                  x1={margin.left}
-                                  y1={y}
-                                  x2={margin.left + chartW}
-                                  y2={y}
-                                  stroke="#374151"
-                                  strokeWidth={0.5}
-                                  strokeDasharray={frac === 0 ? undefined : "2,2"}
-                                />
-                                <text
-                                  x={margin.left - 6}
-                                  y={y + 3}
-                                  textAnchor="end"
-                                  fill="#9ca3af"
-                                  fontSize={10}
-                                >
-                                  {Math.round(garbleMaxBinCount * frac)}
-                                </text>
-                              </g>
-                            );
-                          })}
-
-                          {/* Bars */}
-                          {garbleBearingHistogram.map((bin, i) => {
-                            const x = margin.left + i * barW;
-                            const totalH =
-                              ((bin.sidelobe + bin.multipath) / garbleMaxBinCount) * chartH;
-                            const sideH = (bin.sidelobe / garbleMaxBinCount) * chartH;
-                            const multiH = (bin.multipath / garbleMaxBinCount) * chartH;
-                            const baseY = margin.top + chartH;
-
-                            return (
-                              <g key={`bar-${bin.center}`}>
-                                {/* Multipath (bottom) */}
-                                {bin.multipath > 0 && (
-                                  <rect
-                                    x={x + 1}
-                                    y={baseY - multiH}
-                                    width={Math.max(barW - 2, 1)}
-                                    height={multiH}
-                                    fill="#f97316"
-                                    rx={1}
-                                  />
-                                )}
-                                {/* Sidelobe (stacked on top) */}
-                                {bin.sidelobe > 0 && (
-                                  <rect
-                                    x={x + 1}
-                                    y={baseY - totalH}
-                                    width={Math.max(barW - 2, 1)}
-                                    height={sideH}
-                                    fill="#eab308"
-                                    rx={1}
-                                  />
-                                )}
-                              </g>
-                            );
-                          })}
-
-                          {/* X axis labels */}
-                          {garbleBearingHistogram
-                            .filter((_, i) => i % 6 === 0 || i === garbleBearingHistogram.length - 1)
-                            .map((bin, _) => {
-                              const i = garbleBearingHistogram.indexOf(bin);
-                              const x = margin.left + i * barW + barW / 2;
-                              return (
-                                <text
-                                  key={`xlabel-${bin.center}`}
-                                  x={x}
-                                  y={margin.top + chartH + 18}
-                                  textAnchor="middle"
-                                  fill="#9ca3af"
-                                  fontSize={10}
-                                >
-                                  {bin.center}°
-                                </text>
-                              );
-                            })}
-
-                          {/* Axis labels */}
-                          <text
-                            x={svgW / 2}
-                            y={svgH - 4}
-                            textAnchor="middle"
-                            fill="#9ca3af"
-                            fontSize={11}
-                          >
-                            방위차 (°)
-                          </text>
-                          <text
-                            x={12}
-                            y={margin.top + chartH / 2}
-                            textAnchor="middle"
-                            fill="#9ca3af"
-                            fontSize={11}
-                            transform={`rotate(-90, 12, ${margin.top + chartH / 2})`}
-                          >
-                            건수
-                          </text>
-                        </svg>
-
-                        {/* Legend */}
-                        <div className="mt-3 flex items-center justify-center gap-6 text-xs text-gray-500">
-                          <div className="flex items-center gap-1.5">
-                            <div className="h-3 w-3 rounded-sm bg-yellow-500" />
-                            사이드로브
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <div className="h-3 w-3 rounded-sm bg-orange-500" />
-                            다중경로
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* 반사체 추정 */}
-                    {garbleActiveTab === "reflector" && (
-                      <div className="space-y-4">
-                        {garbleReflectorEstimates.length === 0 ? (
-                          <div className="py-12 text-center text-sm text-gray-500">
-                            {garbleSelectedPoints.filter((p) => p.garble_type === "multipath")
-                              .length === 0
-                              ? "선택된 Mode-S에 다중경로 포인트가 없습니다."
-                              : "반사체 위치를 추정할 수 없습니다."}
-                          </div>
-                        ) : (
-                          <>
-                            {/* 추정 결과 테이블 */}
-                            <div>
-                              <p className="mb-2 text-xs font-medium text-gray-500">
-                                추정 반사체 위치 ({garbleReflectorEstimates.length}건)
-                              </p>
-                              <div className="max-h-[280px] overflow-auto rounded-lg border border-gray-200">
-                                <table className="w-full text-sm">
-                                  <thead className="sticky top-0 z-10 bg-gray-100 text-gray-600">
-                                    <tr>
-                                      <th className="whitespace-nowrap px-4 py-2 text-left font-medium">
-                                        #
-                                      </th>
-                                      <th className="whitespace-nowrap px-4 py-2 text-right font-medium">
-                                        방위(°)
-                                      </th>
-                                      <th className="whitespace-nowrap px-4 py-2 text-right font-medium">
-                                        거리(NM)
-                                      </th>
-                                      <th className="whitespace-nowrap px-4 py-2 text-right font-medium">
-                                        신뢰도
-                                      </th>
-                                      <th className="whitespace-nowrap px-4 py-2 text-left font-medium">
-                                        좌표
-                                      </th>
-                                    </tr>
-                                  </thead>
-                                  <tbody className="divide-y divide-gray-100">
-                                    {garbleReflectorEstimates.map((est, i) => (
-                                      <tr
-                                        key={`ref-${i}`}
-                                        className="bg-white hover:bg-gray-100"
-                                      >
-                                        <td className="px-4 py-2 text-gray-500">
-                                          {i + 1}
-                                        </td>
-                                        <td className="px-4 py-2 text-right text-gray-600">
-                                          {est.bearing.toFixed(1)}
-                                        </td>
-                                        <td className="px-4 py-2 text-right text-gray-600">
-                                          {est.distanceNm.toFixed(1)}
-                                        </td>
-                                        <td className="px-4 py-2 text-right">
-                                          <span
-                                            className={`font-medium ${
-                                              est.confidence > 0.7
-                                                ? "text-green-500"
-                                                : est.confidence > 0.4
-                                                ? "text-yellow-500"
-                                                : "text-red-400"
-                                            }`}
-                                          >
-                                            {(est.confidence * 100).toFixed(0)}%
-                                          </span>
-                                        </td>
-                                        <td className="px-4 py-2 font-mono text-xs text-gray-500">
-                                          {est.lat.toFixed(4)}°N{" "}
-                                          {est.lon.toFixed(4)}°E
-                                        </td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                            </div>
-
-                            {/* 클러스터 요약 */}
-                            {garbleReflectorClusters.length > 0 && (
-                              <div>
-                                <p className="mb-2 text-xs font-medium text-gray-500">
-                                  반사체 클러스터 요약 (방위 5° 그룹)
-                                </p>
-                                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                                  {garbleReflectorClusters.slice(0, 6).map((cl) => (
-                                    <div
-                                      key={`cl-${cl.bearing}`}
-                                      className="rounded-lg border border-gray-200 bg-gray-50 p-3"
-                                    >
-                                      <div className="flex items-center justify-between">
-                                        <span className="text-sm font-medium text-gray-800">
-                                          방위 {cl.bearing}°
-                                        </span>
-                                        <span className="rounded bg-orange-500/20 px-1.5 py-0.5 text-xs font-medium text-orange-400">
-                                          {cl.count}건
-                                        </span>
-                                      </div>
-                                      <div className="mt-1.5 flex gap-4 text-xs text-gray-500">
-                                        <span>
-                                          평균 거리:{" "}
-                                          <span className="font-medium text-gray-700">
-                                            {cl.avgDistanceNm.toFixed(1)} NM
-                                          </span>
-                                        </span>
-                                        <span>
-                                          신뢰도:{" "}
-                                          <span
-                                            className={`font-medium ${
-                                              cl.avgConfidence > 0.7
-                                                ? "text-green-500"
-                                                : cl.avgConfidence > 0.4
-                                                ? "text-yellow-500"
-                                                : "text-red-400"
-                                            }`}
-                                          >
-                                            {(cl.avgConfidence * 100).toFixed(0)}%
-                                          </span>
-                                        </span>
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
+          {/* ── 저장된 LoS 분석 뷰 ── */}
+          {losPreview ? (
+            /* 상세 미리보기 */
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setLosPreview(null)}
+                  className="rounded-md border border-gray-200 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50"
+                >
+                  목록으로
+                </button>
+                <span className="text-sm font-medium text-gray-800">
+                  {losPreview.radarSiteName} → {losPreview.bearing.toFixed(1)}° / {losPreview.totalDistance.toFixed(1)}km
+                </span>
+                <span className={`ml-auto rounded px-2 py-0.5 text-xs font-bold ${
+                  losPreview.losBlocked ? "bg-red-100 text-red-700" : "bg-green-100 text-green-700"
+                }`}>
+                  {losPreview.losBlocked ? "차단" : "양호"}
+                </span>
+              </div>
+              {losPreview.mapScreenshot && (
+                <SimpleCard className="!p-0 overflow-hidden">
+                  <img src={losPreview.mapScreenshot} alt="맵 스크린샷" className="w-full" />
                 </SimpleCard>
               )}
-          </div>
+              {losPreview.chartScreenshot && (
+                <SimpleCard className="!p-0 overflow-hidden">
+                  <img src={losPreview.chartScreenshot} alt="단면도" className="w-full" />
+                </SimpleCard>
+              )}
+              {!losPreview.mapScreenshot && !losPreview.chartScreenshot && (
+                <SimpleCard>
+                  <p className="py-8 text-center text-sm text-gray-400">
+                    스크린샷 없음 (이전 버전에서 저장된 결과)
+                  </p>
+                </SimpleCard>
+              )}
+            </div>
+          ) : losResults.length === 0 ? (
+            <SimpleCard>
+              <div className="flex flex-col items-center justify-center gap-2 py-16 text-sm text-gray-500">
+                <Crosshair className="h-8 w-8 text-gray-300" />
+                <p>저장된 LoS 분석 결과가 없습니다.</p>
+                <p className="text-xs">항적 지도에서 LoS 분석 후 저장하세요.</p>
+              </div>
+            </SimpleCard>
+          ) : (
+            <div className="space-y-2">
+              {[...losResults].reverse().map((r) => (
+                <SimpleCard key={r.id} className="!p-0 overflow-hidden">
+                  <div className="flex items-stretch">
+                    {/* 썸네일 (맵 + 차트) */}
+                    <button
+                      onClick={() => setLosPreview(r)}
+                      className="flex shrink-0 gap-0.5 bg-gray-50 hover:bg-gray-100 transition-colors"
+                    >
+                      {r.mapScreenshot ? (
+                        <img src={r.mapScreenshot} alt="" className="h-[72px] w-[100px] object-cover" />
+                      ) : (
+                        <div className="flex h-[72px] w-[100px] items-center justify-center text-gray-300">
+                          <MapPin size={20} />
+                        </div>
+                      )}
+                      {r.chartScreenshot ? (
+                        <img src={r.chartScreenshot} alt="" className="h-[72px] w-[120px] object-cover" />
+                      ) : (
+                        <div className="flex h-[72px] w-[120px] items-center justify-center text-gray-300">
+                          <Crosshair size={20} />
+                        </div>
+                      )}
+                    </button>
+                    {/* 정보 */}
+                    <button
+                      onClick={() => setLosPreview(r)}
+                      className="flex min-w-0 flex-1 flex-col justify-center gap-1 px-3 py-2 text-left hover:bg-gray-50 transition-colors"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-gray-800 truncate">
+                          {r.radarSiteName}
+                        </span>
+                        <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                          r.losBlocked ? "bg-red-100 text-red-700" : "bg-green-100 text-green-700"
+                        }`}>
+                          {r.losBlocked ? "차단" : "양호"}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3 text-[11px] text-gray-500">
+                        <span>방위 <b className="text-gray-700">{r.bearing.toFixed(1)}°</b></span>
+                        <span>거리 <b className="text-gray-700">{r.totalDistance.toFixed(1)}km</b></span>
+                        {r.maxBlockingPoint && (
+                          <span>최대차단 <b className="text-gray-700">{r.maxBlockingPoint.elevation.toFixed(0)}m</b>
+                            {r.maxBlockingPoint.name && ` (${r.maxBlockingPoint.name})`}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-gray-400">
+                        {new Date(r.timestamp > 1e12 ? r.timestamp : r.timestamp * 1000).toLocaleString("ko-KR")}
+                        <span className="ml-2">
+                          목표 ({r.targetLat.toFixed(4)}, {r.targetLon.toFixed(4)})
+                        </span>
+                      </div>
+                    </button>
+                    {/* 삭제 */}
+                    <button
+                      onClick={() => removeLOSResult(r.id)}
+                      className="flex shrink-0 items-center px-3 text-gray-300 hover:text-red-500 transition-colors"
+                      title="삭제"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </SimpleCard>
+              ))}
+            </div>
+          )}
         </>
       ) : (
         <>

@@ -71,6 +71,12 @@ export default function Drawing() {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  // 비행 선택 변경 시 구간 핸들 초기화
+  useEffect(() => {
+    setRangeStart(0);
+    setRangeEnd(100);
+  }, [selectedFlightId]);
+
   // 포인트 필터링
   const { filteredPoints, colorMap, legendEntries } = useMemo(() => {
     const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
@@ -148,7 +154,7 @@ export default function Drawing() {
     });
   }, [flights, aircraft, selectedModeS]);
 
-  // 비행 선택 시 해당 비행의 시간 범위로 표시
+  // 비행 선택 시 해당 비행의 시간 범위로 표시 (앞뒤 1시간 여유)
   const displayTimeRange = useMemo(() => {
     const pts = selectedFlightId
       ? (filteredFlights.find((f) => f.id === selectedFlightId)?.track_points ?? [])
@@ -158,6 +164,11 @@ export default function Drawing() {
     for (const p of pts) {
       if (p.timestamp < min) min = p.timestamp;
       if (p.timestamp > max) max = p.timestamp;
+    }
+    // 비행 선택 시 앞뒤 1시간 여유
+    if (selectedFlightId) {
+      min -= 3600;
+      max += 3600;
     }
     return { min, max };
   }, [selectedFlightId, filteredFlights, filteredPoints]);
@@ -236,13 +247,20 @@ export default function Drawing() {
     return valid.sort();
   }, [flights, registeredModeSSet]);
 
-  // 비행 선택 시 해당 비행만 필터, 선택 해제 시 전체
+  // 비행 선택 시 해당 비행만 필터 + 구간 선택 적용, 선택 해제 시 전체
   const flightFilteredPoints = useMemo(() => {
     if (!selectedFlightId) return displayPoints;
     const flight = filteredFlights.find((f) => f.id === selectedFlightId);
     if (!flight) return displayPoints;
-    return flight.track_points;
-  }, [selectedFlightId, filteredFlights, displayPoints]);
+    let pts = flight.track_points;
+    // 구간 선택 적용 (displayTimeRange 기준)
+    if (rangeStart > 0 || rangeEnd < 100) {
+      const minTs = displayPctToTs(rangeStart);
+      const maxTs = displayPctToTs(rangeEnd);
+      pts = pts.filter((p) => p.timestamp >= minTs && p.timestamp <= maxTs);
+    }
+    return pts;
+  }, [selectedFlightId, filteredFlights, displayPoints, rangeStart, rangeEnd, displayPctToTs]);
 
   // ── 측면도 캔버스 (NM / ft) ──
   useEffect(() => {
@@ -433,20 +451,23 @@ export default function Drawing() {
     [radarSite, flightFilteredPoints.length, selectedFlightId]
   );
 
-  // 타임라인 밀도 바 (항적 지도 참고)
+  // 타임라인 밀도 바 — 비행 선택 시 해당 비행 포인트 기준 (displayTimeRange)
   const densityBuckets = useMemo(() => {
-    if (filteredPoints.length === 0 || timeRange.max <= timeRange.min) return [];
+    const range = selectedFlightId ? displayTimeRange : timeRange;
+    const pts = selectedFlightId
+      ? (filteredFlights.find((f) => f.id === selectedFlightId)?.track_points ?? filteredPoints)
+      : filteredPoints;
+    if (pts.length === 0 || range.max <= range.min) return [];
     const NUM_BUCKETS = 200;
     const buckets = new Array(NUM_BUCKETS).fill(0);
-    const span = timeRange.max - timeRange.min;
-    // 밀도 바는 전체 filteredPoints 기준 (구간 선택 참조용)
-    for (const p of filteredPoints) {
-      const idx = Math.min(NUM_BUCKETS - 1, Math.floor(((p.timestamp - timeRange.min) / span) * NUM_BUCKETS));
-      buckets[idx]++;
+    const span = range.max - range.min;
+    for (const p of pts) {
+      const idx = Math.min(NUM_BUCKETS - 1, Math.floor(((p.timestamp - range.min) / span) * NUM_BUCKETS));
+      if (idx >= 0) buckets[idx]++;
     }
     const maxCount = Math.max(1, ...buckets);
     return buckets.map((c: number) => c / maxCount);
-  }, [filteredPoints, timeRange]);
+  }, [filteredPoints, filteredFlights, selectedFlightId, timeRange, displayTimeRange]);
 
   const getFilterLabel = () => {
     if (!selectedModeS) return "비행검사기 (등록)";
