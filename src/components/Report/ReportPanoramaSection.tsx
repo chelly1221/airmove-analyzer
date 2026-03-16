@@ -171,6 +171,18 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
             );
           })}
 
+          {/* BRA 0.25° 기준선 */}
+          {0.25 >= minAngle && 0.25 <= maxAngle && (
+            <line
+              x1={margin.left} y1={toY(0.25)} x2={margin.left + chartW} y2={toY(0.25)}
+              stroke="#06b6d4" strokeWidth={0.7} strokeDasharray="4,3" opacity={0.7}
+            />
+          )}
+          {0.25 >= minAngle && 0.25 <= maxAngle && (
+            <text x={margin.left + chartW - 2} y={toY(0.25) - 3}
+              textAnchor="end" fill="#06b6d4" fontSize={6.5} fontWeight={500}>BRA 0.25°</text>
+          )}
+
           {/* 지형 + 실루엣 */}
           <g clipPath="url(#report-panorama-clip)">
             <path d={terrainPath} fill="#22c55e" fillOpacity={0.2} />
@@ -196,6 +208,8 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
             <text x={43} y={6} fill="#374151" fontSize={7}>GIS 건물</text>
             <rect x={80} y={0} width={6} height={6} fill="#ef4444" fillOpacity={0.7} rx={1} />
             <text x={88} y={6} fill="#374151" fontSize={7}>수동 건물</text>
+            <line x1={120} y1={3} x2={135} y2={3} stroke="#06b6d4" strokeWidth={0.7} strokeDasharray="3,2" />
+            <text x={138} y={6} fill="#06b6d4" fontSize={7}>BRA 0.25°</text>
           </g>
 
           {/* 축 라벨 */}

@@ -36,9 +36,11 @@ import ReportFlightProfileSection from "../components/Report/ReportFlightProfile
 import ReportFlightLossAnalysisSection from "../components/Report/ReportFlightLossAnalysisSection";
 import ReportPanoramaSection from "../components/Report/ReportPanoramaSection";
 import ReportObstacleSummarySection from "../components/Report/ReportObstacleSummarySection";
+import ReportCoverageMapSection from "../components/Report/ReportCoverageMapSection";
 import { useReportExport } from "../components/Report/useReportExport";
 import { invoke } from "@tauri-apps/api/core";
 import { flightLabel } from "../utils/flightConsolidation";
+import { getCachedTerrainProfile, computeLayerFromProfile, type CoverageLayer } from "../utils/radarCoverage";
 import type { Flight, LOSProfileData, WeatherSnapshot, Aircraft as AircraftType, ReportMetadata, PanoramaPoint } from "../types";
 
 type ReportTemplate = "weekly" | "monthly" | "flights" | "single" | "obstacle";
@@ -61,6 +63,7 @@ interface ReportSections {
   flightLossAnalysis: boolean;
   // 장애물 보고서 전용
   obstacleSummary: boolean;
+  coverageMap: boolean;
 }
 
 const DEFAULT_SECTIONS: ReportSections = {
@@ -77,6 +80,7 @@ const DEFAULT_SECTIONS: ReportSections = {
   flightProfile: true,
   flightLossAnalysis: true,
   obstacleSummary: true,
+  coverageMap: true,
 };
 
 /** 템플릿별 표시할 섹션 토글 목록 */
@@ -96,6 +100,7 @@ function getSectionToggles(template: ReportTemplate, _sections: ReportSections):
     return [
       { key: "cover", label: "표지" },
       { key: "obstacleSummary", label: "요약" },
+      { key: "coverageMap", label: "커버리지" },
       { key: "trackMap", label: "지도" },
       { key: "los", label: "LOS" },
       { key: "panorama", label: "파노라마" },
@@ -166,6 +171,23 @@ export default function ReportGeneration() {
         }
       })
       .catch(() => {});
+  }, [radarSite]);
+
+  // 커버리지 레이어 (캐시된 지형 프로파일에서 계산)
+  const coverageLayers = useMemo<CoverageLayer[]>(() => {
+    const profile = getCachedTerrainProfile();
+    if (!profile) return [];
+    // 100ft ~ 20000ft, 적절 간격으로 레이어 생성
+    const layers: CoverageLayer[] = [];
+    const maxAlt = 20000;
+    const step = 1000;
+    for (let alt = 100; alt <= maxAlt; alt += (alt < 2000 ? 500 : step)) {
+      layers.push(computeLayerFromProfile(profile, alt));
+    }
+    if (layers.length > 0 && layers[layers.length - 1].altitudeFt !== maxAlt) {
+      layers.push(computeLayerFromProfile(profile, maxAlt));
+    }
+    return layers;
   }, [radarSite]);
 
   // 비행 선택 (건별/단일 상세용)
@@ -342,6 +364,7 @@ export default function ReportGeneration() {
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else if (template === "obstacle") {
       if (sections.obstacleSummary) nums.obstacleSummary = n++;
+      if (sections.coverageMap && coverageLayers.length > 0) nums.coverageMap = n++;
       if (sections.trackMap) nums.trackMap = n++;
       if (sections.los && losResults.length > 0) nums.los = n++;
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
@@ -362,7 +385,7 @@ export default function ReportGeneration() {
       if (sections.aircraft && aircraft.length > 0) nums.aircraft = n++;
     }
     return nums;
-  }, [template, sections, weatherData, losResults, flights, aircraft, panoramaData]);
+  }, [template, sections, weatherData, losResults, flights, aircraft, panoramaData, coverageLayers]);
 
   // ── 설정 모드 (Config) ──
   if (mode === "config") {
@@ -426,12 +449,13 @@ export default function ReportGeneration() {
           <TemplateCard
             icon={Radio}
             title="전파 장애물 보고서"
-            description="레이더 전파 장애물을 종합 분석합니다. LOS 차단 분석, 360° 파노라마 장애물 탐색, 건물 목록이 포함됩니다."
+            description="레이더 전파 장애물을 종합 분석합니다. LOS 차단 분석, 360° 파노라마 장애물 탐색, 스펙트럼 커버리지 맵이 포함됩니다."
             stats={[
               { label: "LOS 분석", value: `${losResults.length}건` },
               { label: "파노라마", value: panoramaData.length > 0 ? "있음" : "없음" },
+              { label: "커버리지", value: coverageLayers.length > 0 ? "있음" : "없음" },
             ]}
-            disabled={losResults.length === 0 && panoramaData.length === 0}
+            disabled={losResults.length === 0 && panoramaData.length === 0 && coverageLayers.length === 0}
             onClick={() => setTemplateModalOpen("obstacle")}
           />
         </div>
@@ -630,6 +654,16 @@ export default function ReportGeneration() {
                     mapImage={mapImage}
                   />
                 )}
+              </ReportPage>
+            )}
+
+            {sections.coverageMap && coverageLayers.length > 0 && radarSite && (
+              <ReportPage>
+                <ReportCoverageMapSection
+                  sectionNum={sectionNumbers.coverageMap ?? 2}
+                  coverageLayers={coverageLayers}
+                  radarSite={radarSite}
+                />
               </ReportPage>
             )}
 
@@ -887,9 +921,11 @@ function TemplateConfigModal({
       ];
     }
     if (template === "obstacle") {
+      const hasCoverage = !!getCachedTerrainProfile();
       return [
         { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
         { key: "obstacleSummary", label: "장애물 종합 요약", icon: Radio, desc: "LOS·파노라마 통합 KPI, 주요 장애물 TOP 5", available: losResults.length > 0 || panoramaData.length > 0 },
+        { key: "coverageMap", label: "커버리지 맵", icon: Radio, desc: "고도별 스펙트럼 커버리지 극좌표 시각화", available: hasCoverage },
         { key: "trackMap", label: "항적 지도", icon: Map, desc: "LOS 경로 및 장애물 위치 시각화", available: true },
         { key: "los", label: "LOS 분석", icon: Crosshair, desc: "전파 가시선 차단/양호 상세 결과", available: losResults.length > 0 },
         { key: "panorama", label: "360° 파노라마", icon: Mountain, desc: "방위별 최대 앙각 장애물 및 건물 목록", available: panoramaData.length > 0 },

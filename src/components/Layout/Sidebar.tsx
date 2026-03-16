@@ -262,7 +262,60 @@ function MapFlightPanel() {
         }
       }
       if (storeFlightIds.size < 2) {
-        alert("병합할 수 있는 파싱된 비행이 2개 이상 필요합니다.");
+        // 항적 없이 FlightRecord 시각 기준으로 병합 (빈 Flight 생성)
+        const selectedRecords = flights.filter((f) => mergeSelection.has(flightRecordKey(f)));
+        if (selectedRecords.length < 2) {
+          alert("병합할 수 있는 비행이 2개 이상 필요합니다.");
+          return;
+        }
+        const modeS = selectedRecords[0].icao24.toUpperCase();
+        if (!selectedRecords.every((r) => r.icao24.toUpperCase() === modeS)) {
+          alert("같은 항공기(Mode-S)의 비행만 병합할 수 있습니다.");
+          return;
+        }
+        // FlightRecord 메타데이터로 빈 Flight 생성 후 store에 추가
+        const sorted = [...selectedRecords].sort((a, b) => a.first_seen - b.first_seen);
+        const startTime = sorted[0].first_seen;
+        const endTime = sorted[sorted.length - 1].last_seen;
+        const callsign = sorted.find((r) => r.callsign)?.callsign ?? undefined;
+        const departure = sorted.find((r) => r.est_departure_airport)?.est_departure_airport ?? undefined;
+        const arrival = [...sorted].reverse().find((r) => r.est_arrival_airport)?.est_arrival_airport ?? undefined;
+        // 기존 store Flight 중 시간범위 내 있는 것들의 track_points 수집
+        const allPoints: import("../../types").TrackPoint[] = [];
+        for (const sf of currentFlights) {
+          if (sf.mode_s.toUpperCase() === modeS && sf.start_time <= endTime + 300 && sf.end_time >= startTime - 300) {
+            allPoints.push(...sf.track_points);
+          }
+        }
+        const acName = activeAircraft.find((a) => a.mode_s_code.toUpperCase() === modeS)?.name;
+        const mergedFlight: import("../../types").Flight = {
+          id: `${modeS}_${startTime}`,
+          mode_s: modeS,
+          aircraft_name: acName,
+          callsign,
+          departure_airport: departure,
+          arrival_airport: arrival,
+          start_time: startTime,
+          end_time: endTime,
+          track_points: allPoints.sort((a, b) => a.timestamp - b.timestamp),
+          loss_points: [],
+          loss_segments: [],
+          total_loss_time: 0,
+          total_track_time: endTime - startTime,
+          loss_percentage: 0,
+          max_radar_range_km: 0,
+          match_type: "manual",
+        };
+        // 기존 flights에서 겹치는 것 제거 후 병합된 Flight 추가
+        const state = useAppStore.getState();
+        const overlapping = new Set(currentFlights
+          .filter((sf) => sf.mode_s.toUpperCase() === modeS && sf.start_time <= endTime + 300 && sf.end_time >= startTime - 300)
+          .map((sf) => sf.id));
+        const remaining = currentFlights.filter((f) => !overlapping.has(f.id));
+        state.setFlights([...remaining, mergedFlight].sort((a, b) => a.start_time - b.start_time));
+        setMergeMode(false);
+        setMergeSelection(new Set());
+        setSelectedFlightId(null);
         return;
       }
     }

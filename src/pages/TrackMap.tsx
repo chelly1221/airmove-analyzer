@@ -147,8 +147,7 @@ export default function TrackMap() {
   const [trailDropOpen, setTrailDropOpen] = useState(false);
 
   // 레이더 커버리지 (범위 슬라이더: min~max)
-  const [coverageAltMin, setCoverageAltMin] = useState(1000); // 하한 (ft)
-  const [coverageAltMax, setCoverageAltMax] = useState(10000); // 상한 (ft)
+  const [coverageAlt, setCoverageAlt] = useState(10000); // 커버리지 고도 (ft)
   const [terrainProfile, setTerrainProfile] = useState<CoverageTerrainProfile | null>(null);
   const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
   const coverageVisible = useAppStore((s) => s.coverageVisible);
@@ -158,6 +157,7 @@ export default function TrackMap() {
   const coverageProgress = useAppStore((s) => s.coverageProgress);
   const setCoverageProgress = useAppStore((s) => s.setCoverageProgress);
   const coverageAltRef = useRef<HTMLDivElement>(null);
+  const [coverageModalOpen, setCoverageModalOpen] = useState(false);
 
   // LOS Analysis state
   const [losMode, setLosMode] = useState(false);
@@ -236,7 +236,7 @@ export default function TrackMap() {
 
   // 전체 포인트/Loss 합산 (비정상 항적 + UNKNOWN 제거)
   // selectedFlightId → 해당 비행만, selectedFlight(시간범위) → 시간 필터, selectedModeS: null → 등록 비행검사기만, "__ALL__" → 전체, 그 외 → 해당 Mode-S 전체
-  const { allPoints, allLoss, allLossPoints } = useMemo(() => {
+  const { allPoints, allLoss, allLossPoints, paddedTimeRange } = useMemo(() => {
     const pts: TrackPoint[] = [];
     const loss: LossSegment[] = [];
     const lossP: LossPoint[] = [];
@@ -265,7 +265,9 @@ export default function TrackMap() {
         }
       }
       pts.sort((a, b) => a.timestamp - b.timestamp);
-      return { allPoints: pts, allLoss: loss, allLossPoints: lossP };
+      const tFlight = flights.find((f) => f.id === selectedFlightId);
+      const padded = tFlight ? { min: tFlight.start_time - 3600, max: tFlight.end_time + 3600 } : undefined;
+      return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: padded };
     }
 
     // 사이드바에서 비행 선택했지만 store Flight 매칭 실패 시 → 시간 범위로 필터링 (1시간 여유)
@@ -289,7 +291,7 @@ export default function TrackMap() {
         ));
       }
       pts.sort((a, b) => a.timestamp - b.timestamp);
-      return { allPoints: pts, allLoss: loss, allLossPoints: lossP };
+      return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: { min: tMin, max: tMax } };
     }
 
     const showAll = selectedModeS === "__ALL__";
@@ -320,7 +322,7 @@ export default function TrackMap() {
       }
     }
     pts.sort((a, b) => a.timestamp - b.timestamp);
-    return { allPoints: pts, allLoss: loss, allLossPoints: lossP };
+    return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: undefined as { min: number; max: number } | undefined };
   }, [flights, selectedModeS, selectedFlightId, selectedFlight, validModeS, registeredModeS]);
 
   // 고유 Mode-S 목록
@@ -344,14 +346,16 @@ export default function TrackMap() {
       .map(([ms]) => ms);
   }, [flights, aircraft]);
 
-  // 시간 범위
+  // 시간 범위 (비행 선택 시 ±1시간 패딩 포함)
   const timeRange = useMemo(() => {
-    if (allPoints.length === 0) return { min: 0, max: 0 };
+    if (allPoints.length === 0 && !paddedTimeRange) return { min: 0, max: 0 };
+    const pointMin = allPoints.length > 0 ? allPoints[0].timestamp : Infinity;
+    const pointMax = allPoints.length > 0 ? allPoints[allPoints.length - 1].timestamp : -Infinity;
     return {
-      min: allPoints[0].timestamp,
-      max: allPoints[allPoints.length - 1].timestamp,
+      min: paddedTimeRange ? Math.min(paddedTimeRange.min, pointMin) : pointMin,
+      max: paddedTimeRange ? Math.max(paddedTimeRange.max, pointMax) : pointMax,
     };
-  }, [allPoints]);
+  }, [allPoints, paddedTimeRange]);
 
   // 퍼센트 → 타임스탬프
   const pctToTs = useCallback(
@@ -657,28 +661,28 @@ export default function TrackMap() {
     }
   }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageVisible]);
 
-  // 범위 슬라이더 변경 시 레이어들 재계산 (지형 프로파일 캐시에서 즉시 계산)
+  // 고도 슬라이더 변경 시 레이어들 재계산 (100ft ~ 선택 고도까지 전부 겹침)
   useEffect(() => {
     const profile = terrainProfile || getCachedTerrainProfile();
     if (!profile || !coverageVisible) return;
 
-    // 범위 내 적절한 간격으로 레이어 생성 (최대 20개)
-    const range = coverageAltMax - coverageAltMin;
+    // 100ft부터 선택 고도까지 적절한 간격으로 레이어 생성 (최대 20개)
+    const range = coverageAlt - 100;
     let step: number;
     if (range <= 2000) step = 100;
     else if (range <= 5000) step = 500;
     else step = 1000;
 
     const layers: CoverageLayer[] = [];
-    for (let alt = coverageAltMin; alt <= coverageAltMax; alt += step) {
+    for (let alt = 100; alt <= coverageAlt; alt += step) {
       layers.push(computeLayerFromProfile(profile, alt));
     }
-    // 상한이 정확히 포함되지 않았으면 추가
-    if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== coverageAltMax) {
-      layers.push(computeLayerFromProfile(profile, coverageAltMax));
+    // 선택 고도가 정확히 포함되지 않았으면 추가
+    if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== coverageAlt) {
+      layers.push(computeLayerFromProfile(profile, coverageAlt));
     }
     setCoverageLayers(layers);
-  }, [coverageAltMin, coverageAltMax, terrainProfile, coverageVisible]);
+  }, [coverageAlt, terrainProfile, coverageVisible]);
 
   // Mode-S별 트랙 패스 데이터 (gap + radar_type 변경 시 분할)
   /** 1포인트 항적용 데이터 */
@@ -1035,19 +1039,36 @@ export default function TrackMap() {
           widthUnits: "pixels" as const,
         })
       );
-      // PSR 흰색 glow 링 (PSR 동반 포인트만)
+      // PSR glow 링 (PSR 동반 포인트만 — 시안 glow로 시인성 확보)
       const psrDots = dotPoints.filter((d) => PSR_TYPES.has(d.radar_type));
       if (psrDots.length > 0) {
+        // 외곽 확산 glow
         layers.push(
           new ScatterplotLayer<TrackPoint>({
-            id: "dot-psr-glow",
+            id: "dot-psr-glow-outer",
             data: psrDots,
             getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
             updateTriggers: { getPosition: [losMode, altScale] },
-            getFillColor: [255, 255, 255, 30],
-            getRadius: 7,
-            radiusMinPixels: 4,
-            radiusMaxPixels: 10,
+            getFillColor: [0, 255, 255, 50],
+            getRadius: 10,
+            radiusMinPixels: 6,
+            radiusMaxPixels: 14,
+            radiusUnits: "pixels",
+            billboard: true,
+            parameters: { depthWriteEnabled: false },
+          })
+        );
+        // 내곽 밝은 glow
+        layers.push(
+          new ScatterplotLayer<TrackPoint>({
+            id: "dot-psr-glow-inner",
+            data: psrDots,
+            getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
+            updateTriggers: { getPosition: [losMode, altScale] },
+            getFillColor: [0, 255, 255, 100],
+            getRadius: 6,
+            radiusMinPixels: 3,
+            radiusMaxPixels: 8,
             radiusUnits: "pixels",
             billboard: true,
             parameters: { depthWriteEnabled: false },
@@ -1096,19 +1117,36 @@ export default function TrackMap() {
         })
       );
     } else {
-      // PSR 흰색 glow 레이어 (PSR 동반 세그먼트만 넓은 반투명 경로)
-      // depthWriteEnabled: false → glow가 depth buffer에 쓰지 않아 실선을 가리지 않음
+      // PSR glow 레이어 (PSR 동반 세그먼트 — 시안 2중 glow로 시인성 확보)
       const psrPaths = trackPaths.filter((d) => d.hasPsr);
       if (psrPaths.length > 0) {
+        // 외곽 확산 glow
         layers.push(
           new PathLayer<TrackPath>({
-            id: "track-psr-glow",
+            id: "track-psr-glow-outer",
             data: psrPaths,
             getPath: (d) => d.path,
-            getColor: [255, 255, 255, 30],
-            getWidth: 8,
-            widthMinPixels: 4,
-            widthMaxPixels: 12,
+            getColor: [0, 255, 255, 50],
+            getWidth: 12,
+            widthMinPixels: 6,
+            widthMaxPixels: 16,
+            widthUnits: "pixels",
+            billboard: true,
+            jointRounded: true,
+            capRounded: true,
+            parameters: { depthWriteEnabled: false },
+          })
+        );
+        // 내곽 밝은 glow
+        layers.push(
+          new PathLayer<TrackPath>({
+            id: "track-psr-glow-inner",
+            data: psrPaths,
+            getPath: (d) => d.path,
+            getColor: [0, 255, 255, 100],
+            getWidth: 6,
+            widthMinPixels: 3,
+            widthMaxPixels: 8,
             widthUnits: "pixels",
             billboard: true,
             jointRounded: true,
@@ -1981,82 +2019,92 @@ export default function TrackMap() {
               <span className="max-w-[140px] truncate">{coverageProgress}</span>
             </div>
           ) : (
-            <div className="flex items-center gap-1">
-              <button
-                onClick={() => {
-                  if (terrainProfile && terrainProfile.radarName === radarSite.name) {
-                    setCoverageVisible(!coverageVisible);
-                  } else {
-                    startCoverageCompute();
-                  }
-                }}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  startCoverageCompute(true);
-                }}
-                className={`rounded-lg p-1.5 transition-colors ${
-                  coverageVisible && coverageLayers.length > 0
-                    ? "bg-[#a60739] text-white shadow-sm"
-                    : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-                }`}
-                title={terrainProfile ? "커버리지 맵 (우클릭: 재생성)" : "커버리지 맵 생성"}
-              >
-                <CoverageIcon size={16} />
-              </button>
-              {/* 고도 범위 슬라이더 (100ft 단위, 듀얼 핸들) */}
-              {coverageVisible && coverageLayers.length > 0 && (
-                <div className="flex items-center gap-1">
-                  <span className="min-w-[32px] rounded bg-[#a60739]/80 px-1 py-0.5 text-center text-[8px] font-semibold text-white leading-tight">
-                    {coverageAltMin >= 1000 ? `${(coverageAltMin / 1000).toFixed(coverageAltMin % 1000 === 0 ? 0 : 1)}k` : coverageAltMin}
-                  </span>
-                  <div className="relative h-4 w-24">
-                    {/* 트랙 배경 */}
-                    <div className="absolute top-1/2 left-0 right-0 h-1 -translate-y-1/2 rounded-full bg-gray-300" />
-                    {/* 활성 범위 바 */}
-                    <div
-                      className="absolute top-1/2 h-1 -translate-y-1/2 rounded-full bg-[#a60739]"
-                      style={{
-                        left: `${((coverageAltMin - 100) / 19900) * 100}%`,
-                        right: `${100 - ((coverageAltMax - 100) / 19900) * 100}%`,
-                      }}
-                    />
-                    {/* 최소 핸들 */}
-                    <input
-                      type="range"
-                      min={100}
-                      max={20000}
-                      step={100}
-                      value={coverageAltMin}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        setCoverageAltMin(Math.min(v, coverageAltMax - 100));
-                      }}
-                      className="pointer-events-none absolute top-0 left-0 h-full w-full appearance-none bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-sm [&::-webkit-slider-thumb]:cursor-pointer"
-                      title={`하한: ${coverageAltMin.toLocaleString()}ft (${Math.round(coverageAltMin * 0.3048)}m)`}
-                    />
-                    {/* 최대 핸들 */}
-                    <input
-                      type="range"
-                      min={100}
-                      max={20000}
-                      step={100}
-                      value={coverageAltMax}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        setCoverageAltMax(Math.max(v, coverageAltMin + 100));
-                      }}
-                      className="pointer-events-none absolute top-0 left-0 h-full w-full appearance-none bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-sm [&::-webkit-slider-thumb]:cursor-pointer"
-                      title={`상한: ${coverageAltMax.toLocaleString()}ft (${Math.round(coverageAltMax * 0.3048)}m)`}
-                    />
-                  </div>
-                  <span className="min-w-[32px] rounded bg-[#a60739]/80 px-1 py-0.5 text-center text-[8px] font-semibold text-white leading-tight">
-                    {coverageAltMax >= 1000 ? `${(coverageAltMax / 1000).toFixed(coverageAltMax % 1000 === 0 ? 0 : 1)}k` : coverageAltMax}
-                  </span>
-                </div>
-              )}
-            </div>
+            <button
+              onClick={() => {
+                if (terrainProfile && terrainProfile.radarName === radarSite.name) {
+                  setCoverageModalOpen(true);
+                } else {
+                  startCoverageCompute().then(() => setCoverageModalOpen(true));
+                }
+              }}
+              className={`rounded-lg p-1.5 transition-colors ${
+                coverageVisible && coverageLayers.length > 0
+                  ? "bg-[#a60739] text-white shadow-sm"
+                  : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+              }`}
+              title="레이더 커버리지 맵"
+            >
+              <CoverageIcon size={16} />
+            </button>
           )}
         </div>
+
+        {/* 커버리지 모달 */}
+        {coverageModalOpen && (
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40" onClick={() => setCoverageModalOpen(false)}>
+            <div className="w-80 rounded-xl bg-white shadow-2xl border border-gray-200" onClick={(e) => e.stopPropagation()}>
+              {/* 헤더 */}
+              <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3">
+                <h3 className="text-sm font-semibold text-gray-800">레이더 커버리지 맵</h3>
+                <button onClick={() => setCoverageModalOpen(false)} className="text-gray-400 hover:text-gray-600 text-lg leading-none">&times;</button>
+              </div>
+              {/* 본문 */}
+              <div className="space-y-4 px-5 py-4">
+                {/* 표시/숨기기 토글 */}
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-600">커버리지 표시</span>
+                  <button
+                    onClick={() => setCoverageVisible(!coverageVisible)}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${coverageVisible ? "bg-[#a60739]" : "bg-gray-300"}`}
+                  >
+                    <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${coverageVisible ? "translate-x-4.5" : "translate-x-0.5"}`} />
+                  </button>
+                </div>
+
+                {/* 고도 슬라이더 */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-600">표시 고도</span>
+                    <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-xs font-semibold text-[#a60739]">
+                      {coverageAlt.toLocaleString()}ft ({Math.round(coverageAlt * 0.3048)}m)
+                    </span>
+                  </div>
+                  <div className="relative h-6">
+                    <div className="absolute top-1/2 left-0 right-0 h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
+                    <div
+                      className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
+                      style={{ left: "0%", right: `${100 - ((coverageAlt - 100) / 19900) * 100}%` }}
+                    />
+                    <input
+                      type="range"
+                      min={100}
+                      max={20000}
+                      step={100}
+                      value={coverageAlt}
+                      onChange={(e) => setCoverageAlt(Number(e.target.value))}
+                      className="absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer"
+                    />
+                  </div>
+                  <div className="flex justify-between text-[9px] text-gray-400">
+                    <span>100ft</span>
+                    <span>20,000ft</span>
+                  </div>
+                </div>
+
+                {/* 재생성 버튼 */}
+                <button
+                  onClick={() => {
+                    setCoverageModalOpen(false);
+                    startCoverageCompute(true).then(() => setCoverageModalOpen(true));
+                  }}
+                  className="w-full rounded-lg border border-gray-200 py-2 text-xs text-gray-600 hover:bg-gray-50 transition-colors"
+                >
+                  지형 프로파일 재생성
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* 구름 오버레이 토글 */}
         {cloudGridLoading ? (
@@ -2169,7 +2217,7 @@ export default function TrackMap() {
                       className="inline-block h-[3px] w-4 rounded-sm"
                       style={{
                         backgroundColor: `rgb(${color[0]},${color[1]},${color[2]})`,
-                        boxShadow: PSR_TYPES.has(rt) ? `0 0 4px 1px rgba(255,255,255,0.8)` : undefined,
+                        boxShadow: PSR_TYPES.has(rt) ? `0 0 6px 2px rgba(0,255,255,0.8)` : undefined,
                       }}
                     />
                     <span className="text-gray-500">{radarTypeLabel(rt)}</span>
@@ -2202,15 +2250,15 @@ export default function TrackMap() {
                 )}
                 {coverageVisible && coverageLayers.length > 0 && (() => {
                   const fmtAlt = (ft: number) => ft >= 1000 ? `${(ft / 1000).toFixed(ft % 1000 === 0 ? 0 : 1)}kft` : `${ft}ft`;
-                  const colorMin = altToColor(coverageAltMin);
-                  const colorMax = altToColor(coverageAltMax);
+                  const colorMin = altToColor(100);
+                  const colorMax = altToColor(coverageAlt);
                   return (
                     <div className="flex items-center gap-1.5">
                       <span className="inline-flex h-3 w-5 rounded-sm overflow-hidden">
                         <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMin})`, opacity: 0.7 }} />
                         <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMax})`, opacity: 0.7 }} />
                       </span>
-                      <span className="text-gray-600">커버리지 ({fmtAlt(coverageAltMin)}~{fmtAlt(coverageAltMax)})</span>
+                      <span className="text-gray-600">커버리지 (~{fmtAlt(coverageAlt)})</span>
                     </div>
                   );
                 })()}
