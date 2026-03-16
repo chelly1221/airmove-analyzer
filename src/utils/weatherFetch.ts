@@ -172,7 +172,7 @@ async function fetchCloudGridForDay(
   date: string,
   onProgress?: (msg: string) => void,
 ): Promise<CloudGridFrame[]> {
-  const BATCH_SIZE = 10;
+  const BATCH_SIZE = 30;
   const allResults: { lat: number; lon: number; times: string[]; covers: number[]; lows: number[]; mids: number[]; highs: number[] }[] = [];
 
   for (let i = 0; i < points.length; i += BATCH_SIZE) {
@@ -230,92 +230,97 @@ async function fetchCloudGridForDay(
   });
 }
 
-/** 구름 그리드 데이터 조회 (레이더 주변 격자점, 일 단위 캐싱) */
-export async function fetchCloudGrid(
-  radarLat: number,
-  radarLon: number,
-  radiusKm: number,
-  gridSpacingKm: number,
-  startDate: string,
-  endDate: string,
-  onProgress?: (pct: number, msg: string) => void,
-): Promise<CloudGridData> {
-  // 격자점 생성
-  const points: { lat: number; lon: number }[] = [];
-  const degPerKm = 1 / 111.32;
-  const cosLat = Math.cos((radarLat * Math.PI) / 180);
-  const steps = Math.ceil(radiusKm / gridSpacingKm);
+// 한국 전역 격자 범위
+const KOREA_MIN_LAT = 33.0;
+const KOREA_MAX_LAT = 38.8;
+const KOREA_MIN_LON = 124.5;
+const KOREA_MAX_LON = 132.0;
+const KOREA_CENTER_LAT = 36.0;
+const KOREA_CENTER_LON = 128.0;
 
-  for (let dy = -steps; dy <= steps; dy++) {
-    for (let dx = -steps; dx <= steps; dx++) {
-      const distKm = Math.sqrt(dx * dx + dy * dy) * gridSpacingKm;
-      if (distKm > radiusKm) continue;
-      points.push({
-        lat: radarLat + dy * gridSpacingKm * degPerKm,
-        lon: radarLon + dx * gridSpacingKm * degPerKm / cosLat,
-      });
+/** 한국 전역 격자점 생성 */
+function generateKoreaGridPoints(gridSpacingKm: number): { lat: number; lon: number }[] {
+  const points: { lat: number; lon: number }[] = [];
+  const degPerKmLat = 1 / 111.32;
+  const stepLat = gridSpacingKm * degPerKmLat;
+
+  for (let lat = KOREA_MIN_LAT; lat <= KOREA_MAX_LAT; lat += stepLat) {
+    const cosLat = Math.cos((lat * Math.PI) / 180);
+    const stepLon = gridSpacingKm * degPerKmLat / cosLat;
+    for (let lon = KOREA_MIN_LON; lon <= KOREA_MAX_LON; lon += stepLon) {
+      points.push({ lat: parseFloat(lat.toFixed(4)), lon: parseFloat(lon.toFixed(4)) });
     }
   }
+  return points;
+}
 
-  const allDates = getDateRange(startDate, endDate);
+/** 한국 전역 구름 그리드 백그라운드 조회 (당일→과거 역순, 일별 프로그레시브 업데이트) */
+export async function fetchCloudGridKorea(
+  gridSpacingKm: number,
+  flightDates: string[],
+  onDayLoaded: (data: CloudGridData) => void,
+  onProgress?: (msg: string) => void,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  const points = generateKoreaGridPoints(gridSpacingKm);
+  console.log(`[CloudGrid] 한국 전역 격자점 ${points.length}개 (${gridSpacingKm}km 간격), 비행일 ${flightDates.length}일`);
+
+  // 당일(최신)부터 과거로 역순 조회
+  const allDates = [...flightDates].sort().reverse();
+
   let allFrames: CloudGridFrame[] = [];
 
-  // 1) DB에서 구름 그리드 캐시 로드
-  let cloudCachedDates: Set<string> = new Set();
+  // 1) DB 캐시 로드
+  const cachedDates = new Set<string>();
   try {
-    // load_cloud_grid_cache로 전체 날짜 시도
     const rows = await invoke<[string, string, number][]>("load_cloud_grid_cache", {
-      radarLat, radarLon, dates: allDates,
+      radarLat: KOREA_CENTER_LAT, radarLon: KOREA_CENTER_LON, dates: allDates,
     });
     for (const [date, framesJson] of rows) {
       const frames: CloudGridFrame[] = JSON.parse(framesJson);
       allFrames.push(...frames);
-      cloudCachedDates.add(date);
+      cachedDates.add(date);
     }
-    if (cloudCachedDates.size > 0) {
-      console.log(`[CloudGrid] DB 캐시에서 ${cloudCachedDates.size}일 로드`);
+    if (cachedDates.size > 0) {
+      console.log(`[CloudGrid] DB 캐시에서 ${cachedDates.size}일 로드`);
+      allFrames.sort((a, b) => a.timestamp - b.timestamp);
+      onDayLoaded({
+        radarLat: KOREA_CENTER_LAT, radarLon: KOREA_CENTER_LON,
+        frames: [...allFrames], gridSpacingKm,
+      });
     }
   } catch (e) {
     console.warn("[CloudGrid] 캐시 로드 실패:", e);
   }
 
-  // 2) 미캐시 날짜만 API 조회
-  const uncachedDates = allDates.filter((d) => !cloudCachedDates.has(d));
-  const totalWork = uncachedDates.length;
+  // 2) 미캐시 날짜를 역순(최신→과거)으로 순차 조회
+  const uncachedDates = allDates.filter((d) => !cachedDates.has(d));
 
-  for (let di = 0; di < uncachedDates.length; di++) {
-    const date = uncachedDates[di];
-    onProgress?.(
-      ((di + 1) / totalWork) * 100,
-      `구름 데이터 조회 중... (${di + 1}/${totalWork}) ${date}`,
-    );
+  for (let i = 0; i < uncachedDates.length; i++) {
+    if (abortSignal?.aborted) break;
+    const date = uncachedDates[i];
+    onProgress?.(`구름 ${date} (${i + 1}/${uncachedDates.length})`);
 
     try {
-      const frames = await fetchCloudGridForDay(points, date, (msg) =>
-        onProgress?.(((di + 0.5) / totalWork) * 100, msg),
-      );
+      const frames = await fetchCloudGridForDay(points, date, onProgress);
       allFrames.push(...frames);
-      // DB에 캐시 저장
+      allFrames.sort((a, b) => a.timestamp - b.timestamp);
+
+      // 매 날짜 완료 시 프로그레시브 업데이트
+      onDayLoaded({
+        radarLat: KOREA_CENTER_LAT, radarLon: KOREA_CENTER_LON,
+        frames: [...allFrames], gridSpacingKm,
+      });
+
+      // DB 캐시 저장
       invoke("save_cloud_grid_day", {
-        date, radarLat, radarLon, gridSpacingKm,
-        framesJson: JSON.stringify(frames),
+        date, radarLat: KOREA_CENTER_LAT, radarLon: KOREA_CENTER_LON,
+        gridSpacingKm, framesJson: JSON.stringify(frames),
       }).catch((e) => console.warn(`[CloudGrid] ${date} 캐시 저장 실패:`, e));
     } catch (e) {
       console.warn(`[CloudGrid] ${date} 조회 실패:`, e);
     }
   }
-
-  // timestamp 정렬
-  allFrames.sort((a, b) => a.timestamp - b.timestamp);
-
-  onProgress?.(100, "완료");
-
-  return {
-    radarLat,
-    radarLon,
-    frames: allFrames,
-    gridSpacingKm,
-  };
 }
 
 /** 특정 시각에 가장 가까운 구름 프레임 반환 */

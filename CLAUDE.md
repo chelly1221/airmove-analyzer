@@ -72,7 +72,7 @@ src/                    # React frontend
   │   │   └── Titlebar.tsx        # Tauri 커스텀 타이틀바 (드래그/창 컨트롤)
   │   ├── Map/
   │   │   ├── DeckGLOverlay.tsx   # deck.gl ↔ MapLibre 통합 (MapboxOverlay)
-  │   │   ├── LOSProfilePanel.tsx # LOS 단면도 (SVG 차트, 크로스헤어+포인트 핀+건물 표시, 맵/차트 스크린샷 캡처)
+  │   │   ├── LOSProfilePanel.tsx # LOS 단면도 (SVG 차트, 크로스헤어+포인트 핀+건물 클릭/호버+상세보기 모달, 맵/차트 스크린샷 캡처)
   │   │   ├── LossMarkers.tsx     # React Leaflet 용 Loss 마커 (미사용 예비)
   │   │   ├── MapStyleToggle.tsx  # 맵 스타일 전환 (다크/표준)
   │   │   └── TrackLayer.tsx      # React Leaflet 용 항적 레이어 (미사용 예비)
@@ -163,6 +163,9 @@ public/                 # 정적 자산
 34. 커버리지 동심 링 시각화 (다중 고도 범위 시 겹침 없는 스펙트럼 링 방식)
 35. 도면 타임라인 줌 (스크롤 휠로 시간축 확대/축소, 마우스 위치 기준 줌, 구간 핸들 줌 연동)
 36. 파노라마 맵 건물 호버 (ScatterplotLayer onHover→파노라마 차트 건물 하이라이트 연동)
+37. LOS 단면도 빈 영역 클릭 재생성 (프로파일 표시 중 빈 맵 클릭→새 좌표로 LOS 재생성)
+38. LOS 건물↔맵 양방향 하이라이트 (차트 건물 호버/클릭→맵 노란 마커, 건물 오버레이 비활성 상태에서도 표시)
+39. 건물 상세보기 모달 (LOS 차트 건물 클릭→상세보기 버튼→Google Street View+위성지도 모달)
 
 ## 핵심 아키텍처: 비행(Flight) 기반 분석
 분석 단위가 "파싱 파일(`AnalysisResult`)"에서 "**비행(`Flight`)**"으로 전환됨.
@@ -379,7 +382,9 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 - **LOS 포인트 핀**: 클릭 시 고정, 황색 stroke, 지도↔차트 양방향 하이라이트 연동
 - **LOS 맵↔차트 호버**: 맵 포인트 호버→차트 하이라이트(시안 stroke), 차트 포인트 호버→맵 마커 표시 (onTrackPointHover/externalHoverIdx)
 - **LOS 맵 항적 포인트**: deck.gl ScatterplotLayer, 클릭 시 차트 핀 동기화 (externalHighlightIdx), 호버 시 차트 하이라이트 (externalHoverIdx)
-- **LOS 건물 표시**: 경로 상 건물 높이/주소/용도 시각화
+- **LOS 건물 호버/클릭**: 경로 상 건물 높이/주소/용도 시각화, 클릭 시 핀 고정(앰버), 맵에 노란 마커 하이라이트 (건물 오버레이 비활성에서도 표시)
+- **LOS 건물 상세보기**: 건물 클릭 툴팁에 상세보기 버튼 → Google Street View + Google Maps 위성지도 모달 (레이더→건물 방위 기반 heading)
+- **LOS 빈 영역 클릭 재생성**: 프로파일 표시 중 맵 빈 영역 클릭 시 해당 좌표로 LOS 단면도 재생성 (deck.gl 포인트 클릭과 구분)
 - **소실분석 미니맵**: Leaflet Tooltip (시작/종료 마커에 시각, 고도, 좌표)
 - **데이터 테이블**: 선택 행 시각적 강조 (ring + 배경색)
 - **PathLayer**: autoHighlight (흰색 오버레이)

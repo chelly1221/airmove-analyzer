@@ -273,6 +273,17 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             memo TEXT NOT NULL DEFAULT '',
             active INTEGER NOT NULL DEFAULT 1
         );
+
+        -- 자기편각 캐시 (NOAA API 결과 + WMM fallback)
+        CREATE TABLE IF NOT EXISTS declination_cache (
+            lat_key TEXT NOT NULL,
+            lon_key TEXT NOT NULL,
+            date_key TEXT NOT NULL,
+            declination_deg REAL NOT NULL,
+            source TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            PRIMARY KEY (lat_key, lon_key, date_key)
+        );
         ",
     )?;
 

@@ -196,18 +196,32 @@ export const useAppStore = create<AppState>((set, get) => ({
   addAircraft: (a) =>
     set((state) => {
       if (state.aircraft.length >= 10) return state;
+      invoke("save_aircraft", { aircraft: a }).catch((e) =>
+        console.warn("[Aircraft] DB 저장 실패:", e)
+      );
       return { aircraft: [...state.aircraft, a] };
     }),
   updateAircraft: (id, updates) =>
-    set((state) => ({
-      aircraft: state.aircraft.map((a) =>
+    set((state) => {
+      const updated = state.aircraft.map((a) =>
         a.id === id ? { ...a, ...updates } : a
-      ),
-    })),
-  removeAircraft: (id) =>
+      );
+      const target = updated.find((a) => a.id === id);
+      if (target) {
+        invoke("save_aircraft", { aircraft: target }).catch((e) =>
+          console.warn("[Aircraft] DB 저장 실패:", e)
+        );
+      }
+      return { aircraft: updated };
+    }),
+  removeAircraft: (id) => {
+    invoke("delete_aircraft", { id }).catch((e) =>
+      console.warn("[Aircraft] DB 삭제 실패:", e)
+    );
     set((state) => ({
       aircraft: state.aircraft.filter((a) => a.id !== id),
-    })),
+    }));
+  },
 
   // 업로드 파일
   uploadedFiles: [],

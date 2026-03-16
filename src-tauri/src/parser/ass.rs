@@ -667,9 +667,12 @@ impl TrackAssembler {
 }
 
 /// Convert polar coordinates to lat/lon using the radar site as reference.
-fn polar_to_latlon(rho_nm: f64, theta_deg: f64, radar_lat: f64, radar_lon: f64) -> (f64, f64) {
+/// NEC 레이더의 THETA는 자북(Magnetic North) 기준 → mag_dec_deg로 진북 보정
+fn polar_to_latlon(rho_nm: f64, theta_deg: f64, radar_lat: f64, radar_lon: f64, mag_dec_deg: f64) -> (f64, f64) {
     let rho_km = rho_nm * 1.852;
-    let theta_rad = theta_deg.to_radians();
+    // 자북 → 진북 보정: True Bearing = Magnetic Bearing + Declination
+    let true_theta = theta_deg + mag_dec_deg;
+    let theta_rad = true_theta.to_radians();
     let lat_rad = radar_lat.to_radians();
     let earth_r = 6371.0;
 
@@ -684,11 +687,16 @@ fn polar_to_latlon(rho_nm: f64, theta_deg: f64, radar_lat: f64, radar_lon: f64) 
 }
 
 /// Convert Cartesian (x, y in NM) to lat/lon using radar site as reference.
-fn cartesian_to_latlon(x_nm: f64, y_nm: f64, radar_lat: f64, radar_lon: f64) -> (f64, f64) {
+/// NEC 레이더의 X/Y는 자북 기준 → mag_dec_deg로 진북 회전 보정
+fn cartesian_to_latlon(x_nm: f64, y_nm: f64, radar_lat: f64, radar_lon: f64, mag_dec_deg: f64) -> (f64, f64) {
     let x_km = x_nm * 1.852;
     let y_km = y_nm * 1.852;
-    let lat_offset = y_km / 111.32;
-    let lon_offset = x_km / (111.32 * radar_lat.to_radians().cos());
+    // 자북 → 진북 좌표 회전 (declination 만큼 반시계 회전)
+    let rot_rad = mag_dec_deg.to_radians();
+    let x_true = x_km * rot_rad.cos() - y_km * rot_rad.sin();
+    let y_true = x_km * rot_rad.sin() + y_km * rot_rad.cos();
+    let lat_offset = y_true / 111.32;
+    let lon_offset = x_true / (111.32 * radar_lat.to_radians().cos());
     (radar_lat + lat_offset, radar_lon + lon_offset)
 }
 
@@ -698,6 +706,7 @@ fn classify_and_convert(
     base_date_secs: f64,
     radar_lat: f64,
     radar_lon: f64,
+    mag_dec_deg: f64,
 ) -> RecordOutcome {
     // TYP=0,1 → Discard
     match record.radar_typ {
@@ -713,9 +722,9 @@ fn classify_and_convert(
 
     // Convert position from polar or Cartesian to lat/lon
     let (lat, lon) = if let (Some(rho), Some(theta)) = (record.rho_nm, record.theta_deg) {
-        polar_to_latlon(rho, theta, radar_lat, radar_lon)
+        polar_to_latlon(rho, theta, radar_lat, radar_lon, mag_dec_deg)
     } else if let (Some(x_nm), Some(y_nm)) = (record.cart_x_nm, record.cart_y_nm) {
-        cartesian_to_latlon(x_nm, y_nm, radar_lat, radar_lon)
+        cartesian_to_latlon(x_nm, y_nm, radar_lat, radar_lon, mag_dec_deg)
     } else {
         return RecordOutcome::Discard;
     };
@@ -794,6 +803,7 @@ pub fn parse_ass_file(
     radar_lat: f64,
     radar_lon: f64,
     mode_s_filter: &[String],
+    mag_dec_deg: f64,
     _progress: impl Fn(f64),
 ) -> Result<crate::models::ParsedFile, ParseError> {
     let data = std::fs::read(path).map_err(|e| ParseError::FileReadError(e.to_string()))?;
@@ -945,6 +955,7 @@ pub fn parse_ass_file(
                                 base_date_secs + day_offset,
                                 radar_lat,
                                 radar_lon,
+                                mag_dec_deg,
                             ) {
                                 RecordOutcome::Discard => {
                                     assembler.stats.discarded_psr_none += 1;
@@ -1142,6 +1153,30 @@ fn is_nec_frame(data: &[u8], offset: usize, month: u8, day: u8) -> bool {
     }
     let after = data[offset + 5];
     after == CAT048 || after == CAT034 || after == CAT008 || after == month
+}
+
+/// 파일명에서 날짜 추출 (YYYY-MM-DD 형식 반환). 편각 조회용.
+/// "gimpo_260304_0415.ass" → "2026-03-04"
+pub fn extract_date_from_filename(path: &str) -> Option<String> {
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let stem = filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(&filename);
+    for part in stem.split('_') {
+        if part.len() == 6 {
+            if let (Ok(yy), Ok(mm), Ok(dd)) = (
+                part[0..2].parse::<u32>(),
+                part[2..4].parse::<u32>(),
+                part[4..6].parse::<u32>(),
+            ) {
+                if mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 {
+                    return Some(format!("{:04}-{:02}-{:02}", 2000 + yy, mm, dd));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Extract a base Unix timestamp (UTC midnight) from a filename like "gimpo_260304_0415.ass".

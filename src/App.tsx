@@ -12,7 +12,7 @@ import ReportGeneration from "./pages/ReportGeneration";
 import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
 import { Loader2 } from "lucide-react";
-import type { ElevationPoint, FlightRecord, LOSProfileData, ParseStatistics, RadarSite, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
+import type { Aircraft, ElevationPoint, FlightRecord, LOSProfileData, ParseStatistics, RadarSite, SavedReportSummary, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
 import { consolidateFlights } from "./utils/flightConsolidation";
 
 /** DB 저장 데이터 타입 */
@@ -43,6 +43,24 @@ function useRestoreSavedData() {
     loadedRef.current = true;
 
     const restore = async () => {
+      // 0) 비행검사기 DB 복원
+      try {
+        const dbAircraft = await invoke<Aircraft[]>("get_aircraft_list");
+        if (dbAircraft.length > 0) {
+          useAppStore.setState({ aircraft: dbAircraft });
+          console.log(`[Restore] 비행검사기 ${dbAircraft.length}대 복원`);
+        } else {
+          // 최초 실행: 프리셋 항공기를 DB에 저장
+          const presets = useAppStore.getState().aircraft;
+          for (const a of presets) {
+            await invoke("save_aircraft", { aircraft: a }).catch(() => {});
+          }
+          console.log(`[Restore] 프리셋 비행검사기 ${presets.length}대 DB 초기 저장`);
+        }
+      } catch (e) {
+        console.log("[Restore] 비행검사기 복원 실패:", e);
+      }
+
       // 1) 설정 복원 (customRadarSites, radarSite)
       try {
         const settingsToLoad = ["custom_radar_sites", "selected_radar_site", "report_metadata"];
@@ -290,6 +308,30 @@ function useRestoreSavedData() {
         }
       } catch (e) {
         console.log("[Restore] 파싱 데이터 복원 실패:", e);
+      }
+
+      // 5) 저장된 보고서 목록 복원
+      try {
+        const reports = await invoke<SavedReportSummary[]>("list_saved_reports");
+        if (reports.length > 0) {
+          useAppStore.setState({ savedReports: reports });
+          console.log(`[Restore] 저장된 보고서 ${reports.length}건 복원`);
+        }
+      } catch (e) {
+        console.log("[Restore] 보고서 목록 복원 실패:", e);
+      }
+
+      // 6) 레이더 커버리지 캐시 복원
+      try {
+        const rs = useAppStore.getState().radarSite;
+        const cachedJson = await invoke<string | null>("load_coverage_cache", { radarName: rs.name });
+        if (cachedJson) {
+          const coverageData = JSON.parse(cachedJson);
+          useAppStore.setState({ coverageData });
+          console.log(`[Restore] 레이더 커버리지 캐시 복원 (${rs.name})`);
+        }
+      } catch (e) {
+        console.log("[Restore] 커버리지 캐시 복원 실패:", e);
       }
     };
 

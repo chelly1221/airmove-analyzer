@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod building;
 pub mod coord;
 pub mod db;
+pub mod declination;
 pub mod models;
 pub mod parser;
 pub mod srtm;
@@ -162,10 +163,12 @@ fn get_app_data_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// Parse an ASS binary file and return structured track data.
 #[tauri::command]
-async fn parse_ass_file(path: String, radar_lat: f64, radar_lon: f64, mode_s_filter: Vec<String>) -> Result<ParsedFile, String> {
+async fn parse_ass_file(path: String, radar_lat: f64, radar_lon: f64, mode_s_filter: Vec<String>, app_handle: tauri::AppHandle) -> Result<ParsedFile, String> {
     info!("Command: parse_ass_file({}, radar={},{}, filter={:?})", path, radar_lat, radar_lon, mode_s_filter);
+    // 편각 조회 (파일 날짜 + 레이더 좌표)
+    let mag_dec = resolve_declination(&app_handle, &path, radar_lat, radar_lon).await;
     tauri::async_runtime::spawn_blocking(move || {
-        parser::ass::parse_ass_file(&path, radar_lat, radar_lon, &mode_s_filter, |_| {}).map_err(|e| e.to_string())
+        parser::ass::parse_ass_file(&path, radar_lat, radar_lon, &mode_s_filter, mag_dec, |_| {}).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -223,10 +226,11 @@ async fn parse_and_analyze(
     mode_s_filter: Vec<String>,
 ) -> Result<AnalysisResult, String> {
     info!("Command: parse_and_analyze({}, radar={},{}, filter={:?})", file_path, radar_lat, radar_lon, mode_s_filter);
+    let mag_dec = resolve_declination(&app_handle, &file_path, radar_lat, radar_lon).await;
     let handle = app_handle.clone();
     let fp = file_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_filter, |_| {})
+        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_filter, mag_dec, |_| {})
             .map_err(|e| e.to_string())?;
         let analysis = analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS);
 
@@ -280,6 +284,13 @@ async fn parse_and_analyze_batch(
         mode_s_filter
     );
 
+    // 배치 전체에 대해 편각 1회 조회 (첫 번째 파일 날짜 기준, 배치 내 날짜 차이는 무시 가능)
+    let mag_dec = if let Some(first) = file_paths.first() {
+        resolve_declination(&app_handle, first, radar_lat, radar_lon).await
+    } else {
+        -8.5
+    };
+
     let handle = app_handle.clone();
     let total = file_paths.len();
 
@@ -294,7 +305,7 @@ async fn parse_and_analyze_batch(
             for path in &file_paths {
                 let path = path.clone();
                 s.spawn(move |_| {
-                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, filter_ref, |_| {})
+                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, filter_ref, mag_dec, |_| {})
                         .map_err(|e| e.to_string())
                         .map(|parsed| {
                             analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)
@@ -1560,6 +1571,165 @@ fn delete_saved_report(
     db::delete_report(&conn, &id).map_err(|e| format!("DB error: {}", e))
 }
 
+// ---------- 자기편각 (Magnetic Declination) ----------
+
+/// 파싱 전 편각 조회 헬퍼: 파일 날짜 + 레이더 좌표로 편각 결정
+///
+/// MutexGuard를 .await 경계 너머로 들고 가지 않도록 단계별로 분리:
+/// 1. DB 캐시 조회 (sync, lock/unlock)
+/// 2. NOAA API 호출 (async, lock 없음)
+/// 3. DB 저장 (sync, lock/unlock)
+async fn resolve_declination(app_handle: &tauri::AppHandle, file_path: &str, radar_lat: f64, radar_lon: f64) -> f64 {
+    let date = parser::ass::extract_date_from_filename(file_path)
+        .unwrap_or_else(|| "2025-06-01".to_string());
+
+    // 1단계: 캐시 확인 (lock → 조회 → unlock)
+    let cached = {
+        let state = app_handle.state::<AppState>();
+        let guard = state.db.lock().ok();
+        guard.and_then(|conn| declination::get_cached(&conn, radar_lat, radar_lon, &date))
+    };
+    if let Some((dec, ref source)) = cached {
+        if source == "noaa" {
+            return dec;
+        }
+    }
+
+    // 2단계: NOAA API 시도 (async, lock 없음)
+    let date_parts = date.split('-').collect::<Vec<_>>();
+    if date_parts.len() == 3 {
+        let year: i32 = date_parts[0].parse().unwrap_or(2025);
+        let month: u32 = date_parts[1].parse().unwrap_or(6);
+        let day: u32 = date_parts[2].parse().unwrap_or(1);
+
+        if let Ok(dec) = declination::fetch_noaa(radar_lat, radar_lon, year, month, day).await {
+            info!("Magnetic declination (NOAA): {:.2}° for ({},{}) on {}", dec, radar_lat, radar_lon, date);
+            // 3단계: 결과 저장 (lock → 저장 → unlock)
+            let state = app_handle.state::<AppState>();
+            let _ = state.db.lock().ok().map(|conn| {
+                declination::save_cache(&conn, radar_lat, radar_lon, &date, dec, "noaa")
+            });
+            return dec;
+        }
+    }
+
+    // 4단계: WMM fallback (동기 계산)
+    if let Some((dec, _)) = cached {
+        return dec; // 이미 WMM 캐시가 있으면 재사용
+    }
+
+    let state = app_handle.state::<AppState>();
+    let guard = state.db.lock().ok();
+    match guard {
+        Some(conn) => declination::get_declination_sync(&conn, radar_lat, radar_lon, &date),
+        None => -8.5,
+    }
+}
+
+/// 자기편각 조회 IPC 커맨드
+#[tauri::command]
+async fn get_magnetic_declination(
+    app_handle: tauri::AppHandle,
+    lat: f64,
+    lon: f64,
+    date: String,
+) -> Result<f64, String> {
+    // 1. 캐시 확인
+    let cached = {
+        let state = app_handle.state::<AppState>();
+        let guard = state.db.lock().ok();
+        guard.and_then(|conn| declination::get_cached(&conn, lat, lon, &date))
+    };
+    if let Some((dec, ref source)) = cached {
+        if source == "noaa" {
+            return Ok(dec);
+        }
+    }
+
+    // 2. NOAA API 시도
+    let date_parts = date.split('-').collect::<Vec<_>>();
+    if date_parts.len() == 3 {
+        let year: i32 = date_parts[0].parse().unwrap_or(2025);
+        let month: u32 = date_parts[1].parse().unwrap_or(6);
+        let day: u32 = date_parts[2].parse().unwrap_or(1);
+
+        if let Ok(dec) = declination::fetch_noaa(lat, lon, year, month, day).await {
+            let state = app_handle.state::<AppState>();
+            let _ = state.db.lock().ok().map(|conn| {
+                declination::save_cache(&conn, lat, lon, &date, dec, "noaa")
+            });
+            return Ok(dec);
+        }
+    }
+
+    // 3. WMM fallback
+    if let Some((dec, _)) = cached {
+        return Ok(dec);
+    }
+    let result = {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        declination::get_declination_sync(&conn, lat, lon, &date)
+    };
+    Ok(result)
+}
+
+/// WMM fallback 데이터를 NOAA 데이터로 치환하는 IPC 커맨드
+#[tauri::command]
+async fn refresh_declination_cache(
+    app_handle: tauri::AppHandle,
+) -> Result<usize, String> {
+    refresh_wmm_to_noaa(&app_handle).await
+}
+
+/// WMM→NOAA 치환 로직 (IPC + 백그라운드 공용)
+/// rusqlite::Connection은 Send가 아니므로 DB 접근(sync)과 API 호출(async)을 분리
+async fn refresh_wmm_to_noaa(app_handle: &tauri::AppHandle) -> Result<usize, String> {
+    // 1. DB에서 WMM 엔트리 목록 조회 (sync)
+    let entries = {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        declination::list_wmm_entries(&conn)
+    };
+
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    info!("Refreshing {} WMM declination entries with NOAA data", entries.len());
+    let mut refreshed = 0usize;
+
+    for (lat_key, lon_key, date_key) in &entries {
+        let lat: f64 = lat_key.parse().unwrap_or(37.5);
+        let lon: f64 = lon_key.parse().unwrap_or(127.0);
+        let (year, month, day) = match declination::parse_date(date_key) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // 2. NOAA API 호출 (async, DB lock 없음)
+        match declination::fetch_noaa(lat, lon, year, month, day).await {
+            Ok(dec) => {
+                // 3. DB 저장 (sync)
+                let state = app_handle.state::<AppState>();
+                let saved = state.db.lock().ok().map(|conn| {
+                    declination::save_cache(&conn, lat, lon, date_key, dec, "noaa").is_ok()
+                }).unwrap_or(false);
+                if saved { refreshed += 1; }
+            }
+            Err(e) => {
+                log::warn!("NOAA refresh failed for ({},{}) on {}: {}", lat_key, lon_key, date_key, e);
+                break; // API 실패 시 중단
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    info!("Refreshed {}/{} WMM entries with NOAA data", refreshed, entries.len());
+    Ok(refreshed)
+}
+
 // ---------- App Entry Point ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1611,10 +1781,21 @@ pub fn run() {
             info!("SRTM data dir: {:?}", srtm_dir);
 
             app.manage(AppState {
-                app_data_dir: Mutex::new(app_data_dir),
+                app_data_dir: Mutex::new(app_data_dir.clone()),
                 db: Mutex::new(db_conn),
                 oauth_token: Mutex::new(None),
                 srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir)),
+            });
+
+            // 백그라운드: WMM fallback 편각을 NOAA 데이터로 치환
+            let bg_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                match refresh_wmm_to_noaa(&bg_handle).await {
+                    Ok(n) if n > 0 => info!("Refreshed {} WMM declination entries with NOAA data", n),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("Declination refresh failed: {}", e),
+                }
             });
 
             Ok(())
@@ -1683,6 +1864,9 @@ pub fn run() {
             list_saved_reports,
             load_report_detail,
             delete_saved_report,
+            // 자기편각
+            get_magnetic_declination,
+            refresh_declination_cache,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

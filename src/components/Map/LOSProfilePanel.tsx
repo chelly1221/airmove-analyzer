@@ -50,6 +50,8 @@ interface Props {
   onTrackPointHover?: (idx: number | null) => void;
   /** 맵에서 호버한 항적 포인트 인덱스 (외부→차트 호버) */
   externalHoverIdx?: number | null;
+  /** 차트에서 건물 호버/클릭 시 건물 정보 콜백 (null이면 해제) */
+  onBuildingHover?: (building: { lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null) => void;
 }
 
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -96,7 +98,7 @@ function curvDrop43(dKm: number): number {
 
 
 
-export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx }: Props) {
+export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover }: Props) {
   const addLOSResult = useAppStore((s) => s.addLOSResult);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
@@ -112,6 +114,15 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const [hoveredTrackIdx, setHoveredTrackIdx] = useState<number | null>(null);
   const [pinnedTrackIdx, setPinnedTrackIdx] = useState<number | null>(null);
   const [hoveredBldgIdx, setHoveredBldgIdx] = useState<number | null>(null);
+  const [clickedBldgIdx, setClickedBldgIdx] = useState<number | null>(null);
+  const [detailBuilding, setDetailBuilding] = useState<(BuildingOnPath & { isBlocking?: boolean }) | null>(null);
+  // 건물 상세 모달 ESC 닫기
+  useEffect(() => {
+    if (!detailBuilding) return;
+    const handleEsc = (e: KeyboardEvent) => { if (e.key === "Escape") setDetailBuilding(null); };
+    document.addEventListener("keydown", handleEsc);
+    return () => document.removeEventListener("keydown", handleEsc);
+  }, [detailBuilding]);
   // 맵에서 클릭한 포인트 → 차트 핀 동기화
   const prevExternalIdx = useRef<number | null | undefined>(undefined);
   useEffect(() => {
@@ -143,6 +154,15 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       setPeakNames(new Map());
       setBuildings([]);
       setLoading(true);
+      setSaved(false);
+      setPinnedTrackIdx(null);
+      setHoveredTrackIdx(null);
+      setHoveredBldgIdx(null);
+      setClickedBldgIdx(null);
+      setDetailBuilding(null);
+      onBuildingHover?.(null);
+      setXZoom([0, 100]);
+      xZoomRef.current = [0, 100];
       const numSamples = 150;
       const lats: number[] = [];
       const lons: number[] = [];
@@ -904,6 +924,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           const bHeight = byBottom - byTop;
           if (bHeight < 1) return null;
           const isHovered = hoveredBldgIdx === bi;
+          const isClicked = clickedBldgIdx === bi;
           return (
             <g key={`bld-${bi}`}>
               {/* 투명 히트영역 (시각적으로 보이지 않지만 넓은 클릭/호버 범위) */}
@@ -912,14 +933,19 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 stroke="transparent"
                 strokeWidth={14}
                 style={{ cursor: "pointer" }}
-                onMouseEnter={() => setHoveredBldgIdx(bi)}
-                onMouseLeave={() => setHoveredBldgIdx(null)}
+                onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage }); }}
+                onMouseLeave={() => { setHoveredBldgIdx(null); if (clickedBldgIdx === null) onBuildingHover?.(null); }}
+                onClick={() => {
+                  const toggling = clickedBldgIdx === bi;
+                  setClickedBldgIdx(toggling ? null : bi);
+                  onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
+                }}
               />
               {/* 실제 시각 표현 */}
               <line
                 x1={bx} y1={byBottom} x2={bx} y2={byTop}
-                stroke={isHovered ? "#facc15" : b.isBlocking ? "rgba(239, 68, 68, 0.8)" : "rgba(71, 85, 105, 0.7)"}
-                strokeWidth={isHovered ? 3 : 2}
+                stroke={isClicked ? "#f59e0b" : isHovered ? "#facc15" : b.isBlocking ? "rgba(239, 68, 68, 0.8)" : "rgba(71, 85, 105, 0.7)"}
+                strokeWidth={isClicked ? 3.5 : isHovered ? 3 : 2}
                 pointerEvents="none"
               />
             </g>
@@ -1127,9 +1153,11 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })()}
 
-        {/* 건물 호버 툴팁 */}
-        {hoveredBldgIdx !== null && chartData.significantBuildings[hoveredBldgIdx] && (() => {
-          const b = chartData.significantBuildings[hoveredBldgIdx];
+        {/* 건물 호버/클릭 툴팁 */}
+        {(() => {
+          const activeBldgIdx = clickedBldgIdx ?? hoveredBldgIdx;
+          if (activeBldgIdx === null || !chartData.significantBuildings[activeBldgIdx]) return null;
+          const b = chartData.significantBuildings[activeBldgIdx];
           const bTopAdj = (b.ground_elev_m + b.height_m) - curvDrop(b.distance_km);
           const bx = xScale(b.distance_km);
           const by = yScale(bTopAdj);
@@ -1138,14 +1166,15 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           const hasAddr = !!b.address;
           const hasUsage = !!b.usage;
           const headerLines = (hasName ? 1 : 0) + (hasAddr ? 1 : 0) + (hasUsage ? 1 : 0);
-          const tooltipH = 56 + headerLines * 13;
+          const isClicked = clickedBldgIdx === activeBldgIdx;
+          const tooltipH = 56 + headerLines * 13 + (isClicked ? 22 : 0);
           const tooltipX = bx + tooltipW + 12 > W ? bx - tooltipW - 8 : bx + 8;
           const tooltipY = Math.max(PAD.top + 4, by - tooltipH / 2);
           let lineY = tooltipY;
           return (
             <g>
               <rect x={tooltipX} y={tooltipY} width={tooltipW} height={tooltipH}
-                rx={4} fill="rgba(255,255,255,0.95)" stroke="rgba(0,0,0,0.15)" strokeWidth={0.5} />
+                rx={4} fill="rgba(255,255,255,0.95)" stroke={isClicked ? "rgba(245,158,11,0.6)" : "rgba(0,0,0,0.15)"} strokeWidth={isClicked ? 1 : 0.5} />
               {hasName && (
                 <text x={tooltipX + 8} y={(lineY += 13, lineY)} fill="#374151" fontSize={9} fontWeight="bold">
                   {b.name}
@@ -1177,6 +1206,16 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
               <text x={tooltipX + 8} y={(lineY += 14, lineY)} fill={b.isBlocking ? "#ef4444" : "#6b7280"} fontSize={8} fontWeight={b.isBlocking ? "bold" : "normal"}>
                 {b.isBlocking ? "⚠ LOS 차단 기여" : "차폐 영향"}
               </text>
+              {isClicked && (
+                <foreignObject x={tooltipX + 6} y={(lineY += 6, lineY)} width={tooltipW - 12} height={18}>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setDetailBuilding(b); }}
+                    style={{ width: "100%", height: "18px", fontSize: "9px", fontWeight: 600, color: "#fff", background: "linear-gradient(135deg, #3b82f6, #2563eb)", border: "none", borderRadius: "3px", cursor: "pointer", lineHeight: "18px" }}
+                  >
+                    상세보기 (Street View / 지도)
+                  </button>
+                </foreignObject>
+              )}
             </g>
           );
         })()}
@@ -1286,6 +1325,71 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           renderChart()
         )}
       </div>
+
+      {/* 건물 상세보기 모달 (Google Street View + Google Maps) */}
+      {detailBuilding && (() => {
+        const lat = detailBuilding.lat;
+        const lon = detailBuilding.lon;
+        const label = detailBuilding.name || detailBuilding.address || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+        // 레이더→건물 방위 계산 (Street View heading)
+        const dLon = lon - radarSite.longitude;
+        const dLat = lat - radarSite.latitude;
+        const headingFromRadar = ((Math.atan2(dLon * Math.cos(lat * Math.PI / 180), dLat) * 180 / Math.PI) + 360) % 360;
+        // 건물에서 레이더 방향 (반대 방향) → Street View에서 건물을 바라보는 시점
+        const headingToBuilding = (headingFromRadar + 180) % 360;
+        return (
+          <div
+            className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm"
+            onClick={(e) => { if (e.target === e.currentTarget) setDetailBuilding(null); }}
+          >
+            <div className="w-[720px] max-h-[90vh] rounded-xl border border-gray-200 bg-white shadow-2xl overflow-hidden">
+              {/* 헤더 */}
+              <div className="flex items-center justify-between border-b border-gray-200 px-5 py-3">
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-sm font-semibold text-gray-800 truncate">{label}</h3>
+                  <p className="text-[11px] text-gray-500 mt-0.5">
+                    {lat.toFixed(6)}°N, {lon.toFixed(6)}°E
+                    {detailBuilding.height_m > 0 && <span className="ml-2">높이 {detailBuilding.height_m.toFixed(1)}m</span>}
+                    {detailBuilding.usage && <span className="ml-2 text-indigo-500">{detailBuilding.usage}</span>}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setDetailBuilding(null)}
+                  className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors ml-3"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+              {/* Street View */}
+              <div className="border-b border-gray-100">
+                <div className="px-3 py-1.5 text-[10px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Google Street View</div>
+                <iframe
+                  title="Street View"
+                  width="100%"
+                  height="300"
+                  style={{ border: 0 }}
+                  loading="lazy"
+                  referrerPolicy="no-referrer-when-downgrade"
+                  src={`https://www.google.com/maps/@${lat},${lon},3a,75y,${headingToBuilding.toFixed(0)}h,85t/data=!3m1!1e1`}
+                />
+              </div>
+              {/* Google Maps (위성) */}
+              <div>
+                <div className="px-3 py-1.5 text-[10px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Google Maps</div>
+                <iframe
+                  title="Google Maps"
+                  width="100%"
+                  height="300"
+                  style={{ border: 0 }}
+                  loading="lazy"
+                  referrerPolicy="no-referrer-when-downgrade"
+                  src={`https://maps.google.com/maps?q=${lat},${lon}&z=18&t=k&output=embed`}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

@@ -11,6 +11,52 @@ export interface ExportResult {
   pdfBase64?: string;
 }
 
+/**
+ * html2canvas 1.4가 oklch() 색상 함수를 파싱하지 못하는 문제 해결.
+ * Tailwind CSS v4는 모든 색상 유틸리티를 oklch()로 생성함.
+ *
+ * 2단계 방어:
+ * 1) 클론 문서의 <style> 태그에서 oklch 포함 규칙을 제거 (파서 오류 방지)
+ * 2) 모든 요소에 computed rgb 값을 인라인 강제 적용 (스타일 유지)
+ */
+const COLOR_CSS_PROPS = [
+  "color",
+  "background-color",
+  "border-color",
+  "border-top-color",
+  "border-right-color",
+  "border-bottom-color",
+  "border-left-color",
+  "outline-color",
+  "text-decoration-color",
+  "box-shadow",
+  "caret-color",
+] as const;
+
+function sanitizeForHtml2Canvas(doc: Document) {
+  const win = doc.defaultView;
+  if (!win) return;
+
+  // 1단계: 모든 요소에 computed rgb를 인라인 적용 (스타일시트 제거 전에 수행)
+  doc.querySelectorAll("*").forEach((el) => {
+    const computed = win.getComputedStyle(el);
+    const htmlEl = el as HTMLElement;
+    for (const prop of COLOR_CSS_PROPS) {
+      const val = computed.getPropertyValue(prop);
+      if (val) {
+        htmlEl.style.setProperty(prop, val);
+      }
+    }
+  });
+
+  // 2단계: oklch가 포함된 <style> 태그 제거 (html2canvas CSS 파서 오류 방지)
+  doc.querySelectorAll("style").forEach((styleEl) => {
+    if (styleEl.textContent && /oklch\s*\(/i.test(styleEl.textContent)) {
+      styleEl.remove();
+    }
+  });
+}
+
 export function useReportExport() {
   const exportPDF = useCallback(
     async (
@@ -51,6 +97,9 @@ export function useReportExport() {
           useCORS: true,
           backgroundColor: "#ffffff",
           logging: false,
+          onclone: (_doc, clonedEl) => {
+            sanitizeForHtml2Canvas(clonedEl.ownerDocument);
+          },
         });
 
         // 캡처된 이미지의 실제 비율 계산

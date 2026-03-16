@@ -36,7 +36,7 @@ import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, AdsbTrack } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
 import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
-import { fetchCloudGrid, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
+import { fetchCloudGridKorea, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 
 /**
  * 탐지 유형 색상:
@@ -120,6 +120,7 @@ export default function TrackMap() {
   const [showBuildings, setShowBuildings] = useState(false);
   const [buildingOverlayData, setBuildingOverlayData] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; source: string }[]>([]);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
+  const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
   const [playSpeed, setPlaySpeed] = useState(1);
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
@@ -177,10 +178,12 @@ export default function TrackMap() {
   const savedTerrainRef = useRef(true); // LOS 모드 진입 전 지형 상태 저장
   const savedPitchRef = useRef(45);
   const savedBearingRef = useRef(0);
+  const losPointClickedRef = useRef(false); // deck.gl LOS 포인트 클릭 여부 (빈 영역 클릭 구분용)
 
   const mapRef = useRef<MapRef>(null);
   const terrainAdded = useRef(false);
   const playRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const cloudAbortRef = useRef<AbortController | null>(null);
   const aircraftDropRef = useRef<HTMLDivElement>(null);
   const radarDropRef = useRef<HTMLDivElement>(null);
   const speedRef = useRef<HTMLDivElement>(null);
@@ -610,14 +613,15 @@ export default function TrackMap() {
     if (!frame || frame.cells.length === 0) return null;
 
     const halfStep = (cloudGrid.gridSpacingKm / 111.32) * 0.5;
-    const cosLat = Math.cos((cloudGrid.radarLat * Math.PI) / 180);
-    const halfStepLon = halfStep / cosLat;
 
     const dots: { position: [number, number]; cover: number }[] = [];
     const GRID_SIZE = 12; // 셀당 12×12 = 144개 격자점 (운량 100%일 때)
 
     for (const c of frame.cells) {
       if (c.cloud_cover <= 10) continue;
+      // 셀별 cosLat 사용 (한국 전역 커버 시 위도별 보정)
+      const cellCosLat = Math.cos((c.lat * Math.PI) / 180);
+      const halfStepLon = halfStep / cellCosLat;
       // 운량에 따라 격자 해상도 조절: 운량 낮으면 간격 넓게 (점 적게)
       const ratio = c.cloud_cover / 100;
       const effectiveSize = Math.max(3, Math.round(GRID_SIZE * Math.sqrt(ratio)));
@@ -638,24 +642,32 @@ export default function TrackMap() {
     return dots;
   }, [cloudGrid, cloudGridVisible, sliderValue, timeRange.max, pctToTs]);
 
-  /** 구름 그리드 조회 시작 */
+  /** 구름 그리드 조회 시작 (한국 전역, 백그라운드 역순 로딩, 비행 날짜만) */
   const startCloudFetch = useCallback(async () => {
     if (radarFilteredFlights.length === 0) return;
-    let minTs = Infinity, maxTs = -Infinity;
-    for (const f of radarFilteredFlights) {
-      if (f.start_time < minTs) minTs = f.start_time;
-      if (f.end_time > maxTs) maxTs = f.end_time;
-    }
-    if (minTs === Infinity) return;
 
-    const startDate = new Date(minTs * 1000).toISOString().slice(0, 10);
-    const endDate = new Date(maxTs * 1000).toISOString().slice(0, 10);
+    // 비행 데이터에서 실제 존재하는 날짜만 추출
+    const dateSet = new Set<string>();
+    for (const f of radarFilteredFlights) {
+      // 비행 시작~종료 사이의 모든 날짜 추가 (자정 걸치는 비행 대응)
+      const d = new Date(f.start_time * 1000);
+      const end = new Date(f.end_time * 1000);
+      while (d <= end) {
+        dateSet.add(d.toISOString().slice(0, 10));
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+    }
+    const flightDates = Array.from(dateSet);
+    if (flightDates.length === 0) return;
+
+    const startDate = flightDates.sort()[0];
+    const endDate = flightDates[flightDates.length - 1];
 
     setCloudGridLoading(true);
     setCloudGridProgress("구름 데이터 조회 중...");
 
     try {
-      // 기상 데이터도 함께 조회 (보고서용, 일 단위 캐싱)
+      // 기상 데이터 조회 (보고서용, 일 단위 캐싱)
       setWeatherLoading(true);
       const weather = await fetchHistoricalWeather(
         radarSite.latitude, radarSite.longitude, startDate, endDate,
@@ -663,21 +675,31 @@ export default function TrackMap() {
       );
       setWeatherData(weather);
       setWeatherLoading(false);
-
-      // 구름 그리드 (200km 반경, 50km 간격, 일 단위 캐싱)
-      const grid = await fetchCloudGrid(
-        radarSite.latitude, radarSite.longitude,
-        200, 10, startDate, endDate,
-        (_pct, msg) => setCloudGridProgress(msg),
-      );
-      setCloudGrid(grid);
-      setCloudGridVisible(true);
     } catch (err) {
-      console.error("구름 데이터 조회 실패:", err);
-    } finally {
+      console.error("기상 데이터 조회 실패:", err);
+      setWeatherLoading(false);
+    }
+
+    // 한국 전역 구름 그리드 — 비행 날짜만, 백그라운드에서 당일→과거 순차 조회
+    cloudAbortRef.current?.abort();
+    const abort = new AbortController();
+    cloudAbortRef.current = abort;
+
+    setCloudGridVisible(true);
+
+    fetchCloudGridKorea(
+      10, flightDates,
+      (data) => setCloudGrid(data),
+      (msg) => setCloudGridProgress(msg),
+      abort.signal,
+    ).then(() => {
       setCloudGridLoading(false);
       setCloudGridProgress("");
-    }
+    }).catch((err) => {
+      if (!abort.signal.aborted) console.error("구름 데이터 조회 실패:", err);
+      setCloudGridLoading(false);
+      setCloudGridProgress("");
+    });
   }, [radarFilteredFlights, radarSite, setCloudGrid, setCloudGridVisible, setCloudGridLoading, setCloudGridProgress, setWeatherData, setWeatherLoading]);
 
   /** 건물 오버레이 데이터 로드 (레이더 주변 bbox) */
@@ -1046,8 +1068,20 @@ export default function TrackMap() {
   // LOS mode map click handler (카메라 조정은 단면도 로딩 완료 후)
   const handleMapClick = useCallback(
     (evt: any) => {
-      if (!losMode || losTarget) return; // 타겟이 이미 설정되면 재설정 방지
+      if (!losMode) return;
+      // deck.gl LOS 포인트 클릭이었으면 스킵 (빈 영역 클릭만 처리)
+      if (losPointClickedRef.current) {
+        losPointClickedRef.current = false;
+        return;
+      }
       const { lngLat } = evt;
+      // 이미 타겟이 있으면 하이라이트/호버 초기화 후 새 타겟으로 재생성
+      if (losTarget) {
+        setLosHighlightIdx(null);
+        setLosHoverIdx(null);
+        setLosHoverRatio(null);
+        setLosBuildingHighlight(null);
+      }
       setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
     },
     [losMode, losTarget]
@@ -1476,6 +1510,7 @@ export default function TrackMap() {
             pickable: true,
             onClick: (info: any) => {
               if (info.object) {
+                losPointClickedRef.current = true; // 빈 영역 클릭과 구분
                 const clickedIdx = info.object.idx;
                 setLosHighlightIdx((prev) => prev === clickedIdx ? null : clickedIdx);
               }
@@ -1646,8 +1681,28 @@ export default function TrackMap() {
       );
     }
 
+    // LOS 단면도 건물 호버/클릭 하이라이트 (건물 오버레이 비활성 상태에서도 표시)
+    if (losBuildingHighlight) {
+      layers.push(
+        new ScatterplotLayer({
+          id: "los-building-highlight",
+          data: [losBuildingHighlight],
+          getPosition: (d: typeof losBuildingHighlight) => [d!.lon, d!.lat],
+          getRadius: 8,
+          radiusMinPixels: 6,
+          radiusMaxPixels: 14,
+          radiusUnits: "pixels" as const,
+          getFillColor: [250, 204, 21, 180],
+          getLineColor: [250, 204, 21, 255],
+          stroked: true,
+          lineWidthMinPixels: 2,
+          pickable: false,
+        })
+      );
+    }
+
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots, losBuildingHighlight]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2244,7 +2299,7 @@ export default function TrackMap() {
                                 handleCoverageAltMinChange(Math.min(v, coverageAltInput));
                               }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 30 : 20 }}
-                              className="coverage-range-thumb absolute top-1/2 -translate-y-1/2 left-0 h-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
+                              className="coverage-range-thumb absolute inset-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
                               aria-label="최소 고도"
                             />
                             {/* 최대 핸들 */}
@@ -2259,7 +2314,7 @@ export default function TrackMap() {
                                 handleCoverageAltChange(Math.max(v, coverageAltMinInput));
                               }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 20 : 30 }}
-                              className="coverage-range-thumb absolute top-1/2 -translate-y-1/2 left-0 h-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
+                              className="coverage-range-thumb absolute inset-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
                               aria-label="최대 고도"
                             />
                           </div>
@@ -2279,12 +2334,7 @@ export default function TrackMap() {
         </div>
 
         {/* 구름 오버레이 토글 */}
-        {cloudGridLoading ? (
-          <div className="flex items-center gap-1 rounded-lg bg-blue-50 px-2 py-1.5 text-[10px] text-blue-600">
-            <Loader2 size={14} className="animate-spin" />
-            <span className="max-w-[100px] truncate">{cloudGridProgress || "구름..."}</span>
-          </div>
-        ) : (
+        <div className="flex items-center gap-1">
           <button
             onClick={() => {
               if (cloudGrid) {
@@ -2298,11 +2348,17 @@ export default function TrackMap() {
                 ? "bg-[#a60739] text-white shadow-sm"
                 : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
             }`}
-            title={cloudGrid ? "구름 오버레이 토글" : "구름/기상 데이터 조회"}
+            title={cloudGrid ? "구름 오버레이 토글" : "구름/기상 데이터 조회 (한국 전역)"}
           >
             <Cloud size={16} />
           </button>
-        )}
+          {cloudGridLoading && (
+            <div className="flex items-center gap-1 text-[10px] text-blue-500">
+              <Loader2 size={12} className="animate-spin" />
+              <span className="max-w-[100px] truncate">{cloudGridProgress || "구름..."}</span>
+            </div>
+          )}
+        </div>
 
         {/* Terrain toggle */}
         <button
@@ -2324,7 +2380,7 @@ export default function TrackMap() {
           <Crosshair size={12} />
           <span>LOS 분석 모드: 지도에서 분석할 지점을 클릭하세요</span>
           <button
-            onClick={() => { setLosMode(false); setLosTarget(null); setLosCursor(null); setLosHighlightIdx(null); }}
+            onClick={() => { setLosMode(false); setLosTarget(null); setLosCursor(null); setLosHighlightIdx(null); setLosBuildingHighlight(null); }}
             className="ml-auto text-[10px] text-gray-500 hover:text-gray-900"
           >
             취소
@@ -2469,7 +2525,7 @@ export default function TrackMap() {
           radarSite={radarSite}
           targetLat={losTarget.lat}
           targetLon={losTarget.lon}
-          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); }}
+          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); }}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
           onLoaded={handleLosLoaded}
@@ -2477,6 +2533,7 @@ export default function TrackMap() {
           externalHighlightIdx={losHighlightIdx}
           onTrackPointHover={setLosHoverIdx}
           externalHoverIdx={losHoverIdx}
+          onBuildingHover={setLosBuildingHighlight}
         />
       )}
 
