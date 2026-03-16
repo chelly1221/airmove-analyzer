@@ -331,7 +331,7 @@ export default function ReportGeneration() {
     setMode("preview");
   }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite]);
 
-  // PDF 내보내기
+  // PDF 내보내기 + DB 저장
   const handleExportPDF = useCallback(async () => {
     setGenerating(true);
     setError(null);
@@ -343,12 +343,45 @@ export default function ReportGeneration() {
       if (!result.success && result.error && result.error !== "저장이 취소되었습니다") {
         setError(result.error);
       }
+      // 보고서 DB 저장
+      if (result.success && result.pdfBase64) {
+        const reportId = `rpt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const title = coverTitle;
+        const configJson = JSON.stringify({
+          template,
+          sections,
+          selectedFlightIds: Array.from(selectedFlightIds),
+          singleFlightId,
+        });
+        const metaJson = JSON.stringify(reportMetadata);
+        invoke("save_report", {
+          id: reportId,
+          title,
+          template,
+          radarName: radarSite?.name ?? "",
+          reportConfigJson: configJson,
+          pdfBase64: result.pdfBase64,
+          metadataJson: metaJson,
+        })
+          .then(() => {
+            useAppStore.getState().addSavedReport({
+              id: reportId,
+              title,
+              template,
+              radar_name: radarSite?.name ?? "",
+              created_at: Math.floor(Date.now() / 1000),
+              has_pdf: true,
+            });
+            console.log(`[Report] 보고서 DB 저장: ${reportId}`);
+          })
+          .catch((e) => console.warn("[Report] DB 저장 실패:", e));
+      }
     } catch (err) {
       setError(`PDF 내보내기 실패: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setGenerating(false);
     }
-  }, [template, exportPDF]);
+  }, [template, exportPDF, coverTitle, sections, selectedFlightIds, singleFlightId, reportMetadata, radarSite]);
 
   // 활성 섹션 번호 계산
   const sectionNumbers = useMemo(() => {

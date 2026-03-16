@@ -49,7 +49,7 @@ const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
   mode_s_allcall:       [56, 189, 248],   // sky blue (하늘색)
   mode_s_allcall_psr:   [132, 204, 22],   // lime green (연두색)
   mode_s_rollcall:      [59, 130, 246],   // blue (파란색)
-  mode_s_rollcall_psr:  [59, 130, 246],   // blue (파란색)
+  mode_s_rollcall_psr:  [34, 197, 94],    // green (초록색)
 };
 
 
@@ -144,8 +144,10 @@ export default function TrackMap() {
   const [trailDropOpen, setTrailDropOpen] = useState(false);
 
   // 레이더 커버리지 (범위 슬라이더: min~max)
-  const [coverageAlt, setCoverageAlt] = useState(10000); // 커버리지 고도 (ft)
-  const [coverageAltInput, setCoverageAltInput] = useState(10000); // 디바운스용 입력값
+  const [coverageAlt, setCoverageAlt] = useState(10000); // 커버리지 최대 고도 (ft)
+  const [coverageAltMin, setCoverageAltMin] = useState(COVERAGE_MIN_ALT_FT); // 커버리지 최소 고도 (ft)
+  const [coverageAltInput, setCoverageAltInput] = useState(10000); // 디바운스용 최대 입력값
+  const [coverageAltMinInput, setCoverageAltMinInput] = useState(COVERAGE_MIN_ALT_FT); // 디바운스용 최소 입력값
   const [terrainProfile, setTerrainProfile] = useState<CoverageTerrainProfile | null>(null);
   const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
   const coverageVisible = useAppStore((s) => s.coverageVisible);
@@ -163,6 +165,7 @@ export default function TrackMap() {
   const coverageAltRef = useRef<HTMLDivElement>(null);
   const [coverageModalOpen, setCoverageModalOpen] = useState(false);
   const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const coverageAltMinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // LOS Analysis state
   const [losMode, setLosMode] = useState(false);
@@ -597,7 +600,7 @@ export default function TrackMap() {
     };
 
     const dots: { position: [number, number]; cover: number }[] = [];
-    const MAX_DOTS_PER_CELL = 40; // 운량 100%일 때 최대 점 수
+    const MAX_DOTS_PER_CELL = 25; // 운량 100%일 때 최대 점 수
 
     for (const c of frame.cells) {
       if (c.cloud_cover <= 10) continue;
@@ -644,7 +647,7 @@ export default function TrackMap() {
       // 구름 그리드 (200km 반경, 50km 간격, 일 단위 캐싱)
       const grid = await fetchCloudGrid(
         radarSite.latitude, radarSite.longitude,
-        200, 50, startDate, endDate,
+        200, 10, startDate, endDate,
         (_pct, msg) => setCloudGridProgress(msg),
       );
       setCloudGrid(grid);
@@ -697,11 +700,16 @@ export default function TrackMap() {
     }
   }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
 
-  // 슬라이더 디바운스: 입력값 변경 → 300ms 후 실제 고도 반영
+  // 슬라이더 디바운스: 입력값 변경 → 150ms 후 실제 고도 반영
   const handleCoverageAltChange = useCallback((val: number) => {
     setCoverageAltInput(val);
     if (coverageAltTimerRef.current) clearTimeout(coverageAltTimerRef.current);
     coverageAltTimerRef.current = setTimeout(() => setCoverageAlt(val), 150);
+  }, []);
+  const handleCoverageAltMinChange = useCallback((val: number) => {
+    setCoverageAltMinInput(val);
+    if (coverageAltMinTimerRef.current) clearTimeout(coverageAltMinTimerRef.current);
+    coverageAltMinTimerRef.current = setTimeout(() => setCoverageAltMin(val), 150);
   }, []);
 
   // ESC 키로 모달 닫기
@@ -713,26 +721,28 @@ export default function TrackMap() {
     return () => window.removeEventListener("keydown", handleEscape);
   }, [coverageModalOpen]);
 
-  // 고도 슬라이더 변경 시 레이어들 재계산 (100ft ~ 선택 고도까지 전부 겹침)
+  // 고도 슬라이더 변경 시 레이어들 재계산 (최소~최대 고도 범위 겹침)
   useEffect(() => {
     const profile = terrainProfile || getCachedTerrainProfile();
     if (!profile || !coverageVisible) return;
 
-    const range = coverageAlt - COVERAGE_MIN_ALT_FT;
+    const effMin = Math.min(coverageAltMin, coverageAlt);
+    const effMax = Math.max(coverageAltMin, coverageAlt);
+    const range = effMax - effMin;
     let step: number;
     if (range <= 2000) step = COVERAGE_ALT_STEP_FT;
     else if (range <= 5000) step = 500;
     else step = 1000;
 
     const layers: CoverageLayer[] = [];
-    for (let alt = COVERAGE_MIN_ALT_FT; alt <= coverageAlt; alt += step) {
+    for (let alt = effMin; alt <= effMax; alt += step) {
       layers.push(computeLayerFromProfile(profile, alt));
     }
-    if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== coverageAlt) {
-      layers.push(computeLayerFromProfile(profile, coverageAlt));
+    if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== effMax) {
+      layers.push(computeLayerFromProfile(profile, effMax));
     }
     setCoverageLayers(layers);
-  }, [coverageAlt, terrainProfile, coverageVisible]);
+  }, [coverageAlt, coverageAltMin, terrainProfile, coverageVisible]);
 
   // Mode-S별 트랙 패스 데이터 (gap + radar_type 변경 시 분할)
   /** 1포인트 항적용 데이터 */
@@ -1473,10 +1483,10 @@ export default function TrackMap() {
           id: "cloud-overlay",
           data: cloudDots,
           getPosition: (d: any) => d.position,
-          getRadius: 600,
+          getRadius: 300,
           radiusUnits: "meters" as const,
-          radiusMinPixels: 1.5,
-          radiusMaxPixels: 4,
+          radiusMinPixels: 1,
+          radiusMaxPixels: 2.5,
           getFillColor: (d: any) => {
             const alpha = Math.min(200, 80 + Math.round(d.cover * 1.2));
             return [30, 30, 40, alpha];
@@ -2113,35 +2123,60 @@ export default function TrackMap() {
                       </button>
                     </div>
 
-                    {/* 고도 슬라이더 */}
+                    {/* 고도 범위 슬라이더 */}
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
-                        <label htmlFor="coverage-altitude-slider" className="text-xs text-gray-600">표시 고도</label>
+                        <label className="text-xs text-gray-600">표시 고도 범위</label>
                         <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-xs font-semibold text-[#a60739]">
-                          {coverageAltInput.toLocaleString()}ft ({Math.round(coverageAltInput * 0.3048).toLocaleString()}m)
+                          {coverageAltMinInput.toLocaleString()}ft ~ {coverageAltInput.toLocaleString()}ft
                         </span>
                       </div>
-                      <div className="relative h-6">
-                        <div className="absolute top-1/2 left-0 right-0 h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
-                        <div
-                          className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
-                          style={{ left: "0%", right: `${100 - ((coverageAltInput - COVERAGE_MIN_ALT_FT) / (COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT)) * 100}%` }}
-                        />
-                        <input
-                          id="coverage-altitude-slider"
-                          type="range"
-                          min={COVERAGE_MIN_ALT_FT}
-                          max={COVERAGE_MAX_ALT_FT}
-                          step={COVERAGE_ALT_STEP_FT}
-                          value={coverageAltInput}
-                          onChange={(e) => handleCoverageAltChange(Number(e.target.value))}
-                          className="absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer"
-                          aria-valuemin={COVERAGE_MIN_ALT_FT}
-                          aria-valuemax={COVERAGE_MAX_ALT_FT}
-                          aria-valuenow={coverageAltInput}
-                          aria-valuetext={`${coverageAltInput.toLocaleString()}ft`}
-                        />
-                      </div>
+                      {(() => {
+                        const totalRange = COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT;
+                        const pctMin = ((Math.min(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
+                        const pctMax = ((Math.max(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
+                        return (
+                          <div className="relative h-6">
+                            {/* 트랙 배경 */}
+                            <div className="absolute top-1/2 left-0 right-0 h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
+                            {/* 활성 범위 */}
+                            <div
+                              className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
+                              style={{ left: `${pctMin}%`, right: `${100 - pctMax}%` }}
+                            />
+                            {/* 최소 핸들 */}
+                            <input
+                              type="range"
+                              min={COVERAGE_MIN_ALT_FT}
+                              max={COVERAGE_MAX_ALT_FT}
+                              step={COVERAGE_ALT_STEP_FT}
+                              value={coverageAltMinInput}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                handleCoverageAltMinChange(Math.min(v, coverageAltInput));
+                              }}
+                              style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 30 : 20 }}
+                              className="coverage-range-thumb absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:relative [&::-moz-range-thumb]:pointer-events-auto"
+                              aria-label="최소 고도"
+                            />
+                            {/* 최대 핸들 */}
+                            <input
+                              type="range"
+                              min={COVERAGE_MIN_ALT_FT}
+                              max={COVERAGE_MAX_ALT_FT}
+                              step={COVERAGE_ALT_STEP_FT}
+                              value={coverageAltInput}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                handleCoverageAltChange(Math.max(v, coverageAltMinInput));
+                              }}
+                              style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 20 : 30 }}
+                              className="coverage-range-thumb absolute top-0 left-0 h-full w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:relative [&::-moz-range-thumb]:pointer-events-auto"
+                              aria-label="최대 고도"
+                            />
+                          </div>
+                        );
+                      })()}
                       <div className="flex justify-between text-[9px] text-gray-400">
                         <span>{COVERAGE_MIN_ALT_FT.toLocaleString()}ft</span>
                         <span>{COVERAGE_MAX_ALT_FT.toLocaleString()}ft</span>
@@ -2301,15 +2336,17 @@ export default function TrackMap() {
                 )}
                 {coverageVisible && coverageLayers.length > 0 && (() => {
                   const fmtAlt = (ft: number) => ft >= 1000 ? `${(ft / 1000).toFixed(ft % 1000 === 0 ? 0 : 1)}kft` : `${ft}ft`;
-                  const colorMin = altToColor(COVERAGE_MIN_ALT_FT);
-                  const colorMax = altToColor(coverageAlt);
+                  const effMin = Math.min(coverageAltMin, coverageAlt);
+                  const effMax = Math.max(coverageAltMin, coverageAlt);
+                  const colorMin = altToColor(effMin);
+                  const colorMax = altToColor(effMax);
                   return (
                     <div className="flex items-center gap-1.5">
                       <span className="inline-flex h-3 w-5 rounded-sm overflow-hidden">
                         <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMin})`, opacity: 0.7 }} />
                         <span className="w-1/2 h-full" style={{ backgroundColor: `rgb(${colorMax})`, opacity: 0.7 }} />
                       </span>
-                      <span className="text-gray-600">커버리지 (~{fmtAlt(coverageAlt)})</span>
+                      <span className="text-gray-600">커버리지 ({fmtAlt(effMin)}~{fmtAlt(effMax)})</span>
                     </div>
                   );
                 })()}

@@ -538,7 +538,7 @@ pub struct ManualBuilding {
     pub memo: String,
     /// 도형 유형: "point" | "rectangle" | "circle" | "line"
     pub geometry_type: String,
-    /// 도형 좌표 JSON (rectangle: [[minLat,minLon],[maxLat,maxLon]], circle: {center:[lat,lon],semi_major_m,semi_minor_m,rotation_deg}, line: [[lat,lon],...])
+    /// 도형 좌표 JSON (rectangle: [[lat,lon]x4] 4꼭짓점 (레거시: [[minLat,minLon],[maxLat,maxLon]]), circle: {center:[lat,lon],semi_major_m,semi_minor_m,rotation_deg}, line: [[lat,lon],...])
     pub geometry_json: Option<String>,
 }
 
@@ -828,9 +828,28 @@ fn expand_manual_building_geometry(
 
     match geo_type {
         "rectangle" => {
-            // [[minLat, minLon], [maxLat, maxLon]]
             if let Some(arr) = val.as_array() {
-                if arr.len() == 2 {
+                if arr.len() == 4 {
+                    // 4꼭짓점 형식: [[lat1,lon1],[lat2,lon2],[lat3,lon3],[lat4,lon4]]
+                    let corners: Vec<(f64, f64)> = arr.iter().filter_map(|p| {
+                        let lat = p.get(0).and_then(|v| v.as_f64())?;
+                        let lon = p.get(1).and_then(|v| v.as_f64())?;
+                        Some((lat, lon))
+                    }).collect();
+                    if corners.len() == 4 {
+                        let mid_lat = corners.iter().map(|c| c.0).sum::<f64>() / 4.0;
+                        let mid_lon = corners.iter().map(|c| c.1).sum::<f64>() / 4.0;
+                        let mut pts = corners.clone();
+                        // 변 중점 4개
+                        for i in 0..4 {
+                            let j = (i + 1) % 4;
+                            pts.push(((corners[i].0 + corners[j].0) / 2.0, (corners[i].1 + corners[j].1) / 2.0));
+                        }
+                        pts.push((mid_lat, mid_lon));
+                        return pts;
+                    }
+                } else if arr.len() == 2 {
+                    // 레거시: [[minLat, minLon], [maxLat, maxLon]]
                     let min_lat = arr[0].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
                     let min_lon = arr[0].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
                     let max_lat = arr[1].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);

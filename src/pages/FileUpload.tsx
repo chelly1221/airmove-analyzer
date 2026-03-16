@@ -19,6 +19,7 @@ import {
   Circle,
   Minus,
   ChevronRight,
+  RotateCw,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -88,6 +89,48 @@ function perpDistM(pt: [number, number], p1: [number, number], p2: [number, numb
   return cross / len;
 }
 
+/** 두 점(한 변) + 마우스 위치에서 사각형 4꼭짓점 계산 (수직 오프셋) */
+function rectCornersFromEdge(
+  p1: [number, number], p2: [number, number], mouse: [number, number],
+): [[number, number], [number, number], [number, number], [number, number]] {
+  const cosLat = Math.cos((p1[0] * Math.PI) / 180);
+  // 변 방향 벡터 (미터 단위)
+  const edgeX = (p2[1] - p1[1]) * 111320 * cosLat;
+  const edgeY = (p2[0] - p1[0]) * 111320;
+  const edgeLen = Math.sqrt(edgeX * edgeX + edgeY * edgeY);
+  if (edgeLen < 0.01) return [p1, p2, p2, p1];
+  // 수직 단위 벡터 (좌측)
+  const nx = -edgeY / edgeLen;
+  const ny = edgeX / edgeLen;
+  // 마우스→p1 벡터
+  const mx = (mouse[1] - p1[1]) * 111320 * cosLat;
+  const my = (mouse[0] - p1[0]) * 111320;
+  // 수직 성분 (부호 유지)
+  const proj = mx * nx + my * ny;
+  // 오프셋을 위경도로 변환
+  const dLon = (proj * nx) / (111320 * cosLat);
+  const dLat = (proj * ny) / 111320;
+  return [
+    p1,
+    p2,
+    [p2[0] + dLat, p2[1] + dLon],
+    [p1[0] + dLat, p1[1] + dLon],
+  ];
+}
+
+/** 4꼭짓점을 GeoJSON polygon 좌표로 변환 */
+function cornersToPolygonCoords(
+  corners: [[number, number], [number, number], [number, number], [number, number]],
+): [number, number][] {
+  return [
+    [corners[0][1], corners[0][0]],
+    [corners[1][1], corners[1][0]],
+    [corners[2][1], corners[2][0]],
+    [corners[3][1], corners[3][0]],
+    [corners[0][1], corners[0][0]], // close ring
+  ];
+}
+
 /** 타원을 GeoJSON polygon 좌표로 변환 */
 function ellipseToPolygon(
   center: [number, number],
@@ -133,6 +176,8 @@ function BuildingModal({
   // 그리기 임시 상태: 클릭 포인트 축적 + 마우스 현재 위치
   const [clickPts, setClickPts] = useState<[number, number][]>([]); // [lat, lon][]
   const [mousePt, setMousePt] = useState<[number, number] | null>(null);
+  // 타원 회전 모드
+  const [rotatingEllipse, setRotatingEllipse] = useState(false);
 
   useEffect(() => {
     if (initial) {
@@ -153,6 +198,7 @@ function BuildingModal({
     }
     setClickPts([]);
     setMousePt(null);
+    setRotatingEllipse(false);
   }, [initial, isOpen]);
 
   const handleSubmit = () => {
@@ -164,6 +210,7 @@ function BuildingModal({
   useEffect(() => {
     setClickPts([]);
     setMousePt(null);
+    setRotatingEllipse(false);
   }, [drawTool]);
 
   // 도형 확정 후 맵 자동 fit bounds (사각형/원/타원/선)
@@ -171,7 +218,17 @@ function BuildingModal({
     if (!miniMapRef.current || !form.geometry_json || clickPts.length > 0) return;
     try {
       if (form.geometry_type === "rectangle") {
-        const [[minLat, minLon], [maxLat, maxLon]] = JSON.parse(form.geometry_json);
+        const parsed = JSON.parse(form.geometry_json);
+        let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+        const pts: [number, number][] = parsed.length === 2
+          ? [parsed[0], parsed[1]] // legacy [[minLat,minLon],[maxLat,maxLon]]
+          : parsed; // 4-corner
+        for (const [lat, lon] of pts) {
+          if (lat < minLat) minLat = lat;
+          if (lat > maxLat) maxLat = lat;
+          if (lon < minLon) minLon = lon;
+          if (lon > maxLon) maxLon = lon;
+        }
         miniMapRef.current.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 50, maxZoom: 18, duration: 500 });
       } else if (form.geometry_type === "circle") {
         const gj = JSON.parse(form.geometry_json);
@@ -198,18 +255,16 @@ function BuildingModal({
     } catch { /* ignore parse errors */ }
   }, [form.geometry_json, form.geometry_type, clickPts.length]);
 
-  /** form에 사각형 반영 (clickPts는 건드리지 않음) */
-  const applyRect = useCallback((c1: [number, number], c2: [number, number]) => {
-    const minLat = Math.min(c1[0], c2[0]);
-    const maxLat = Math.max(c1[0], c2[0]);
-    const minLon = Math.min(c1[1], c2[1]);
-    const maxLon = Math.max(c1[1], c2[1]);
+  /** form에 사각형 반영 — 4꼭짓점 저장 */
+  const applyRect4 = useCallback((corners: [[number, number], [number, number], [number, number], [number, number]]) => {
+    const cLat = corners.reduce((s, c) => s + c[0], 0) / 4;
+    const cLon = corners.reduce((s, c) => s + c[1], 0) / 4;
     setForm((f) => ({
       ...f,
-      latitude: ((minLat + maxLat) / 2).toFixed(6),
-      longitude: ((minLon + maxLon) / 2).toFixed(6),
+      latitude: cLat.toFixed(6),
+      longitude: cLon.toFixed(6),
       geometry_type: "rectangle" as GeometryType,
-      geometry_json: JSON.stringify([[minLat, minLon], [maxLat, maxLon]]),
+      geometry_json: JSON.stringify(corners),
     }));
   }, []);
 
@@ -236,6 +291,18 @@ function BuildingModal({
     const lon: number = lngLat.lng;
     const pt: [number, number] = [lat, lon];
 
+    // 타원 회전 모드: 클릭으로 회전 확정
+    if (rotatingEllipse && form.geometry_type === "circle" && form.geometry_json) {
+      try {
+        const gj = JSON.parse(form.geometry_json);
+        const center: [number, number] = gj.center;
+        const newRot = bearing(center[0], center[1], lat, lon);
+        applyEllipse(center, gj.semi_major_m ?? gj.radius_m, gj.semi_minor_m ?? gj.semi_major_m ?? gj.radius_m, newRot);
+      } catch { /* ignore */ }
+      setRotatingEllipse(false);
+      return;
+    }
+
     if (drawTool === "point") {
       setForm((f) => ({
         ...f,
@@ -249,9 +316,11 @@ function BuildingModal({
 
     if (drawTool === "rectangle") {
       setClickPts((prev) => {
-        if (prev.length === 0) return [pt];
-        // 두 번째 클릭 → 확정
-        applyRect(prev[0], pt);
+        if (prev.length === 0) return [pt]; // 1클릭: 첫 번째 꼭짓점
+        if (prev.length === 1) return [prev[0], pt]; // 2클릭: 한 변 확정
+        // 3클릭: 수직으로 당겨서 사각형 확정
+        const corners = rectCornersFromEdge(prev[0], prev[1], pt);
+        applyRect4(corners);
         return [];
       });
       return;
@@ -303,7 +372,7 @@ function BuildingModal({
         return updated;
       });
     }
-  }, [drawTool, applyRect, applyEllipse]);
+  }, [drawTool, applyRect4, applyEllipse, rotatingEllipse, form.geometry_type, form.geometry_json]);
 
   // 라인 더블클릭으로 완료
   const handleMapDblClick = useCallback((evt: any) => {
@@ -321,16 +390,26 @@ function BuildingModal({
   // ── GeoJSON 미리보기 생성 ──
 
   const previewGeoJson = useMemo(() => {
-    // 사각형 미리보기: 1포인트 + 마우스
+    // 사각형 미리보기: 1포인트 → 선 미리보기, 2포인트 → 사각형 미리보기
     if (drawTool === "rectangle" && clickPts.length === 1 && mousePt) {
-      const c1 = clickPts[0], c2 = mousePt;
-      const minLat = Math.min(c1[0], c2[0]), maxLat = Math.max(c1[0], c2[0]);
-      const minLon = Math.min(c1[1], c2[1]), maxLon = Math.max(c1[1], c2[1]);
+      // 한 변 미리보기 (선)
+      return {
+        type: "Feature" as const,
+        geometry: {
+          type: "LineString" as const,
+          coordinates: [[clickPts[0][1], clickPts[0][0]], [mousePt[1], mousePt[0]]],
+        },
+        properties: {},
+      };
+    }
+    if (drawTool === "rectangle" && clickPts.length === 2 && mousePt) {
+      // 수직으로 당기는 사각형 미리보기
+      const corners = rectCornersFromEdge(clickPts[0], clickPts[1], mousePt);
       return {
         type: "Feature" as const,
         geometry: {
           type: "Polygon" as const,
-          coordinates: [[[minLon, minLat], [maxLon, minLat], [maxLon, maxLat], [minLon, maxLat], [minLon, minLat]]],
+          coordinates: [cornersToPolygonCoords(corners)],
         },
         properties: {},
       };
@@ -364,18 +443,47 @@ function BuildingModal({
       }
     }
 
+    // 타원 회전 모드 미리보기
+    if (rotatingEllipse && drawTool === "circle" && form.geometry_type === "circle" && form.geometry_json && mousePt) {
+      try {
+        const gj = JSON.parse(form.geometry_json);
+        const center: [number, number] = gj.center;
+        const semiMajor: number = gj.semi_major_m ?? gj.radius_m ?? 100;
+        const semiMinor: number = gj.semi_minor_m ?? semiMajor;
+        const newRot = bearing(center[0], center[1], mousePt[0], mousePt[1]);
+        return {
+          type: "Feature" as const,
+          geometry: { type: "Polygon" as const, coordinates: [ellipseToPolygon(center, semiMajor, semiMinor, newRot)] },
+          properties: {},
+        };
+      } catch { /* ignore */ }
+    }
+
     // 확정된 도형 표시
     if (form.geometry_type === "rectangle" && form.geometry_json) {
       try {
-        const [[minLat, minLon], [maxLat, maxLon]] = JSON.parse(form.geometry_json);
-        return {
-          type: "Feature" as const,
-          geometry: {
-            type: "Polygon" as const,
-            coordinates: [[[minLon, minLat], [maxLon, minLat], [maxLon, maxLat], [minLon, maxLat], [minLon, minLat]]],
-          },
-          properties: {},
-        };
+        const parsed = JSON.parse(form.geometry_json);
+        if (Array.isArray(parsed) && parsed.length === 4) {
+          // 4꼭짓점 형식
+          const coords = cornersToPolygonCoords(parsed as [[number, number], [number, number], [number, number], [number, number]]);
+          return {
+            type: "Feature" as const,
+            geometry: { type: "Polygon" as const, coordinates: [coords] },
+            properties: {},
+          };
+        }
+        if (Array.isArray(parsed) && parsed.length === 2) {
+          // 레거시 축 정렬 형식
+          const [[minLat, minLon], [maxLat, maxLon]] = parsed;
+          return {
+            type: "Feature" as const,
+            geometry: {
+              type: "Polygon" as const,
+              coordinates: [[[minLon, minLat], [maxLon, minLat], [maxLon, maxLat], [minLon, maxLat], [minLon, minLat]]],
+            },
+            properties: {},
+          };
+        }
       } catch { /* ignore */ }
     }
     if (form.geometry_type === "circle" && form.geometry_json) {
@@ -405,7 +513,7 @@ function BuildingModal({
       } catch { /* ignore */ }
     }
     return null;
-  }, [drawTool, clickPts, mousePt, form.geometry_type, form.geometry_json]);
+  }, [drawTool, clickPts, mousePt, form.geometry_type, form.geometry_json, rotatingEllipse]);
 
   // 라인 그리기 중 진행 미리보기 (확정 전 점선)
   const linePreviewGeoJson = useMemo(() => {
@@ -419,8 +527,23 @@ function BuildingModal({
     };
   }, [drawTool, clickPts, mousePt]);
 
-  // 타원 장축선 미리보기 (3단계 시)
+  // 타원 장축선 미리보기 (3단계 시) + 회전 모드 가이드선
   const majorAxisGeoJson = useMemo(() => {
+    // 회전 모드: 중심→마우스 가이드선
+    if (rotatingEllipse && form.geometry_type === "circle" && form.geometry_json && mousePt) {
+      try {
+        const gj = JSON.parse(form.geometry_json);
+        const center: [number, number] = gj.center;
+        return {
+          type: "Feature" as const,
+          geometry: {
+            type: "LineString" as const,
+            coordinates: [[center[1], center[0]], [mousePt[1], mousePt[0]]],
+          },
+          properties: {},
+        };
+      } catch { /* ignore */ }
+    }
     if (drawTool !== "circle" || clickPts.length !== 2) return null;
     const [center, majorEnd] = clickPts;
     return {
@@ -431,13 +554,29 @@ function BuildingModal({
       },
       properties: {},
     };
+  }, [drawTool, clickPts, rotatingEllipse, form.geometry_type, form.geometry_json, mousePt]);
+
+  // 사각형 한 변 미리보기 (2클릭 후 edge 표시)
+  const rectEdgeGeoJson = useMemo(() => {
+    if (drawTool !== "rectangle" || clickPts.length !== 2) return null;
+    return {
+      type: "Feature" as const,
+      geometry: {
+        type: "LineString" as const,
+        coordinates: [[clickPts[0][1], clickPts[0][0]], [clickPts[1][1], clickPts[1][0]]],
+      },
+      properties: {},
+    };
   }, [drawTool, clickPts]);
 
   // 힌트 텍스트
   const hintText = useMemo(() => {
+    if (rotatingEllipse) return "클릭하여 회전 확정";
     if (drawTool === "point") return "클릭하여 위치 지정";
     if (drawTool === "rectangle") {
-      return clickPts.length === 0 ? "첫 번째 꼭짓점 클릭" : "대각 꼭짓점 클릭";
+      if (clickPts.length === 0) return "첫 번째 꼭짓점 클릭";
+      if (clickPts.length === 1) return "두 번째 꼭짓점 클릭 (한 변)";
+      return "당겨서 사각형 확정";
     }
     if (drawTool === "circle") {
       if (clickPts.length === 0) return "중심점 클릭";
@@ -446,7 +585,7 @@ function BuildingModal({
     }
     if (drawTool === "line") return clickPts.length === 0 ? "첫 번째 꼭짓점 클릭" : "다음 꼭짓점 클릭";
     return "";
-  }, [drawTool, clickPts.length]);
+  }, [drawTool, clickPts.length, rotatingEllipse]);
 
   const markerLat = parseFloat(form.latitude);
   const markerLon = parseFloat(form.longitude);
@@ -638,6 +777,24 @@ function BuildingModal({
                 원으로 확정
               </button>
             )}
+            {/* 타원 회전 버튼: 확정된 타원이 있고 그리기 중이 아닐 때 */}
+            {drawTool === "circle" && clickPts.length === 0 && form.geometry_type === "circle" && form.geometry_json && !rotatingEllipse && (
+              <button
+                onClick={() => setRotatingEllipse(true)}
+                className="ml-1 flex items-center gap-1 rounded-lg bg-gray-100 px-2.5 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-200 transition-colors"
+              >
+                <RotateCw size={12} />
+                회전
+              </button>
+            )}
+            {rotatingEllipse && (
+              <button
+                onClick={() => setRotatingEllipse(false)}
+                className="ml-1 rounded-lg bg-[#a60739] px-2.5 py-1.5 text-xs font-medium text-white hover:bg-[#85062e] transition-colors"
+              >
+                회전 취소
+              </button>
+            )}
             {clickPts.length > 0 && (
               <button
                 onClick={() => {
@@ -717,7 +874,7 @@ function BuildingModal({
                 />
               </Source>
 
-              {/* 타원 장축선 (3단계 시) */}
+              {/* 타원 장축선 (3단계 / 회전 모드) */}
               <Source
                 id="major-axis"
                 type="geojson"
@@ -727,6 +884,19 @@ function BuildingModal({
                   id="major-axis-line"
                   type="line"
                   paint={{ "line-color": "#a60739", "line-width": 1.5, "line-dasharray": [6, 4] }}
+                />
+              </Source>
+
+              {/* 사각형 한 변 확정선 */}
+              <Source
+                id="rect-edge"
+                type="geojson"
+                data={(rectEdgeGeoJson ?? { type: "FeatureCollection", features: [] }) as any}
+              >
+                <Layer
+                  id="rect-edge-line"
+                  type="line"
+                  paint={{ "line-color": "#a60739", "line-width": 2, "line-dasharray": [6, 4] }}
                 />
               </Source>
 
@@ -922,6 +1092,8 @@ export default function FileUpload() {
   const addUploadedFile = useAppStore((s) => s.addUploadedFile);
   const updateUploadedFile = useAppStore((s) => s.updateUploadedFile);
   const clearUploadedFiles = useAppStore((s) => s.clearUploadedFiles);
+  const removeUploadedFile = useAppStore((s) => s.removeUploadedFile);
+  const removeUploadedFiles = useAppStore((s) => s.removeUploadedFiles);
   const appendRawTrackPoints = useAppStore((s) => s.appendRawTrackPoints);
   const addParseStats = useAppStore((s) => s.addParseStats);
   const rawTrackPoints = useAppStore((s) => s.rawTrackPoints);
@@ -1030,6 +1202,38 @@ export default function FileUpload() {
       runConsolidation();
     });
   }, [registeredTrackRanges]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // DB에서 rawTrackPoints + garblePoints 재로드 후 비행 재통합
+  const reloadAndReconsolidate = useCallback(async () => {
+    try {
+      const data = await invoke<any>("load_saved_data");
+      if (data?.track_points?.length > 0) {
+        useAppStore.setState({ rawTrackPoints: data.track_points });
+        if (data.garble_points) {
+          useAppStore.setState({ garblePoints: data.garble_points });
+        }
+      } else {
+        useAppStore.setState({ rawTrackPoints: [], garblePoints: [], flights: [] });
+      }
+    } catch {
+      useAppStore.setState({ rawTrackPoints: [], garblePoints: [], flights: [] });
+    }
+    // 약간의 딜레이 후 재통합 (state 반영 대기)
+    setTimeout(() => runConsolidation(), 50);
+  }, [runConsolidation]);
+
+  // 개별 파일 삭제
+  const handleDeleteFile = useCallback(async (filePath: string) => {
+    removeUploadedFile(filePath);
+    await reloadAndReconsolidate();
+  }, [removeUploadedFile, reloadAndReconsolidate]);
+
+  // 레이더별 그룹 삭제
+  const handleDeleteGroup = useCallback(async (groupFiles: UploadedFile[]) => {
+    const paths = groupFiles.map((f) => f.path);
+    removeUploadedFiles(paths);
+    await reloadAndReconsolidate();
+  }, [removeUploadedFiles, reloadAndReconsolidate]);
 
   const handleFilePick = async () => {
     try {
@@ -1306,6 +1510,15 @@ export default function FileUpload() {
                       <span className="text-[10px] text-gray-400">
                         {files.length}개{!isPending && doneCount > 0 && ` · ${doneCount}건 완료`}
                       </span>
+                      <span className="flex-1" />
+                      <span
+                        role="button"
+                        onClick={(e) => { e.stopPropagation(); handleDeleteGroup(files); }}
+                        className="shrink-0 rounded p-1 text-gray-300 hover:bg-red-50 hover:text-red-500 transition-colors"
+                        title={isPending ? "대기 파일 삭제" : `${groupLabel} 전체 삭제`}
+                      >
+                        <Trash2 size={12} />
+                      </span>
                     </button>
                     {/* 파일 목록 */}
                     {expanded && (
@@ -1328,7 +1541,7 @@ export default function FileUpload() {
                             >
                               {statusText(file)}
                             </span>
-                            {file.status === "pending" ? (
+                            {file.status === "pending" && (
                               <button
                                 onClick={() => requestParseSingle(file)}
                                 className="shrink-0 rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-900 transition-colors"
@@ -1336,9 +1549,14 @@ export default function FileUpload() {
                               >
                                 <Play size={12} />
                               </button>
-                            ) : (
-                              <span className="w-[22px] shrink-0" />
                             )}
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleDeleteFile(file.path); }}
+                              className="shrink-0 rounded p-1 text-gray-300 hover:bg-red-50 hover:text-red-500 transition-colors"
+                              title="삭제"
+                            >
+                              <Minus size={12} />
+                            </button>
                           </div>
                         ))}
                       </div>

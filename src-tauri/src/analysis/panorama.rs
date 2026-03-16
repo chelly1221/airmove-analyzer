@@ -375,16 +375,33 @@ fn expand_manual_geometry(
 
     match geo_type {
         "rectangle" => {
-            // [[minLat, minLon], [maxLat, maxLon]]
             if let Some(arr) = val.as_array() {
-                if arr.len() == 2 {
+                if arr.len() == 4 {
+                    // 4꼭짓점 형식
+                    let corners: Vec<(f64, f64)> = arr.iter().filter_map(|p| {
+                        let lat = p.get(0).and_then(|v| v.as_f64())?;
+                        let lon = p.get(1).and_then(|v| v.as_f64())?;
+                        Some((lat, lon))
+                    }).collect();
+                    if corners.len() == 4 {
+                        let mid_lat = corners.iter().map(|c| c.0).sum::<f64>() / 4.0;
+                        let mid_lon = corners.iter().map(|c| c.1).sum::<f64>() / 4.0;
+                        let mut pts = corners.clone();
+                        for i in 0..4 {
+                            let j = (i + 1) % 4;
+                            pts.push(((corners[i].0 + corners[j].0) / 2.0, (corners[i].1 + corners[j].1) / 2.0));
+                        }
+                        pts.push((mid_lat, mid_lon));
+                        return pts;
+                    }
+                } else if arr.len() == 2 {
+                    // 레거시: [[minLat, minLon], [maxLat, maxLon]]
                     let min_lat = arr[0].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
                     let min_lon = arr[0].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
                     let max_lat = arr[1].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
                     let max_lon = arr[1].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
                     let mid_lat = (min_lat + max_lat) / 2.0;
                     let mid_lon = (min_lon + max_lon) / 2.0;
-                    // 4 꼭짓점 + 4 변 중점 + 중심 = 9포인트
                     return vec![
                         (min_lat, min_lon), (min_lat, max_lon),
                         (max_lat, min_lon), (max_lat, max_lon),

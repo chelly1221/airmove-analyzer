@@ -7,12 +7,14 @@ import type {
   Flight,
   FlightRecord,
   GarblePoint,
+  GarbleSummaryCached,
   LOSProfileData,
   PageId,
   PanoramaPoint,
   ParseStatistics,
   RadarSite,
   ReportMetadata,
+  SavedReportSummary,
   TrackPoint,
   UploadedFile,
   WeatherSnapshot,
@@ -38,6 +40,8 @@ interface AppState {
   uploadedFiles: UploadedFile[];
   addUploadedFile: (f: UploadedFile) => void;
   updateUploadedFile: (path: string, update: Partial<UploadedFile>) => void;
+  removeUploadedFile: (path: string) => void;
+  removeUploadedFiles: (paths: string[]) => void;
   clearUploadedFiles: () => void;
 
   // 원시 데이터 (파싱 결과 축적)
@@ -161,6 +165,16 @@ interface AppState {
   reportMetadata: ReportMetadata;
   setReportMetadata: (meta: Partial<ReportMetadata>) => void;
 
+  // 저장된 보고서
+  savedReports: SavedReportSummary[];
+  setSavedReports: (reports: SavedReportSummary[]) => void;
+  addSavedReport: (report: SavedReportSummary) => void;
+  removeSavedReport: (id: string) => void;
+
+  // Garble 요약 캐시
+  garbleSummaries: GarbleSummaryCached[];
+  setGarbleSummaries: (summaries: GarbleSummaryCached[]) => void;
+
   // UI
   activePage: PageId;
   setActivePage: (page: PageId) => void;
@@ -170,7 +184,7 @@ interface AppState {
   setLoadingMessage: (msg: string) => void;
 }
 
-export const useAppStore = create<AppState>((set) => ({
+export const useAppStore = create<AppState>((set, get) => ({
   // 비행검사기 (프리셋)
   aircraft: [
     {
@@ -220,8 +234,41 @@ export const useAppStore = create<AppState>((set) => ({
         f.path === path ? { ...f, ...update } : f
       ),
     })),
+  removeUploadedFile: (path) => {
+    const file = get().uploadedFiles.find((f) => f.path === path);
+    if (file && file.status !== "pending") {
+      invoke("delete_parsed_file", { filePath: path }).catch((e) =>
+        console.warn("[DB] delete file failed:", e)
+      );
+    }
+    set((s) => ({
+      uploadedFiles: s.uploadedFiles.filter((f) => f.path !== path),
+      parseStatsList: s.parseStatsList.filter((ps) => ps.filename !== file?.name),
+    }));
+  },
+  removeUploadedFiles: (paths) => {
+    const dbPaths = paths.filter((p) => {
+      const f = get().uploadedFiles.find((uf) => uf.path === p);
+      return f && f.status !== "pending";
+    });
+    if (dbPaths.length > 0) {
+      invoke("delete_parsed_files", { filePaths: dbPaths }).catch((e) =>
+        console.warn("[DB] delete files failed:", e)
+      );
+    }
+    const pathSet = new Set(paths);
+    set((s) => ({
+      uploadedFiles: s.uploadedFiles.filter((f) => !pathSet.has(f.path)),
+      parseStatsList: s.parseStatsList.filter((ps) => {
+        const file = s.uploadedFiles.find((f) => f.name === ps.filename);
+        return !file || !pathSet.has(file.path);
+      }),
+    }));
+  },
   clearUploadedFiles: () => {
     invoke("clear_saved_data").catch((e) => console.warn("[DB] clear failed:", e));
+    invoke("clear_manual_merges").catch(() => {});
+    invoke("clear_garble_summaries").catch(() => {});
     set({
       uploadedFiles: [],
       rawTrackPoints: [],
@@ -230,6 +277,7 @@ export const useAppStore = create<AppState>((set) => ({
       selectedModeS: null,
       selectedFlightId: null,
       garblePoints: [],
+      garbleSummaries: [],
     });
   },
 
@@ -261,6 +309,11 @@ export const useAppStore = create<AppState>((set) => ({
     const merged = manualMergeFlights(selected, state.radarSite);
     const remaining = state.flights.filter((f) => !ids.includes(f.id));
     const flights = [...remaining, merged].sort((a, b) => a.start_time - b.start_time);
+    // DB에 병합 이력 저장
+    invoke("save_manual_merge", {
+      sourceFlightIdsJson: JSON.stringify(ids),
+      modeS,
+    }).catch((e) => console.warn("[Merge] DB 저장 실패:", e));
     return { flights };
   }),
 
@@ -324,15 +377,35 @@ export const useAppStore = create<AppState>((set) => ({
   selectedFlightId: null,
   setSelectedFlightId: (id) => set({ selectedFlightId: id }),
 
-  // LOS 분석
+  // LOS 분석 (DB 영속화)
   losResults: [],
-  addLOSResult: (r) =>
-    set((state) => ({ losResults: [...state.losResults, r] })),
-  removeLOSResult: (id) =>
+  addLOSResult: (r) => {
+    set((state) => ({ losResults: [...state.losResults, r] }));
+    invoke("save_los_result", {
+      id: r.id,
+      radarSiteName: r.radarSiteName,
+      radarLat: r.radarLat,
+      radarLon: r.radarLon,
+      radarHeight: r.radarHeight,
+      targetLat: r.targetLat,
+      targetLon: r.targetLon,
+      bearing: r.bearing,
+      totalDistance: r.totalDistance,
+      elevationProfileJson: JSON.stringify(r.elevationProfile),
+      losBlocked: r.losBlocked,
+      maxBlockingJson: r.maxBlockingPoint ? JSON.stringify(r.maxBlockingPoint) : null,
+    }).catch((e) => console.warn("[LOS] DB 저장 실패:", e));
+  },
+  removeLOSResult: (id) => {
     set((state) => ({
       losResults: state.losResults.filter((r) => r.id !== id),
-    })),
-  clearLOSResults: () => set({ losResults: [] }),
+    }));
+    invoke("delete_los_result", { id }).catch((e) => console.warn("[LOS] DB 삭제 실패:", e));
+  },
+  clearLOSResults: () => {
+    set({ losResults: [] });
+    invoke("clear_los_results").catch((e) => console.warn("[LOS] DB 초기화 실패:", e));
+  },
 
   // ADS-B
   adsbTracks: [],
@@ -397,7 +470,14 @@ export const useAppStore = create<AppState>((set) => ({
   setCoverageData: (data) => {
     set({ coverageData: data });
     if (data) {
-      persistSetting(`coverage_map_${data.radarName}`, data);
+      invoke("save_coverage_cache", {
+        radarName: data.radarName,
+        radarLat: data.radarLat,
+        radarLon: data.radarLon,
+        radarHeight: data.radarAltitude + data.antennaHeight,
+        maxElevDeg: data.maxElevDeg,
+        layersJson: JSON.stringify(data),
+      }).catch((e) => console.warn("[Coverage] DB 저장 실패:", e));
     }
   },
   coverageVisible: false,
@@ -442,6 +522,20 @@ export const useAppStore = create<AppState>((set) => ({
       persistSetting("report_metadata", updated);
       return { reportMetadata: updated };
     }),
+
+  // 저장된 보고서
+  savedReports: [],
+  setSavedReports: (reports) => set({ savedReports: reports }),
+  addSavedReport: (report) =>
+    set((state) => ({ savedReports: [report, ...state.savedReports] })),
+  removeSavedReport: (id) => {
+    set((state) => ({ savedReports: state.savedReports.filter((r) => r.id !== id) }));
+    invoke("delete_saved_report", { id }).catch((e) => console.warn("[Report] DB 삭제 실패:", e));
+  },
+
+  // Garble 요약 캐시
+  garbleSummaries: [],
+  setGarbleSummaries: (summaries) => set({ garbleSummaries: summaries }),
 
   // UI
   activePage: "upload",

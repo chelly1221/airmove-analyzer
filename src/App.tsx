@@ -12,7 +12,7 @@ import ReportGeneration from "./pages/ReportGeneration";
 import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
 import { Loader2 } from "lucide-react";
-import type { FlightRecord, GarblePoint, ParseStatistics, RadarSite, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
+import type { ElevationPoint, FlightRecord, GarblePoint, LOSProfileData, ParseStatistics, RadarSite, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
 import { consolidateFlights } from "./utils/flightConsolidation";
 
 /** DB 저장 데이터 타입 */
@@ -138,13 +138,82 @@ function useRestoreSavedData() {
 
         // flights 재생성 (flightHistory 로드 후 consolidateFlights)
         const state = useAppStore.getState();
-        const flights = consolidateFlights(
+        let flights = consolidateFlights(
           state.rawTrackPoints,
           state.flightHistory,
           state.aircraft,
           state.radarSite,
         );
+
+        // 수동 병합 이력 재적용
+        try {
+          const merges = await invoke<[string, string][]>("load_manual_merges");
+          if (merges.length > 0) {
+            console.log(`[Restore] 수동 병합 이력 ${merges.length}건 재적용`);
+            const { manualMergeFlights: doMerge } = await import("./utils/flightConsolidation");
+            for (const [idsJson, modeS] of merges) {
+              const sourceIds: string[] = JSON.parse(idsJson);
+              // 원래 비행을 mode_s + 시간 범위로 매칭 (ID가 달라졌을 수 있으므로)
+              const candidates = flights.filter(
+                (f) => f.mode_s.toUpperCase() === modeS.toUpperCase()
+              );
+              // sourceIds 중 현재 존재하는 비행만 매칭
+              const toMerge = candidates.filter((f) => sourceIds.includes(f.id));
+              if (toMerge.length >= 2) {
+                const merged = doMerge(toMerge, state.radarSite);
+                flights = flights.filter((f) => !toMerge.some((m) => m.id === f.id));
+                flights.push(merged);
+              }
+            }
+            flights.sort((a, b) => a.start_time - b.start_time);
+          }
+        } catch (e) {
+          console.log("[Restore] 수동 병합 복원 실패:", e);
+        }
+
         store.setFlights(flights);
+
+        // LOS 분석 결과 복원
+        try {
+          const losJson = await invoke<string>("load_los_results");
+          const losRows: Array<{
+            id: string;
+            radar_site_name: string;
+            radar_lat: number;
+            radar_lon: number;
+            radar_height: number;
+            target_lat: number;
+            target_lon: number;
+            bearing: number;
+            total_distance: number;
+            elevation_profile_json: string;
+            los_blocked: boolean;
+            max_blocking_json: string | null;
+            created_at: number;
+          }> = JSON.parse(losJson);
+          if (losRows.length > 0) {
+            const restored: LOSProfileData[] = losRows.map((r) => ({
+              id: r.id,
+              radarSiteName: r.radar_site_name,
+              radarLat: r.radar_lat,
+              radarLon: r.radar_lon,
+              radarHeight: r.radar_height,
+              targetLat: r.target_lat,
+              targetLon: r.target_lon,
+              bearing: r.bearing,
+              totalDistance: r.total_distance,
+              elevationProfile: JSON.parse(r.elevation_profile_json) as ElevationPoint[],
+              losBlocked: r.los_blocked,
+              maxBlockingPoint: r.max_blocking_json ? JSON.parse(r.max_blocking_json) : undefined,
+              timestamp: r.created_at,
+            }));
+            // 직접 set (addLOSResult은 DB 재저장을 유발하므로)
+            useAppStore.setState({ losResults: restored });
+            console.log(`[Restore] LOS 분석 결과 ${restored.length}건 복원`);
+          }
+        } catch (e) {
+          console.log("[Restore] LOS 결과 복원 실패:", e);
+        }
 
         // 4) 기상 데이터 DB 캐시 복원 (비행 시간 범위 기반)
         if (flights.length > 0) {

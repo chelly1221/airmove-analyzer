@@ -349,7 +349,7 @@ public/                 # 정적 자산
 격자 셀 좌표 + 운량 4종, 시간별 프레임 타임시리즈
 
 ### BuildingOnPath / ManualBuilding
-LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rectangle `[[minLat,minLon],[maxLat,maxLon]]`, circle/ellipse `{center,semi_major_m,semi_minor_m,rotation_deg}`, line `[[lat,lon],...]`, point `[lat,lon]`)
+LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rectangle `[[lat,lon]x4]` (4꼭짓점, 레거시: `[[minLat,minLon],[maxLat,maxLon]]`), circle/ellipse `{center,semi_major_m,semi_minor_m,rotation_deg}`, line `[[lat,lon],...]`, point `[lat,lon]`)
 
 ### PanoramaPoint
 방위별 최대 앙각 장애물 (거리, 높이, 유형, 이름, 주소, 용도)

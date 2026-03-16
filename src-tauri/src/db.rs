@@ -192,6 +192,73 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             ground_elev REAL NOT NULL DEFAULT 0,
             memo TEXT NOT NULL DEFAULT ''
         );
+
+        -- LOS 분석 결과 영속화
+        CREATE TABLE IF NOT EXISTS los_results (
+            id TEXT PRIMARY KEY,
+            radar_site_name TEXT NOT NULL,
+            radar_lat REAL NOT NULL,
+            radar_lon REAL NOT NULL,
+            radar_height REAL NOT NULL,
+            target_lat REAL NOT NULL,
+            target_lon REAL NOT NULL,
+            bearing REAL NOT NULL,
+            total_distance REAL NOT NULL,
+            elevation_profile_json TEXT NOT NULL,
+            los_blocked INTEGER NOT NULL,
+            max_blocking_json TEXT,
+            created_at INTEGER NOT NULL
+        );
+
+        -- 수동 비행 병합 이력
+        CREATE TABLE IF NOT EXISTS manual_merge_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_flight_ids_json TEXT NOT NULL,
+            mode_s TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        -- 커버리지 맵 캐시 (settings에서 분리)
+        CREATE TABLE IF NOT EXISTS coverage_cache (
+            radar_name TEXT PRIMARY KEY,
+            radar_lat REAL NOT NULL,
+            radar_lon REAL NOT NULL,
+            radar_height REAL NOT NULL,
+            max_elev_deg REAL NOT NULL,
+            layers_json TEXT NOT NULL,
+            computed_at INTEGER NOT NULL
+        );
+
+        -- Garble 요약 통계 캐시
+        CREATE TABLE IF NOT EXISTS garble_summary_cache (
+            mode_s TEXT PRIMARY KEY,
+            aircraft_name TEXT,
+            total_count INTEGER NOT NULL,
+            sidelobe_count INTEGER NOT NULL,
+            multipath_count INTEGER NOT NULL,
+            time_range_start REAL NOT NULL,
+            time_range_end REAL NOT NULL,
+            computed_at INTEGER NOT NULL
+        );
+
+        -- 저장된 보고서 (PDF 포함)
+        CREATE TABLE IF NOT EXISTS saved_reports (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            template TEXT NOT NULL,
+            radar_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            report_config_json TEXT NOT NULL,
+            pdf_base64 TEXT,
+            metadata_json TEXT
+        );
+
+        -- 기상-Garble 상관분석 캐시
+        CREATE TABLE IF NOT EXISTS weather_garble_correlation (
+            cache_key TEXT PRIMARY KEY,
+            result_json TEXT NOT NULL,
+            computed_at INTEGER NOT NULL
+        );
         ",
     )?;
 
@@ -712,6 +779,21 @@ pub fn clear_all_parsed_data(conn: &Connection) -> SqlResult<()> {
     Ok(())
 }
 
+/// 특정 파싱 파일 삭제 (CASCADE로 track_points/garble_points도 삭제)
+pub fn delete_parsed_file(conn: &Connection, file_path: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM parsed_files WHERE path = ?1", params![file_path])?;
+    Ok(())
+}
+
+/// 여러 파싱 파일 삭제 (경로 목록)
+pub fn delete_parsed_files(conn: &Connection, file_paths: &[String]) -> SqlResult<()> {
+    let mut stmt = conn.prepare("DELETE FROM parsed_files WHERE path = ?1")?;
+    for path in file_paths {
+        stmt.execute(params![path])?;
+    }
+    Ok(())
+}
+
 // ========== 고도 프로파일 캐시 ==========
 
 /// 캐시에서 고도 조회 (lat/lon을 소수점 4자리 문자열 키로 사용)
@@ -962,5 +1044,355 @@ pub fn clear_panorama_cache(
         "DELETE FROM panorama_cache WHERE radar_lat = ?1 AND radar_lon = ?2",
         params![lat_key, lon_key],
     )?;
+    Ok(())
+}
+
+// ========== LOS 분석 결과 영속화 ==========
+
+/// LOS 결과 저장
+pub fn save_los_result(
+    conn: &Connection,
+    id: &str,
+    radar_site_name: &str,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height: f64,
+    target_lat: f64,
+    target_lon: f64,
+    bearing: f64,
+    total_distance: f64,
+    elevation_profile_json: &str,
+    los_blocked: bool,
+    max_blocking_json: Option<&str>,
+) -> SqlResult<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO los_results (id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked as i32, max_blocking_json, now],
+    )?;
+    Ok(())
+}
+
+/// LOS 결과 전체 로드
+pub fn load_all_los_results(conn: &Connection) -> SqlResult<Vec<(String, String, f64, f64, f64, f64, f64, f64, f64, String, bool, Option<String>, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, created_at
+         FROM los_results ORDER BY created_at",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, f64>(6)?,
+                row.get::<_, f64>(7)?,
+                row.get::<_, f64>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i32>(10)? != 0,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, i64>(12)?,
+            ))
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// LOS 결과 삭제
+pub fn delete_los_result(conn: &Connection, id: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM los_results WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// LOS 결과 전체 삭제
+pub fn clear_all_los_results(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM los_results", [])?;
+    Ok(())
+}
+
+// ========== 수동 병합 이력 ==========
+
+/// 수동 병합 저장
+pub fn save_manual_merge(conn: &Connection, source_flight_ids_json: &str, mode_s: &str) -> SqlResult<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO manual_merge_history (source_flight_ids_json, mode_s, created_at) VALUES (?1, ?2, ?3)",
+        params![source_flight_ids_json, mode_s, now],
+    )?;
+    Ok(())
+}
+
+/// 수동 병합 이력 전체 로드
+pub fn load_manual_merges(conn: &Connection) -> SqlResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_flight_ids_json, mode_s FROM manual_merge_history ORDER BY created_at",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 수동 병합 이력 전체 삭제
+pub fn clear_manual_merges(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM manual_merge_history", [])?;
+    Ok(())
+}
+
+// ========== 커버리지 캐시 ==========
+
+/// 커버리지 캐시 저장
+pub fn save_coverage_cache(
+    conn: &Connection,
+    radar_name: &str,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height: f64,
+    max_elev_deg: f64,
+    layers_json: &str,
+) -> SqlResult<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO coverage_cache (radar_name, radar_lat, radar_lon, radar_height, max_elev_deg, layers_json, computed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![radar_name, radar_lat, radar_lon, radar_height, max_elev_deg, layers_json, now],
+    )?;
+    Ok(())
+}
+
+/// 커버리지 캐시 로드
+pub fn load_coverage_cache(conn: &Connection, radar_name: &str) -> SqlResult<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT layers_json FROM coverage_cache WHERE radar_name = ?1",
+    )?;
+    match stmt.query_row(params![radar_name], |row| row.get::<_, String>(0)) {
+        Ok(json) => Ok(Some(json)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 커버리지 캐시 삭제
+pub fn clear_coverage_cache(conn: &Connection, radar_name: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM coverage_cache WHERE radar_name = ?1", params![radar_name])?;
+    Ok(())
+}
+
+// ========== Garble 요약 캐시 ==========
+
+/// Garble 요약 저장 (전체 교체)
+pub fn save_garble_summaries(conn: &Connection, summaries_json: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM garble_summary_cache", [])?;
+
+    #[derive(serde::Deserialize)]
+    struct GarbleSummaryRow {
+        mode_s: String,
+        aircraft_name: Option<String>,
+        total_count: i64,
+        sidelobe_count: i64,
+        multipath_count: i64,
+        time_range_start: f64,
+        time_range_end: f64,
+    }
+
+    let summaries: Vec<GarbleSummaryRow> = serde_json::from_str(summaries_json)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    conn.execute_batch("BEGIN")?;
+    {
+        let mut stmt = conn.prepare(
+            "INSERT INTO garble_summary_cache (mode_s, aircraft_name, total_count, sidelobe_count, multipath_count, time_range_start, time_range_end, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for s in &summaries {
+            stmt.execute(params![s.mode_s, s.aircraft_name, s.total_count, s.sidelobe_count, s.multipath_count, s.time_range_start, s.time_range_end, now])?;
+        }
+    }
+    conn.execute_batch("COMMIT")?;
+    Ok(())
+}
+
+/// Garble 요약 로드
+pub fn load_garble_summaries(conn: &Connection) -> SqlResult<String> {
+    let mut stmt = conn.prepare(
+        "SELECT mode_s, aircraft_name, total_count, sidelobe_count, multipath_count, time_range_start, time_range_end FROM garble_summary_cache",
+    )?;
+
+    #[derive(serde::Serialize)]
+    struct Row {
+        mode_s: String,
+        aircraft_name: Option<String>,
+        total_count: i64,
+        sidelobe_count: i64,
+        multipath_count: i64,
+        time_range_start: f64,
+        time_range_end: f64,
+    }
+
+    let rows: Vec<Row> = stmt
+        .query_map([], |row| {
+            Ok(Row {
+                mode_s: row.get(0)?,
+                aircraft_name: row.get(1)?,
+                total_count: row.get(2)?,
+                sidelobe_count: row.get(3)?,
+                multipath_count: row.get(4)?,
+                time_range_start: row.get(5)?,
+                time_range_end: row.get(6)?,
+            })
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+
+    serde_json::to_string(&rows).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+/// Garble 요약 삭제
+pub fn clear_garble_summaries(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM garble_summary_cache", [])?;
+    Ok(())
+}
+
+// ========== 저장된 보고서 ==========
+
+/// 보고서 저장
+pub fn save_report(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    template: &str,
+    radar_name: &str,
+    report_config_json: &str,
+    pdf_base64: Option<&str>,
+    metadata_json: Option<&str>,
+) -> SqlResult<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO saved_reports (id, title, template, radar_name, created_at, report_config_json, pdf_base64, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, title, template, radar_name, now, report_config_json, pdf_base64, metadata_json],
+    )?;
+    Ok(())
+}
+
+/// 보고서 목록 조회 (PDF 제외 — 경량)
+#[derive(serde::Serialize)]
+pub struct SavedReportSummary {
+    pub id: String,
+    pub title: String,
+    pub template: String,
+    pub radar_name: String,
+    pub created_at: i64,
+    pub has_pdf: bool,
+}
+
+pub fn list_saved_reports(conn: &Connection) -> SqlResult<Vec<SavedReportSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, template, radar_name, created_at, (pdf_base64 IS NOT NULL) FROM saved_reports ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SavedReportSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                template: row.get(2)?,
+                radar_name: row.get(3)?,
+                created_at: row.get(4)?,
+                has_pdf: row.get::<_, i32>(5)? != 0,
+            })
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 보고서 상세 (PDF 포함)
+pub fn load_report_detail(conn: &Connection, id: &str) -> SqlResult<Option<(String, String, String, String, i64, String, Option<String>, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, template, radar_name, created_at, report_config_json, pdf_base64, metadata_json FROM saved_reports WHERE id = ?1",
+    )?;
+    match stmt.query_row(params![id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    }) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 보고서 삭제
+pub fn delete_report(conn: &Connection, id: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM saved_reports WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+// ========== 기상-Garble 상관분석 캐시 ==========
+
+/// 상관분석 캐시 저장
+pub fn save_weather_garble_correlation(
+    conn: &Connection,
+    cache_key: &str,
+    result_json: &str,
+) -> SqlResult<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO weather_garble_correlation (cache_key, result_json, computed_at)
+         VALUES (?1, ?2, ?3)",
+        params![cache_key, result_json, now],
+    )?;
+    Ok(())
+}
+
+/// 상관분석 캐시 로드
+pub fn load_weather_garble_correlation(
+    conn: &Connection,
+    cache_key: &str,
+) -> SqlResult<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT result_json FROM weather_garble_correlation WHERE cache_key = ?1",
+    )?;
+    match stmt.query_row(params![cache_key], |row| row.get::<_, String>(0)) {
+        Ok(json) => Ok(Some(json)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 상관분석 캐시 전체 삭제
+pub fn clear_weather_garble_correlations(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM weather_garble_correlation", [])?;
     Ok(())
 }

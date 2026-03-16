@@ -940,6 +940,26 @@ fn clear_saved_data(
     db::clear_all_parsed_data(&conn).map_err(|e| format!("DB clear error: {}", e))
 }
 
+/// 특정 파싱 파일 삭제 (건별)
+#[tauri::command]
+fn delete_parsed_file(
+    file_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::delete_parsed_file(&conn, &file_path).map_err(|e| format!("DB delete error: {}", e))
+}
+
+/// 여러 파싱 파일 삭제 (경로 목록)
+#[tauri::command]
+fn delete_parsed_files(
+    file_paths: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::delete_parsed_files(&conn, &file_paths).map_err(|e| format!("DB delete error: {}", e))
+}
+
 // ========== 기상 데이터 캐시 ==========
 
 /// 일 단위 기상 데이터 저장
@@ -1401,6 +1421,261 @@ fn delete_manual_building(
     building::delete_manual_building(&conn, id)
 }
 
+// ========== LOS 분석 결과 영속화 ==========
+
+#[tauri::command]
+fn save_los_result(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    radar_site_name: String,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height: f64,
+    target_lat: f64,
+    target_lon: f64,
+    bearing: f64,
+    total_distance: f64,
+    elevation_profile_json: String,
+    los_blocked: bool,
+    max_blocking_json: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_los_result(
+        &conn, &id, &radar_site_name, radar_lat, radar_lon, radar_height,
+        target_lat, target_lon, bearing, total_distance,
+        &elevation_profile_json, los_blocked, max_blocking_json.as_deref(),
+    ).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn load_los_results(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let rows = db::load_all_los_results(&conn).map_err(|e| format!("DB error: {}", e))?;
+
+    #[derive(serde::Serialize)]
+    struct LOSResult {
+        id: String,
+        radar_site_name: String,
+        radar_lat: f64,
+        radar_lon: f64,
+        radar_height: f64,
+        target_lat: f64,
+        target_lon: f64,
+        bearing: f64,
+        total_distance: f64,
+        elevation_profile_json: String,
+        los_blocked: bool,
+        max_blocking_json: Option<String>,
+        created_at: i64,
+    }
+
+    let results: Vec<LOSResult> = rows.into_iter().map(|r| LOSResult {
+        id: r.0, radar_site_name: r.1, radar_lat: r.2, radar_lon: r.3,
+        radar_height: r.4, target_lat: r.5, target_lon: r.6, bearing: r.7,
+        total_distance: r.8, elevation_profile_json: r.9, los_blocked: r.10,
+        max_blocking_json: r.11, created_at: r.12,
+    }).collect();
+
+    serde_json::to_string(&results).map_err(|e| format!("JSON error: {}", e))
+}
+
+#[tauri::command]
+fn delete_los_result(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::delete_los_result(&conn, &id).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn clear_los_results(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::clear_all_los_results(&conn).map_err(|e| format!("DB error: {}", e))
+}
+
+// ========== 수동 병합 이력 ==========
+
+#[tauri::command]
+fn save_manual_merge(
+    state: tauri::State<'_, AppState>,
+    source_flight_ids_json: String,
+    mode_s: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_manual_merge(&conn, &source_flight_ids_json, &mode_s)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn load_manual_merges(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<(String, String)>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_manual_merges(&conn).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn clear_manual_merges(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::clear_manual_merges(&conn).map_err(|e| format!("DB error: {}", e))
+}
+
+// ========== 커버리지 캐시 ==========
+
+#[tauri::command]
+fn save_coverage_cache(
+    state: tauri::State<'_, AppState>,
+    radar_name: String,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height: f64,
+    max_elev_deg: f64,
+    layers_json: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_coverage_cache(&conn, &radar_name, radar_lat, radar_lon, radar_height, max_elev_deg, &layers_json)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn load_coverage_cache(
+    state: tauri::State<'_, AppState>,
+    radar_name: String,
+) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn clear_coverage_cache(
+    state: tauri::State<'_, AppState>,
+    radar_name: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::clear_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
+}
+
+// ========== Garble 요약 캐시 ==========
+
+#[tauri::command]
+fn save_garble_summaries(
+    state: tauri::State<'_, AppState>,
+    summaries_json: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_garble_summaries(&conn, &summaries_json).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn load_garble_summaries(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_garble_summaries(&conn).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn clear_garble_summaries(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::clear_garble_summaries(&conn).map_err(|e| format!("DB error: {}", e))
+}
+
+// ========== 저장된 보고서 ==========
+
+#[tauri::command]
+fn save_report(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    title: String,
+    template: String,
+    radar_name: String,
+    report_config_json: String,
+    pdf_base64: Option<String>,
+    metadata_json: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_report(&conn, &id, &title, &template, &radar_name, &report_config_json, pdf_base64.as_deref(), metadata_json.as_deref())
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn list_saved_reports(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<db::SavedReportSummary>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::list_saved_reports(&conn).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn load_report_detail(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let row = db::load_report_detail(&conn, &id).map_err(|e| format!("DB error: {}", e))?;
+    match row {
+        Some(r) => {
+            #[derive(serde::Serialize)]
+            struct Detail {
+                id: String,
+                title: String,
+                template: String,
+                radar_name: String,
+                created_at: i64,
+                report_config_json: String,
+                pdf_base64: Option<String>,
+                metadata_json: Option<String>,
+            }
+            let detail = Detail {
+                id: r.0, title: r.1, template: r.2, radar_name: r.3,
+                created_at: r.4, report_config_json: r.5, pdf_base64: r.6, metadata_json: r.7,
+            };
+            serde_json::to_string(&detail).map_err(|e| format!("JSON error: {}", e)).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn delete_saved_report(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::delete_report(&conn, &id).map_err(|e| format!("DB error: {}", e))
+}
+
+// ========== 기상-Garble 상관분석 캐시 ==========
+
+#[tauri::command]
+fn save_weather_garble_correlation(
+    state: tauri::State<'_, AppState>,
+    cache_key: String,
+    result_json: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::save_weather_garble_correlation(&conn, &cache_key, &result_json)
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn load_weather_garble_correlation(
+    state: tauri::State<'_, AppState>,
+    cache_key: String,
+) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_weather_garble_correlation(&conn, &cache_key).map_err(|e| format!("DB error: {}", e))
+}
+
 // ---------- App Entry Point ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1471,6 +1746,8 @@ pub fn run() {
             load_saved_data,
             load_garble_points,
             clear_saved_data,
+            delete_parsed_file,
+            delete_parsed_files,
             load_setting,
             save_setting,
             export_database,
@@ -1495,6 +1772,31 @@ pub fn run() {
             get_weather_cached_dates,
             load_weather_cache,
             load_cloud_grid_cache,
+            // LOS 결과 영속화
+            save_los_result,
+            load_los_results,
+            delete_los_result,
+            clear_los_results,
+            // 수동 병합 이력
+            save_manual_merge,
+            load_manual_merges,
+            clear_manual_merges,
+            // 커버리지 캐시
+            save_coverage_cache,
+            load_coverage_cache,
+            clear_coverage_cache,
+            // Garble 요약
+            save_garble_summaries,
+            load_garble_summaries,
+            clear_garble_summaries,
+            // 보고서
+            save_report,
+            list_saved_reports,
+            load_report_detail,
+            delete_saved_report,
+            // 기상-Garble 상관분석
+            save_weather_garble_correlation,
+            load_weather_garble_correlation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

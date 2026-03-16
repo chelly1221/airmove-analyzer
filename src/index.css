@@ -136,6 +136,20 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
+/* Coverage dual range slider: hide default track since we render our own */
+input.coverage-range-thumb {
+  background: transparent !important;
+  height: 100% !important;
+}
+input.coverage-range-thumb::-webkit-slider-runnable-track {
+  background: transparent !important;
+  height: 0 !important;
+}
+input.coverage-range-thumb::-moz-range-track {
+  background: transparent !important;
+  height: 0 !important;
+}
+
 /* Select styling */
 select {
   appearance: none;

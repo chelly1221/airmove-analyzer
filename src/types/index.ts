@@ -391,6 +391,56 @@ export interface ReportMetadata {
   footer: string;
 }
 
+/** 수동 병합 기록 */
+export interface ManualMergeRecord {
+  source_flight_ids: string[];
+  mode_s: string;
+}
+
+/** 저장된 보고서 요약 (목록 표시용) */
+export interface SavedReportSummary {
+  id: string;
+  title: string;
+  template: string;
+  radar_name: string;
+  created_at: number;
+  has_pdf: boolean;
+}
+
+/** 저장된 보고서 상세 */
+export interface SavedReportDetail {
+  id: string;
+  title: string;
+  template: string;
+  radar_name: string;
+  created_at: number;
+  report_config_json: string;
+  pdf_base64?: string;
+  metadata_json?: string;
+}
+
+/** Garble 요약 통계 (캐시용) */
+export interface GarbleSummaryCached {
+  mode_s: string;
+  aircraft_name?: string;
+  total_count: number;
+  sidelobe_count: number;
+  multipath_count: number;
+  time_range_start: number;
+  time_range_end: number;
+}
+
+/** 기상-Garble 상관분석 결과 */
+export interface WeatherGarbleCorrelation {
+  avgCloud: number;
+  avgVis: number;
+  avgPressure: number;
+  sampleCount: number;
+  overallAvgCloud: number;
+  overallAvgVis: number;
+  overallAvgPressure: number;
+}
+
 /** UI 페이지 */
 export type PageId =
   | "upload"

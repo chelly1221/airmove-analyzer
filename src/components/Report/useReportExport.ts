@@ -4,12 +4,19 @@ import html2canvas from "html2canvas";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 
+export interface ExportResult {
+  success: boolean;
+  error?: string;
+  /** 생성된 PDF base64 (DB 저장용) */
+  pdfBase64?: string;
+}
+
 export function useReportExport() {
   const exportPDF = useCallback(
     async (
       containerRef: React.RefObject<HTMLDivElement | null>,
       defaultFilename: string
-    ): Promise<{ success: boolean; error?: string }> => {
+    ): Promise<ExportResult> => {
       if (!containerRef.current) {
         return { success: false, error: "미리보기 컨테이너를 찾을 수 없습니다" };
       }
@@ -83,7 +90,7 @@ export function useReportExport() {
       const pdfBase64 = doc.output("datauristring").split(",")[1];
       await invoke("write_file_base64", { path: savePath, data: pdfBase64 });
 
-      return { success: true };
+      return { success: true, pdfBase64 };
     },
     []
   );
