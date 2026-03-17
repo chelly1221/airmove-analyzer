@@ -249,13 +249,28 @@ async fn parse_and_analyze(
     .map_err(|e| format!("Task join error: {}", e))?
 }
 
-/// 배치 파싱 결과 이벤트 페이로드 (파일 하나 완료 시 emit, track_points는 이미 청크로 전송됨)
+/// 배치 파싱 결과 이벤트 페이로드 (파일 하나 완료 시 emit, track_points는 청크로 별도 전송)
 #[derive(Clone, serde::Serialize)]
 struct BatchResultEvent {
     file_path: String,
     success: bool,
-    result: Option<AnalysisResult>,
+    /// 파일 메타정보 (track_points 제외 — 청크 스트리밍으로 별도 전송)
+    file_info: Option<BatchFileInfo>,
     error: Option<String>,
+}
+
+/// 배치 결과에 포함할 파일 메타정보 (track_points 제외하여 메모리 절약)
+#[derive(Clone, serde::Serialize)]
+struct BatchFileInfo {
+    filename: String,
+    total_records: usize,
+    parse_errors: Vec<String>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    radar_lat: f64,
+    radar_lon: f64,
+    parse_stats: Option<models::ParseStatistics>,
+    track_point_count: usize,
 }
 
 /// 배치 완료 이벤트 페이로드
@@ -340,8 +355,18 @@ async fn parse_and_analyze_batch(
                             "DB 잠금 획득 실패: 파싱 데이터가 저장되지 않았습니다".to_string()
                         );
                     }
-                    // BatchResultEvent에 포함할 결과를 drain 전에 clone
-                    let result_for_event = analysis.clone();
+                    // 메타정보만 추출 (clone 없이, track_points 제외)
+                    let file_info = BatchFileInfo {
+                        filename: analysis.file_info.filename.clone(),
+                        total_records: analysis.file_info.total_records,
+                        parse_errors: analysis.file_info.parse_errors.clone(),
+                        start_time: analysis.file_info.start_time,
+                        end_time: analysis.file_info.end_time,
+                        radar_lat: analysis.file_info.radar_lat,
+                        radar_lon: analysis.file_info.radar_lon,
+                        parse_stats: analysis.file_info.parse_stats.clone(),
+                        track_point_count: analysis.file_info.track_points.len(),
+                    };
                     // track_points를 청크로 스트리밍 후 메모리 해제
                     emit_and_drain_track_points(&handle, &path, &mut analysis.file_info.track_points);
 
@@ -349,7 +374,7 @@ async fn parse_and_analyze_batch(
                     BatchResultEvent {
                         file_path: path,
                         success: true,
-                        result: Some(result_for_event),
+                        file_info: Some(file_info),
                         error: None,
                     }
                 }
@@ -358,7 +383,7 @@ async fn parse_and_analyze_batch(
                     BatchResultEvent {
                         file_path: path,
                         success: false,
-                        result: None,
+                        file_info: None,
                         error: Some(e),
                     }
                 }
