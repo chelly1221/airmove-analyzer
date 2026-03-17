@@ -14,6 +14,7 @@ import {
   Loader2,
   Cloud,
   Building2,
+  X,
 } from "lucide-react";
 
 /** Dot 모드 핀 아이콘 (가느다란 선 위에 원) */
@@ -121,6 +122,7 @@ export default function TrackMap() {
   const [buildingOverlayData, setBuildingOverlayData] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; source: string }[]>([]);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
+  const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
   const [playSpeed, setPlaySpeed] = useState(1);
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
@@ -811,11 +813,12 @@ export default function TrackMap() {
     else step = 1000;
 
     const layers: CoverageLayer[] = [];
+    // bearingStep=10: 0.1°×10 = 1° 간격 (3600→360 포인트, 시각적 차이 없음)
     for (let alt = effMin; alt <= effMax; alt += step) {
-      layers.push(computeLayerFromProfile(profile, alt));
+      layers.push(computeLayerFromProfile(profile, alt, 10));
     }
     if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== effMax) {
-      layers.push(computeLayerFromProfile(profile, effMax));
+      layers.push(computeLayerFromProfile(profile, effMax, 10));
     }
     setCoverageLayers(layers);
   }, [coverageAlt, coverageAltMin, terrainProfile, coverageVisible]);
@@ -1081,6 +1084,7 @@ export default function TrackMap() {
         setLosHoverIdx(null);
         setLosHoverRatio(null);
         setLosBuildingHighlight(null);
+        setDetailBuilding(null);
       }
       setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
     },
@@ -1567,59 +1571,59 @@ export default function TrackMap() {
 
     }
 
-    // 커버리지 맵 (합성 스펙트럼: 동심 링 — 겹침 없이 각 링 고유 색상)
+    // 커버리지 맵 (합성 스펙트럼: 동심 링 — 단일 레이어로 통합하여 GPU 오버헤드 최소화)
     if (coveragePolygonsList && coveragePolygonsList.length > 0) {
       const n = coveragePolygonsList.length;
       const isSingle = n === 1;
-      const fillAlpha = isSingle ? 40 : 100; // 단일: 반투명, 범위: 고체 스펙트럼
+      const fillAlpha = isSingle ? 40 : 100;
 
-      coveragePolygonsList.forEach((cp, idx) => {
-        const { polygon, outerRing, coneRing, fillColor, altFt } = cp;
+      // 단일 PolygonLayer로 모든 커버리지 폴리곤 통합
+      layers.push(
+        new PolygonLayer({
+          id: "coverage-fill",
+          data: coveragePolygonsList,
+          getPolygon: (d: any) => d.polygon,
+          getFillColor: (d: any) => [...d.fillColor, fillAlpha] as [number, number, number, number],
+          getLineColor: [0, 0, 0, 0],
+          filled: true,
+          stroked: false,
+          extruded: false,
+          _full3d: true,
+          parameters: { depthWriteEnabled: false },
+        })
+      );
+
+      // 최외곽 경계선
+      const outermost = coveragePolygonsList[n - 1];
+      layers.push(
+        new PathLayer({
+          id: "coverage-outline",
+          data: [{ path: outermost.outerRing }],
+          getPath: (d: any) => d.path,
+          getColor: [...outermost.fillColor, isSingle ? 255 : 180],
+          getWidth: isSingle ? 2.5 : 1.5,
+          widthMinPixels: isSingle ? 2 : 1,
+          widthMaxPixels: isSingle ? 4 : 3,
+          widthUnits: "pixels" as const,
+        })
+      );
+
+      // Cone of Silence 경계선 (최내곽 레이어)
+      const innermost = coveragePolygonsList[0];
+      if (innermost.coneRing) {
         layers.push(
-          new PolygonLayer({
-            id: `coverage-fill-${altFt}`,
-            data: [{ polygon }],
-            getPolygon: (d: any) => d.polygon,
-            getFillColor: [...fillColor, fillAlpha],
-            getLineColor: [0, 0, 0, 0],
-            filled: true,
-            stroked: false,
-            extruded: false,
-            _full3d: true,
-            parameters: { depthWriteEnabled: false },
+          new PathLayer({
+            id: "cone-outline",
+            data: [{ path: innermost.coneRing }],
+            getPath: (d: any) => d.path,
+            getColor: [...innermost.fillColor, 100],
+            getWidth: 1,
+            widthMinPixels: 1,
+            widthMaxPixels: 2,
+            widthUnits: "pixels" as const,
           })
         );
-        // 최외곽 경계선 표시
-        if (isSingle || idx === n - 1) {
-          layers.push(
-            new PathLayer({
-              id: `coverage-outline-${altFt}`,
-              data: [{ path: outerRing }],
-              getPath: (d: any) => d.path,
-              getColor: [...fillColor, isSingle ? 255 : 180],
-              getWidth: isSingle ? 2.5 : 1.5,
-              widthMinPixels: isSingle ? 2 : 1,
-              widthMaxPixels: isSingle ? 4 : 3,
-              widthUnits: "pixels" as const,
-            })
-          );
-        }
-        // Cone of Silence 경계선 (단일: 해당 레이어, 범위: 최하 레이어)
-        if (idx === 0 && coneRing) {
-          layers.push(
-            new PathLayer({
-              id: `cone-outline-${altFt}`,
-              data: [{ path: coneRing }],
-              getPath: (d: any) => d.path,
-              getColor: [...fillColor, 100],
-              getWidth: 1,
-              widthMinPixels: 1,
-              widthMaxPixels: 2,
-              widthUnits: "pixels" as const,
-            })
-          );
-        }
-      });
+      }
     }
 
     // 구름 오버레이 — 점화(stippling) 방식
@@ -1684,18 +1688,18 @@ export default function TrackMap() {
     // LOS 단면도 건물 호버/클릭 하이라이트 (건물 오버레이 비활성 상태에서도 표시)
     if (losBuildingHighlight) {
       layers.push(
-        new ScatterplotLayer({
+        new IconLayer({
           id: "los-building-highlight",
           data: [losBuildingHighlight],
           getPosition: (d: typeof losBuildingHighlight) => [d!.lon, d!.lat],
-          getRadius: 8,
-          radiusMinPixels: 6,
-          radiusMaxPixels: 14,
-          radiusUnits: "pixels" as const,
-          getFillColor: [250, 204, 21, 180],
-          getLineColor: [250, 204, 21, 255],
-          stroked: true,
-          lineWidthMinPixels: 2,
+          getIcon: () => ({
+            url: "/building-icon.png",
+            width: 128,
+            height: 128,
+            anchorY: 128,
+          }),
+          getSize: 15,
+          sizeUnits: "pixels" as const,
           pickable: false,
         })
       );
@@ -2299,7 +2303,7 @@ export default function TrackMap() {
                                 handleCoverageAltMinChange(Math.min(v, coverageAltInput));
                               }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 30 : 20 }}
-                              className="coverage-range-thumb absolute inset-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
+                              className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
                               aria-label="최소 고도"
                             />
                             {/* 최대 핸들 */}
@@ -2314,7 +2318,7 @@ export default function TrackMap() {
                                 handleCoverageAltChange(Math.max(v, coverageAltMinInput));
                               }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 20 : 30 }}
-                              className="coverage-range-thumb absolute inset-0 w-full appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:bg-[#a60739] [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto"
+                              className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
                               aria-label="최대 고도"
                             />
                           </div>
@@ -2380,7 +2384,7 @@ export default function TrackMap() {
           <Crosshair size={12} />
           <span>LOS 분석 모드: 지도에서 분석할 지점을 클릭하세요</span>
           <button
-            onClick={() => { setLosMode(false); setLosTarget(null); setLosCursor(null); setLosHighlightIdx(null); setLosBuildingHighlight(null); }}
+            onClick={() => { setLosMode(false); setLosTarget(null); setLosCursor(null); setLosHighlightIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); }}
             className="ml-auto text-[10px] text-gray-500 hover:text-gray-900"
           >
             취소
@@ -2388,8 +2392,11 @@ export default function TrackMap() {
         </div>
       )}
 
+      {/* Map + Building Detail sidebar wrapper */}
+      <div className="relative flex flex-1 min-h-0">
       {/* Map container */}
-      <div className="relative flex-1">
+      <div className="flex flex-col flex-1 min-w-0">
+        <div className="relative flex-1">
         <MapGL
           ref={mapRef}
           {...viewState}
@@ -2517,7 +2524,7 @@ export default function TrackMap() {
             </div>
           </div>
         )}
-      </div>
+        </div>
 
       {/* LOS Profile Panel */}
       {losTarget && (
@@ -2525,7 +2532,7 @@ export default function TrackMap() {
           radarSite={radarSite}
           targetLat={losTarget.lat}
           targetLon={losTarget.lon}
-          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); }}
+          onClose={() => { setLosTarget(null); setLosMode(false); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); }}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
           onLoaded={handleLosLoaded}
@@ -2534,8 +2541,73 @@ export default function TrackMap() {
           onTrackPointHover={setLosHoverIdx}
           externalHoverIdx={losHoverIdx}
           onBuildingHover={setLosBuildingHighlight}
+          onBuildingDetail={setDetailBuilding}
         />
       )}
+      </div>
+
+      {/* 건물 상세보기 사이드바 (Google Street View + Maps) */}
+      <div
+        className="flex-shrink-0 flex flex-col border-l border-gray-200 bg-white overflow-hidden transition-[width] duration-300 ease-in-out"
+        style={{ width: detailBuilding ? 360 : 0, borderLeftWidth: detailBuilding ? 1 : 0 }}
+      >
+        {detailBuilding && (() => {
+          const lat = detailBuilding.lat;
+          const lon = detailBuilding.lon;
+          const label = detailBuilding.name || detailBuilding.address || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+          const dLon = lon - radarSite.longitude;
+          const dLat = lat - radarSite.latitude;
+          const headingFromRadar = ((Math.atan2(dLon * Math.cos(lat * Math.PI / 180), dLat) * 180 / Math.PI) + 360) % 360;
+          const headingToBuilding = (headingFromRadar + 180) % 360;
+          return (
+            <>
+            <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2" style={{ minWidth: 360 }}>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-xs font-semibold text-gray-800 truncate">{label}</h3>
+                <p className="text-[10px] text-gray-400 mt-0.5 truncate">
+                  {lat.toFixed(6)}°N, {lon.toFixed(6)}°E
+                  {detailBuilding.height_m > 0 && ` · ${detailBuilding.height_m.toFixed(1)}m`}
+                  {detailBuilding.usage && ` · ${detailBuilding.usage}`}
+                </p>
+              </div>
+              <button
+                onClick={() => setDetailBuilding(null)}
+                className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors ml-2"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <div className="flex-1 flex flex-col min-h-0 overflow-y-auto" style={{ minWidth: 360 }}>
+              <div className="flex-1 min-h-0 flex flex-col">
+                <div className="px-2 py-1 text-[9px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Street View</div>
+                <div className="flex-1 min-h-[200px] overflow-hidden relative">
+                  <iframe
+                    title="Street View"
+                    style={{ border: 0, position: "absolute", top: -72, left: -2, width: "calc(100% + 74px)", height: "calc(100% + 96px)" }}
+                    loading="lazy"
+                    referrerPolicy="no-referrer-when-downgrade"
+                    src={`https://maps.google.com/maps?layer=c&cbll=${lat},${lon}&cbp=12,${headingToBuilding.toFixed(0)},0,0,0&output=svembed`}
+                  />
+                </div>
+              </div>
+              <div className="flex-1 min-h-0 flex flex-col border-t border-gray-100">
+                <div className="px-2 py-1 text-[9px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Google Maps</div>
+                <div className="flex-1 min-h-[200px] overflow-hidden relative">
+                  <iframe
+                    title="Google Maps"
+                    style={{ border: 0, position: "absolute", top: -2, left: -2, width: "calc(100% + 74px)", height: "calc(100% + 50px)" }}
+                    loading="lazy"
+                    referrerPolicy="no-referrer-when-downgrade"
+                    src={`https://maps.google.com/maps?q=${lat},${lon}&z=18&t=k&output=embed`}
+                  />
+                </div>
+              </div>
+            </div>
+            </>
+          );
+        })()}
+      </div>
+      </div>
 
       {/* Bottom control bar - 타임라인 */}
       {allPoints.length > 0 && (() => {

@@ -267,12 +267,14 @@ export function invalidateTerrainCache(): void {
 
 /**
  * 캐시된 지형 프로파일에서 특정 고도 레이어의 커버리지 경계 계산
- * - O(rays × samples) — 각 레이에서 maxAngle 비교로 차단점 탐색
- * - 슬라이더 변경 시 호출 (~50ms 이내)
+ * - LOS 차단: 이진 탐색 O(log N) — maxAngles 단조증가 특성 활용
+ * - 지형 차단: 이진 탐색 결과까지만 선형 탐색 (대부분 조기 종료)
+ * - bearingStep: 출력 해상도 조절 (10 = 매 10번째 ray = 1° 간격, 기본 1)
  */
 export function computeLayerFromProfile(
   profile: CoverageTerrainProfile,
   altFt: number,
+  bearingStep = 1,
 ): CoverageLayer {
   const altM = altFt * FT_TO_M;
   const maxElevRad = (profile.maxElevDeg * Math.PI) / 180;
@@ -283,46 +285,52 @@ export function computeLayerFromProfile(
     ? (heightAboveRadar / Math.tan(maxElevRad)) / 1000
     : 0;
 
+  const radarH = profile.radarHeight;
+  const rays = profile.rays;
+  const numRays = rays.length;
   const bearings: CoverageBearing[] = [];
 
-  for (const ray of profile.rays) {
+  for (let r = 0; r < numRays; r += bearingStep) {
+    const ray = rays[r];
     const n = ray.distances.length;
-    let maxVisibleRange = profile.maxRangeKm;
-    let boundaryLat = ray.lats[n - 1];
-    let boundaryLon = ray.lons[n - 1];
-    let blocked = false;
 
-    for (let i = 0; i < n; i++) {
-      const d = ray.distances[i];
+    // ── 이진 탐색: LOS 차단점 (조건 2) ──
+    // maxAngles[i-1]는 단조증가, targetAngle = (altM-radarH)/d 는 단조감소
+    // → 교차점 이후로는 항상 차단 → 이진 탐색 O(log N)
+    let losBlockIdx = n;
+    let lo = 1, hi = n - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const targetAngle = (altM - radarH) / ray.distances[mid];
+      if (ray.maxAngles[mid - 1] > targetAngle) {
+        losBlockIdx = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
 
-      // 조건 1: 타겟 지점의 보정 지형이 타겟 고도보다 높음
+    // ── 선형 탐색: 지형 차단점 (조건 1) — losBlockIdx까지만 ──
+    // adjTerrains는 비단조이므로 선형 필요하지만, 탐색 범위가 제한됨
+    let terrainBlockIdx = n;
+    for (let i = 0; i < losBlockIdx; i++) {
       if (ray.adjTerrains[i] > altM) {
-        blocked = true;
-      }
-
-      // 조건 2: 중간 지형의 최대 각도가 타겟 각도를 초과
-      if (!blocked && i > 0) {
-        const targetAngle = (altM - profile.radarHeight) / d;
-        if (ray.maxAngles[i - 1] > targetAngle) {
-          blocked = true;
-        }
-      }
-
-      if (blocked) {
-        if (i > 0) {
-          maxVisibleRange = ray.distances[i - 1];
-          boundaryLat = ray.lats[i - 1];
-          boundaryLon = ray.lons[i - 1];
-        } else {
-          maxVisibleRange = 0;
-          boundaryLat = profile.radarLat;
-          boundaryLon = profile.radarLon;
-        }
+        terrainBlockIdx = i;
         break;
       }
     }
 
-    bearings.push({ deg: ray.bearing, maxRangeKm: maxVisibleRange, lat: boundaryLat, lon: boundaryLon });
+    const blockIdx = Math.min(losBlockIdx, terrainBlockIdx);
+
+    if (blockIdx < n) {
+      if (blockIdx > 0) {
+        bearings.push({ deg: ray.bearing, maxRangeKm: ray.distances[blockIdx - 1], lat: ray.lats[blockIdx - 1], lon: ray.lons[blockIdx - 1] });
+      } else {
+        bearings.push({ deg: ray.bearing, maxRangeKm: 0, lat: profile.radarLat, lon: profile.radarLon });
+      }
+    } else {
+      bearings.push({ deg: ray.bearing, maxRangeKm: profile.maxRangeKm, lat: ray.lats[n - 1], lon: ray.lons[n - 1] });
+    }
   }
 
   return { altitudeFt: altFt, altitudeM: altM, bearings, coneRadiusKm };

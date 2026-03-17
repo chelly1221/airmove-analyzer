@@ -52,6 +52,8 @@ interface Props {
   externalHoverIdx?: number | null;
   /** 차트에서 건물 호버/클릭 시 건물 정보 콜백 (null이면 해제) */
   onBuildingHover?: (building: { lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null) => void;
+  /** 건물 상세보기 요청 콜백 */
+  onBuildingDetail?: (building: BuildingOnPath & { isBlocking?: boolean }) => void;
 }
 
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -98,7 +100,7 @@ function curvDrop43(dKm: number): number {
 
 
 
-export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover }: Props) {
+export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail }: Props) {
   const addLOSResult = useAppStore((s) => s.addLOSResult);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
@@ -115,14 +117,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const [pinnedTrackIdx, setPinnedTrackIdx] = useState<number | null>(null);
   const [hoveredBldgIdx, setHoveredBldgIdx] = useState<number | null>(null);
   const [clickedBldgIdx, setClickedBldgIdx] = useState<number | null>(null);
-  const [detailBuilding, setDetailBuilding] = useState<(BuildingOnPath & { isBlocking?: boolean }) | null>(null);
-  // 건물 상세 모달 ESC 닫기
-  useEffect(() => {
-    if (!detailBuilding) return;
-    const handleEsc = (e: KeyboardEvent) => { if (e.key === "Escape") setDetailBuilding(null); };
-    document.addEventListener("keydown", handleEsc);
-    return () => document.removeEventListener("keydown", handleEsc);
-  }, [detailBuilding]);
   // 맵에서 클릭한 포인트 → 차트 핀 동기화
   const prevExternalIdx = useRef<number | null | undefined>(undefined);
   useEffect(() => {
@@ -159,7 +153,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       setHoveredTrackIdx(null);
       setHoveredBldgIdx(null);
       setClickedBldgIdx(null);
-      setDetailBuilding(null);
       onBuildingHover?.(null);
       setXZoom([0, 100]);
       xZoomRef.current = [0, 100];
@@ -533,23 +526,35 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const handleSave = async () => {
     if (!chartData) return;
 
-    // 맵 스크린샷 캡처
+    // 맵 스크린샷 캡처 (MapLibre 네이티브 캔버스 + deck.gl 오버레이 합성)
     let mapScreenshot: string | undefined;
     try {
-      const mapContainer = document.querySelector(".maplibregl-map");
-      if (mapContainer) {
-        const canvases = mapContainer.querySelectorAll("canvas");
-        if (canvases.length > 0) {
-          const w = canvases[0].width;
-          const h = canvases[0].height;
-          const offscreen = document.createElement("canvas");
-          offscreen.width = w;
-          offscreen.height = h;
-          const ctx = offscreen.getContext("2d");
-          if (ctx) {
-            for (const c of canvases) ctx.drawImage(c, 0, 0);
-            mapScreenshot = offscreen.toDataURL("image/jpeg", 0.7);
+      const map = (window as any).__maplibreInstance;
+      if (map) {
+        // MapLibre 강제 리페인트 후 캔버스 캡처 (preserveDrawingBuffer 불필요)
+        map.triggerRepaint();
+        await new Promise<void>((resolve) => {
+          map.once("render", () => resolve());
+        });
+        const mapCanvas = map.getCanvas() as HTMLCanvasElement;
+        const w = mapCanvas.width;
+        const h = mapCanvas.height;
+        const offscreen = document.createElement("canvas");
+        offscreen.width = w;
+        offscreen.height = h;
+        const ctx = offscreen.getContext("2d");
+        if (ctx) {
+          // MapLibre 기본 캔버스 (타일)
+          ctx.drawImage(mapCanvas, 0, 0);
+          // deck.gl 오버레이 캔버스 합성
+          const mapContainer = document.querySelector(".maplibregl-map");
+          if (mapContainer) {
+            const canvases = mapContainer.querySelectorAll("canvas");
+            for (const c of canvases) {
+              if (c !== mapCanvas) ctx.drawImage(c, 0, 0);
+            }
           }
+          mapScreenshot = offscreen.toDataURL("image/jpeg", 0.7);
         }
       }
     } catch (e) {
@@ -1167,7 +1172,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           const hasUsage = !!b.usage;
           const headerLines = (hasName ? 1 : 0) + (hasAddr ? 1 : 0) + (hasUsage ? 1 : 0);
           const isClicked = clickedBldgIdx === activeBldgIdx;
-          const tooltipH = 56 + headerLines * 13 + (isClicked ? 22 : 0);
+          const tooltipH = 62 + headerLines * 13;
           const tooltipX = bx + tooltipW + 12 > W ? bx - tooltipW - 8 : bx + 8;
           const tooltipY = Math.max(PAD.top + 4, by - tooltipH / 2);
           let lineY = tooltipY;
@@ -1207,14 +1212,14 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 {b.isBlocking ? "⚠ LOS 차단 기여" : "차폐 영향"}
               </text>
               {isClicked && (
-                <foreignObject x={tooltipX + 6} y={(lineY += 6, lineY)} width={tooltipW - 12} height={18}>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); setDetailBuilding(b); }}
-                    style={{ width: "100%", height: "18px", fontSize: "9px", fontWeight: 600, color: "#fff", background: "linear-gradient(135deg, #3b82f6, #2563eb)", border: "none", borderRadius: "3px", cursor: "pointer", lineHeight: "18px" }}
-                  >
-                    상세보기 (Street View / 지도)
-                  </button>
-                </foreignObject>
+                <text x={tooltipX + tooltipW - 8} y={lineY} textAnchor="end"
+                  fill="#3b82f6" fontSize={7.5} style={{ cursor: "pointer" }}
+                  onMouseEnter={(e) => { (e.target as SVGTextElement).style.textDecoration = "underline"; }}
+                  onMouseLeave={(e) => { (e.target as SVGTextElement).style.textDecoration = "none"; }}
+                  onClick={(e) => { e.stopPropagation(); onBuildingDetail?.(b); }}
+                >
+                  상세보기
+                </text>
               )}
             </g>
           );
@@ -1326,70 +1331,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         )}
       </div>
 
-      {/* 건물 상세보기 모달 (Google Street View + Google Maps) */}
-      {detailBuilding && (() => {
-        const lat = detailBuilding.lat;
-        const lon = detailBuilding.lon;
-        const label = detailBuilding.name || detailBuilding.address || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
-        // 레이더→건물 방위 계산 (Street View heading)
-        const dLon = lon - radarSite.longitude;
-        const dLat = lat - radarSite.latitude;
-        const headingFromRadar = ((Math.atan2(dLon * Math.cos(lat * Math.PI / 180), dLat) * 180 / Math.PI) + 360) % 360;
-        // 건물에서 레이더 방향 (반대 방향) → Street View에서 건물을 바라보는 시점
-        const headingToBuilding = (headingFromRadar + 180) % 360;
-        return (
-          <div
-            className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm"
-            onClick={(e) => { if (e.target === e.currentTarget) setDetailBuilding(null); }}
-          >
-            <div className="w-[720px] max-h-[90vh] rounded-xl border border-gray-200 bg-white shadow-2xl overflow-hidden">
-              {/* 헤더 */}
-              <div className="flex items-center justify-between border-b border-gray-200 px-5 py-3">
-                <div className="min-w-0 flex-1">
-                  <h3 className="text-sm font-semibold text-gray-800 truncate">{label}</h3>
-                  <p className="text-[11px] text-gray-500 mt-0.5">
-                    {lat.toFixed(6)}°N, {lon.toFixed(6)}°E
-                    {detailBuilding.height_m > 0 && <span className="ml-2">높이 {detailBuilding.height_m.toFixed(1)}m</span>}
-                    {detailBuilding.usage && <span className="ml-2 text-indigo-500">{detailBuilding.usage}</span>}
-                  </p>
-                </div>
-                <button
-                  onClick={() => setDetailBuilding(null)}
-                  className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors ml-3"
-                >
-                  <X size={18} />
-                </button>
-              </div>
-              {/* Street View */}
-              <div className="border-b border-gray-100">
-                <div className="px-3 py-1.5 text-[10px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Google Street View</div>
-                <iframe
-                  title="Street View"
-                  width="100%"
-                  height="300"
-                  style={{ border: 0 }}
-                  loading="lazy"
-                  referrerPolicy="no-referrer-when-downgrade"
-                  src={`https://www.google.com/maps/@${lat},${lon},3a,75y,${headingToBuilding.toFixed(0)}h,85t/data=!3m1!1e1`}
-                />
-              </div>
-              {/* Google Maps (위성) */}
-              <div>
-                <div className="px-3 py-1.5 text-[10px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Google Maps</div>
-                <iframe
-                  title="Google Maps"
-                  width="100%"
-                  height="300"
-                  style={{ border: 0 }}
-                  loading="lazy"
-                  referrerPolicy="no-referrer-when-downgrade"
-                  src={`https://maps.google.com/maps?q=${lat},${lon}&z=18&t=k&output=embed`}
-                />
-              </div>
-            </div>
-          </div>
-        );
-      })()}
     </div>
   );
 }

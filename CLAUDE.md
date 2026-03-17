@@ -97,7 +97,7 @@ src/                    # React frontend
   │   ├── altitudeCorrection.ts   # 이상고도 보정 (수직속도 기반 + 선형 보간)
   │   ├── flightConsolidation.ts  # 비행 통합 (OpenSky 매칭 + gap 분리 + 수동 병합)
   │   ├── lossDetection.ts       # Loss 탐지 (TypeScript 구현, 개별 LossPoint 생성)
-  │   ├── radarCoverage.ts       # 레이더 커버리지 맵 (다중 고도 레이어, 지형 프로파일 캐시)
+  │   ├── radarCoverage.ts       # 레이더 커버리지 맵 (다중 고도 레이어, 지형 프로파일 캐시, 이진 탐색 최적화)
   │   └── weatherFetch.ts        # 기상 데이터 조회 (Open-Meteo Archive, 구름 그리드, 덕팅 위험)
   ├── store/
   │   └── index.ts      # Zustand 전역 상태 (항공기/파일/비행/레이더/LOS/커버리지/기상/UI)
@@ -123,6 +123,7 @@ src-tauri/src/          # Rust backend
 src-tauri/icons/        # 앱 아이콘 (icon.ico, icon.png, 각종 크기)
 public/                 # 정적 자산
   ├── radar-icon.png    # 레이더 아이콘 (맵 표시용)
+  ├── building-icon.png # 건물 아이콘 (LOS 건물 하이라이트용)
   └── favicon.svg       # 파비콘
 ```
 
@@ -165,7 +166,11 @@ public/                 # 정적 자산
 36. 파노라마 맵 건물 호버 (ScatterplotLayer onHover→파노라마 차트 건물 하이라이트 연동)
 37. LOS 단면도 빈 영역 클릭 재생성 (프로파일 표시 중 빈 맵 클릭→새 좌표로 LOS 재생성)
 38. LOS 건물↔맵 양방향 하이라이트 (차트 건물 호버/클릭→맵 노란 마커, 건물 오버레이 비활성 상태에서도 표시)
-39. 건물 상세보기 모달 (LOS 차트 건물 클릭→상세보기 버튼→Google Street View+위성지도 모달)
+39. 건물 상세보기 사이드바 (LOS 차트 건물 클릭→상세보기 링크→Google Street View+위성지도 사이드 패널)
+40. 커버리지 계산 이진 탐색 최적화 (LOS 차단점 O(log N), bearingStep 해상도 조절)
+41. 커버리지 맵 단일 레이어 통합 (다중 PolygonLayer→단일 PolygonLayer, GPU 오버헤드 감소)
+42. LOS 맵 스크린샷 개선 (MapLibre triggerRepaint + deck.gl 오버레이 합성)
+43. LOS 건물 하이라이트 아이콘 (ScatterplotLayer→IconLayer 건물 아이콘 마커)
 
 ## 핵심 아키텍처: 비행(Flight) 기반 분석
 분석 단위가 "파싱 파일(`AnalysisResult`)"에서 "**비행(`Flight`)**"으로 전환됨.
@@ -272,7 +277,7 @@ public/                 # 정적 자산
 ## 레이더 커버리지 맵
 - **아키텍처**: 지형 프로파일 캐시 기반 2단계 계산
   - Phase 1: SRTM + 건물 고도 조회 (무거운 계산, 1회 수행) → `CoverageTerrainProfile`
-  - Phase 2: 고도별 레이어 계산 (캐시 재사용, ~50ms) → `CoverageLayer`
+  - Phase 2: 고도별 레이어 계산 (캐시 재사용, 이진 탐색 O(log N)) → `CoverageLayer`
 - **건물 필터**: 10km 이내 10m+, 10-30km 30m+, 30km+ 60m+ 높이만 반영
 - **다중 고도**: 100ft 단위 200층 사전 계산 → 슬라이더로 실시간 전환
 - **Cone of Silence**: `heightAboveRadar / tan(maxElevDeg)` → 반경 계산
@@ -352,7 +357,8 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
   - `PathLayer`: 항적 경로 (gap/radar_type 변경 시 세그먼트 분할)
   - `LineLayer`: Loss 구간 빨간 점선, LOS 미리보기선
   - `ScatterplotLayer`: Loss 시작/종료 마커, Dot 모드 포인트, LOS 항적 하이라이트
-  - `IconLayer`: 레이더 아이콘
+  - `IconLayer`: 레이더 아이콘, LOS 건물 하이라이트 (building-icon.png)
+  - `PolygonLayer`: 커버리지 맵 (다중 고도 폴리곤 단일 레이어 통합)
   - `LineLayer` (dot-stems): Dot 모드 수직선
 - **MapLibre 네이티브 레이어** (맵 캔버스):
   - `range-ring-lines`: 동심원 (20NM 간격)
@@ -382,8 +388,8 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 - **LOS 포인트 핀**: 클릭 시 고정, 황색 stroke, 지도↔차트 양방향 하이라이트 연동
 - **LOS 맵↔차트 호버**: 맵 포인트 호버→차트 하이라이트(시안 stroke), 차트 포인트 호버→맵 마커 표시 (onTrackPointHover/externalHoverIdx)
 - **LOS 맵 항적 포인트**: deck.gl ScatterplotLayer, 클릭 시 차트 핀 동기화 (externalHighlightIdx), 호버 시 차트 하이라이트 (externalHoverIdx)
-- **LOS 건물 호버/클릭**: 경로 상 건물 높이/주소/용도 시각화, 클릭 시 핀 고정(앰버), 맵에 노란 마커 하이라이트 (건물 오버레이 비활성에서도 표시)
-- **LOS 건물 상세보기**: 건물 클릭 툴팁에 상세보기 버튼 → Google Street View + Google Maps 위성지도 모달 (레이더→건물 방위 기반 heading)
+- **LOS 건물 호버/클릭**: 경로 상 건물 높이/주소/용도 시각화, 클릭 시 핀 고정(앰버), 맵에 건물 아이콘 하이라이트 (건물 오버레이 비활성에서도 표시)
+- **LOS 건물 상세보기**: 건물 클릭 툴팁에 상세보기 링크 → Google Street View + Google Maps 위성지도 사이드바 (레이더→건물 방위 기반 heading, 애니메이션 전환)
 - **LOS 빈 영역 클릭 재생성**: 프로파일 표시 중 맵 빈 영역 클릭 시 해당 좌표로 LOS 단면도 재생성 (deck.gl 포인트 클릭과 구분)
 - **소실분석 미니맵**: Leaflet Tooltip (시작/종료 마커에 시각, 고도, 좌표)
 - **데이터 테이블**: 선택 행 시각적 강조 (ring + 배경색)
