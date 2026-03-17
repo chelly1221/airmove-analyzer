@@ -11,8 +11,8 @@ use crate::srtm::SrtmReader;
 /// 4/3 유효지구반경 (m)
 const R_EFF: f64 = 6_371_000.0 * 4.0 / 3.0;
 
-/// 건물 높이 상한 (m)
-const MAX_BUILDING_HEIGHT_M: f64 = 1000.0;
+/// 건물 높이 상한 (m) — 한국 최고층 롯데월드타워 ~555m, 여유 포함 650m
+const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
 
 /// 파노라마 포인트 (방위별 최대 앙각 장애물)
 #[derive(Serialize, Clone, Debug)]

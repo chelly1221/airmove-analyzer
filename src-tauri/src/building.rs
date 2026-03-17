@@ -13,8 +13,19 @@ use shapefile::dbase::FieldValue;
 
 use crate::coord::epsg5186_to_wgs84;
 
-/// 건물 높이 상한 (m) — 한국 최고층 롯데월드타워 ~555m, 여유 포함 1000m
-const MAX_BUILDING_HEIGHT_M: f64 = 1000.0;
+/// 건물 높이 상한 (m) — 한국 최고층 롯데월드타워 ~555m, 여유 포함 650m
+const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
+
+/// 층당 최소/최대 높이 (m) — 층수 교차검증용
+const MIN_HEIGHT_PER_FLOOR: f64 = 2.5;
+const MAX_HEIGHT_PER_FLOOR: f64 = 6.0;
+
+/// 이웃 비교 이상치 탐지 파라미터
+const NEIGHBOR_OUTLIER_MIN_HEIGHT_M: f64 = 40.0;   // 이 높이 이상인 건물만 검사
+const NEIGHBOR_RADIUS_DEG: f64 = 0.0014;            // ~150m (위도 기준)
+const NEIGHBOR_MIN_COUNT: usize = 3;                 // 최소 이웃 수
+const NEIGHBOR_RATIO_THRESHOLD: f64 = 2.0;           // 이웃 평균 대비 배수
+const NEIGHBOR_ABS_DIFF_THRESHOLD: f64 = 30.0;       // 이웃 평균 대비 절대 차이 (m)
 
 /// LOS 경로 상의 건물 정보 (프론트엔드 반환)
 #[derive(Serialize, Clone, Debug)]
@@ -129,9 +140,12 @@ pub fn import_from_zip(
 
         count += 1;
 
-        // 높이 추출 (A16=높이(m), 0이면 skip)
-        let height = get_field_as_f64(&record, &["A16", "HEIGHT", "HEIGHT_M", "BDTYP_HG", "BULD_HG"])
-            .filter(|h| *h > 0.0);
+        // 지상층수 먼저 추출 (높이 선택에 활용)
+        let ground_floors = get_field_as_f64(&record, &["A26", "GRND_FLR", "GRND_FLCNT", "GRD_FLR_CO"])
+            .map(|f| f as i32);
+
+        // 높이 추출 — 다중 필드 수집 후 층수 교차검증으로 최적값 선택
+        let height = get_best_height(&record, &["A16", "HEIGHT", "HEIGHT_M", "BDTYP_HG", "BULD_HG"], ground_floors);
 
         let height = match height {
             Some(h) if h > 0.0 && h <= MAX_BUILDING_HEIGHT_M => h,
@@ -149,10 +163,6 @@ pub fn import_from_zip(
                 continue;
             }
         };
-
-        // 지상층수 (A26)
-        let ground_floors = get_field_as_f64(&record, &["A26", "GRND_FLR", "GRND_FLCNT", "GRD_FLR_CO"])
-            .map(|f| f as i32);
 
         // 건물명: A24 우선 → A25 fallback (실제 건축물명칭만)
         let building_name = euckr_bldg_names.as_ref()
@@ -220,6 +230,18 @@ pub fn import_from_zip(
 
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
 
+    // 이웃 비교 이상치 필터링 (같은 단지 내 한 동만 비정상적으로 높은 경우 제거)
+    progress_fn(BuildingImportProgress {
+        region: region.to_string(),
+        total: count,
+        processed: count,
+        status: "이웃 비교 이상치 필터링 중...".to_string(),
+    });
+    let outlier_removed = remove_neighbor_outliers(conn, region)?;
+    if outlier_removed > 0 {
+        inserted -= outlier_removed.min(inserted);
+    }
+
     // 임포트 로그 기록
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -236,11 +258,16 @@ pub fn import_from_zip(
     // 임시 파일 정리
     let _ = std::fs::remove_dir_all(&temp_dir);
 
+    let outlier_msg = if outlier_removed > 0 {
+        format!(" (이웃 비교 이상치 {}건 제거)", outlier_removed)
+    } else {
+        String::new()
+    };
     progress_fn(BuildingImportProgress {
         region: region.to_string(),
         total: count,
         processed: count,
-        status: format!("완료: {}건 중 {}건 임포트", count, inserted),
+        status: format!("완료: {}건 중 {}건 임포트{}", count, inserted, outlier_msg),
     });
 
     Ok(inserted)
@@ -615,6 +642,72 @@ pub fn query_buildings_in_bbox(
     Ok(result)
 }
 
+// ─── 건물 그룹 CRUD ─────────────────────────────────────────────
+
+/// 건물 그룹
+#[derive(Serialize, Clone, Debug)]
+pub struct BuildingGroup {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    pub memo: String,
+}
+
+/// 건물 그룹 전체 조회
+pub fn list_building_groups(conn: &Connection) -> Result<Vec<BuildingGroup>, String> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, color, memo FROM building_groups ORDER BY id"
+    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(BuildingGroup {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+            memo: row.get(3)?,
+        })
+    }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("결과 수집 실패: {}", e))
+}
+
+/// 건물 그룹 추가 (생성된 id 반환)
+pub fn add_building_group(
+    conn: &Connection,
+    name: &str,
+    color: &str,
+    memo: &str,
+) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO building_groups (name, color, memo) VALUES (?1, ?2, ?3)",
+        params![name, color, memo],
+    ).map_err(|e| format!("INSERT 실패: {}", e))?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 건물 그룹 수정
+pub fn update_building_group(
+    conn: &Connection,
+    id: i64,
+    name: &str,
+    color: &str,
+    memo: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE building_groups SET name=?1, color=?2, memo=?3 WHERE id=?4",
+        params![name, color, memo, id],
+    ).map_err(|e| format!("UPDATE 실패: {}", e))?;
+    Ok(())
+}
+
+/// 건물 그룹 삭제 (소속 건물의 group_id는 ON DELETE SET NULL로 자동 해제)
+pub fn delete_building_group(conn: &Connection, id: i64) -> Result<(), String> {
+    conn.execute("DELETE FROM building_groups WHERE id = ?1", params![id])
+        .map_err(|e| format!("DELETE 실패: {}", e))?;
+    Ok(())
+}
+
 // ─── 수동 등록 건물 CRUD ─────────────────────────────────────────
 
 /// 수동 등록 건물
@@ -631,12 +724,14 @@ pub struct ManualBuilding {
     pub geometry_type: String,
     /// 도형 좌표 JSON (rectangle: [[lat,lon]x4] 4꼭짓점 (레거시: [[minLat,minLon],[maxLat,maxLon]]), circle: {center:[lat,lon],semi_major_m,semi_minor_m,rotation_deg}, line: [[lat,lon],...])
     pub geometry_json: Option<String>,
+    /// 소속 그룹 ID (null이면 미분류)
+    pub group_id: Option<i64>,
 }
 
 /// 수동 건물 전체 조회
 pub fn list_manual_buildings(conn: &Connection) -> Result<Vec<ManualBuilding>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json FROM manual_buildings ORDER BY id"
+        "SELECT id, name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id FROM manual_buildings ORDER BY id"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -650,6 +745,7 @@ pub fn list_manual_buildings(conn: &Connection) -> Result<Vec<ManualBuilding>, S
             memo: row.get(6)?,
             geometry_type: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "point".to_string()),
             geometry_json: row.get(8)?,
+            group_id: row.get(9)?,
         })
     }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
@@ -668,10 +764,11 @@ pub fn add_manual_building(
     memo: &str,
     geometry_type: &str,
     geometry_json: Option<&str>,
+    group_id: Option<i64>,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO manual_buildings (name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json],
+        "INSERT INTO manual_buildings (name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id],
     ).map_err(|e| format!("INSERT 실패: {}", e))?;
     Ok(conn.last_insert_rowid())
 }
@@ -688,10 +785,11 @@ pub fn update_manual_building(
     memo: &str,
     geometry_type: &str,
     geometry_json: Option<&str>,
+    group_id: Option<i64>,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE manual_buildings SET name=?1, latitude=?2, longitude=?3, height=?4, ground_elev=?5, memo=?6, geometry_type=?7, geometry_json=?8 WHERE id=?9",
-        params![name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, id],
+        "UPDATE manual_buildings SET name=?1, latitude=?2, longitude=?3, height=?4, ground_elev=?5, memo=?6, geometry_type=?7, geometry_json=?8, group_id=?9 WHERE id=?10",
+        params![name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id, id],
     ).map_err(|e| format!("UPDATE 실패: {}", e))?;
     Ok(())
 }
@@ -701,6 +799,86 @@ pub fn delete_manual_building(conn: &Connection, id: i64) -> Result<(), String> 
     conn.execute("DELETE FROM manual_buildings WHERE id = ?1", params![id])
         .map_err(|e| format!("DELETE 실패: {}", e))?;
     Ok(())
+}
+
+// ─── 이웃 비교 이상치 필터링 ─────────────────────────────────────
+
+/// 인접 건물과 비교하여 비정상적으로 높은 건물 제거
+/// 같은 단지(아파트 등)에서 한 동만 SHP 데이터 오류로 높이가 비정상인 경우를 탐지.
+/// 예: 온수 힐스테이트 — 대부분 동이 40~60m인데 한 동만 300m로 기록된 케이스.
+fn remove_neighbor_outliers(conn: &Connection, region: &str) -> Result<usize, String> {
+    // 1) 높이 > 0 인 전체 건물을 메모리로 로드 (lat 정렬)
+    let mut stmt = conn.prepare(
+        "SELECT rowid, centroid_lat, centroid_lon, height
+         FROM buildings
+         WHERE region = ?1 AND height > 0
+         ORDER BY centroid_lat"
+    ).map_err(|e| format!("건물 조회 실패: {}", e))?;
+
+    let all: Vec<(i64, f64, f64, f64)> = stmt.query_map(
+        params![region],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).map_err(|e| format!("건물 쿼리 실패: {}", e))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    if all.is_empty() {
+        return Ok(0);
+    }
+
+    // lat 값만 추출 (이진 탐색용)
+    let lats: Vec<f64> = all.iter().map(|b| b.1).collect();
+
+    // 2) 높이 40m 이상 후보에 대해 메모리 내 이웃 탐색 (이진 탐색으로 lat 범위 좁힘)
+    let mut outlier_ids = Vec::new();
+
+    for &(rowid, lat, lon, height) in &all {
+        if height < NEIGHBOR_OUTLIER_MIN_HEIGHT_M {
+            continue;
+        }
+
+        let lat_lo = lat - NEIGHBOR_RADIUS_DEG;
+        let lat_hi = lat + NEIGHBOR_RADIUS_DEG;
+        let lon_lo = lon - NEIGHBOR_RADIUS_DEG;
+        let lon_hi = lon + NEIGHBOR_RADIUS_DEG;
+
+        // 이진 탐색으로 lat 범위 내 시작/끝 인덱스
+        let start = lats.partition_point(|&l| l < lat_lo);
+        let end = lats.partition_point(|&l| l <= lat_hi);
+
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+
+        for &(rid, _, blon, bh) in &all[start..end] {
+            if rid != rowid && blon >= lon_lo && blon <= lon_hi {
+                sum += bh;
+                count += 1;
+            }
+        }
+
+        if count < NEIGHBOR_MIN_COUNT {
+            continue;
+        }
+
+        let avg = sum / count as f64;
+        if height > avg * NEIGHBOR_RATIO_THRESHOLD && height - avg > NEIGHBOR_ABS_DIFF_THRESHOLD {
+            outlier_ids.push(rowid);
+        }
+    }
+
+    // 3) 이상치 삭제
+    if !outlier_ids.is_empty() {
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let mut del_stmt = conn.prepare("DELETE FROM buildings WHERE rowid = ?1")
+            .map_err(|e| format!("이상치 삭제 준비 실패: {}", e))?;
+        for id in &outlier_ids {
+            del_stmt.execute(params![id])
+                .map_err(|e| format!("이상치 삭제 실패: {}", e))?;
+        }
+        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    }
+
+    Ok(outlier_ids.len())
 }
 
 // ─── 헬퍼 함수 ─────────────────────────────────────────────────
@@ -873,7 +1051,7 @@ fn compute_polygon_z_bbox_centroid(
     Some((sum_x / n, sum_y / n, min_x, min_y, max_x, max_y))
 }
 
-/// DBF 레코드에서 숫자 필드 추출 (여러 필드명 시도)
+/// DBF 레코드에서 숫자 필드 추출 (여러 필드명 시도, 첫 번째 매칭 반환)
 fn get_field_as_f64(
     record: &shapefile::dbase::Record,
     field_names: &[&str],
@@ -895,6 +1073,54 @@ fn get_field_as_f64(
         }
     }
     None
+}
+
+/// 높이 필드 다중 수집 후 최적값 선택
+/// - 층수 있으면: 층당 2.5~6.0m 범위에 드는 값 중 최대값 (가장 정확한 높이 채택)
+/// - 층수 없거나 범위 내 값 없으면: 최소 양수값 (보수적 fallback)
+fn get_best_height(
+    record: &shapefile::dbase::Record,
+    field_names: &[&str],
+    ground_floors: Option<i32>,
+) -> Option<f64> {
+    let mut values = Vec::new();
+    for name in field_names {
+        if let Some(value) = record.get(name) {
+            let v = match value {
+                FieldValue::Numeric(Some(v)) => Some(*v),
+                FieldValue::Float(Some(v)) => Some(*v as f64),
+                FieldValue::Double(v) => Some(*v),
+                FieldValue::Integer(v) => Some(*v as f64),
+                FieldValue::Character(Some(s)) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            };
+            if let Some(h) = v {
+                if h > 0.0 {
+                    values.push(h);
+                }
+            }
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+    // 층수 데이터가 있으면 층당 합리적 범위(2.5~6.0m) 내 값 필터 → 최대값
+    if let Some(floors) = ground_floors {
+        if floors > 0 {
+            let f = floors as f64;
+            let valid: Vec<f64> = values.iter().copied()
+                .filter(|h| {
+                    let per_floor = h / f;
+                    per_floor >= MIN_HEIGHT_PER_FLOOR && per_floor <= MAX_HEIGHT_PER_FLOOR
+                })
+                .collect();
+            if let Some(best) = valid.into_iter().reduce(f64::max) {
+                return Some(best);
+            }
+        }
+    }
+    // fallback: 최소 양수값 (보수적)
+    values.into_iter().reduce(f64::min)
 }
 
 /// DBF 레코드에서 문자열 필드 추출

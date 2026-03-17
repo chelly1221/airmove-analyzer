@@ -3,7 +3,7 @@
 
 fn main() {
     // Force WebView2 to use hardware GPU acceleration (prevents software rendering fallback)
-    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--enable-gpu --enable-webgl --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy --disable-gpu-driver-bug-workarounds");
+    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--enable-gpu --enable-webgl --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy --disable-gpu-driver-bug-workarounds --force_high_performance_gpu");
 
     airmove_analyzer_lib::run()
 }

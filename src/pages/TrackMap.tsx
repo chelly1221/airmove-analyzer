@@ -255,95 +255,114 @@ export default function TrackMap() {
   );
 
   // 전체 포인트/Loss 합산 (비정상 항적 + UNKNOWN 제거)
-  // selectedFlightId → 해당 비행만, selectedFlight(시간범위) → 시간 필터, selectedModeS: null → 등록 비행검사기만, "__ALL__" → 전체, 그 외 → 해당 Mode-S 전체
-  const { allPoints, allLoss, allLossPoints, paddedTimeRange } = useMemo(() => {
-    const pts: TrackPoint[] = [];
-    const loss: LossSegment[] = [];
-    const lossP: LossPoint[] = [];
+  // 대량 데이터(전체 항적) 시 비동기 처리로 UI 프리징 방지
+  type AllPointsResult = { allPoints: TrackPoint[]; allLoss: LossSegment[]; allLossPoints: LossPoint[]; paddedTimeRange?: { min: number; max: number } };
+  const [allPointsState, setAllPointsState] = useState<AllPointsResult>({ allPoints: [], allLoss: [], allLossPoints: [] });
+  const [allPointsLoading, setAllPointsLoading] = useState(false);
 
-    // 특정 비행 선택 시 해당 비행 + 앞뒤 1시간 여유 시간 범위 표시
-    if (selectedFlightId) {
-      const targetFlight = radarFilteredFlights.find((f) => f.id === selectedFlightId);
-      if (targetFlight) {
+  useEffect(() => {
+    let cancelled = false;
+
+    const compute = async () => {
+      const pts: TrackPoint[] = [];
+      const loss: LossSegment[] = [];
+      const lossP: LossPoint[] = [];
+
+      // 특정 비행 선택
+      if (selectedFlightId) {
+        const targetFlight = radarFilteredFlights.find((f) => f.id === selectedFlightId);
+        if (targetFlight) {
+          const padding = 3600;
+          const tMin = targetFlight.start_time - padding;
+          const tMax = targetFlight.end_time + padding;
+          const targetModeS = targetFlight.mode_s;
+          for (const f of radarFilteredFlights) {
+            for (const p of f.track_points) {
+              if (!validModeS.has(p.mode_s)) continue;
+              if (p.mode_s === targetModeS && p.timestamp >= tMin && p.timestamp <= tMax) pts.push(p);
+            }
+            loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s) && s.mode_s === targetModeS && s.start_time >= tMin && s.end_time <= tMax));
+            lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s) && p.mode_s === targetModeS && p.timestamp >= tMin && p.timestamp <= tMax));
+          }
+        }
+        pts.sort((a, b) => a.timestamp - b.timestamp);
+        const tFlight = radarFilteredFlights.find((f) => f.id === selectedFlightId);
+        if (!cancelled) setAllPointsState({ allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: tFlight ? { min: tFlight.start_time - 3600, max: tFlight.end_time + 3600 } : undefined });
+        return;
+      }
+
+      // 사이드바 비행 선택 (시간 범위 필터)
+      if (selectedFlight && selectedModeS) {
         const padding = 3600;
-        const tMin = targetFlight.start_time - padding;
-        const tMax = targetFlight.end_time + padding;
-        const targetModeS = targetFlight.mode_s;
+        const tMin = selectedFlight.first_seen - padding;
+        const tMax = selectedFlight.last_seen + padding;
+        const modeS = selectedModeS;
         for (const f of radarFilteredFlights) {
           for (const p of f.track_points) {
             if (!validModeS.has(p.mode_s)) continue;
-            if (p.mode_s === targetModeS && p.timestamp >= tMin && p.timestamp <= tMax) {
-              pts.push(p);
-            }
+            if (p.mode_s === modeS && p.timestamp >= tMin && p.timestamp <= tMax) pts.push(p);
           }
-          loss.push(...f.loss_segments.filter((s) =>
-            validModeS.has(s.mode_s) && s.mode_s === targetModeS && s.start_time >= tMin && s.end_time <= tMax
-          ));
-          lossP.push(...f.loss_points.filter((p) =>
-            validModeS.has(p.mode_s) && p.mode_s === targetModeS && p.timestamp >= tMin && p.timestamp <= tMax
-          ));
+          loss.push(...f.loss_segments.filter((s) => s.mode_s === modeS && s.start_time >= tMin && s.end_time <= tMax));
+          lossP.push(...f.loss_points.filter((p) => p.mode_s === modeS && p.timestamp >= tMin && p.timestamp <= tMax));
         }
+        pts.sort((a, b) => a.timestamp - b.timestamp);
+        if (!cancelled) setAllPointsState({ allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: { min: tMin, max: tMax } });
+        return;
       }
-      pts.sort((a, b) => a.timestamp - b.timestamp);
-      const tFlight = radarFilteredFlights.find((f) => f.id === selectedFlightId);
-      const padded = tFlight ? { min: tFlight.start_time - 3600, max: tFlight.end_time + 3600 } : undefined;
-      return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: padded };
-    }
 
-    // 사이드바에서 비행 선택했지만 store Flight 매칭 실패 시 → 시간 범위로 필터링 (1시간 여유)
-    if (selectedFlight && selectedModeS) {
-      const padding = 3600;
-      const tMin = selectedFlight.first_seen - padding;
-      const tMax = selectedFlight.last_seen + padding;
-      const modeS = selectedModeS;
+      // 일반 필터 (전체/__ALL__, 등록기체, 특정 Mode-S)
+      const showAll = selectedModeS === "__ALL__";
+      let processed = 0;
       for (const f of radarFilteredFlights) {
         for (const p of f.track_points) {
           if (!validModeS.has(p.mode_s)) continue;
-          if (p.mode_s === modeS && p.timestamp >= tMin && p.timestamp <= tMax) {
+          if (showAll) {
             pts.push(p);
+          } else if (!selectedModeS) {
+            if (registeredModeS.has(p.mode_s.toUpperCase())) pts.push(p);
+          } else {
+            if (p.mode_s === selectedModeS) pts.push(p);
           }
         }
-        loss.push(...f.loss_segments.filter((s) =>
-          s.mode_s === modeS && s.start_time >= tMin && s.end_time <= tMax
-        ));
-        lossP.push(...f.loss_points.filter((p) =>
-          p.mode_s === modeS && p.timestamp >= tMin && p.timestamp <= tMax
-        ));
-      }
-      pts.sort((a, b) => a.timestamp - b.timestamp);
-      return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: { min: tMin, max: tMax } };
-    }
-
-    const showAll = selectedModeS === "__ALL__";
-    for (const f of radarFilteredFlights) {
-      for (const p of f.track_points) {
-        if (!validModeS.has(p.mode_s)) continue;
         if (showAll) {
-          pts.push(p);
+          loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s)));
+          lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s)));
         } else if (!selectedModeS) {
-          if (registeredModeS.has(p.mode_s.toUpperCase())) pts.push(p);
+          loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s) && registeredModeS.has(s.mode_s.toUpperCase())));
+          lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s) && registeredModeS.has(p.mode_s.toUpperCase())));
         } else {
-          if (p.mode_s === selectedModeS) pts.push(p);
+          loss.push(...f.loss_segments.filter((s) => s.mode_s === selectedModeS));
+          lossP.push(...f.loss_points.filter((p) => p.mode_s === selectedModeS));
+        }
+        // 대량 데이터 시 비행 10개마다 UI 양보
+        processed++;
+        if (showAll && processed % 10 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+          if (cancelled) return;
         }
       }
-      if (showAll) {
-        loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s)));
-        lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s)));
-      } else if (!selectedModeS) {
-        loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s) && registeredModeS.has(s.mode_s.toUpperCase())));
-        lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s) && registeredModeS.has(p.mode_s.toUpperCase())));
-      } else {
-        loss.push(
-          ...f.loss_segments.filter((s) => s.mode_s === selectedModeS)
-        );
-        lossP.push(
-          ...f.loss_points.filter((p) => p.mode_s === selectedModeS)
-        );
-      }
+      pts.sort((a, b) => a.timestamp - b.timestamp);
+      if (!cancelled) setAllPointsState({ allPoints: pts, allLoss: loss, allLossPoints: lossP });
+    };
+
+    // 소규모 데이터는 동기 실행, 대규모면 비동기 + 로딩 표시
+    const totalPts = radarFilteredFlights.reduce((s, f) => s + f.track_points.length, 0);
+    if (totalPts > 1_000_000 && selectedModeS === "__ALL__") {
+      setAllPointsLoading(true);
+      // 다음 프레임에서 시작하여 로딩 UI가 먼저 표시되도록
+      requestAnimationFrame(() => {
+        compute().finally(() => {
+          if (!cancelled) setAllPointsLoading(false);
+        });
+      });
+    } else {
+      compute();
     }
-    pts.sort((a, b) => a.timestamp - b.timestamp);
-    return { allPoints: pts, allLoss: loss, allLossPoints: lossP, paddedTimeRange: undefined as { min: number; max: number } | undefined };
+
+    return () => { cancelled = true; };
   }, [radarFilteredFlights, selectedModeS, selectedFlightId, selectedFlight, validModeS, registeredModeS]);
+
+  const { allPoints, allLoss, allLossPoints, paddedTimeRange } = allPointsState;
 
   // 고유 Mode-S 목록
   const uniqueModeS = useMemo(() => {
@@ -834,115 +853,98 @@ export default function TrackMap() {
 
   // mode_s → 색상 안정 매핑 (allPoints 기반, 정렬하여 슬라이더/필터 변경에도 색상 유지)
 
-  const { trackPaths, singlePoints } = useMemo(() => {
-    const groups = new Map<string, TrackPoint[]>();
+  const [trackPathsState, setTrackPathsState] = useState<{ trackPaths: TrackPath[]; singlePoints: SinglePoint[] }>({ trackPaths: [], singlePoints: [] });
 
-    for (const p of allPoints) {
-      if (p.timestamp > visibleMaxTs) continue;
-      if (p.timestamp < visibleMinTs) continue;
-      let arr = groups.get(p.mode_s);
-      if (!arr) {
-        arr = [];
-        groups.set(p.mode_s, arr);
-      }
-      arr.push(p);
-    }
+  useEffect(() => {
+    let cancelled = false;
 
-    const paths: TrackPath[] = [];
-    const singles: SinglePoint[] = [];
-    for (const [modeS, pts] of groups) {
-      if (pts.length === 1) {
-        // 1포인트 항적: ScatterplotLayer용 데이터로 수집
-        const p = pts[0];
-        const color = detectionTypeColor(p.radar_type);
-        singles.push({
-          modeS,
-          position: losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale],
-          color,
-          point: p,
-        });
-        continue;
+    const compute = async () => {
+      const groups = new Map<string, TrackPoint[]>();
+      const n = allPoints.length;
+
+      for (let i = 0; i < n; i++) {
+        const p = allPoints[i];
+        if (p.timestamp > visibleMaxTs || p.timestamp < visibleMinTs) continue;
+        let arr = groups.get(p.mode_s);
+        if (!arr) { arr = []; groups.set(p.mode_s, arr); }
+        arr.push(p);
       }
 
-      // Loss 탐지 임계값과 동일하게 7초 이상 gap이면 세그먼트 분할
-      const splitThreshold = 7;
+      if (cancelled) return;
 
-      const totalAlts = pts.map((p) => p.altitude);
-      const avgAlt = totalAlts.reduce((s, a) => s + a, 0) / totalAlts.length;
+      const paths: TrackPath[] = [];
+      const singles: SinglePoint[] = [];
+      let groupsDone = 0;
 
-      // 1단계: 원시 세그먼트 수집 (start/end 인덱스)
-      const rawSegs: { start: number; end: number }[] = [];
-      let segStart = 0;
-      for (let i = 1; i <= pts.length; i++) {
-        const isEnd = i === pts.length;
-        const hasGap = !isEnd && pts[i].timestamp - pts[i - 1].timestamp > splitThreshold;
-        const typeChanged = !isEnd && pts[i].radar_type !== pts[i - 1].radar_type;
+      for (const [modeS, pts] of groups) {
+        if (pts.length === 1) {
+          const p = pts[0];
+          singles.push({ modeS, position: losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale], color: detectionTypeColor(p.radar_type), point: p });
+          continue;
+        }
 
-        if (isEnd || hasGap || typeChanged) {
-          rawSegs.push({ start: segStart, end: i });
-          if (typeChanged && !hasGap) {
-            segStart = i - 1;
-          } else {
-            segStart = i;
+        const splitThreshold = 7;
+        let altSum = 0;
+        for (const p of pts) altSum += p.altitude;
+        const avgAlt = altSum / pts.length;
+
+        // 세그먼트 수집
+        const rawSegs: { start: number; end: number }[] = [];
+        let segStart = 0;
+        for (let i = 1; i <= pts.length; i++) {
+          const isEnd = i === pts.length;
+          const hasGap = !isEnd && pts[i].timestamp - pts[i - 1].timestamp > splitThreshold;
+          const typeChanged = !isEnd && pts[i].radar_type !== pts[i - 1].radar_type;
+          if (isEnd || hasGap || typeChanged) {
+            rawSegs.push({ start: segStart, end: i });
+            segStart = typeChanged && !hasGap ? i - 1 : i;
           }
         }
-      }
 
-      // 2단계: 1-포인트 세그먼트를 인접 세그먼트에 병합 (solo dot 방지)
-      // 단, 인접 세그먼트와의 gap이 splitThreshold 이하일 때만 병합
-      // gap이 크면 Loss 구간이므로 진짜 싱글 타겟 → singles로 유지
-      for (let s = 0; s < rawSegs.length; s++) {
-        if (rawSegs[s].end - rawSegs[s].start === 1) {
-          const singlePt = pts[rawSegs[s].start];
-          const canMergeNext = s < rawSegs.length - 1 &&
-            pts[rawSegs[s + 1].start].timestamp - singlePt.timestamp <= splitThreshold;
-          const canMergePrev = s > 0 &&
-            singlePt.timestamp - pts[rawSegs[s - 1].end - 1].timestamp <= splitThreshold;
-
-          if (canMergeNext) {
-            // 다음 세그먼트에 흡수 (첫점으로 prepend)
-            rawSegs[s + 1].start = rawSegs[s].start;
-            rawSegs.splice(s, 1);
-            s--;
-          } else if (canMergePrev) {
-            // 이전 세그먼트에 흡수
-            rawSegs[s - 1].end = rawSegs[s].end;
-            rawSegs.splice(s, 1);
-            s--;
+        // 1-포인트 세그먼트 병합
+        for (let s = 0; s < rawSegs.length; s++) {
+          if (rawSegs[s].end - rawSegs[s].start === 1) {
+            const singlePt = pts[rawSegs[s].start];
+            const canMergeNext = s < rawSegs.length - 1 && pts[rawSegs[s + 1].start].timestamp - singlePt.timestamp <= splitThreshold;
+            const canMergePrev = s > 0 && singlePt.timestamp - pts[rawSegs[s - 1].end - 1].timestamp <= splitThreshold;
+            if (canMergeNext) { rawSegs[s + 1].start = rawSegs[s].start; rawSegs.splice(s, 1); s--; }
+            else if (canMergePrev) { rawSegs[s - 1].end = rawSegs[s].end; rawSegs.splice(s, 1); s--; }
           }
-          // 양쪽 모두 gap 초과 → 진짜 고립 싱글 타겟, path 생성에서 singles로 처리
+        }
+
+        // PathLayer 데이터 생성
+        for (const seg of rawSegs) {
+          const slice = pts.slice(seg.start, seg.end);
+          if (slice.length >= 2) {
+            const rt = slice[slice.length - 1].radar_type;
+            paths.push({ modeS, radarType: rt, path: slice.map((p) => losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale]), color: detectionTypeColor(rt), avgAlt, pointCount: slice.length });
+          } else if (slice.length === 1) {
+            const p = slice[0];
+            singles.push({ modeS, position: losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale], color: detectionTypeColor(p.radar_type), point: p });
+          }
+        }
+
+        // 대량 데이터 시 mode_s 그룹 50개마다 UI 양보
+        groupsDone++;
+        if (n > 1_000_000 && groupsDone % 50 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+          if (cancelled) return;
         }
       }
 
-      // 3단계: 세그먼트 → PathLayer 데이터 생성
-      for (const seg of rawSegs) {
-        const slice = pts.slice(seg.start, seg.end);
-        if (slice.length >= 2) {
-          const rt = slice[slice.length - 1].radar_type;
-          const color = detectionTypeColor(rt);
-          paths.push({
-            modeS,
-            radarType: rt,
-            path: slice.map((p) => losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale]),
-            color,
-            avgAlt,
-            pointCount: slice.length,
-          });
-        } else if (slice.length === 1) {
-          // 병합 불가능한 진짜 단독 포인트 (전체 항적이 1포인트)
-          const p = slice[0];
-          const color = detectionTypeColor(p.radar_type);
-          singles.push({
-            modeS,
-            position: losMode ? [p.longitude, p.latitude] : [p.longitude, p.latitude, p.altitude * altScale],
-            color,
-            point: p,
-          });
-        }
-      }
+      if (!cancelled) setTrackPathsState({ trackPaths: paths, singlePoints: singles });
+    };
+
+    if (allPoints.length > 1_000_000) {
+      requestAnimationFrame(() => { compute(); });
+    } else {
+      compute();
     }
-    return { trackPaths: paths, singlePoints: singles };
+
+    return () => { cancelled = true; };
   }, [allPoints, visibleMinTs, visibleMaxTs, altScale, losMode]);
+
+  const { trackPaths, singlePoints } = trackPathsState;
 
   // Loss 데이터 (전체 loss type 표시)
   const signalLoss = useMemo(() => {
@@ -1947,8 +1949,16 @@ export default function TrackMap() {
 
         {/* Center: Compact stats */}
         <div className="flex items-center gap-3 text-[10px] text-gray-400">
-          <span>{allPoints.length.toLocaleString()} pts</span>
-          <span className="text-[#a60739]">Loss {signalLossPoints.length}pt/{signalLoss.length}gap</span>
+          {allPointsLoading ? (
+            <span className="flex items-center gap-1 text-blue-500">
+              <Loader2 size={10} className="animate-spin" /> 항적 로딩...
+            </span>
+          ) : (
+            <>
+              <span>{allPoints.length.toLocaleString()} pts</span>
+              <span className="text-[#a60739]">Loss {signalLossPoints.length}pt/{signalLoss.length}gap</span>
+            </>
+          )}
         </div>
 
         {/* ADS-B 로딩 표시 */}
@@ -2409,8 +2419,9 @@ export default function TrackMap() {
           style={{ width: "100%", height: "100%" }}
           cursor={losMode ? "crosshair" : undefined}
           attributionControl={false}
-          // @ts-expect-error preserveDrawingBuffer is a valid maplibre option but not typed in react-map-gl
+          // @ts-expect-error preserveDrawingBuffer, powerPreference are valid maplibre options but not typed in react-map-gl
           preserveDrawingBuffer={true}
+          powerPreference="high-performance"
         >
           <DeckGLOverlay layers={deckLayers} />
           <NavigationControl position="top-right" showZoom={false} />
@@ -2489,20 +2500,30 @@ export default function TrackMap() {
                 )}
                 {coverageVisible && coverageLayers.length > 0 && (() => {
                   const fmtAlt = (ft: number) => ft >= 1000 ? `${(ft / 1000).toFixed(ft % 1000 === 0 ? 0 : 1)}kft` : `${ft}ft`;
-                  const effMin = Math.min(coverageAltMin, coverageAlt);
-                  const effMax = Math.max(coverageAltMin, coverageAlt);
-                  const colorMin = altToColor(effMin);
-                  const colorMax = altToColor(effMax);
+                  const sorted = [...coverageLayers].sort((a, b) => a.altitudeFt - b.altitudeFt);
+                  // 밴드가 너무 많으면 대표 밴드만 표시 (최대 5개)
+                  const maxBands = 5;
+                  const bands = sorted.length <= maxBands
+                    ? sorted
+                    : (() => {
+                        const step = (sorted.length - 1) / (maxBands - 1);
+                        return Array.from({ length: maxBands }, (_, i) => sorted[Math.round(i * step)]);
+                      })();
                   return (
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className="inline-block h-3 w-5 rounded-sm"
-                        style={{
-                          background: `linear-gradient(to right, rgb(${colorMin}), rgb(${altToColor(effMin + (effMax - effMin) * 0.5)}), rgb(${colorMax}))`,
-                          opacity: 0.7,
-                        }}
-                      />
-                      <span className="text-gray-600">커버리지 ({fmtAlt(effMin)}~{fmtAlt(effMax)})</span>
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-gray-500 text-[8px] font-medium">커버리지</span>
+                      {bands.map((band) => {
+                        const c = altToColor(band.altitudeFt);
+                        return (
+                          <div key={band.altitudeFt} className="flex items-center gap-1.5">
+                            <span
+                              className="inline-block h-2.5 w-4 rounded-sm"
+                              style={{ backgroundColor: `rgb(${c})`, opacity: 0.7 }}
+                            />
+                            <span className="text-gray-600">{fmtAlt(band.altitudeFt)}</span>
+                          </div>
+                        );
+                      })}
                     </div>
                   );
                 })()}

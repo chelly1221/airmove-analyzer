@@ -1068,10 +1068,21 @@ export function SrtmDownloadSection() {
 // ─── 건물 데이터 (GIS건물통합정보) ────────────────────────────────────
 
 const REGIONS = [
-  { key: "seoul", label: "서울특별시" },
-  { key: "incheon", label: "인천광역시" },
-  { key: "gyeonggi", label: "경기도" },
+  { key: "seoul", label: "서울특별시", code: "11" },
+  { key: "incheon", label: "인천광역시", code: "28" },
+  { key: "gyeonggi", label: "경기도", code: "41" },
 ] as const;
+
+/** 파일명에서 행정구역코드로 지역 자동 감지 (예: AL_D010_11_20260309.zip → seoul) */
+function detectRegionFromFilename(filename: string): { key: string; label: string } | null {
+  const base = filename.replace(/\\/g, "/").split("/").pop() ?? "";
+  for (const r of REGIONS) {
+    if (base.includes(`_${r.code}_`) || base.includes(`_${r.code}.`)) {
+      return { key: r.key, label: r.label };
+    }
+  }
+  return null;
+}
 
 export function BuildingDataSection() {
   const [importStatus, setImportStatus] = useState<BuildingImportStatus[]>([]);
@@ -1080,6 +1091,7 @@ export function BuildingDataSection() {
   const [progress, setProgress] = useState<{ region: string; processed: number; status: string } | null>(null);
   const [result, setResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [batchResults, setBatchResults] = useState<{ label: string; ok: boolean; msg: string }[]>([]);
 
   const loadStatus = async () => {
     try {
@@ -1137,6 +1149,74 @@ export function BuildingDataSection() {
     }
   };
 
+  const handleBatchImport = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const files = await open({
+        title: "건물 데이터 일괄 가져오기 (여러 ZIP 선택)",
+        filters: [{ name: "SHP ZIP 파일", extensions: ["zip"] }],
+        multiple: true,
+        directory: false,
+      });
+      if (!files || (Array.isArray(files) && files.length === 0)) return;
+
+      const paths = Array.isArray(files) ? files : [files];
+
+      // 파일명에서 지역 자동 감지
+      const queue: { region: string; path: string; label: string }[] = [];
+      const unknown: string[] = [];
+      for (const p of paths) {
+        const detected = detectRegionFromFilename(p as string);
+        if (detected) {
+          queue.push({ region: detected.key, path: p as string, label: detected.label });
+        } else {
+          unknown.push((p as string).replace(/\\/g, "/").split("/").pop() ?? (p as string));
+        }
+      }
+
+      if (unknown.length > 0) {
+        setResult({ type: "error", message: `지역 감지 실패 (파일명에 행정구역코드 없음): ${unknown.join(", ")}` });
+        if (queue.length === 0) return;
+      }
+
+      // 순차 임포트
+      setResult(null);
+      setBatchResults([]);
+      const results: { label: string; ok: boolean; msg: string }[] = [];
+
+      for (let i = 0; i < queue.length; i++) {
+        const item = queue[i];
+        setImporting(item.region);
+        setProgress(null);
+        try {
+          const msg = await invoke<string>("import_building_data", {
+            zipPath: item.path,
+            region: item.region,
+          });
+          results.push({ label: item.label, ok: true, msg });
+        } catch (e) {
+          results.push({ label: item.label, ok: false, msg: `${e}` });
+        }
+        setBatchResults([...results]);
+      }
+
+      setImporting(null);
+      setProgress(null);
+      await loadStatus();
+
+      const ok = results.filter(r => r.ok).length;
+      const fail = results.filter(r => !r.ok).length;
+      setResult({
+        type: fail > 0 ? "error" : "success",
+        message: `일괄 임포트 완료: ${ok}건 성공${fail > 0 ? `, ${fail}건 실패` : ""}`,
+      });
+    } catch (e) {
+      setImporting(null);
+      setProgress(null);
+      setResult({ type: "error", message: `일괄 임포트 실패: ${e}` });
+    }
+  };
+
   const handleClear = async (regionKey: string) => {
     try {
       await invoke("clear_building_data", { region: regionKey });
@@ -1174,10 +1254,37 @@ export function BuildingDataSection() {
           vworld 다운로드
         </a>
       </div>
-      <p className="text-xs text-gray-500">
-        국토교통부 GIS건물통합정보 SHP 데이터를 임포트하여 LOS 분석에 건물 차폐를 반영합니다.
-        vworld에서 서울/인천/경기도 ZIP 파일을 다운로드한 후 아래에서 가져오기 하세요.
-      </p>
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-gray-500">
+          국토교통부 GIS건물통합정보 SHP 데이터를 임포트하여 LOS 분석에 건물 차폐를 반영합니다.
+          vworld에서 서울/인천/경기도 ZIP 파일을 다운로드한 후 아래에서 가져오기 하세요.
+        </p>
+        <button
+          onClick={handleBatchImport}
+          disabled={importing !== null}
+          className="flex-shrink-0 flex items-center gap-1.5 rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          <Upload size={12} />
+          일괄 가져오기
+        </button>
+      </div>
+
+      {batchResults.length > 0 && importing !== null && (
+        <div className="space-y-1">
+          {batchResults.map((r, i) => (
+            <div key={i} className={`flex items-center gap-2 text-xs ${r.ok ? "text-emerald-600" : "text-red-500"}`}>
+              {r.ok ? <Check size={12} /> : <X size={12} />}
+              <span>{r.label}: {r.msg}</span>
+            </div>
+          ))}
+          {importing && (
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <Loader2 size={12} className="animate-spin" />
+              <span>{REGIONS.find(r => r.key === importing)?.label ?? importing} 임포트 중...</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {loading ? (
         <div className="py-4 text-center text-sm text-gray-500">로딩 중...</div>

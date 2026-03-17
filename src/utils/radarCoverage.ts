@@ -2,12 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import type { RadarSite } from "../types";
 
 const R_EARTH_M = 6_371_000;
-const R_EFF_M = R_EARTH_M * (4 / 3);
 
-/** 4/3 유효지구반경 곡률 보정 (m 단위 반환) */
-function curvDrop43(dKm: number): number {
+/** 실제 지구반경 곡률 보정 — 직선 LoS 기준 (m 단위 반환) */
+function curvDrop(dKm: number): number {
   const dM = dKm * 1000;
-  return (dM * dM) / (2 * R_EFF_M);
+  return (dM * dM) / (2 * R_EARTH_M);
 }
 
 /** 방위각+거리로 목적지 좌표 계산 (WGS-84) */
@@ -81,7 +80,7 @@ interface RayProfile {
   bearing: number;
   /** 각 샘플 포인트의 거리 (km) */
   distances: Float64Array;
-  /** 각 샘플 포인트의 보정된 지형 높이 (= 지형고도 + 건물높이 - curvDrop43) */
+  /** 각 샘플 포인트의 보정된 지형 높이 (= 지형고도 + 건물높이 - curvDrop) */
   adjTerrains: Float64Array;
   /** 누적 최대 지형 각도 (maxAngle[i] = max(adjTerrain[j]-radarH)/dist[j] for j=0..i) */
   maxAngles: Float64Array;
@@ -215,7 +214,7 @@ export async function computeCoverageTerrainProfile(
 
       // 지형 + 건물 높이 → 4/3 유효지구 프레임 보정
       const terrainWithBuilding = allElevations[globalIdx] + buildingHeights[globalIdx];
-      const adj = terrainWithBuilding - curvDrop43(dist);
+      const adj = terrainWithBuilding - curvDrop(dist);
       adjTerrains[s] = adj;
 
       // 레이더에서 본 지형 각도 (높이/거리 비율)

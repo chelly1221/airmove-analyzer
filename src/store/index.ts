@@ -280,7 +280,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   // 원시 데이터
   rawTrackPoints: [],
   appendRawTrackPoints: (points) =>
-    set((state) => ({ rawTrackPoints: [...state.rawTrackPoints, ...points] })),
+    set((state) => {
+      const merged = state.rawTrackPoints.concat(points);
+      return { rawTrackPoints: merged };
+    }),
   clearRawTrackPoints: () => set({ rawTrackPoints: [] }),
 
   // 파싱 통계

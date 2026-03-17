@@ -20,6 +20,7 @@ import {
   Minus,
   ChevronRight,
   RotateCw,
+  FolderPlus,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -27,7 +28,7 @@ import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre
 import { useAppStore } from "../store";
 import { consolidateFlights } from "../utils/flightConsolidation";
 import Modal from "../components/common/Modal";
-import type { AnalysisResult, FlightRecord, GeometryType, ManualBuilding, UploadedFile } from "../types";
+import type { AnalysisResult, BuildingGroup, FlightRecord, GeometryType, ManualBuilding, UploadedFile } from "../types";
 
 // ─── 건물 입력 모달 ──────────────────────────────────────────────
 
@@ -44,6 +45,7 @@ interface BuildingFormData {
   memo: string;
   geometry_type: GeometryType;
   geometry_json: string | null;
+  group_id: number | null;
 }
 
 const emptyForm: BuildingFormData = {
@@ -55,6 +57,7 @@ const emptyForm: BuildingFormData = {
   memo: "",
   geometry_type: "point",
   geometry_json: null,
+  group_id: null,
 };
 
 /** 두 좌표 간 거리 (m) */
@@ -163,11 +166,13 @@ function BuildingModal({
   onClose,
   onSave,
   initial,
+  groups,
 }: {
   open: boolean;
   onClose: () => void;
   onSave: (data: BuildingFormData) => void;
   initial?: ManualBuilding | null;
+  groups: BuildingGroup[];
 }) {
   const [form, setForm] = useState<BuildingFormData>(emptyForm);
   const [drawTool, setDrawTool] = useState<DrawTool>("point");
@@ -190,6 +195,7 @@ function BuildingModal({
         memo: initial.memo,
         geometry_type: initial.geometry_type || "point",
         geometry_json: initial.geometry_json || null,
+        group_id: initial.group_id ?? null,
       });
       setDrawTool(initial.geometry_type as DrawTool || "point");
     } else {
@@ -733,6 +739,23 @@ function BuildingModal({
             </div>
           )}
 
+          {/* 그룹 선택 */}
+          {groups.length > 0 && (
+            <div>
+              <label className="mb-0.5 block text-xs font-medium text-gray-600">그룹</label>
+              <select
+                value={form.group_id ?? ""}
+                onChange={(e) => setForm((f) => ({ ...f, group_id: e.target.value ? Number(e.target.value) : null }))}
+                className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-800 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30"
+              >
+                <option value="">미분류</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>{g.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
           <div className="flex items-center justify-end gap-2 pt-2">
             <button
               onClick={onClose}
@@ -925,22 +948,35 @@ function BuildingModal({
 
 function ManualBuildingPanel() {
   const [buildings, setBuildings] = useState<ManualBuilding[]>([]);
+  const [groups, setGroups] = useState<BuildingGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<ManualBuilding | null>(null);
+  // 그룹 관리
+  const [groupModalOpen, setGroupModalOpen] = useState(false);
+  const [editGroup, setEditGroup] = useState<BuildingGroup | null>(null);
+  const [groupForm, setGroupForm] = useState({ name: "", color: "#6b7280", memo: "" });
+  // 그룹 필터 (null=전체, 0=미분류, 양수=그룹ID)
+  const [filterGroupId, setFilterGroupId] = useState<number | null>(null);
+  // 그룹 접기/펼치기
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<number>>(new Set());
 
-  const loadBuildings = useCallback(async () => {
+  const loadData = useCallback(async () => {
     try {
-      const list = await invoke<ManualBuilding[]>("list_manual_buildings");
-      setBuildings(list);
+      const [bList, gList] = await Promise.all([
+        invoke<ManualBuilding[]>("list_manual_buildings"),
+        invoke<BuildingGroup[]>("list_building_groups"),
+      ]);
+      setBuildings(bList);
+      setGroups(gList);
     } catch (e) {
-      console.warn("건물 목록 로드 실패:", e);
+      console.warn("데이터 로드 실패:", e);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { loadBuildings(); }, [loadBuildings]);
+  useEffect(() => { loadData(); }, [loadData]);
 
   const handleSave = async (data: BuildingFormData) => {
     try {
@@ -955,6 +991,7 @@ function ManualBuildingPanel() {
           memo: data.memo,
           geometryType: data.geometry_type || "point",
           geometryJson: data.geometry_json || null,
+          groupId: data.group_id,
         });
       } else {
         await invoke("add_manual_building", {
@@ -966,11 +1003,12 @@ function ManualBuildingPanel() {
           memo: data.memo,
           geometryType: data.geometry_type || "point",
           geometryJson: data.geometry_json || null,
+          groupId: data.group_id,
         });
       }
       setModalOpen(false);
       setEditTarget(null);
-      loadBuildings();
+      loadData();
     } catch (e) {
       console.error("건물 저장 실패:", e);
     }
@@ -979,7 +1017,7 @@ function ManualBuildingPanel() {
   const handleDelete = async (b: ManualBuilding) => {
     try {
       await invoke("delete_manual_building", { id: b.id });
-      loadBuildings();
+      loadData();
     } catch (e) {
       console.error("건물 삭제 실패:", e);
     }
@@ -995,6 +1033,127 @@ function ManualBuildingPanel() {
     setModalOpen(true);
   };
 
+  // 그룹 CRUD
+  const openGroupAdd = () => {
+    setEditGroup(null);
+    setGroupForm({ name: "", color: "#6b7280", memo: "" });
+    setGroupModalOpen(true);
+  };
+  const openGroupEdit = (g: BuildingGroup) => {
+    setEditGroup(g);
+    setGroupForm({ name: g.name, color: g.color, memo: g.memo });
+    setGroupModalOpen(true);
+  };
+  const handleGroupSave = async () => {
+    if (!groupForm.name.trim()) return;
+    try {
+      if (editGroup) {
+        await invoke("update_building_group", { id: editGroup.id, name: groupForm.name.trim(), color: groupForm.color, memo: groupForm.memo });
+      } else {
+        await invoke("add_building_group", { name: groupForm.name.trim(), color: groupForm.color, memo: groupForm.memo });
+      }
+      setGroupModalOpen(false);
+      loadData();
+    } catch (e) { console.error("그룹 저장 실패:", e); }
+  };
+  const handleGroupDelete = async (g: BuildingGroup) => {
+    try {
+      await invoke("delete_building_group", { id: g.id });
+      if (filterGroupId === g.id) setFilterGroupId(null);
+      loadData();
+    } catch (e) { console.error("그룹 삭제 실패:", e); }
+  };
+
+  const toggleCollapse = (groupId: number) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  };
+
+  // 그룹별로 건물 분류
+  const groupedBuildings = useMemo(() => {
+    const filtered = filterGroupId === null
+      ? buildings
+      : filterGroupId === 0
+        ? buildings.filter((b) => !b.group_id)
+        : buildings.filter((b) => b.group_id === filterGroupId);
+
+    const map = new Map<number | null, ManualBuilding[]>();
+    for (const b of filtered) {
+      const key = b.group_id;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(b);
+    }
+    return map;
+  }, [buildings, filterGroupId]);
+
+  const getGroupName = (id: number | null) => {
+    if (!id) return "미분류";
+    return groups.find((g) => g.id === id)?.name ?? "미분류";
+  };
+  const getGroupColor = (id: number | null) => {
+    if (!id) return "#9ca3af";
+    return groups.find((g) => g.id === id)?.color ?? "#9ca3af";
+  };
+
+  // 그룹 순서: 그룹 목록 순서 + 미분류 마지막
+  const sortedGroupKeys = useMemo(() => {
+    const keys = [...groupedBuildings.keys()];
+    return keys.sort((a, b) => {
+      if (a === null) return 1;
+      if (b === null) return -1;
+      const ia = groups.findIndex((g) => g.id === a);
+      const ib = groups.findIndex((g) => g.id === b);
+      return ia - ib;
+    });
+  }, [groupedBuildings, groups]);
+
+  const GROUP_COLORS = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899", "#6b7280", "#14b8a6"];
+
+  const renderBuildingRow = (b: ManualBuilding) => (
+    <div key={b.id} className="flex items-center gap-3 px-3 py-2 hover:bg-gray-100 transition-colors group">
+      {b.geometry_type === "rectangle" ? <Square size={14} className="shrink-0 text-gray-400" />
+        : b.geometry_type === "circle" ? <Circle size={14} className="shrink-0 text-gray-400" />
+        : b.geometry_type === "line" ? <Minus size={14} className="shrink-0 text-gray-400" />
+        : <Building2 size={14} className="shrink-0 text-gray-400" />}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <span className="text-sm font-medium text-gray-800 truncate">{b.name}</span>
+          <span className="text-[10px] text-gray-400">{b.height}m</span>
+          {b.geometry_type && b.geometry_type !== "point" && (
+            <span className="text-[9px] text-gray-400 bg-gray-200 px-1 rounded">
+              {b.geometry_type === "rectangle" ? "사각형" : b.geometry_type === "circle" ? "원/타원" : "선"}
+            </span>
+          )}
+        </div>
+        <div className="text-[10px] text-gray-400">
+          {b.latitude.toFixed(4)}°N, {b.longitude.toFixed(4)}°E
+          {b.ground_elev > 0 && ` · 표고 ${b.ground_elev}m`}
+          {b.memo && ` · ${b.memo}`}
+        </div>
+      </div>
+      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        <button
+          onClick={() => openEdit(b)}
+          className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700 transition-colors"
+          title="수정"
+        >
+          <Pencil size={12} />
+        </button>
+        <button
+          onClick={() => handleDelete(b)}
+          className="rounded p-1 text-gray-400 hover:bg-red-100 hover:text-red-600 transition-colors"
+          title="삭제"
+        >
+          <Trash2 size={12} />
+        </button>
+      </div>
+    </div>
+  );
+
   return (
     <>
       <div className="space-y-3">
@@ -1005,14 +1164,65 @@ function ManualBuildingPanel() {
               LOS 분석에 사용할 건물을 수동 등록합니다
             </p>
           </div>
-          <button
-            onClick={openAdd}
-            className="flex items-center gap-2 rounded-lg bg-[#a60739] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e]"
-          >
-            <Plus size={16} />
-            건물 추가
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={openGroupAdd}
+              className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-sm text-gray-600 transition-colors hover:bg-gray-100"
+            >
+              <FolderPlus size={14} />
+              그룹
+            </button>
+            <button
+              onClick={openAdd}
+              className="flex items-center gap-2 rounded-lg bg-[#a60739] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e]"
+            >
+              <Plus size={16} />
+              건물 추가
+            </button>
+          </div>
         </div>
+
+        {/* 그룹 필터 탭 */}
+        {groups.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              onClick={() => setFilterGroupId(null)}
+              className={`rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
+                filterGroupId === null ? "bg-gray-800 text-white" : "bg-gray-100 text-gray-500 hover:bg-gray-200"
+              }`}
+            >
+              전체 ({buildings.length})
+            </button>
+            {groups.map((g) => {
+              const cnt = buildings.filter((b) => b.group_id === g.id).length;
+              return (
+                <button
+                  key={g.id}
+                  onClick={() => setFilterGroupId(filterGroupId === g.id ? null : g.id)}
+                  className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
+                    filterGroupId === g.id ? "bg-gray-800 text-white" : "bg-gray-100 text-gray-500 hover:bg-gray-200"
+                  }`}
+                >
+                  <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: g.color }} />
+                  {g.name} ({cnt})
+                </button>
+              );
+            })}
+            {(() => {
+              const ungrouped = buildings.filter((b) => !b.group_id).length;
+              return ungrouped > 0 ? (
+                <button
+                  onClick={() => setFilterGroupId(filterGroupId === 0 ? null : 0)}
+                  className={`rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
+                    filterGroupId === 0 ? "bg-gray-800 text-white" : "bg-gray-100 text-gray-500 hover:bg-gray-200"
+                  }`}
+                >
+                  미분류 ({ungrouped})
+                </button>
+              ) : null;
+            })()}
+          </div>
+        )}
 
         {loading ? (
           <div className="flex items-center justify-center py-12 text-gray-400">
@@ -1029,48 +1239,63 @@ function ManualBuildingPanel() {
               건물 추가하기
             </button>
           </div>
-        ) : (
+        ) : groups.length === 0 ? (
+          /* 그룹 없으면 플랫 리스트 */
           <div className="divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200 bg-gray-50">
-            {buildings.map((b) => (
-              <div key={b.id} className="flex items-center gap-3 px-3 py-2 hover:bg-gray-100 transition-colors group">
-                {b.geometry_type === "rectangle" ? <Square size={14} className="shrink-0 text-gray-400" />
-                  : b.geometry_type === "circle" ? <Circle size={14} className="shrink-0 text-gray-400" />
-                  : b.geometry_type === "line" ? <Minus size={14} className="shrink-0 text-gray-400" />
-                  : <Building2 size={14} className="shrink-0 text-gray-400" />}
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2">
-                    <span className="text-sm font-medium text-gray-800 truncate">{b.name}</span>
-                    <span className="text-[10px] text-gray-400">{b.height}m</span>
-                    {b.geometry_type && b.geometry_type !== "point" && (
-                      <span className="text-[9px] text-gray-400 bg-gray-200 px-1 rounded">
-                        {b.geometry_type === "rectangle" ? "사각형" : b.geometry_type === "circle" ? "원/타원" : "선"}
-                      </span>
+            {buildings.map(renderBuildingRow)}
+          </div>
+        ) : (
+          /* 그룹별 접기/펼치기 리스트 */
+          <div className="space-y-2">
+            {sortedGroupKeys.map((gId) => {
+              const items = groupedBuildings.get(gId) ?? [];
+              const collapsed = collapsedGroups.has(gId ?? 0);
+              const group = gId ? groups.find((g) => g.id === gId) : null;
+              return (
+                <div key={gId ?? "ungrouped"} className="overflow-hidden rounded-xl border border-gray-200 bg-gray-50">
+                  {/* 그룹 헤더 */}
+                  <div
+                    className="group/hdr flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-100 transition-colors"
+                    onClick={() => toggleCollapse(gId ?? 0)}
+                  >
+                    <ChevronRight
+                      size={14}
+                      className={`shrink-0 text-gray-400 transition-transform ${collapsed ? "" : "rotate-90"}`}
+                    />
+                    <span
+                      className="inline-block h-2.5 w-2.5 rounded-full shrink-0"
+                      style={{ backgroundColor: getGroupColor(gId) }}
+                    />
+                    <span className="text-sm font-medium text-gray-700">{getGroupName(gId)}</span>
+                    <span className="text-[10px] text-gray-400">({items.length})</span>
+                    {group && (
+                      <div className="ml-auto flex items-center gap-1 opacity-0 group-hover/hdr:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); openGroupEdit(group); }}
+                          className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700 transition-colors"
+                          title="그룹 수정"
+                        >
+                          <Pencil size={10} />
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleGroupDelete(group); }}
+                          className="rounded p-1 text-gray-400 hover:bg-red-100 hover:text-red-600 transition-colors"
+                          title="그룹 삭제"
+                        >
+                          <Trash2 size={10} />
+                        </button>
+                      </div>
                     )}
                   </div>
-                  <div className="text-[10px] text-gray-400">
-                    {b.latitude.toFixed(4)}°N, {b.longitude.toFixed(4)}°E
-                    {b.ground_elev > 0 && ` · 표고 ${b.ground_elev}m`}
-                    {b.memo && ` · ${b.memo}`}
-                  </div>
+                  {/* 건물 목록 */}
+                  {!collapsed && (
+                    <div className="divide-y divide-gray-100 border-t border-gray-100">
+                      {items.map(renderBuildingRow)}
+                    </div>
+                  )}
                 </div>
-                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button
-                    onClick={() => openEdit(b)}
-                    className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700 transition-colors"
-                    title="수정"
-                  >
-                    <Pencil size={12} />
-                  </button>
-                  <button
-                    onClick={() => handleDelete(b)}
-                    className="rounded p-1 text-gray-400 hover:bg-red-100 hover:text-red-600 transition-colors"
-                    title="삭제"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -1080,7 +1305,62 @@ function ManualBuildingPanel() {
         onClose={() => { setModalOpen(false); setEditTarget(null); }}
         onSave={handleSave}
         initial={editTarget}
+        groups={groups}
       />
+
+      {/* 그룹 관리 모달 */}
+      <Modal open={groupModalOpen} onClose={() => setGroupModalOpen(false)} title={editGroup ? "그룹 수정" : "그룹 추가"} width="max-w-sm">
+        <div className="space-y-3">
+          <div>
+            <label className="mb-0.5 block text-xs font-medium text-gray-600">그룹명 <span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              value={groupForm.name}
+              onChange={(e) => setGroupForm((f) => ({ ...f, name: e.target.value }))}
+              placeholder="예: 인천공항 주변"
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-800 placeholder:text-gray-400 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30"
+            />
+          </div>
+          <div>
+            <label className="mb-0.5 block text-xs font-medium text-gray-600">색상</label>
+            <div className="flex items-center gap-2">
+              {GROUP_COLORS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setGroupForm((f) => ({ ...f, color: c }))}
+                  className={`h-6 w-6 rounded-full transition-all ${groupForm.color === c ? "ring-2 ring-offset-1 ring-gray-800 scale-110" : "hover:scale-110"}`}
+                  style={{ backgroundColor: c }}
+                />
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="mb-0.5 block text-xs font-medium text-gray-600">메모</label>
+            <input
+              type="text"
+              value={groupForm.memo}
+              onChange={(e) => setGroupForm((f) => ({ ...f, memo: e.target.value }))}
+              placeholder="비고"
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-800 placeholder:text-gray-400 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              onClick={() => setGroupModalOpen(false)}
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              취소
+            </button>
+            <button
+              onClick={handleGroupSave}
+              disabled={!groupForm.name.trim()}
+              className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] disabled:opacity-40 transition-colors"
+            >
+              {editGroup ? "수정" : "추가"}
+            </button>
+          </div>
+        </div>
+      </Modal>
     </>
   );
 }

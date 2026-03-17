@@ -846,13 +846,36 @@ fn save_setting(
     db::set_setting(&conn, &key, &value).map_err(|e| format!("DB error: {}", e))
 }
 
-/// DB에서 저장된 파싱 데이터 로드 (앱 시작 시 호출)
+/// DB에서 저장된 파싱 데이터 로드 (앱 시작 시 호출) — 레거시 (소량 데이터 호환)
 #[tauri::command]
 fn load_saved_data(
     state: tauri::State<'_, AppState>,
 ) -> Result<db::SavedParsedData, String> {
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     db::load_all_parsed_data(&conn).map_err(|e| format!("DB load error: {}", e))
+}
+
+/// 파일 메타데이터만 로드 (포인트 제외, 스트리밍 복원 1단계)
+#[tauri::command]
+fn load_saved_file_metas(
+    state: tauri::State<'_, AppState>,
+) -> Result<db::SavedParsedMeta, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::load_parsed_file_metas(&conn).map_err(|e| format!("DB load error: {}", e))
+}
+
+/// 특정 파일의 track_points를 로드 (파일 단위 분할 복원)
+#[tauri::command]
+async fn load_file_track_points(
+    state: tauri::State<'_, AppState>,
+    file_id: i64,
+) -> Result<Vec<TrackPoint>, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let mut points = Vec::new();
+    db::load_track_points_chunked(&conn, file_id, 50000, |chunk| {
+        points.extend(chunk);
+    }).map_err(|e| format!("DB load error: {}", e))?;
+    Ok(points)
 }
 
 /// 저장된 파싱 데이터 전체 삭제
@@ -1107,23 +1130,29 @@ async fn download_srtm_korea(
     use flate2::read::GzDecoder;
     use std::io::Read;
 
-    let srtm_dir = {
+    let (srtm_dir, db_path) = {
         let state = app_handle.state::<AppState>();
         let reader = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-        reader.data_dir().to_path_buf()
+        (reader.data_dir().to_path_buf(), reader.db_path().to_path_buf())
     };
 
-    // 한국 영역 타일 목록
+    // DB 연결 (타일 존재 확인용)
+    let db_conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| format!("DB open: {}", e))?;
+
+    // 한국 영역 타일 목록 (DB + 파일 모두 확인)
     let mut tiles: Vec<(i32, i32, String)> = Vec::new();
     for lat in 33..=38 {
         for lon in 124..=131 {
             let name = srtm::SrtmReader::tile_name(lat, lon);
-            let path = srtm_dir.join(format!("{}.hgt", name));
-            if !path.exists() {
+            let in_db = db::has_srtm_tile(&db_conn, &name);
+            let in_file = srtm_dir.join(format!("{}.hgt", &name)).exists();
+            if !in_db && !in_file {
                 tiles.push((lat, lon, name));
             }
         }
     }
+    drop(db_conn);
 
     if tiles.is_empty() {
         return Ok("모든 SRTM 타일이 이미 다운로드되어 있습니다.".to_string());
@@ -1172,9 +1201,17 @@ async fn download_srtm_korea(
                 decoder.read_to_end(&mut hgt_bytes)
                     .map_err(|e| format!("Decompress error for {}: {}", name, e))?;
 
+                // DB에 저장
+                {
+                    let db_conn = rusqlite::Connection::open(&db_path)
+                        .map_err(|e| format!("DB open: {}", e))?;
+                    db::save_srtm_tile(&db_conn, name, &hgt_bytes)
+                        .map_err(|e| format!("DB save error for {}: {}", name, e))?;
+                }
+
+                // 파일에도 저장 (폴백 호환)
                 let dest = srtm_dir.join(format!("{}.hgt", name));
-                std::fs::write(&dest, &hgt_bytes)
-                    .map_err(|e| format!("Write error for {}: {}", name, e))?;
+                let _ = std::fs::write(&dest, &hgt_bytes);
 
                 downloaded += 1;
                 info!("[SRTM] Downloaded: {} ({:.1}MB)", name, gz_bytes.len() as f64 / 1_048_576.0);
@@ -1206,7 +1243,7 @@ async fn download_srtm_korea(
     {
         let state = app_handle.state::<AppState>();
         let mut reader = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-        *reader = srtm::SrtmReader::new(srtm_dir);
+        *reader = srtm::SrtmReader::new(srtm_dir, db_path);
     }
 
     let msg = format!(
@@ -1304,6 +1341,48 @@ fn query_buildings_for_overlay(
     building::query_buildings_for_overlay(&conn, min_lat, max_lat, min_lon, max_lon, min_height_m.unwrap_or(3.0))
 }
 
+// ---------- 건물 그룹 ----------
+
+#[tauri::command]
+fn list_building_groups(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<building::BuildingGroup>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::list_building_groups(&conn)
+}
+
+#[tauri::command]
+fn add_building_group(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    color: String,
+    memo: String,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::add_building_group(&conn, &name, &color, &memo)
+}
+
+#[tauri::command]
+fn update_building_group(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    name: String,
+    color: String,
+    memo: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::update_building_group(&conn, id, &name, &color, &memo)
+}
+
+#[tauri::command]
+fn delete_building_group(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::delete_building_group(&conn, id)
+}
+
 // ---------- 수동 등록 건물 ----------
 
 #[tauri::command]
@@ -1325,11 +1404,12 @@ fn add_manual_building(
     memo: String,
     geometry_type: Option<String>,
     geometry_json: Option<String>,
+    group_id: Option<i64>,
 ) -> Result<i64, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let gt = geometry_type.as_deref().unwrap_or("point");
     let gj = geometry_json.as_deref();
-    building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &memo, gt, gj)
+    building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
 }
 
 #[tauri::command]
@@ -1344,11 +1424,12 @@ fn update_manual_building(
     memo: String,
     geometry_type: Option<String>,
     geometry_json: Option<String>,
+    group_id: Option<i64>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let gt = geometry_type.as_deref().unwrap_or("point");
     let gj = geometry_json.as_deref();
-    building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &memo, gt, gj)
+    building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
 }
 
 #[tauri::command]
@@ -1784,7 +1865,7 @@ pub fn run() {
                 app_data_dir: Mutex::new(app_data_dir.clone()),
                 db: Mutex::new(db_conn),
                 oauth_token: Mutex::new(None),
-                srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir)),
+                srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir, db_path.clone())),
             });
 
             // 백그라운드: WMM fallback 편각을 NOAA 데이터로 치환
@@ -1818,6 +1899,8 @@ pub fn run() {
             save_opensky_credentials,
             load_opensky_credentials,
             load_saved_data,
+            load_saved_file_metas,
+            load_file_track_points,
             clear_saved_data,
             delete_parsed_file,
             delete_parsed_files,
@@ -1837,6 +1920,10 @@ pub fn run() {
             query_buildings_for_overlay,
             get_building_import_status,
             clear_building_data,
+            list_building_groups,
+            add_building_group,
+            update_building_group,
+            delete_building_group,
             list_manual_buildings,
             add_manual_building,
             update_manual_building,

@@ -1,5 +1,6 @@
 //! SRTM HGT 타일 읽기 (1-arcsecond, 30m 해상도)
 //! 파일 포맷: 3601×3601 big-endian i16 (meters), 북→남, 서→동
+//! 저장소: SQLite DB (srtm_tiles BLOB) + 파일 폴백
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,15 +9,18 @@ const SRTM1_SAMPLES: usize = 3601;
 const TILE_BYTES: usize = SRTM1_SAMPLES * SRTM1_SAMPLES * 2;
 
 /// SRTM HGT 타일 읽기 + 메모리 캐시
+/// DB 우선 로드, 파일 폴백 (파일에서 로드 시 DB에 자동 저장)
 pub struct SrtmReader {
     data_dir: PathBuf,
+    db_path: PathBuf,
     tiles: HashMap<String, Option<Vec<i16>>>,
 }
 
 impl SrtmReader {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, db_path: PathBuf) -> Self {
         Self {
             data_dir,
+            db_path,
             tiles: HashMap::new(),
         }
     }
@@ -33,8 +37,32 @@ impl SrtmReader {
         self.data_dir.join(format!("{}.hgt", name))
     }
 
-    /// 타일 로드 (3601×3601 big-endian i16)
-    fn load_tile(&self, name: &str) -> Option<Vec<i16>> {
+    /// raw bytes → i16 배열 변환
+    fn parse_hgt_bytes(bytes: &[u8]) -> Option<Vec<i16>> {
+        if bytes.len() != TILE_BYTES {
+            return None;
+        }
+        let mut data = Vec::with_capacity(SRTM1_SAMPLES * SRTM1_SAMPLES);
+        for chunk in bytes.chunks_exact(2) {
+            data.push(i16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        Some(data)
+    }
+
+    /// DB에서 타일 로드
+    fn load_tile_from_db(&self, name: &str) -> Option<Vec<i16>> {
+        let conn = rusqlite::Connection::open(&self.db_path).ok()?;
+        let bytes: Vec<u8> = match crate::db::load_srtm_tile(&conn, name) {
+            Ok(Some(b)) => b,
+            _ => return None,
+        };
+        let data = Self::parse_hgt_bytes(&bytes)?;
+        log::info!("[SRTM] Loaded tile from DB: {}", name);
+        Some(data)
+    }
+
+    /// 파일에서 타일 로드 → 성공 시 DB에도 저장
+    fn load_tile_from_file(&self, name: &str) -> Option<Vec<i16>> {
         let path = self.tile_path(name);
         let bytes = std::fs::read(&path).ok()?;
         if bytes.len() != TILE_BYTES {
@@ -46,12 +74,23 @@ impl SrtmReader {
             );
             return None;
         }
-        let mut data = Vec::with_capacity(SRTM1_SAMPLES * SRTM1_SAMPLES);
-        for chunk in bytes.chunks_exact(2) {
-            data.push(i16::from_be_bytes([chunk[0], chunk[1]]));
+        // DB에 자동 저장 (파일→DB 마이그레이션)
+        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+            if let Err(e) = crate::db::save_srtm_tile(&conn, name, &bytes) {
+                log::warn!("[SRTM] Failed to save tile {} to DB: {}", name, e);
+            } else {
+                log::info!("[SRTM] Migrated tile to DB: {}", name);
+            }
         }
-        log::info!("[SRTM] Loaded tile: {}", name);
+        let data = Self::parse_hgt_bytes(&bytes)?;
+        log::info!("[SRTM] Loaded tile from file: {}", name);
         Some(data)
+    }
+
+    /// 타일 로드 (DB 우선 → 파일 폴백)
+    fn load_tile(&self, name: &str) -> Option<Vec<i16>> {
+        self.load_tile_from_db(name)
+            .or_else(|| self.load_tile_from_file(name))
     }
 
     /// 좌표에서 고도 조회 (바이리니어 보간, 30m 해상도)
@@ -105,14 +144,37 @@ impl SrtmReader {
             .collect()
     }
 
-    /// 특정 타일 존재 여부
+    /// 특정 타일 존재 여부 (DB 또는 파일)
     pub fn has_tile(&self, lat: i32, lon: i32) -> bool {
         let name = Self::tile_name(lat, lon);
+        // DB 확인
+        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+            if crate::db::has_srtm_tile(&conn, &name) {
+                return true;
+            }
+        }
+        // 파일 폴백
         self.tile_path(&name).exists()
     }
 
     /// 데이터 디렉토리 경로
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// DB 경로
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// raw bytes를 DB에 직접 저장
+    pub fn save_tile_to_db(&self, name: &str, hgt_bytes: &[u8]) -> Result<(), String> {
+        if hgt_bytes.len() != TILE_BYTES {
+            return Err(format!("Invalid tile size: {} (expected {})", hgt_bytes.len(), TILE_BYTES));
+        }
+        let conn = rusqlite::Connection::open(&self.db_path)
+            .map_err(|e| format!("DB open: {}", e))?;
+        crate::db::save_srtm_tile(&conn, name, hgt_bytes)
+            .map_err(|e| format!("DB save: {}", e))
     }
 }

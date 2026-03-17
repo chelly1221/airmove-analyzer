@@ -658,7 +658,7 @@ export default function LossAnalysis() {
                         fillOpacity={0.2}
                       />
 
-                      {/* 전체 실루엣 (건물 포함, 라인) */}
+                      {/* 지형 실루엣 라인 */}
                       <path
                         d={(() => {
                           const { startIdx, endIdx } = panoramaVisibleRange;
@@ -666,7 +666,11 @@ export default function LossAnalysis() {
                           let d = "";
                           for (let i = startIdx; i <= endIdx; i++) {
                             const x = idxToX(i);
-                            const y = toY(filteredPanoramaData[i].elevation_angle_deg);
+                            const pt = filteredPanoramaData[i];
+                            const terrainAngle = pt.obstacle_type === "terrain"
+                              ? pt.elevation_angle_deg
+                              : Math.max(0, pt.elevation_angle_deg - (pt.obstacle_height_m / (pt.distance_km * 1000)) * (180 / Math.PI));
+                            const y = toY(Math.max(terrainAngle, panoramaMinAngle));
                             d += i === startIdx ? `M ${x} ${y}` : ` L ${x} ${y}`;
                           }
                           return d;
@@ -676,7 +680,7 @@ export default function LossAnalysis() {
                         strokeWidth={1.2}
                       />
 
-                      {/* 건물 포인트 (건물인 경우 오렌지 세로선) */}
+                      {/* 건물 세로선 (지형 위에 오버레이) */}
                       {filteredPanoramaData.map((pt, i) => {
                         if (pt.obstacle_type === "terrain") return null;
                         const { startIdx, endIdx } = panoramaVisibleRange;
@@ -692,6 +696,25 @@ export default function LossAnalysis() {
                             stroke={color} strokeWidth={2} strokeOpacity={0.7} />
                         );
                       })}
+
+                      {/* 전체 실루엣 (건물 포함, 최상단 라인) */}
+                      <path
+                        d={(() => {
+                          const { startIdx, endIdx } = panoramaVisibleRange;
+                          const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
+                          let d = "";
+                          for (let i = startIdx; i <= endIdx; i++) {
+                            const x = idxToX(i);
+                            const y = toY(filteredPanoramaData[i].elevation_angle_deg);
+                            d += i === startIdx ? `M ${x} ${y}` : ` L ${x} ${y}`;
+                          }
+                          return d;
+                        })()}
+                        fill="none"
+                        stroke="#374151"
+                        strokeWidth={0.8}
+                        strokeOpacity={0.5}
+                      />
                     </g>
 
                     {/* 호버/핀 크로스헤어 */}
@@ -893,14 +916,15 @@ export default function LossAnalysis() {
                             radiusMinPixels: 8,
                             radiusMaxPixels: 12,
                           }),
-                          // 활성 건물 하이라이트 (빨간색)
-                          ...(panoramaActivePoint && panoramaActivePoint.obstacle_type !== "terrain"
+                          // 활성 포인트 하이라이트 (건물: 빨간색, 지형: 녹색)
+                          ...(panoramaActivePoint
                             ? [
                                 new ScatterplotLayer({
                                   id: "panorama-bldg-highlight",
                                   data: [panoramaActivePoint],
                                   getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
-                                  getFillColor: [239, 68, 68, 240],
+                                  getFillColor: panoramaActivePoint.obstacle_type === "terrain"
+                                    ? [34, 197, 94, 220] : [239, 68, 68, 240],
                                   getLineColor: [255, 255, 255, 255],
                                   getRadius: 300,
                                   stroked: true,
@@ -908,6 +932,19 @@ export default function LossAnalysis() {
                                   radiusMinPixels: 8,
                                   radiusMaxPixels: 24,
                                 }),
+                                // 지형 포인트인 경우 레이더→지형 연결선 표시
+                                ...(panoramaActivePoint.obstacle_type === "terrain"
+                                  ? [
+                                      new LineLayer({
+                                        id: "panorama-terrain-line",
+                                        data: [panoramaActivePoint],
+                                        getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
+                                        getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                                        getColor: [34, 197, 94, 120],
+                                        getWidth: 2,
+                                      }),
+                                    ]
+                                  : []),
                               ]
                             : []),
                         ]}

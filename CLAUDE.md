@@ -154,7 +154,7 @@ public/                 # 정적 자산
 24. 구름 그리드 오버레이 (레이더 주변 격자 구름 분포, 시간별 애니메이션)
 25. LOS 스크린샷 캡처 (맵 JPEG + 차트 PNG, DB 영속화, 보고서 재활용)
 26. GIS 건물통합정보 임포트 (vWorld SHP ZIP, EPSG:5186→WGS84, LOS 경로 건물 쿼리)
-27. 수동 건물 관리 (점/사각형/타원/선 도형, CRUD, LOS 분석 반영, 도형 지오메트리 샘플링)
+27. 수동 건물 관리 (점/사각형/타원/선 도형, CRUD, 그룹 관리, LOS 분석 반영, 도형 지오메트리 샘플링)
 28. SRTM 고도 데이터 (1-arcsecond 30m 해상도, 한국 영역 타일 다운로드/캐시)
 29. 360° LoS 파노라마 (방위별 최대 앙각 장애물 탐색, 지형+건물 통합)
 30. 이상고도 보정 (수직속도 기반 탐지 + 선형 보간)
@@ -171,6 +171,13 @@ public/                 # 정적 자산
 41. 커버리지 맵 단일 레이어 통합 (다중 PolygonLayer→단일 PolygonLayer, GPU 오버헤드 감소)
 42. LOS 맵 스크린샷 개선 (MapLibre triggerRepaint + deck.gl 오버레이 합성)
 43. LOS 건물 하이라이트 아이콘 (ScatterplotLayer→IconLayer 건물 아이콘 마커)
+44. 스트리밍 데이터 복원 (파일 메타 선로드→파일별 포인트 분할 로드, 대용량 DB 복원 시 UI 프리징 방지)
+45. SRTM DB 저장 (HGT 타일 SQLite BLOB 저장, DB 우선 로드 + 파일 폴백, 자동 마이그레이션)
+46. 건물 그룹 관리 (그룹 CRUD, 색상/메모, 수동 건물 그룹 배정, 그룹별 필터/접기)
+47. 건물 데이터 일괄 임포트 (다중 ZIP 선택, 파일명 행정구역코드 자동 감지, 순차 임포트)
+48. GIS 건물 높이 교차검증 (층수 기반 높이 선택, 이웃 비교 이상치 자동 제거)
+49. 비동기 항적 렌더링 (대량 포인트 처리 시 UI 양보, 1M+ 포인트 비동기 전환)
+50. 파노라마 차트 지형/건물 분리 렌더링 (지형 실루엣 + 건물 세로선 + 통합 외곽선 3레이어)
 
 ## 핵심 아키텍처: 비행(Flight) 기반 분석
 분석 단위가 "파싱 파일(`AnalysisResult`)"에서 "**비행(`Flight`)**"으로 전환됨.
@@ -184,7 +191,7 @@ public/                 # 정적 자산
 
 ### 앱 재시작 복원
 - `useRestoreSavedData()` 훅: DB에서 파싱 데이터 + 레이더 설정 자동 복원
-- DB 반환 구조: `SavedParsedData.files[].track_points[]` (파일별 포인트 포함)
+- **스트리밍 복원**: `load_saved_file_metas` (메타만) → `load_file_track_points` (파일별 분할 로드)
 - 복원 시 좌표 매칭으로 `radar_name` 태깅 후 `consolidateFlights()` 재실행
 
 ## Tauri IPC 명령
@@ -210,7 +217,9 @@ public/                 # 정적 자산
 | `load_opensky_credentials` | 저장된 OpenSky 인증정보 로드 |
 | `fetch_adsb_tracks` | ADS-B 항적 데이터 조회 |
 | **데이터 관리** | |
-| `load_saved_data` | DB에서 저장된 파싱 데이터 전체 로드 |
+| `load_saved_data` | DB에서 저장된 파싱 데이터 전체 로드 (레거시) |
+| `load_saved_file_metas` | 파일 메타데이터만 로드 (포인트 제외, 스트리밍 복원 1단계) |
+| `load_file_track_points` | 특정 파일의 track_points 로드 (파일 단위 분할 복원) |
 | `clear_saved_data` | 저장된 파싱 데이터 전체 삭제 |
 | `load_setting` | Key-Value 설정 로드 |
 | `save_setting` | Key-Value 설정 저장 |
@@ -232,6 +241,11 @@ public/                 # 정적 자산
 | `query_buildings_along_path` | LOS 경로 상 건물 조회 |
 | `get_building_import_status` | 임포트 상태 조회 |
 | `clear_building_data` | 건물 데이터 삭제 |
+| **건물 그룹** | |
+| `list_building_groups` | 건물 그룹 목록 |
+| `add_building_group` | 건물 그룹 추가 |
+| `update_building_group` | 건물 그룹 수정 |
+| `delete_building_group` | 건물 그룹 삭제 (소속 건물 group_id 자동 NULL) |
 | **수동 건물** | |
 | `list_manual_buildings` | 수동 건물 목록 |
 | `add_manual_building` | 수동 건물 추가 |
@@ -295,10 +309,13 @@ public/                 # 정적 자산
 ### GIS 건물통합정보
 - **소스**: vWorld GIS건물통합정보 SHP (EPSG:5186, EUC-KR)
 - **임포트**: ZIP 선택 → `import_building_data` → 진행률 이벤트 → SQLite `buildings` 테이블
+- **일괄 임포트**: 다중 ZIP 선택 → 파일명 행정구역코드(`_11_`=서울, `_28_`=인천, `_41_`=경기) 자동 감지 → 순차 처리
+- **높이 검증**: 다중 필드 수집 → 층수 교차검증(2.5~6.0m/층) → 이웃 비교 이상치 제거(150m 반경, 평균 대비 2배+30m)
 - **LOS 쿼리**: `query_buildings_along_path()` — 경로 복도 내 건물 필터링
 - **좌표 변환**: `coord.rs` — GRS80 타원체 Transverse Mercator 역변환
 
 ### 수동 건물
+- **그룹 관리**: `building_groups` 테이블 (name, color, memo), 건물에 `group_id` FK (ON DELETE SET NULL)
 - **도형 유형**: point, rectangle, circle/ellipse, line (`GeometryType`)
 - **타원 지오메트리**: `{center, semi_major_m, semi_minor_m, rotation_deg}` (레거시 `radius_m` 호환)
 - **CRUD**: `manual_buildings` 테이블, Drawing.tsx에서 도형 그리기 (도형 확정 후 자동 맵핏)
@@ -306,8 +323,9 @@ public/                 # 정적 자산
 
 ### SRTM 고도 데이터
 - **해상도**: 1-arcsecond (~30m), 3601×3601 big-endian i16
-- **읽기**: `SrtmReader` — 메모리 캐시 + 바이리니어 보간
-- **다운로드**: `download_srtm_korea` — 한국 영역 타일 자동 다운로드
+- **저장**: SQLite `srtm_tiles` BLOB 우선 → 파일 폴백 (자동 마이그레이션)
+- **읽기**: `SrtmReader` — DB/파일 듀얼 소스 + 메모리 캐시 + 바이리니어 보간
+- **다운로드**: `download_srtm_korea` — 한국 영역 타일 자동 다운로드 (DB + 파일 동시 저장)
 
 ## 360° LoS 파노라마
 - **모듈**: `src-tauri/src/analysis/panorama.rs`
@@ -346,8 +364,11 @@ public/                 # 정적 자산
 ### CloudGridCell / CloudGridFrame / CloudGridData
 격자 셀 좌표 + 운량 4종, 시간별 프레임 타임시리즈
 
+### BuildingGroup
+건물 그룹 (name, color, memo)
+
 ### BuildingOnPath / ManualBuilding
-LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rectangle `[[lat,lon]x4]` (4꼭짓점, 레거시: `[[minLat,minLon],[maxLat,maxLon]]`), circle/ellipse `{center,semi_major_m,semi_minor_m,rotation_deg}`, line `[[lat,lon],...]`, point `[lat,lon]`)
+LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rectangle `[[lat,lon]x4]` (4꼭짓점, 레거시: `[[minLat,minLon],[maxLat,maxLon]]`), circle/ellipse `{center,semi_major_m,semi_minor_m,rotation_deg}`, line `[[lat,lon],...]`, point `[lat,lon]`, group_id FK)
 
 ### PanoramaPoint
 방위별 최대 앙각 장애물 (거리, 높이, 유형, 이름, 주소, 용도)
@@ -486,7 +507,9 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 - **cloud_grid_cache**: 구름 그리드 캐시 (grid_spacing_km 포함)
 - **buildings**: GIS 건물 (region, centroid, bbox, height, address, usage)
 - **building_import_log**: 임포트 로그 (region, file_date, record_count)
-- **manual_buildings**: 수동 건물 (geometry_type, geometry_json)
+- **building_groups**: 건물 그룹 (name, color, memo)
+- **manual_buildings**: 수동 건물 (geometry_type, geometry_json, group_id FK→building_groups)
+- **srtm_tiles**: SRTM HGT 타일 BLOB (name PK, ~25MB/타일, 파일 폴백 호환)
 - **elevation_cache**: 고도 캐시 (open-meteo 결과)
 
 ## 코딩 컨벤션

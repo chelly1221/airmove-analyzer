@@ -143,6 +143,7 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         CREATE INDEX IF NOT EXISTS idx_buildings_lat ON buildings(centroid_lat);
         CREATE INDEX IF NOT EXISTS idx_buildings_lon ON buildings(centroid_lon);
         CREATE INDEX IF NOT EXISTS idx_buildings_region ON buildings(region);
+        CREATE INDEX IF NOT EXISTS idx_buildings_region_lat_lon ON buildings(region, centroid_lat, centroid_lon);
 
         CREATE TABLE IF NOT EXISTS building_import_log (
             region TEXT PRIMARY KEY,
@@ -274,6 +275,21 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             active INTEGER NOT NULL DEFAULT 1
         );
 
+        -- SRTM HGT 타일 (BLOB, 3601×3601 big-endian i16 ≈ 25MB/타일)
+        CREATE TABLE IF NOT EXISTS srtm_tiles (
+            name TEXT PRIMARY KEY,
+            data BLOB NOT NULL,
+            downloaded_at INTEGER NOT NULL
+        );
+
+        -- 수동 건물 그룹
+        CREATE TABLE IF NOT EXISTS building_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            color TEXT NOT NULL DEFAULT '#6b7280',
+            memo TEXT NOT NULL DEFAULT ''
+        );
+
         -- 자기편각 캐시 (NOAA API 결과 + WMM fallback)
         CREATE TABLE IF NOT EXISTS declination_cache (
             lat_key TEXT NOT NULL,
@@ -294,6 +310,9 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 수동 건물에 도형 컬럼 추가
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_type TEXT NOT NULL DEFAULT 'point'", []);
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_json TEXT", []);
+
+    // 수동 건물에 그룹 컬럼 추가
+    let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN group_id INTEGER REFERENCES building_groups(id) ON DELETE SET NULL", []);
 
     // LOS 결과에 스크린샷 컬럼 추가
     let _ = conn.execute("ALTER TABLE los_results ADD COLUMN map_screenshot TEXT", []);
@@ -691,10 +710,34 @@ pub struct SavedFileInfo {
     pub track_points: Vec<TrackPoint>,
 }
 
+/// 파일 메타데이터 (포인트 제외, 스트리밍 복원용)
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SavedFileMeta {
+    pub file_id: i64,
+    pub path: String,
+    pub name: String,
+    pub filename: String,
+    pub total_records: usize,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+    pub radar_lat: f64,
+    pub radar_lon: f64,
+    pub parse_errors: Vec<String>,
+    pub parse_stats: Option<ParseStatistics>,
+    pub point_count: usize,
+}
+
 /// 저장된 전체 데이터 (프론트엔드 반환용)
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct SavedParsedData {
     pub files: Vec<SavedFileInfo>,
+}
+
+/// 파일 메타데이터만 반환 (포인트 개수 포함, 포인트 자체는 제외)
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SavedParsedMeta {
+    pub files: Vec<SavedFileMeta>,
+    pub total_points: usize,
 }
 
 /// DB에서 모든 파싱 데이터 로드
@@ -763,6 +806,107 @@ pub fn load_all_parsed_data(conn: &Connection) -> SqlResult<SavedParsedData> {
     Ok(SavedParsedData {
         files,
     })
+}
+
+/// 파일 메타데이터만 로드 (포인트 제외, 스트리밍 복원용)
+pub fn load_parsed_file_metas(conn: &Connection) -> SqlResult<SavedParsedMeta> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.path, f.name, f.total_records, f.start_time, f.end_time,
+                f.radar_lat, f.radar_lon, f.parse_errors, f.stats_json,
+                (SELECT COUNT(*) FROM track_points WHERE file_id = f.id) as pt_count
+         FROM parsed_files f ORDER BY f.created_at",
+    )?;
+
+    let mut files = Vec::new();
+    let mut total_points = 0usize;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+            row.get::<_, Option<f64>>(5)?,
+            row.get::<_, f64>(6)?,
+            row.get::<_, f64>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, i64>(10)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (file_id, path, name, total_records, start_time, end_time,
+             radar_lat, radar_lon, errors_json, stats_json, pt_count) = row?;
+        let parse_errors: Vec<String> = serde_json::from_str(&errors_json).unwrap_or_default();
+        let parse_stats: Option<ParseStatistics> = stats_json.as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let pc = pt_count as usize;
+        total_points += pc;
+        files.push(SavedFileMeta {
+            file_id,
+            path,
+            name: name.clone(),
+            filename: name,
+            total_records: total_records as usize,
+            start_time,
+            end_time,
+            radar_lat,
+            radar_lon,
+            parse_errors,
+            parse_stats,
+            point_count: pc,
+        });
+    }
+
+    Ok(SavedParsedMeta { files, total_points })
+}
+
+/// 특정 파일의 track_points를 청크 단위로 콜백 호출
+pub fn load_track_points_chunked<F>(
+    conn: &Connection,
+    file_id: i64,
+    chunk_size: usize,
+    mut on_chunk: F,
+) -> SqlResult<usize>
+where
+    F: FnMut(Vec<TrackPoint>),
+{
+    let mut stmt = conn.prepare(
+        "SELECT timestamp, mode_s, latitude, longitude, altitude, speed, heading, radar_type
+         FROM track_points WHERE file_id = ?1 ORDER BY timestamp",
+    )?;
+
+    let mut rows = stmt.query(params![file_id])?;
+    let mut buffer = Vec::with_capacity(chunk_size);
+    let mut total = 0usize;
+
+    while let Some(row) = rows.next()? {
+        let radar_type_str: String = row.get(7)?;
+        buffer.push(TrackPoint {
+            timestamp: row.get(0)?,
+            mode_s: row.get(1)?,
+            latitude: row.get(2)?,
+            longitude: row.get(3)?,
+            altitude: row.get(4)?,
+            speed: row.get(5)?,
+            heading: row.get(6)?,
+            radar_type: str_to_radar_type(&radar_type_str),
+            raw_data: Vec::new(),
+        });
+        total += 1;
+
+        if buffer.len() >= chunk_size {
+            on_chunk(std::mem::replace(&mut buffer, Vec::with_capacity(chunk_size)));
+        }
+    }
+
+    if !buffer.is_empty() {
+        on_chunk(buffer);
+    }
+
+    Ok(total)
 }
 
 /// 모든 파싱 데이터 삭제
@@ -1275,4 +1419,45 @@ pub fn delete_report(conn: &Connection, id: &str) -> SqlResult<()> {
     Ok(())
 }
 
+// ========== SRTM 타일 ==========
 
+/// SRTM 타일 저장 (UPSERT)
+pub fn save_srtm_tile(conn: &Connection, name: &str, data: &[u8]) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO srtm_tiles (name, data, downloaded_at) VALUES (?1, ?2, strftime('%s','now'))
+         ON CONFLICT(name) DO UPDATE SET data = excluded.data, downloaded_at = excluded.downloaded_at",
+        params![name, data],
+    )?;
+    Ok(())
+}
+
+/// SRTM 타일 로드 (BLOB → Vec<u8>)
+pub fn load_srtm_tile(conn: &Connection, name: &str) -> SqlResult<Option<Vec<u8>>> {
+    match conn.query_row(
+        "SELECT data FROM srtm_tiles WHERE name = ?1",
+        params![name],
+        |row| row.get::<_, Vec<u8>>(0),
+    ) {
+        Ok(data) => Ok(Some(data)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// SRTM 타일 존재 여부
+pub fn has_srtm_tile(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM srtm_tiles WHERE name = ?1",
+        params![name],
+        |_| Ok(()),
+    ).is_ok()
+}
+
+/// 저장된 SRTM 타일 이름 목록
+pub fn list_srtm_tiles(conn: &Connection) -> SqlResult<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM srtm_tiles ORDER BY name")?;
+    let names = stmt.query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(names)
+}

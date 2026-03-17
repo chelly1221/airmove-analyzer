@@ -15,8 +15,9 @@ import { Loader2 } from "lucide-react";
 import type { Aircraft, ElevationPoint, FlightRecord, LOSProfileData, ParseStatistics, RadarSite, SavedReportSummary, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
 import { consolidateFlights } from "./utils/flightConsolidation";
 
-/** DB 저장 데이터 타입 */
-interface SavedFileInfo {
+/** DB 저장 파일 메타 (포인트 제외, 스트리밍 복원용) */
+interface SavedFileMeta {
+  file_id: number;
   path: string;
   name: string;
   filename: string;
@@ -27,11 +28,12 @@ interface SavedFileInfo {
   radar_lon: number;
   parse_errors: string[];
   parse_stats: ParseStatistics | null;
-  track_points: TrackPoint[];
+  point_count: number;
 }
 
-interface SavedParsedData {
-  files: SavedFileInfo[];
+interface SavedParsedMeta {
+  files: SavedFileMeta[];
+  total_points: number;
 }
 
 /** 앱 시작 시 DB에서 저장된 파싱 데이터 + 설정 복원 */
@@ -82,25 +84,25 @@ function useRestoreSavedData() {
         console.log("[Restore] 설정 복원 실패:", e);
       }
 
-      // 2) 파싱 데이터 복원
+      // 2) 파싱 데이터 복원 (파일별 분할 로드)
       try {
-        const data = await invoke<SavedParsedData>("load_saved_data");
-        if (data.files.length === 0) return;
+        const meta = await invoke<SavedParsedMeta>("load_saved_file_metas");
+        if (meta.files.length === 0) return;
 
-        const totalPoints = data.files.reduce((sum, f) => sum + f.track_points.length, 0);
-        console.log(`[Restore] DB에서 ${data.files.length}개 파일, ${totalPoints}개 포인트 복원`);
+        console.log(`[Restore] DB에서 ${meta.files.length}개 파일, ${meta.total_points}개 포인트 복원 시작`);
 
         const store = useAppStore.getState();
-
-        // uploadedFiles 복원 (radar_lat/lon → radarName 매칭) + 포인트에 radar_name 태깅
         const radarSites = store.customRadarSites;
-        const allPoints: TrackPoint[] = [];
-        for (const f of data.files) {
-          // 좌표로 레이더 사이트 이름 매칭 (0.01° 이내)
+
+        // 파일별 메타 등록
+        const fileRadarNames: (string | undefined)[] = [];
+        for (const f of meta.files) {
           const matchedSite = radarSites.find(
             (s) => Math.abs(s.latitude - f.radar_lat) < 0.01 && Math.abs(s.longitude - f.radar_lon) < 0.01
           );
           const radarName = matchedSite?.name;
+          fileRadarNames.push(radarName);
+
           store.addUploadedFile({
             path: f.path,
             name: f.name,
@@ -109,7 +111,7 @@ function useRestoreSavedData() {
             parsedFile: {
               filename: f.filename,
               total_records: f.total_records,
-              track_points: [], // 별도 관리
+              track_points: [],
               parse_errors: f.parse_errors,
               start_time: f.start_time,
               end_time: f.end_time,
@@ -119,22 +121,30 @@ function useRestoreSavedData() {
             },
           });
 
-          // parseStatsList 복원
           if (f.parse_stats) {
             store.addParseStats(f.filename, f.parse_stats, f.total_records);
           }
-
-          // 포인트에 radar_name 태깅 후 축적
-          if (radarName) {
-            for (const p of f.track_points) {
-              p.radar_name = radarName;
-            }
-          }
-          allPoints.push(...f.track_points);
         }
 
-        // rawTrackPoints 복원
-        store.appendRawTrackPoints(allPoints);
+        // 파일별 순차 로드 → rawTrackPoints에 점진 추가
+        let loaded = 0;
+        for (let fi = 0; fi < meta.files.length; fi++) {
+          const f = meta.files[fi];
+          const radarName = fileRadarNames[fi];
+          const points = await invoke<TrackPoint[]>("load_file_track_points", {
+            fileId: f.file_id,
+          });
+          if (radarName) {
+            for (const p of points) p.radar_name = radarName;
+          }
+          store.appendRawTrackPoints(points);
+          loaded += points.length;
+          console.log(`[Restore] ${f.name}: ${points.length}pt (${loaded}/${meta.total_points})`);
+          // UI 스레드 양보
+          await new Promise((r) => setTimeout(r, 0));
+        }
+
+        console.log(`[Restore] 포인트 로드 완료: ${loaded}개`);
 
         // 3) flightHistory를 DB에서 먼저 로드 (consolidateFlights 전에 필요)
         try {
@@ -174,11 +184,9 @@ function useRestoreSavedData() {
             const { manualMergeFlights: doMerge } = await import("./utils/flightConsolidation");
             for (const [idsJson, modeS] of merges) {
               const sourceIds: string[] = JSON.parse(idsJson);
-              // 원래 비행을 mode_s + 시간 범위로 매칭 (ID가 달라졌을 수 있으므로)
               const candidates = flights.filter(
                 (f) => f.mode_s.toUpperCase() === modeS.toUpperCase()
               );
-              // sourceIds 중 현재 존재하는 비행만 매칭
               const toMerge = candidates.filter((f) => sourceIds.includes(f.id));
               if (toMerge.length >= 2) {
                 const merged = doMerge(toMerge, state.radarSite);

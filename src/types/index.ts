@@ -199,6 +199,15 @@ export interface BuildingImportStatus {
 /** 도형 유형 */
 export type GeometryType = "point" | "rectangle" | "circle" | "line";
 
+/** 건물 그룹 */
+export interface BuildingGroup {
+  id: number;
+  name: string;
+  /** 색상 (hex) */
+  color: string;
+  memo: string;
+}
+
 /** 수동 등록 건물 */
 export interface ManualBuilding {
   id: number;
@@ -214,6 +223,8 @@ export interface ManualBuilding {
   geometry_type: GeometryType;
   /** 도형 좌표 JSON */
   geometry_json: string | null;
+  /** 소속 그룹 ID (null이면 미분류) */
+  group_id: number | null;
 }
 
 /** LoS 파노라마 포인트 (방위별 최대 앙각 장애물) */
