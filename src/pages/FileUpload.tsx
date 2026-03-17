@@ -23,13 +23,12 @@ import {
   FolderPlus,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre";
 import { useAppStore } from "../store";
 import { consolidateFlights } from "../utils/flightConsolidation";
 import Modal from "../components/common/Modal";
-import type { AnalysisResult, BuildingGroup, FlightRecord, GeometryType, ManualBuilding, ParseStatistics, TrackPoint, UploadedFile } from "../types";
+import type { AnalysisResult, BuildingGroup, FlightRecord, GeometryType, ManualBuilding, UploadedFile } from "../types";
 
 // ─── 건물 입력 모달 ──────────────────────────────────────────────
 
@@ -1640,112 +1639,8 @@ export default function FileUpload() {
     const pending = useAppStore.getState().uploadedFiles.filter((f) => f.status === "pending");
     if (pending.length === 0) return;
 
-    // 단일 파일이면 기존 순차 파싱 (오버헤드 없음)
-    if (pending.length === 1) {
-      await parseFile(pending[0]);
-      runConsolidation();
-      return;
-    }
-
-    // 다중 파일: rayon 병렬 파싱 사용
-    const currentSite = useAppStore.getState().radarSite;
-    const radarName = currentSite.name;
-    const modeSFilter = getModeSFilter();
-
-    // 모든 대기 파일을 "parsing" 상태로 변경
-    for (const f of pending) {
-      updateUploadedFile(f.path, { status: "parsing" });
-    }
-
-    const unlisteners: UnlistenFn[] = [];
-
-    try {
-      // 1) 포인트 청크 수신 → rawTrackPoints에 누적
-      unlisteners.push(
-        await listen<{ file_path: string; points: TrackPoint[] }>("parse-points-chunk", (ev) => {
-          const pts = ev.payload.points;
-          for (const p of pts) {
-            p.radar_name = radarName;
-          }
-          appendRawTrackPoints(pts);
-        })
-      );
-
-      // 2) 파일별 완료 이벤트 수신
-      unlisteners.push(
-        await listen<{
-          file_path: string;
-          success: boolean;
-          file_info?: {
-            filename: string;
-            total_records: number;
-            parse_errors: string[];
-            start_time: number | null;
-            end_time: number | null;
-            radar_lat: number;
-            radar_lon: number;
-            parse_stats?: ParseStatistics;
-            track_point_count: number;
-          };
-          error?: string;
-        }>("batch-parse-result", (ev) => {
-          const { file_path, success, file_info, error } = ev.payload;
-          if (success && file_info) {
-            updateUploadedFile(file_path, {
-              status: "done",
-              parsedFile: {
-                filename: file_info.filename,
-                total_records: file_info.total_records,
-                track_points: [], // 포인트는 청크로 이미 전송됨
-                parse_errors: file_info.parse_errors,
-                start_time: file_info.start_time,
-                end_time: file_info.end_time,
-                radar_lat: file_info.radar_lat,
-                radar_lon: file_info.radar_lon,
-                parse_stats: file_info.parse_stats,
-              },
-            });
-            if (file_info.parse_stats) {
-              addParseStats(file_info.filename, file_info.parse_stats, file_info.total_records);
-            }
-            if (file_info.parse_errors.length > 0) {
-              const name = file_path.split(/[/\\]/).pop() ?? file_path;
-              setErrorLog((prev) => [
-                ...prev,
-                ...file_info.parse_errors.map((e) => `[${name}] ${e}`),
-              ]);
-            }
-          } else {
-            const errMsg = error ?? "알 수 없는 오류";
-            updateUploadedFile(file_path, { status: "error", error: errMsg });
-            const name = file_path.split(/[/\\]/).pop() ?? file_path;
-            setErrorLog((prev) => [...prev, `[${name}] 파싱 오류: ${errMsg}`]);
-          }
-        })
-      );
-
-      // 3) 배치 invoke (rayon 병렬 파싱 시작)
-      await invoke("parse_and_analyze_batch", {
-        filePaths: pending.map((f) => f.path),
-        radarLat: currentSite.latitude,
-        radarLon: currentSite.longitude,
-        modeSFilter,
-      });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      // 아직 parsing 상태인 파일을 error로 변경
-      for (const f of pending) {
-        const cur = useAppStore.getState().uploadedFiles.find((u) => u.path === f.path);
-        if (cur?.status === "parsing") {
-          updateUploadedFile(f.path, { status: "error", error: errMsg });
-        }
-      }
-      setErrorLog((prev) => [...prev, `배치 파싱 오류: ${errMsg}`]);
-    } finally {
-      // 리스너 정리
-      for (const unlisten of unlisteners) {
-        unlisten();
-      }
+    for (const file of pending) {
+      await parseFile(file);
     }
 
     // 모든 파일 파싱 완료 후 비행 통합
