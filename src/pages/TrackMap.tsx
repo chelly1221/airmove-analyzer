@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef, useCallback } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback, useLayoutEffect } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
@@ -38,6 +38,7 @@ import type { TrackPoint, LossSegment, LossPoint, AdsbTrack } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
 import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
 import { fetchCloudGridKorea, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
+import { GPU2D, type RectData } from "../utils/gpu2d";
 
 /**
  * 탐지 유형 색상:
@@ -1759,6 +1760,9 @@ export default function TrackMap() {
   // 시작점 드래그
   const [draggingStart, setDraggingStart] = useState(false);
   const timelineRef = useRef<HTMLDivElement>(null);
+  // 타임라인 GPU 렌더링
+  const tlCanvasRef = useRef<HTMLCanvasElement>(null);
+  const tlGpuRef = useRef<GPU2D | null>(null);
 
   // 타임라인 줌 (커서 기준 스크롤 축척)
   const [zoomView, setZoomView] = useState<[number, number]>([0, 100]);
@@ -1872,6 +1876,71 @@ export default function TrackMap() {
     }
     return bands;
   }, [allPoints, timeRange]);
+
+  // ── 타임라인 GPU 초기화/정리 ──
+  useEffect(() => {
+    const canvas = tlCanvasRef.current;
+    if (!canvas) return;
+    try {
+      tlGpuRef.current = new GPU2D(canvas);
+    } catch (e) {
+      console.warn('[Timeline] WebGL2 초기화 실패:', e);
+    }
+    return () => { tlGpuRef.current?.dispose(); tlGpuRef.current = null; };
+  }, []);
+
+  // ── 타임라인 GPU 렌더링 (밴드 + Loss 마커) ──
+  const tlLossMarkers = useMemo(() => {
+    const range = timeRange.max - timeRange.min;
+    if (range <= 0) return [];
+    return allLoss
+      .map((l) => ({
+        startPct: ((l.start_time - timeRange.min) / range) * 100,
+        endPct: ((l.end_time - timeRange.min) / range) * 100,
+      }))
+      .filter((lm) => lm.endPct > lm.startPct);
+  }, [allLoss, timeRange]);
+
+  useLayoutEffect(() => {
+    const gpu = tlGpuRef.current;
+    const el = timelineRef.current;
+    if (!gpu || !el) return;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (w <= 0 || h <= 0) return;
+    gpu.setResolution(w, h);
+    gpu.syncSize(w, h);
+    gpu.clear();
+    const rects: RectData[] = [];
+    const bandCount = Math.max(1, timelineBands.length);
+    // 밴드 세그먼트
+    for (let bi = 0; bi < timelineBands.length; bi++) {
+      const band = timelineBands[bi];
+      const bandH = Math.max(3, h / bandCount);
+      const bandY = (bi / bandCount) * h;
+      for (const seg of band.segments) {
+        const l = zoomRange > 0 ? ((seg.start - zoomVStart) / zoomRange) * 100 : 0;
+        const r = zoomRange > 0 ? ((seg.end - zoomVStart) / zoomRange) * 100 : 0;
+        if (r < -5 || l > 105) continue;
+        const x = (l / 100) * w;
+        const segW = Math.max(0.3 * w / 100, ((r - l) / 100) * w);
+        rects.push({
+          x, y: bandY, w: segW, h: bandH,
+          color: [band.color[0] / 255, band.color[1] / 255, band.color[2] / 255, 0.5],
+        });
+      }
+    }
+    // Loss 마커
+    for (const lm of tlLossMarkers) {
+      const l = zoomRange > 0 ? ((lm.startPct - zoomVStart) / zoomRange) * 100 : 0;
+      const r = zoomRange > 0 ? ((lm.endPct - zoomVStart) / zoomRange) * 100 : 0;
+      if (r < -5 || l > 105) continue;
+      const x = (l / 100) * w;
+      const lw = Math.max(0.3 * w / 100, ((r - l) / 100) * w);
+      rects.push({ x, y: h - 3, w: lw, h: 3, color: [239 / 255, 68 / 255, 68 / 255, 0.8] });
+    }
+    gpu.drawRects(rects);
+  }, [timelineBands, tlLossMarkers, zoomVStart, zoomRange]);
 
   return (
     <div className="flex h-full flex-col">
@@ -2632,17 +2701,6 @@ export default function TrackMap() {
 
       {/* Bottom control bar - 타임라인 */}
       {allPoints.length > 0 && (() => {
-        // Loss 구간 타임라인 마커
-        const lossMarkers = allLoss
-          .map((l) => {
-            const range = timeRange.max - timeRange.min;
-            if (range <= 0) return null;
-            const startPct = ((l.start_time - timeRange.min) / range) * 100;
-            const endPct = ((l.end_time - timeRange.min) / range) * 100;
-            return { startPct, endPct };
-          })
-          .filter(Boolean) as { startPct: number; endPct: number }[];
-
         return (
         <div className="border-t border-gray-200 bg-white/95 backdrop-blur-sm shadow-lg">
           <div className="flex items-center gap-3 px-4 py-2 min-h-[44px]">
@@ -2702,45 +2760,8 @@ export default function TrackMap() {
             >
               {/* 트랙 배경 + 시간 눈금 */}
               <div className="absolute left-0 right-0 top-0 h-6 rounded bg-gray-100 overflow-hidden">
-                {/* 타겟별 데이터 띠 */}
-                {timelineBands.map((band, bi) => (
-                  band.segments.map((seg, si) => {
-                    const l = absToScreen(seg.start);
-                    const r = absToScreen(seg.end);
-                    if (r < -5 || l > 105) return null;
-                    return (
-                      <div
-                        key={`${bi}-${si}`}
-                        className="absolute rounded-sm"
-                        style={{
-                          left: `${l}%`,
-                          width: `${Math.max(0.3, r - l)}%`,
-                          top: `${(bi / Math.max(timelineBands.length, 1)) * 100}%`,
-                          height: `${Math.max(3, 100 / Math.max(timelineBands.length, 1))}%`,
-                          backgroundColor: `rgba(${band.color[0]},${band.color[1]},${band.color[2]},0.5)`,
-                        }}
-                      />
-                    );
-                  })
-                ))}
-                {/* Loss 마커 (빨간 틱) */}
-                {lossMarkers.map((lm, i) => {
-                  const l = absToScreen(lm.startPct);
-                  const r = absToScreen(lm.endPct);
-                  if (r < -5 || l > 105) return null;
-                  return (
-                    <div
-                      key={`loss-${i}`}
-                      className="absolute bottom-0 rounded-sm"
-                      style={{
-                        left: `${l}%`,
-                        width: `${Math.max(0.3, r - l)}%`,
-                        height: "3px",
-                        backgroundColor: "rgba(239, 68, 68, 0.8)",
-                      }}
-                    />
-                  );
-                })}
+                {/* 타겟별 데이터 띠 + Loss 마커: GPU 캔버스 렌더링 */}
+                <canvas ref={tlCanvasRef} className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }} />
                 {/* 활성 구간 (시작점 ~ 현재위치) — overflow-hidden 안에서 자동 클리핑 */}
                 <div
                   className="absolute top-0 h-full bg-[#a60739]/10 pointer-events-none"

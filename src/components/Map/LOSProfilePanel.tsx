@@ -3,6 +3,7 @@ import { X, Save, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../../store";
 import type { ElevationPoint, LOSProfileData, RadarSite, BuildingOnPath } from "../../types";
+import { GPU2D, type CircleData } from "../../utils/gpu2d";
 
 const R_EARTH_M = 6_371_000;
 const R_EFF_M = R_EARTH_M * (4 / 3); // 4/3 유효 지구 반경
@@ -113,10 +114,25 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   // X축 줌: [시작%, 끝%] (0~100)
   const [xZoom, setXZoom] = useState<[number, number]>([0, 100]);
   const xZoomRef = useRef<[number, number]>([0, 100]);
+  // ── SVG 차트 상수 ──
+  const W = 900;
+  const H = 280;
+  const PAD = { top: 20, right: 30, bottom: 30, left: 65 };
+  const cw = W - PAD.left - PAD.right;
+  const ch = H - PAD.top - PAD.bottom;
   const [hoveredTrackIdx, setHoveredTrackIdx] = useState<number | null>(null);
   const [pinnedTrackIdx, setPinnedTrackIdx] = useState<number | null>(null);
   const [hoveredBldgIdx, setHoveredBldgIdx] = useState<number | null>(null);
   const [clickedBldgIdx, setClickedBldgIdx] = useState<number | null>(null);
+  // GPU 렌더링 (항적 포인트)
+  const trackCanvasRef = useRef<HTMLCanvasElement>(null);
+  const gpu2dRef = useRef<GPU2D | null>(null);
+  // 안정적인 콜백 ref (useCallback 의존성 최소화)
+  const hoveredTrackIdxRef = useRef<number | null>(null);
+  const pinnedTrackIdxRef = useRef<number | null>(null);
+  const trackPointPosRef = useRef<{ x: number; y: number; idx: number }[]>([]);
+  const onTrackPointHoverRef = useRef(onTrackPointHover);
+  const onTrackPointHighlightRef = useRef(onTrackPointHighlight);
   // 맵에서 클릭한 포인트 → 차트 핀 동기화
   const prevExternalIdx = useRef<number | null | undefined>(undefined);
   useEffect(() => {
@@ -128,6 +144,11 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       setPinnedTrackIdx(null);
     }
   }, [externalHighlightIdx]);
+  // Ref 동기화 (안정적 콜백용)
+  hoveredTrackIdxRef.current = hoveredTrackIdx;
+  pinnedTrackIdxRef.current = pinnedTrackIdx;
+  onTrackPointHoverRef.current = onTrackPointHover;
+  onTrackPointHighlightRef.current = onTrackPointHighlight;
   // 드래그 패닝
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
@@ -523,6 +544,86 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     };
   }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings]);
 
+  // ── GPU: 항적 포인트 좌표 사전계산 (히트테스트 + 렌더링 공용) ──
+  const trackPointPositions = useMemo(() => {
+    if (!losTrackPoints || !chartData) return [];
+    const { maxDistance, minY, maxY } = chartData;
+    const zoomStart = (xZoom[0] / 100) * maxDistance;
+    const zoomEnd = (xZoom[1] / 100) * maxDistance;
+    const zoomRange = zoomEnd - zoomStart;
+    if (zoomRange <= 0) return [];
+    const result: { x: number; y: number; idx: number }[] = [];
+    for (let i = 0; i < losTrackPoints.length; i++) {
+      const tp = losTrackPoints[i];
+      const dist = tp.distRatio * maxDistance;
+      const adjAlt = tp.altitude - curvDrop(dist);
+      if (adjAlt < minY || adjAlt > maxY) continue;
+      const x = PAD.left + ((dist - zoomStart) / zoomRange) * cw;
+      const y = PAD.top + ch - ((adjAlt - minY) / (maxY - minY)) * ch;
+      if (x < PAD.left - 10 || x > W - PAD.right + 10) continue;
+      result.push({ x, y, idx: i });
+    }
+    return result;
+  }, [losTrackPoints, chartData, xZoom, cw, ch]);
+  trackPointPosRef.current = trackPointPositions;
+
+  // ── GPU: WebGL2 초기화/정리 ──
+  useEffect(() => {
+    const canvas = trackCanvasRef.current;
+    if (!canvas) return;
+    try {
+      gpu2dRef.current = new GPU2D(canvas);
+      gpu2dRef.current.setResolution(W, H);
+    } catch (e) {
+      console.warn('[LOS] WebGL2 초기화 실패:', e);
+    }
+    return () => { gpu2dRef.current?.dispose(); gpu2dRef.current = null; };
+  }, []);
+
+  // ── GPU: 항적 포인트 렌더링 ──
+  useEffect(() => {
+    const gpu = gpu2dRef.current;
+    const canvas = trackCanvasRef.current;
+    const svg = svgRef.current;
+    if (!gpu || !canvas || !svg || !losTrackPoints) return;
+    // 캔버스 크기를 SVG 렌더 크기에 동기화
+    const rect = svg.getBoundingClientRect();
+    gpu.syncSize(rect.width, rect.height);
+    gpu.clear();
+    if (trackPointPositions.length === 0) return;
+    // 차트 영역 클리핑
+    gpu.scissor(PAD.left, PAD.top, cw, ch);
+    const circles: CircleData[] = [];
+    for (const pos of trackPointPositions) {
+      const tp = losTrackPoints[pos.idx];
+      const isPinned = pinnedTrackIdx === pos.idx;
+      const isExtHover = externalHoverIdx === pos.idx && hoveredTrackIdx !== pos.idx;
+      const isHovered = hoveredTrackIdx === pos.idx;
+      const isActive = isHovered || isPinned || isExtHover;
+      // 색상
+      const col = tp.isLoss
+        ? [1, 0.09, 0.27] as [number, number, number]
+        : (() => { const c = detectionTypeColor(tp.radar_type); return [c[0]/255, c[1]/255, c[2]/255] as [number, number, number]; })();
+      const fillA = isActive ? 1 : tp.isLoss ? 0.9 : 0.7;
+      let strokeCol: [number, number, number, number] = [0, 0, 0, 0];
+      let sw = 0;
+      if (isPinned)        { strokeCol = [0.98, 0.8, 0.08, 1]; sw = 2; }
+      else if (isExtHover) { strokeCol = [0.22, 0.74, 0.97, 1]; sw = 2; }
+      else if (isHovered)  { strokeCol = [1, 1, 1, 1]; sw = 1.5; }
+      else if (tp.isLoss)  { strokeCol = [1, 0.09, 0.27, 0.5]; sw = 0.5; }
+      else if (PSR_TYPES.has(tp.radar_type)) { strokeCol = [1, 1, 1, 0.6]; sw = 1; }
+      circles.push({
+        x: pos.x, y: pos.y,
+        r: isActive ? 4 : tp.isLoss ? 2.5 : 1.5,
+        fill: [col[0], col[1], col[2], fillA],
+        stroke: strokeCol,
+        strokeWidth: sw,
+      });
+    }
+    gpu.drawCircles(circles);
+    gpu.noScissor();
+  }, [trackPointPositions, losTrackPoints, hoveredTrackIdx, pinnedTrackIdx, externalHoverIdx]);
+
   const handleSave = async () => {
     if (!chartData) return;
 
@@ -581,6 +682,11 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
               ctx.fillStyle = "#fafafa";
               ctx.fillRect(0, 0, canvas.width, canvas.height);
               ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              // GPU 캔버스 (항적 포인트) 합성
+              const trackCvs = trackCanvasRef.current;
+              if (trackCvs && trackCvs.width > 0) {
+                ctx.drawImage(trackCvs, 0, 0, canvas.width, canvas.height);
+              }
               resolve(canvas.toDataURL("image/png"));
             } else {
               resolve(undefined);
@@ -622,13 +728,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
-
-  // ── SVG 차트 상수 (훅보다 먼저 선언) ──
-  const W = 900;
-  const H = 280;
-  const PAD = { top: 20, right: 30, bottom: 30, left: 65 };
-  const cw = W - PAD.left - PAD.right;
-  const ch = H - PAD.top - PAD.bottom;
 
   // X축 줌 네이티브 휠 핸들러 (passive: false 필수)
   useEffect(() => {
@@ -713,19 +812,68 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     setXZoom([0, 100]);
   }, [profile]);
 
-  // 마우스 이동 핸들러 (SVG 좌표 → 거리)
+  // 마우스 이동 핸들러 (SVG 좌표 → 거리 + 항적 포인트 히트테스트)
   const handleSvgMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
-    if (isDragging.current) return; // 드래그 중에는 크로스헤어 비활성
+    if (isDragging.current) return;
     const svg = svgRef.current;
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
-    const svgX = ((e.clientX - rect.left) / rect.width) * 900; // viewBox 기준 X
+    const svgX = ((e.clientX - rect.left) / rect.width) * W;
+    const svgY = ((e.clientY - rect.top) / rect.height) * H;
     setHoverX(svgX);
-  }, []);
+    // 항적 포인트 히트테스트 (GPU 캔버스 대응)
+    const positions = trackPointPosRef.current;
+    let nearIdx: number | null = null;
+    let nearDist = 100; // 10px threshold²
+    for (const p of positions) {
+      const dx = p.x - svgX, dy = p.y - svgY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < nearDist) { nearDist = d2; nearIdx = p.idx; }
+    }
+    if (nearIdx !== hoveredTrackIdxRef.current) {
+      hoveredTrackIdxRef.current = nearIdx;
+      setHoveredTrackIdx(nearIdx);
+      onTrackPointHoverRef.current?.(nearIdx);
+      if (pinnedTrackIdxRef.current === null) onTrackPointHighlightRef.current?.(nearIdx);
+    }
+  }, []); // refs만 사용하므로 의존성 없음
   const handleSvgMouseLeave = useCallback(() => {
     setHoverX(null);
     onHoverDistance?.(null);
+    // 항적 포인트 호버 해제
+    if (hoveredTrackIdxRef.current !== null) {
+      hoveredTrackIdxRef.current = null;
+      setHoveredTrackIdx(null);
+      onTrackPointHoverRef.current?.(null);
+      if (pinnedTrackIdxRef.current === null) onTrackPointHighlightRef.current?.(null);
+    }
   }, [onHoverDistance]);
+  // 항적 포인트 클릭 → 핀 토글
+  const handleSvgClick = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const svgX = ((e.clientX - rect.left) / rect.width) * W;
+    const svgY = ((e.clientY - rect.top) / rect.height) * H;
+    const positions = trackPointPosRef.current;
+    let nearIdx: number | null = null;
+    let nearDist = 100;
+    for (const p of positions) {
+      const dx = p.x - svgX, dy = p.y - svgY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < nearDist) { nearDist = d2; nearIdx = p.idx; }
+    }
+    if (nearIdx !== null) {
+      const prev = pinnedTrackIdxRef.current;
+      if (prev === nearIdx) {
+        setPinnedTrackIdx(null);
+        onTrackPointHighlightRef.current?.(null);
+      } else {
+        setPinnedTrackIdx(nearIdx);
+        onTrackPointHighlightRef.current?.(nearIdx);
+      }
+    }
+  }, []);
 
   // 호버 위치의 상세 데이터 계산
   const hoverData = useMemo(() => {
@@ -861,9 +1009,10 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     for (let xn = xTickStartNm; xn <= zoomEndNm; xn += xStepNm) xTicks.push(xn / KM_TO_NM); // km으로 변환
 
     return (
-      <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full"
+      <div className="relative">
+      <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full relative"
         style={{ minHeight: 220, cursor: xZoom[0] !== 0 || xZoom[1] !== 100 ? "grab" : undefined }}
-        onMouseMove={handleSvgMouseMove} onMouseLeave={handleSvgMouseLeave}>
+        onMouseMove={handleSvgMouseMove} onMouseLeave={handleSvgMouseLeave} onClick={handleSvgClick}>
         <defs>
           <linearGradient id="terrainGrad" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#22c55e" stopOpacity="0.5" />
@@ -940,7 +1089,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 style={{ cursor: "pointer" }}
                 onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage }); }}
                 onMouseLeave={() => { setHoveredBldgIdx(null); if (clickedBldgIdx === null) onBuildingHover?.(null); }}
-                onClick={() => {
+                onClick={(e) => {
+                  e.stopPropagation(); // SVG 항적 포인트 클릭과 분리
                   const toggling = clickedBldgIdx === bi;
                   setClickedBldgIdx(toggling ? null : bi);
                   onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
@@ -1010,49 +1160,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })}
 
-        {/* LOS 선상 항적/Loss 포인트 전체 */}
-        {losTrackPoints && losTrackPoints.map((tp, tpIdx) => {
-          const tpDist = tp.distRatio * maxDistance;
-          // 고도를 4/3 조정 프레임으로 변환
-          const tpAdjAlt = tp.altitude - curvDrop(tpDist);
-          // Y축 범위 밖이면 표시 안 함
-          if (tpAdjAlt < minY || tpAdjAlt > maxY) return null;
-          const tpX = xScale(tpDist);
-          const tpY = yScale(tpAdjAlt);
-          const isPinned = pinnedTrackIdx === tpIdx;
-          const isExternalHover = externalHoverIdx === tpIdx && hoveredTrackIdx !== tpIdx;
-          const isActive = hoveredTrackIdx === tpIdx || isPinned || isExternalHover;
-          return (
-            <circle key={`tp-${tpIdx}`}
-              cx={tpX} cy={tpY}
-              r={isActive ? 4 : tp.isLoss ? 2.5 : 1.5}
-              fill={tp.isLoss ? "#ff1744" : (() => { const c = detectionTypeColor(tp.radar_type); return `rgba(${c[0]},${c[1]},${c[2]},0.85)`; })()}
-              fillOpacity={isActive ? 1 : tp.isLoss ? 0.9 : 0.7}
-              stroke={isPinned ? "#facc15" : isExternalHover ? "#38bdf8" : isActive ? "white" : tp.isLoss ? "#ff1744" : PSR_TYPES.has(tp.radar_type) ? "rgba(255,255,255,0.6)" : "none"}
-              strokeWidth={isPinned ? 2 : isExternalHover ? 2 : isActive ? 1.5 : tp.isLoss ? 0.5 : PSR_TYPES.has(tp.radar_type) ? 1 : 0}
-              style={{ cursor: "pointer" }}
-              onMouseEnter={() => {
-                setHoveredTrackIdx(tpIdx);
-                onTrackPointHover?.(tpIdx);
-                if (pinnedTrackIdx === null) onTrackPointHighlight?.(tpIdx);
-              }}
-              onMouseLeave={() => {
-                setHoveredTrackIdx(null);
-                onTrackPointHover?.(null);
-                if (pinnedTrackIdx === null) onTrackPointHighlight?.(null);
-              }}
-              onClick={() => {
-                if (pinnedTrackIdx === tpIdx) {
-                  setPinnedTrackIdx(null);
-                  onTrackPointHighlight?.(null);
-                } else {
-                  setPinnedTrackIdx(tpIdx);
-                  onTrackPointHighlight?.(tpIdx);
-                }
-              }}
-            />
-          );
-        })}
+        {/* LOS 선상 항적/Loss 포인트: GPU 캔버스에서 렌더링 (아래 trackCanvasRef) */}
 
         </g>{/* /chart-clip */}
 
@@ -1261,6 +1369,9 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })()}
       </svg>
+      {/* GPU 캔버스: 항적 포인트 (SVG 위에 오버레이, 이벤트 투과) */}
+      <canvas ref={trackCanvasRef} className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }} />
+      </div>
     );
   };
 
