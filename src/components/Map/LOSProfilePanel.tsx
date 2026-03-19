@@ -165,6 +165,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     let cancelled = false;
     const fetchElevation = async () => {
       // 이전 데이터 초기화 (stale 데이터 방지)
+      gpu2dRef.current?.dispose();
+      gpu2dRef.current = null;
       setProfile([]);
       setPeakNames(new Map());
       setBuildings([]);
@@ -485,8 +487,12 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       ...minDetFresnel.map((p) => p.height),
       ...braLine.map((p) => p.height),
     ];
-    let maxY = Math.max(...allHeights) + 100;
-    const minY = Math.min(0, ...adjTerrain.map((p) => p.height)) - 50;
+    let maxY = -Infinity;
+    for (const h of allHeights) if (h > maxY) maxY = h;
+    maxY += 100;
+    let minY = 0;
+    for (const p of adjTerrain) if (p.height < minY) minY = p.height;
+    minY -= 50;
     // 0ft가 차트 40% 지점보다 위로 오지 않도록 maxY를 능동 조절
     // 0ft 위치 = (0 - minY) / (maxY - minY) → 아래에서 위로의 비율
     // 차트에서 40% 높이 이하에 0ft가 오려면: (0 - minY) / (maxY - minY) <= 0.4
@@ -544,10 +550,56 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     };
   }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings]);
 
+  // ── Y축 가시 범위 자동조정 (줌인 시 보이는 구간의 데이터만 기준) ──
+  const visibleYRange = useMemo(() => {
+    if (!chartData) return null;
+    const { adjTerrain, minDetRefracted, minDetStraight, minDetFresnel, braLine,
+            significantBuildings, maxDistance, minY: fullMinY, maxY: fullMaxY } = chartData;
+    // 전체 줌이면 기존 범위 그대로
+    if (xZoom[0] === 0 && xZoom[1] === 100) return { minY: fullMinY, maxY: fullMaxY };
+
+    const zoomStart = (xZoom[0] / 100) * maxDistance;
+    const zoomEnd = (xZoom[1] / 100) * maxDistance;
+    const inRange = (d: number) => d >= zoomStart && d <= zoomEnd;
+
+    // 보이는 구간 내 높이값 수집
+    const heights: number[] = [];
+    for (const p of adjTerrain) if (inRange(p.distance)) heights.push(p.height);
+    for (const p of minDetRefracted) if (inRange(p.distance)) heights.push(p.height);
+    for (const p of minDetStraight) if (inRange(p.distance)) heights.push(p.height);
+    for (const p of minDetFresnel) if (inRange(p.distance)) heights.push(p.height);
+    for (const p of braLine) if (inRange(p.distance)) heights.push(p.height);
+    // 건물 꼭대기
+    for (const b of significantBuildings) {
+      if (inRange(b.distance_km)) {
+        heights.push((b.ground_elev_m + b.height_m) - curvDrop(b.distance_km));
+        heights.push(b.ground_elev_m - curvDrop(b.distance_km));
+      }
+    }
+    // 레이더 높이 (시작점이 보이면)
+    if (zoomStart <= 0.1) heights.push(radarHeight);
+
+    if (heights.length === 0) return { minY: fullMinY, maxY: fullMaxY };
+
+    let rawMin = Infinity, rawMax = -Infinity;
+    for (const h of heights) { if (h < rawMin) rawMin = h; if (h > rawMax) rawMax = h; }
+    const range = rawMax - rawMin;
+    const padding = Math.max(range * 0.12, 50); // 최소 50m 여유
+    let visMinY = rawMin - padding;
+    let visMaxY = rawMax + padding;
+    // 0ft가 차트 40% 이하에 오도록 보장 (기존 로직과 동일)
+    if (visMinY < 0) {
+      const minMaxYFor40Pct = -visMinY * 1.5;
+      if (visMaxY < minMaxYFor40Pct) visMaxY = minMaxYFor40Pct;
+    }
+    return { minY: visMinY, maxY: visMaxY };
+  }, [chartData, xZoom, radarHeight]);
+
   // ── GPU: 항적 포인트 좌표 사전계산 (히트테스트 + 렌더링 공용) ──
   const trackPointPositions = useMemo(() => {
-    if (!losTrackPoints || !chartData) return [];
-    const { maxDistance, minY, maxY } = chartData;
+    if (!losTrackPoints || !chartData || !visibleYRange) return [];
+    const { maxDistance } = chartData;
+    const { minY, maxY } = visibleYRange;
     const zoomStart = (xZoom[0] / 100) * maxDistance;
     const zoomEnd = (xZoom[1] / 100) * maxDistance;
     const zoomRange = zoomEnd - zoomStart;
@@ -557,40 +609,47 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       const tp = losTrackPoints[i];
       const dist = tp.distRatio * maxDistance;
       const adjAlt = tp.altitude - curvDrop(dist);
-      if (adjAlt < minY || adjAlt > maxY) continue;
       const x = PAD.left + ((dist - zoomStart) / zoomRange) * cw;
       const y = PAD.top + ch - ((adjAlt - minY) / (maxY - minY)) * ch;
       if (x < PAD.left - 10 || x > W - PAD.right + 10) continue;
       result.push({ x, y, idx: i });
     }
     return result;
-  }, [losTrackPoints, chartData, xZoom, cw, ch]);
+  }, [losTrackPoints, chartData, visibleYRange, xZoom, cw, ch]);
   trackPointPosRef.current = trackPointPositions;
 
-  // ── GPU: WebGL2 초기화/정리 ──
+  // GPU 정리 (컴포넌트 언마운트 시)
   useEffect(() => {
-    const canvas = trackCanvasRef.current;
-    if (!canvas) return;
-    try {
-      gpu2dRef.current = new GPU2D(canvas);
-      gpu2dRef.current.setResolution(W, H);
-    } catch (e) {
-      console.warn('[LOS] WebGL2 초기화 실패:', e);
-    }
     return () => { gpu2dRef.current?.dispose(); gpu2dRef.current = null; };
   }, []);
 
-  // ── GPU: 항적 포인트 렌더링 ──
+  // ── GPU: 항적 포인트 렌더링 (lazy-init: 캔버스가 조건부 렌더링이므로 여기서 초기화) ──
+  const gpuCanvasElRef = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
-    const gpu = gpu2dRef.current;
     const canvas = trackCanvasRef.current;
     const svg = svgRef.current;
-    if (!gpu || !canvas || !svg || !losTrackPoints) return;
+    if (!canvas || !svg || !losTrackPoints) return;
+    // 캔버스 엘리먼트가 변경되면 GPU2D 재생성 (로딩 후 새 캔버스)
+    if (gpu2dRef.current && gpuCanvasElRef.current !== canvas) {
+      gpu2dRef.current.dispose();
+      gpu2dRef.current = null;
+    }
+    if (!gpu2dRef.current) {
+      try {
+        gpu2dRef.current = new GPU2D(canvas);
+        gpu2dRef.current.setResolution(W, H);
+        gpuCanvasElRef.current = canvas;
+      } catch (e) {
+        console.warn('[LOS] WebGL2 초기화 실패:', e);
+        return;
+      }
+    }
+    const gpu = gpu2dRef.current;
     // 캔버스 크기를 SVG 렌더 크기에 동기화
     const rect = svg.getBoundingClientRect();
     gpu.syncSize(rect.width, rect.height);
     gpu.clear();
-    if (trackPointPositions.length === 0) return;
+    if (trackPointPositions.length === 0) { gpu.flush(); return; }
     // 차트 영역 클리핑
     gpu.scissor(PAD.left, PAD.top, cw, ch);
     const circles: CircleData[] = [];
@@ -600,7 +659,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       const isExtHover = externalHoverIdx === pos.idx && hoveredTrackIdx !== pos.idx;
       const isHovered = hoveredTrackIdx === pos.idx;
       const isActive = isHovered || isPinned || isExtHover;
-      // 색상
       const col = tp.isLoss
         ? [1, 0.09, 0.27] as [number, number, number]
         : (() => { const c = detectionTypeColor(tp.radar_type); return [c[0]/255, c[1]/255, c[2]/255] as [number, number, number]; })();
@@ -622,7 +680,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     }
     gpu.drawCircles(circles);
     gpu.noScissor();
-  }, [trackPointPositions, losTrackPoints, hoveredTrackIdx, pinnedTrackIdx, externalHoverIdx]);
+    gpu.flush();
+  }, [trackPointPositions, losTrackPoints, hoveredTrackIdx, pinnedTrackIdx, externalHoverIdx, chartData]);
 
   const handleSave = async () => {
     if (!chartData) return;
@@ -681,12 +740,13 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
             if (ctx) {
               ctx.fillStyle = "#fafafa";
               ctx.fillRect(0, 0, canvas.width, canvas.height);
-              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-              // GPU 캔버스 (항적 포인트) 합성
+              // GPU 캔버스 (항적 포인트) — SVG 아래에 합성
               const trackCvs = trackCanvasRef.current;
               if (trackCvs && trackCvs.width > 0) {
                 ctx.drawImage(trackCvs, 0, 0, canvas.width, canvas.height);
               }
+              // SVG (범례/툴팁 포함) — 위에 합성
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
               resolve(canvas.toDataURL("image/png"));
             } else {
               resolve(undefined);
@@ -834,7 +894,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       hoveredTrackIdxRef.current = nearIdx;
       setHoveredTrackIdx(nearIdx);
       onTrackPointHoverRef.current?.(nearIdx);
-      if (pinnedTrackIdxRef.current === null) onTrackPointHighlightRef.current?.(nearIdx);
     }
   }, []); // refs만 사용하므로 의존성 없음
   const handleSvgMouseLeave = useCallback(() => {
@@ -845,7 +904,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       hoveredTrackIdxRef.current = null;
       setHoveredTrackIdx(null);
       onTrackPointHoverRef.current?.(null);
-      if (pinnedTrackIdxRef.current === null) onTrackPointHighlightRef.current?.(null);
     }
   }, [onHoverDistance]);
   // 항적 포인트 클릭 → 핀 토글
@@ -878,7 +936,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   // 호버 위치의 상세 데이터 계산
   const hoverData = useMemo(() => {
     if (hoverX === null || !chartData || profile.length === 0) return null;
-    const { adjTerrain, minDetRefracted, minDetStraight, minDetFresnel, minY, maxY, maxDistance } = chartData;
+    const { adjTerrain, minDetRefracted, minDetStraight, minDetFresnel, maxDistance } = chartData;
 
     const PAD_LEFT = 65;
     const PAD_RIGHT = 30;
@@ -926,7 +984,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const cosH = radarHeight + dist * 1000 * Math.tan((70 * Math.PI) / 180);
     const cosAMSL = cosH + curvDrop(dist);
 
-    return { dist, terrainH, realElev, refractedH, straightH, fresnelH, refractedAGL, straightAGL, fresnelAGL, refractedAMSL, straightAMSL, fresnelAMSL, braAMSL, cosAMSL, minY, maxY };
+    return { dist, terrainH, realElev, refractedH, straightH, fresnelH, refractedAGL, straightAGL, fresnelAGL, refractedAMSL, straightAMSL, fresnelAMSL, braAMSL, cosAMSL };
   }, [hoverX, chartData, profile, xZoom]);
 
   // 호버 거리 비율을 부모에 전달
@@ -939,11 +997,12 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   }, [hoverData, totalDist, onHoverDistance]);
 
   const renderChart = () => {
-    if (!chartData) return null;
+    if (!chartData || !visibleYRange) return null;
     const {
       adjTerrain, minDetRefracted, minDetStraight, minDetFresnel, braLine, cosLine,
-      maxBlockPoint, minY, maxY, maxDistance,
+      maxBlockPoint, maxDistance,
     } = chartData;
+    const { minY, maxY } = visibleYRange;
 
     const zoomStart = (xZoom[0] / 100) * maxDistance;
     const zoomEnd = (xZoom[1] / 100) * maxDistance;
@@ -1010,6 +1069,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     return (
       <div className="relative">
+      {/* GPU 캔버스: 항적 포인트 (SVG 아래에 배치, 범례/툴팁이 위에 표시) */}
+      <canvas ref={trackCanvasRef} className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }} />
       <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full relative"
         style={{ minHeight: 220, cursor: xZoom[0] !== 0 || xZoom[1] !== 100 ? "grab" : undefined }}
         onMouseMove={handleSvgMouseMove} onMouseLeave={handleSvgMouseLeave} onClick={handleSvgClick}>
@@ -1369,8 +1430,6 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })()}
       </svg>
-      {/* GPU 캔버스: 항적 포인트 (SVG 위에 오버레이, 이벤트 투과) */}
-      <canvas ref={trackCanvasRef} className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }} />
       </div>
     );
   };

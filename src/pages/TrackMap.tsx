@@ -36,7 +36,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, AdsbTrack } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
-import { computeCoverageTerrainProfile, computeLayerFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
+import { computeCoverageTerrainProfile, computeLayersFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
 import { fetchCloudGridKorea, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 import { GPU2D, type RectData } from "../utils/gpu2d";
 
@@ -77,6 +77,9 @@ function detectionTypeColor(rt: string): [number, number, number] {
 const MAP_STYLE_URL = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
 
 const SPEED_OPTIONS = [1, 60, 120, 300];
+
+/** 전체 항적 표시 시 최대 선택 가능 윈도우 (초) = 24시간 */
+const MAX_WINDOW_SECS = 86400;
 
 interface TrackPath {
   modeS: string;
@@ -171,6 +174,11 @@ export default function TrackMap() {
   const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageAltMinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // 파노라마 장애물 맵 하이라이트 (전역 스토어)
+  const panoramaViewActive = useAppStore((s) => s.panoramaViewActive);
+  const panoramaActivePoint = useAppStore((s) => s.panoramaActivePoint);
+  const panoramaPinned = useAppStore((s) => s.panoramaPinned);
+
   // LOS Analysis state
   const [losMode, setLosMode] = useState(false);
   const [losTarget, setLosTarget] = useState<{ lat: number; lon: number } | null>(null);
@@ -221,7 +229,8 @@ export default function TrackMap() {
   // 레이더 정보
   const radarInfo = useMemo(() => {
     if (radarFilteredFlights.length === 0) return null;
-    const maxRange = Math.max(...radarFilteredFlights.map((f) => f.max_radar_range_km));
+    let maxRange = 0;
+    for (const f of radarFilteredFlights) if (f.max_radar_range_km > maxRange) maxRange = f.max_radar_range_km;
     const rangeKm = radarSite.range_nm > 0
       ? radarSite.range_nm * 1.852
       : maxRange;
@@ -260,6 +269,8 @@ export default function TrackMap() {
   type AllPointsResult = { allPoints: TrackPoint[]; allLoss: LossSegment[]; allLossPoints: LossPoint[]; paddedTimeRange?: { min: number; max: number } };
   const [allPointsState, setAllPointsState] = useState<AllPointsResult>({ allPoints: [], allLoss: [], allLossPoints: [] });
   const [allPointsLoading, setAllPointsLoading] = useState(false);
+  const [allPointsProgress, setAllPointsProgress] = useState(0); // 0~100
+  const [allPointsCount, setAllPointsCount] = useState({ loaded: 0, total: 0 });
 
   useEffect(() => {
     let cancelled = false;
@@ -313,18 +324,26 @@ export default function TrackMap() {
 
       // 일반 필터 (전체/__ALL__, 등록기체, 특정 Mode-S)
       const showAll = selectedModeS === "__ALL__";
-      let processed = 0;
+      const totalPtsEst = radarFilteredFlights.reduce((s, f) => s + f.track_points.length, 0);
+      const isLarge = totalPtsEst > 100_000;
+      let pointsProcessed = 0;
+      let lastProgressUpdate = performance.now();
+
+      // 비행별 필터링된 포인트를 정렬된 청크로 수집 (각 비행 내 포인트는 이미 시간순)
+      const sortedChunks: TrackPoint[][] = [];
       for (const f of radarFilteredFlights) {
+        const chunk: TrackPoint[] = [];
         for (const p of f.track_points) {
           if (!validModeS.has(p.mode_s)) continue;
           if (showAll) {
-            pts.push(p);
+            chunk.push(p);
           } else if (!selectedModeS) {
-            if (registeredModeS.has(p.mode_s.toUpperCase())) pts.push(p);
+            if (registeredModeS.has(p.mode_s.toUpperCase())) chunk.push(p);
           } else {
-            if (p.mode_s === selectedModeS) pts.push(p);
+            if (p.mode_s === selectedModeS) chunk.push(p);
           }
         }
+        if (chunk.length > 0) sortedChunks.push(chunk);
         if (showAll) {
           loss.push(...f.loss_segments.filter((s) => validModeS.has(s.mode_s)));
           lossP.push(...f.loss_points.filter((p) => validModeS.has(p.mode_s)));
@@ -335,25 +354,97 @@ export default function TrackMap() {
           loss.push(...f.loss_segments.filter((s) => s.mode_s === selectedModeS));
           lossP.push(...f.loss_points.filter((p) => p.mode_s === selectedModeS));
         }
-        // 대량 데이터 시 비행 10개마다 UI 양보
-        processed++;
-        if (showAll && processed % 10 === 0) {
+        // 수집 단계 진행률 (0~80%)
+        pointsProcessed += f.track_points.length;
+        const now = performance.now();
+        if (isLarge && now - lastProgressUpdate > 150) {
+          setAllPointsProgress(Math.round((pointsProcessed / totalPtsEst) * 80));
+          setAllPointsCount({ loaded: pointsProcessed, total: totalPtsEst });
           await new Promise((r) => setTimeout(r, 0));
+          lastProgressUpdate = performance.now();
           if (cancelled) return;
         }
       }
-      pts.sort((a, b) => a.timestamp - b.timestamp);
+
+      // k-way 병합 단계 (80~100%) — 정렬된 청크들을 min-heap으로 병합하며 진행률 추적
+      const totalMerge = sortedChunks.reduce((s, c) => s + c.length, 0);
+      if (isLarge) {
+        setAllPointsProgress(80);
+        setAllPointsCount({ loaded: pointsProcessed, total: totalPtsEst });
+        await new Promise((r) => setTimeout(r, 0));
+      }
+
+      if (sortedChunks.length <= 1) {
+        // 청크 1개 이하면 병합 불필요
+        if (sortedChunks.length === 1) pts.push(...sortedChunks[0]);
+      } else {
+        // Min-heap 기반 k-way 병합 (O(n log k))
+        const heap: { ts: number; ci: number; pi: number }[] = [];
+        const sinkDown = (i: number) => {
+          const n = heap.length;
+          while (true) {
+            let min = i;
+            const l = 2 * i + 1, r = 2 * i + 2;
+            if (l < n && heap[l].ts < heap[min].ts) min = l;
+            if (r < n && heap[r].ts < heap[min].ts) min = r;
+            if (min === i) break;
+            [heap[min], heap[i]] = [heap[i], heap[min]];
+            i = min;
+          }
+        };
+        const bubbleUp = (i: number) => {
+          while (i > 0) {
+            const p = (i - 1) >> 1;
+            if (heap[p].ts <= heap[i].ts) break;
+            [heap[p], heap[i]] = [heap[i], heap[p]];
+            i = p;
+          }
+        };
+        // 힙 초기화: 각 청크의 첫 포인트
+        for (let ci = 0; ci < sortedChunks.length; ci++) {
+          const entry = { ts: sortedChunks[ci][0].timestamp, ci, pi: 0 };
+          heap.push(entry);
+          bubbleUp(heap.length - 1);
+        }
+        let merged = 0;
+        let lastMergeUpdate = performance.now();
+        while (heap.length > 0) {
+          const top = heap[0];
+          pts.push(sortedChunks[top.ci][top.pi]);
+          merged++;
+          const nextPi = top.pi + 1;
+          if (nextPi < sortedChunks[top.ci].length) {
+            heap[0] = { ts: sortedChunks[top.ci][nextPi].timestamp, ci: top.ci, pi: nextPi };
+          } else {
+            heap[0] = heap[heap.length - 1];
+            heap.pop();
+          }
+          if (heap.length > 0) sinkDown(0);
+          // 병합 진행률 (80~100%)
+          if (isLarge) {
+            const now2 = performance.now();
+            if (now2 - lastMergeUpdate > 150) {
+              setAllPointsProgress(80 + Math.round((merged / totalMerge) * 20));
+              await new Promise((r) => setTimeout(r, 0));
+              lastMergeUpdate = performance.now();
+              if (cancelled) return;
+            }
+          }
+        }
+      }
       if (!cancelled) setAllPointsState({ allPoints: pts, allLoss: loss, allLossPoints: lossP });
     };
 
     // 소규모 데이터는 동기 실행, 대규모면 비동기 + 로딩 표시
     const totalPts = radarFilteredFlights.reduce((s, f) => s + f.track_points.length, 0);
-    if (totalPts > 1_000_000 && selectedModeS === "__ALL__") {
+    if (totalPts > 100_000) {
       setAllPointsLoading(true);
+      setAllPointsProgress(0);
+      setAllPointsCount({ loaded: 0, total: totalPts });
       // 다음 프레임에서 시작하여 로딩 UI가 먼저 표시되도록
       requestAnimationFrame(() => {
         compute().finally(() => {
-          if (!cancelled) setAllPointsLoading(false);
+          if (!cancelled) { setAllPointsLoading(false); setAllPointsProgress(100); }
         });
       });
     } else {
@@ -406,6 +497,77 @@ export default function TrackMap() {
     [timeRange]
   );
 
+  // 전체항적 24시간 윈도우: 초 → 퍼센트 변환
+  const secsToPct = useCallback(
+    (secs: number) => {
+      const range = timeRange.max - timeRange.min;
+      return range > 0 ? (secs / range) * 100 : 100;
+    },
+    [timeRange]
+  );
+
+  /** 전체항적 모드에서 24시간 윈도우 적용 여부 */
+  const isAllTrackMode = selectedModeS === "__ALL__" && !selectedFlightId && !selectedFlight;
+  const maxWindowPct = secsToPct(MAX_WINDOW_SECS);
+
+  // 전체항적 모드 진입 시 24시간 윈도우로 초기화
+  useEffect(() => {
+    if (!isAllTrackMode) return;
+    const totalSecs = timeRange.max - timeRange.min;
+    if (totalSecs > MAX_WINDOW_SECS) {
+      // 마지막 24시간 구간으로 설정
+      const startPct = Math.max(0, 100 - maxWindowPct);
+      setRangeStart(startPct);
+      setSliderValue(100);
+    }
+  }, [isAllTrackMode, timeRange.min, timeRange.max]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 24시간 제한 refs (드래그 클로저에서 최신값 참조용)
+  const isAllTrackModeRef = useRef(isAllTrackMode);
+  isAllTrackModeRef.current = isAllTrackMode;
+  const maxWindowPctRef = useRef(maxWindowPct);
+  maxWindowPctRef.current = maxWindowPct;
+
+  /** rangeStart 변경 시 24시간 윈도우 제한 적용 */
+  const setConstrainedRangeStart = useCallback(
+    (newStart: number) => {
+      setRangeStart(newStart);
+      if (isAllTrackModeRef.current) {
+        // 시작점을 왼쪽으로 벌리면 끝점이 따라감
+        setSliderValue((sv) => {
+          const range = timeRange.max - timeRange.min;
+          const startTs = timeRange.min + (range * newStart) / 100;
+          const endTs = timeRange.min + (range * sv) / 100;
+          if ((endTs - startTs) > MAX_WINDOW_SECS) {
+            return Math.min(100, newStart + maxWindowPctRef.current);
+          }
+          return sv;
+        });
+      }
+    },
+    [timeRange]
+  );
+
+  /** sliderValue 변경 시 24시간 윈도우 제한 적용 */
+  const setConstrainedSliderValue = useCallback(
+    (newEnd: number) => {
+      setSliderValue(newEnd);
+      if (isAllTrackModeRef.current) {
+        // 끝점을 오른쪽으로 벌리면 시작점이 따라감
+        setRangeStart((rs) => {
+          const range = timeRange.max - timeRange.min;
+          const startTs = timeRange.min + (range * rs) / 100;
+          const endTs = timeRange.min + (range * newEnd) / 100;
+          if ((endTs - startTs) > MAX_WINDOW_SECS) {
+            return Math.max(0, newEnd - maxWindowPctRef.current);
+          }
+          return rs;
+        });
+      }
+    },
+    [timeRange]
+  );
+
   // 현재 표시 범위: rangeStart ~ sliderValue
   const { visibleMinTs, visibleMaxTs } = useMemo(() => {
     const maxTs = sliderValue >= 100 ? Infinity : pctToTs(sliderValue);
@@ -420,13 +582,22 @@ export default function TrackMap() {
     if (playing) {
       const totalDuration = timeRange.max - timeRange.min;
       const stepPct = totalDuration > 0 ? (0.1 * playSpeed / totalDuration) * 100 : 0.1;
+      const windowPct = totalDuration > 0 ? (MAX_WINDOW_SECS / totalDuration) * 100 : 100;
       playRef.current = setInterval(() => {
         setSliderValue((v) => {
           if (v >= 100) {
             setPlaying(false);
             return 100;
           }
-          return Math.min(v + stepPct, 100);
+          const newV = Math.min(v + stepPct, 100);
+          // 전체항적 모드: 재생 시 24시간 윈도우 유지 (시작점 따라감)
+          if (isAllTrackMode && totalDuration > MAX_WINDOW_SECS) {
+            setRangeStart((rs) => {
+              const gap = newV - rs;
+              return gap > windowPct ? newV - windowPct : rs;
+            });
+          }
+          return newV;
         });
       }, 100);
     } else {
@@ -438,7 +609,7 @@ export default function TrackMap() {
     return () => {
       if (playRef.current) clearInterval(playRef.current);
     };
-  }, [playing, playSpeed, timeRange]);
+  }, [playing, playSpeed, timeRange, isAllTrackMode]);
 
   // Auto fit bounds
   const [viewState, setViewState] = useState({
@@ -775,8 +946,8 @@ export default function TrackMap() {
       setCoverageVisible(true);
 
       // DB에 대표 레이어 저장 (보고서 재활용)
-      const repAlts = [500, 1000, 2000, 3000, 5000, 10000, 15000, 20000];
-      const repLayers = repAlts.map((alt) => computeLayerFromProfile(profile, alt));
+      const repAlts = [500, 1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
+      const repLayers = await computeLayersFromProfile(profile, repAlts);
       setCoverageData({
         radarName: radarSite.name,
         radarLat: radarSite.latitude,
@@ -832,15 +1003,20 @@ export default function TrackMap() {
     else if (range <= 5000) step = 500;
     else step = 1000;
 
-    const layers: CoverageLayer[] = [];
     // bearingStep=10: 0.1°×10 = 1° 간격 (3600→360 포인트, 시각적 차이 없음)
+    const altFts: number[] = [];
     for (let alt = effMin; alt <= effMax; alt += step) {
-      layers.push(computeLayerFromProfile(profile, alt, 10));
+      altFts.push(alt);
     }
-    if (layers.length === 0 || layers[layers.length - 1].altitudeFt !== effMax) {
-      layers.push(computeLayerFromProfile(profile, effMax, 10));
+    if (altFts.length === 0 || altFts[altFts.length - 1] !== effMax) {
+      altFts.push(effMax);
     }
-    setCoverageLayers(layers);
+
+    let cancelled = false;
+    computeLayersFromProfile(profile, altFts, 10).then((layers) => {
+      if (!cancelled) setCoverageLayers(layers);
+    });
+    return () => { cancelled = true; };
   }, [coverageAlt, coverageAltMin, terrainProfile, coverageVisible]);
 
   // Mode-S별 트랙 패스 데이터 (gap + radar_type 변경 시 분할)
@@ -1708,8 +1884,47 @@ export default function TrackMap() {
       );
     }
 
+    // ── 파노라마 장애물 하이라이트 (hover/click → 메인 지도 표시) ──
+    if (panoramaViewActive && panoramaActivePoint) {
+      const pt = panoramaActivePoint;
+      const isBuilding = pt.obstacle_type !== "terrain";
+      const color: [number, number, number, number] = isBuilding
+        ? [239, 68, 68, 230]   // 건물: 빨간색
+        : [34, 197, 94, 230];  // 지형: 녹색
+
+      // 레이더→장애물 방향선
+      layers.push(
+        new LineLayer({
+          id: "panorama-direction-line",
+          data: [pt],
+          getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
+          getTargetPosition: (d) => [d.lon, d.lat],
+          getColor: [...color.slice(0, 3), 100] as [number, number, number, number],
+          getWidth: 2,
+          widthMinPixels: 1.5,
+          widthUnits: "pixels" as const,
+        })
+      );
+
+      // 장애물 포인트 마커
+      layers.push(
+        new ScatterplotLayer({
+          id: "panorama-highlight-point",
+          data: [pt],
+          getPosition: (d) => [d.lon, d.lat],
+          getFillColor: color,
+          getLineColor: [255, 255, 255, 200] as [number, number, number, number],
+          getRadius: panoramaPinned ? 8 : 6,
+          radiusUnits: "pixels" as const,
+          lineWidthMinPixels: panoramaPinned ? 2.5 : 1.5,
+          stroked: true,
+          pickable: false,
+        })
+      );
+    }
+
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots, losBuildingHighlight]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots, losBuildingHighlight, panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -1877,19 +2092,12 @@ export default function TrackMap() {
     return bands;
   }, [allPoints, timeRange]);
 
-  // ── 타임라인 GPU 초기화/정리 ──
+  // 타임라인 GPU 정리 (언마운트 시)
   useEffect(() => {
-    const canvas = tlCanvasRef.current;
-    if (!canvas) return;
-    try {
-      tlGpuRef.current = new GPU2D(canvas);
-    } catch (e) {
-      console.warn('[Timeline] WebGL2 초기화 실패:', e);
-    }
     return () => { tlGpuRef.current?.dispose(); tlGpuRef.current = null; };
   }, []);
 
-  // ── 타임라인 GPU 렌더링 (밴드 + Loss 마커) ──
+  // ── 타임라인 GPU 렌더링 (밴드 + Loss 마커, lazy-init) ──
   const tlLossMarkers = useMemo(() => {
     const range = timeRange.max - timeRange.min;
     if (range <= 0) return [];
@@ -1902,9 +2110,19 @@ export default function TrackMap() {
   }, [allLoss, timeRange]);
 
   useLayoutEffect(() => {
-    const gpu = tlGpuRef.current;
+    const canvas = tlCanvasRef.current;
     const el = timelineRef.current;
-    if (!gpu || !el) return;
+    if (!canvas || !el) return;
+    // GPU2D lazy-init (캔버스가 조건부 렌더링이므로 여기서 초기화)
+    if (!tlGpuRef.current) {
+      try {
+        tlGpuRef.current = new GPU2D(canvas);
+      } catch (e) {
+        console.warn('[Timeline] WebGL2 초기화 실패:', e);
+        return;
+      }
+    }
+    const gpu = tlGpuRef.current;
     const w = el.clientWidth;
     const h = el.clientHeight;
     if (w <= 0 || h <= 0) return;
@@ -1940,6 +2158,7 @@ export default function TrackMap() {
       rects.push({ x, y: h - 3, w: lw, h: 3, color: [239 / 255, 68 / 255, 68 / 255, 0.8] });
     }
     gpu.drawRects(rects);
+    gpu.flush();
   }, [timelineBands, tlLossMarkers, zoomVStart, zoomRange]);
 
   return (
@@ -2026,6 +2245,9 @@ export default function TrackMap() {
             <>
               <span>{allPoints.length.toLocaleString()} pts</span>
               <span className="text-[#a60739]">Loss {signalLossPoints.length}pt/{signalLoss.length}gap</span>
+              {isAllTrackMode && (timeRange.max - timeRange.min) > MAX_WINDOW_SECS && (
+                <span className="text-amber-500 font-medium">24h 윈도우</span>
+              )}
             </>
           )}
         </div>
@@ -2517,6 +2739,31 @@ export default function TrackMap() {
         )}
 
 
+        {/* 전체항적 로딩 모달 오버레이 */}
+        {allPointsLoading && (
+          <div className="absolute inset-0 z-[2000] flex items-center justify-center bg-black/40 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-3 rounded-xl bg-white/95 px-8 py-6 shadow-2xl border border-gray-200 min-w-[240px]">
+              <Loader2 size={32} className="animate-spin text-[#a60739]" />
+              <div className="text-sm font-medium text-gray-700">
+                {allPointsProgress >= 80 ? '항적 병합 정렬 중...' : '전체 항적 수집 중...'}
+              </div>
+              <div className="w-full">
+                <div className="h-2 w-full rounded-full bg-gray-200 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-[#a60739] transition-all duration-200"
+                    style={{ width: `${allPointsProgress}%` }}
+                  />
+                </div>
+                <div className="mt-1.5 text-center text-xs text-gray-400">
+                  {allPointsCount.total > 0
+                    ? `${(allPointsCount.loaded).toLocaleString()} / ${(allPointsCount.total).toLocaleString()} (${allPointsProgress}%)`
+                    : `${allPointsProgress}%`}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* 범례 (왼쪽 하단) */}
         {allPoints.length > 0 && (
           <div className="absolute bottom-3 left-3 z-[1000] rounded-lg border border-gray-200 bg-white/95 px-3 py-2.5 text-[10px] backdrop-blur-sm shadow-lg">
@@ -2728,7 +2975,7 @@ export default function TrackMap() {
                   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
                 } else {
                   // 시크 — 재생 중이면 재생 유지
-                  setSliderValue(Math.max(pct, rangeStart));
+                  setConstrainedSliderValue(Math.max(pct, rangeStart));
                   setDraggingStart(false);
                   const onMove = (me: PointerEvent) => {
                     const r = timelineRef.current?.getBoundingClientRect();
@@ -2736,7 +2983,7 @@ export default function TrackMap() {
                     const sp = ((me.clientX - r.left) / r.width) * 100;
                     const [vs2, ve2] = zoomViewRef.current;
                     const p = Math.max(0, Math.min(100, vs2 + (sp / 100) * (ve2 - vs2)));
-                    setSliderValue(Math.max(p, rangeStart));
+                    setConstrainedSliderValue(Math.max(p, rangeStart));
                   };
                   const onUp = () => {
                     window.removeEventListener("pointermove", onMove);
@@ -2752,7 +2999,7 @@ export default function TrackMap() {
                 const sp = ((e.clientX - rect.left) / rect.width) * 100;
                 const [zvs, zve] = zoomViewRef.current;
                 const pct = Math.max(0, Math.min(sliderValue, zvs + (sp / 100) * (zve - zvs)));
-                setRangeStart(pct);
+                setConstrainedRangeStart(pct);
               }}
               onPointerUp={() => setDraggingStart(false)}
               onPointerCancel={() => setDraggingStart(false)}

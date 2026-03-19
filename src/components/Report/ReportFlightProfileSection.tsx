@@ -23,17 +23,18 @@ export default function ReportFlightProfileSection({ sectionNum, flight, radarSi
   const matchTypeLabel = flight.match_type === "opensky" ? "OpenSky 매칭" : flight.match_type === "manual" ? "수동 병합" : "Gap 분리";
 
   // 고도/속도 범위
-  const altitudes = flight.track_points.map((p) => p.altitude);
-  const speeds = flight.track_points.map((p) => p.speed);
-  const minAlt = altitudes.length > 0 ? Math.min(...altitudes) : 0;
-  const maxAlt = altitudes.length > 0 ? Math.max(...altitudes) : 0;
-  const minSpd = speeds.length > 0 ? Math.min(...speeds) : 0;
-  const maxSpd = speeds.length > 0 ? Math.max(...speeds) : 0;
+  let minAlt = Infinity, maxAlt = -Infinity, minSpd = Infinity, maxSpd = -Infinity;
+  for (const p of flight.track_points) {
+    if (p.altitude < minAlt) minAlt = p.altitude;
+    if (p.altitude > maxAlt) maxAlt = p.altitude;
+    if (p.speed < minSpd) minSpd = p.speed;
+    if (p.speed > maxSpd) maxSpd = p.speed;
+  }
+  if (!isFinite(minAlt)) { minAlt = 0; maxAlt = 0; minSpd = 0; maxSpd = 0; }
 
   // 최대 gap 시간
-  const maxGap = flight.loss_points.length > 0
-    ? Math.max(...flight.loss_points.map((lp) => lp.gap_duration_secs))
-    : 0;
+  let maxGap = 0;
+  for (const lp of flight.loss_points) if (lp.gap_duration_secs > maxGap) maxGap = lp.gap_duration_secs;
 
   // 고도-시간 미니차트
   const chartPoints = flight.track_points;

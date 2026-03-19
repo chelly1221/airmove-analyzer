@@ -1418,34 +1418,40 @@ export default function FileUpload() {
     return ranges;
   }, [aircraft, rawTrackPoints]);
 
-  // 비행 통합 실행 (수동 병합 비행 보존)
-  const runConsolidation = useCallback(() => {
+  // 비행 통합 실행 (수동 병합 비행 보존, 비동기 — UI 논블로킹)
+  const consolidatingRef = useRef(false);
+  const runConsolidation = useCallback(async () => {
+    if (consolidatingRef.current) return; // 중복 실행 방지
     const state = useAppStore.getState();
     if (state.rawTrackPoints.length === 0) return;
-    const consolidated = consolidateFlights(
-      state.rawTrackPoints,
-      state.flightHistory,
-      state.aircraft,
-      state.radarSite,
-    );
-    // 수동 병합된 비행은 재통합에서 보존 (사용자 의도 유지)
-    const manualFlights = state.flights.filter((f) => f.match_type === "manual");
-    if (manualFlights.length > 0) {
-      // 수동 병합에 포함된 포인트의 시간 범위와 겹치는 자동 비행 제거
-      const manualRanges = manualFlights.map((mf) => ({
-        mode_s: mf.mode_s.toUpperCase(),
-        start: mf.start_time,
-        end: mf.end_time,
-      }));
-      const filtered = consolidated.filter((cf) => {
-        const ms = cf.mode_s.toUpperCase();
-        return !manualRanges.some((mr) =>
-          mr.mode_s === ms && cf.start_time >= mr.start - 300 && cf.end_time <= mr.end + 300
-        );
-      });
-      setFlights([...filtered, ...manualFlights].sort((a, b) => a.start_time - b.start_time));
-    } else {
-      setFlights(consolidated);
+    consolidatingRef.current = true;
+    try {
+      const consolidated = await consolidateFlights(
+        state.rawTrackPoints,
+        state.flightHistory,
+        state.aircraft,
+        state.radarSite,
+      );
+      // 수동 병합된 비행은 재통합에서 보존 (사용자 의도 유지)
+      const manualFlights = useAppStore.getState().flights.filter((f) => f.match_type === "manual");
+      if (manualFlights.length > 0) {
+        const manualRanges = manualFlights.map((mf) => ({
+          mode_s: mf.mode_s.toUpperCase(),
+          start: mf.start_time,
+          end: mf.end_time,
+        }));
+        const filtered = consolidated.filter((cf) => {
+          const ms = cf.mode_s.toUpperCase();
+          return !manualRanges.some((mr) =>
+            mr.mode_s === ms && cf.start_time >= mr.start - 300 && cf.end_time <= mr.end + 300
+          );
+        });
+        setFlights([...filtered, ...manualFlights].sort((a, b) => a.start_time - b.start_time));
+      } else {
+        setFlights(consolidated);
+      }
+    } finally {
+      consolidatingRef.current = false;
     }
   }, [setFlights]);
 
@@ -1465,8 +1471,8 @@ export default function FileUpload() {
     }
     const icao24List = [...registeredTrackRanges.keys()];
     const ranges = [...registeredTrackRanges.values()];
-    const start = Math.min(...ranges.map((r) => r.minTs));
-    const end = Math.max(...ranges.map((r) => r.maxTs));
+    let start = Infinity, end = -Infinity;
+    for (const r of ranges) { if (r.minTs < start) start = r.minTs; if (r.maxTs > end) end = r.maxTs; }
     // 운항이력 — DB에서 로드 후 setFlightHistory → flightHistory useEffect가 재통합 트리거
     invoke<FlightRecord[]>("load_flight_history", {
       icao24_list: icao24List, start, end,

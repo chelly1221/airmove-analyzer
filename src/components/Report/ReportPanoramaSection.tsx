@@ -98,37 +98,37 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[15px] font-bold text-gray-900">
+      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
         {sectionNum}. 전파 장애물 분석
       </h2>
 
       {/* 레이더 정보 + 요약 KPI */}
       <div className="mb-4 grid grid-cols-5 gap-2">
         <div className="rounded-md bg-gray-50 px-2 py-1.5 text-center">
-          <p className="text-[8px] text-gray-400">레이더</p>
-          <p className="text-[10px] font-bold text-gray-800">{radarSite.name}</p>
+          <p className="text-[11px] text-gray-400">레이더</p>
+          <p className="text-[13px] font-bold text-gray-800">{radarSite.name}</p>
         </div>
         <div className="rounded-md bg-gray-50 px-2 py-1.5 text-center">
-          <p className="text-[8px] text-gray-400">안테나 높이</p>
-          <p className="text-[10px] font-bold text-gray-800">{(radarSite.altitude + radarSite.antenna_height).toFixed(0)}m ASL</p>
+          <p className="text-[11px] text-gray-400">안테나 높이</p>
+          <p className="text-[13px] font-bold text-gray-800">{(radarSite.altitude + radarSite.antenna_height).toFixed(0)}m ASL</p>
         </div>
         <div className="rounded-md bg-gray-50 px-2 py-1.5 text-center">
-          <p className="text-[8px] text-gray-400">최대 앙각</p>
-          <p className="text-[10px] font-bold text-[#a60739]">{maxAnglePt.elevation_angle_deg.toFixed(3)}°</p>
+          <p className="text-[11px] text-gray-400">최대 앙각</p>
+          <p className="text-[13px] font-bold text-[#a60739]">{maxAnglePt.elevation_angle_deg.toFixed(3)}°</p>
         </div>
         <div className="rounded-md bg-gray-50 px-2 py-1.5 text-center">
-          <p className="text-[8px] text-gray-400">평균 앙각</p>
-          <p className="text-[10px] font-bold text-gray-800">{avgAngle.toFixed(3)}°</p>
+          <p className="text-[11px] text-gray-400">평균 앙각</p>
+          <p className="text-[13px] font-bold text-gray-800">{avgAngle.toFixed(3)}°</p>
         </div>
         <div className="rounded-md bg-gray-50 px-2 py-1.5 text-center">
-          <p className="text-[8px] text-gray-400">건물 장애물</p>
-          <p className="text-[10px] font-bold text-gray-800">{buildings.length}건</p>
+          <p className="text-[11px] text-gray-400">건물 장애물</p>
+          <p className="text-[13px] font-bold text-gray-800">{buildings.length}건</p>
         </div>
       </div>
 
       {/* 파노라마 차트 (SVG) */}
       <div className="mb-4 rounded-md border border-gray-200 p-2">
-        <p className="mb-1 text-[9px] font-semibold text-gray-600">360° LoS 파노라마</p>
+        <p className="mb-1 text-[12px] font-semibold text-gray-600">360° LoS 파노라마</p>
         <svg viewBox={`0 0 ${svgW} ${svgH}`} className="w-full">
           <rect x={0} y={0} width={svgW} height={svgH} fill="#fafafa" rx={3} />
 
@@ -223,8 +223,8 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
 
       {/* 방위별 요약 테이블 */}
       <div className="mb-4 overflow-hidden">
-        <p className="mb-1.5 text-[10px] font-semibold text-gray-600">방위별 장애물 요약 (8방위)</p>
-        <table className="w-full table-fixed border-collapse text-[9px]">
+        <p className="mb-1.5 text-[13px] font-semibold text-gray-600">방위별 장애물 요약 (8방위)</p>
+        <table className="w-full table-fixed border-collapse text-[12px]">
           <colgroup>
             <col style={{ width: "10%" }} />
             <col style={{ width: "13%" }} />
@@ -245,7 +245,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
             {sectorStats.map((s, i) => (
               <tr key={s.label} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
                 <td className="border border-gray-200 px-1.5 py-1 text-center font-semibold">{s.label}</td>
-                <td className="border border-gray-200 px-1.5 py-1 text-center font-mono text-[8px] text-gray-500">
+                <td className="border border-gray-200 px-1.5 py-1 text-center font-mono text-[11px] text-gray-500">
                   {s.start}°–{s.end}°
                 </td>
                 <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">
@@ -261,7 +261,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
                 <td className="border border-gray-200 px-1.5 py-1 truncate">
                   {s.maxPt ? (
                     <span className="flex items-center gap-1">
-                      <span className={`inline-block shrink-0 rounded px-1 py-0.5 text-[8px] font-medium ${
+                      <span className={`inline-block shrink-0 rounded px-1 py-0.5 text-[11px] font-medium ${
                         s.maxPt.obstacle_type === "terrain"
                           ? "bg-green-50 text-green-600"
                           : s.maxPt.obstacle_type === "gis_building"
@@ -286,12 +286,12 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
       {/* 주요 건물 장애물 목록 */}
       {topBuildings.length > 0 && (
         <div>
-          <p className="mb-1.5 text-[10px] font-semibold text-gray-600">
+          <p className="mb-1.5 text-[13px] font-semibold text-gray-600">
             주요 건물 장애물 (앙각 상위 {topBuildings.length}건)
             {gisBuildings.length > 0 && <span className="ml-2 font-normal text-gray-400">GIS {gisBuildings.length}건</span>}
             {manualBuildings.length > 0 && <span className="ml-1 font-normal text-gray-400">수동 {manualBuildings.length}건</span>}
           </p>
-          <table className="w-full border-collapse text-[9px]">
+          <table className="w-full border-collapse text-[12px]">
             <thead>
               <tr className="bg-[#28283c] text-white">
                 <th className="border border-gray-300 px-1.5 py-1 text-center font-medium w-5">#</th>
@@ -310,7 +310,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
                 <tr key={idx} className={idx % 2 === 0 ? "bg-white" : "bg-gray-50"}>
                   <td className="border border-gray-200 px-1.5 py-1 text-center">{idx + 1}</td>
                   <td className="border border-gray-200 px-1.5 py-1 text-center">
-                    <span className={`rounded px-1 py-0.5 text-[8px] font-medium ${
+                    <span className={`rounded px-1 py-0.5 text-[11px] font-medium ${
                       pt.obstacle_type === "gis_building"
                         ? "bg-orange-50 text-orange-600"
                         : "bg-red-50 text-red-600"
@@ -319,7 +319,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
                     </span>
                   </td>
                   <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">
-                    {pt.azimuth_deg.toFixed(1)} <span className="text-[7px] text-gray-400">{azLabel(pt.azimuth_deg)}</span>
+                    {pt.azimuth_deg.toFixed(1)} <span className="text-[10px] text-gray-400">{azLabel(pt.azimuth_deg)}</span>
                   </td>
                   <td className="border border-gray-200 px-1.5 py-1 text-right font-mono font-medium text-[#a60739]">
                     {pt.elevation_angle_deg.toFixed(3)}

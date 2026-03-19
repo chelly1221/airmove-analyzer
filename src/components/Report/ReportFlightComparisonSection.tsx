@@ -26,7 +26,8 @@ export default function ReportFlightComparisonSection({ sectionNum, flights, rad
   const totalTrackMin = flights.reduce((s, f) => s + f.total_track_time, 0) / 60;
   const totalLossTime = flights.reduce((s, f) => s + f.total_loss_time, 0);
   const grade = getGrade(avgLossPercent);
-  const maxLossPercent = Math.max(...flights.map((f) => f.loss_percentage), 1);
+  let maxLossPercent = 1;
+  for (const f of flights) if (f.loss_percentage > maxLossPercent) maxLossPercent = f.loss_percentage;
 
   return (
     <div className="mb-8">

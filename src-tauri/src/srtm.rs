@@ -167,6 +167,26 @@ impl SrtmReader {
         &self.db_path
     }
 
+    /// Pre-load all SRTM tiles in the given coordinate range into memory cache
+    pub fn preload_tiles(&mut self, min_lat: i32, max_lat: i32, min_lon: i32, max_lon: i32) {
+        for lat in min_lat..=max_lat {
+            for lon in min_lon..=max_lon {
+                let name = Self::tile_name(lat, lon);
+                if !self.tiles.contains_key(&name) {
+                    let tile = self.load_tile(&name);
+                    self.tiles.insert(name, tile);
+                }
+            }
+        }
+    }
+
+    /// Read-only access to loaded tiles (for parallel processing)
+    pub fn tiles_ref(&self) -> &HashMap<String, Option<Vec<i16>>> {
+        &self.tiles
+    }
+
+
+
     /// raw bytes를 DB에 직접 저장
     pub fn save_tile_to_db(&self, name: &str, hgt_bytes: &[u8]) -> Result<(), String> {
         if hgt_bytes.len() != TILE_BYTES {
@@ -177,4 +197,43 @@ impl SrtmReader {
         crate::db::save_srtm_tile(&conn, name, hgt_bytes)
             .map_err(|e| format!("DB save: {}", e))
     }
+}
+
+/// Thread-safe elevation lookup from pre-loaded tiles (no mutation needed)
+/// Used by rayon parallel iterators in coverage/panorama computation
+pub fn elevation_from_tiles(tiles: &HashMap<String, Option<Vec<i16>>>, lat: f64, lon: f64) -> f64 {
+    let tile_lat = lat.floor() as i32;
+    let tile_lon = lon.floor() as i32;
+    let name = SrtmReader::tile_name(tile_lat, tile_lon);
+
+    let data = match tiles.get(&name) {
+        Some(Some(d)) => d,
+        _ => return 0.0,
+    };
+
+    let row_f = (tile_lat as f64 + 1.0 - lat) * (SRTM1_SAMPLES - 1) as f64;
+    let col_f = (lon - tile_lon as f64) * (SRTM1_SAMPLES - 1) as f64;
+    let row = row_f.floor() as usize;
+    let col = col_f.floor() as usize;
+
+    if row >= SRTM1_SAMPLES - 1 || col >= SRTM1_SAMPLES - 1 {
+        return 0.0;
+    }
+
+    let row_frac = row_f - row as f64;
+    let col_frac = col_f - col as f64;
+
+    let idx = |r: usize, c: usize| r * SRTM1_SAMPLES + c;
+    let v00 = data[idx(row, col)] as f64;
+    let v01 = data[idx(row, col + 1)] as f64;
+    let v10 = data[idx(row + 1, col)] as f64;
+    let v11 = data[idx(row + 1, col + 1)] as f64;
+
+    if v00 == -32768.0 || v01 == -32768.0 || v10 == -32768.0 || v11 == -32768.0 {
+        return 0.0;
+    }
+
+    let v0 = v00 + (v01 - v00) * col_frac;
+    let v1 = v10 + (v11 - v10) * col_frac;
+    (v0 + (v1 - v0) * row_frac).max(0.0)
 }

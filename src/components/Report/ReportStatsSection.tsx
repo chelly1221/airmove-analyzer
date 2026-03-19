@@ -68,19 +68,20 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
   }
 
   // 막대 차트용 최대값
-  const maxLossPercent = Math.max(...realFlights.map((f) => f.loss_percentage), 1);
+  let maxLossPercent = 1;
+  for (const f of realFlights) if (f.loss_percentage > maxLossPercent) maxLossPercent = f.loss_percentage;
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[15px] font-bold text-gray-900">
+      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
         {sectionNum}. 분석 통계
       </h2>
 
       {/* 주간 보고서: 10주 추이 테이블 */}
       {isWeekly && weeks.length > 0 && (
         <div className="mb-6">
-          <h3 className="mb-2 text-[12px] font-semibold text-gray-700">주간 변화 추이 (최근 10주)</h3>
-          <table className="mb-4 w-full border-collapse text-[11px]">
+          <h3 className="mb-2 text-[15px] font-semibold text-gray-700">주간 변화 추이 (최근 10주)</h3>
+          <table className="mb-4 w-full border-collapse text-[14px]">
             <thead>
               <tr className="bg-[#28283c] text-white">
                 <th className="border border-gray-300 px-2 py-1.5 text-left font-medium">기간</th>
@@ -117,10 +118,10 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
       {/* 비행검사기별 비행 분석 (OpenSky 매칭 비행만) */}
       {[...byAircraft.entries()].sort(([a], [b]) => a.localeCompare(b, "ko")).map(([acName, acFlights]) => (
         <div key={acName} className="mb-5">
-          <h3 className="mb-2 text-[12px] font-semibold text-gray-700">
+          <h3 className="mb-2 text-[15px] font-semibold text-gray-700">
             {acName} — 비행별 분석
           </h3>
-          <table className="mb-3 w-full border-collapse text-[11px]">
+          <table className="mb-3 w-full border-collapse text-[14px]">
             <thead>
               <tr className="bg-[#28283c] text-white">
                 <th className="border border-gray-300 px-2 py-1.5 text-left font-medium">비행</th>
@@ -193,8 +194,8 @@ function WeeklyTrendChart({ weeks }: { weeks: WeekStats[] }) {
   const innerW = chartW - padL - padR;
   const innerH = chartH - padT - padB;
 
-  const maxLoss = Math.max(...data.map((w) => w.avgLossPercent), 1);
-  const maxCount = Math.max(...data.map((w) => w.totalLoss), 1);
+  let maxLoss = 1, maxCount = 1;
+  for (const w of data) { if (w.avgLossPercent > maxLoss) maxLoss = w.avgLossPercent; if (w.totalLoss > maxCount) maxCount = w.totalLoss; }
 
   const barW = innerW / data.length * 0.35;
 

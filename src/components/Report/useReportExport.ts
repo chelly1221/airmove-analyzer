@@ -1,6 +1,4 @@
 import { useCallback } from "react";
-import { jsPDF } from "jspdf";
-import html2canvas from "html2canvas";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 
@@ -11,62 +9,107 @@ export interface ExportResult {
   pdfBase64?: string;
 }
 
-/**
- * html2canvas 1.4가 oklch() 색상 함수를 파싱하지 못하는 문제 해결.
- * Tailwind CSS v4는 모든 색상 유틸리티를 oklch()로 생성함.
+/** WebView2 네이티브 PrintToPdf — 벡터 PDF, GPU 가속
  *
- * 2단계 방어:
- * 1) 클론 문서의 <style> 태그에서 oklch 포함 규칙을 제거 (파서 오류 방지)
- * 2) 모든 요소에 computed rgb 값을 인라인 강제 적용 (스타일 유지)
+ * DOM 직접 조작 방식:
+ * 1. 보고서 [data-page] 요소들을 body 직속 래퍼로 이동
+ * 2. 기존 body 자식 요소 전부 숨김
+ * 3. CDP Page.printToPDF 호출
+ * 4. DOM 원복
  */
-const COLOR_CSS_PROPS = [
-  "color",
-  "background-color",
-  "border-color",
-  "border-top-color",
-  "border-right-color",
-  "border-bottom-color",
-  "border-left-color",
-  "outline-color",
-  "text-decoration-color",
-  "box-shadow",
-  "caret-color",
-] as const;
+async function exportViaNative(
+  containerRef: React.RefObject<HTMLDivElement | null>,
+  savePath: string,
+): Promise<ExportResult> {
+  if (!containerRef.current) {
+    return { success: false, error: "미리보기 컨테이너를 찾을 수 없습니다" };
+  }
 
-function sanitizeForHtml2Canvas(doc: Document) {
-  const win = doc.defaultView;
-  if (!win) return;
+  const container = containerRef.current;
+  const pages = container.querySelectorAll<HTMLDivElement>("[data-page]");
+  if (pages.length === 0) {
+    return { success: false, error: "보고서 페이지가 없습니다" };
+  }
 
-  // 1단계: 모든 요소에 computed rgb를 인라인 적용 (스타일시트 제거 전에 수행)
-  doc.querySelectorAll("*").forEach((el) => {
-    const computed = win.getComputedStyle(el);
-    const htmlEl = el as HTMLElement;
-    for (const prop of COLOR_CSS_PROPS) {
-      const val = computed.getPropertyValue(prop);
-      if (val) {
-        htmlEl.style.setProperty(prop, val);
-      }
+  // 1. 프린트 래퍼 생성 (body 직속)
+  const wrapper = document.createElement("div");
+  wrapper.id = "__print-wrapper__";
+
+  // 2. 페이지 요소들을 래퍼로 이동 (원래 부모 컨테이너 기록)
+  const pageArray = Array.from(pages);
+  pageArray.forEach((page) => wrapper.appendChild(page));
+
+  // 3. 기존 body 자식 전부 숨김
+  const bodyChildren = Array.from(document.body.children) as HTMLElement[];
+  bodyChildren.forEach((el) => el.style.setProperty("display", "none", "important"));
+
+  // 4. 래퍼를 body에 추가
+  document.body.appendChild(wrapper);
+
+  // 5. 인쇄 전용 스타일 주입
+  const styleEl = document.createElement("style");
+  styleEl.textContent = `
+    @page {
+      size: 210mm 297mm;
+      margin: 0;
     }
-  });
-
-  // 2단계: oklch가 포함된 <style> 태그 제거 (html2canvas CSS 파서 오류 방지)
-  doc.querySelectorAll("style").forEach((styleEl) => {
-    if (styleEl.textContent && /oklch\s*\(/i.test(styleEl.textContent)) {
-      styleEl.remove();
+    html, body {
+      margin: 0 !important;
+      padding: 0 !important;
+      overflow: visible !important;
     }
-  });
+    #__print-wrapper__ {
+      background: white;
+    }
+    #__print-wrapper__ [data-page] {
+      page-break-after: always;
+      break-after: page;
+      width: 210mm !important;
+      min-height: 297mm !important;
+      margin: 0 !important;
+      box-shadow: none !important;
+      overflow: hidden;
+    }
+    #__print-wrapper__ [data-page]:last-child {
+      page-break-after: auto;
+      break-after: auto;
+    }
+    * {
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
+    }
+  `;
+  document.head.appendChild(styleEl);
+
+  // 렌더링 안정화 대기
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  try {
+    // WebView2 PrintToPdf IPC 호출 — base64 PDF 반환
+    const pdfBase64 = await invoke<string>("webview_print_to_pdf", { path: savePath });
+
+    return { success: true, pdfBase64 };
+  } catch (err) {
+    return {
+      success: false,
+      error: `WebView2 PDF 생성 실패: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  } finally {
+    // DOM 원복
+    styleEl.remove();
+    bodyChildren.forEach((el) => el.style.removeProperty("display"));
+    // 페이지를 원래 컨테이너로 복원
+    pageArray.forEach((page) => container.appendChild(page));
+    wrapper.remove();
+  }
 }
 
 export function useReportExport() {
   const exportPDF = useCallback(
     async (
       containerRef: React.RefObject<HTMLDivElement | null>,
-      defaultFilename: string
+      defaultFilename: string,
     ): Promise<ExportResult> => {
-      if (!containerRef.current) {
-        return { success: false, error: "미리보기 컨테이너를 찾을 수 없습니다" };
-      }
-
       // 저장 경로 먼저 선택
       const savePath = await save({
         defaultPath: defaultFilename,
@@ -77,69 +120,7 @@ export function useReportExport() {
         return { success: false, error: "저장이 취소되었습니다" };
       }
 
-      // 페이지 div들 수집
-      const pages = containerRef.current.querySelectorAll<HTMLDivElement>("[data-page]");
-      if (pages.length === 0) {
-        return { success: false, error: "보고서 페이지가 없습니다" };
-      }
-
-      const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
-      const pdfW = 210;
-      const pdfH = 297;
-
-      let isFirstPage = true;
-      for (let i = 0; i < pages.length; i++) {
-        const page = pages[i];
-
-        // html2canvas로 캡처
-        const canvas = await html2canvas(page, {
-          scale: 2,
-          useCORS: true,
-          backgroundColor: "#ffffff",
-          logging: false,
-          onclone: (_doc, clonedEl) => {
-            sanitizeForHtml2Canvas(clonedEl.ownerDocument);
-          },
-        });
-
-        // 캡처된 이미지의 실제 비율 계산
-        const imgAspect = canvas.height / canvas.width;
-        const imgHeightMM = pdfW * imgAspect;
-
-        const imgData = canvas.toDataURL("image/jpeg", 0.92);
-
-        if (imgHeightMM <= pdfH) {
-          // A4 한 페이지에 들어가면 그대로 출력
-          if (!isFirstPage) doc.addPage();
-          doc.addImage(imgData, "JPEG", 0, 0, pdfW, imgHeightMM);
-          isFirstPage = false;
-        } else {
-          // A4보다 길면 여러 페이지로 분할
-          const totalPdfPages = Math.ceil(imgHeightMM / pdfH);
-          for (let p = 0; p < totalPdfPages; p++) {
-            if (!isFirstPage) doc.addPage();
-            // 이미지를 전체 너비로 배치하되 Y 오프셋으로 잘라서 보여줌
-            const yOffset = -(p * pdfH);
-            doc.addImage(imgData, "JPEG", 0, yOffset, pdfW, imgHeightMM);
-            isFirstPage = false;
-          }
-        }
-      }
-
-      // 페이지 번호 추가
-      const totalPages = doc.getNumberOfPages();
-      for (let i = 1; i <= totalPages; i++) {
-        doc.setPage(i);
-        doc.setFontSize(8);
-        doc.setTextColor(150);
-        doc.text(`- ${i} / ${totalPages} -`, pdfW / 2, pdfH - 5, { align: "center" });
-      }
-
-      // base64로 변환 후 Tauri로 저장
-      const pdfBase64 = doc.output("datauristring").split(",")[1];
-      await invoke("write_file_base64", { path: savePath, data: pdfBase64 });
-
-      return { success: true, pdfBase64 };
+      return exportViaNative(containerRef, savePath);
     },
     []
   );

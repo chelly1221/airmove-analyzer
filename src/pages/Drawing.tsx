@@ -2,33 +2,45 @@ import { useMemo, useRef, useEffect, useState, useCallback } from "react";
 import { Filter, ChevronDown } from "lucide-react";
 import { format } from "date-fns";
 import MapGL, { Source, Layer, Marker } from "react-map-gl/maplibre";
+import { ScatterplotLayer } from "@deck.gl/layers";
+import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { useAppStore } from "../store";
 import type { TrackPoint } from "../types";
+import { GPU2D, type CircleData, type LineData } from "../utils/gpu2d";
+import {
+  computeMaxDistanceGPU, computeMaxDistanceCPU,
+  computeEwDistsGPU, computeEwDistsCPU,
+  computeDensityHistogramGPU, computeDensityHistogramCPU,
+  type EwDistResult,
+} from "../utils/gpuDrawingCompute";
 
-/** 항공기별 색상 팔레트 */
-const AIRCRAFT_COLORS: [number, number, number][] = [
-  [59, 130, 246], [16, 185, 129], [139, 92, 246], [6, 182, 212],
-  [249, 115, 22], [236, 72, 153], [132, 204, 22], [245, 158, 11],
-  [99, 102, 241], [20, 184, 166],
-];
+/** 탐지 유형별 색상 (항적지도와 동일) */
+const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
+  mode_ac:              [234, 179, 8],
+  mode_ac_psr:          [234, 179, 8],
+  mode_s_allcall:       [56, 189, 248],
+  mode_s_allcall_psr:   [132, 204, 22],
+  mode_s_rollcall:      [59, 130, 246],
+  mode_s_rollcall_psr:  [34, 197, 94],
+};
+
+/** 탐지 유형 라벨 */
+function radarTypeLabel(rt: string): string {
+  switch (rt) {
+    case "mode_ac":              return "Mode A/C";
+    case "mode_ac_psr":          return "Mode A/C + PSR";
+    case "mode_s_allcall":       return "Mode S All-Call";
+    case "mode_s_allcall_psr":   return "Mode S All-Call + PSR";
+    case "mode_s_rollcall":      return "Mode S Roll-Call";
+    case "mode_s_rollcall_psr":  return "Mode S Roll-Call + PSR";
+    default:                     return rt.toUpperCase();
+  }
+}
 
 const KM_TO_NM = 0.539957;
 const NM_TO_KM = 1.852;
 const M_TO_FT = 3.28084;
 const MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
-
-/** Haversine distance (km) */
-function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
 
 /** 동심원 좌표 생성 */
 function circleCoords(lat: number, lon: number, radiusKm: number, steps = 64): [number, number][] {
@@ -58,6 +70,8 @@ export default function Drawing() {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const sideCanvasRef = useRef<HTMLCanvasElement>(null);
+  const gpuRef = useRef<GPU2D | null>(null);
+  const gpuCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // 구간 선택
   const [rangeStart, setRangeStart] = useState(0);
@@ -81,6 +95,11 @@ export default function Drawing() {
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  // GPU2D 정리 (언마운트 시)
+  useEffect(() => {
+    return () => { gpuRef.current?.dispose(); gpuRef.current = null; };
   }, []);
 
   // 비행 선택 변경 시 구간 핸들 + 줌 초기화
@@ -114,20 +133,28 @@ export default function Drawing() {
     return () => el.removeEventListener("wheel", handler);
   }, []);
 
-  // 포인트 필터링
-  const { filteredPoints, colorMap, legendEntries } = useMemo(() => {
-    const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
-    const modeSCounts = new Map<string, number>();
+  // Mode-S 카운팅 (1회만 수행, filteredPoints + modeSOptions 공유)
+  const modeSCounts = useMemo(() => {
+    const counts = new Map<string, number>();
     for (const f of flights) {
       for (const p of f.track_points) {
-        modeSCounts.set(p.mode_s, (modeSCounts.get(p.mode_s) ?? 0) + 1);
+        counts.set(p.mode_s, (counts.get(p.mode_s) ?? 0) + 1);
       }
     }
-    const validModeS = new Set<string>();
-    for (const [ms, cnt] of modeSCounts) {
-      if (cnt >= 10) validModeS.add(ms);
-    }
+    return counts;
+  }, [flights]);
 
+  const validModeS = useMemo(() => {
+    const valid = new Set<string>();
+    for (const [ms, cnt] of modeSCounts) {
+      if (cnt >= 10) valid.add(ms);
+    }
+    return valid;
+  }, [modeSCounts]);
+
+  // 포인트 필터링
+  const { filteredPoints, legendEntries } = useMemo(() => {
+    const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
     const showAll = selectedModeS === "__ALL__";
     const pts: TrackPoint[] = [];
     for (const f of flights) {
@@ -142,32 +169,20 @@ export default function Drawing() {
       }
     }
 
-    const colorMap = new Map<string, [number, number, number]>();
-    let acIdx = 0;
-    const modeSList = [...new Set(pts.map((p) => p.mode_s))].sort((a, b) => {
-      const acA = aircraft.find((ac) => ac.mode_s_code.toUpperCase() === a.toUpperCase());
-      const acB = aircraft.find((ac) => ac.mode_s_code.toUpperCase() === b.toUpperCase());
-      if (acA && acB) return acA.name.localeCompare(acB.name, "ko");
-      if (acA) return -1;
-      if (acB) return 1;
-      return a.localeCompare(b);
-    });
-    for (const ms of modeSList) {
-      colorMap.set(ms, AIRCRAFT_COLORS[acIdx % AIRCRAFT_COLORS.length]);
-      acIdx++;
-    }
+    // 탐지 유형별 색상 매핑 (항적지도와 동일)
+    const usedTypes = new Set<string>();
+    for (const p of pts) usedTypes.add(p.radar_type);
 
-    const legendEntries = modeSList.map((ms) => {
-      const ac = aircraft.find((a) => a.mode_s_code.toUpperCase() === ms.toUpperCase());
-      return {
-        modeS: ms,
-        label: ac ? `${ac.name} (${ms})` : ms,
-        color: colorMap.get(ms) ?? [128, 128, 128],
-      };
-    });
+    const legendEntries = Array.from(usedTypes)
+      .sort()
+      .map((rt) => ({
+        radarType: rt,
+        label: radarTypeLabel(rt),
+        color: DETECTION_TYPE_COLORS[rt] ?? [128, 128, 128] as [number, number, number],
+      }));
 
-    return { filteredPoints: pts, colorMap, legendEntries };
-  }, [flights, aircraft, selectedModeS]);
+    return { filteredPoints: pts, legendEntries };
+  }, [flights, aircraft, selectedModeS, validModeS]);
 
   // 시간 범위
   const timeRange = useMemo(() => {
@@ -272,20 +287,14 @@ export default function Drawing() {
     [aircraft]
   );
 
-  // Mode-S 드롭다운 옵션 (등록 항공기 제외)
+  // Mode-S 드롭다운 옵션 (등록 항공기 제외, 공유된 modeSCounts 재사용)
   const modeSOptions = useMemo(() => {
-    const modeSCounts = new Map<string, number>();
-    for (const f of flights) {
-      for (const p of f.track_points) {
-        modeSCounts.set(p.mode_s, (modeSCounts.get(p.mode_s) ?? 0) + 1);
-      }
-    }
     const valid: string[] = [];
-    for (const [ms, cnt] of modeSCounts) {
-      if (cnt >= 10 && !registeredModeSSet.has(ms.toUpperCase())) valid.push(ms);
+    for (const ms of validModeS) {
+      if (!registeredModeSSet.has(ms.toUpperCase())) valid.push(ms);
     }
     return valid.sort();
-  }, [flights, registeredModeSSet]);
+  }, [validModeS, registeredModeSSet]);
 
   // 비행 선택 시 해당 비행 전체 포인트 (구간 미적용, 맵 뷰/줌 고정용)
   const flightBasePoints = useMemo(() => {
@@ -309,15 +318,61 @@ export default function Drawing() {
     return pts;
   }, [selectedFlightId, filteredFlights, displayPoints, rangeStart, rangeEnd, displayPctToTs]);
 
-  // ── 측면도 캔버스 (NM / ft) ──
+  // ── WebGPU 계산용 사전 추출 배열 (포인트 변경 시 1회 생성) ──
+  const { lonsArray, timestampsArray } = useMemo(() => {
+    const n = flightFilteredPoints.length;
+    const latLon = new Float32Array(n * 2);
+    const lons = new Float32Array(n);
+    const ts = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const p = flightFilteredPoints[i];
+      latLon[i * 2] = p.latitude;
+      latLon[i * 2 + 1] = p.longitude;
+      lons[i] = p.longitude;
+      ts[i] = p.timestamp;
+    }
+    return { latLonArray: latLon, lonsArray: lons, timestampsArray: ts };
+  }, [flightFilteredPoints]);
+
+  // flightBasePoints용 latLon (planViewState + rangeRings에서 사용)
+  const baseLatLonArray = useMemo(() => {
+    const n = flightBasePoints.length;
+    const arr = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      arr[i * 2] = flightBasePoints[i].latitude;
+      arr[i * 2 + 1] = flightBasePoints[i].longitude;
+    }
+    return arr;
+  }, [flightBasePoints]);
+
+  // ── 측면도: ewDists GPU/CPU 비동기 계산 ──
+  const [ewDistResult, setEwDistResult] = useState<EwDistResult | null>(null);
+
   useEffect(() => {
-    if (flightFilteredPoints.length === 0) return;
+    if (flightFilteredPoints.length === 0) { setEwDistResult(null); return; }
+    const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
+    let cancelled = false;
+
+    computeEwDistsGPU(radarSite.longitude, cosLat, lonsArray).then((gpuResult) => {
+      if (cancelled) return;
+      if (gpuResult) {
+        setEwDistResult(gpuResult);
+      } else {
+        // CPU 폴백
+        setEwDistResult(computeEwDistsCPU(radarSite.longitude, cosLat, flightFilteredPoints));
+      }
+    });
+
+    return () => { cancelled = true; };
+  }, [flightFilteredPoints, lonsArray, radarSite.latitude, radarSite.longitude]);
+
+  // ── 측면도 캔버스 렌더링 (ewDistResult 준비 후 실행) ──
+  useEffect(() => {
+    if (!ewDistResult || flightFilteredPoints.length === 0) return;
 
     const PAD = 50;
     const DOT_R = 2;
-    const radarLat = radarSite.latitude;
-    const radarLon = radarSite.longitude;
-    const cosLat = Math.cos((radarLat * Math.PI) / 180);
+    const { ewDists, minEW, maxEW } = ewDistResult;
 
     const sideCanvas = sideCanvasRef.current;
     if (!sideCanvas) return;
@@ -334,15 +389,9 @@ export default function Drawing() {
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
 
-    // 동서 거리(km) 및 고도(m) 범위
-    let minEW = 0, maxEW = 0;
+    // 고도 범위
     let minAlt = Infinity, maxAlt = -Infinity;
-    const ewDists: number[] = [];
     for (const p of flightFilteredPoints) {
-      const dEW = (p.longitude - radarLon) * 111.32 * cosLat;
-      ewDists.push(dEW);
-      if (dEW < minEW) minEW = dEW;
-      if (dEW > maxEW) maxEW = dEW;
       if (p.altitude < minAlt) minAlt = p.altitude;
       if (p.altitude > maxAlt) maxAlt = p.altitude;
     }
@@ -357,42 +406,126 @@ export default function Drawing() {
     const xScale = (dEW: number) => centerX - (dEW / maxAbsEW) * (cw / 2);
     const yScale = (alt: number) => PAD + ch - ((alt - minAlt) / (maxAlt - minAlt + 100)) * ch;
 
-    // 그리드 - 고도 (ft)
-    ctx.strokeStyle = "rgba(0,0,0,0.08)";
-    ctx.lineWidth = 0.5;
-    const altRangeFt = (maxAlt - minAlt) * M_TO_FT;
-    const yStepFt = altRangeFt > 30000 ? 5000 : altRangeFt > 15000 ? 2000 : altRangeFt > 5000 ? 1000 : altRangeFt > 1500 ? 500 : 100;
-    for (let ft = Math.ceil(minAltFt / yStepFt) * yStepFt; ft <= maxAltFt; ft += yStepFt) {
-      const altM = ft / M_TO_FT;
-      const y = yScale(altM);
-      ctx.beginPath(); ctx.moveTo(PAD, y); ctx.lineTo(w - PAD, y); ctx.stroke();
-      ctx.fillStyle = "rgba(0,0,0,0.45)";
-      ctx.font = "10px sans-serif";
-      ctx.textAlign = "right";
-      ctx.fillText(`${ft.toLocaleString()}`, PAD - 5, y + 3);
+    // GPU 초기화 (lazy-init)
+    const gpuCanvas = gpuCanvasRef.current;
+    if (gpuCanvas && !gpuRef.current) {
+      try { gpuRef.current = new GPU2D(gpuCanvas); } catch { /* WebGL2 불가 시 무시 */ }
+    }
+    const gpu = gpuRef.current;
+
+    if (gpu) {
+      gpu.setResolution(w, h);
+      gpu.syncSize(w, h);
+      gpu.clear();
+
+      // ── 그리드 라인 (GPU) ──
+      const gridLines: LineData[] = [];
+      const gridColor: [number, number, number, number] = [0, 0, 0, 0.08];
+
+      const altRangeFt = (maxAlt - minAlt) * M_TO_FT;
+      const yStepFt = altRangeFt > 30000 ? 5000 : altRangeFt > 15000 ? 2000 : altRangeFt > 5000 ? 1000 : altRangeFt > 1500 ? 500 : 100;
+      for (let ft = Math.ceil(minAltFt / yStepFt) * yStepFt; ft <= maxAltFt; ft += yStepFt) {
+        const y = yScale(ft / M_TO_FT);
+        gridLines.push({ x1: PAD, y1: y, x2: w - PAD, y2: y, width: 0.5, color: gridColor });
+      }
+
+      const maxAbsEW_NM = maxAbsEW * KM_TO_NM;
+      const ewStepNM = maxAbsEW_NM > 100 ? 20 : maxAbsEW_NM > 50 ? 10 : maxAbsEW_NM > 20 ? 5 : maxAbsEW_NM > 10 ? 2 : 1;
+      for (let nm = -Math.ceil(maxAbsEW_NM / ewStepNM) * ewStepNM; nm <= maxAbsEW_NM; nm += ewStepNM) {
+        const x = xScale(nm * NM_TO_KM);
+        if (x < PAD || x > w - PAD) continue;
+        gridLines.push({ x1: x, y1: PAD, x2: x, y2: h - PAD, width: 0.5, color: gridColor });
+      }
+
+      const dashLen = 4, gapLen = 4;
+      const radarLineColor: [number, number, number, number] = [59 / 255, 130 / 255, 246 / 255, 0.3];
+      for (let y = PAD; y < h - PAD; y += dashLen + gapLen) {
+        const yEnd = Math.min(y + dashLen, h - PAD);
+        gridLines.push({ x1: centerX, y1: y, x2: centerX, y2: yEnd, width: 1, color: radarLineColor });
+      }
+
+      gpu.drawLines(gridLines);
+
+      // ── 포인트 (GPU) ──
+      const circles: CircleData[] = [];
+      for (let i = 0; i < flightFilteredPoints.length; i++) {
+        const p = flightFilteredPoints[i];
+        const c = DETECTION_TYPE_COLORS[p.radar_type] ?? [128, 128, 128];
+        circles.push({
+          x: xScale(ewDists[i]),
+          y: yScale(p.altitude),
+          r: DOT_R,
+          fill: [c[0] / 255, c[1] / 255, c[2] / 255, 0.7],
+          stroke: [0, 0, 0, 0],
+          strokeWidth: 0,
+        });
+      }
+      circles.push({
+        x: centerX,
+        y: yScale(radarSite.altitude + radarSite.antenna_height),
+        r: 4,
+        fill: [59 / 255, 130 / 255, 246 / 255, 1],
+        stroke: [0, 0, 0, 0],
+        strokeWidth: 0,
+      });
+      gpu.drawCircles(circles);
+      gpu.flush();
+    } else {
+      // GPU 불가 시 Canvas 2D 폴백
+      ctx.strokeStyle = "rgba(0,0,0,0.08)";
+      ctx.lineWidth = 0.5;
+      const altRangeFt = (maxAlt - minAlt) * M_TO_FT;
+      const yStepFt = altRangeFt > 30000 ? 5000 : altRangeFt > 15000 ? 2000 : altRangeFt > 5000 ? 1000 : altRangeFt > 1500 ? 500 : 100;
+      for (let ft = Math.ceil(minAltFt / yStepFt) * yStepFt; ft <= maxAltFt; ft += yStepFt) {
+        const y = yScale(ft / M_TO_FT);
+        ctx.beginPath(); ctx.moveTo(PAD, y); ctx.lineTo(w - PAD, y); ctx.stroke();
+      }
+      const maxAbsEW_NM = maxAbsEW * KM_TO_NM;
+      const ewStepNM = maxAbsEW_NM > 100 ? 20 : maxAbsEW_NM > 50 ? 10 : maxAbsEW_NM > 20 ? 5 : maxAbsEW_NM > 10 ? 2 : 1;
+      for (let nm = -Math.ceil(maxAbsEW_NM / ewStepNM) * ewStepNM; nm <= maxAbsEW_NM; nm += ewStepNM) {
+        const x = xScale(nm * NM_TO_KM);
+        if (x < PAD || x > w - PAD) continue;
+        ctx.beginPath(); ctx.moveTo(x, PAD); ctx.lineTo(x, h - PAD); ctx.stroke();
+      }
+      ctx.strokeStyle = "rgba(59,130,246,0.3)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(centerX, PAD); ctx.lineTo(centerX, h - PAD); ctx.stroke();
+      ctx.setLineDash([]);
+      for (let i = 0; i < flightFilteredPoints.length; i++) {
+        const p = flightFilteredPoints[i];
+        const c = DETECTION_TYPE_COLORS[p.radar_type] ?? [128, 128, 128];
+        ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.7)`;
+        ctx.beginPath();
+        ctx.arc(xScale(ewDists[i]), yScale(p.altitude), DOT_R, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = "rgba(59,130,246,1)";
+      ctx.beginPath();
+      ctx.arc(centerX, yScale(radarSite.altitude + radarSite.antenna_height), 4, 0, Math.PI * 2);
+      ctx.fill();
     }
 
-    // 그리드 - 동서 거리 (NM)
-    const maxAbsEW_NM = maxAbsEW * KM_TO_NM;
-    const ewStepNM = maxAbsEW_NM > 100 ? 20 : maxAbsEW_NM > 50 ? 10 : maxAbsEW_NM > 20 ? 5 : maxAbsEW_NM > 10 ? 2 : 1;
-    for (let nm = -Math.ceil(maxAbsEW_NM / ewStepNM) * ewStepNM; nm <= maxAbsEW_NM; nm += ewStepNM) {
-      const km = nm * NM_TO_KM;
-      const x = xScale(km);
+    // ── 텍스트 라벨 (Canvas 2D) ──
+    const altRangeFtLabel = (maxAlt - minAlt) * M_TO_FT;
+    const yStepFtLabel = altRangeFtLabel > 30000 ? 5000 : altRangeFtLabel > 15000 ? 2000 : altRangeFtLabel > 5000 ? 1000 : altRangeFtLabel > 1500 ? 500 : 100;
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "right";
+    for (let ft = Math.ceil(minAltFt / yStepFtLabel) * yStepFtLabel; ft <= maxAltFt; ft += yStepFtLabel) {
+      const y = yScale(ft / M_TO_FT);
+      ctx.fillText(`${ft.toLocaleString()}`, PAD - 5, y + 3);
+    }
+    const maxAbsEW_NM_label = maxAbsEW * KM_TO_NM;
+    const ewStepNMLabel = maxAbsEW_NM_label > 100 ? 20 : maxAbsEW_NM_label > 50 ? 10 : maxAbsEW_NM_label > 20 ? 5 : maxAbsEW_NM_label > 10 ? 2 : 1;
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.textAlign = "center";
+    for (let nm = -Math.ceil(maxAbsEW_NM_label / ewStepNMLabel) * ewStepNMLabel; nm <= maxAbsEW_NM_label; nm += ewStepNMLabel) {
+      const x = xScale(nm * NM_TO_KM);
       if (x < PAD || x > w - PAD) continue;
-      ctx.beginPath(); ctx.moveTo(x, PAD); ctx.lineTo(x, h - PAD); ctx.stroke();
-      ctx.fillStyle = "rgba(0,0,0,0.45)";
-      ctx.textAlign = "center";
       ctx.fillText(nm === 0 ? "0" : `${Math.abs(nm)}`, x, h - PAD + 14);
     }
 
-    // 레이더 위치 수직선 (중앙)
-    ctx.strokeStyle = "rgba(59,130,246,0.3)";
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(centerX, PAD); ctx.lineTo(centerX, h - PAD); ctx.stroke();
-    ctx.setLineDash([]);
-
-    // 축 라벨
     ctx.fillStyle = "rgba(0,0,0,0.5)";
     ctx.font = "11px sans-serif";
     ctx.textAlign = "center";
@@ -403,59 +536,76 @@ export default function Drawing() {
     ctx.fillText("고도 (ft)", 0, 0);
     ctx.restore();
 
-    // 포인트
-    for (let i = 0; i < flightFilteredPoints.length; i++) {
-      const p = flightFilteredPoints[i];
-      const c = colorMap.get(p.mode_s) ?? [128, 128, 128];
-      ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.7)`;
-      ctx.beginPath();
-      ctx.arc(xScale(ewDists[i]), yScale(p.altitude), DOT_R, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // 레이더 마커 (중앙)
-    ctx.fillStyle = "#3b82f6";
-    ctx.beginPath();
-    ctx.arc(centerX, yScale(radarSite.altitude + radarSite.antenna_height), 4, 0, Math.PI * 2);
-    ctx.fill();
     ctx.fillStyle = "rgba(0,0,0,0.5)";
     ctx.font = "9px sans-serif";
     ctx.textAlign = "left";
     ctx.fillText(radarSite.name, centerX + 6, yScale(radarSite.altitude + radarSite.antenna_height) - 4);
+  }, [ewDistResult, flightFilteredPoints, radarSite]);
 
-    // (제목 없음 — 탭 타이틀로 충분)
-  }, [flightFilteredPoints, colorMap, radarSite]);
+  // ── 평면도: 최대 거리 GPU/CPU 비동기 계산 (planViewState + rangeRings 공유) ──
+  const [maxDistKm, setMaxDistKm] = useState(0);
 
-  // ── 평면도 지도 데이터 (구간 필터 전 전체 포인트 기준 — 줌/뷰 고정) ──
+  useEffect(() => {
+    if (flightBasePoints.length === 0) { setMaxDistKm(0); return; }
+    let cancelled = false;
+
+    computeMaxDistanceGPU(radarSite.latitude, radarSite.longitude, baseLatLonArray).then((gpuResult) => {
+      if (cancelled) return;
+      if (gpuResult !== null) {
+        setMaxDistKm(gpuResult);
+      } else {
+        // CPU 폴백
+        setMaxDistKm(computeMaxDistanceCPU(radarSite.latitude, radarSite.longitude, flightBasePoints));
+      }
+    });
+
+    return () => { cancelled = true; };
+  }, [flightBasePoints, baseLatLonArray, radarSite.latitude, radarSite.longitude]);
+
   const planViewState = useMemo(() => {
     if (flightBasePoints.length === 0) {
       return { longitude: radarSite.longitude, latitude: radarSite.latitude, zoom: 8 };
     }
-    let maxDist = 0;
+    // 항적 포인트 + 레이더 사이트의 바운딩 박스 계산
+    let minLat = radarSite.latitude, maxLat = radarSite.latitude;
+    let minLon = radarSite.longitude, maxLon = radarSite.longitude;
     for (const p of flightBasePoints) {
-      const d = haversine(radarSite.latitude, radarSite.longitude, p.latitude, p.longitude);
-      if (d > maxDist) maxDist = d;
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLon) minLon = p.longitude;
+      if (p.longitude > maxLon) maxLon = p.longitude;
     }
-    maxDist = Math.max(maxDist, 1);
-    const zoom = Math.max(4, Math.min(13, Math.log2(40000 / (maxDist * 2.5))));
-    return { longitude: radarSite.longitude, latitude: radarSite.latitude, zoom };
+    const centerLat = (minLat + maxLat) / 2;
+    const centerLon = (minLon + maxLon) / 2;
+    const latSpan = Math.max(maxLat - minLat, 0.01);
+    const lonSpan = Math.max(maxLon - minLon, 0.01);
+    // 위도/경도 범위 중 큰 쪽 기준으로 줌 계산 (여유 1.3배)
+    const maxSpan = Math.max(latSpan, lonSpan * Math.cos((centerLat * Math.PI) / 180)) * 1.3;
+    const zoom = Math.max(4, Math.min(13, Math.log2(180 / maxSpan)));
+    return { longitude: centerLon, latitude: centerLat, zoom };
   }, [flightBasePoints, radarSite]);
 
-  const trackPointsGeoJSON = useMemo((): GeoJSON.FeatureCollection => ({
-    type: "FeatureCollection",
-    features: flightFilteredPoints.map((p) => ({
-      type: "Feature" as const,
-      geometry: { type: "Point" as const, coordinates: [p.longitude, p.latitude] },
-      properties: { mode_s: p.mode_s },
-    })),
-  }), [flightFilteredPoints]);
+  // ── 평면도: deck.gl ScatterplotLayer (GeoJSON Feature 객체 생성 제거) ──
+  const deckLayers = useMemo(() => {
+    if (flightFilteredPoints.length === 0) return [];
+    return [
+      new ScatterplotLayer<TrackPoint>({
+        id: "drawing-track-dots",
+        data: flightFilteredPoints,
+        getPosition: (d) => [d.longitude, d.latitude],
+        getFillColor: (d) => {
+          const c = DETECTION_TYPE_COLORS[d.radar_type] ?? [128, 128, 128];
+          return [...c, 180] as [number, number, number, number];
+        },
+        getRadius: 2,
+        radiusMinPixels: 1.5,
+        radiusMaxPixels: 4,
+        radiusUnits: "pixels" as const,
+      }),
+    ];
+  }, [flightFilteredPoints]);
 
   const { rangeRingsGeoJSON, ringLabelsGeoJSON } = useMemo(() => {
-    let maxDistKm = 0;
-    for (const p of flightBasePoints) {
-      const d = haversine(radarSite.latitude, radarSite.longitude, p.latitude, p.longitude);
-      if (d > maxDistKm) maxDistKm = d;
-    }
     const maxDistNM = Math.max(maxDistKm * KM_TO_NM, 1);
     const ringStepNM = maxDistNM > 100 ? 20 : maxDistNM > 50 ? 10 : maxDistNM > 20 ? 5 : maxDistNM > 10 ? 2 : 1;
 
@@ -468,7 +618,6 @@ export default function Drawing() {
         geometry: { type: "LineString", coordinates: coords },
         properties: {},
       });
-      // 라벨: 동쪽 점 (step 16/64)
       labelFeatures.push({
         type: "Feature",
         geometry: { type: "Point", coordinates: coords[16] },
@@ -480,47 +629,46 @@ export default function Drawing() {
       rangeRingsGeoJSON: { type: "FeatureCollection" as const, features: ringFeatures },
       ringLabelsGeoJSON: { type: "FeatureCollection" as const, features: labelFeatures },
     };
-  }, [flightBasePoints, radarSite]);
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const colorExpression = useMemo((): any => {
-    if (colorMap.size === 0) return "rgb(128,128,128)";
-    const expr: unknown[] = ["match", ["get", "mode_s"]];
-    for (const [ms, c] of colorMap) {
-      expr.push(ms, `rgb(${c[0]},${c[1]},${c[2]})`);
-    }
-    expr.push("rgb(128,128,128)");
-    return expr;
-  }, [colorMap]);
+  }, [maxDistKm, radarSite]);
 
   const mapKey = useMemo(
     () => `${radarSite.latitude}-${radarSite.longitude}-${selectedFlightId ?? "all"}`,
     [radarSite, selectedFlightId]
   );
 
-  // 타임라인 밀도 바 — 줌 뷰포트 범위 기준
-  const densityBuckets = useMemo(() => {
+  // ── 타임라인 밀도 바 — WebGPU/CPU 비동기 계산 ──
+  const [densityBuckets, setDensityBuckets] = useState<number[]>([]);
+
+  useEffect(() => {
     const range = selectedFlightId ? displayTimeRange : timeRange;
     const pts = selectedFlightId
       ? (filteredFlights.find((f) => f.id === selectedFlightId)?.track_points ?? filteredPoints)
       : filteredPoints;
-    if (pts.length === 0 || range.max <= range.min) return [];
+    if (pts.length === 0 || range.max <= range.min) { setDensityBuckets([]); return; }
     const fullSpan = range.max - range.min;
-    // 줌 뷰포트의 시간 범위
     const viewMinTs = range.min + (zoomVStart / 100) * fullSpan;
     const viewMaxTs = range.min + (zoomVEnd / 100) * fullSpan;
-    const viewSpan = viewMaxTs - viewMinTs;
-    if (viewSpan <= 0) return [];
+    if (viewMaxTs <= viewMinTs) { setDensityBuckets([]); return; }
+
+    let cancelled = false;
     const NUM_BUCKETS = 200;
-    const buckets = new Array(NUM_BUCKETS).fill(0);
-    for (const p of pts) {
-      if (p.timestamp < viewMinTs || p.timestamp > viewMaxTs) continue;
-      const idx = Math.min(NUM_BUCKETS - 1, Math.floor(((p.timestamp - viewMinTs) / viewSpan) * NUM_BUCKETS));
-      if (idx >= 0) buckets[idx]++;
-    }
-    const maxCount = Math.max(1, ...buckets);
-    return buckets.map((c: number) => c / maxCount);
-  }, [filteredPoints, filteredFlights, selectedFlightId, timeRange, displayTimeRange, zoomVStart, zoomVEnd]);
+
+    // timestamps 배열 생성 (선택 비행이면 해당 비행용, 아니면 공유 배열)
+    const tsArr = selectedFlightId
+      ? (() => { const a = new Float32Array(pts.length); for (let i = 0; i < pts.length; i++) a[i] = pts[i].timestamp; return a; })()
+      : timestampsArray;
+
+    computeDensityHistogramGPU(tsArr, viewMinTs, viewMaxTs, NUM_BUCKETS).then((gpuResult) => {
+      if (cancelled) return;
+      if (gpuResult) {
+        setDensityBuckets(gpuResult);
+      } else {
+        setDensityBuckets(computeDensityHistogramCPU(pts, viewMinTs, viewMaxTs, NUM_BUCKETS));
+      }
+    });
+
+    return () => { cancelled = true; };
+  }, [filteredPoints, filteredFlights, selectedFlightId, timeRange, displayTimeRange, zoomVStart, zoomVEnd, timestampsArray]);
 
   const getFilterLabel = () => {
     if (!selectedModeS) return "비행검사기 (등록)";
@@ -595,13 +743,13 @@ export default function Drawing() {
         </div>
       ) : (
         <>
-          {/* 범례 */}
+          {/* 범례 (탐지 유형별, 항적지도와 동일) */}
           {legendEntries.length > 0 && (
             <div className="flex flex-wrap items-center gap-3 text-xs">
               {legendEntries.map((e) => (
-                <div key={e.modeS} className="flex items-center gap-1.5">
-                  <div
-                    className="h-2.5 w-2.5 rounded-full"
+                <div key={e.radarType} className="flex items-center gap-1.5">
+                  <span
+                    className="inline-block h-[3px] w-4 rounded-sm"
                     style={{ backgroundColor: `rgb(${e.color[0]},${e.color[1]},${e.color[2]})` }}
                   />
                   <span className="text-gray-600">{e.label}</span>
@@ -615,7 +763,10 @@ export default function Drawing() {
           <div className="flex flex-1 gap-4 min-h-0">
             {/* 측면도 */}
             <div className="flex-1 rounded-xl border border-gray-200 bg-gray-100 p-2">
-              <canvas ref={sideCanvasRef} className="h-full w-full" />
+              <div className="relative h-full w-full">
+                <canvas ref={sideCanvasRef} className="absolute inset-0 h-full w-full" />
+                <canvas ref={gpuCanvasRef} className="absolute inset-0 h-full w-full pointer-events-none" />
+              </div>
             </div>
             {/* 평면도 (지도 오버레이) */}
             <div className="flex-1 rounded-xl border border-gray-200 overflow-hidden">
@@ -651,17 +802,7 @@ export default function Drawing() {
                     }}
                   />
                 </Source>
-                <Source id="track-points" type="geojson" data={trackPointsGeoJSON}>
-                  <Layer
-                    id="track-dots"
-                    type="circle"
-                    paint={{
-                      "circle-radius": 2,
-                      "circle-color": colorExpression,
-                      "circle-opacity": 0.7,
-                    }}
-                  />
-                </Source>
+                <DeckGLOverlay layers={deckLayers} />
                 <Marker latitude={radarSite.latitude} longitude={radarSite.longitude} anchor="center">
                   <div className="flex h-2.5 w-2.5 items-center justify-center rounded-full bg-blue-500 ring-1 ring-blue-500/30">
                     <div className="h-1 w-1 rounded-full bg-white" />

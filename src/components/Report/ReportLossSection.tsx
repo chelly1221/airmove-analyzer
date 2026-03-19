@@ -24,11 +24,11 @@ export default function ReportLossSection({ sectionNum, flights, template }: Los
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[15px] font-bold text-gray-900">
+      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
         {sectionNum}. 표적소실 포인트 상세
       </h2>
 
-      <table className="w-full border-collapse text-[10px]">
+      <table className="w-full border-collapse text-[13px]">
         <thead>
           <tr className="bg-[#28283c] text-white">
             <th className="border border-gray-300 px-1.5 py-1 text-center font-medium w-6">#</th>
@@ -62,7 +62,7 @@ export default function ReportLossSection({ sectionNum, flights, template }: Los
       </table>
 
       {template === "monthly" && allLoss.length > maxRows && (
-        <p className="mt-2 text-[10px] text-gray-400">
+        <p className="mt-2 text-[13px] text-gray-400">
           ... 외 {allLoss.length - maxRows}건 (총 {allLoss.length}건)
         </p>
       )}

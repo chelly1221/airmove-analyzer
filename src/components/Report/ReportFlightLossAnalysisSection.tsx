@@ -18,7 +18,8 @@ export default function ReportFlightLossAnalysisSection({ sectionNum, flight }: 
     hourBins.set(hour, (hourBins.get(hour) ?? 0) + 1);
   }
   const hourEntries = Array.from(hourBins.entries()).sort((a, b) => a[0] - b[0]);
-  const maxHourCount = Math.max(...hourEntries.map(([, c]) => c), 1);
+  let maxHourCount = 1;
+  for (const [, c] of hourEntries) if (c > maxHourCount) maxHourCount = c;
 
   // 거리대별 소실 분포 (20km bin)
   const distBins = new Map<string, number>();
@@ -32,7 +33,8 @@ export default function ReportFlightLossAnalysisSection({ sectionNum, flight }: 
     const nb = parseInt(b[0]);
     return na - nb;
   });
-  const maxDistCount = Math.max(...distEntries.map(([, c]) => c), 1);
+  let maxDistCount = 1;
+  for (const [, c] of distEntries) if (c > maxDistCount) maxDistCount = c;
 
   return (
     <div className="space-y-6">

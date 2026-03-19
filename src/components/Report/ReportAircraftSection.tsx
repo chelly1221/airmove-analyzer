@@ -13,11 +13,11 @@ export default function ReportAircraftSection({ sectionNum, aircraft }: Aircraft
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[15px] font-bold text-gray-900">
+      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
         {sectionNum}. 비행검사기 현황
       </h2>
 
-      <table className="w-full border-collapse text-[11px]">
+      <table className="w-full border-collapse text-[14px]">
         <thead>
           <tr className="bg-[#28283c] text-white">
             <th className="border border-gray-300 px-2 py-1.5 text-left font-medium">이름</th>

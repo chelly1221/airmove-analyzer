@@ -76,13 +76,25 @@ src/                    # React frontend
   │   │   ├── LossMarkers.tsx     # React Leaflet 용 Loss 마커 (미사용 예비)
   │   │   ├── MapStyleToggle.tsx  # 맵 스타일 전환 (다크/표준)
   │   │   └── TrackLayer.tsx      # React Leaflet 용 항적 레이어 (미사용 예비)
+  │   ├── DevOverlay.tsx          # 개발 모드 GPU/CPU 진단 오버레이 (WebGL2/WebGPU 감지, 메모리)
   │   ├── Report/
   │   │   ├── EditableText.tsx        # contentEditable 인라인 텍스트 편집
   │   │   ├── ReportAircraftSection.tsx   # 비행검사기 현황 테이블
   │   │   ├── ReportCoverPage.tsx     # 표지 (문서번호/시행일자/레이더명, 인라인 편집)
+  │   │   ├── ReportFlightComparisonSection.tsx  # 비행별 비교 분석
+  │   │   ├── ReportFlightLossAnalysisSection.tsx # 비행별 Loss 상세 분석
+  │   │   ├── ReportFlightProfileSection.tsx     # 비행 프로파일 섹션
   │   │   ├── ReportLOSSection.tsx    # LOS 분석 결과 테이블
   │   │   ├── ReportLossSection.tsx   # 표적소실 구간 상세 테이블
   │   │   ├── ReportMapSection.tsx    # 항적 지도 캡처 이미지
+  │   │   ├── ReportOMAltitudeDistribution.tsx  # 장애물월간: Loss 고도 분포 히스토그램
+  │   │   ├── ReportOMBuildingLOS.tsx           # 장애물월간: 건물 LOS 차단 vs 표적고도
+  │   │   ├── ReportOMCoverageDiff.tsx          # 장애물월간: 커버리지 비교 (건물 유/무)
+  │   │   ├── ReportOMDailyChart.tsx            # 장애물월간: 일별 PSR/Loss 추이 차트
+  │   │   ├── ReportOMFindings.tsx              # 장애물월간: 분석 소견 (서술형)
+  │   │   ├── ReportOMLossEvents.tsx            # 장애물월간: Loss 이벤트 상세 테이블
+  │   │   ├── ReportOMSummarySection.tsx        # 장애물월간: 대상 장애물 요약 테이블
+  │   │   ├── ReportOMWeeklyChart.tsx           # 장애물월간: 주간 집계 차트
   │   │   ├── ReportPage.tsx          # A4 페이지 래퍼 (210×297mm)
   │   │   ├── ReportPanoramaSection.tsx  # 360° 파노라마 장애물 분석 (SVG 차트+8방위 요약+건물 목록)
   │   │   ├── ReportStatsSection.tsx  # 분석 통계 (추이 차트+비행별 막대 차트)
@@ -96,6 +108,11 @@ src/                    # React frontend
   ├── utils/
   │   ├── altitudeCorrection.ts   # 이상고도 보정 (수직속도 기반 + 선형 보간)
   │   ├── flightConsolidation.ts  # 비행 통합 (OpenSky 매칭 + gap 분리 + 수동 병합)
+  │   ├── gpu2d.ts               # WebGL2 GPU 가속 2D 렌더링 (LOS 프로파일, 타임라인)
+  │   ├── gpuCompute.ts          # WebGPU 디바이스 싱글턴 + 범용 컴퓨트 셰이더 실행
+  │   ├── gpuCoverage.ts         # WebGPU 커버리지 맵 (0.01° 고해상도, 36000 레이)
+  │   ├── gpuDrawingCompute.ts   # WebGPU 도면 타임라인 (최대거리/EW변환/밀도히스토그램)
+  │   ├── gpuPanorama.ts         # WebGPU 360° 파노라마 앙각 계산 가속
   │   ├── lossDetection.ts       # Loss 탐지 (TypeScript 구현, 개별 LossPoint 생성)
   │   ├── radarCoverage.ts       # 레이더 커버리지 맵 (다중 고도 레이어, 지형 프로파일 캐시, 이진 탐색 최적화)
   │   └── weatherFetch.ts        # 기상 데이터 조회 (Open-Meteo Archive, 구름 그리드, 덕팅 위험)
@@ -104,7 +121,7 @@ src/                    # React frontend
   └── types/
       └── index.ts      # TypeScript 인터페이스 정의
 src-tauri/src/          # Rust backend
-  ├── lib.rs            # Tauri entry point + IPC commands (34개)
+  ├── lib.rs            # Tauri entry point + IPC commands (39개)
   ├── main.rs           # WebView2 GPU 가속 강제 플래그 설정
   ├── db.rs             # SQLite 데이터베이스 (운항이력/파싱데이터/설정/건물/기상캐시 영속화)
   ├── building.rs       # GIS건물통합정보 SHP 임포트 + LOS 경로 건물 쿼리 + 수동 건물 CRUD
@@ -115,8 +132,10 @@ src-tauri/src/          # Rust backend
   │   └── ass.rs        # ASTERIX CAT048 파싱 (NEC 프레임 + FSPEC + 유령표적 제거)
   ├── analysis/
   │   ├── mod.rs
+  │   ├── coverage.rs   # GPU 커버리지 프리샘플 + 이진 탐색 LOS 엔진 (건물 제외 옵션)
   │   ├── loss.rs       # Loss 탐지 (자동 임계값 + signal_loss/out_of_range + LossPoint)
   │   ├── los.rs        # Line of Sight (4/3 유효지구반경 모델)
+  │   ├── obstacle_monthly.rs  # 장애물 월간 분석 (방위 섹터별 PSR/Loss 일별 집계)
   │   └── panorama.rs   # 360° LoS 파노라마 (지형+건물 통합 스캔)
   └── models/
       └── mod.rs        # 데이터 모델 (serde 직렬화)
@@ -178,6 +197,12 @@ public/                 # 정적 자산
 48. GIS 건물 높이 교차검증 (층수 기반 높이 선택, 이웃 비교 이상치 자동 제거)
 49. 비동기 항적 렌더링 (대량 포인트 처리 시 UI 양보, 1M+ 포인트 비동기 전환)
 50. 파노라마 차트 지형/건물 분리 렌더링 (지형 실루엣 + 건물 세로선 + 통합 외곽선 3레이어)
+51. 장애물 월간 분석 보고서 (방위 섹터별 PSR 탐지율/Loss율 일별 집계, 다중 레이더 병렬 분석)
+52. WebGPU 컴퓨트 셰이더 (커버리지 0.01° 고해상도, 파노라마 앙각, 도면 거리/밀도 계산, CPU 폴백)
+53. 커버리지 비교 분석 (건물 유/무 커버리지 차이 시각화, 장애물 영향 정량화)
+54. GPU 프리샘플링 파이프라인 (Rust SRTM+건물 프리샘플 → base64 전송 → WebGPU/Worker 병렬 계산)
+55. 개발 모드 진단 오버레이 (WebGL2/WebGPU 감지, GPU 하드웨어 정보, 메모리 사용량)
+56. 장애물 월간 보고서 9개 섹션 (요약/일별PSR/일별Loss/주간/커버리지비교/건물LOS/고도분포/Loss이벤트/소견)
 
 ## 핵심 아키텍처: 비행(Flight) 기반 분석
 분석 단위가 "파싱 파일(`AnalysisResult`)"에서 "**비행(`Flight`)**"으로 전환됨.
@@ -251,6 +276,14 @@ public/                 # 정적 자산
 | `add_manual_building` | 수동 건물 추가 |
 | `update_manual_building` | 수동 건물 수정 |
 | `delete_manual_building` | 수동 건물 삭제 |
+| **장애물 월간 분석** | |
+| `analyze_radar_monthly` | 다중 레이더 장애물 월간 분석 (방위 섹터별 PSR/Loss 일별 집계) |
+| **GPU 프리샘플링** | |
+| `presample_panorama_elevations` | 파노라마 SRTM 고도 그리드 프리샘플 (base64, GPU용) |
+| `presample_coverage_elevations` | 커버리지 SRTM+건물 고도 프리샘플 (배치 단위, GPU용) |
+| **커버리지 (건물 제외)** | |
+| `compute_coverage_terrain_profile_excluding` | 특정 건물 제외 커버리지 지형 프로파일 |
+| `compute_coverage_layers_batch_excluded` | 건물 제외 캐시 기반 커버리지 레이어 생성 |
 ### 배치 파싱 이벤트
 - `batch-parse-result`: 파일별 결과 (성공/실패)
 - `batch-parse-done`: 배치 완료 통계
@@ -260,10 +293,24 @@ public/                 # 정적 자산
 - `flight-history-records`: 건별 운항이력 실시간 스트리밍
 - `flight-history-progress`: 동기화 진행 상황 (current/total/icao24)
 
+### 장애물 월간 분석 이벤트
+- `obstacle-monthly-progress`: 레이더별 분석 진행 (radar_name, stage=parsing/analyzing, progress)
+
 ## GPU 가속
 - `src-tauri/src/main.rs`에서 WebView2에 GPU 가속 강제 플래그 설정
 - `--ignore-gpu-blocklist --enable-gpu --enable-gpu-rasterization` 등
 - iGPU 없는 CPU(F 모델)에서도 외장 GPU 활용 보장
+
+### WebGPU 컴퓨트 셰이더
+- **디바이스 관리**: `gpuCompute.ts` — 싱글턴 WebGPU 디바이스 (discrete GPU 우선), Lost Device 자동 복구
+- **커버리지 컴퓨트**: `gpuCoverage.ts` — 0.01° 고해상도 36,000 레이, 2-pass GPU 파이프라인
+  - Pass 1: 곡률 보정 + running max angle 누적
+  - Pass 2: 고도별 이진 탐색 LOS 차단점
+  - 메모리 인지 배치 처리 (maxStorageBufferBindingSize 기반 분할)
+- **파노라마 컴퓨트**: `gpuPanorama.ts` — Rust 프리샘플 18M 포인트 → GPU 최대 앙각 계산 (5GB→72MB 압축)
+- **도면 컴퓨트**: `gpuDrawingCompute.ts` — Haversine 최대거리 (트리 리덕션), EW 좌표 변환, 밀도 히스토그램 (atomic)
+- **프리샘플 파이프라인**: Rust SRTM+건물 → base64 → Worker 디코드 → GPU 컴퓨트 (또는 CPU 폴백)
+- **CPU 폴백**: 모든 GPU 커널에 동일 로직 CPU 구현 포함 (WebGPU 미지원 브라우저 대응)
 
 ## NEC ASS 파일 포맷 (ASTERIX CAT048)
 - NEC RDRS 녹화 파일은 ASTERIX 형식의 데이터 블록을 포함
@@ -292,6 +339,9 @@ public/                 # 정적 자산
 - **아키텍처**: 지형 프로파일 캐시 기반 2단계 계산
   - Phase 1: SRTM + 건물 고도 조회 (무거운 계산, 1회 수행) → `CoverageTerrainProfile`
   - Phase 2: 고도별 레이어 계산 (캐시 재사용, 이진 탐색 O(log N)) → `CoverageLayer`
+- **GPU 가속**: WebGPU 컴퓨트 셰이더 → 0.01° 고해상도 (36,000 레이), CPU 폴백 지원
+- **프리샘플**: Rust에서 SRTM+건물 고도 배치 추출 → base64 → GPU/Worker 병렬 처리
+- **건물 제외 모드**: 특정 수동 건물 제외 프로파일 → 장애물 영향 비교 분석
 - **건물 필터**: 10km 이내 10m+, 10-30km 30m+, 30km+ 60m+ 높이만 반영
 - **다중 고도**: 100ft 단위 200층 사전 계산 → 슬라이더로 실시간 전환
 - **Cone of Silence**: `heightAboveRadar / tan(maxElevDeg)` → 반경 계산
@@ -336,6 +386,26 @@ public/                 # 정적 자산
 - **캐싱**: `load_panorama_cache(radarLat, radarLon)` — 계산 결과 DB 영속화, 보고서 재활용
 - **4/3 유효지구 모델**: 앙각 계산에 굴절 모델 적용
 
+## 장애물 월간 분석 (Obstacle Monthly)
+- **모듈**: `src-tauri/src/analysis/obstacle_monthly.rs`
+- **원리**: 대상 건물의 방위 섹터 내 항공기 필터 → 일별 PSR 탐지율/Loss율 집계 → 비대상 방위 기준선 비교
+- **입력**: `RadarFileSet[]` (레이더별 파일 경로 + 방위 섹터 + 좌표)
+- **방위 섹터**: `AzSector[]` (start_deg, end_deg) — 건물 방위 기반 대상/비대상 영역 분리
+- **일별 통계**: PSR 탐지율, Loss율, Loss 이벤트 위치정보(LossPointGeo), 기준선(비대상 방위) 비교
+- **주간 집계**: 월 내 주차별 요약 (일별 데이터 그룹핑)
+- **커버리지 비교**: 건물 유/무 커버리지 프로파일 차이 → 장애물 영향 정량화
+- **출력**: `RadarMonthlyResult` (daily_stats[], avg_loss_altitude_ft, 실패 추적)
+- **보고서 섹션** (9개):
+  1. 요약 (`ReportOMSummarySection`): 대상 장애물 테이블 (높이, 방위/거리)
+  2. 일별 PSR (`ReportOMDailyChart`): PSR 탐지율 시계열 막대 차트
+  3. 일별 Loss (`ReportOMDailyChart`): Loss율 시계열 (대상 vs 기준선)
+  4. 주간 집계 (`ReportOMWeeklyChart`): 주차별 요약
+  5. 커버리지 비교 (`ReportOMCoverageDiff`): 건물 유/무 커버리지 diff
+  6. 건물 LOS (`ReportOMBuildingLOS`): 표적 고도 vs LOS 차단각
+  7. 고도 분포 (`ReportOMAltitudeDistribution`): Loss 이벤트 고도 히스토그램
+  8. Loss 이벤트 (`ReportOMLossEvents`): 상세 테이블 (위치/시각/지속시간)
+  9. 분석 소견 (`ReportOMFindings`): 서술형 종합 판정
+
 ## 데이터 모델
 ### Aircraft
 `id`, `name`, `registration`, `model`, `mode_s_code`, `organization`, `memo`, `active`
@@ -372,6 +442,15 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 
 ### PanoramaPoint
 방위별 최대 앙각 장애물 (거리, 높이, 유형, 이름, 주소, 용도)
+
+### AzSector / RadarFileSet (장애물 월간)
+`AzSector`: 방위 섹터 (start_deg, end_deg)
+`RadarFileSet`: 레이더별 분석 세트 (radar_name, coordinates, file_paths, azimuth_sectors)
+
+### DailyStats / LossPointGeo / RadarMonthlyResult
+`DailyStats`: 일별 PSR 탐지율/Loss율/기준선 통계
+`LossPointGeo`: Loss 이벤트 위치정보 (lat/lon/alt/duration)
+`RadarMonthlyResult`: 레이더별 월간 분석 결과 (daily_stats[], avg_loss_altitude_ft)
 
 ## 맵 렌더링 구조
 - **deck.gl 레이어** (GPU 캔버스):
@@ -440,7 +519,15 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 - **렌더링 파이프라인**: React 컴포넌트 → A4 HTML 미리보기 → html2canvas(scale:2) → jsPDF
 - **저장**: Tauri `write_file_base64` + `@tauri-apps/plugin-dialog` 저장 다이얼로그
 
-### 9개 섹션 (토글 가능)
+### 보고서 템플릿 (6종)
+- `weekly`: 주간 보고서
+- `monthly`: 월간 보고서
+- `flights`: 비행별 보고서
+- `single`: 단일 비행 보고서
+- `obstacle`: 장애물 분석 보고서
+- `obstacle_monthly`: 장애물 월간 분석 보고서 (신규)
+
+### 기본 9개 섹션 (토글 가능)
 1. **표지** (`ReportCoverPage`): 문서번호, 시행일자, 레이더명, 제목/부제 인라인 편집
 2. **요약** (`ReportSummarySection`): KPI 그리드, 종합 판정 등급(양호/주의/경고), 편집 가능한 분석 소견
 3. **항적 지도** (`ReportMapSection`): MapLibre 캡처 이미지
@@ -450,6 +537,17 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 7. **장애물 분석** (`ReportPanoramaSection`): 360° 파노라마 SVG 차트, 8방위 요약 테이블, 상위 15건 건물 목록
 8. **기상 조건** (`ReportWeatherSection`): 시간별 기상 테이블, 덕팅 위험
 9. **기체 현황** (`ReportAircraftSection`): 비행검사기 현황 테이블
+
+### 장애물 월간 보고서 9개 섹션 (obstacle_monthly 전용)
+1. **장애물 요약** (`ReportOMSummarySection`): 대상 장애물 목록
+2. **일별 PSR** (`ReportOMDailyChart`): PSR 탐지율 일별 추이
+3. **일별 Loss** (`ReportOMDailyChart`): Loss율 일별 추이 (대상 vs 기준선)
+4. **주간 집계** (`ReportOMWeeklyChart`): 주차별 요약
+5. **커버리지 비교** (`ReportOMCoverageDiff`): 건물 유/무 커버리지 diff
+6. **건물 LOS** (`ReportOMBuildingLOS`): 표적 고도 vs LOS 차단각
+7. **고도 분포** (`ReportOMAltitudeDistribution`): Loss 고도 히스토그램
+8. **Loss 이벤트** (`ReportOMLossEvents`): 상세 테이블
+9. **분석 소견** (`ReportOMFindings`): 서술형 종합 판정
 
 ### 공통 컴포넌트
 - `ReportPage`: A4 페이지 래퍼 (210×297mm, `data-page` 속성)
@@ -486,6 +584,7 @@ LOS 경로 상 건물 (높이, 주소, 용도), 수동 건물 (도형 JSON: rect
 - **기상**: weatherData, weatherLoading
 - **구름 그리드**: cloudGrid, cloudGridVisible, cloudGridLoading, cloudGridProgress
 - **UI**: activePage, loading, loadingMessage
+- **개발**: devMode (GPU/CPU 진단 오버레이 토글)
 
 ## OpenSky Network 연동
 - **인증**: OAuth2 Client Credentials 필수 (익명 접근 403 차단)

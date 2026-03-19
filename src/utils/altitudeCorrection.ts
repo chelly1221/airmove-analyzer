@@ -34,9 +34,11 @@ export interface AltitudeCorrectionResult {
  * 3. 첫/끝 포인트: 인접 정상 포인트 2개의 추세와 비교하여 판정
  * 4. 이상값은 가장 가까운 양쪽 정상 포인트로 선형 보간
  */
-export function correctAnomalousAltitudes(
+const yieldUI = () => new Promise<void>(r => setTimeout(r, 0));
+
+export async function correctAnomalousAltitudes(
   points: TrackPoint[],
-): AltitudeCorrectionResult {
+): Promise<AltitudeCorrectionResult> {
   if (points.length < 3) return { points, correctedCount: 0 };
 
   const n = points.length;
@@ -49,6 +51,8 @@ export function correctAnomalousAltitudes(
       isAnomalous[i] = true;
     }
   }
+
+  await yieldUI();
 
   // 2단계: 수직속도 기반 이상값 감지
   // 가장 가까운 정상 이전 포인트와 비교 (연속 이상값도 탐지 가능)
@@ -85,6 +89,8 @@ export function correctAnomalousAltitudes(
     }
   }
 
+  await yieldUI();
+
   // 2.5단계: 단일 포인트 스파이크 탐지
   // 앞뒤 정상 포인트 간 선형 보간 대비 크게 벗어나는 포인트 탐지
   // (수직속도 기반으로 잡히지 않는 중간 크기 스파이크 보완)
@@ -118,6 +124,8 @@ export function correctAnomalousAltitudes(
       isAnomalous[i] = true;
     }
   }
+
+  await yieldUI();
 
   // 첫 포인트 검사: 인접 정상 포인트와 비교
   if (!isAnomalous[0] && n >= 2) {
@@ -184,6 +192,8 @@ export function correctAnomalousAltitudes(
     }
   }
 
+  await yieldUI();
+
   // 앞쪽 연속 이상값 전파: 첫 포인트가 이상값이면 뒤따르는 포인트도 검사
   // (2단계에서 prevIdx < 0으로 건너뛴 포인트들)
   if (isAnomalous[0]) {
@@ -245,6 +255,8 @@ export function correctAnomalousAltitudes(
       }
     }
   }
+
+  await yieldUI();
 
   // 3단계: 이상값 보정 — 가장 가까운 양쪽 정상 포인트로 선형 보간
   let correctedCount = 0;

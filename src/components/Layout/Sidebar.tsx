@@ -565,7 +565,6 @@ function ReportMetadataPanel() {
     { label: "기관", value: reportMetadata.organization },
     { label: "부서", value: reportMetadata.department },
     { label: "현장", value: reportMetadata.siteName },
-    { label: "작성자", value: reportMetadata.author || "—" },
     { label: "문서접두", value: reportMetadata.docPrefix },
   ];
 
@@ -606,7 +605,7 @@ function ReportMetadataModal({
   onSave,
   onClose,
 }: {
-  metadata: { department: string; author: string; docPrefix: string; organization: string; siteName: string; footer: string };
+  metadata: { department: string; docPrefix: string; organization: string; siteName: string; footer: string };
   onSave: (meta: Partial<typeof metadata>) => void;
   onClose: () => void;
 }) {
@@ -616,7 +615,6 @@ function ReportMetadataModal({
     { key: "organization", label: "기관명", placeholder: "예: 김포공항" },
     { key: "department", label: "부서명", placeholder: "예: 레이더관제부" },
     { key: "siteName", label: "현장명", placeholder: "예: 레이더송신소" },
-    { key: "author", label: "작성자", placeholder: "예: 홍길동" },
     { key: "docPrefix", label: "문서번호 접두사", placeholder: "예: RDR-RPT" },
     { key: "footer", label: "하단 푸터", placeholder: "보고서 하단 문구" },
   ];

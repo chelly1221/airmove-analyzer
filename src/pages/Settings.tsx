@@ -1396,6 +1396,45 @@ export function BuildingDataSection() {
   );
 }
 
+// ─── 개발자 모드 ──────────────────────────────────────────────────────
+function DevModeSection() {
+  const devMode = useAppStore((s) => s.devMode);
+  const setDevMode = useAppStore((s) => s.setDevMode);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-semibold text-gray-800">
+            <AlertTriangle size={20} className="text-amber-500" />
+            개발자 모드
+          </h2>
+          <p className="mt-0.5 text-xs text-gray-500">
+            GPU 사용 현황, 렌더링 API, 메모리 사용량을 화면에 실시간 표시합니다
+          </p>
+        </div>
+        <button
+          onClick={() => setDevMode(!devMode)}
+          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+            devMode ? "bg-amber-500" : "bg-gray-300"
+          }`}
+        >
+          <span
+            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform shadow-sm ${
+              devMode ? "translate-x-6" : "translate-x-1"
+            }`}
+          />
+        </button>
+      </div>
+      {devMode && (
+        <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 p-3 text-xs text-amber-800">
+          개발자 오버레이가 화면 우측 하단에 표시됩니다. 각 컴포넌트의 GPU/CPU 사용 상태와 메모리 사용량을 확인할 수 있습니다.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── 설정 메인 페이지 ──────────────────────────────────────────────────
 
 export default function Settings() {
@@ -1417,6 +1456,11 @@ export default function Settings() {
       {/* 레이더사이트 관리 */}
       <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
         <RadarSiteSection />
+      </div>
+
+      {/* 개발자 모드 */}
+      <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
+        <DevModeSection />
       </div>
 
     </div>

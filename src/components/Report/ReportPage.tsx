@@ -15,7 +15,7 @@ const ReportPage = forwardRef<HTMLDivElement, ReportPageProps>(
       style={{
         width: "210mm",
         minHeight: "297mm",
-        padding: "20mm",
+        padding: "12mm 14mm",
         boxSizing: "border-box",
       }}
     >

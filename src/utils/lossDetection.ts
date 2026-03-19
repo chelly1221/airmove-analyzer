@@ -1,4 +1,5 @@
 import type { TrackPoint, LossPoint, LossSegment } from "../types";
+import { getGPUDevice, createBuffer, readBuffer, runComputeShader } from "./gpuCompute";
 
 /** 기본 임계값 (초): 이 시간 이상 gap이면 Loss */
 const DEFAULT_THRESHOLD_SECS = 7.0;
@@ -14,6 +15,78 @@ const MAX_LOSS_DURATION_SECS = 14400.0;
 
 /** 보간 속도 vs 직전 속도 차이 비율이 이 값을 초과하면 범위이탈로 판정 (예: 0.5 = 50% 차이) */
 const SPEED_DEVIATION_RATIO = 0.5;
+
+// ─── WebGPU Haversine Compute Shader ──────────────────────────
+
+const HAVERSINE_SHADER = `
+@group(0) @binding(0) var<storage, read> lats1: array<f32>;
+@group(0) @binding(1) var<storage, read> lons1: array<f32>;
+@group(0) @binding(2) var<storage, read> lats2: array<f32>;
+@group(0) @binding(3) var<storage, read> lons2: array<f32>;
+@group(0) @binding(4) var<storage, read_write> distances: array<f32>;
+
+const R: f32 = 6371.0;
+const PI: f32 = 3.14159265358979;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= arrayLength(&lats1)) { return; }
+
+  let lat1 = lats1[i] * PI / 180.0;
+  let lon1 = lons1[i] * PI / 180.0;
+  let lat2 = lats2[i] * PI / 180.0;
+  let lon2 = lons2[i] * PI / 180.0;
+
+  let dlat = (lat2 - lat1) / 2.0;
+  let dlon = (lon2 - lon1) / 2.0;
+  let a = sin(dlat) * sin(dlat) + cos(lat1) * cos(lat2) * sin(dlon) * sin(dlon);
+  distances[i] = R * 2.0 * asin(sqrt(min(a, 1.0)));
+}
+`;
+
+/** GPU batch Haversine distance (WebGPU with CPU fallback) */
+async function gpuHaversineBatch(
+  lat1s: Float32Array, lon1s: Float32Array,
+  lat2s: Float32Array, lon2s: Float32Array,
+): Promise<Float32Array> {
+  const n = lat1s.length;
+  const device = await getGPUDevice();
+
+  if (!device || n < 1000) {
+    // CPU fallback for small batches or no GPU
+    const result = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      result[i] = haversine(lat1s[i], lon1s[i], lat2s[i], lon2s[i]);
+    }
+    return result;
+  }
+
+  const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
+  const buf1 = createBuffer(device, lat1s, usage);
+  const buf2 = createBuffer(device, lon1s, usage);
+  const buf3 = createBuffer(device, lat2s, usage);
+  const buf4 = createBuffer(device, lon2s, usage);
+  const outBuf = device.createBuffer({
+    size: n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+
+  await runComputeShader(device, HAVERSINE_SHADER, [
+    { buffer: buf1, type: "read-only-storage" },
+    { buffer: buf2, type: "read-only-storage" },
+    { buffer: buf3, type: "read-only-storage" },
+    { buffer: buf4, type: "read-only-storage" },
+    { buffer: outBuf, type: "storage" },
+  ], [Math.ceil(n / 256), 1, 1]);
+
+  const result = await readBuffer(device, outBuf, n * 4);
+
+  buf1.destroy(); buf2.destroy(); buf3.destroy(); buf4.destroy(); outBuf.destroy();
+  return result;
+}
+
+// ─── CPU 구현 (기존) ─────────────────────────────────────────
 
 /** Haversine 거리 계산 (km) */
 export function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -40,7 +113,7 @@ function estimateScanInterval(points: TrackPoint[]): number | null {
   return gaps[Math.floor(gaps.length / 2)] ?? null;
 }
 
-/** 레이더 최대 탐지거리 추정 (95th percentile) */
+/** 레이더 최대 탐지거리 추정 (95th percentile) — CPU */
 export function estimateMaxRadarRange(
   points: TrackPoint[],
   radarLat: number,
@@ -53,7 +126,36 @@ export function estimateMaxRadarRange(
   return Math.max(distances[idx], 50.0);
 }
 
-/** 단일 항적의 Loss 포인트 탐지 (포인트 기반) */
+/** GPU 가속 레이더 최대 탐지거리 추정 (95th percentile) */
+export async function estimateMaxRadarRangeGPU(
+  points: TrackPoint[],
+  radarLat: number,
+  radarLon: number,
+): Promise<number> {
+  if (points.length === 0) return 150.0;
+
+  const n = points.length;
+  const lat1s = new Float32Array(n);
+  const lon1s = new Float32Array(n);
+  const lat2s = new Float32Array(n);
+  const lon2s = new Float32Array(n);
+
+  for (let i = 0; i < n; i++) {
+    lat1s[i] = radarLat;
+    lon1s[i] = radarLon;
+    lat2s[i] = points[i].latitude;
+    lon2s[i] = points[i].longitude;
+  }
+
+  const distances = await gpuHaversineBatch(lat1s, lon1s, lat2s, lon2s);
+
+  // 95th percentile
+  const sorted = Array.from(distances).sort((a, b) => a - b);
+  const idx = Math.min(Math.floor(sorted.length * 0.95), sorted.length - 1);
+  return Math.max(sorted[idx], 50.0);
+}
+
+/** 단일 항적의 Loss 포인트 탐지 (포인트 기반) — CPU */
 function detectLossForTrack(
   modeS: string,
   points: TrackPoint[],
@@ -81,7 +183,7 @@ function detectLossForTrack(
 
       // 보간 속도 계산 (knots): gap 구간의 직선거리 / 시간
       const gapDistKm = haversine(prev.latitude, prev.longitude, next.latitude, next.longitude);
-      const impliedSpeedKts = (gapDistKm / gap) * 3600 / 1.852; // km/s → knots
+      const impliedSpeedKts = (gapDistKm / gap) * 3600 / 1.852; // km/s -> knots
 
       // 직전 속도 대비 보간 속도 편차가 크면 범위이탈로 판정
       const prevSpeed = prev.speed; // knots
@@ -213,16 +315,18 @@ function deriveSegments(points: LossPoint[], trackPoints: TrackPoint[]): LossSeg
 }
 
 /**
- * 정렬된 TrackPoint 배열에 대해 Loss 탐지 수행.
+ * CPU Loss 탐지 — 기존 구현 (동기)
  * mode_s별로 그룹핑하여 각각 loss 탐지.
  * 포인트 기반: 각 미탐지 스캔마다 LossPoint 생성.
  */
-export function detectLoss(
+const yieldUI = () => new Promise<void>(r => setTimeout(r, 0));
+
+export async function detectLoss(
   points: TrackPoint[],
   radarLat: number,
   radarLon: number,
   thresholdSecs: number = DEFAULT_THRESHOLD_SECS,
-): LossDetectionResult {
+): Promise<LossDetectionResult> {
   // mode_s별 그룹핑
   const groups = new Map<string, TrackPoint[]>();
   for (const p of points) {
@@ -237,6 +341,7 @@ export function detectLoss(
   const allPoints: LossPoint[] = [];
   let overallMaxRange = 50.0;
 
+  let groupIdx = 0;
   for (const [modeS, pts] of groups) {
     if (pts.length < 1) continue;
     pts.sort((a, b) => a.timestamp - b.timestamp);
@@ -247,6 +352,8 @@ export function detectLoss(
     const scanInterval = estimateScanInterval(pts) ?? 5.0;
     const lps = detectLossForTrack(modeS, pts, thresholdSecs, scanInterval, radarLat, radarLon, rangeKm);
     allPoints.push(...lps);
+
+    if (++groupIdx % 5 === 0) await yieldUI();
   }
 
   allPoints.sort((a, b) => a.timestamp - b.timestamp);
@@ -254,5 +361,125 @@ export function detectLoss(
   // 하위 호환용 세그먼트 파생
   const segments = deriveSegments(allPoints, points);
 
+  return { lossPoints: allPoints, lossSegments: segments, maxRadarRangeKm: overallMaxRange };
+}
+
+/**
+ * GPU 가속 Loss 탐지 (haversine 배치 사전 계산)
+ * WebGPU로 대량 haversine 거리를 일괄 계산 후 CPU에서 Loss 판정
+ */
+export async function detectLossGPU(
+  points: TrackPoint[],
+  radarLat: number,
+  radarLon: number,
+  thresholdSecs: number = DEFAULT_THRESHOLD_SECS,
+): Promise<LossDetectionResult> {
+  // mode_s별 그룹핑
+  const groups = new Map<string, TrackPoint[]>();
+  for (const p of points) {
+    let arr = groups.get(p.mode_s);
+    if (!arr) { arr = []; groups.set(p.mode_s, arr); }
+    arr.push(p);
+  }
+
+  const allPoints: LossPoint[] = [];
+  let overallMaxRange = 50.0;
+
+  for (const [modeS, pts] of groups) {
+    if (pts.length < 2) continue;
+    pts.sort((a, b) => a.timestamp - b.timestamp);
+
+    // GPU 배치: 모든 포인트의 레이더 거리 + 인접 포인트간 거리 사전 계산
+    const n = pts.length;
+    const radarLats = new Float32Array(n).fill(radarLat);
+    const radarLons = new Float32Array(n).fill(radarLon);
+    const ptLats = new Float32Array(n);
+    const ptLons = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      ptLats[i] = pts[i].latitude;
+      ptLons[i] = pts[i].longitude;
+    }
+
+    // 1. 레이더-포인트 거리 (GPU)
+    const radarDists = await gpuHaversineBatch(radarLats, radarLons, ptLats, ptLons);
+
+    // 2. 인접 포인트간 거리 (GPU)
+    const prevLats = ptLats.slice(0, n - 1);
+    const prevLons = ptLons.slice(0, n - 1);
+    const nextLats = ptLats.slice(1);
+    const nextLons = ptLons.slice(1);
+    const gapDists = await gpuHaversineBatch(prevLats, prevLons, nextLats, nextLons);
+
+    // Range estimation from pre-computed distances
+    const distArr = Array.from(radarDists).sort((a, b) => a - b);
+    const rangeIdx = Math.min(Math.floor(distArr.length * 0.95), distArr.length - 1);
+    const rangeKm = Math.max(distArr[rangeIdx], 50.0);
+    if (rangeKm > overallMaxRange) overallMaxRange = rangeKm;
+
+    const scanInterval = estimateScanInterval(pts) ?? 5.0;
+    const boundaryKm = rangeKm * OUT_OF_RANGE_THRESHOLD;
+
+    // Loss detection using pre-computed distances
+    for (let i = 0; i < n - 1; i++) {
+      const prev = pts[i];
+      const next = pts[i + 1];
+      const gap = next.timestamp - prev.timestamp;
+
+      if (gap > thresholdSecs && gap <= MAX_LOSS_DURATION_SECS) {
+        if (gap <= 0) continue;
+        const startRadarDist = radarDists[i];
+        const endRadarDist = radarDists[i + 1];
+        const missedScans = gap / scanInterval;
+        const gapDistKm = gapDists[i];
+        const impliedSpeedKts = (gapDistKm / gap) * 3600 / 1.852;
+        const prevSpeed = prev.speed;
+        const speedDeviation = prevSpeed > 10
+          ? Math.abs(impliedSpeedKts - prevSpeed) / prevSpeed
+          : 0;
+
+        let lossType: string;
+        if (startRadarDist >= boundaryKm && endRadarDist >= boundaryKm) {
+          lossType = "out_of_range";
+        } else if (missedScans >= MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS && (startRadarDist >= boundaryKm || endRadarDist >= boundaryKm)) {
+          lossType = "out_of_range";
+        } else if (speedDeviation > SPEED_DEVIATION_RATIO) {
+          lossType = "out_of_range";
+        } else {
+          lossType = "signal_loss";
+        }
+
+        if (lossType === "out_of_range") continue;
+
+        const totalMissed = Math.max(1, Math.round(gap / scanInterval) - 1);
+        for (let si = 1; si <= totalMissed; si++) {
+          const t = si / (totalMissed + 1);
+          const ts = prev.timestamp + gap * t;
+          const lat = prev.latitude + (next.latitude - prev.latitude) * t;
+          const lon = prev.longitude + (next.longitude - prev.longitude) * t;
+          const alt = prev.altitude + (next.altitude - prev.altitude) * t;
+          // Linear interpolation of radar distances for interpolated points
+          const radDist = startRadarDist + (endRadarDist - startRadarDist) * t;
+
+          allPoints.push({
+            mode_s: modeS,
+            timestamp: ts,
+            latitude: lat,
+            longitude: lon,
+            altitude: alt,
+            radar_distance_km: radDist,
+            loss_type: lossType,
+            scan_index: si,
+            total_missed_scans: totalMissed,
+            gap_start_time: prev.timestamp,
+            gap_end_time: next.timestamp,
+            gap_duration_secs: gap,
+          });
+        }
+      }
+    }
+  }
+
+  allPoints.sort((a, b) => a.timestamp - b.timestamp);
+  const segments = deriveSegments(allPoints, points);
   return { lossPoints: allPoints, lossSegments: segments, maxRadarRangeKm: overallMaxRange };
 }

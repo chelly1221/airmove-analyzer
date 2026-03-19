@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
-import { ScatterplotLayer, LineLayer } from "@deck.gl/layers";
+import { ScatterplotLayer, LineLayer, PathLayer, PolygonLayer } from "@deck.gl/layers";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -76,6 +76,8 @@ export default function LossAnalysis() {
   const [panoramaPeakNames, setPanoramaPeakNames] = useState<Map<number, string>>(new Map()); // 파노라마 인덱스 → 산 이름
   // 파노라마 X축 줌 (방위 범위)
   const [panoramaAzRange, setPanoramaAzRange] = useState<[number, number]>([0, 360]);
+  // 파노라마 미니맵 장애물 경계 오버레이 토글
+  const [showBoundaryOverlay, setShowBoundaryOverlay] = useState(false);
 
   // 파노라마 뷰 활성 상태를 스토어에 동기화
   useEffect(() => {
@@ -83,34 +85,76 @@ export default function LossAnalysis() {
     return () => setPanoramaViewActive(false);
   }, [viewMode, setPanoramaViewActive]);
 
-  // 파노라마 계산 함수 (DB 저장 포함)
-  const computePanorama = useCallback(() => {
+  // 파노라마 계산 함수 (GPU 우선, CPU 폴백, DB 저장 포함)
+  const computePanorama = useCallback(async () => {
     setPanoramaLoading(true);
     setPanoramaPinnedIdx(null);
     setPanoramaHoverIdx(null);
     setPanoramaAzRange([0, 360]);
     const radarH = radarSite.altitude + radarSite.antenna_height;
-    invoke<PanoramaPoint[]>("calculate_los_panorama", {
-      radarLat: radarSite.latitude,
-      radarLon: radarSite.longitude,
-      radarHeightM: radarH,
-      maxRangeKm: 100.0,
-      azimuthStepDeg: 0.5,
-      rangeStepM: 200.0,
-    })
-      .then((data) => {
+    const azStep = 0.01;
+    const rangeStep = 200.0;
+    const maxRange = 100.0;
+
+    try {
+      // GPU 경로 시도
+      const { computePanoramaTerrainGPU } = await import("../utils/gpuPanorama");
+      const terrainResults = await computePanoramaTerrainGPU(
+        radarSite.latitude, radarSite.longitude, radarH,
+        maxRange, azStep, rangeStep,
+      );
+
+      if (terrainResults) {
+        console.log(`[Panorama] GPU 지형 스캔 완료: ${terrainResults.length} azimuths`);
+        // GPU 지형 결과에 건물 병합 (Rust)
+        const data = await invoke<PanoramaPoint[]>("panorama_merge_buildings", {
+          radarLat: radarSite.latitude,
+          radarLon: radarSite.longitude,
+          radarHeightM: radarH,
+          maxRangeKm: maxRange,
+          azimuthStepDeg: azStep,
+          terrainResults,
+        });
         setPanoramaData(data);
-        // DB에 캐시 저장
+
         invoke("save_panorama_cache", {
           radarLat: radarSite.latitude,
           radarLon: radarSite.longitude,
           radarHeightM: radarH,
           dataJson: JSON.stringify(data),
         }).catch((e) => console.error("파노라마 캐시 저장 실패:", e));
-      })
-      .catch((e) => console.error("파노라마 계산 실패:", e))
-      .finally(() => setPanoramaLoading(false));
+        return;
+      }
+    } catch (e) {
+      console.warn("[Panorama] GPU 경로 실패, CPU 폴백:", e);
+    }
+
+    // CPU 폴백: 전체 Rust 계산
+    try {
+      const data = await invoke<PanoramaPoint[]>("calculate_los_panorama", {
+        radarLat: radarSite.latitude,
+        radarLon: radarSite.longitude,
+        radarHeightM: radarH,
+        maxRangeKm: maxRange,
+        azimuthStepDeg: azStep,
+        rangeStepM: rangeStep,
+      });
+      setPanoramaData(data);
+      invoke("save_panorama_cache", {
+        radarLat: radarSite.latitude,
+        radarLon: radarSite.longitude,
+        radarHeightM: radarH,
+        dataJson: JSON.stringify(data),
+      }).catch((e) => console.error("파노라마 캐시 저장 실패:", e));
+    } catch (e) {
+      console.error("파노라마 계산 실패:", e);
+    }
   }, [radarSite]);
+
+  // computePanorama wrapper (useEffect에서 호출 시 void 반환)
+  const triggerPanorama = useCallback(() => {
+    computePanorama().finally(() => setPanoramaLoading(false));
+  }, [computePanorama]);
 
   // LoS 파노라마 탭 선택 시 DB 캐시 로드 또는 계산
   useEffect(() => {
@@ -127,16 +171,17 @@ export default function LossAnalysis() {
             const data = JSON.parse(cached) as PanoramaPoint[];
             if (data.length > 0) {
               setPanoramaData(data);
+      
               setPanoramaLoading(false);
               return;
             }
           } catch { /* 파싱 실패 시 재계산 */ }
         }
         // 캐시 없으면 계산
-        computePanorama();
+        triggerPanorama();
       })
-      .catch(() => computePanorama());
-  }, [viewMode, radarSite, panoramaData.length, computePanorama]);
+      .catch(() => triggerPanorama());
+  }, [viewMode, radarSite, panoramaData.length, triggerPanorama]);
 
   // 레이더 변경 시 파노라마 데이터 초기화
   const prevRadarRef = useRef(radarSite.name);
@@ -144,6 +189,7 @@ export default function LossAnalysis() {
     if (prevRadarRef.current !== radarSite.name) {
       prevRadarRef.current = radarSite.name;
       setPanoramaData([]);
+      setShowBoundaryOverlay(false);
       setPanoramaPinnedIdx(null);
       setPanoramaHoverIdx(null);
       setPanoramaPeakNames(new Map());
@@ -323,6 +369,58 @@ export default function LossAnalysis() {
     return azToX(az);
   }, [filteredPanoramaData.length, azToX, panoramaMargin.left]);
 
+  // 건물 세로선을 단일 <path>로 사전 계산 (DOM 수천 개 → 1개)
+  const panoramaBuildingPaths = useMemo(() => {
+    if (filteredPanoramaData.length === 0) return { gis: "", manual: "" };
+    const { startIdx, endIdx } = panoramaVisibleRange;
+    const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
+    let gisD = "";
+    let manualD = "";
+    for (let i = startIdx; i <= endIdx; i++) {
+      const pt = filteredPanoramaData[i];
+      if (pt.obstacle_type === "terrain") continue;
+      const x = idxToX(i);
+      const yTop = toY(pt.elevation_angle_deg);
+      const terrainAngle = Math.max(0, pt.elevation_angle_deg - (pt.obstacle_height_m / (pt.distance_km * 1000)) * (180 / Math.PI));
+      const yBottom = toY(Math.max(terrainAngle, panoramaMinAngle));
+      const seg = `M${x} ${yTop}L${x} ${yBottom}`;
+      if (pt.obstacle_type === "manual_building") {
+        manualD += seg;
+      } else {
+        gisD += seg;
+      }
+    }
+    return { gis: gisD, manual: manualD };
+  }, [filteredPanoramaData, panoramaVisibleRange, panoramaMinAngle, panoramaMaxAngle, panoramaMargin, panoramaChartH, idxToX]);
+
+  // 미니맵 장애물 경계 오버레이 (폴리곤 + 유형별 세그먼트)
+  const { boundaryPolygon, boundarySegments } = useMemo(() => {
+    const empty = { boundaryPolygon: null as [number, number][] | null, boundarySegments: [] as { path: [number, number][]; color: [number, number, number, number] }[] };
+    if (!showBoundaryOverlay || filteredPanoramaData.length < 3) return empty;
+    const pts = filteredPanoramaData;
+    const coords: [number, number][] = pts.map((p) => [p.lon, p.lat]);
+    coords.push(coords[0]);
+    const TYPE_COLORS: Record<string, [number, number, number, number]> = {
+      terrain: [34, 197, 94, 200],
+      gis_building: [245, 158, 11, 220],
+      manual_building: [239, 68, 68, 220],
+    };
+    const segments: { path: [number, number][]; color: [number, number, number, number] }[] = [];
+    let curType = pts[0].obstacle_type;
+    let curPath: [number, number][] = [[pts[0].lon, pts[0].lat]];
+    for (let i = 1; i <= pts.length; i++) {
+      const pt = i < pts.length ? pts[i] : pts[0];
+      const type = pt.obstacle_type;
+      curPath.push([pt.lon, pt.lat]);
+      if (type !== curType || i === pts.length) {
+        segments.push({ path: curPath, color: TYPE_COLORS[curType] ?? [128, 128, 128, 160] });
+        curType = type;
+        curPath = [[pt.lon, pt.lat]];
+      }
+    }
+    return { boundaryPolygon: coords, boundarySegments: segments };
+  }, [showBoundaryOverlay, filteredPanoramaData]);
+
   const handlePanoramaMouseMove = useCallback(
     (e: React.MouseEvent<SVGSVGElement>) => {
       if (filteredPanoramaData.length === 0) return;
@@ -431,7 +529,7 @@ export default function LossAnalysis() {
     return {
       totalDuration,
       avgDuration: durations.length > 0 ? totalDuration / durations.length : 0,
-      maxDuration: durations.length > 0 ? Math.max(...durations) : 0,
+      maxDuration: durations.reduce((m, d) => d > m ? d : m, 0),
       totalPoints: flatLoss.length,
       gapCount: gapDurations.size,
     };
@@ -509,8 +607,11 @@ export default function LossAnalysis() {
                   <div>
                     <h3 className="text-sm font-semibold text-gray-800">
                       360° LoS 파노라마 — {radarSite.name}
+                      <span className="ml-2 text-xs font-normal text-gray-400">
+                        0.01° ({filteredPanoramaData.length.toLocaleString()}점)
+                      </span>
                       {panoramaBuildingPoints.length > 0 && (
-                        <span className="ml-2 text-xs font-normal text-gray-500">
+                        <span className="ml-1 text-xs font-normal text-gray-500">
                           · 건물 {panoramaBuildingPoints.length}개
                           {panoramaBldgMaxHeight !== null && ` (≤ ${panoramaBldgMaxHeight}m)`}
                         </span>
@@ -544,14 +645,27 @@ export default function LossAnalysis() {
                       })()}
                     </div>
                     <button
+                      onClick={() => setShowBoundaryOverlay(!showBoundaryOverlay)}
+                      disabled={filteredPanoramaData.length < 3}
+                      className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
+                        showBoundaryOverlay
+                          ? "border-[#a60739] bg-[#a60739] text-white"
+                          : "border-gray-200 text-gray-500 hover:bg-gray-50"
+                      } disabled:cursor-not-allowed disabled:opacity-40`}
+                      title="장애물 경계 오버레이"
+                    >
+                      경계 오버레이
+                    </button>
+                    <button
                       onClick={() => {
                         invoke("clear_panorama_cache", {
                           radarLat: radarSite.latitude,
                           radarLon: radarSite.longitude,
                         }).catch(() => {});
                         setPanoramaData([]);
+                        setShowBoundaryOverlay(false);
                         setPanoramaPeakNames(new Map());
-                        computePanorama();
+                        triggerPanorama();
                       }}
                       className="rounded-md border border-gray-200 px-2.5 py-1 text-xs text-gray-500 hover:bg-gray-50"
                     >
@@ -634,9 +748,9 @@ export default function LossAnalysis() {
                       return grids;
                     })()}
 
-                    {/* 지형/건물 면 채우기 */}
+                    {/* 지형/건물 면 채우기 — 모든 데이터를 <path> 4개로 통합 (DOM 최소화) */}
                     <g clipPath="url(#panorama-clip)">
-                      {/* 지형 영역 (녹색) */}
+                      {/* 지형 영역 (녹색 면) */}
                       <path
                         d={(() => {
                           const { startIdx, endIdx } = panoramaVisibleRange;
@@ -680,22 +794,17 @@ export default function LossAnalysis() {
                         strokeWidth={1.2}
                       />
 
-                      {/* 건물 세로선 (지형 위에 오버레이) */}
-                      {filteredPanoramaData.map((pt, i) => {
-                        if (pt.obstacle_type === "terrain") return null;
-                        const { startIdx, endIdx } = panoramaVisibleRange;
-                        if (i < startIdx || i > endIdx) return null;
-                        const x = idxToX(i);
-                        const toY = (angle: number) => panoramaMargin.top + panoramaChartH * (1 - (angle - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
-                        const yTop = toY(pt.elevation_angle_deg);
-                        const terrainAngle = Math.max(0, pt.elevation_angle_deg - (pt.obstacle_height_m / (pt.distance_km * 1000)) * (180 / Math.PI));
-                        const yBottom = toY(Math.max(terrainAngle, panoramaMinAngle));
-                        const color = pt.obstacle_type === "manual_building" ? "#ef4444" : "#f97316";
-                        return (
-                          <line key={`bld-${i}`} x1={x} y1={yTop} x2={x} y2={yBottom}
-                            stroke={color} strokeWidth={2} strokeOpacity={0.7} />
-                        );
-                      })}
+                      {/* GIS 건물 세로선 — 단일 <path>로 통합 */}
+                      {panoramaBuildingPaths.gis && (
+                        <path d={panoramaBuildingPaths.gis}
+                          fill="none" stroke="#f97316" strokeWidth={2} strokeOpacity={0.7} />
+                      )}
+
+                      {/* 수동 건물 세로선 — 단일 <path>로 통합 */}
+                      {panoramaBuildingPaths.manual && (
+                        <path d={panoramaBuildingPaths.manual}
+                          fill="none" stroke="#ef4444" strokeWidth={2} strokeOpacity={0.7} />
+                      )}
 
                       {/* 전체 실루엣 (건물 포함, 최상단 라인) */}
                       <path
@@ -818,7 +927,7 @@ export default function LossAnalysis() {
                 </div>
 
               {/* 건물 위치 지도 (카드 내부, 나머지 공간 채움) */}
-              {panoramaBuildingPoints.length > 0 && (
+              {(panoramaBuildingPoints.length > 0 || showBoundaryOverlay) && (
                 <div className="min-h-0 flex-1 border-t border-gray-200">
                   <MapGL
                       ref={panoramaMapRef}
@@ -833,77 +942,132 @@ export default function LossAnalysis() {
                       <NavigationControl position="top-right" />
                       <DeckGLOverlay
                         layers={[
-                          // 레이더 → 건물 연결선
-                          new LineLayer({
-                            id: "panorama-bldg-lines",
-                            data: panoramaBuildingPoints,
-                            getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
-                            getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
-                            getColor: [100, 100, 100, 40],
-                            getWidth: 1,
-                          }),
-                          // 건물 포인트
-                          new ScatterplotLayer({
-                            id: "panorama-bldg-dots",
-                            data: panoramaBuildingPoints,
-                            getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
-                            getRadius: (d: PanoramaPoint) => Math.max(30, d.obstacle_height_m * 2),
-                            getFillColor: (d: PanoramaPoint) =>
-                              d.obstacle_type === "manual_building" ? [239, 68, 68, 180] : [249, 115, 22, 180],
-                            getLineColor: [255, 255, 255, 200],
-                            lineWidthMinPixels: 1,
-                            stroked: true,
-                            pickable: true,
-                            radiusMinPixels: 4,
-                            radiusMaxPixels: 20,
-                            onHover: (info: { object?: PanoramaPoint }) => {
-                              if (panoramaPinnedIdx !== null) return; // 핀 고정 시 호버 무시
-                              if (!info.object) {
-                                setPanoramaHoverIdx(null);
-                                return;
-                              }
-                              const hovered = info.object;
-                              let bestIdx = -1;
-                              let bestDist = Infinity;
-                              for (let i = 0; i < filteredPanoramaData.length; i++) {
-                                const pt = filteredPanoramaData[i];
-                                if (pt.obstacle_type === "terrain") continue;
-                                const dlat = pt.lat - hovered.lat;
-                                const dlon = pt.lon - hovered.lon;
-                                const dist = dlat * dlat + dlon * dlon;
-                                if (dist < bestDist) {
-                                  bestDist = dist;
-                                  bestIdx = i;
-                                }
-                              }
-                              if (bestIdx >= 0) {
-                                setPanoramaHoverIdx(bestIdx);
-                              }
-                            },
-                            onClick: (info: { object?: PanoramaPoint }) => {
-                              if (!info.object) return;
-                              // 클릭한 건물의 좌표로 filteredPanoramaData에서 가장 가까운 인덱스 찾기
-                              const clicked = info.object;
-                              let bestIdx = -1;
-                              let bestDist = Infinity;
-                              for (let i = 0; i < filteredPanoramaData.length; i++) {
-                                const pt = filteredPanoramaData[i];
-                                if (pt.obstacle_type === "terrain") continue;
-                                const dlat = pt.lat - clicked.lat;
-                                const dlon = pt.lon - clicked.lon;
-                                const dist = dlat * dlat + dlon * dlon;
-                                if (dist < bestDist) {
-                                  bestDist = dist;
-                                  bestIdx = i;
-                                }
-                              }
-                              if (bestIdx >= 0) {
-                                setPanoramaPinnedIdx((prev) => (prev === bestIdx ? null : bestIdx));
-                                setPanoramaHoverIdx(bestIdx);
-                              }
-                            },
-                          }),
-                          // 레이더 위치
+                          // 경계 오버레이 모드: 경계만 표시
+                          ...(showBoundaryOverlay && boundaryPolygon && boundaryPolygon.length > 2
+                            ? [
+                                new PolygonLayer({
+                                  id: "panorama-boundary-fill",
+                                  data: [{ polygon: boundaryPolygon }],
+                                  getPolygon: (d: { polygon: [number, number][] }) => d.polygon,
+                                  getFillColor: [34, 197, 94, 30],
+                                  getLineColor: [0, 0, 0, 0],
+                                  lineWidthMinPixels: 0,
+                                  pickable: false,
+                                }),
+                                ...(boundarySegments.length > 0
+                                  ? [
+                                      new PathLayer<{ path: [number, number][]; color: [number, number, number, number] }>({
+                                        id: "panorama-boundary-outline",
+                                        data: boundarySegments,
+                                        getPath: (d) => d.path,
+                                        getColor: (d) => d.color,
+                                        getWidth: 2,
+                                        widthMinPixels: 1.5,
+                                        widthUnits: "pixels" as const,
+                                        pickable: false,
+                                      }),
+                                    ]
+                                  : []),
+                              ]
+                            // 기본 모드: 건물 포인트 표시
+                            : [
+                                new LineLayer({
+                                  id: "panorama-bldg-lines",
+                                  data: panoramaBuildingPoints,
+                                  getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
+                                  getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                                  getColor: [100, 100, 100, 40],
+                                  getWidth: 1,
+                                }),
+                                new ScatterplotLayer({
+                                  id: "panorama-bldg-dots",
+                                  data: panoramaBuildingPoints,
+                                  getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                                  getRadius: 5,
+                                  radiusUnits: "pixels" as const,
+                                  getFillColor: (d: PanoramaPoint) =>
+                                    d.obstacle_type === "manual_building" ? [239, 68, 68, 180] : [249, 115, 22, 180],
+                                  getLineColor: [255, 255, 255, 200],
+                                  lineWidthMinPixels: 1,
+                                  stroked: true,
+                                  pickable: true,
+                                  onHover: (info: { object?: PanoramaPoint }) => {
+                                    if (panoramaPinnedIdx !== null) return;
+                                    if (!info.object) {
+                                      setPanoramaHoverIdx(null);
+                                      return;
+                                    }
+                                    const hovered = info.object;
+                                    let bestIdx = -1;
+                                    let bestDist = Infinity;
+                                    for (let i = 0; i < filteredPanoramaData.length; i++) {
+                                      const pt = filteredPanoramaData[i];
+                                      if (pt.obstacle_type === "terrain") continue;
+                                      const dlat = pt.lat - hovered.lat;
+                                      const dlon = pt.lon - hovered.lon;
+                                      const dist = dlat * dlat + dlon * dlon;
+                                      if (dist < bestDist) {
+                                        bestDist = dist;
+                                        bestIdx = i;
+                                      }
+                                    }
+                                    if (bestIdx >= 0) {
+                                      setPanoramaHoverIdx(bestIdx);
+                                    }
+                                  },
+                                  onClick: (info: { object?: PanoramaPoint }) => {
+                                    if (!info.object) return;
+                                    const clicked = info.object;
+                                    let bestIdx = -1;
+                                    let bestDist = Infinity;
+                                    for (let i = 0; i < filteredPanoramaData.length; i++) {
+                                      const pt = filteredPanoramaData[i];
+                                      if (pt.obstacle_type === "terrain") continue;
+                                      const dlat = pt.lat - clicked.lat;
+                                      const dlon = pt.lon - clicked.lon;
+                                      const dist = dlat * dlat + dlon * dlon;
+                                      if (dist < bestDist) {
+                                        bestDist = dist;
+                                        bestIdx = i;
+                                      }
+                                    }
+                                    if (bestIdx >= 0) {
+                                      setPanoramaPinnedIdx((prev) => (prev === bestIdx ? null : bestIdx));
+                                      setPanoramaHoverIdx(bestIdx);
+                                    }
+                                  },
+                                }),
+                                ...(panoramaActivePoint
+                                  ? [
+                                      new ScatterplotLayer({
+                                        id: "panorama-bldg-highlight",
+                                        data: [panoramaActivePoint],
+                                        getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                                        getFillColor: panoramaActivePoint.obstacle_type === "terrain"
+                                          ? [34, 197, 94, 220] : [239, 68, 68, 240],
+                                        getLineColor: [255, 255, 255, 255],
+                                        getRadius: 300,
+                                        stroked: true,
+                                        lineWidthMinPixels: 2,
+                                        radiusMinPixels: 8,
+                                        radiusMaxPixels: 24,
+                                      }),
+                                      ...(panoramaActivePoint.obstacle_type === "terrain"
+                                        ? [
+                                            new LineLayer({
+                                              id: "panorama-terrain-line",
+                                              data: [panoramaActivePoint],
+                                              getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
+                                              getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                                              getColor: [34, 197, 94, 120],
+                                              getWidth: 2,
+                                            }),
+                                          ]
+                                        : []),
+                                    ]
+                                  : []),
+                              ]),
+                          // 레이더 위치 (항상 표시)
                           new ScatterplotLayer({
                             id: "panorama-radar-dot",
                             data: [radarSite],
@@ -916,37 +1080,6 @@ export default function LossAnalysis() {
                             radiusMinPixels: 8,
                             radiusMaxPixels: 12,
                           }),
-                          // 활성 포인트 하이라이트 (건물: 빨간색, 지형: 녹색)
-                          ...(panoramaActivePoint
-                            ? [
-                                new ScatterplotLayer({
-                                  id: "panorama-bldg-highlight",
-                                  data: [panoramaActivePoint],
-                                  getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
-                                  getFillColor: panoramaActivePoint.obstacle_type === "terrain"
-                                    ? [34, 197, 94, 220] : [239, 68, 68, 240],
-                                  getLineColor: [255, 255, 255, 255],
-                                  getRadius: 300,
-                                  stroked: true,
-                                  lineWidthMinPixels: 2,
-                                  radiusMinPixels: 8,
-                                  radiusMaxPixels: 24,
-                                }),
-                                // 지형 포인트인 경우 레이더→지형 연결선 표시
-                                ...(panoramaActivePoint.obstacle_type === "terrain"
-                                  ? [
-                                      new LineLayer({
-                                        id: "panorama-terrain-line",
-                                        data: [panoramaActivePoint],
-                                        getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
-                                        getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
-                                        getColor: [34, 197, 94, 120],
-                                        getWidth: 2,
-                                      }),
-                                    ]
-                                  : []),
-                              ]
-                            : []),
                         ]}
                       />
                     </MapGL>

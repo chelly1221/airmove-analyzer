@@ -47,17 +47,17 @@ export default function ReportSummarySection({
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[15px] font-bold text-gray-900">
+      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
         {sectionNum}. 요약
       </h2>
 
       {/* 판정 등급 */}
       <div className="mb-4 flex items-center gap-3">
-        <span className="text-[12px] text-gray-600">종합 판정:</span>
-        <span className={`rounded-md border px-3 py-1 text-[13px] font-bold ${grade.bg} ${grade.color}`}>
+        <span className="text-[16px] text-gray-600">종합 판정:</span>
+        <span className={`rounded-md border px-3 py-1 text-[16px] font-bold ${grade.bg} ${grade.color}`}>
           {grade.label}
         </span>
-        <span className="text-[11px] text-gray-400">
+        <span className="text-[14px] text-gray-400">
           (소실율 1% 미만: 양호 / 1~5%: 주의 / 5% 이상: 경고)
         </span>
       </div>
@@ -69,8 +69,8 @@ export default function ReportSummarySection({
             key={kpi.label}
             className="rounded border border-gray-200 bg-gray-50 px-3 py-2 text-center"
           >
-            <div className="text-[10px] text-gray-400">{kpi.label}</div>
-            <div className={`text-[16px] font-bold ${kpi.accent ? "text-[#a60739]" : "text-gray-800"}`}>
+            <div className="text-[14px] text-gray-400">{kpi.label}</div>
+            <div className={`text-[20px] font-bold ${kpi.accent ? "text-[#a60739]" : "text-gray-800"}`}>
               {kpi.value}
             </div>
           </div>
@@ -79,13 +79,13 @@ export default function ReportSummarySection({
 
       {/* 편집 가능한 코멘트 */}
       <div className="rounded border border-gray-200 bg-gray-50 p-3">
-        <div className="mb-1 text-[10px] font-medium text-gray-400">분석 소견</div>
+        <div className="mb-1 text-[14px] font-medium text-gray-400">분석 소견</div>
         <EditableText
           value={commentary}
           onChange={onCommentaryChange}
           editable={editable}
           tag="p"
-          className="text-[12px] leading-relaxed text-gray-700"
+          className="text-[16px] leading-relaxed text-gray-700"
         />
       </div>
     </div>

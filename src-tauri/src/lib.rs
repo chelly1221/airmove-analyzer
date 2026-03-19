@@ -434,6 +434,107 @@ fn write_file_base64(path: String, data: String) -> Result<(), String> {
     Ok(())
 }
 
+/// WebView2 네이티브 PrintToPdf — CDP(Chrome DevTools Protocol) Page.printToPDF 사용
+/// 벡터 텍스트 PDF, GPU 가속 렌더링, html2canvas 대비 5-10x 빠름
+/// 반환: PDF base64 (DB 저장용)
+#[tauri::command]
+async fn webview_print_to_pdf(
+    app_handle: tauri::AppHandle,
+    path: String,
+) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use std::sync::mpsc;
+
+        let window = app_handle
+            .get_webview_window("main")
+            .ok_or("메인 윈도우를 찾을 수 없습니다")?;
+
+        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+
+        // CDP Page.printToPDF 호출 — UI 스레드에서 실행
+        window
+            .with_webview(move |webview| {
+                unsafe {
+                    let controller = webview.controller();
+                    let core = controller.CoreWebView2().unwrap();
+
+                    // CDP 파라미터: A4 용지, 여백 0, 배경색 출력
+                    let params = r#"{
+                        "landscape": false,
+                        "printBackground": true,
+                        "paperWidth": 8.27,
+                        "paperHeight": 11.69,
+                        "marginTop": 0,
+                        "marginBottom": 0,
+                        "marginLeft": 0,
+                        "marginRight": 0,
+                        "scale": 1,
+                        "preferCSSPageSize": true
+                    }"#;
+
+                    let method_h: windows::core::HSTRING = "Page.printToPDF".into();
+                    let params_h: windows::core::HSTRING = params.into();
+
+                    // webview2-com 고수준 래퍼: wait_for_async_operation 패턴
+                    let tx_inner = tx.clone();
+                    let result = webview2_com::CallDevToolsProtocolMethodCompletedHandler
+                        ::wait_for_async_operation(
+                            Box::new(move |handler| {
+                                core.CallDevToolsProtocolMethod(&method_h, &params_h, &handler)
+                                    .map_err(webview2_com::Error::WindowsError)
+                            }),
+                            Box::new(move |hr_result, json_str| {
+                                match hr_result {
+                                    Ok(()) => { let _ = tx_inner.send(Ok(json_str)); }
+                                    Err(e) => { let _ = tx_inner.send(Err(format!("CDP 실패: {:?}", e))); }
+                                }
+                                Ok(())
+                            }),
+                        );
+
+                    if let Err(e) = result {
+                        let _ = tx.send(Err(format!("CDP 호출 실패: {}", e)));
+                    }
+                }
+            })
+            .map_err(|e| format!("with_webview 실패: {}", e))?;
+
+        // 비동기로 CDP 결과 대기
+        let cdp_result = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(60))
+                .map_err(|_| "PrintToPdf 타임아웃 (60초)".to_string())?
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 실패: {}", e))??;
+
+        // CDP 응답에서 base64 PDF 데이터 추출
+        let json: serde_json::Value = serde_json::from_str(&cdp_result)
+            .map_err(|e| format!("CDP 응답 파싱 실패: {}", e))?;
+
+        let pdf_base64 = json["data"]
+            .as_str()
+            .ok_or("CDP 응답에 data 필드가 없습니다")?;
+
+        // base64 디코딩 후 파일 저장
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let pdf_bytes = STANDARD
+            .decode(pdf_base64)
+            .map_err(|e| format!("PDF base64 디코딩 실패: {}", e))?;
+
+        fs::write(&path, &pdf_bytes)
+            .map_err(|e| format!("PDF 파일 저장 실패: {}", e))?;
+
+        // base64 반환 (DB 저장용)
+        Ok(pdf_base64.to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("WebView2 PrintToPdf는 Windows에서만 지원됩니다".to_string())
+    }
+}
+
 /// OpenSky Network API로 ADS-B 항적 조회
 #[derive(serde::Deserialize)]
 struct AdsbQuery {
@@ -1073,19 +1174,121 @@ fn calculate_los_panorama(
     max_range_km: Option<f64>,
     azimuth_step_deg: Option<f64>,
     range_step_m: Option<f64>,
+    exclude_manual_ids: Option<Vec<i64>>,
 ) -> Result<Vec<analysis::panorama::PanoramaPoint>, String> {
     let max_range = max_range_km.unwrap_or(100.0);
     let az_step = azimuth_step_deg.unwrap_or(0.5);
     let r_step = range_step_m.unwrap_or(200.0);
+    let exclude_ids = exclude_manual_ids.unwrap_or_default();
 
-    // DB 먼저 잠금 해제하고 건물 조회, 그 다음 SRTM
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
 
     Ok(analysis::panorama::calculate_panorama(
         &mut srtm, &conn,
         radar_lat, radar_lon, radar_height_m,
-        max_range, az_step, r_step,
+        max_range, az_step, r_step, &exclude_ids,
+    ))
+}
+
+/// GPU 파노라마용: Rust에서 SRTM 조회 수행 후 elevation 배열만 전송 (경량)
+/// 18M개 destination_point + SRTM 바이리니어 보간을 rayon 병렬로 수행
+/// 결과: base64(f32 LE) — num_azimuths × num_steps 순서
+#[tauri::command]
+fn presample_panorama_elevations(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+    max_range_km: Option<f64>,
+    azimuth_step_deg: Option<f64>,
+    range_step_m: Option<f64>,
+) -> Result<PreSampledElevations, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use rayon::prelude::*;
+
+    let max_range_m = max_range_km.unwrap_or(100.0) * 1000.0;
+    let az_step = azimuth_step_deg.unwrap_or(0.01);
+    let r_step = range_step_m.unwrap_or(200.0);
+    let num_azimuths = (360.0 / az_step).round() as usize;
+    let num_steps = (max_range_m / r_step).floor() as usize;
+
+    // 메모리 안전 체크: f32 72MB + base64 96MB + u8 72MB = ~240MB 피크
+    let total_samples = num_azimuths * num_steps;
+    let estimated_mb = total_samples as f64 * 4.0 / 1_000_000.0;
+    if estimated_mb > 200.0 {
+        return Err(format!(
+            "Pre-sample too large: {}MB ({} azimuths × {} steps). Reduce resolution or range.",
+            estimated_mb as u64, num_azimuths, num_steps
+        ));
+    }
+
+    // SRTM 타일 프리로드
+    let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+    let range_deg = (max_range_m / 111_000.0).ceil() as i32 + 1;
+    srtm.preload_tiles(
+        radar_lat.floor() as i32 - range_deg,
+        radar_lat.floor() as i32 + range_deg,
+        radar_lon.floor() as i32 - range_deg,
+        radar_lon.floor() as i32 + range_deg,
+    );
+    let tiles = srtm.tiles_ref();
+
+    // rayon 병렬: 각 azimuth ray에 대해 모든 range step의 고도 조회
+    let elevations: Vec<f32> = (0..num_azimuths)
+        .into_par_iter()
+        .flat_map_iter(|az_idx| {
+            let az_deg = az_idx as f64 * az_step;
+            (1..=num_steps).map(move |s| {
+                let d = s as f64 * r_step;
+                let (lat, lon) = analysis::panorama::destination_point_pub(
+                    radar_lat, radar_lon, az_deg, d,
+                );
+                srtm::elevation_from_tiles(tiles, lat, lon) as f32
+            })
+        })
+        .collect();
+
+    // f32 LE bytes → base64 (72MB → 96MB, 피크 ~240MB)
+    let bytes: Vec<u8> = elevations.into_iter().flat_map(|v| v.to_le_bytes()).collect();
+    let data_b64 = STANDARD.encode(&bytes);
+    drop(bytes); // base64 인코딩 후 원본 해제
+
+    Ok(PreSampledElevations {
+        data_b64,
+        num_azimuths: num_azimuths as u32,
+        num_steps: num_steps as u32,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct PreSampledElevations {
+    data_b64: String,
+    num_azimuths: u32,
+    num_steps: u32,
+}
+
+/// GPU 파노라마 건물 병합 (GPU에서 계산한 지형 결과에 건물 데이터 오버레이)
+#[tauri::command]
+fn panorama_merge_buildings(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    max_range_km: Option<f64>,
+    azimuth_step_deg: Option<f64>,
+    terrain_results: Vec<analysis::panorama::TerrainResult>,
+) -> Result<Vec<analysis::panorama::PanoramaPoint>, String> {
+    let max_range = max_range_km.unwrap_or(100.0);
+    let az_step = azimuth_step_deg.unwrap_or(0.01);
+
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+
+    Ok(analysis::panorama::merge_buildings_into_panorama(
+        &mut srtm, &conn,
+        &terrain_results,
+        radar_lat, radar_lon, radar_height_m,
+        max_range * 1000.0, az_step,
     ))
 }
 
@@ -1732,6 +1935,124 @@ async fn resolve_declination(app_handle: &tauri::AppHandle, file_path: &str, rad
     }
 }
 
+/// 장애물 월간 분석 IPC 커맨드
+#[tauri::command]
+async fn analyze_obstacle_monthly(
+    app_handle: tauri::AppHandle,
+    radar_file_sets: Vec<analysis::obstacle_monthly::RadarFileSet>,
+    exclude_mode_s: Vec<String>,
+) -> Result<analysis::obstacle_monthly::ObstacleMonthlyResult, String> {
+    use analysis::obstacle_monthly::{self as om, ObstacleMonthlyProgress};
+
+    info!(
+        "Command: analyze_obstacle_monthly({} radars, exclude={:?})",
+        radar_file_sets.len(),
+        exclude_mode_s
+    );
+
+    // 편각: 첫 레이더의 첫 파일 기준
+    let mag_dec = if let Some(rfs) = radar_file_sets.first() {
+        if let Some(first_path) = rfs.file_paths.first() {
+            resolve_declination(&app_handle, first_path, rfs.radar_lat, rfs.radar_lon).await
+        } else {
+            -8.5
+        }
+    } else {
+        -8.5
+    };
+
+    let handle = app_handle.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut radar_results = Vec::new();
+
+        for radar in &radar_file_sets {
+            let h = handle.clone();
+            let progress_fn = move |p: ObstacleMonthlyProgress| {
+                let _ = h.emit("obstacle-monthly-progress", p);
+            };
+
+            match om::analyze_radar_monthly(radar, &exclude_mode_s, mag_dec, &progress_fn) {
+                Ok(result) => radar_results.push(result),
+                Err(e) => {
+                    info!("[ObstacleMonthly] 레이더 '{}' 분석 실패: {}", radar.radar_name, e);
+                }
+            }
+        }
+
+        om::ObstacleMonthlyResult { radar_results }
+    })
+    .await
+    .map_err(|e| format!("분석 스레드 오류: {}", e))?;
+
+    Ok(result)
+}
+
+/// 건물 제외 커버리지 프로파일 계산 (장애물 월간 보고서용)
+#[tauri::command]
+fn compute_coverage_terrain_profile_excluding(
+    state: tauri::State<'_, AppState>,
+    radar_name: String,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_altitude: f64,
+    antenna_height: f64,
+    range_nm: f64,
+    exclude_manual_ids: Vec<i64>,
+    bearing_step_deg: Option<f64>,
+) -> Result<analysis::coverage::ProfileMeta, String> {
+    let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    Ok(analysis::coverage::compute_terrain_profile_excluding(
+        &mut srtm, &conn,
+        &radar_name, radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
+        &exclude_manual_ids,
+        bearing_step_deg.unwrap_or(0.1),
+    ))
+}
+
+/// 건물 제외 캐시에서 레이어 배치 계산
+#[tauri::command]
+fn compute_coverage_layers_batch_excluded(
+    alt_fts: Vec<f64>,
+    bearing_step: Option<usize>,
+) -> Result<Vec<analysis::coverage::CoverageLayer>, String> {
+    let step = bearing_step.unwrap_or(1);
+    Ok(analysis::coverage::compute_layers_batch_excluded(&alt_fts, step))
+}
+
+/// GPU용 커버리지 프리샘플 (SRTM + 건물 → base64)
+#[tauri::command]
+fn presample_coverage_elevations(
+    state: tauri::State<'_, AppState>,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_altitude: f64,
+    antenna_height: f64,
+    range_nm: f64,
+    bearing_step_deg: Option<f64>,
+    exclude_manual_ids: Option<Vec<i64>>,
+    batch_start_ray: Option<usize>,
+    batch_ray_count: Option<usize>,
+) -> Result<analysis::coverage::PreSampledCoverage, String> {
+    let step = bearing_step_deg.unwrap_or(0.1);
+    let total_rays = (360.0 / step).floor() as usize;
+    let start = batch_start_ray.unwrap_or(0);
+    let count = batch_ray_count.unwrap_or(total_rays);
+
+    let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+
+    Ok(analysis::coverage::presample_elevations_batch(
+        &mut srtm,
+        &conn,
+        radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
+        step,
+        exclude_manual_ids.as_deref(),
+        start,
+        count,
+    ))
+}
+
 /// 자기편각 조회 IPC 커맨드
 #[tauri::command]
 async fn get_magnetic_declination(
@@ -1836,6 +2157,59 @@ async fn refresh_wmm_to_noaa(app_handle: &tauri::AppHandle) -> Result<usize, Str
     Ok(refreshed)
 }
 
+// ---------- 커버리지 계산 (GPU/rayon 최적화) ----------
+
+#[tauri::command]
+fn compute_coverage_terrain_profile(
+    state: tauri::State<'_, AppState>,
+    radar_name: String,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_altitude: f64,
+    antenna_height: f64,
+    range_nm: f64,
+    bearing_step_deg: Option<f64>,
+) -> Result<analysis::coverage::ProfileMeta, String> {
+    let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    Ok(analysis::coverage::compute_terrain_profile(
+        &mut srtm, &conn, &radar_name,
+        radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
+        bearing_step_deg.unwrap_or(0.1),
+    ))
+}
+
+#[tauri::command]
+fn compute_coverage_layer(
+    alt_ft: f64,
+    bearing_step: Option<usize>,
+) -> Result<Option<analysis::coverage::CoverageLayer>, String> {
+    Ok(analysis::coverage::compute_layer(alt_ft, bearing_step.unwrap_or(1)))
+}
+
+#[tauri::command]
+fn compute_coverage_layers_batch(
+    alt_fts: Vec<f64>,
+    bearing_step: Option<usize>,
+) -> Result<Vec<analysis::coverage::CoverageLayer>, String> {
+    Ok(analysis::coverage::compute_layers_batch(&alt_fts, bearing_step.unwrap_or(1)))
+}
+
+#[tauri::command]
+fn is_coverage_profile_valid(
+    radar_name: String,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height: f64,
+) -> bool {
+    analysis::coverage::is_cache_valid(&radar_name, radar_lat, radar_lon, radar_height)
+}
+
+#[tauri::command]
+fn invalidate_coverage_profile() {
+    analysis::coverage::invalidate_cache();
+}
+
 // ---------- App Entry Point ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1934,6 +2308,9 @@ pub fn run() {
             export_database,
             import_database,
             calculate_los_panorama,
+            presample_panorama_elevations,
+            presample_coverage_elevations,
+            panorama_merge_buildings,
             save_panorama_cache,
             load_panorama_cache,
             clear_panorama_cache,
@@ -1971,6 +2348,12 @@ pub fn run() {
             save_coverage_cache,
             load_coverage_cache,
             clear_coverage_cache,
+            // 커버리지 계산 (rayon 최적화)
+            compute_coverage_terrain_profile,
+            compute_coverage_layer,
+            compute_coverage_layers_batch,
+            is_coverage_profile_valid,
+            invalidate_coverage_profile,
             // 보고서
             save_report,
             list_saved_reports,
@@ -1979,6 +2362,12 @@ pub fn run() {
             // 자기편각
             get_magnetic_declination,
             refresh_declination_cache,
+            // 장애물 월간 분석
+            analyze_obstacle_monthly,
+            compute_coverage_terrain_profile_excluding,
+            compute_coverage_layers_batch_excluded,
+            // WebView2 네이티브 PDF
+            webview_print_to_pdf,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

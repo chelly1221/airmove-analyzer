@@ -63,6 +63,8 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "webview2-com",
+ "windows",
  "wmm",
  "zip",
 ]

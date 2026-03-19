@@ -119,6 +119,11 @@ interface AppState {
   setPanoramaActivePoint: (pt: PanoramaPoint | null) => void;
   panoramaPinned: boolean;
   setPanoramaPinned: (v: boolean) => void;
+  // 파노라마 맵 오버레이 (장애물 경계 폴리곤)
+  panoramaOverlayData: PanoramaPoint[] | null;
+  setPanoramaOverlayData: (data: PanoramaPoint[] | null) => void;
+  panoramaOverlayVisible: boolean;
+  setPanoramaOverlayVisible: (v: boolean) => void;
 
   // 레이더 커버리지 (다중 고도 레이어)
   coverageData: MultiCoverageResult | null;
@@ -167,6 +172,10 @@ interface AppState {
   setLoading: (loading: boolean) => void;
   loadingMessage: string;
   setLoadingMessage: (msg: string) => void;
+
+  // 개발자 모드
+  devMode: boolean;
+  setDevMode: (v: boolean) => void;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -298,23 +307,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   flights: [],
   setFlights: (flights) => set({ flights }),
   clearFlights: () => set({ flights: [] }),
-  mergeFlights: (ids) => set((state) => {
-    if (ids.length < 2) return state;
+  mergeFlights: (ids) => {
+    const state = get();
+    if (ids.length < 2) return;
     const selected = state.flights.filter((f) => ids.includes(f.id));
-    if (selected.length < 2) return state;
-    // 같은 mode_s만 병합 가능
+    if (selected.length < 2) return;
     const modeS = selected[0].mode_s.toUpperCase();
-    if (!selected.every((f) => f.mode_s.toUpperCase() === modeS)) return state;
-    const merged = manualMergeFlights(selected, state.radarSite);
-    const remaining = state.flights.filter((f) => !ids.includes(f.id));
-    const flights = [...remaining, merged].sort((a, b) => a.start_time - b.start_time);
-    // DB에 병합 이력 저장
-    invoke("save_manual_merge", {
-      sourceFlightIdsJson: JSON.stringify(ids),
-      modeS,
-    }).catch((e) => console.warn("[Merge] DB 저장 실패:", e));
-    return { flights };
-  }),
+    if (!selected.every((f) => f.mode_s.toUpperCase() === modeS)) return;
+    manualMergeFlights(selected, state.radarSite).then((merged) => {
+      const remaining = get().flights.filter((f) => !ids.includes(f.id));
+      const flights = [...remaining, merged].sort((a, b) => a.start_time - b.start_time);
+      set({ flights });
+      invoke("save_manual_merge", {
+        sourceFlightIdsJson: JSON.stringify(ids),
+        modeS,
+      }).catch((e) => console.warn("[Merge] DB 저장 실패:", e));
+    });
+  },
 
   // 레이더 사이트 (기본: 김포 #1)
   radarSite: {
@@ -455,6 +464,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   setPanoramaActivePoint: (pt) => set({ panoramaActivePoint: pt }),
   panoramaPinned: false,
   setPanoramaPinned: (v) => set({ panoramaPinned: v }),
+  panoramaOverlayData: null,
+  setPanoramaOverlayData: (data) => set({ panoramaOverlayData: data }),
+  panoramaOverlayVisible: false,
+  setPanoramaOverlayVisible: (v) => set({ panoramaOverlayVisible: v }),
 
   // 레이더 커버리지 (다중 고도 레이어)
   coverageData: null,
@@ -501,8 +514,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   // 보고서 메타데이터
   reportMetadata: {
     department: "레이더관제부",
-    author: "서상현",
-    docPrefix: "RDR-RPT",
+    docPrefix: "RDRPT",
     organization: "김포공항",
     siteName: "레이더송신소",
     footer: "비행검사기 항적 분석 체계 - 자동 생성 보고서",
@@ -531,4 +543,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   setLoading: (loading) => set({ loading }),
   loadingMessage: "",
   setLoadingMessage: (msg) => set({ loadingMessage: msg }),
+
+  // 개발자 모드
+  devMode: false,
+  setDevMode: (v) => {
+    set({ devMode: v });
+    persistSetting("dev_mode", v);
+  },
 }));

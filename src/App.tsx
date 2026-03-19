@@ -11,6 +11,7 @@ import LossAnalysis from "./pages/LossAnalysis";
 import ReportGeneration from "./pages/ReportGeneration";
 import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
+import DevOverlay from "./components/DevOverlay";
 import { Loader2 } from "lucide-react";
 import type { Aircraft, ElevationPoint, FlightRecord, LOSProfileData, ParseStatistics, RadarSite, SavedReportSummary, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
 import { consolidateFlights } from "./utils/flightConsolidation";
@@ -65,7 +66,7 @@ function useRestoreSavedData() {
 
       // 1) 설정 복원 (customRadarSites, radarSite)
       try {
-        const settingsToLoad = ["custom_radar_sites", "selected_radar_site", "report_metadata"];
+        const settingsToLoad = ["custom_radar_sites", "selected_radar_site", "report_metadata", "dev_mode"];
         for (const key of settingsToLoad) {
           const value = await invoke<string | null>("load_setting", { key });
           if (!value) continue;
@@ -78,6 +79,9 @@ function useRestoreSavedData() {
           } else if (key === "report_metadata") {
             const meta = JSON.parse(value);
             useAppStore.getState().setReportMetadata(meta);
+          } else if (key === "dev_mode") {
+            const devMode = JSON.parse(value);
+            if (devMode === true) useAppStore.setState({ devMode: true });
           }
         }
       } catch (e) {
@@ -169,7 +173,7 @@ function useRestoreSavedData() {
 
         // flights 재생성 (flightHistory 로드 후 consolidateFlights)
         const state = useAppStore.getState();
-        let flights = consolidateFlights(
+        let flights = await consolidateFlights(
           state.rawTrackPoints,
           state.flightHistory,
           state.aircraft,
@@ -189,7 +193,7 @@ function useRestoreSavedData() {
               );
               const toMerge = candidates.filter((f) => sourceIds.includes(f.id));
               if (toMerge.length >= 2) {
-                const merged = doMerge(toMerge, state.radarSite);
+                const merged = await doMerge(toMerge, state.radarSite);
                 flights = flights.filter((f) => !toMerge.some((m) => m.id === f.id));
                 flights.push(merged);
               }
@@ -581,6 +585,9 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* Developer mode overlay */}
+      <DevOverlay />
 
       {/* Global loading overlay */}
       {loading && (

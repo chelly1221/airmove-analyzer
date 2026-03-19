@@ -1,5 +1,5 @@
 /**
- * 경량 WebGL2 2D 렌더러 — 외장 GPU 우선 사용
+ * 경량 WebGL2 2D 렌더러 — 각 캔버스에 직접 WebGL2 컨텍스트 생성
  * powerPreference: 'high-performance' → 이산 GPU(RTX 등) 우선 선택
  */
 
@@ -66,6 +66,33 @@ in vec4 v_color;
 out vec4 fragColor;
 void main(){ fragColor = v_color; }`;
 
+const LINE_VERT = `#version 300 es
+layout(location=0) in vec2 a_quad;
+layout(location=1) in vec2 a_start;
+layout(location=2) in vec2 a_end;
+layout(location=3) in float a_width;
+layout(location=4) in vec4 a_color;
+uniform vec2 u_res;
+out vec4 v_color;
+void main() {
+  vec2 dir = a_end - a_start;
+  float len = length(dir);
+  if (len < 0.001) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); return; }
+  vec2 fwd = dir / len;
+  vec2 right = vec2(fwd.y, -fwd.x);
+  vec2 pos = a_start + fwd * (a_quad.x + 0.5) * len + right * a_quad.y * a_width;
+  vec2 ndc = (pos / u_res) * 2.0 - 1.0;
+  ndc.y = -ndc.y;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  v_color = a_color;
+}`;
+
+const LINE_FRAG = `#version 300 es
+precision highp float;
+in vec4 v_color;
+out vec4 fragColor;
+void main() { fragColor = v_color; }`;
+
 function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
   const s = gl.createShader(type)!;
   gl.shaderSource(s, src);
@@ -103,18 +130,30 @@ export interface RectData {
   color: [number, number, number, number];
 }
 
+export interface LineData {
+  x1: number; y1: number;
+  x2: number; y2: number;
+  width: number;
+  color: [number, number, number, number];
+}
+
 export class GPU2D {
   private gl: WebGL2RenderingContext;
   private cProg: WebGLProgram;
   private rProg: WebGLProgram;
+  private lProg: WebGLProgram;
   private cVAO: WebGLVertexArrayObject;
   private rVAO: WebGLVertexArrayObject;
+  private lVAO: WebGLVertexArrayObject;
   private cInstBuf: WebGLBuffer;
   private rInstBuf: WebGLBuffer;
+  private lInstBuf: WebGLBuffer;
   private cResLoc: WebGLUniformLocation;
   private rResLoc: WebGLUniformLocation;
+  private lResLoc: WebGLUniformLocation;
   private cQuadBuf: WebGLBuffer;
   private rQuadBuf: WebGLBuffer;
+  private lQuadBuf: WebGLBuffer;
   private vw = 0;
   private vh = 0;
 
@@ -123,6 +162,7 @@ export class GPU2D {
       alpha: true,
       premultipliedAlpha: false,
       antialias: true,
+      preserveDrawingBuffer: true,
       powerPreference: 'high-performance',
     });
     if (!gl) throw new Error('WebGL2 not available');
@@ -144,19 +184,32 @@ export class GPU2D {
     this.rResLoc = gl.getUniformLocation(this.rProg, 'u_res')!;
     gl.deleteShader(rvs); gl.deleteShader(rfs);
 
-    // Circle quad: triangle strip [-1,-1],[1,-1],[-1,1],[1,1]
+    // Line program
+    const lvs = compile(gl, gl.VERTEX_SHADER, LINE_VERT);
+    const lfs = compile(gl, gl.FRAGMENT_SHADER, LINE_FRAG);
+    this.lProg = linkProg(gl, lvs, lfs);
+    this.lResLoc = gl.getUniformLocation(this.lProg, 'u_res')!;
+    gl.deleteShader(lvs); gl.deleteShader(lfs);
+
+    // Circle quad
     this.cQuadBuf = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.cQuadBuf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
 
-    // Rect quad: triangle strip [0,0],[1,0],[0,1],[1,1]
+    // Rect quad
     this.rQuadBuf = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.rQuadBuf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 0,1, 1,1]), gl.STATIC_DRAW);
 
+    // Line quad
+    this.lQuadBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lQuadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5,-0.5, 0.5,-0.5, -0.5,0.5, 0.5,0.5]), gl.STATIC_DRAW);
+
     // Instance buffers
     this.cInstBuf = gl.createBuffer()!;
     this.rInstBuf = gl.createBuffer()!;
+    this.lInstBuf = gl.createBuffer()!;
 
     // Circle VAO
     this.cVAO = gl.createVertexArray()!;
@@ -165,7 +218,7 @@ export class GPU2D {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.cInstBuf);
-    const CS = 48; // 12 floats × 4 bytes
+    const CS = 48;
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, CS, 0);  gl.vertexAttribDivisor(1, 1);
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, CS, 8);  gl.vertexAttribDivisor(2, 1);
     gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, CS, 12); gl.vertexAttribDivisor(3, 1);
@@ -180,9 +233,23 @@ export class GPU2D {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.rInstBuf);
-    const RS = 32; // 8 floats × 4 bytes
+    const RS = 32;
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, RS, 0);  gl.vertexAttribDivisor(1, 1);
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, RS, 16); gl.vertexAttribDivisor(2, 1);
+    gl.bindVertexArray(null);
+
+    // Line VAO
+    this.lVAO = gl.createVertexArray()!;
+    gl.bindVertexArray(this.lVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lQuadBuf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lInstBuf);
+    const LS = 36;
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, LS, 0);  gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, LS, 8);  gl.vertexAttribDivisor(2, 1);
+    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 1, gl.FLOAT, false, LS, 16); gl.vertexAttribDivisor(3, 1);
+    gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 4, gl.FLOAT, false, LS, 20); gl.vertexAttribDivisor(4, 1);
     gl.bindVertexArray(null);
   }
 
@@ -218,6 +285,9 @@ export class GPU2D {
   }
 
   noScissor() { this.gl.disable(this.gl.SCISSOR_TEST); }
+
+  /** no-op (직접 렌더링이므로 flush 불필요, API 호환용) */
+  flush() {}
 
   drawCircles(circles: CircleData[]) {
     if (!circles.length) return;
@@ -257,15 +327,38 @@ export class GPU2D {
     gl.bindVertexArray(null);
   }
 
+  drawLines(lines: LineData[]) {
+    if (!lines.length) return;
+    const gl = this.gl;
+    const buf = new Float32Array(lines.length * 9);
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i], o = i * 9;
+      buf[o]=l.x1; buf[o+1]=l.y1; buf[o+2]=l.x2; buf[o+3]=l.y2;
+      buf[o+4]=l.width;
+      buf[o+5]=l.color[0]; buf[o+6]=l.color[1]; buf[o+7]=l.color[2]; buf[o+8]=l.color[3];
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lInstBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, buf, gl.DYNAMIC_DRAW);
+    gl.useProgram(this.lProg);
+    gl.uniform2f(this.lResLoc, this.vw, this.vh);
+    gl.bindVertexArray(this.lVAO);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, lines.length);
+    gl.bindVertexArray(null);
+  }
+
   dispose() {
     const gl = this.gl;
     gl.deleteProgram(this.cProg);
     gl.deleteProgram(this.rProg);
+    gl.deleteProgram(this.lProg);
     gl.deleteVertexArray(this.cVAO);
     gl.deleteVertexArray(this.rVAO);
+    gl.deleteVertexArray(this.lVAO);
     gl.deleteBuffer(this.cInstBuf);
     gl.deleteBuffer(this.rInstBuf);
+    gl.deleteBuffer(this.lInstBuf);
     gl.deleteBuffer(this.cQuadBuf);
     gl.deleteBuffer(this.rQuadBuf);
+    gl.deleteBuffer(this.lQuadBuf);
   }
 }

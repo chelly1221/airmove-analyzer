@@ -5,7 +5,7 @@ import { forwardRef } from "react";
 import type { ReportMetadata } from "../../types";
 
 interface CoverPageProps {
-  template: "weekly" | "monthly" | "flights" | "single" | "obstacle";
+  template: "weekly" | "monthly" | "flights" | "single" | "obstacle" | "obstacle_monthly";
   radarName: string;
   metadata: ReportMetadata;
   editable: boolean;
@@ -15,10 +15,20 @@ interface CoverPageProps {
   onSubtitleChange: (v: string) => void;
 }
 
+const templateCodeMap: Record<string, string> = {
+  weekly: "WK",
+  monthly: "MO",
+  flights: "FL",
+  single: "SG",
+  obstacle: "OB",
+  obstacle_monthly: "OM",
+};
+
 const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
-  ({ template: _template, radarName, metadata, editable, title, onTitleChange, subtitle, onSubtitleChange }, ref) => {
+  ({ template, radarName, metadata, editable, title, onTitleChange, subtitle, onSubtitleChange }, ref) => {
     const now = new Date();
-    const docNum = `${metadata.docPrefix}-${format(now, "yyyyMMdd")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
+    const tplCode = templateCodeMap[template] ?? "RPT";
+    const docNum = `${metadata.docPrefix}-${tplCode}-${format(now, "yyMMdd")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
 
     return (
       <ReportPage ref={ref}>
@@ -26,11 +36,11 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
         <div className="border-t-[3px] border-black" />
 
         {/* 문서 헤더 */}
-        <div className="mt-3 flex justify-between text-[11px] text-gray-500">
-          <span>{metadata.organization} {metadata.department}{metadata.siteName ? ` · ${metadata.siteName}` : ""}</span>
+        <div className="mt-3 flex justify-between text-[14px] text-gray-500">
+          <span>{metadata.organization} {metadata.department}{metadata.siteName ? ` ${metadata.siteName}` : ""}</span>
           <span>문서번호: {docNum}</span>
         </div>
-        <div className="mt-1 flex justify-between text-[11px] text-gray-500">
+        <div className="mt-1 flex justify-between text-[14px] text-gray-500">
           <span>작성일자: {format(now, "yyyy년 MM월 dd일")}</span>
           <span>레이더: {radarName}</span>
         </div>
@@ -39,7 +49,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
 
         {/* 중앙 제목 영역 */}
         <div className="flex flex-col items-center justify-center" style={{ marginTop: "80mm" }}>
-          <div className="mb-6 text-[13px] tracking-[0.3em] text-gray-400">
+          <div className="mb-6 text-[16px] tracking-[0.3em] text-gray-400">
             {metadata.organization}{metadata.siteName ? ` ${metadata.siteName}` : ""}
           </div>
 
@@ -48,7 +58,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
             onChange={onTitleChange}
             editable={editable}
             tag="h1"
-            className="text-center text-[28px] font-bold text-gray-900"
+            className="text-center text-[32px] font-bold text-gray-900"
           />
 
           <div className="mt-6 h-[2px] w-24 bg-[#a60739]" />
@@ -58,20 +68,15 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
             onChange={onSubtitleChange}
             editable={editable}
             tag="p"
-            className="mt-6 text-center text-[14px] text-gray-500"
+            className="mt-6 text-center text-[17px] text-gray-500"
           />
 
-          {metadata.author && (
-            <div className="mt-12 text-[12px] text-gray-400">
-              작성: {metadata.author}
-            </div>
-          )}
         </div>
 
         {/* 하단 */}
-        <div className="absolute bottom-[20mm] left-[20mm] right-[20mm]">
+        <div className="absolute bottom-[12mm] left-[14mm] right-[14mm]">
           <div className="border-t-[2px] border-gray-300" />
-          <p className="mt-2 text-center text-[9px] text-gray-400">
+          <p className="mt-2 text-center text-[12px] text-gray-400">
             {metadata.footer}
           </p>
         </div>
