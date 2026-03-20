@@ -57,7 +57,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { flightLabel } from "../utils/flightConsolidation";
-import { getCachedTerrainProfile, computeLayersFromProfile, type CoverageLayer } from "../utils/radarCoverage";
+import { computeLayersForAltitudes, isGPUCacheValidFor, type CoverageLayer } from "../utils/radarCoverage";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import type {
   Flight, LOSProfileData, WeatherSnapshot, Aircraft as AircraftType, ReportMetadata, PanoramaPoint,
@@ -358,11 +358,10 @@ export default function ReportGeneration() {
     return () => { cancelled = true; };
   }, [panoramaData]);
 
-  // 커버리지 레이어 (캐시된 지형 프로파일에서 비동기 계산)
+  // 커버리지 레이어 (GPU 캐시에서 동기 추출)
   const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
   useEffect(() => {
-    const profile = getCachedTerrainProfile();
-    if (!profile) { setCoverageLayers([]); return; }
+    if (!isGPUCacheValidFor(radarSite)) { setCoverageLayers([]); return; }
     // 100ft ~ 30000ft, 적절 간격으로 레이어 생성
     const maxAlt = 30000;
     const step = 1000;
@@ -373,11 +372,7 @@ export default function ReportGeneration() {
     if (altFts.length > 0 && altFts[altFts.length - 1] !== maxAlt) {
       altFts.push(maxAlt);
     }
-    let cancelled = false;
-    computeLayersFromProfile(profile, altFts).then((layers) => {
-      if (!cancelled) setCoverageLayers(layers);
-    });
-    return () => { cancelled = true; };
+    setCoverageLayers(computeLayersForAltitudes(altFts));
   }, [radarSite]);
 
   // OM 분석 완료 시 파노라마 자동 계산 (0.01° 해상도, 포함/미포함 2회)
@@ -1702,6 +1697,7 @@ function TemplateConfigModal({
   onClose: () => void;
   onGenerate: (tpl: ReportTemplate, sections: ReportSections, flightIds?: Set<string>, singleId?: string | null) => void;
 }) {
+  const radarSite = useAppStore((s) => s.radarSite);
   const tplLabel = templateDisplayLabel(template);
   const [sections, setSections] = useState<ReportSections>({ ...DEFAULT_SECTIONS });
 
@@ -1733,7 +1729,7 @@ function TemplateConfigModal({
       ];
     }
     if (template === "obstacle") {
-      const hasCoverage = !!getCachedTerrainProfile();
+      const hasCoverage = isGPUCacheValidFor(radarSite);
       return [
         { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
         { key: "obstacleSummary", label: "장애물 종합 요약", icon: Radio, desc: "LOS·파노라마 통합 KPI, 주요 장애물 TOP 5", available: losResults.length > 0 || panoramaData.length > 0 },

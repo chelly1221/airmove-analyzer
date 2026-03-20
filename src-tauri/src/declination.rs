@@ -4,7 +4,7 @@
 //! 2차: WMM 크레이트 (오프라인 fallback)
 //! API 복원 시 WMM fallback 데이터를 NOAA 데이터로 자동 치환
 
-use log::{info, warn};
+use log::info;
 use rusqlite::{params, Connection};
 
 /// 기본 fallback 편각 (한국, 2025년 기준)

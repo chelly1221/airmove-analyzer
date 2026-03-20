@@ -13,7 +13,6 @@ use crate::srtm::{self, SrtmReader};
 const R_EARTH_M: f64 = 6_371_000.0;
 const MAX_ELEVATION_DEG: f64 = 40.0;
 const FT_TO_M: f64 = 0.3048;
-const DEFAULT_BEARING_STEP: f64 = 0.1;
 const SAMPLES_PER_RAY: usize = 2400;
 
 /// Module-level profile cache

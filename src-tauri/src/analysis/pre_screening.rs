@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::loss::calculate_haversine_distance;
 use crate::analysis::obstacle_monthly::{AzSector, RadarFileSet, ObstacleMonthlyProgress};
-use crate::models::{RadarDetectionType, TrackPoint};
+use crate::models::TrackPoint;
 use crate::parser;
 use std::sync::Mutex;
 use crate::srtm::SrtmReader;

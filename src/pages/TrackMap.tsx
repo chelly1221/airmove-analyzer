@@ -15,6 +15,7 @@ import {
   Cloud,
   Building2,
   X,
+  Layers,
 } from "lucide-react";
 
 /** Dot 모드 핀 아이콘 (가느다란 선 위에 원) */
@@ -36,10 +37,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, AdsbTrack } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
-import { computeCoverageTerrainProfile, computeLayersFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
+import { computeMainCoverage, computeLayersForAltitudes, isGPUCacheValidFor, invalidateGPUCache, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer } from "../utils/radarCoverage";
 import { fetchCloudGridKorea, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 import { GPU2D, type RectData } from "../utils/gpu2d";
 import { addPlanOverlay, removePlanOverlay } from "../utils/planOverlay";
+import { generateGimpoOLS, OLS_COLORS, type OLSSurfaceData } from "../utils/olsSurfaces";
 
 /**
  * 탐지 유형 색상:
@@ -124,6 +126,7 @@ export default function TrackMap() {
   const altScale = 1;
   const [dotMode, setDotMode] = useState(false);
   const [showBuildings, setShowBuildings] = useState(false);
+  const [showOLS, setShowOLS] = useState(false);
   const [buildingOverlayData, setBuildingOverlayData] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; source: string }[]>([]);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
@@ -156,7 +159,7 @@ export default function TrackMap() {
   const [coverageAltMin, setCoverageAltMin] = useState(COVERAGE_MIN_ALT_FT); // 커버리지 최소 고도 (ft)
   const [coverageAltInput, setCoverageAltInput] = useState(10000); // 디바운스용 최대 입력값
   const [coverageAltMinInput, setCoverageAltMinInput] = useState(COVERAGE_MIN_ALT_FT); // 디바운스용 최소 입력값
-  const [terrainProfile, setTerrainProfile] = useState<CoverageTerrainProfile | null>(null);
+  const [gpuCacheReady, setGpuCacheReady] = useState(false);
   const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
   const coverageVisible = useAppStore((s) => s.coverageVisible);
   const setCoverageVisible = useAppStore((s) => s.setCoverageVisible);
@@ -179,6 +182,12 @@ export default function TrackMap() {
   const panoramaViewActive = useAppStore((s) => s.panoramaViewActive);
   const panoramaActivePoint = useAppStore((s) => s.panoramaActivePoint);
   const panoramaPinned = useAppStore((s) => s.panoramaPinned);
+
+  // 김포공항 장애물 제한표면 (OLS)
+  const olsData = useMemo<OLSSurfaceData | null>(() => {
+    if (!showOLS) return null;
+    return generateGimpoOLS();
+  }, [showOLS]);
 
   // LOS Analysis state
   const [losMode, setLosMode] = useState(false);
@@ -715,8 +724,8 @@ export default function TrackMap() {
 
   // 레이더 사이트 변경 시 커버리지 캐시 무효화 (이름+좌표+고도 모두 비교)
   useEffect(() => {
-    if (!isCacheValidFor(radarSite)) {
-      setTerrainProfile(null);
+    if (!isGPUCacheValidFor(radarSite)) {
+      setGpuCacheReady(false);
       setCoverageLayers([]);
       setCoverageVisible(false);
       setCoverageError("");
@@ -958,28 +967,15 @@ export default function TrackMap() {
     setCoverageProgressPct(0);
     setCoverageProgress("준비 중...");
     try {
-      if (force) invalidateTerrainCache();
+      if (force) invalidateGPUCache();
 
-      const profile = await computeCoverageTerrainProfile(radarSite, (pct, msg) => {
+      const result = await computeMainCoverage(radarSite, (pct, msg) => {
         setCoverageProgressPct(pct);
         setCoverageProgress(msg);
       });
-      setTerrainProfile(profile);
+      setGpuCacheReady(true);
       setCoverageVisible(true);
-
-      // DB에 대표 레이어 저장 (보고서 재활용)
-      const repAlts = [500, 1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
-      const repLayers = await computeLayersFromProfile(profile, repAlts);
-      setCoverageData({
-        radarName: radarSite.name,
-        radarLat: radarSite.latitude,
-        radarLon: radarSite.longitude,
-        radarAltitude: radarSite.altitude,
-        antennaHeight: radarSite.antenna_height,
-        maxElevDeg: profile.maxElevDeg,
-        layers: repLayers,
-        computedAt: Date.now(),
-      });
+      setCoverageData(result);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error("커버리지 계산 실패:", err);
@@ -1014,8 +1010,7 @@ export default function TrackMap() {
 
   // 고도 슬라이더 변경 시 레이어들 재계산 (최소~최대 고도 범위 겹침)
   useEffect(() => {
-    const profile = terrainProfile || getCachedTerrainProfile();
-    if (!profile || !coverageVisible) return;
+    if (!gpuCacheReady || !coverageVisible) return;
 
     const effMin = Math.min(coverageAltMin, coverageAlt);
     const effMax = Math.max(coverageAltMin, coverageAlt);
@@ -1025,7 +1020,6 @@ export default function TrackMap() {
     else if (range <= 5000) step = 500;
     else step = 1000;
 
-    // bearingStep=10: 0.1°×10 = 1° 간격 (3600→360 포인트, 시각적 차이 없음)
     const altFts: number[] = [];
     for (let alt = effMin; alt <= effMax; alt += step) {
       altFts.push(alt);
@@ -1034,12 +1028,8 @@ export default function TrackMap() {
       altFts.push(effMax);
     }
 
-    let cancelled = false;
-    computeLayersFromProfile(profile, altFts, 10).then((layers) => {
-      if (!cancelled) setCoverageLayers(layers);
-    });
-    return () => { cancelled = true; };
-  }, [coverageAlt, coverageAltMin, terrainProfile, coverageVisible]);
+    setCoverageLayers(computeLayersForAltitudes(altFts));
+  }, [coverageAlt, coverageAltMin, gpuCacheReady, coverageVisible]);
 
   // Mode-S별 트랙 패스 데이터 (gap + radar_type 변경 시 분할)
   /** 1포인트 항적용 데이터 */
@@ -1408,6 +1398,7 @@ export default function TrackMap() {
           radiusUnits: "pixels",
           billboard: true,
           pickable: true,
+          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
           onHover: (info) => {
             if (info.object) {
               const p = info.object;
@@ -1449,6 +1440,7 @@ export default function TrackMap() {
           pickable: true,
           autoHighlight: true,
           highlightColor: [255, 255, 255, 80],
+          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
           onHover: (info) => {
             if (info.object && info.coordinate) {
               const d = info.object;
@@ -1509,6 +1501,7 @@ export default function TrackMap() {
           lineWidthMinPixels: 1,
           billboard: true,
           pickable: true,
+          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
           onHover: (info: any) => {
             if (info.object) {
               const d = info.object;
@@ -1551,6 +1544,7 @@ export default function TrackMap() {
           getWidth: 3,
           widthUnits: "pixels" as const,
           pickable: true,
+          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
           onHover: (info: any) => {
             if (info.object) {
               setHoverInfo({
@@ -1584,6 +1578,7 @@ export default function TrackMap() {
           radiusUnits: "pixels",
           billboard: true,
           pickable: true,
+          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
           onHover: (info) => {
             if (info.object) {
               const d = info.object;
@@ -1629,6 +1624,7 @@ export default function TrackMap() {
           sizeUnits: "meters",
           billboard: true,
           pickable: true,
+          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
           onHover: (info) => {
             if (info.object) {
               const d = info.object as typeof radarInfo;
@@ -1772,6 +1768,83 @@ export default function TrackMap() {
 
     }
 
+    // 김포공항 장애물 제한표면 (OLS)
+    if (olsData) {
+      // 원추표면 (외곽 → 수평표면까지 링)
+      layers.push(
+        new PolygonLayer({
+          id: "ols-conical",
+          data: [{ polygon: [olsData.conicalRing, olsData.horizontalRing] }],
+          getPolygon: (d: any) => d.polygon,
+          getFillColor: [...OLS_COLORS.conical, 35] as [number, number, number, number],
+          getLineColor: [...OLS_COLORS.conical, 180] as [number, number, number, number],
+          filled: true,
+          stroked: true,
+          lineWidthMinPixels: 1.5,
+          extruded: false,
+          parameters: { depthWriteEnabled: false },
+        })
+      );
+      // 수평표면 (45m 평면)
+      layers.push(
+        new PolygonLayer({
+          id: "ols-horizontal",
+          data: [{ polygon: olsData.horizontalRing }],
+          getPolygon: (d: any) => d.polygon,
+          getFillColor: [...OLS_COLORS.horizontal, 30] as [number, number, number, number],
+          getLineColor: [...OLS_COLORS.horizontal, 180] as [number, number, number, number],
+          filled: true,
+          stroked: true,
+          lineWidthMinPixels: 1.5,
+          extruded: false,
+          parameters: { depthWriteEnabled: false },
+        })
+      );
+      // 진입표면 (사다리꼴 × 4)
+      layers.push(
+        new PolygonLayer({
+          id: "ols-approach",
+          data: olsData.approachPolygons.map((p) => ({ polygon: p })),
+          getPolygon: (d: any) => d.polygon,
+          getFillColor: [...OLS_COLORS.approach, 40] as [number, number, number, number],
+          getLineColor: [...OLS_COLORS.approach, 200] as [number, number, number, number],
+          filled: true,
+          stroked: true,
+          lineWidthMinPixels: 1.5,
+          extruded: false,
+          parameters: { depthWriteEnabled: false },
+        })
+      );
+      // 전이표면 (측면 × 4)
+      layers.push(
+        new PolygonLayer({
+          id: "ols-transitional",
+          data: olsData.transitionalPolygons.map((p) => ({ polygon: p })),
+          getPolygon: (d: any) => d.polygon,
+          getFillColor: [...OLS_COLORS.transitional, 40] as [number, number, number, number],
+          getLineColor: [...OLS_COLORS.transitional, 200] as [number, number, number, number],
+          filled: true,
+          stroked: true,
+          lineWidthMinPixels: 1.5,
+          extruded: false,
+          parameters: { depthWriteEnabled: false },
+        })
+      );
+      // 원추표면 외곽선
+      layers.push(
+        new PathLayer({
+          id: "ols-conical-outline",
+          data: [{ path: olsData.conicalRing }],
+          getPath: (d: any) => d.path,
+          getColor: [...OLS_COLORS.conical, 220],
+          getWidth: 2,
+          widthMinPixels: 1.5,
+          widthMaxPixels: 3,
+          widthUnits: "pixels" as const,
+        })
+      );
+    }
+
     // 커버리지 맵 (합성 스펙트럼: 동심 링 — 단일 레이어로 통합하여 GPU 오버헤드 최소화)
     if (coveragePolygonsList && coveragePolygonsList.length > 0) {
       const n = coveragePolygonsList.length;
@@ -1866,6 +1939,7 @@ export default function TrackMap() {
           stroked: true,
           lineWidthMinPixels: 1,
           pickable: true,
+          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
           onHover: (info: { object?: (typeof buildingOverlayData)[0]; x: number; y: number }) => {
             if (info.object) {
               const d = info.object;
@@ -1946,7 +2020,7 @@ export default function TrackMap() {
     }
 
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots, losBuildingHighlight, panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite]);
+  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, adsbTracks, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildingOverlayData, cloudDots, losBuildingHighlight, panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite, olsData]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2469,6 +2543,19 @@ export default function TrackMap() {
           </button>
         )}
 
+        {/* 장애물 제한표면 (OLS) 토글 */}
+        <button
+          onClick={() => setShowOLS(!showOLS)}
+          className={`rounded-lg p-1.5 transition-colors ${
+            showOLS
+              ? "bg-[#a60739] text-white shadow-sm"
+              : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+          }`}
+          title="김포공항 장애물 제한표면 (OLS)"
+        >
+          <Layers size={16} />
+        </button>
+
         {/* 레이더 커버리지 맵 */}
         <div ref={coverageAltRef} className="relative">
           <button
@@ -2534,7 +2621,7 @@ export default function TrackMap() {
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    {!terrainProfile || !isCacheValidFor(radarSite) ? (
+                    {!gpuCacheReady || !isGPUCacheValidFor(radarSite) ? (
                       <button
                         onClick={() => startCoverageCompute(false)}
                         className="w-full rounded-lg bg-[#a60739] py-2.5 text-xs font-medium text-white hover:bg-[#8a0630] transition-colors"
@@ -2546,7 +2633,7 @@ export default function TrackMap() {
                         onClick={() => startCoverageCompute(true)}
                         className="w-full rounded-lg border border-gray-200 py-2 text-xs text-gray-600 hover:bg-gray-50 transition-colors"
                       >
-                        지형 프로파일 재계산
+                        커버리지 재계산
                       </button>
                     )}
                   </div>
@@ -2560,7 +2647,7 @@ export default function TrackMap() {
                 )}
 
                 {/* 아래 컨트롤은 프로파일 계산 완료 후 활성화 */}
-                {terrainProfile && isCacheValidFor(radarSite) && (
+                {gpuCacheReady && isGPUCacheValidFor(radarSite) && (
                   <>
                     {/* 구분선 */}
                     <div className="border-t border-gray-100" />
@@ -2827,6 +2914,26 @@ export default function TrackMap() {
                     </div>
                   </>
                 )}
+                {showOLS && (
+                  <>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-4 rounded-sm" style={{ backgroundColor: `rgba(${OLS_COLORS.approach.join(",")},0.6)` }} />
+                      <span className="text-gray-600">진입표면</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-4 rounded-sm" style={{ backgroundColor: `rgba(${OLS_COLORS.transitional.join(",")},0.6)` }} />
+                      <span className="text-gray-600">전이표면</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-4 rounded-sm" style={{ backgroundColor: `rgba(${OLS_COLORS.horizontal.join(",")},0.6)` }} />
+                      <span className="text-gray-600">수평표면</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-2 w-4 rounded-sm" style={{ backgroundColor: `rgba(${OLS_COLORS.conical.join(",")},0.6)` }} />
+                      <span className="text-gray-600">원추표면</span>
+                    </div>
+                  </>
+                )}
                 {cloudGridVisible && cloudGrid && (
                   <div className="flex items-center gap-1.5">
                     <span className="inline-flex items-center justify-center h-3 w-4">
@@ -2837,7 +2944,7 @@ export default function TrackMap() {
                   </div>
                 )}
                 {coverageVisible && coverageLayers.length > 0 && (() => {
-                  const fmtAlt = (ft: number) => ft >= 1000 ? `${(ft / 1000).toFixed(ft % 1000 === 0 ? 0 : 1)}kft` : `${ft}ft`;
+                  const fmtAlt = (ft: number) => `${ft.toLocaleString()}ft`;
                   const sorted = [...coverageLayers].sort((a, b) => a.altitudeFt - b.altitudeFt);
                   // 밴드가 너무 많으면 대표 밴드만 표시 (최대 5개)
                   const maxBands = 5;

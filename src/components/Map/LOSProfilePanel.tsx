@@ -124,6 +124,14 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const [pinnedTrackIdx, setPinnedTrackIdx] = useState<number | null>(null);
   const [hoveredBldgIdx, setHoveredBldgIdx] = useState<number | null>(null);
   const [clickedBldgIdx, setClickedBldgIdx] = useState<number | null>(null);
+  // 사용자 조절 각도선
+  const [customAngleDeg, setCustomAngleDeg] = useState(0.5);
+  const [showCustomAngle, setShowCustomAngle] = useState(false);
+  const customAngleDegRef = useRef(0.5);
+  const showCustomAngleRef = useRef(false);
+  const isAngleDragging = useRef(false);
+  const angleHandlePosRef = useRef<{ x: number; y: number } | null>(null);
+  const chartScaleRef = useRef<{ zoomStart: number; zoomEnd: number; zoomRange: number; minY: number; maxY: number } | null>(null);
   // GPU 렌더링 (항적 포인트)
   const trackCanvasRef = useRef<HTMLCanvasElement>(null);
   const gpu2dRef = useRef<GPU2D | null>(null);
@@ -149,6 +157,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
   pinnedTrackIdxRef.current = pinnedTrackIdx;
   onTrackPointHoverRef.current = onTrackPointHover;
   onTrackPointHighlightRef.current = onTrackPointHighlight;
+  customAngleDegRef.current = customAngleDeg;
+  showCustomAngleRef.current = showCustomAngle;
   // 드래그 패닝
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
@@ -881,6 +891,20 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       setXZoom(next);
     };
     const onMouseDown = (e: MouseEvent) => {
+      // 각도선 핸들 드래그 체크
+      if (showCustomAngleRef.current && angleHandlePosRef.current) {
+        const rr = svg.getBoundingClientRect();
+        const sx = ((e.clientX - rr.left) / rr.width) * W;
+        const sy = ((e.clientY - rr.top) / rr.height) * H;
+        const hp = angleHandlePosRef.current;
+        const ddx = sx - hp.x, ddy = sy - hp.y;
+        if (ddx * ddx + ddy * ddy < 225) {
+          isAngleDragging.current = true;
+          svg.style.cursor = "ns-resize";
+          e.preventDefault();
+          return;
+        }
+      }
       // 줌 상태가 아니면 드래그 패닝 불필요
       const [s, en] = xZoomRef.current;
       if (s === 0 && en === 100) return;
@@ -894,6 +918,20 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       e.preventDefault();
     };
     const onMouseMoveGlobal = (e: MouseEvent) => {
+      if (isAngleDragging.current) {
+        const rr = svg.getBoundingClientRect();
+        const svgY = ((e.clientY - rr.top) / rr.height) * H;
+        const scl = chartScaleRef.current;
+        if (scl) {
+          const h = scl.minY + (1 - (svgY - PAD.top) / ch) * (scl.maxY - scl.minY);
+          const dist = scl.zoomEnd;
+          if (dist > 0) {
+            const angle = Math.atan((h - radarHeight) / (dist * 1000)) * 180 / Math.PI;
+            setCustomAngleDeg(Math.round(Math.max(-1, Math.min(45, angle)) * 100) / 100);
+          }
+        }
+        return;
+      }
       if (!isDragging.current) return;
       const rect = svg.getBoundingClientRect();
       const dx = e.clientX - dragStartX.current;
@@ -913,6 +951,11 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       setXZoom(next);
     };
     const onMouseUpGlobal = () => {
+      if (isAngleDragging.current) {
+        isAngleDragging.current = false;
+        svg.style.cursor = "";
+        return;
+      }
       if (isDragging.current) {
         isDragging.current = false;
         svg.style.cursor = "";
@@ -938,7 +981,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
   // 마우스 이동 핸들러 (SVG 좌표 → 거리 + 항적 포인트 히트테스트)
   const handleSvgMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
-    if (isDragging.current) return;
+    if (isDragging.current || isAngleDragging.current) return;
     const svg = svgRef.current;
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
@@ -1073,6 +1116,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const zoomRange = zoomEnd - zoomStart;
     const xScale = (d: number) => PAD.left + ((d - zoomStart) / zoomRange) * cw;
     const yScale = (h: number) => PAD.top + ch - ((h - minY) / (maxY - minY)) * ch;
+    chartScaleRef.current = { zoomStart, zoomEnd, zoomRange, minY, maxY };
+    if (!showCustomAngle) angleHandlePosRef.current = null;
 
     // 지형 채우기
     const terrainFill =
@@ -1322,13 +1367,37 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })}
 
+        {/* 사용자 조절 각도선 */}
+        {showCustomAngle && (() => {
+          const angRad = customAngleDeg * Math.PI / 180;
+          const endH = radarHeight + maxDistance * 1000 * Math.tan(angRad);
+          const linePath = `M ${xScale(0)} ${yScale(radarHeight)} L ${xScale(maxDistance)} ${yScale(endH)}`;
+          const hDist = zoomEnd;
+          const hH = radarHeight + hDist * 1000 * Math.tan(angRad);
+          const hX = xScale(hDist);
+          const hY = yScale(hH);
+          const hAMSL = hH + curvDrop(hDist);
+          angleHandlePosRef.current = { x: hX, y: hY };
+          return (
+            <>
+              <path d={linePath} fill="none" stroke="#f43f5e" strokeWidth={1.5} strokeDasharray="6 4" />
+              <text x={hX - 4} y={Math.max(PAD.top + 10, hY - 8)} textAnchor="end" fill="#f43f5e" fontSize={9} fontWeight="bold">
+                {customAngleDeg.toFixed(2)}°
+              </text>
+              <text x={hX - 4} y={Math.min(H - PAD.bottom - 2, hY + 14)} textAnchor="end" fill="#f43f5e" fontSize={8}>
+                {Math.round(hAMSL * M_TO_FT).toLocaleString()}ft
+              </text>
+            </>
+          );
+        })()}
+
         {/* LOS 선상 항적/Loss 포인트: GPU 캔버스에서 렌더링 (아래 trackCanvasRef) */}
 
         </g>{/* /chart-clip */}
 
         {/* 범례 (왼쪽 위) */}
         <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5})`}>
-          <rect x={-4} y={-6} width={270} height={chartData.significantBuildings.length > 0 ? 94 : 80} rx={4} fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
+          <rect x={-4} y={-6} width={270} height={(chartData.significantBuildings.length > 0 ? 94 : 80) + (showCustomAngle ? 14 : 0)} rx={4} fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
           <line x1={0} y1={0} x2={20} y2={0}
             stroke="#f59e0b" strokeWidth={1.8} />
           <text x={24} y={3} fill="#374151" fontSize={8}>
@@ -1366,15 +1435,25 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
               </text>
             </>
           )}
+          {showCustomAngle && (
+            <>
+              <line x1={0} y1={80 + (chartData.significantBuildings.length > 0 ? 14 : 0)} x2={20} y2={80 + (chartData.significantBuildings.length > 0 ? 14 : 0)}
+                stroke="#f43f5e" strokeWidth={1.5} strokeDasharray="6 4" />
+              <text x={24} y={80 + (chartData.significantBuildings.length > 0 ? 14 : 0) + 3} fill="#374151" fontSize={8}>
+                사용자 각도선 ({customAngleDeg.toFixed(2)}°)
+              </text>
+            </>
+          )}
         </g>
 
         {/* 인터랙티브 크로스헤어 + 호버 툴팁 */}
         {hoverData && hoveredTrackIdx === null && externalHoverIdx == null && pinnedTrackIdx === null && hoveredBldgIdx === null && (() => {
           const hXPos = xScale(hoverData.dist);
           const tooltipW = 195;
-          const tooltipH = 118;
+          const tooltipH = showCustomAngle ? 132 : 118;
           const tooltipX = hXPos + tooltipW + 12 > W ? hXPos - tooltipW - 8 : hXPos + 8;
           const tooltipY = PAD.top + 4;
+          const customAngleHoverAMSL = showCustomAngle ? radarHeight + hoverData.dist * 1000 * Math.tan(customAngleDeg * Math.PI / 180) + curvDrop(hoverData.dist) : 0;
           return (
             <g>
               {/* 차트 Y축 크로스헤어 (보조) */}
@@ -1396,6 +1475,11 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
               {/* 프레넬존 클리어런스 인디케이터 */}
               <circle cx={hXPos} cy={yScale(hoverData.fresnelH)} r={2.5}
                 fill="#ec4899" stroke="white" strokeWidth={0.8} />
+              {/* 각도선 인디케이터 */}
+              {showCustomAngle && (
+                <circle cx={hXPos} cy={yScale(radarHeight + hoverData.dist * 1000 * Math.tan(customAngleDeg * Math.PI / 180))} r={3}
+                  fill="#f43f5e" stroke="white" strokeWidth={0.8} />
+              )}
               {/* 툴팁 배경 */}
               <rect x={tooltipX} y={tooltipY} width={tooltipW} height={tooltipH}
                 rx={4} fill="rgba(255,255,255,0.95)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
@@ -1424,6 +1508,11 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
               <text x={tooltipX + 8} y={tooltipY + 98} fill="#a855f7" fontSize={8}>
                 최고탐지(CoS): <tspan fill="#374151" fontWeight="bold">{Math.round(hoverData.cosAMSL * 3.28084).toLocaleString()}ft</tspan>
               </text>
+              {showCustomAngle && (
+                <text x={tooltipX + 8} y={tooltipY + 112} fill="#f43f5e" fontSize={8}>
+                  각도선 {customAngleDeg.toFixed(2)}°: <tspan fill="#374151" fontWeight="bold">{Math.round(customAngleHoverAMSL * 3.28084).toLocaleString()}ft</tspan>
+                </text>
+              )}
             </g>
           );
         })()}
@@ -1530,6 +1619,16 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
             </g>
           );
         })()}
+        {/* 각도선 드래그 핸들 */}
+        {showCustomAngle && angleHandlePosRef.current && (
+          <circle
+            cx={angleHandlePosRef.current.x}
+            cy={Math.max(PAD.top, Math.min(H - PAD.bottom, angleHandlePosRef.current.y))}
+            r={6}
+            fill="#f43f5e" fillOpacity={0.8} stroke="white" strokeWidth={2}
+            style={{ cursor: "ns-resize" }}
+          />
+        )}
       </svg>
       </div>
     );
@@ -1571,6 +1670,34 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
             >
               건물 {showBuildings ? "ON" : "OFF"}
             </button>
+          )}
+          <button
+            onClick={() => setShowCustomAngle(!showCustomAngle)}
+            className={`rounded px-1.5 py-0.5 text-[10px] transition-colors ${
+              showCustomAngle
+                ? "bg-rose-100 text-rose-700"
+                : "bg-gray-100 text-gray-400"
+            }`}
+          >
+            각도선
+          </button>
+          {showCustomAngle && (
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                value={customAngleDeg}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  if (!isNaN(v)) setCustomAngleDeg(Math.max(-1, Math.min(45, Math.round(v * 100) / 100)));
+                }}
+                step={0.01}
+                min={-1}
+                max={45}
+                className="w-16 rounded border border-gray-300 bg-white px-1 py-0.5 text-[10px] text-center text-gray-700"
+                title="각도 (°)"
+              />
+              <span className="text-[10px] text-gray-400">°</span>
+            </div>
           )}
           {chartData && chartData.namedPeaks.length > 0 && (
             <span className="text-yellow-600">

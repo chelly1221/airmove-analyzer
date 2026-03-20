@@ -78,6 +78,15 @@ export default function Drawing() {
   const [draggingHandle, setDraggingHandle] = useState<"start" | "end" | null>(null);
   const rangeBarRef = useRef<HTMLDivElement>(null);
 
+  // 측면도 마우스 호버
+  const [sideHover, setSideHover] = useState<{
+    x: number; y: number; distNM: number; altFt: number;
+  } | null>(null);
+  const sideScaleRef = useRef<{
+    PAD: number; maxAbsEW: number; minAlt: number; maxAlt: number;
+    cw: number; ch: number; centerX: number; w: number; h: number;
+  } | null>(null);
+
   // 타임라인 줌 (스크롤로 확대/축소)
   const [zoomView, setZoomView] = useState<[number, number]>([0, 100]);
   const zoomViewRef = useRef<[number, number]>([0, 100]);
@@ -280,6 +289,25 @@ export default function Drawing() {
     setDraggingHandle(null);
   }, []);
 
+  // 측면도 마우스 호버 핸들러
+  const handleSideMouseMove = useCallback((e: React.MouseEvent) => {
+    const scale = sideScaleRef.current;
+    if (!scale) { setSideHover(null); return; }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const { PAD, maxAbsEW, minAlt, maxAlt, cw, ch, centerX, w, h } = scale;
+    if (mx < PAD || mx > w - PAD || my < PAD || my > h - PAD) {
+      setSideHover(null);
+      return;
+    }
+    const dEW = ((centerX - mx) / (cw / 2)) * maxAbsEW;
+    const distNM = dEW * KM_TO_NM;
+    const alt = ((PAD + ch - my) / ch) * (maxAlt - minAlt + 100) + minAlt;
+    const altFt = alt * M_TO_FT;
+    setSideHover({ x: mx, y: my, distNM, altFt });
+  }, []);
+
   // 등록 항공기 Mode-S 세트
   const registeredModeSSet = useMemo(
     () => new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase())),
@@ -405,6 +433,9 @@ export default function Drawing() {
     const xScale = (dEW: number) => centerX - (dEW / maxAbsEW) * (cw / 2);
     const yScale = (alt: number) => PAD + ch - ((alt - minAlt) / (maxAlt - minAlt + 100)) * ch;
 
+    // 호버 계산용 스케일 파라미터 저장
+    sideScaleRef.current = { PAD, maxAbsEW, minAlt, maxAlt, cw, ch, centerX, w, h };
+
     // GPU 초기화 (lazy-init)
     const gpuCanvas = gpuCanvasRef.current;
     if (gpuCanvas && !gpuRef.current) {
@@ -505,7 +536,15 @@ export default function Drawing() {
       ctx.fill();
     }
 
-    // ── 텍스트 라벨 (Canvas 2D) ──
+    // ── 축 라인 + 눈금 (Canvas 2D) ──
+    ctx.strokeStyle = "rgba(0,0,0,0.3)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD, PAD); ctx.lineTo(PAD, h - PAD); // Y축
+    ctx.moveTo(PAD, h - PAD); ctx.lineTo(w - PAD, h - PAD); // X축
+    ctx.stroke();
+
+    // ── 텍스트 라벨 + 눈금 (Canvas 2D) ──
     const altRangeFtLabel = (maxAlt - minAlt) * M_TO_FT;
     const yStepFtLabel = altRangeFtLabel > 30000 ? 5000 : altRangeFtLabel > 15000 ? 2000 : altRangeFtLabel > 5000 ? 1000 : altRangeFtLabel > 1500 ? 500 : 100;
     ctx.fillStyle = "rgba(0,0,0,0.45)";
@@ -513,7 +552,11 @@ export default function Drawing() {
     ctx.textAlign = "right";
     for (let ft = Math.ceil(minAltFt / yStepFtLabel) * yStepFtLabel; ft <= maxAltFt; ft += yStepFtLabel) {
       const y = yScale(ft / M_TO_FT);
-      ctx.fillText(`${ft.toLocaleString()}`, PAD - 5, y + 3);
+      ctx.fillText(`${ft.toLocaleString()}`, PAD - 6, y + 3);
+      // Y축 눈금
+      ctx.strokeStyle = "rgba(0,0,0,0.3)";
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(PAD - 4, y); ctx.lineTo(PAD, y); ctx.stroke();
     }
     const maxAbsEW_NM_label = maxAbsEW * KM_TO_NM;
     const ewStepNMLabel = maxAbsEW_NM_label > 100 ? 20 : maxAbsEW_NM_label > 50 ? 10 : maxAbsEW_NM_label > 20 ? 5 : maxAbsEW_NM_label > 10 ? 2 : 1;
@@ -523,6 +566,10 @@ export default function Drawing() {
       const x = xScale(nm * NM_TO_KM);
       if (x < PAD || x > w - PAD) continue;
       ctx.fillText(nm === 0 ? "0" : `${Math.abs(nm)}`, x, h - PAD + 14);
+      // X축 눈금
+      ctx.strokeStyle = "rgba(0,0,0,0.3)";
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, h - PAD); ctx.lineTo(x, h - PAD + 4); ctx.stroke();
     }
 
     ctx.fillStyle = "rgba(0,0,0,0.5)";
@@ -606,7 +653,7 @@ export default function Drawing() {
 
   const { rangeRingsGeoJSON, ringLabelsGeoJSON } = useMemo(() => {
     const maxDistNM = Math.max(maxDistKm * KM_TO_NM, 1);
-    const ringStepNM = maxDistNM > 100 ? 20 : maxDistNM > 50 ? 10 : maxDistNM > 20 ? 5 : maxDistNM > 10 ? 2 : 1;
+    const ringStepNM = 20; // 고정 20NM 간격
 
     const ringFeatures: GeoJSON.Feature[] = [];
     const labelFeatures: GeoJSON.Feature[] = [];
@@ -762,9 +809,46 @@ export default function Drawing() {
           <div className="flex flex-1 gap-4 min-h-0">
             {/* 측면도 */}
             <div className="flex-1 rounded-xl border border-gray-200 bg-gray-100 p-2">
-              <div className="relative h-full w-full">
+              <div className="relative h-full w-full" onMouseMove={handleSideMouseMove} onMouseLeave={() => setSideHover(null)}>
                 <canvas ref={sideCanvasRef} className="absolute inset-0 h-full w-full" />
                 <canvas ref={gpuCanvasRef} className="absolute inset-0 h-full w-full pointer-events-none" />
+                {sideHover && sideScaleRef.current && (
+                  <>
+                    {/* 크로스헤어 수직선 */}
+                    <div
+                      className="absolute pointer-events-none"
+                      style={{
+                        left: sideHover.x,
+                        top: sideScaleRef.current.PAD,
+                        width: 1,
+                        height: sideScaleRef.current.h - sideScaleRef.current.PAD * 2,
+                        backgroundColor: "rgba(0,0,0,0.2)",
+                      }}
+                    />
+                    {/* 크로스헤어 수평선 */}
+                    <div
+                      className="absolute pointer-events-none"
+                      style={{
+                        left: sideScaleRef.current.PAD,
+                        top: sideHover.y,
+                        width: sideScaleRef.current.w - sideScaleRef.current.PAD * 2,
+                        height: 1,
+                        backgroundColor: "rgba(0,0,0,0.2)",
+                      }}
+                    />
+                    {/* 툴팁 */}
+                    <div
+                      className="absolute pointer-events-none z-20 rounded bg-gray-800/90 px-2 py-1 text-xs text-white shadow-lg whitespace-nowrap"
+                      style={{
+                        left: sideHover.x + (sideHover.x > (sideScaleRef.current.w - 120) ? -90 : 12),
+                        top: sideHover.y + (sideHover.y < 60 ? 12 : -40),
+                      }}
+                    >
+                      <div className="font-mono">{Math.abs(sideHover.distNM).toFixed(1)} NM {sideHover.distNM >= 0 ? "W" : "E"}</div>
+                      <div className="font-mono">{Math.round(sideHover.altFt).toLocaleString()} ft</div>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
             {/* 평면도 (지도 오버레이) */}

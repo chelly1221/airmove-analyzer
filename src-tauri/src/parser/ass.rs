@@ -104,9 +104,9 @@ struct RecordExtra {
 /// 내부 표현: TrackPoint + 유령 탐지용 극좌표/트랙번호
 struct RichTrackPoint {
     point: TrackPoint,
-    track_number: Option<u16>,
-    rho_nm: f64,
-    theta_deg: f64,
+    _track_number: Option<u16>,
+    _rho_nm: f64,
+    _theta_deg: f64,
 }
 
 /// 분류 결과
@@ -268,9 +268,9 @@ impl TrackAssembler {
                 merged_point.mode_s = ms_code.to_string();
                 let rtp = RichTrackPoint {
                     point: merged_point,
-                    track_number: None,
-                    rho_nm: 0.0,
-                    theta_deg: 0.0,
+                    _track_number: None,
+                    _rho_nm: 0.0,
+                    _theta_deg: 0.0,
                 };
                 self.tracks.entry(ms_code.to_string()).or_default().push(rtp);
                 merged += 1;
@@ -965,9 +965,9 @@ pub fn parse_ass_file(
                                     if !filtering || filter_set.contains(&tp.mode_s.to_uppercase()) {
                                         let rtp = RichTrackPoint {
                                             point: tp,
-                                            track_number: extra.track_number,
-                                            rho_nm: extra.rho_nm,
-                                            theta_deg: extra.theta_deg,
+                                            _track_number: extra.track_number,
+                                            _rho_nm: extra.rho_nm,
+                                            _theta_deg: extra.theta_deg,
                                         };
                                         assembler.insert(rtp, mode3a);
                                         _point_count += 1;
