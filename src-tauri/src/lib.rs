@@ -1597,9 +1597,10 @@ fn update_building_group(
     name: String,
     color: String,
     memo: String,
+    plan_opacity: Option<f64>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    building::update_building_group(&conn, id, &name, &color, &memo)
+    building::update_building_group(&conn, id, &name, &color, &memo, plan_opacity)
 }
 
 #[tauri::command]
@@ -1609,6 +1610,51 @@ fn delete_building_group(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     building::delete_building_group(&conn, id)
+}
+
+#[tauri::command]
+fn save_group_plan_image(
+    state: tauri::State<'_, AppState>,
+    group_id: i64,
+    image_base64: String,
+    bounds_json: String,
+    opacity: f64,
+) -> Result<(), String> {
+    use base64::Engine;
+    let image_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&image_base64)
+        .map_err(|e| format!("base64 디코드 실패: {}", e))?;
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::save_group_plan_image(&conn, group_id, &image_bytes, &bounds_json, opacity)
+}
+
+#[tauri::command]
+fn load_group_plan_image(
+    state: tauri::State<'_, AppState>,
+    group_id: i64,
+) -> Result<Option<serde_json::Value>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    match building::load_group_plan_image(&conn, group_id)? {
+        Some((image_bytes, bounds_json, opacity)) => {
+            use base64::Engine;
+            let image_base64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+            Ok(Some(serde_json::json!({
+                "image_base64": image_base64,
+                "bounds_json": bounds_json,
+                "opacity": opacity,
+            })))
+        }
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn delete_group_plan_image(
+    state: tauri::State<'_, AppState>,
+    group_id: i64,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::delete_group_plan_image(&conn, group_id)
 }
 
 // ---------- 수동 등록 건물 ----------
@@ -1987,6 +2033,62 @@ async fn analyze_obstacle_monthly(
     Ok(result)
 }
 
+/// 장애물 전파영향 사전검토 IPC 커맨드
+#[tauri::command]
+async fn analyze_pre_screening(
+    app_handle: tauri::AppHandle,
+    radar_file_sets: Vec<analysis::obstacle_monthly::RadarFileSet>,
+    proposed_buildings: Vec<analysis::pre_screening::ProposedBuilding>,
+    exclude_mode_s: Vec<String>,
+) -> Result<analysis::pre_screening::PreScreeningResult, String> {
+    use analysis::obstacle_monthly::ObstacleMonthlyProgress;
+    use analysis::pre_screening as ps;
+
+    info!(
+        "Command: analyze_pre_screening({} radars, {} buildings, exclude={:?})",
+        radar_file_sets.len(), proposed_buildings.len(), exclude_mode_s
+    );
+
+    let mag_dec = if let Some(rfs) = radar_file_sets.first() {
+        if let Some(first_path) = rfs.file_paths.first() {
+            resolve_declination(&app_handle, first_path, rfs.radar_lat, rfs.radar_lon).await
+        } else {
+            -8.5
+        }
+    } else {
+        -8.5
+    };
+
+    let handle = app_handle.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        let mut radar_results = Vec::new();
+
+        for radar in &radar_file_sets {
+            let h = handle.clone();
+            let progress_fn = move |p: ObstacleMonthlyProgress| {
+                let _ = h.emit("pre-screening-progress", p);
+            };
+
+            match ps::analyze_pre_screening(
+                radar, &proposed_buildings, &exclude_mode_s, mag_dec, &state.srtm, &progress_fn,
+            ) {
+                Ok(result) => radar_results.push(result),
+                Err(e) => {
+                    info!("[PreScreening] 레이더 '{}' 분석 실패: {}", radar.radar_name, e);
+                }
+            }
+        }
+
+        ps::PreScreeningResult { radar_results }
+    })
+    .await
+    .map_err(|e| format!("분석 스레드 오류: {}", e))?;
+
+    Ok(result)
+}
+
 /// 건물 제외 커버리지 프로파일 계산 (장애물 월간 보고서용)
 #[tauri::command]
 fn compute_coverage_terrain_profile_excluding(
@@ -2326,6 +2428,9 @@ pub fn run() {
             add_building_group,
             update_building_group,
             delete_building_group,
+            save_group_plan_image,
+            load_group_plan_image,
+            delete_group_plan_image,
             list_manual_buildings,
             add_manual_building,
             update_manual_building,
@@ -2364,6 +2469,8 @@ pub fn run() {
             refresh_declination_cache,
             // 장애물 월간 분석
             analyze_obstacle_monthly,
+            // 장애물 사전검토
+            analyze_pre_screening,
             compute_coverage_terrain_profile_excluding,
             compute_coverage_layers_batch_excluded,
             // WebView2 네이티브 PDF

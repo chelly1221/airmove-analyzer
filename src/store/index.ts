@@ -3,13 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AdsbTrack,
   Aircraft,
+  BuildingGroup,
   CloudGridData,
   Flight,
   FlightRecord,
   LOSProfileData,
+  ManualBuilding,
   PageId,
   PanoramaPoint,
   ParseStatistics,
+  PlanImageBounds,
   RadarSite,
   ReportMetadata,
   SavedReportSummary,
@@ -165,6 +168,14 @@ interface AppState {
   addSavedReport: (report: SavedReportSummary) => void;
   removeSavedReport: (id: string) => void;
 
+  // 건물 그룹 + 수동 건물
+  buildingGroups: BuildingGroup[];
+  manualBuildings: ManualBuilding[];
+  loadBuildingGroups: () => Promise<void>;
+  loadManualBuildings: () => Promise<void>;
+  // 토지이용계획도 오버레이
+  activePlanOverlays: Map<number, { imageDataUrl: string; bounds: PlanImageBounds; opacity: number }>;
+  setActivePlanOverlay: (groupId: number, data: { imageDataUrl: string; bounds: PlanImageBounds; opacity: number } | null) => void;
   // UI
   activePage: PageId;
   setActivePage: (page: PageId) => void;
@@ -536,6 +547,36 @@ export const useAppStore = create<AppState>((set, get) => ({
     invoke("delete_saved_report", { id }).catch((e) => console.warn("[Report] DB 삭제 실패:", e));
   },
 
+  // 건물 그룹 + 수동 건물
+  buildingGroups: [],
+  manualBuildings: [],
+  loadBuildingGroups: async () => {
+    try {
+      const groups = await invoke<BuildingGroup[]>("list_building_groups");
+      set({ buildingGroups: groups });
+    } catch (e) {
+      console.warn("[BuildingGroups] 로드 실패:", e);
+    }
+  },
+  loadManualBuildings: async () => {
+    try {
+      const buildings = await invoke<ManualBuilding[]>("list_manual_buildings");
+      set({ manualBuildings: buildings });
+    } catch (e) {
+      console.warn("[ManualBuildings] 로드 실패:", e);
+    }
+  },
+  activePlanOverlays: new Map(),
+  setActivePlanOverlay: (groupId, data) =>
+    set((state) => {
+      const next = new Map(state.activePlanOverlays);
+      if (data) {
+        next.set(groupId, data);
+      } else {
+        next.delete(groupId);
+      }
+      return { activePlanOverlays: next };
+    }),
   // UI
   activePage: "upload",
   setActivePage: (page) => set({ activePage: page }),

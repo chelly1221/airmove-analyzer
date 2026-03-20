@@ -72,7 +72,6 @@ export default function Drawing() {
   const sideCanvasRef = useRef<HTMLCanvasElement>(null);
   const gpuRef = useRef<GPU2D | null>(null);
   const gpuCanvasRef = useRef<HTMLCanvasElement | null>(null);
-
   // 구간 선택
   const [rangeStart, setRangeStart] = useState(0);
   const [rangeEnd, setRangeEnd] = useState(100);

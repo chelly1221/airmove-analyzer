@@ -247,7 +247,9 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           let elev = points[i].elevation;
           if (showBuildings) {
             for (const b of buildings) {
-              if (Math.abs(b.distance_km - di) < 0.05) {
+              const nearD = b.near_dist_km ?? b.distance_km;
+              const farD = b.far_dist_km ?? b.distance_km;
+              if (di >= nearD - 0.05 && di <= farD + 0.05) {
                 const bTop = b.ground_elev_m + b.height_m;
                 if (bTop > elev) elev = bTop;
               }
@@ -340,16 +342,78 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     }
     if (showBuildings && buildings.length > 0) {
       for (const b of buildings) {
-        // 건물 꼭대기 = 지반고 + 건물높이 (AMSL)
-        obstacles.push({ distance: b.distance_km, elevation: b.ground_elev_m + b.height_m });
+        const bTop = b.ground_elev_m + b.height_m;
+        const nearD = b.near_dist_km ?? b.distance_km;
+        const farD = b.far_dist_km ?? b.distance_km;
+        // 건물 양쪽 끝에 장애물 추가 (도형 건물의 경우 양쪽 경계)
+        obstacles.push({ distance: nearD, elevation: bTop });
+        if (farD - nearD > 0.001) {
+          obstacles.push({ distance: farD, elevation: bTop });
+        }
       }
     }
     obstacles.sort((a, b) => a.distance - b.distance);
 
+    // 건물 경계 거리 목록 (쉐도잉 라인에 건물 경계점 삽입용)
+    interface BuildingEdge { nearD: number; farD: number; topElev: number; groundElev: number; }
+    const buildingEdges: BuildingEdge[] = [];
+    if (showBuildings && buildings.length > 0) {
+      for (const b of buildings) {
+        const nearD = b.near_dist_km ?? b.distance_km;
+        const farD = b.far_dist_km ?? b.distance_km;
+        buildingEdges.push({
+          nearD,
+          farD,
+          topElev: b.ground_elev_m + b.height_m,
+          groundElev: b.ground_elev_m,
+        });
+      }
+    }
+
+    // 프로파일에서 특정 거리의 지형 고도 보간
+    const interpTerrainElev = (d: number): number => {
+      if (d <= profile[0].distance) return profile[0].elevation;
+      if (d >= profile[profile.length - 1].distance) return profile[profile.length - 1].elevation;
+      for (let i = 1; i < profile.length; i++) {
+        if (profile[i].distance >= d) {
+          const t = (d - profile[i - 1].distance) / (profile[i].distance - profile[i - 1].distance);
+          return profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
+        }
+      }
+      return 0;
+    };
+
+    // 통합 샘플 거리: 프로파일 포인트 + 건물 경계 (쉐도잉 라인이 건물에서 수직으로 오르도록)
+    const sampleDists: number[] = profile.map(p => p.distance);
+    for (const be of buildingEdges) {
+      // 건물 바로 앞에도 포인트 삽입 (수직 전환 보장)
+      const eps = 0.0005; // ~0.5m
+      if (be.nearD > eps) sampleDists.push(be.nearD - eps);
+      sampleDists.push(be.nearD);
+      if (be.farD - be.nearD > 0.001) {
+        sampleDists.push(be.farD);
+        sampleDists.push(be.farD + eps);
+      } else {
+        sampleDists.push(be.nearD + eps);
+      }
+    }
+    // 중복 제거 & 정렬
+    const uniqueDists = [...new Set(sampleDists)].sort((a, b) => a - b);
+
+    // 특정 거리에서 건물 높이를 포함한 유효 고도 (곡률 미보정 AMSL)
+    const effectiveElevAt = (d: number): number => {
+      let elev = interpTerrainElev(d);
+      for (const be of buildingEdges) {
+        if (d >= be.nearD && d <= be.farD + 0.0001) {
+          if (be.topElev > elev) elev = be.topElev;
+        }
+      }
+      return elev;
+    };
+
     // 2) 최저 탐지가능 높이 - 직선 LOS (디스플레이 프레임에서 직접 shadow-casting → 직선)
-    const minDetStraight = profile.map((p, idx) => {
-      const d = p.distance;
-      if (idx === 0) return { distance: d, height: radarHeight };
+    const minDetStraight = uniqueDists.map((d) => {
+      if (d <= 0) return { distance: d, height: radarHeight };
 
       let maxShadow = radarHeight;
       for (const ob of obstacles) {
@@ -359,44 +423,42 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         if (shadow > maxShadow) maxShadow = shadow;
       }
 
+      const terrElev = effectiveElevAt(d);
+      const adjH = terrElev - curvDrop(d);
       return {
         distance: d,
-        height: Math.max(adjTerrain[idx].height, maxShadow),
+        height: Math.max(adjH, maxShadow),
       };
     });
 
     // 2.5) 최저 탐지가능 높이 - 직선 LOS + 프레넬존 80% 클리어런스
-    //    각 타겟점 j에 대해 사이 장애물을 0.8×F1만큼 올려서 shadow-casting
-    const minDetFresnel = profile.map((p, idx) => {
-      const dj = p.distance;
-      if (idx === 0) return { distance: dj, height: radarHeight };
-      const djM = dj * 1000;
+    const minDetFresnel = uniqueDists.map((d) => {
+      if (d <= 0) return { distance: d, height: radarHeight };
+      const dM = d * 1000;
 
       let maxShadow = radarHeight;
       for (const ob of obstacles) {
-        if (ob.distance <= 0 || ob.distance >= dj) continue;
+        if (ob.distance <= 0 || ob.distance >= d) continue;
         const diM = ob.distance * 1000;
         const adjH = ob.elevation - curvDrop(ob.distance);
-        // 프레넬존 반경: F1 = sqrt(λ × d1 × d2 / D), d1=diM, d2=djM-diM, D=djM
-        const f1 = Math.sqrt(LAMBDA_M * diM * (djM - diM) / djM);
+        const f1 = Math.sqrt(LAMBDA_M * diM * (dM - diM) / dM);
         const adjHFresnel = adjH + 0.8 * f1;
-        const shadow = radarHeight + (adjHFresnel - radarHeight) * (dj / ob.distance);
+        const shadow = radarHeight + (adjHFresnel - radarHeight) * (d / ob.distance);
         if (shadow > maxShadow) maxShadow = shadow;
       }
 
+      const terrElev = effectiveElevAt(d);
+      const adjH = terrElev - curvDrop(d);
       return {
-        distance: dj,
-        height: Math.max(adjTerrain[idx].height, maxShadow),
+        distance: d,
+        height: Math.max(adjH, maxShadow),
       };
     });
 
     // 3) 최저 탐지가능 높이 - 4/3 굴절 적용
-    //    4/3 프레임에서 shadow-casting → AMSL 복원 → 실제지구 디스플레이 프레임 변환
-    const minDetRefracted = profile.map((p, idx) => {
-      const d = p.distance;
-      if (idx === 0) return { distance: d, height: radarHeight };
+    const minDetRefracted = uniqueDists.map((d) => {
+      if (d <= 0) return { distance: d, height: radarHeight };
 
-      // 4/3 프레임에서 shadow-casting (통합 장애물 사용)
       let maxShadow = radarHeight;
       for (const ob of obstacles) {
         if (ob.distance <= 0 || ob.distance >= d) continue;
@@ -405,9 +467,9 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         if (shadow > maxShadow) maxShadow = shadow;
       }
 
-      const adjTerrain43 = profile[idx].elevation - curvDrop43(d);
+      const terrElev = effectiveElevAt(d);
+      const adjTerrain43 = terrElev - curvDrop43(d);
       const h43 = Math.max(adjTerrain43, maxShadow);
-      // 4/3 프레임 → AMSL → 실제지구 디스플레이 프레임
       const amslH = h43 + curvDrop43(d);
       return { distance: d, height: amslH - curvDrop(d) };
     });
@@ -571,7 +633,9 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     for (const p of braLine) if (inRange(p.distance)) heights.push(p.height);
     // 건물 꼭대기
     for (const b of significantBuildings) {
-      if (inRange(b.distance_km)) {
+      const nearD = b.near_dist_km ?? b.distance_km;
+      const farD = b.far_dist_km ?? b.distance_km;
+      if (inRange(nearD) || inRange(farD) || (nearD <= zoomStart && farD >= zoomEnd)) {
         heights.push((b.ground_elev_m + b.height_m) - curvDrop(b.distance_km));
         heights.push(b.ground_elev_m - curvDrop(b.distance_km));
       }
@@ -1129,38 +1193,75 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         {/* 지형 윤곽선 */}
         <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
 
-        {/* 건물 실루엣 (차폐 기여 건물만) — 넓은 투명 히트영역 + 얇은 시각선 */}
+        {/* 건물 실루엣 (차폐 기여 건물만) — 점 건물: 세로선, 도형 건물: 채워진 사각형 */}
         {showBuildings && chartData.significantBuildings.map((b, bi) => {
-          const bGroundAdj = b.ground_elev_m - curvDrop(b.distance_km);
-          const bTopAdj = (b.ground_elev_m + b.height_m) - curvDrop(b.distance_km);
-          const bx = xScale(b.distance_km);
-          const byBottom = yScale(bGroundAdj);
-          const byTop = yScale(bTopAdj);
-          const bHeight = byBottom - byTop;
+          const nearD = b.near_dist_km ?? b.distance_km;
+          const farD = b.far_dist_km ?? b.distance_km;
+          const hasExtent = (farD - nearD) > 0.001;
+          // 도형 건물: 양 끝의 곡률 보정 적용
+          const nearGroundAdj = b.ground_elev_m - curvDrop(nearD);
+          const nearTopAdj = (b.ground_elev_m + b.height_m) - curvDrop(nearD);
+          const farGroundAdj = hasExtent ? (b.ground_elev_m - curvDrop(farD)) : nearGroundAdj;
+          const farTopAdj = hasExtent ? ((b.ground_elev_m + b.height_m) - curvDrop(farD)) : nearTopAdj;
+          const bxNear = xScale(nearD);
+          const bxFar = hasExtent ? xScale(farD) : bxNear;
+          const byBottomNear = yScale(nearGroundAdj);
+          const byTopNear = yScale(nearTopAdj);
+          const byBottomFar = hasExtent ? yScale(farGroundAdj) : byBottomNear;
+          const byTopFar = hasExtent ? yScale(farTopAdj) : byTopNear;
+          const bHeight = byBottomNear - byTopNear;
           if (bHeight < 1) return null;
           const isHovered = hoveredBldgIdx === bi;
           const isClicked = clickedBldgIdx === bi;
+          const baseColor = isClicked ? "#f59e0b" : isHovered ? "#facc15" : b.isBlocking ? "rgba(239, 68, 68, 0.8)" : "rgba(71, 85, 105, 0.7)";
+          const fillColor = isClicked ? "rgba(245,158,11,0.3)" : isHovered ? "rgba(250,204,21,0.25)" : b.isBlocking ? "rgba(239,68,68,0.15)" : "rgba(71,85,105,0.12)";
+
+          if (hasExtent) {
+            // 도형 건물: 채워진 사각형 (사다리꼴 — 곡률 보정으로 양쪽 높이 다름)
+            const pathD = `M ${bxNear} ${byBottomNear} L ${bxNear} ${byTopNear} L ${bxFar} ${byTopFar} L ${bxFar} ${byBottomFar} Z`;
+            return (
+              <g key={`bld-${bi}`}>
+                {/* 투명 히트영역 */}
+                <path d={pathD} fill="transparent" stroke="transparent" strokeWidth={4}
+                  style={{ cursor: "pointer" }}
+                  onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage }); }}
+                  onMouseLeave={() => { setHoveredBldgIdx(null); if (clickedBldgIdx === null) onBuildingHover?.(null); }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const toggling = clickedBldgIdx === bi;
+                    setClickedBldgIdx(toggling ? null : bi);
+                    onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
+                  }}
+                />
+                {/* 채워진 사각형 + 윤곽선 */}
+                <path d={pathD} fill={fillColor} stroke={baseColor}
+                  strokeWidth={isClicked ? 2.5 : isHovered ? 2 : 1.5}
+                  pointerEvents="none"
+                />
+              </g>
+            );
+          }
+
+          // 점 건물: 기존 세로선 방식
           return (
             <g key={`bld-${bi}`}>
-              {/* 투명 히트영역 (시각적으로 보이지 않지만 넓은 클릭/호버 범위) */}
               <line
-                x1={bx} y1={byBottom} x2={bx} y2={byTop}
+                x1={bxNear} y1={byBottomNear} x2={bxNear} y2={byTopNear}
                 stroke="transparent"
                 strokeWidth={14}
                 style={{ cursor: "pointer" }}
                 onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage }); }}
                 onMouseLeave={() => { setHoveredBldgIdx(null); if (clickedBldgIdx === null) onBuildingHover?.(null); }}
                 onClick={(e) => {
-                  e.stopPropagation(); // SVG 항적 포인트 클릭과 분리
+                  e.stopPropagation();
                   const toggling = clickedBldgIdx === bi;
                   setClickedBldgIdx(toggling ? null : bi);
                   onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
                 }}
               />
-              {/* 실제 시각 표현 */}
               <line
-                x1={bx} y1={byBottom} x2={bx} y2={byTop}
-                stroke={isClicked ? "#f59e0b" : isHovered ? "#facc15" : b.isBlocking ? "rgba(239, 68, 68, 0.8)" : "rgba(71, 85, 105, 0.7)"}
+                x1={bxNear} y1={byBottomNear} x2={bxNear} y2={byTopNear}
+                stroke={baseColor}
                 strokeWidth={isClicked ? 3.5 : isHovered ? 3 : 2}
                 pointerEvents="none"
               />

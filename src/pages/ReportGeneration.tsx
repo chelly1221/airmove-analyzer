@@ -41,8 +41,6 @@ import ReportFlightComparisonSection from "../components/Report/ReportFlightComp
 import ReportFlightProfileSection from "../components/Report/ReportFlightProfileSection";
 import ReportFlightLossAnalysisSection from "../components/Report/ReportFlightLossAnalysisSection";
 import ReportPanoramaSection from "../components/Report/ReportPanoramaSection";
-import ReportObstacleSummarySection from "../components/Report/ReportObstacleSummarySection";
-import ReportCoverageMapSection from "../components/Report/ReportCoverageMapSection";
 import ReportOMSummarySection from "../components/Report/ReportOMSummarySection";
 import ReportOMDailyChart from "../components/Report/ReportOMDailyChart";
 import ReportOMWeeklyChart from "../components/Report/ReportOMWeeklyChart";
@@ -51,15 +49,20 @@ import ReportOMBuildingLOS from "../components/Report/ReportOMBuildingLOS";
 import ReportOMAltitudeDistribution from "../components/Report/ReportOMAltitudeDistribution";
 import ReportOMFindings from "../components/Report/ReportOMFindings";
 import ReportOMLossEvents from "../components/Report/ReportOMLossEvents";
+import ReportPSSummarySection from "../components/Report/ReportPSSummarySection";
+import ReportPSAngleHeight from "../components/Report/ReportPSAngleHeight";
+import ReportPSAdditionalLoss from "../components/Report/ReportPSAdditionalLoss";
 import { useReportExport } from "../components/Report/useReportExport";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { flightLabel } from "../utils/flightConsolidation";
 import { getCachedTerrainProfile, computeLayersFromProfile, type CoverageLayer } from "../utils/radarCoverage";
+import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import type {
   Flight, LOSProfileData, WeatherSnapshot, Aircraft as AircraftType, ReportMetadata, PanoramaPoint,
   ManualBuilding, BuildingGroup, RadarSite, AzSector, ObstacleMonthlyResult, ObstacleMonthlyProgress, SavedReportSummary,
+  PreScreeningResult,
 } from "../types";
 
 type ReportTemplate = "weekly" | "monthly" | "flights" | "single" | "obstacle" | "obstacle_monthly";
@@ -80,9 +83,11 @@ interface ReportSections {
   // 단일 상세 전용
   flightProfile: boolean;
   flightLossAnalysis: boolean;
-  // 장애물 보고서 전용
+  // 장애물 사전검토 보고서 전용
   obstacleSummary: boolean;
   coverageMap: boolean;
+  psAdditionalLoss: boolean;
+  psAngleHeight: boolean;
   // 장애물 월간 보고서 전용
   omSummary: boolean;
   omDailyPsr: boolean;
@@ -110,6 +115,8 @@ const DEFAULT_SECTIONS: ReportSections = {
   flightLossAnalysis: true,
   obstacleSummary: true,
   coverageMap: true,
+  psAdditionalLoss: true,
+  psAngleHeight: true,
   omSummary: true,
   omDailyPsr: true,
   omDailyLoss: true,
@@ -138,9 +145,10 @@ function getSectionToggles(template: ReportTemplate, _sections: ReportSections):
     return [
       { key: "cover", label: "표지" },
       { key: "obstacleSummary", label: "요약" },
+      { key: "psAngleHeight", label: "앙각/높이" },
+      { key: "psAdditionalLoss", label: "추가Loss" },
       { key: "coverageMap", label: "커버리지" },
       { key: "los", label: "LOS" },
-      { key: "panorama", label: "파노라마" },
     ];
   }
   if (template === "obstacle_monthly") {
@@ -186,7 +194,7 @@ function templateDisplayLabel(tpl: ReportTemplate): string {
     case "monthly": return "월간";
     case "flights": return "건별";
     case "single": return "상세";
-    case "obstacle": return "장애물";
+    case "obstacle": return "사전검토";
     case "obstacle_monthly": return "장애물월간";
   }
 }
@@ -225,6 +233,15 @@ export default function ReportGeneration() {
   const [omRecommendText, setOmRecommendText] = useState<string>("");
   const [omPanoWithTargets, setOmPanoWithTargets] = useState<Map<string, PanoramaPoint[]>>(new Map());
   const [omPanoWithoutTargets, setOmPanoWithoutTargets] = useState<Map<string, PanoramaPoint[]>>(new Map());
+
+  // 사전검토 분석 상태
+  const [psResult, setPsResult] = useState<PreScreeningResult | null>(null);
+  const [psSelectedBuildings, setPsSelectedBuildings] = useState<ManualBuilding[]>([]);
+  const [psSelectedRadarSites, setPsSelectedRadarSites] = useState<RadarSite[]>([]);
+  const [psLosMap, setPsLosMap] = useState<Map<string, LOSProfileData>>(new Map());
+  const [psCovLayersWith, setPsCovLayersWith] = useState<CoverageLayer[]>([]);
+  const [psCovLayersWithout, setPsCovLayersWithout] = useState<CoverageLayer[]>([]);
+  const [psAnalysisMonth, setPsAnalysisMonth] = useState<string>("");
 
   // 2주 초과 데이터 → 최근 31일만 사용
   const omResultTrimmed = useMemo(() => {
@@ -688,9 +705,10 @@ export default function ReportGeneration() {
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else if (template === "obstacle") {
       if (sections.obstacleSummary) nums.obstacleSummary = n++;
-      if (sections.coverageMap && coverageLayers.length > 0) nums.coverageMap = n++;
-      if (sections.los && losResults.length > 0) nums.los = n++;
-      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
+      if (sections.psAngleHeight && psResult) nums.psAngleHeight = n++;
+      if (sections.psAdditionalLoss && psResult) nums.psAdditionalLoss = n++;
+      if (sections.coverageMap && (psCovLayersWith.length > 0 || psCovLayersWithout.length > 0)) nums.coverageMap = n++;
+      if (sections.los && psLosMap.size > 0) nums.los = n++;
     } else if (template === "obstacle_monthly") {
       if (sections.omSummary) nums.omSummary = n++;
       if (sections.omDailyPsr) nums.omDailyPsr = n++;
@@ -766,7 +784,7 @@ export default function ReportGeneration() {
         )}
 
         {/* Template modal */}
-        {templateModalOpen && templateModalOpen !== "obstacle_monthly" && (
+        {templateModalOpen && templateModalOpen !== "obstacle_monthly" && templateModalOpen !== "obstacle" && (
           <TemplateConfigModal
             template={templateModalOpen}
             flights={flights}
@@ -795,22 +813,44 @@ export default function ReportGeneration() {
               setOmCovLayersWithBuildings(covWith);
               setOmCovLayersWithout(covWithout);
               setOmAnalysisMonth(monthStr ?? "");
-              // 소견/권고 자동 생성
-              const bldgNames = buildings.map((b) => b.name || `건물${b.id}`).join(", ");
-              const findings = result.radar_results.map((rr) => {
-                const avg = rr.daily_stats.length > 0 ? rr.daily_stats.reduce((s, d) => s + d.loss_rate, 0) / rr.daily_stats.length : 0;
-                const bl = rr.daily_stats.length > 0 ? rr.daily_stats.reduce((s, d) => s + d.baseline_loss_rate, 0) / rr.daily_stats.length : 0;
-                const dev = avg - bl;
-                const grade = avg < 0.5 ? "양호" : avg < 2 ? "주의" : "경고";
-                return `${rr.radar_name}: 분석 구간 평균 표적소실율 ${avg.toFixed(2)}%(기준선 ${bl.toFixed(2)}%, 편차 ${dev > 0 ? "+" : ""}${dev.toFixed(2)}%p), 종합 판정 '${grade}'`;
-              }).join("\n");
-              setOmFindingsText(`분석 대상: ${bldgNames}\n${findings}\n\n※ 상세 분석 소견을 입력하세요.`);
-              setOmRecommendText("※ 권고사항을 입력하세요.");
+              // 소견 자동 생성
+              setOmFindingsText(generateOMFindingsText({
+                radarResults: result.radar_results,
+                selectedBuildings: buildings,
+                radarSites: radars,
+                losMap: losMap,
+                covLayersWithBuildings: covWith,
+                covLayersWithout: covWithout,
+                analysisMonth: monthStr ?? "",
+              }));
+              setOmRecommendText("");
               handleGenerate("obstacle_monthly", sections);
             }}
             onCoverageReady={(covWith, covWithout) => {
               setOmCovLayersWithBuildings(covWith);
               setOmCovLayersWithout(covWithout);
+            }}
+          />
+        )}
+        {templateModalOpen === "obstacle" && (
+          <ObstaclePreScreeningModal
+            customRadarSites={customRadarSites}
+            aircraft={aircraft}
+            metadata={reportMetadata}
+            onClose={() => setTemplateModalOpen(null)}
+            onGenerate={(result, buildings, radars, losMap, covWith, covWithout, monthStr) => {
+              setPsResult(result);
+              setPsSelectedBuildings(buildings);
+              setPsSelectedRadarSites(radars);
+              setPsLosMap(losMap);
+              setPsCovLayersWith(covWith);
+              setPsCovLayersWithout(covWithout);
+              setPsAnalysisMonth(monthStr ?? "");
+              handleGenerate("obstacle", sections);
+            }}
+            onCoverageReady={(covWith, covWithout) => {
+              setPsCovLayersWith(covWith);
+              setPsCovLayersWithout(covWithout);
             }}
           />
         )}
@@ -970,46 +1010,58 @@ export default function ReportGeneration() {
           </>
         )}
 
-        {/* ─── 전파 장애물 ─── */}
-        {template === "obstacle" && (
+        {/* ─── 장애물 전파영향 사전검토 ─── */}
+        {template === "obstacle" && psResult && (
           <>
-            {sections.obstacleSummary && radarSite && (
+            {sections.obstacleSummary && (
               <ReportPage>
-                <ReportObstacleSummarySection
+                <ReportPSSummarySection
                   sectionNum={sectionNumbers.obstacleSummary ?? 1}
-                  losResults={losResults}
-                  panoramaData={panoramaData}
-                  radarSite={radarSite}
+                  result={psResult}
+                  buildings={psSelectedBuildings}
+                  radars={psSelectedRadarSites}
+                  analysisMonth={psAnalysisMonth}
                 />
               </ReportPage>
             )}
 
-            {sections.coverageMap && coverageLayers.length > 0 && radarSite && (
+            {sections.psAngleHeight && (
               <ReportPage>
-                <ReportCoverageMapSection
-                  sectionNum={sectionNumbers.coverageMap ?? 2}
-                  coverageLayers={coverageLayers}
-                  radarSite={radarSite}
+                <ReportPSAngleHeight
+                  sectionNum={sectionNumbers.psAngleHeight ?? 2}
+                  result={psResult}
                 />
               </ReportPage>
             )}
 
-            {sections.los && losResults.length > 0 && (
+            {sections.psAdditionalLoss && (
+              <ReportPage>
+                <ReportPSAdditionalLoss
+                  sectionNum={sectionNumbers.psAdditionalLoss ?? 3}
+                  result={psResult}
+                />
+              </ReportPage>
+            )}
+
+            {sections.coverageMap && (psCovLayersWith.length > 0 || psCovLayersWithout.length > 0) && psSelectedRadarSites[0] && (
+              <ReportPage>
+                <ReportOMCoverageDiff
+                  sectionNum={sectionNumbers.coverageMap ?? 4}
+                  layersWithTargets={psCovLayersWith}
+                  layersWithoutTargets={psCovLayersWithout}
+                  radarSite={psSelectedRadarSites[0]}
+                  lossPoints={[]}
+                  defaultAltFt={5000}
+                  selectedBuildings={psSelectedBuildings}
+                />
+              </ReportPage>
+            )}
+
+            {sections.los && psLosMap.size > 0 && (
               <ReportPage>
                 <ReportLOSSection
-                  sectionNum={sectionNumbers.los ?? 3}
-                  losResults={losResults}
-                />
-              </ReportPage>
-            )}
-
-            {sections.panorama && panoramaData.length > 0 && radarSite && (
-              <ReportPage>
-                <ReportPanoramaSection
-                  sectionNum={sectionNumbers.panorama ?? 4}
-                  panoramaData={panoramaData}
-                  radarSite={radarSite}
-                  peakNames={panoramaPeakNames}
+                  sectionNum={sectionNumbers.los ?? 5}
+                  losResults={[...psLosMap.values()]}
                 />
               </ReportPage>
             )}
@@ -1335,6 +1387,7 @@ interface TemplateRowDef {
   description: string;
   stats: { label: string; value: string | number }[];
   disabled: boolean;
+  wip?: boolean;
 }
 
 function TemplateTable({
@@ -1342,8 +1395,8 @@ function TemplateTable({
   totalLoss,
   avgLossPercent,
   losResults,
-  panoramaData,
-  coverageLayers,
+  panoramaData: _panoramaData,
+  coverageLayers: _coverageLayers,
   customRadarSites,
   onSelect,
 }: {
@@ -1368,7 +1421,8 @@ function TemplateTable({
         { label: "분석 비행", value: flights.length },
         { label: "소실 건수", value: totalLoss },
       ],
-      disabled: flights.length === 0,
+      disabled: true,
+      wip: true,
     },
     {
       type: "monthly",
@@ -1379,7 +1433,8 @@ function TemplateTable({
         { label: "평균 소실율", value: `${avgLossPercent.toFixed(1)}%` },
         { label: "LOS 분석", value: `${losResults.length}건` },
       ],
-      disabled: flights.length === 0,
+      disabled: true,
+      wip: true,
     },
     {
       type: "flights",
@@ -1390,7 +1445,8 @@ function TemplateTable({
         { label: "선택 가능", value: `${flights.length}건` },
         { label: "소실 건수", value: totalLoss },
       ],
-      disabled: flights.length === 0,
+      disabled: true,
+      wip: true,
     },
     {
       type: "single",
@@ -1398,19 +1454,19 @@ function TemplateTable({
       title: "단일비행 상세 보고서",
       description: "1건의 비행을 심층 분석합니다. 소실 구간 상세, 시간대별 분포, 고도-거리 프로파일이 포함됩니다.",
       stats: [{ label: "선택 가능", value: `${flights.length}건` }],
-      disabled: flights.length === 0,
+      disabled: true,
+      wip: true,
     },
     {
       type: "obstacle",
       icon: Radio,
-      title: "전파 장애물 보고서",
-      description: "레이더 전파 장애물을 종합 분석합니다. LOS 차단 분석, 360° 파노라마 장애물 탐색, 스펙트럼 커버리지 맵이 포함됩니다.",
+      title: "장애물 전파영향 사전검토 보고서",
+      description: "신규 건축물의 레이더 전파 차단 영향을 사전 분석합니다. 기존 지형 대비 추가 표적소실을 검출하고 최대 허용 건축높이를 산출합니다.",
       stats: [
-        { label: "LOS 분석", value: `${losResults.length}건` },
-        { label: "파노라마", value: panoramaData.length > 0 ? "있음" : "없음" },
-        { label: "커버리지", value: coverageLayers.length > 0 ? "있음" : "없음" },
+        { label: "레이더", value: `${customRadarSites.length}개` },
+        { label: "수동 건물", value: "선택식" },
       ],
-      disabled: losResults.length === 0 && panoramaData.length === 0 && coverageLayers.length === 0,
+      disabled: customRadarSites.length === 0,
     },
     {
       type: "obstacle_monthly",
@@ -1458,6 +1514,11 @@ function TemplateTable({
                 <span className="ml-3 text-[11px] text-gray-400">
                   {templateDisplayLabel(row.type)}
                 </span>
+                {row.wip && (
+                  <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-600">
+                    개발 중
+                  </span>
+                )}
               </div>
               <div className="flex shrink-0 gap-2">
                 {row.stats.map((s) => (
@@ -1960,6 +2021,16 @@ function calcBuildingAzExtent(
     const angExtent = dist > 0.01 ? Math.atan(semiMajor / 1000 / dist) * 180 / Math.PI : 5;
     const centerAz = bearingTo(center[0], center[1]);
     return { start_deg: (centerAz - angExtent + 360) % 360, end_deg: (centerAz + angExtent) % 360 };
+  } else if (building.geometry_type === "multi" && geo && Array.isArray(geo)) {
+    // 복합 도형: 서브 도형 재귀 처리하여 방위 합산
+    for (const sub of geo) {
+      const subType = sub.type;
+      const subJson = sub.json;
+      if (!subType || !subJson) continue;
+      const subBuilding = { ...building, geometry_type: subType, geometry_json: subJson };
+      const subResult = calcBuildingAzExtent(radarLat, radarLon, subBuilding);
+      bearings.push(subResult.start_deg, subResult.end_deg);
+    }
   }
 
   if (bearings.length <= 1) {
@@ -2522,6 +2593,476 @@ function ObstacleMonthlyConfigModal({
                 className="h-full rounded-full bg-[#a60739] transition-all"
                 style={{ width: `${progressPct}%` }}
               />
+            </div>
+          </div>
+        )}
+
+        {/* 버튼 */}
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button onClick={onClose} className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 transition-colors">
+            취소
+          </button>
+          <button
+            onClick={handleAnalyze}
+            disabled={!canAnalyze}
+            className="flex items-center gap-2 rounded-lg bg-[#a60739] px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40"
+          >
+            <BarChart3 size={14} />
+            분석 시작
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ── 장애물 전파영향 사전검토 모달 ──
+
+function ObstaclePreScreeningModal({
+  customRadarSites,
+  aircraft,
+  metadata,
+  onClose,
+  onGenerate,
+  onCoverageReady,
+}: {
+  customRadarSites: RadarSite[];
+  aircraft: AircraftType[];
+  metadata: ReportMetadata;
+  onClose: () => void;
+  onGenerate: (
+    result: PreScreeningResult,
+    buildings: ManualBuilding[],
+    radars: RadarSite[],
+    losMap: Map<string, LOSProfileData>,
+    covWith: CoverageLayer[],
+    covWithout: CoverageLayer[],
+    analysisMonth?: string,
+  ) => void;
+  onCoverageReady: (covWith: CoverageLayer[], covWithout: CoverageLayer[]) => void;
+}) {
+  const [checkedRadars, setCheckedRadars] = useState<Set<string>>(new Set());
+  const [manualBuildings, setManualBuildings] = useState<ManualBuilding[]>([]);
+  const [buildingGroups, setBuildingGroups] = useState<BuildingGroup[]>([]);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<number | null>>(new Set());
+  const [checkedBldgIds, setCheckedBldgIds] = useState<Set<number>>(new Set());
+  const [radarFiles, setRadarFiles] = useState<Map<string, string[]>>(new Map());
+  const [analysisMonth, setAnalysisMonth] = useState(() => format(new Date(), "yyyy-MM"));
+  const [analyzing, setAnalyzing] = useState(false);
+  const [progress, setProgress] = useState("");
+  const [progressPct, setProgressPct] = useState(0);
+
+  useEffect(() => {
+    invoke<ManualBuilding[]>("list_manual_buildings").then(setManualBuildings).catch(() => {});
+    invoke<BuildingGroup[]>("list_building_groups").then(setBuildingGroups).catch(() => {});
+  }, []);
+
+  const selectedRadars = customRadarSites.filter((r) => checkedRadars.has(r.name));
+  const selectedBuildings = manualBuildings.filter((b) => checkedBldgIds.has(b.id));
+
+  const handleSelectFiles = useCallback(async (radarName: string) => {
+    const result = await open({
+      multiple: true,
+      filters: [{ name: "ASS Files", extensions: ["ass", "ASS"] }],
+    });
+    if (result && Array.isArray(result)) {
+      setRadarFiles((prev) => {
+        const next = new Map(prev);
+        next.set(radarName, result.map((r) => typeof r === "string" ? r : r));
+        return next;
+      });
+    }
+  }, []);
+
+  const handleAnalyze = useCallback(async () => {
+    if (analyzing) return;
+    setAnalyzing(true);
+    setProgress("분석 준비 중...");
+    setProgressPct(0);
+
+    let unlistenFn: (() => void) | null = null;
+    try {
+      unlistenFn = await listen<ObstacleMonthlyProgress>("pre-screening-progress", (e) => {
+        setProgress(e.payload.message);
+        if (e.payload.total > 0) {
+          setProgressPct(Math.round((e.payload.current / e.payload.total) * 100));
+        }
+      });
+
+      const excludeMs = aircraft.map((a) => a.mode_s_code).filter(Boolean);
+
+      // 방위 구간 계산
+      const azSectorsByRadar = new Map<string, AzSector[]>();
+      for (const r of selectedRadars) {
+        const sectors = selectedBuildings.map((b) => calcBuildingAzExtent(r.latitude, r.longitude, b));
+        azSectorsByRadar.set(r.name, mergeAzSectors(sectors));
+      }
+
+      const radarFileSets = selectedRadars.map((r) => ({
+        radar_name: r.name,
+        radar_lat: r.latitude,
+        radar_lon: r.longitude,
+        radar_altitude: r.altitude,
+        antenna_height: r.antenna_height,
+        file_paths: radarFiles.get(r.name) ?? [],
+        azimuth_sectors: azSectorsByRadar.get(r.name) ?? [],
+      }));
+
+      // 제안 건물 정보
+      const proposedBuildings = selectedBuildings.map((b) => ({
+        id: b.id,
+        name: b.name || `건물 ${b.id}`,
+        latitude: b.latitude,
+        longitude: b.longitude,
+        height_m: b.height,
+        ground_elev_m: b.ground_elev,
+      }));
+
+      const result = await invoke<PreScreeningResult>("analyze_pre_screening", {
+        radarFileSets,
+        proposedBuildings,
+        excludeModeS: excludeMs,
+      });
+
+      // LOS 분석
+      setProgress("LoS 분석 중...");
+      const losMap = new Map<string, LOSProfileData>();
+      for (const radar of selectedRadars) {
+        const radarHeight = radar.altitude + radar.antenna_height;
+        for (const bldg of selectedBuildings) {
+          try {
+            const samples = 150;
+            const lats: number[] = [];
+            const lons: number[] = [];
+            for (let i = 0; i <= samples; i++) {
+              const t = i / samples;
+              lats.push(radar.latitude + (bldg.latitude - radar.latitude) * t);
+              lons.push(radar.longitude + (bldg.longitude - radar.longitude) * t);
+            }
+            const [elevations, pathBuildings] = await Promise.all([
+              invoke<number[]>("fetch_elevation", { latitudes: lats, longitudes: lons }),
+              invoke<{ distance_km: number; height_m: number; ground_elev_m: number; total_height_m: number; name: string | null; address: string | null }[]>(
+                "query_buildings_along_path",
+                { radarLat: radar.latitude, radarLon: radar.longitude, targetLat: bldg.latitude, targetLon: bldg.longitude, corridorWidthM: 200 },
+              ),
+            ]);
+            const totalDist = Math.sqrt(
+              ((bldg.latitude - radar.latitude) * 111320) ** 2 +
+              ((bldg.longitude - radar.longitude) * 111320 * Math.cos(radar.latitude * Math.PI / 180)) ** 2,
+            ) / 1000;
+
+            const combinedElev = [...elevations];
+            for (const pb of pathBuildings) {
+              const sampleIdx = Math.round((pb.distance_km / totalDist) * samples);
+              if (sampleIdx >= 0 && sampleIdx < combinedElev.length) {
+                const bldgTop = pb.ground_elev_m + pb.height_m;
+                if (bldgTop > combinedElev[sampleIdx]) combinedElev[sampleIdx] = bldgTop;
+              }
+            }
+
+            const R = 6371000;
+            const Reff = R * 4 / 3;
+            const targetElev = bldg.ground_elev + bldg.height;
+            let blocked = false;
+            let maxBlockDist = 0, maxBlockElev = -Infinity, maxBlockName = "";
+            for (let i = 1; i < combinedElev.length; i++) {
+              const d = (i / samples) * totalDist * 1000;
+              const t = i / samples;
+              const losHeight = radarHeight * (1 - t) + targetElev * t;
+              const curvDrop = (d * d) / (2 * Reff);
+              const terrainAdjusted = combinedElev[i] + curvDrop;
+              if (terrainAdjusted > losHeight) {
+                blocked = true;
+                if (terrainAdjusted > maxBlockElev) {
+                  maxBlockElev = terrainAdjusted;
+                  maxBlockDist = t * totalDist;
+                  const nearBldg = pathBuildings.find((pb) => Math.abs(pb.distance_km - maxBlockDist) < 0.5);
+                  maxBlockName = nearBldg?.name ?? nearBldg?.address ?? "";
+                }
+              }
+            }
+            if (maxBlockElev === -Infinity) blocked = false;
+
+            const bearing = ((Math.atan2(
+              (bldg.longitude - radar.longitude) * Math.cos(radar.latitude * Math.PI / 180),
+              bldg.latitude - radar.latitude,
+            ) * 180) / Math.PI + 360) % 360;
+
+            const elevProfile = combinedElev.map((elev, idx) => ({
+              distance: (idx / samples) * totalDist,
+              elevation: elev,
+              latitude: lats[idx],
+              longitude: lons[idx],
+            }));
+            losMap.set(`${radar.name}_${bldg.id}`, {
+              id: `ps_${radar.name}_${bldg.id}`,
+              radarSiteName: radar.name,
+              radarLat: radar.latitude,
+              radarLon: radar.longitude,
+              radarHeight,
+              targetLat: bldg.latitude,
+              targetLon: bldg.longitude,
+              bearing,
+              totalDistance: totalDist,
+              elevationProfile: elevProfile,
+              losBlocked: blocked,
+              maxBlockingPoint: blocked ? { distance: maxBlockDist, elevation: maxBlockElev, name: maxBlockName } : undefined,
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            console.warn(`LOS 계산 실패: ${radar.name}→${bldg.name}:`, err);
+          }
+        }
+      }
+
+      onGenerate(result, selectedBuildings, selectedRadars, losMap, [], [], analysisMonth);
+
+      // 커버리지 백그라운드 계산
+      if (selectedRadars.length > 0) {
+        const r = selectedRadars[0];
+        const altFts = [1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
+        const excludeIds = selectedBuildings.map((b) => b.id);
+        import("../utils/gpuCoverage").then(({ computeCoverageLayersOM }) =>
+          computeCoverageLayersOM(
+            {
+              radarName: r.name,
+              radarLat: r.latitude,
+              radarLon: r.longitude,
+              radarAltitude: r.altitude,
+              antennaHeight: r.antenna_height,
+              rangeNm: r.range_nm,
+              bearingStepDeg: 0.01,
+            },
+            altFts,
+            excludeIds,
+          ).then(({ layersWith, layersWithout }) => {
+            onCoverageReady(layersWith, layersWithout);
+          }).catch((err) => console.warn("커버리지 계산 실패:", err)),
+        );
+      }
+    } catch (err) {
+      setProgress(`오류: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      unlistenFn?.();
+      setAnalyzing(false);
+    }
+  }, [analyzing, selectedRadars, selectedBuildings, radarFiles, aircraft, onGenerate, analysisMonth]);
+
+  const allFilesSelected = selectedRadars.every((r) => (radarFiles.get(r.name)?.length ?? 0) > 0);
+  const canAnalyze = selectedRadars.length > 0 && selectedBuildings.length > 0 && allFilesSelected && !analyzing;
+
+  return (
+    <Modal open onClose={onClose} title="장애물 전파영향 사전검토 설정" width="max-w-3xl">
+      <div className="space-y-5">
+        <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12px]">
+            <div className="flex justify-between">
+              <span className="text-gray-400">기관</span>
+              <span className="font-medium text-gray-700">{metadata.organization}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* 분석월 */}
+        <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+          <label className="flex items-center gap-3 text-[12px]">
+            <span className="font-semibold text-gray-700">분석월</span>
+            <input
+              type="month"
+              value={analysisMonth}
+              onChange={(e) => setAnalysisMonth(e.target.value)}
+              className="rounded-md border border-gray-300 bg-white px-2 py-1 text-[12px] text-gray-700 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]"
+            />
+            <span className="text-[10px] text-gray-400">한달분 ASS 데이터를 선택하세요</span>
+          </label>
+        </div>
+
+        {/* 1단계: 레이더 선택 */}
+        <div>
+          <h3 className="mb-2 text-sm font-semibold text-gray-700">
+            1. 레이더 선택 <span className="text-[11px] font-normal text-gray-400">(필수)</span>
+          </h3>
+          <div className="space-y-1 rounded-lg border border-gray-200 p-2">
+            {customRadarSites.map((r) => {
+              const checked = checkedRadars.has(r.name);
+              return (
+                <button
+                  key={r.name}
+                  onClick={() => setCheckedRadars((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(r.name)) next.delete(r.name);
+                    else next.add(r.name);
+                    return next;
+                  })}
+                  className={`flex w-full items-center gap-2.5 rounded-md border px-3 py-2 text-left transition-all ${
+                    checked ? "border-[#a60739]/30 bg-[#a60739]/5" : "border-gray-100 hover:border-gray-200"
+                  }`}
+                >
+                  {checked
+                    ? <CheckSquare size={14} className="shrink-0 text-[#a60739]" />
+                    : <Square size={14} className="shrink-0 text-gray-300" />
+                  }
+                  <span className={`text-[12px] font-medium ${checked ? "text-gray-800" : "text-gray-500"}`}>
+                    {r.name}
+                  </span>
+                  <span className="ml-auto text-[10px] text-gray-400">
+                    {r.latitude.toFixed(4)}°N {r.longitude.toFixed(4)}°E
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* 2단계: 제안 건물 선택 */}
+        <div>
+          <h3 className="mb-2 text-sm font-semibold text-gray-700">
+            2. 검토 대상 건물 선택 <span className="text-[11px] font-normal text-gray-400">(수동 건물, 복수 가능)</span>
+          </h3>
+          {manualBuildings.length === 0 ? (
+            <p className="text-xs text-gray-400">등록된 수동 건물이 없습니다. 그리기 도구에서 건물을 먼저 등록하세요.</p>
+          ) : (
+            <>
+              <div className="mb-1 flex gap-2 text-[11px]">
+                <button onClick={() => setCheckedBldgIds(new Set(manualBuildings.map((b) => b.id)))} className="text-[#a60739] hover:underline">전체 선택</button>
+                <button onClick={() => setCheckedBldgIds(new Set())} className="text-gray-400 hover:underline">전체 해제</button>
+              </div>
+              <div className="max-h-52 space-y-0.5 overflow-y-auto rounded-lg border border-gray-200 p-2">
+                {(() => {
+                  const groupMap = new Map<number | null, ManualBuilding[]>();
+                  for (const b of manualBuildings) {
+                    const gid = b.group_id ?? null;
+                    if (!groupMap.has(gid)) groupMap.set(gid, []);
+                    groupMap.get(gid)!.push(b);
+                  }
+                  const orderedKeys: (number | null)[] = [
+                    ...buildingGroups.map((g) => g.id).filter((id) => groupMap.has(id)),
+                    ...(groupMap.has(null) ? [null as number | null] : []),
+                    ...[...groupMap.keys()].filter((k) => k !== null && !buildingGroups.find((g) => g.id === k)),
+                  ];
+
+                  const renderBuilding = (b: ManualBuilding) => {
+                    const checked = checkedBldgIds.has(b.id);
+                    return (
+                      <button
+                        key={b.id}
+                        onClick={() => setCheckedBldgIds((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(b.id)) next.delete(b.id);
+                          else next.add(b.id);
+                          return next;
+                        })}
+                        className={`flex w-full items-center gap-2.5 rounded-md border px-3 py-1.5 text-left transition-all ${
+                          checked ? "border-[#a60739]/30 bg-[#a60739]/5" : "border-gray-100 hover:border-gray-200"
+                        }`}
+                      >
+                        {checked
+                          ? <CheckSquare size={14} className="shrink-0 text-[#a60739]" />
+                          : <Square size={14} className="shrink-0 text-gray-300" />
+                        }
+                        <div className="min-w-0 flex-1">
+                          <span className={`text-[12px] font-medium ${checked ? "text-gray-800" : "text-gray-500"}`}>
+                            {b.name || `건물 ${b.id}`}
+                          </span>
+                          <span className="ml-2 text-[10px] text-gray-400">{b.height.toFixed(0)}m · {b.geometry_type}</span>
+                        </div>
+                      </button>
+                    );
+                  };
+
+                  return orderedKeys.map((gid) => {
+                    const buildings = groupMap.get(gid) ?? [];
+                    if (buildings.length === 0) return null;
+                    const group = gid !== null ? buildingGroups.find((g) => g.id === gid) : null;
+                    const groupName = group?.name ?? (gid !== null ? `그룹 ${gid}` : "미분류");
+                    const groupColor = group?.color ?? "#9ca3af";
+                    const collapsed = collapsedGroups.has(gid);
+                    const groupBldgIds = buildings.map((b) => b.id);
+                    const allChecked = groupBldgIds.every((id) => checkedBldgIds.has(id));
+                    const someChecked = groupBldgIds.some((id) => checkedBldgIds.has(id));
+
+                    return (
+                      <div key={gid ?? "ungrouped"} className="mb-1">
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => setCollapsedGroups((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(gid)) next.delete(gid);
+                              else next.add(gid);
+                              return next;
+                            })}
+                            className="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] font-semibold text-gray-600 hover:bg-gray-100"
+                          >
+                            {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+                            <span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: groupColor }} />
+                            <span>{groupName}</span>
+                            <span className="ml-1 font-normal text-gray-400">({buildings.length})</span>
+                          </button>
+                          <button
+                            onClick={() => setCheckedBldgIds((prev) => {
+                              const next = new Set(prev);
+                              if (allChecked) groupBldgIds.forEach((id) => next.delete(id));
+                              else groupBldgIds.forEach((id) => next.add(id));
+                              return next;
+                            })}
+                            className="ml-auto text-[10px] text-gray-400 hover:text-[#a60739]"
+                          >
+                            {allChecked ? "해제" : someChecked ? "나머지 선택" : "전체 선택"}
+                          </button>
+                        </div>
+                        {!collapsed && (
+                          <div className="ml-3 mt-0.5 space-y-0.5">
+                            {buildings.map(renderBuilding)}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* 3단계: 파일 선택 */}
+        {selectedRadars.length > 0 && (
+          <div>
+            <h3 className="mb-2 text-sm font-semibold text-gray-700">
+              3. 레이더별 ASS 파일 선택 <span className="text-[11px] font-normal text-gray-400">(한달분)</span>
+            </h3>
+            <div className="space-y-2">
+              {selectedRadars.map((r) => {
+                const files = radarFiles.get(r.name) ?? [];
+                return (
+                  <div key={r.name} className="rounded-lg border border-gray-200 p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[12px] font-semibold text-gray-700">📡 {r.name}</span>
+                      <button
+                        onClick={() => handleSelectFiles(r.name)}
+                        className="rounded-md bg-gray-100 px-3 py-1 text-[11px] text-gray-600 hover:bg-gray-200 transition-colors"
+                      >
+                        📂 파일 선택
+                      </button>
+                    </div>
+                    {files.length > 0 && (
+                      <p className="mt-1 text-[10px] text-gray-500">{files.length}개 파일 선택됨</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* 진행 */}
+        {analyzing && (
+          <div className="rounded-lg border border-[#a60739]/20 bg-[#a60739]/5 p-3">
+            <div className="flex items-center gap-2">
+              <Loader2 size={14} className="animate-spin text-[#a60739]" />
+              <span className="text-[12px] text-gray-700">{progress}</span>
+            </div>
+            <div className="mt-2 h-2 rounded-full bg-gray-200">
+              <div className="h-full rounded-full bg-[#a60739] transition-all" style={{ width: `${progressPct}%` }} />
             </div>
           </div>
         )}

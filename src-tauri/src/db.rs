@@ -314,6 +314,11 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 수동 건물에 그룹 컬럼 추가
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN group_id INTEGER REFERENCES building_groups(id) ON DELETE SET NULL", []);
 
+    // 건물 그룹에 토지이용계획도 컬럼 추가
+    let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_image BLOB", []);
+    let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_bounds_json TEXT", []);
+    let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_opacity REAL NOT NULL DEFAULT 0.5", []);
+
     // LOS 결과에 스크린샷 컬럼 추가
     let _ = conn.execute("ALTER TABLE los_results ADD COLUMN map_screenshot TEXT", []);
     let _ = conn.execute("ALTER TABLE los_results ADD COLUMN chart_screenshot TEXT", []);

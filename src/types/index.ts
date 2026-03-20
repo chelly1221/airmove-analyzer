@@ -178,6 +178,10 @@ export interface LOSProfileData {
 /** LOS 경로 상의 건물 */
 export interface BuildingOnPath {
   distance_km: number;
+  /** LOS 경로 상 건물 시작 거리 (km) — 도형 건물은 near < far */
+  near_dist_km: number;
+  /** LOS 경로 상 건물 끝 거리 (km) */
+  far_dist_km: number;
   height_m: number;
   ground_elev_m: number;
   total_height_m: number;
@@ -197,7 +201,7 @@ export interface BuildingImportStatus {
 }
 
 /** 도형 유형 */
-export type GeometryType = "point" | "rectangle" | "circle" | "line";
+export type GeometryType = "point" | "rectangle" | "circle" | "line" | "multi";
 
 /** 건물 그룹 */
 export interface BuildingGroup {
@@ -206,6 +210,17 @@ export interface BuildingGroup {
   /** 색상 (hex) */
   color: string;
   memo: string;
+  has_plan_image: boolean;
+  plan_bounds_json: string | null;
+  plan_opacity: number;
+}
+
+/** 토지이용계획도 오버레이 경계 (4코너 좌표) */
+export interface PlanImageBounds {
+  topLeft: [number, number];      // [lat, lon]
+  topRight: [number, number];
+  bottomRight: [number, number];
+  bottomLeft: [number, number];
 }
 
 /** 수동 등록 건물 */
@@ -480,6 +495,66 @@ export interface ObstacleMonthlyProgress {
   current: number;
   total: number;
   message: string;
+}
+
+// ─── 장애물 전파영향 사전검토 ───
+
+/** 추가 Loss 이벤트 (건물에 의한 추가 Loss) */
+export interface AdditionalLossEvent {
+  mode_s: string;
+  start_time: number;
+  end_time: number;
+  duration_secs: number;
+  start_lat: number;
+  start_lon: number;
+  start_alt_ft: number;
+  end_lat: number;
+  end_lon: number;
+  end_alt_ft: number;
+  avg_alt_ft: number;
+  radar_distance_km: number;
+  azimuth_deg: number;
+}
+
+/** 건물별 사전검토 결과 */
+export interface PreScreeningBuildingResult {
+  building_id: number;
+  building_name: string;
+  building_height_m: number;
+  ground_elev_m: number;
+  distance_km: number;
+  azimuth_deg: number;
+  /** 기존 지형 앙각 (°, 최소 0.25° 적용) */
+  terrain_elevation_angle_deg: number;
+  /** 건물 꼭대기 앙각 (°) */
+  building_elevation_angle_deg: number;
+  /** 최대 건축가능 높이 (m) */
+  max_buildable_height_m: number;
+  /** 추가 Loss 이벤트 */
+  additional_loss_events: AdditionalLossEvent[];
+  /** 추가 Loss 총 시간 (초) */
+  additional_loss_time_secs: number;
+  /** 영향받는 고유 항공기 수 */
+  affected_aircraft_count: number;
+  /** 해당 섹터 총 항적 시간 (초) */
+  sector_total_track_time_secs: number;
+  /** 해당 섹터 기존 Loss 시간 (초) */
+  sector_existing_loss_time_secs: number;
+}
+
+/** 레이더별 사전검토 결과 */
+export interface PreScreeningRadarResult {
+  radar_name: string;
+  building_results: PreScreeningBuildingResult[];
+  total_files_parsed: number;
+  total_points_in_sectors: number;
+  analysis_period: string;
+  failed_files: string[];
+}
+
+/** 사전검토 전체 결과 */
+export interface PreScreeningResult {
+  radar_results: PreScreeningRadarResult[];
 }
 
 /** UI 페이지 */

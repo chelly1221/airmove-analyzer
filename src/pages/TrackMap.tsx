@@ -39,6 +39,7 @@ import LOSProfilePanel from "../components/Map/LOSProfilePanel";
 import { computeCoverageTerrainProfile, computeLayersFromProfile, getCachedTerrainProfile, invalidateTerrainCache, isCacheValidFor, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageTerrainProfile, type CoverageLayer } from "../utils/radarCoverage";
 import { fetchCloudGridKorea, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 import { GPU2D, type RectData } from "../utils/gpu2d";
+import { addPlanOverlay, removePlanOverlay } from "../utils/planOverlay";
 
 /**
  * 탐지 유형 색상:
@@ -721,6 +722,27 @@ export default function TrackMap() {
       setCoverageError("");
     }
   }, [radarSite.name, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── 토지이용계획도 오버레이 동기화 ──
+  const activePlanOverlays = useAppStore((s) => s.activePlanOverlays);
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (!map || !map.isStyleLoaded()) return;
+    const activeIds = new Set<number>();
+    activePlanOverlays.forEach((data, groupId) => {
+      activeIds.add(groupId);
+      if (!map.getSource(`plan-image-${groupId}`)) {
+        addPlanOverlay(map, groupId, data.imageDataUrl, data.bounds, data.opacity);
+      }
+    });
+    // 비활성 오버레이 제거
+    for (const layer of map.getStyle().layers) {
+      if (layer.id.startsWith("plan-raster-")) {
+        const gid = Number(layer.id.replace("plan-raster-", ""));
+        if (!activeIds.has(gid)) removePlanOverlay(map, gid);
+      }
+    }
+  }, [activePlanOverlays]);
 
   /** 고도 비율 → 색상 스펙트럼 매핑 (HSL 0°→240° : 빨강→파랑) */
   const altToColor = useCallback((altFt: number): [number, number, number] => {

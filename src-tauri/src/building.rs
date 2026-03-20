@@ -31,6 +31,10 @@ const NEIGHBOR_ABS_DIFF_THRESHOLD: f64 = 30.0;       // 이웃 평균 대비 절
 #[derive(Serialize, Clone, Debug)]
 pub struct BuildingOnPath {
     pub distance_km: f64,
+    /// LOS 경로 상 건물 시작 거리 (km) — 도형 건물은 near < far
+    pub near_dist_km: f64,
+    /// LOS 경로 상 건물 끝 거리 (km)
+    pub far_dist_km: f64,
     pub height_m: f64,
     pub ground_elev_m: f64,
     pub total_height_m: f64,
@@ -347,6 +351,8 @@ pub fn query_buildings_along_path(
 
         buildings.push(BuildingOnPath {
             distance_km,
+            near_dist_km: distance_km,
+            far_dist_km: distance_km,
             height_m: height,
             ground_elev_m: 0.0,
             total_height_m: height,
@@ -389,6 +395,11 @@ pub fn query_buildings_along_path(
         // geometry 확장하여 샘플 포인트 생성
         let sample_pts = expand_manual_building_geometry(mlat, mlon, geo_type.as_deref(), geo_json.as_deref());
 
+        // 모든 샘플 포인트 중 경로 코리도 내에 있는 점들의 거리를 수집
+        let mut hit_distances: Vec<f64> = Vec::new();
+        let mut rep_lat = mlat;
+        let mut rep_lon = mlon;
+
         for (slat, slon) in &sample_pts {
             let bx = slon - radar_lon;
             let by = slat - radar_lat;
@@ -403,19 +414,34 @@ pub fn query_buildings_along_path(
                 continue;
             }
             let distance_km = t.clamp(0.0, 1.0) * total_dist;
-            buildings.push(BuildingOnPath {
-                distance_km,
-                height_m: height,
-                ground_elev_m: ground_elev,
-                total_height_m: height + ground_elev,
-                name: name.clone(),
-                address: memo.clone(), // 수동 건물은 memo를 address로
-                usage: None,
-                lat: *slat,
-                lon: *slon,
-            });
-            break; // 같은 건물의 다른 샘플 포인트는 중복 방지
+            hit_distances.push(distance_km);
+            if hit_distances.len() == 1 {
+                rep_lat = *slat;
+                rep_lon = *slon;
+            }
         }
+
+        if hit_distances.is_empty() {
+            continue;
+        }
+
+        let near_dist = hit_distances.iter().cloned().fold(f64::INFINITY, f64::min);
+        let far_dist = hit_distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let center_dist = (near_dist + far_dist) / 2.0;
+
+        buildings.push(BuildingOnPath {
+            distance_km: center_dist,
+            near_dist_km: near_dist,
+            far_dist_km: far_dist,
+            height_m: height,
+            ground_elev_m: ground_elev,
+            total_height_m: height + ground_elev,
+            name: name.clone(),
+            address: memo.clone(), // 수동 건물은 memo를 address로
+            usage: None,
+            lat: rep_lat,
+            lon: rep_lon,
+        });
     }
 
     buildings.sort_by(|a, b| a.distance_km.partial_cmp(&b.distance_km).unwrap_or(std::cmp::Ordering::Equal));
@@ -651,12 +677,15 @@ pub struct BuildingGroup {
     pub name: String,
     pub color: String,
     pub memo: String,
+    pub has_plan_image: bool,
+    pub plan_bounds_json: Option<String>,
+    pub plan_opacity: f64,
 }
 
 /// 건물 그룹 전체 조회
 pub fn list_building_groups(conn: &Connection) -> Result<Vec<BuildingGroup>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, color, memo FROM building_groups ORDER BY id"
+        "SELECT id, name, color, memo, (plan_image IS NOT NULL) AS has_plan_image, plan_bounds_json, plan_opacity FROM building_groups ORDER BY id"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -665,6 +694,9 @@ pub fn list_building_groups(conn: &Connection) -> Result<Vec<BuildingGroup>, Str
             name: row.get(1)?,
             color: row.get(2)?,
             memo: row.get(3)?,
+            has_plan_image: row.get::<_, i32>(4).unwrap_or(0) != 0,
+            plan_bounds_json: row.get(5)?,
+            plan_opacity: row.get::<_, f64>(6).unwrap_or(0.5),
         })
     }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
@@ -693,11 +725,18 @@ pub fn update_building_group(
     name: &str,
     color: &str,
     memo: &str,
+    plan_opacity: Option<f64>,
 ) -> Result<(), String> {
     conn.execute(
         "UPDATE building_groups SET name=?1, color=?2, memo=?3 WHERE id=?4",
         params![name, color, memo, id],
     ).map_err(|e| format!("UPDATE 실패: {}", e))?;
+    if let Some(opacity) = plan_opacity {
+        conn.execute(
+            "UPDATE building_groups SET plan_opacity = ?1 WHERE id = ?2",
+            params![opacity, id],
+        ).map_err(|e| format!("UPDATE opacity 실패: {}", e))?;
+    }
     Ok(())
 }
 
@@ -705,6 +744,49 @@ pub fn update_building_group(
 pub fn delete_building_group(conn: &Connection, id: i64) -> Result<(), String> {
     conn.execute("DELETE FROM building_groups WHERE id = ?1", params![id])
         .map_err(|e| format!("DELETE 실패: {}", e))?;
+    Ok(())
+}
+
+/// 건물 그룹 토지이용계획도 이미지 저장
+pub fn save_group_plan_image(
+    conn: &Connection,
+    group_id: i64,
+    image_bytes: &[u8],
+    bounds_json: &str,
+    opacity: f64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE building_groups SET plan_image = ?1, plan_bounds_json = ?2, plan_opacity = ?3 WHERE id = ?4",
+        params![image_bytes, bounds_json, opacity, group_id],
+    ).map_err(|e| format!("UPDATE 실패: {}", e))?;
+    Ok(())
+}
+
+/// 건물 그룹 토지이용계획도 이미지 로드
+pub fn load_group_plan_image(
+    conn: &Connection,
+    group_id: i64,
+) -> Result<Option<(Vec<u8>, String, f64)>, String> {
+    let mut stmt = conn.prepare(
+        "SELECT plan_image, plan_bounds_json, plan_opacity FROM building_groups WHERE id = ?1"
+    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
+
+    let result = stmt.query_row(params![group_id], |row| {
+        let image: Option<Vec<u8>> = row.get(0)?;
+        let bounds: Option<String> = row.get(1)?;
+        let opacity: f64 = row.get::<_, f64>(2).unwrap_or(0.5);
+        Ok(image.map(|img| (img, bounds.unwrap_or_default(), opacity)))
+    }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
+
+    Ok(result)
+}
+
+/// 건물 그룹 토지이용계획도 이미지 삭제
+pub fn delete_group_plan_image(conn: &Connection, group_id: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE building_groups SET plan_image = NULL, plan_bounds_json = NULL WHERE id = ?1",
+        params![group_id],
+    ).map_err(|e| format!("UPDATE 실패: {}", e))?;
     Ok(())
 }
 
@@ -1252,6 +1334,21 @@ fn expand_manual_building_geometry(
                 }).collect();
                 if !pts.is_empty() {
                     return pts;
+                }
+            }
+        }
+        "multi" => {
+            // 복합 도형: [{type, json}, ...] 배열을 재귀 확장
+            if let Some(arr) = val.as_array() {
+                let mut all_pts = Vec::new();
+                for item in arr {
+                    let sub_type = item.get("type").and_then(|v| v.as_str());
+                    let sub_json = item.get("json").and_then(|v| v.as_str());
+                    let pts = expand_manual_building_geometry(center_lat, center_lon, sub_type, sub_json);
+                    all_pts.extend(pts);
+                }
+                if !all_pts.is_empty() {
+                    return all_pts;
                 }
             }
         }

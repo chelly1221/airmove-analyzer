@@ -21,6 +21,10 @@ import {
   ChevronRight,
   RotateCw,
   FolderPlus,
+  Eye,
+  EyeOff,
+  Image as ImageIcon,
+  X,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -28,7 +32,8 @@ import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre
 import { useAppStore } from "../store";
 import { consolidateFlights } from "../utils/flightConsolidation";
 import Modal from "../components/common/Modal";
-import type { AnalysisResult, BuildingGroup, FlightRecord, GeometryType, ManualBuilding, UploadedFile } from "../types";
+import ImagePositioner from "../components/Map/ImagePositioner";
+import type { AnalysisResult, BuildingGroup, FlightRecord, GeometryType, ManualBuilding, PlanImageBounds, UploadedFile } from "../types";
 
 // ─── 건물 입력 모달 ──────────────────────────────────────────────
 
@@ -161,6 +166,93 @@ function ellipseToPolygon(
   return coords;
 }
 
+/** 도형의 중심점 계산 */
+function shapeCentroid(shape: { type: GeometryType; json: string | null }): [number, number] | null {
+  if (!shape.json) return null;
+  try {
+    const val = JSON.parse(shape.json);
+    if (shape.type === "rectangle" && Array.isArray(val)) {
+      if (val.length === 4)
+        return [
+          val.reduce((s: number, c: number[]) => s + c[0], 0) / 4,
+          val.reduce((s: number, c: number[]) => s + c[1], 0) / 4,
+        ];
+      if (val.length === 2) return [(val[0][0] + val[1][0]) / 2, (val[0][1] + val[1][1]) / 2];
+    }
+    if (shape.type === "circle" && val.center) return val.center;
+    if (shape.type === "line" && Array.isArray(val) && val.length > 0) {
+      return [
+        val.reduce((s: number, c: number[]) => s + c[0], 0) / val.length,
+        val.reduce((s: number, c: number[]) => s + c[1], 0) / val.length,
+      ];
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/** 도형 유형 한글 라벨 */
+function shapeTypeLabel(type: string): string {
+  switch (type) {
+    case "rectangle": return "사각형";
+    case "circle": return "원/타원";
+    case "line": return "선";
+    case "point": return "포인트";
+    case "multi": return "복합";
+    default: return type;
+  }
+}
+
+/** 단일 도형을 GeoJSON Feature로 변환 */
+function shapeToGeoJsonFeature(shape: { type: GeometryType; json: string | null }): GeoJSON.Feature | null {
+  if (!shape.json) return null;
+  try {
+    if (shape.type === "rectangle") {
+      const parsed = JSON.parse(shape.json);
+      if (Array.isArray(parsed) && parsed.length === 4) {
+        return {
+          type: "Feature",
+          geometry: {
+            type: "Polygon",
+            coordinates: [cornersToPolygonCoords(parsed as [[number, number], [number, number], [number, number], [number, number]])],
+          },
+          properties: {},
+        };
+      }
+    }
+    if (shape.type === "circle") {
+      const gj = JSON.parse(shape.json);
+      const semiMajor: number = gj.semi_major_m ?? gj.radius_m ?? 100;
+      const semiMinor: number = gj.semi_minor_m ?? semiMajor;
+      return {
+        type: "Feature",
+        geometry: {
+          type: "Polygon",
+          coordinates: [ellipseToPolygon(gj.center, semiMajor, semiMinor, gj.rotation_deg ?? 0)],
+        },
+        properties: {},
+      };
+    }
+    if (shape.type === "line") {
+      const pts: [number, number][] = JSON.parse(shape.json);
+      if (pts.length >= 2) {
+        return {
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: pts.map(([lat, lon]) => [lon, lat]),
+          },
+          properties: {},
+        };
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 function BuildingModal({
   open: isOpen,
   onClose,
@@ -183,9 +275,12 @@ function BuildingModal({
   const [mousePt, setMousePt] = useState<[number, number] | null>(null);
   // 타원 회전 모드
   const [rotatingEllipse, setRotatingEllipse] = useState(false);
+  // 확정된 도형 목록 (멀티 도형 건물용)
+  const [confirmedShapes, setConfirmedShapes] = useState<{ type: GeometryType; json: string }[]>([]);
 
   useEffect(() => {
     if (initial) {
+      const isMulti = initial.geometry_type === "multi";
       setForm({
         name: initial.name,
         latitude: String(initial.latitude),
@@ -193,14 +288,24 @@ function BuildingModal({
         height: String(initial.height),
         ground_elev: String(initial.ground_elev),
         memo: initial.memo,
-        geometry_type: initial.geometry_type || "point",
-        geometry_json: initial.geometry_json || null,
+        geometry_type: isMulti ? "point" : (initial.geometry_type || "point"),
+        geometry_json: isMulti ? null : (initial.geometry_json || null),
         group_id: initial.group_id ?? null,
       });
-      setDrawTool(initial.geometry_type as DrawTool || "point");
+      setDrawTool(isMulti ? "point" : (initial.geometry_type as DrawTool || "point"));
+      if (isMulti && initial.geometry_json) {
+        try {
+          setConfirmedShapes(JSON.parse(initial.geometry_json));
+        } catch {
+          setConfirmedShapes([]);
+        }
+      } else {
+        setConfirmedShapes([]);
+      }
     } else {
       setForm(emptyForm);
       setDrawTool("point");
+      setConfirmedShapes([]);
     }
     setClickPts([]);
     setMousePt(null);
@@ -209,7 +314,32 @@ function BuildingModal({
 
   const handleSubmit = () => {
     if (!form.name.trim() || !form.latitude || !form.longitude || !form.height) return;
-    onSave(form);
+
+    // 모든 도형 수집 (확정 목록 + 현재 도형)
+    const allShapes = [...confirmedShapes];
+    if (form.geometry_json && form.geometry_type !== "point" && form.geometry_type !== "multi") {
+      allShapes.push({ type: form.geometry_type, json: form.geometry_json });
+    }
+
+    const finalForm = { ...form };
+    if (allShapes.length > 1) {
+      finalForm.geometry_type = "multi";
+      finalForm.geometry_json = JSON.stringify(allShapes);
+      // 전체 도형의 중심점 재계산
+      const centers: [number, number][] = [];
+      for (const s of allShapes) {
+        const c = shapeCentroid(s);
+        if (c) centers.push(c);
+      }
+      if (centers.length > 0) {
+        finalForm.latitude = (centers.reduce((s, c) => s + c[0], 0) / centers.length).toFixed(6);
+        finalForm.longitude = (centers.reduce((s, c) => s + c[1], 0) / centers.length).toFixed(6);
+      }
+    } else if (allShapes.length === 1 && confirmedShapes.length > 0) {
+      finalForm.geometry_type = allShapes[0].type;
+      finalForm.geometry_json = allShapes[0].json;
+    }
+    onSave(finalForm);
   };
 
   // 도구 변경 시 임시 상태 초기화
@@ -218,6 +348,75 @@ function BuildingModal({
     setMousePt(null);
     setRotatingEllipse(false);
   }, [drawTool]);
+
+  // Ctrl+Z 실행취소
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!((e.ctrlKey || e.metaKey) && e.key === "z")) return;
+      e.preventDefault();
+
+      // 1) 그리기 중: 마지막 클릭 취소
+      if (clickPts.length > 0) {
+        const next = clickPts.slice(0, -1);
+        setClickPts(next);
+
+        if (drawTool === "line") {
+          if (next.length >= 2) {
+            const center = next.reduce(
+              (acc, p) => [acc[0] + p[0] / next.length, acc[1] + p[1] / next.length] as [number, number],
+              [0, 0] as [number, number],
+            );
+            setForm((f) => ({
+              ...f,
+              latitude: center[0].toFixed(6),
+              longitude: center[1].toFixed(6),
+              geometry_json: JSON.stringify(next),
+            }));
+          } else if (next.length === 1) {
+            setForm((f) => ({
+              ...f,
+              latitude: next[0][0].toFixed(6),
+              longitude: next[0][1].toFixed(6),
+              geometry_json: JSON.stringify(next),
+            }));
+          } else {
+            setForm((f) => ({ ...f, geometry_json: null }));
+          }
+        }
+
+        // 원/타원: step3→step2 (장축만 남기고 원 확정 해제)
+        if (drawTool === "circle" && clickPts.length === 2) {
+          setForm((f) => ({ ...f, geometry_type: "circle" as GeometryType, geometry_json: null }));
+        }
+        return;
+      }
+
+      // 2) 확정된 현재 도형 취소
+      if (form.geometry_json && form.geometry_type !== "point") {
+        setForm((f) => ({ ...f, geometry_type: drawTool as GeometryType, geometry_json: null }));
+        return;
+      }
+
+      // 3) 멀티 도형: 마지막 확정 도형 제거
+      if (confirmedShapes.length > 0) {
+        setConfirmedShapes((prev) => prev.slice(0, -1));
+      }
+    };
+
+    if (isOpen) {
+      window.addEventListener("keydown", handler);
+      return () => window.removeEventListener("keydown", handler);
+    }
+  }, [isOpen, clickPts, drawTool, form.geometry_json, form.geometry_type, confirmedShapes.length]);
+
+  // 현재 도형을 확정 목록에 추가
+  const addShapeToList = useCallback(() => {
+    if (!form.geometry_json || form.geometry_type === "point") return;
+    setConfirmedShapes((prev) => [...prev, { type: form.geometry_type, json: form.geometry_json! }]);
+    setForm((f) => ({ ...f, geometry_type: drawTool as GeometryType, geometry_json: null }));
+    setClickPts([]);
+    setRotatingEllipse(false);
+  }, [form.geometry_json, form.geometry_type, drawTool]);
 
   // 도형 확정 후 맵 자동 fit bounds (사각형/원/타원/선)
   useEffect(() => {
@@ -533,6 +732,23 @@ function BuildingModal({
     };
   }, [drawTool, clickPts, mousePt]);
 
+  // 확정된 멀티 도형 GeoJSON
+  const confirmedShapesGeoJson = useMemo(() => {
+    if (confirmedShapes.length === 0) return null;
+    const features: GeoJSON.Feature[] = [];
+    for (const shape of confirmedShapes) {
+      const feat = shapeToGeoJsonFeature(shape);
+      if (feat) features.push(feat);
+    }
+    if (features.length === 0) return null;
+    return { type: "FeatureCollection" as const, features };
+  }, [confirmedShapes]);
+
+  // "도형 추가" 가능 여부
+  const canAddShape =
+    (form.geometry_type !== "point" && form.geometry_json && clickPts.length === 0) ||
+    (drawTool === "line" && clickPts.length >= 2 && form.geometry_json);
+
   // 타원 장축선 미리보기 (3단계 시) + 회전 모드 가이드선
   const majorAxisGeoJson = useMemo(() => {
     // 회전 모드: 중심→마우스 가이드선
@@ -577,21 +793,22 @@ function BuildingModal({
 
   // 힌트 텍스트
   const hintText = useMemo(() => {
-    if (rotatingEllipse) return "클릭하여 회전 확정";
+    const undoSuffix = clickPts.length > 0 || (form.geometry_json && form.geometry_type !== "point") ? " · Ctrl+Z" : "";
+    if (rotatingEllipse) return "클릭하여 회전 확정" + undoSuffix;
     if (drawTool === "point") return "클릭하여 위치 지정";
     if (drawTool === "rectangle") {
-      if (clickPts.length === 0) return "첫 번째 꼭짓점 클릭";
-      if (clickPts.length === 1) return "두 번째 꼭짓점 클릭 (한 변)";
-      return "당겨서 사각형 확정";
+      if (clickPts.length === 0) return "첫 번째 꼭짓점 클릭" + undoSuffix;
+      if (clickPts.length === 1) return "두 번째 꼭짓점 클릭 (한 변) · Ctrl+Z";
+      return "당겨서 사각형 확정 · Ctrl+Z";
     }
     if (drawTool === "circle") {
-      if (clickPts.length === 0) return "중심점 클릭";
-      if (clickPts.length === 1) return "장축 끝점 클릭";
-      return "단축 길이 클릭 (타원) 또는 '원으로 확정' 클릭";
+      if (clickPts.length === 0) return "중심점 클릭" + undoSuffix;
+      if (clickPts.length === 1) return "장축 끝점 클릭 · Ctrl+Z";
+      return "단축 길이 클릭 (타원) 또는 '원으로 확정' · Ctrl+Z";
     }
-    if (drawTool === "line") return clickPts.length === 0 ? "첫 번째 꼭짓점 클릭" : "다음 꼭짓점 클릭";
+    if (drawTool === "line") return clickPts.length === 0 ? "첫 번째 꼭짓점 클릭" + undoSuffix : "다음 꼭짓점 클릭 · Ctrl+Z";
     return "";
-  }, [drawTool, clickPts.length, rotatingEllipse]);
+  }, [drawTool, clickPts.length, rotatingEllipse, form.geometry_json, form.geometry_type]);
 
   const markerLat = parseFloat(form.latitude);
   const markerLon = parseFloat(form.longitude);
@@ -723,19 +940,24 @@ function BuildingModal({
           </div>
 
           {/* 도형 유형 표시 */}
-          {form.geometry_type !== "point" && (
+          {(form.geometry_type !== "point" || confirmedShapes.length > 0) && (
             <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-gray-500">
-              도형: {form.geometry_type === "rectangle" ? "사각형" : form.geometry_type === "circle" ? "원/타원" : "선"}
-              {form.geometry_type === "circle" && form.geometry_json && (() => {
-                try {
-                  const g = JSON.parse(form.geometry_json);
-                  const ma = g.semi_major_m ?? g.radius_m;
-                  const mi = g.semi_minor_m ?? ma;
-                  const rot = g.rotation_deg ?? 0;
-                  if (ma === mi) return ` (반경 ${ma}m)`;
-                  return ` (${ma}×${mi}m, ${rot}°)`;
-                } catch { return ""; }
-              })()}
+              {confirmedShapes.length > 0
+                ? `복합 도형 (${confirmedShapes.length + (form.geometry_json && form.geometry_type !== "point" ? 1 : 0)}개)`
+                : <>
+                    도형: {form.geometry_type === "rectangle" ? "사각형" : form.geometry_type === "circle" ? "원/타원" : "선"}
+                    {form.geometry_type === "circle" && form.geometry_json && (() => {
+                      try {
+                        const g = JSON.parse(form.geometry_json);
+                        const ma = g.semi_major_m ?? g.radius_m;
+                        const mi = g.semi_minor_m ?? ma;
+                        const rot = g.rotation_deg ?? 0;
+                        if (ma === mi) return ` (반경 ${ma}m)`;
+                        return ` (${ma}×${mi}m, ${rot}°)`;
+                      } catch { return ""; }
+                    })()}
+                  </>
+              }
             </div>
           )}
 
@@ -830,10 +1052,41 @@ function BuildingModal({
                 초기화
               </button>
             )}
+            {/* 도형 추가 (멀티 도형) */}
+            {canAddShape && (
+              <button
+                onClick={addShapeToList}
+                className="ml-1 flex items-center gap-0.5 rounded-lg bg-blue-500 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-blue-600 transition-colors"
+              >
+                <Plus size={12} />
+                도형 추가
+              </button>
+            )}
             <span className="ml-auto text-[10px] text-gray-400">
               {hintText}
             </span>
           </div>
+
+          {/* 확정된 도형 목록 (멀티 도형) */}
+          {confirmedShapes.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="text-[10px] text-gray-400">확정 도형:</span>
+              {confirmedShapes.map((s, i) => (
+                <span
+                  key={i}
+                  className="inline-flex items-center gap-1 rounded-md bg-blue-50 border border-blue-200 px-2 py-0.5 text-[10px] text-blue-700"
+                >
+                  {shapeTypeLabel(s.type)}
+                  <button
+                    onClick={() => setConfirmedShapes((prev) => prev.filter((_, j) => j !== i))}
+                    className="text-blue-400 hover:text-red-500 font-bold"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
 
           {/* 지도 */}
           <div className="relative h-80 w-full overflow-hidden rounded-xl border border-gray-200">
@@ -852,6 +1105,32 @@ function BuildingModal({
               attributionControl={false}
               doubleClickZoom={drawTool !== "line"}
             >
+              {/* 확정된 멀티 도형 (파란색) */}
+              <Source
+                id="confirmed-shapes"
+                type="geojson"
+                data={(confirmedShapesGeoJson ?? { type: "FeatureCollection", features: [] }) as any}
+              >
+                <Layer
+                  id="confirmed-fill"
+                  type="fill"
+                  paint={{ "fill-color": "#3b82f6", "fill-opacity": 0.15 }}
+                  filter={["==", ["geometry-type"], "Polygon"]}
+                />
+                <Layer
+                  id="confirmed-outline"
+                  type="line"
+                  paint={{ "line-color": "#3b82f6", "line-width": 2 }}
+                  filter={["==", ["geometry-type"], "Polygon"]}
+                />
+                <Layer
+                  id="confirmed-line"
+                  type="line"
+                  paint={{ "line-color": "#3b82f6", "line-width": 2.5 }}
+                  filter={["==", ["geometry-type"], "LineString"]}
+                />
+              </Source>
+
               {/* 확정된 포인트 마커 */}
               {hasMarker && form.geometry_type === "point" && (
                 <Marker latitude={markerLat} longitude={markerLon} anchor="bottom">
@@ -956,6 +1235,15 @@ function ManualBuildingPanel() {
   const [groupModalOpen, setGroupModalOpen] = useState(false);
   const [editGroup, setEditGroup] = useState<BuildingGroup | null>(null);
   const [groupForm, setGroupForm] = useState({ name: "", color: "#6b7280", memo: "" });
+  // 토지이용계획도
+  const [planImagePreview, setPlanImagePreview] = useState<string | null>(null);
+  const [planImageBase64, setPlanImageBase64] = useState<string | null>(null);
+  const [planOpacity, setPlanOpacity] = useState(0.5);
+  // 오버레이 토글
+  const activePlanOverlays = useAppStore((s) => s.activePlanOverlays);
+  const setActivePlanOverlay = useAppStore((s) => s.setActivePlanOverlay);
+  // 위치 조정 맵 모달
+  const [positioningModal, setPositioningModal] = useState<{ groupId: number; imageDataUrl: string; initialBounds: PlanImageBounds | null } | null>(null);
   // 그룹 필터 (null=전체, 0=미분류, 양수=그룹ID)
   const [filterGroupId, setFilterGroupId] = useState<number | null>(null);
   // 그룹 접기/펼치기
@@ -1037,20 +1325,85 @@ function ManualBuildingPanel() {
   const openGroupAdd = () => {
     setEditGroup(null);
     setGroupForm({ name: "", color: "#6b7280", memo: "" });
+    setPlanImagePreview(null);
+    setPlanImageBase64(null);
+    setPlanOpacity(0.5);
     setGroupModalOpen(true);
   };
-  const openGroupEdit = (g: BuildingGroup) => {
+  const openGroupEdit = async (g: BuildingGroup) => {
     setEditGroup(g);
     setGroupForm({ name: g.name, color: g.color, memo: g.memo });
+    setPlanOpacity(g.plan_opacity);
+    setPlanImagePreview(null);
+    setPlanImageBase64(null);
+    if (g.has_plan_image) {
+      try {
+        const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number } | null>(
+          "load_group_plan_image", { groupId: g.id },
+        );
+        if (result) {
+          setPlanImagePreview(`data:image/jpeg;base64,${result.image_base64}`);
+          setPlanImageBase64(result.image_base64);
+          setPlanOpacity(result.opacity);
+        }
+      } catch { /* ignore */ }
+    }
     setGroupModalOpen(true);
+  };
+  /** 이미지 선택 + Canvas 압축 */
+  const handlePickPlanImage = async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "이미지", extensions: ["png", "jpg", "jpeg", "bmp", "webp"] }],
+      });
+      if (!selected) return;
+      const filePath = typeof selected === "string" ? selected : String(selected);
+      const raw = await invoke<string>("read_file_base64", { path: filePath });
+      // Canvas 압축 (4096px, JPEG Q80)
+      const ext = filePath.split(".").pop()?.toLowerCase() ?? "jpeg";
+      const mime = ext === "png" ? "image/png" : "image/jpeg";
+      const img = new Image();
+      img.onload = () => {
+        const MAX = 4096;
+        let w = img.width, h = img.height;
+        if (w > MAX || h > MAX) { const s = MAX / Math.max(w, h); w = Math.round(w * s); h = Math.round(h * s); }
+        const c = document.createElement("canvas"); c.width = w; c.height = h;
+        c.getContext("2d")!.drawImage(img, 0, 0, w, h);
+        const dataUrl = c.toDataURL("image/jpeg", 0.8);
+        setPlanImageBase64(dataUrl.split(",")[1]);
+        setPlanImagePreview(dataUrl);
+      };
+      img.src = `data:${mime};base64,${raw}`;
+    } catch (e) { console.warn("[PlanImage] 선택 실패:", e); }
+  };
+  /** 이미지 삭제 */
+  const handleDeletePlanImage = async () => {
+    if (editGroup) {
+      try { await invoke("delete_group_plan_image", { groupId: editGroup.id }); } catch { /* ignore */ }
+      setActivePlanOverlay(editGroup.id, null);
+    }
+    setPlanImagePreview(null);
+    setPlanImageBase64(null);
   };
   const handleGroupSave = async () => {
     if (!groupForm.name.trim()) return;
     try {
       if (editGroup) {
-        await invoke("update_building_group", { id: editGroup.id, name: groupForm.name.trim(), color: groupForm.color, memo: groupForm.memo });
+        await invoke("update_building_group", { id: editGroup.id, name: groupForm.name.trim(), color: groupForm.color, memo: groupForm.memo, planOpacity: planOpacity });
+        if (planImageBase64) {
+          await invoke("save_group_plan_image", {
+            groupId: editGroup.id, imageBase64: planImageBase64,
+            boundsJson: editGroup.plan_bounds_json || "", opacity: planOpacity,
+          });
+        }
       } else {
-        await invoke("add_building_group", { name: groupForm.name.trim(), color: groupForm.color, memo: groupForm.memo });
+        const newId = await invoke<number>("add_building_group", { name: groupForm.name.trim(), color: groupForm.color, memo: groupForm.memo });
+        if (planImageBase64) {
+          await invoke("save_group_plan_image", {
+            groupId: newId, imageBase64: planImageBase64, boundsJson: "", opacity: planOpacity,
+          });
+        }
       }
       setGroupModalOpen(false);
       loadData();
@@ -1058,10 +1411,30 @@ function ManualBuildingPanel() {
   };
   const handleGroupDelete = async (g: BuildingGroup) => {
     try {
+      setActivePlanOverlay(g.id, null);
       await invoke("delete_building_group", { id: g.id });
       if (filterGroupId === g.id) setFilterGroupId(null);
       loadData();
     } catch (e) { console.error("그룹 삭제 실패:", e); }
+  };
+  /** 오버레이 토글 */
+  const togglePlanOverlay = async (g: BuildingGroup) => {
+    if (activePlanOverlays.has(g.id)) {
+      setActivePlanOverlay(g.id, null);
+      return;
+    }
+    if (!g.has_plan_image || !g.plan_bounds_json) return;
+    try {
+      const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number } | null>(
+        "load_group_plan_image", { groupId: g.id },
+      );
+      if (!result || !result.bounds_json) return;
+      const bounds: PlanImageBounds = JSON.parse(result.bounds_json);
+      setActivePlanOverlay(g.id, {
+        imageDataUrl: `data:image/jpeg;base64,${result.image_base64}`,
+        bounds, opacity: result.opacity,
+      });
+    } catch (e) { console.warn("[PlanOverlay] 토글 실패:", e); }
   };
 
   const toggleCollapse = (groupId: number) => {
@@ -1115,7 +1488,8 @@ function ManualBuildingPanel() {
 
   const renderBuildingRow = (b: ManualBuilding) => (
     <div key={b.id} className="flex items-center gap-3 px-3 py-2 hover:bg-gray-100 transition-colors group">
-      {b.geometry_type === "rectangle" ? <Square size={14} className="shrink-0 text-gray-400" />
+      {b.geometry_type === "multi" ? <Plus size={14} className="shrink-0 text-blue-400" />
+        : b.geometry_type === "rectangle" ? <Square size={14} className="shrink-0 text-gray-400" />
         : b.geometry_type === "circle" ? <Circle size={14} className="shrink-0 text-gray-400" />
         : b.geometry_type === "line" ? <Minus size={14} className="shrink-0 text-gray-400" />
         : <Building2 size={14} className="shrink-0 text-gray-400" />}
@@ -1125,7 +1499,10 @@ function ManualBuildingPanel() {
           <span className="text-[10px] text-gray-400">{b.height}m</span>
           {b.geometry_type && b.geometry_type !== "point" && (
             <span className="text-[9px] text-gray-400 bg-gray-200 px-1 rounded">
-              {b.geometry_type === "rectangle" ? "사각형" : b.geometry_type === "circle" ? "원/타원" : "선"}
+              {shapeTypeLabel(b.geometry_type)}
+              {b.geometry_type === "multi" && b.geometry_json && (() => {
+                try { return ` (${JSON.parse(b.geometry_json).length})`; } catch { return ""; }
+              })()}
             </span>
           )}
         </div>
@@ -1268,8 +1645,22 @@ function ManualBuildingPanel() {
                     />
                     <span className="text-sm font-medium text-gray-700">{getGroupName(gId)}</span>
                     <span className="text-[10px] text-gray-400">({items.length})</span>
+                    {group?.has_plan_image && (
+                      <ImageIcon size={11} className="shrink-0 text-gray-300" />
+                    )}
                     {group && (
                       <div className="ml-auto flex items-center gap-1 opacity-0 group-hover/hdr:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
+                        {group.has_plan_image && group.plan_bounds_json && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); togglePlanOverlay(group); }}
+                            className="rounded p-1 hover:bg-gray-200 transition-colors"
+                            title={activePlanOverlays.has(group.id) ? "오버레이 숨기기" : "오버레이 표시"}
+                          >
+                            {activePlanOverlays.has(group.id)
+                              ? <Eye size={10} className="text-blue-500" />
+                              : <EyeOff size={10} className="text-gray-400" />}
+                          </button>
+                        )}
                         <button
                           onClick={(e) => { e.stopPropagation(); openGroupEdit(group); }}
                           className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700 transition-colors"
@@ -1344,6 +1735,63 @@ function ManualBuildingPanel() {
               className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-800 placeholder:text-gray-400 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30"
             />
           </div>
+          {/* 토지이용계획도 */}
+          <div className="border-t pt-3">
+            <label className="mb-1.5 block text-xs font-medium text-gray-600">토지이용계획도</label>
+            {planImagePreview ? (
+              <div className="space-y-2">
+                <div className="relative rounded-lg border border-gray-200 overflow-hidden">
+                  <img src={planImagePreview} alt="계획도" className="w-full max-h-28 object-contain bg-gray-50" />
+                  <button
+                    onClick={handleDeletePlanImage}
+                    className="absolute top-1 right-1 rounded-full bg-white/80 p-0.5 hover:bg-white"
+                  >
+                    <X size={14} className="text-gray-500" />
+                  </button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-gray-500 w-12">불투명도</span>
+                  <input type="range" min={0.1} max={1} step={0.05} value={planOpacity}
+                    onChange={(e) => setPlanOpacity(Number(e.target.value))}
+                    className="flex-1 accent-[#a60739]" />
+                  <span className="text-[10px] text-gray-500 w-7 text-right">{Math.round(planOpacity * 100)}%</span>
+                </div>
+                {/* 지도에서 위치 조정 — 맵 모달 열기 */}
+                {editGroup && (
+                  <button
+                    onClick={async () => {
+                      // 이미지가 있으면 먼저 저장
+                      if (planImageBase64) {
+                        await invoke("save_group_plan_image", {
+                          groupId: editGroup.id, imageBase64: planImageBase64,
+                          boundsJson: editGroup.plan_bounds_json || "", opacity: planOpacity,
+                        });
+                        await loadData();
+                      }
+                      const bounds = editGroup.plan_bounds_json ? JSON.parse(editGroup.plan_bounds_json) as PlanImageBounds : null;
+                      setPositioningModal({
+                        groupId: editGroup.id,
+                        imageDataUrl: planImagePreview!,
+                        initialBounds: bounds,
+                      });
+                    }}
+                    className="w-full rounded-lg bg-blue-50 px-3 py-1.5 text-xs text-blue-600 hover:bg-blue-100 transition-colors"
+                  >
+                    <MapPin size={12} className="inline mr-1" />
+                    지도에서 위치 조정
+                  </button>
+                )}
+              </div>
+            ) : (
+              <button
+                onClick={handlePickPlanImage}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border-2 border-dashed border-gray-300 px-3 py-3 text-xs text-gray-400 hover:border-gray-400 hover:text-gray-500 transition-colors"
+              >
+                <Upload size={14} />
+                이미지 업로드
+              </button>
+            )}
+          </div>
           <div className="flex justify-end gap-2 pt-1">
             <button
               onClick={() => setGroupModalOpen(false)}
@@ -1361,7 +1809,90 @@ function ManualBuildingPanel() {
           </div>
         </div>
       </Modal>
+
+      {/* 위치 조정 맵 모달 */}
+      {positioningModal && (
+        <PositioningMapModal
+          groupId={positioningModal.groupId}
+          imageDataUrl={positioningModal.imageDataUrl}
+          initialBounds={positioningModal.initialBounds}
+          onConfirm={async (bounds) => {
+            try {
+              const result = await invoke<{ image_base64: string; opacity: number } | null>(
+                "load_group_plan_image", { groupId: positioningModal.groupId },
+              );
+              if (result) {
+                await invoke("save_group_plan_image", {
+                  groupId: positioningModal.groupId,
+                  imageBase64: result.image_base64,
+                  boundsJson: JSON.stringify(bounds),
+                  opacity: result.opacity,
+                });
+                setActivePlanOverlay(positioningModal.groupId, {
+                  imageDataUrl: positioningModal.imageDataUrl,
+                  bounds, opacity: result.opacity,
+                });
+              }
+              loadData();
+            } catch (e) { console.warn("[Positioning] 저장 실패:", e); }
+            setPositioningModal(null);
+          }}
+          onCancel={() => setPositioningModal(null)}
+        />
+      )}
     </>
+  );
+}
+
+// ─── 위치 조정 맵 모달 ──────────────────────────────────────────
+
+const POS_MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
+
+function PositioningMapModal({
+  groupId, imageDataUrl, initialBounds, onConfirm, onCancel,
+}: {
+  groupId: number;
+  imageDataUrl: string;
+  initialBounds: PlanImageBounds | null;
+  onConfirm: (bounds: PlanImageBounds) => void;
+  onCancel: () => void;
+}) {
+  const mapRef = useRef<MapRef>(null);
+  const radarSite = useAppStore((s) => s.radarSite);
+  const [mapReady, setMapReady] = useState(false);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+      <div className="relative w-[90vw] h-[80vh] max-w-5xl rounded-xl border border-gray-200 bg-white shadow-2xl overflow-hidden flex flex-col">
+        <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+          <h2 className="text-sm font-semibold text-gray-800">토지이용계획도 위치 조정</h2>
+          <button onClick={onCancel} className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="flex-1 relative">
+          <MapGL
+            ref={mapRef}
+            initialViewState={{ latitude: radarSite.latitude, longitude: radarSite.longitude, zoom: 12 }}
+            mapStyle={POS_MAP_STYLE}
+            style={{ width: "100%", height: "100%" }}
+            attributionControl={false}
+            onLoad={() => setMapReady(true)}
+          >
+            {mapReady && mapRef.current?.getMap() && (
+              <ImagePositioner
+                map={mapRef.current.getMap()!}
+                groupId={groupId}
+                imageDataUrl={imageDataUrl}
+                initialBounds={initialBounds}
+                onConfirm={onConfirm}
+                onCancel={onCancel}
+              />
+            )}
+          </MapGL>
+        </div>
+      </div>
+    </div>
   );
 }
 

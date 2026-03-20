@@ -522,6 +522,21 @@ fn expand_manual_geometry(
                 }
             }
         }
+        "multi" => {
+            // 복합 도형: [{type, json}, ...] 배열을 재귀 확장
+            if let Some(arr) = val.as_array() {
+                let mut all_pts = Vec::new();
+                for item in arr {
+                    let sub_type = item.get("type").and_then(|v| v.as_str());
+                    let sub_json = item.get("json").and_then(|v| v.as_str());
+                    let pts = expand_manual_geometry(center_lat, center_lon, sub_type, sub_json);
+                    all_pts.extend(pts);
+                }
+                if !all_pts.is_empty() {
+                    return all_pts;
+                }
+            }
+        }
         _ => {}
     }
 
