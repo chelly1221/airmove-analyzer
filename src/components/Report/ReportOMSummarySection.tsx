@@ -1,3 +1,4 @@
+import React from "react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite, AzSector } from "../../types";
 
 interface Props {
@@ -28,7 +29,7 @@ function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): nu
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-export default function ReportOMSummarySection({
+function ReportOMSummarySection({
   sectionNum,
   radarResults,
   selectedBuildings,
@@ -148,3 +149,5 @@ export default function ReportOMSummarySection({
     </div>
   );
 }
+
+export default React.memo(ReportOMSummarySection);

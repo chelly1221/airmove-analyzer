@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
   ChevronRight,
+  FolderPlus,
   Plus,
   Pencil,
   Trash2,
@@ -12,10 +13,12 @@ import {
   Image as ImageIcon,
   Upload,
   X,
+  RotateCw,
 } from "lucide-react";
 import { useAppStore } from "../store";
 import type { BuildingGroup, PlanImageBounds } from "../types";
 import Modal from "./common/Modal";
+import { EmptyState } from "./common/EmptyState";
 
 /** 기본 색상 팔레트 */
 const COLOR_PRESETS = [
@@ -37,6 +40,7 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
   const loadManualBuildings = useAppStore((s) => s.loadManualBuildings);
   const activePlanOverlays = useAppStore((s) => s.activePlanOverlays);
   const setActivePlanOverlay = useAppStore((s) => s.setActivePlanOverlay);
+  const updatePlanOverlayProps = useAppStore((s) => s.updatePlanOverlayProps);
 
   const [expanded, setExpanded] = useState(false);
   const [editModal, setEditModal] = useState<{ mode: "add" | "edit"; group?: BuildingGroup } | null>(null);
@@ -281,6 +285,7 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
           onClick={(e) => { e.stopPropagation(); openAddModal(); }}
           className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
           title="그룹 추가"
+          aria-label="그룹 추가"
         >
           <Plus size={14} />
         </button>
@@ -289,59 +294,96 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
       {expanded && (
         <div className="border-t border-gray-100 px-2 py-1 space-y-1 max-h-64 overflow-y-auto">
           {buildingGroups.length === 0 ? (
-            <p className="py-2 text-center text-xs text-gray-400">등록된 그룹이 없습니다</p>
+            <EmptyState
+              icon={FolderPlus}
+              title="등록된 그룹이 없습니다"
+              description="그룹을 추가하여 건물을 분류하세요"
+              compact
+            />
           ) : (
-            buildingGroups.map((g) => (
-              <div
-                key={g.id}
-                className="flex items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-gray-50 group"
-              >
-                {/* 색상 스와치 */}
-                <span
-                  className="h-3 w-3 rounded-sm flex-shrink-0"
-                  style={{ backgroundColor: g.color }}
-                />
-                {/* 이름 + 건물 수 */}
-                <span className="flex-1 truncate text-gray-700">
-                  {g.name}
-                  <span className="ml-1 text-gray-400">({countByGroup(g.id)})</span>
-                </span>
-                {/* 계획도 표시 */}
-                {g.has_plan_image && (
-                  <ImageIcon size={12} className="text-gray-300 flex-shrink-0" />
-                )}
-                {/* 액션 버튼들 */}
-                <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                  {g.has_plan_image && g.plan_bounds_json && (
-                    <button
-                      onClick={() => toggleOverlay(g)}
-                      className="rounded p-1 hover:bg-gray-200"
-                      title={activePlanOverlays.has(g.id) ? "오버레이 숨기기" : "오버레이 표시"}
-                    >
-                      {activePlanOverlays.has(g.id) ? (
-                        <Eye size={12} className="text-blue-500" />
-                      ) : (
-                        <EyeOff size={12} className="text-gray-400" />
-                      )}
-                    </button>
+            buildingGroups.map((g) => {
+              const overlayData = activePlanOverlays.get(g.id);
+              return (
+              <div key={g.id}>
+                <div
+                  className="flex items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-gray-50 group"
+                >
+                  {/* 색상 스와치 */}
+                  <span
+                    className="h-3 w-3 rounded-sm flex-shrink-0"
+                    style={{ backgroundColor: g.color }}
+                  />
+                  {/* 이름 + 건물 수 */}
+                  <span className="flex-1 truncate text-gray-700">
+                    {g.name}
+                    <span className="ml-1 text-gray-400">({countByGroup(g.id)})</span>
+                  </span>
+                  {/* 계획도 표시 */}
+                  {g.has_plan_image && (
+                    <ImageIcon size={12} className="text-gray-300 flex-shrink-0" />
                   )}
-                  <button
-                    onClick={() => openEditModal(g)}
-                    className="rounded p-1 hover:bg-gray-200"
-                    title="수정"
-                  >
-                    <Pencil size={12} className="text-gray-400" />
-                  </button>
-                  <button
-                    onClick={() => setDeleteConfirm(g.id)}
-                    className="rounded p-1 hover:bg-gray-200"
-                    title="삭제"
-                  >
-                    <Trash2 size={12} className="text-gray-400" />
-                  </button>
+                  {/* 액션 버튼들 */}
+                  <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    {g.has_plan_image && g.plan_bounds_json && (
+                      <button
+                        onClick={() => toggleOverlay(g)}
+                        className="rounded p-1 hover:bg-gray-200"
+                        title={overlayData ? "오버레이 숨기기" : "오버레이 표시"}
+                        aria-label={overlayData ? "오버레이 숨기기" : "오버레이 표시"}
+                      >
+                        {overlayData ? (
+                          <Eye size={12} className="text-blue-500" />
+                        ) : (
+                          <EyeOff size={12} className="text-gray-400" />
+                        )}
+                      </button>
+                    )}
+                    <button
+                      onClick={() => openEditModal(g)}
+                      className="rounded p-1 hover:bg-gray-200"
+                      title="수정"
+                      aria-label="수정"
+                    >
+                      <Pencil size={12} className="text-gray-400" />
+                    </button>
+                    <button
+                      onClick={() => setDeleteConfirm(g.id)}
+                      className="rounded p-1 hover:bg-gray-200"
+                      title="삭제"
+                      aria-label="삭제"
+                    >
+                      <Trash2 size={12} className="text-gray-400" />
+                    </button>
+                  </div>
                 </div>
+                {/* 오버레이 활성 시 투명도/회전 인라인 컨트롤 */}
+                {overlayData && (
+                  <div className="mx-2 mb-1 rounded bg-blue-50/50 px-2 py-1.5 space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <Eye size={10} className="text-gray-400 flex-shrink-0" />
+                      <input
+                        type="range" min={0.05} max={1} step={0.05}
+                        value={overlayData.opacity}
+                        onChange={(e) => updatePlanOverlayProps(g.id, { opacity: Number(e.target.value) })}
+                        className="flex-1 accent-blue-500 h-1"
+                      />
+                      <span className="text-[10px] text-gray-500 w-7 text-right">{Math.round(overlayData.opacity * 100)}%</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <RotateCw size={10} className="text-gray-400 flex-shrink-0" />
+                      <input
+                        type="range" min={-180} max={180} step={1}
+                        value={overlayData.rotation}
+                        onChange={(e) => updatePlanOverlayProps(g.id, { rotation: Number(e.target.value) })}
+                        className="flex-1 accent-blue-500 h-1"
+                      />
+                      <span className="text-[10px] text-gray-500 w-7 text-right">{overlayData.rotation}°</span>
+                    </div>
+                  </div>
+                )}
               </div>
-            ))
+              );
+            })
           )}
         </div>
       )}

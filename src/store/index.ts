@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { useToastStore } from "../components/common/Toast";
 import type {
   AdsbTrack,
   Aircraft,
@@ -174,8 +175,9 @@ interface AppState {
   loadBuildingGroups: () => Promise<void>;
   loadManualBuildings: () => Promise<void>;
   // 토지이용계획도 오버레이
-  activePlanOverlays: Map<number, { imageDataUrl: string; bounds: PlanImageBounds; opacity: number }>;
-  setActivePlanOverlay: (groupId: number, data: { imageDataUrl: string; bounds: PlanImageBounds; opacity: number } | null) => void;
+  activePlanOverlays: Map<number, { imageDataUrl: string; bounds: PlanImageBounds; opacity: number; rotation: number }>;
+  setActivePlanOverlay: (groupId: number, data: { imageDataUrl: string; bounds: PlanImageBounds; opacity: number; rotation?: number } | null) => void;
+  updatePlanOverlayProps: (groupId: number, props: { opacity?: number; rotation?: number }) => void;
   // UI
   activePage: PageId;
   setActivePage: (page: PageId) => void;
@@ -216,9 +218,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   addAircraft: (a) =>
     set((state) => {
       if (state.aircraft.length >= 10) return state;
-      invoke("save_aircraft", { aircraft: a }).catch((e) =>
-        console.warn("[Aircraft] DB 저장 실패:", e)
-      );
+      invoke("save_aircraft", { aircraft: a }).catch((e) => {
+        console.warn("[Aircraft] DB 저장 실패:", e);
+        useToastStore.getState().addToast("비행검사기 저장에 실패했습니다");
+      });
       return { aircraft: [...state.aircraft, a] };
     }),
   updateAircraft: (id, updates) =>
@@ -228,16 +231,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
       const target = updated.find((a) => a.id === id);
       if (target) {
-        invoke("save_aircraft", { aircraft: target }).catch((e) =>
-          console.warn("[Aircraft] DB 저장 실패:", e)
-        );
+        invoke("save_aircraft", { aircraft: target }).catch((e) => {
+          console.warn("[Aircraft] DB 저장 실패:", e);
+          useToastStore.getState().addToast("비행검사기 저장에 실패했습니다");
+        });
       }
       return { aircraft: updated };
     }),
   removeAircraft: (id) => {
-    invoke("delete_aircraft", { id }).catch((e) =>
-      console.warn("[Aircraft] DB 삭제 실패:", e)
-    );
+    invoke("delete_aircraft", { id }).catch((e) => {
+      console.warn("[Aircraft] DB 삭제 실패:", e);
+      useToastStore.getState().addToast("비행검사기 삭제에 실패했습니다");
+    });
     set((state) => ({
       aircraft: state.aircraft.filter((a) => a.id !== id),
     }));
@@ -256,9 +261,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   removeUploadedFile: (path) => {
     const file = get().uploadedFiles.find((f) => f.path === path);
     if (file && file.status !== "pending") {
-      invoke("delete_parsed_file", { filePath: path }).catch((e) =>
-        console.warn("[DB] delete file failed:", e)
-      );
+      invoke("delete_parsed_file", { filePath: path }).catch((e) => {
+        console.warn("[DB] delete file failed:", e);
+        useToastStore.getState().addToast("파일 삭제에 실패했습니다");
+      });
     }
     set((s) => ({
       uploadedFiles: s.uploadedFiles.filter((f) => f.path !== path),
@@ -271,9 +277,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       return f && f.status !== "pending";
     });
     if (dbPaths.length > 0) {
-      invoke("delete_parsed_files", { filePaths: dbPaths }).catch((e) =>
-        console.warn("[DB] delete files failed:", e)
-      );
+      invoke("delete_parsed_files", { filePaths: dbPaths }).catch((e) => {
+        console.warn("[DB] delete files failed:", e);
+        useToastStore.getState().addToast("파일 삭제에 실패했습니다");
+      });
     }
     const pathSet = new Set(paths);
     set((s) => ({
@@ -285,7 +292,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
   },
   clearUploadedFiles: () => {
-    invoke("clear_saved_data").catch((e) => console.warn("[DB] clear failed:", e));
+    invoke("clear_saved_data").catch((e) => {
+      console.warn("[DB] clear failed:", e);
+      useToastStore.getState().addToast("데이터 초기화에 실패했습니다");
+    });
     invoke("clear_manual_merges").catch(() => {});
     set({
       uploadedFiles: [],
@@ -332,7 +342,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       invoke("save_manual_merge", {
         sourceFlightIdsJson: JSON.stringify(ids),
         modeS,
-      }).catch((e) => console.warn("[Merge] DB 저장 실패:", e));
+      }).catch((e) => {
+        console.warn("[Merge] DB 저장 실패:", e);
+        useToastStore.getState().addToast("비행 병합 저장에 실패했습니다");
+      });
     });
   },
 
@@ -421,11 +434,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => ({
       losResults: state.losResults.filter((r) => r.id !== id),
     }));
-    invoke("delete_los_result", { id }).catch((e) => console.warn("[LOS] DB 삭제 실패:", e));
+    invoke("delete_los_result", { id }).catch((e) => {
+      console.warn("[LOS] DB 삭제 실패:", e);
+      useToastStore.getState().addToast("LOS 결과 삭제에 실패했습니다");
+    });
   },
   clearLOSResults: () => {
     set({ losResults: [] });
-    invoke("clear_los_results").catch((e) => console.warn("[LOS] DB 초기화 실패:", e));
+    invoke("clear_los_results").catch((e) => {
+      console.warn("[LOS] DB 초기화 실패:", e);
+      useToastStore.getState().addToast("LOS 결과 초기화에 실패했습니다");
+    });
   },
 
   // ADS-B
@@ -544,7 +563,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => ({ savedReports: [report, ...state.savedReports] })),
   removeSavedReport: (id) => {
     set((state) => ({ savedReports: state.savedReports.filter((r) => r.id !== id) }));
-    invoke("delete_saved_report", { id }).catch((e) => console.warn("[Report] DB 삭제 실패:", e));
+    invoke("delete_saved_report", { id }).catch((e) => {
+      console.warn("[Report] DB 삭제 실패:", e);
+      useToastStore.getState().addToast("보고서 삭제에 실패했습니다");
+    });
   },
 
   // 건물 그룹 + 수동 건물
@@ -571,10 +593,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => {
       const next = new Map(state.activePlanOverlays);
       if (data) {
-        next.set(groupId, data);
+        next.set(groupId, { ...data, rotation: data.rotation ?? 0 });
       } else {
         next.delete(groupId);
       }
+      return { activePlanOverlays: next };
+    }),
+  updatePlanOverlayProps: (groupId, props) =>
+    set((state) => {
+      const existing = state.activePlanOverlays.get(groupId);
+      if (!existing) return state;
+      const next = new Map(state.activePlanOverlays);
+      next.set(groupId, {
+        ...existing,
+        opacity: props.opacity ?? existing.opacity,
+        rotation: props.rotation ?? existing.rotation,
+      });
       return { activePlanOverlays: next };
     }),
   // UI

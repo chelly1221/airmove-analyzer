@@ -25,7 +25,7 @@ function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): num
   return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
-export default function ReportOMBuildingLOS({ sectionNum, selectedBuildings, radarSites, losMap }: Props) {
+function ReportOMBuildingLOS({ sectionNum, selectedBuildings, radarSites, losMap }: Props) {
   // 방위/거리 사전 계산 (렌더 중 재계산 방지)
   const buildingRadarInfo = useMemo(() => {
     const info = new Map<string, { az: number; dist: number }>();
@@ -149,3 +149,5 @@ export default function ReportOMBuildingLOS({ sectionNum, selectedBuildings, rad
     </div>
   );
 }
+
+export default React.memo(ReportOMBuildingLOS);

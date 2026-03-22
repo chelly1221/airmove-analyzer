@@ -37,9 +37,14 @@ export const COVERAGE_ALT_STEP_FT = 100;
 export {
   computeMainCoverage,
   computeLayersForAltitudes,
+  computeLayersForAltitudesAsync,
+  buildPolygonsAsync,
   isGPUCacheValidFor,
+  isWorkerReady,
   invalidateGPUCache,
 } from "./gpuCoverage";
+
+export type { CoveragePolygonData } from "./gpuCoverage";
 
 // ─── GeoJSON 변환 ───────────────────────────────────
 

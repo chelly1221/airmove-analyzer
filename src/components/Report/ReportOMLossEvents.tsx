@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import React, { useMemo } from "react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 
@@ -82,7 +82,7 @@ interface LossEvent {
   obstacleCaused: boolean;
 }
 
-export default function ReportOMLossEvents({
+function ReportOMLossEvents({
   sectionNum,
   radarResults,
   selectedBuildings,
@@ -272,3 +272,5 @@ export default function ReportOMLossEvents({
     </div>
   );
 }
+
+export default React.memo(ReportOMLossEvents);

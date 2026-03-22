@@ -129,7 +129,7 @@ export default function Drawing() {
       const [vs, ve] = zoomViewRef.current;
       const cursorAbs = vs + mouseRatio * (ve - vs);
       const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
-      let newRange = Math.max(0.005, Math.min(100, (ve - vs) * factor));
+      const newRange = Math.max(0.005, Math.min(100, (ve - vs) * factor));
       let ns = cursorAbs - mouseRatio * newRange;
       let ne = ns + newRange;
       if (ns < 0) { ns = 0; ne = Math.min(100, newRange); }
@@ -450,7 +450,7 @@ export default function Drawing() {
 
       // ── 그리드 라인 (GPU) ──
       const gridLines: LineData[] = [];
-      const gridColor: [number, number, number, number] = [0, 0, 0, 0.08];
+      const gridColor: [number, number, number, number] = [0, 0, 0, 0.3];
 
       const altRangeFt = (maxAlt - minAlt) * M_TO_FT;
       const yStepFt = altRangeFt > 30000 ? 5000 : altRangeFt > 15000 ? 2000 : altRangeFt > 5000 ? 1000 : altRangeFt > 1500 ? 500 : 100;
@@ -502,7 +502,7 @@ export default function Drawing() {
       gpu.flush();
     } else {
       // GPU 불가 시 Canvas 2D 폴백
-      ctx.strokeStyle = "rgba(0,0,0,0.08)";
+      ctx.strokeStyle = "rgba(0,0,0,0.3)";
       ctx.lineWidth = 0.5;
       const altRangeFt = (maxAlt - minAlt) * M_TO_FT;
       const yStepFt = altRangeFt > 30000 ? 5000 : altRangeFt > 15000 ? 2000 : altRangeFt > 5000 ? 1000 : altRangeFt > 1500 ? 500 : 100;
@@ -728,7 +728,7 @@ export default function Drawing() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-800">도면</h1>
+          <h1 className="text-2xl font-bold text-gray-800">2D 항적도</h1>
           <p className="mt-1 text-sm text-gray-500">
             측면도와 평면도를 나란히 표시합니다
           </p>
@@ -864,7 +864,7 @@ export default function Drawing() {
                   <Layer
                     id="range-ring-lines"
                     type="line"
-                    paint={{ "line-color": "rgba(0,0,0,0.15)", "line-width": 1, "line-dasharray": [4, 4] }}
+                    paint={{ "line-color": "#999999", "line-width": 1, "line-dasharray": [4, 4] }}
                   />
                 </Source>
                 <Source id="ring-labels" type="geojson" data={ringLabelsGeoJSON}>
@@ -879,7 +879,7 @@ export default function Drawing() {
                       "text-allow-overlap": true,
                     }}
                     paint={{
-                      "text-color": "rgba(0,0,0,0.4)",
+                      "text-color": "#999999",
                       "text-halo-color": "white",
                       "text-halo-width": 1,
                     }}

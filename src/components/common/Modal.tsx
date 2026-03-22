@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 import { X } from "lucide-react";
 
 interface ModalProps {
@@ -17,6 +17,8 @@ export default function Modal({
   width = "max-w-lg",
 }: ModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
 
   useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
@@ -24,6 +26,7 @@ export default function Modal({
     };
     if (open) {
       document.addEventListener("keydown", handleEsc);
+      dialogRef.current?.focus();
     }
     return () => document.removeEventListener("keydown", handleEsc);
   }, [open, onClose]);
@@ -39,13 +42,19 @@ export default function Modal({
       }}
     >
       <div
-        className={`${width} w-full mx-4 rounded-xl border border-gray-200 bg-white shadow-xl`}
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className={`${width} w-full mx-4 rounded-xl border border-gray-200 bg-white shadow-xl outline-none`}
       >
         <div className="flex items-center justify-between border-b border-gray-200 px-6 py-4">
-          <h2 className="text-lg font-semibold text-gray-800">{title}</h2>
+          <h2 id={titleId} className="text-lg font-semibold text-gray-800">{title}</h2>
           <button
             onClick={onClose}
             className="rounded-lg p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
+            aria-label="닫기"
           >
             <X size={20} />
           </button>

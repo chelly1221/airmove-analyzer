@@ -1,3 +1,4 @@
+import React from "react";
 import type { DailyStats } from "../../types";
 
 interface Props {
@@ -16,7 +17,7 @@ const BASELINE_COLOR = "#9ca3af";
 const DEV_POS_COLOR = "#dc2626"; // 편차 양(+) = 분석구간이 더 높음 → 장애물 영향 의심
 const DEV_NEG_COLOR = "#22c55e"; // 편차 음(-) = 분석구간이 더 낮음
 
-export default function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, conditions, analysisMonth }: Props) {
+function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, conditions, analysisMonth }: Props) {
   if (dailyStats.length === 0) return null;
 
   const monthLabel = analysisMonth
@@ -370,3 +371,5 @@ export default function ReportOMDailyChart({ sectionNum, mode, radarName, dailyS
     </div>
   );
 }
+
+export default React.memo(ReportOMDailyChart);

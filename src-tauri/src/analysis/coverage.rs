@@ -67,19 +67,6 @@ fn curv_drop(d_km: f64) -> f64 {
     (d_m * d_m) / (2.0 * R_EARTH_M)
 }
 
-/// Destination point (WGS-84) from lat/lon + bearing + distance
-fn destination_point(lat: f64, lon: f64, bearing_deg: f64, distance_km: f64) -> (f64, f64) {
-    let r = 6371.0;
-    let d = distance_km / r;
-    let brng = bearing_deg.to_radians();
-    let lat1 = lat.to_radians();
-    let lon1 = lon.to_radians();
-    let lat2 = (lat1.sin() * d.cos() + lat1.cos() * d.sin() * brng.cos()).asin();
-    let lon2 = lon1 + (brng.sin() * d.sin() * lat1.cos())
-        .atan2(d.cos() - lat1.sin() * lat2.sin());
-    (lat2.to_degrees(), lon2.to_degrees())
-}
-
 /// Compute terrain profile with rayon parallelization
 pub fn compute_terrain_profile(
     srtm: &mut SrtmReader,
@@ -146,7 +133,7 @@ pub fn compute_terrain_profile(
 
             for s in 0..SAMPLES_PER_RAY {
                 let dist = ((s + 1) as f64 / SAMPLES_PER_RAY as f64) * max_range_km;
-                let (lat, lon) = destination_point(radar_lat, radar_lon, bearing, dist);
+                let (lat, lon) = crate::geo::destination_point_km(radar_lat, radar_lon, bearing, dist);
 
                 let elev = srtm::elevation_from_tiles(tiles, lat, lon);
                 let bld_h = building_heights[ray_idx * SAMPLES_PER_RAY + s] as f64;
@@ -191,13 +178,13 @@ pub fn compute_terrain_profile(
         samples_per_ray: SAMPLES_PER_RAY,
     };
 
-    *PROFILE_CACHE.lock().unwrap() = Some(profile);
+    *PROFILE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(profile);
     meta
 }
 
 /// Compute a single coverage layer from cached profile
 pub fn compute_layer(alt_ft: f64, bearing_step: usize) -> Option<CoverageLayer> {
-    let cache = PROFILE_CACHE.lock().unwrap();
+    let cache = PROFILE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let profile = cache.as_ref()?;
     Some(compute_layer_inner(profile, alt_ft, bearing_step))
 }
@@ -256,12 +243,12 @@ fn compute_layer_inner(profile: &CoverageProfile, alt_ft: f64, bearing_step: usi
 
         let (dist_km, lat, lon) = if block_idx < n && block_idx > 0 {
             let d = (block_idx as f64 / n as f64) * max_range_km;
-            let (la, lo) = destination_point(profile.radar_lat, profile.radar_lon, bearing_deg, d);
+            let (la, lo) = crate::geo::destination_point_km(profile.radar_lat, profile.radar_lon, bearing_deg, d);
             (d, la, lo)
         } else if block_idx == 0 {
             (0.0, profile.radar_lat, profile.radar_lon)
         } else {
-            let (la, lo) = destination_point(profile.radar_lat, profile.radar_lon, bearing_deg, max_range_km);
+            let (la, lo) = crate::geo::destination_point_km(profile.radar_lat, profile.radar_lon, bearing_deg, max_range_km);
             (max_range_km, la, lo)
         };
 
@@ -290,7 +277,7 @@ pub fn compute_layers_batch(alt_fts: &[f64], bearing_step: usize) -> Vec<Coverag
 
 /// Check if cache is valid for given radar params
 pub fn is_cache_valid(radar_name: &str, radar_lat: f64, radar_lon: f64, radar_height: f64) -> bool {
-    let cache = PROFILE_CACHE.lock().unwrap();
+    let cache = PROFILE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     match cache.as_ref() {
         Some(p) => {
             p.radar_name == radar_name
@@ -304,7 +291,7 @@ pub fn is_cache_valid(radar_name: &str, radar_lat: f64, radar_lon: f64, radar_he
 
 /// Invalidate the cached profile
 pub fn invalidate_cache() {
-    *PROFILE_CACHE.lock().unwrap() = None;
+    *PROFILE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Query buildings for coverage computation (returns (lat, lon, height) tuples)
@@ -479,7 +466,7 @@ pub fn compute_terrain_profile_excluding(
 
             for s in 0..SAMPLES_PER_RAY {
                 let dist = ((s + 1) as f64 / SAMPLES_PER_RAY as f64) * max_range_km;
-                let (lat, lon) = destination_point(radar_lat, radar_lon, bearing, dist);
+                let (lat, lon) = crate::geo::destination_point_km(radar_lat, radar_lon, bearing, dist);
 
                 let elev = srtm::elevation_from_tiles(tiles, lat, lon);
                 let bld_h = building_heights[ray_idx * SAMPLES_PER_RAY + s] as f64;
@@ -522,7 +509,7 @@ pub fn compute_terrain_profile_excluding(
         samples_per_ray: SAMPLES_PER_RAY,
     };
 
-    *PROFILE_CACHE_EXCLUDED.lock().unwrap() = Some(profile);
+    *PROFILE_CACHE_EXCLUDED.lock().unwrap_or_else(|e| e.into_inner()) = Some(profile);
     meta
 }
 
@@ -539,7 +526,7 @@ fn compute_layer_from_cache(
     alt_ft: f64,
     bearing_step: usize,
 ) -> Option<CoverageLayer> {
-    let cache = cache_lock.lock().unwrap();
+    let cache = cache_lock.lock().unwrap_or_else(|e| e.into_inner());
     let profile = cache.as_ref()?;
     Some(compute_layer_inner(profile, alt_ft, bearing_step))
 }
@@ -633,7 +620,7 @@ pub fn presample_elevations_batch(
             let bearing = ray_idx as f64 * bearing_step_deg;
             (0..SAMPLES_PER_RAY).map(move |s| {
                 let dist = ((s + 1) as f64 / SAMPLES_PER_RAY as f64) * max_range_km;
-                let (lat, lon) = destination_point(radar_lat, radar_lon, bearing, dist);
+                let (lat, lon) = crate::geo::destination_point_km(radar_lat, radar_lon, bearing, dist);
                 let elev = srtm::elevation_from_tiles(tiles, lat, lon);
                 let bld_h = bh_ref[local_idx * SAMPLES_PER_RAY + s] as f64;
                 (elev + bld_h) as f32

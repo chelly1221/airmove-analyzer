@@ -137,17 +137,6 @@ impl LightPoint {
 
 // ─── 핵심 로직 ───
 
-/// 레이더→포인트 방위 계산 (0~360°, true north)
-fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let lat1 = lat1.to_radians();
-    let lat2 = lat2.to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let y = dlon.sin() * lat2.cos();
-    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
-    let brng = y.atan2(x).to_degrees();
-    (brng + 360.0) % 360.0
-}
-
 /// 포인트가 방위 구간 내에 있는지 확인
 fn in_any_sector(az: f64, sectors: &[AzSector]) -> bool {
     sectors.iter().any(|s| s.contains(az))
@@ -269,7 +258,7 @@ pub fn analyze_radar_monthly(
             }
 
             // 방위 필터링
-            let az = bearing_deg(radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude);
+            let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude);
             let in_sector = in_any_sector(az, &radar.azimuth_sectors);
 
             if in_sector {
@@ -337,7 +326,7 @@ pub fn analyze_radar_monthly(
             message: format!("{} 분석 중... ({}/{})", date, di + 1, total_days),
         });
 
-        let points = daily_points.get(date).unwrap();
+        let points = daily_points.get(date).expect("date exists in daily_points keys");
 
         // PSR 통계 (60NM 이내만)
         const PSR_RANGE_KM: f64 = 60.0 * 1.852; // 60NM
@@ -373,7 +362,7 @@ pub fn analyze_radar_monthly(
             pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
 
             // 비행 시간
-            let track_time = pts.last().unwrap().timestamp - pts.first().unwrap().timestamp;
+            let track_time = pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
             day_track_time += track_time;
 
             // 스캔 간격 추정 (median)
@@ -472,7 +461,7 @@ pub fn analyze_radar_monthly(
                 for (_ms, mut pts) in bl_ms_groups {
                     if pts.len() < 2 { continue; }
                     pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
-                    bl_track_time += pts.last().unwrap().timestamp - pts.first().unwrap().timestamp;
+                    bl_track_time += pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
                     let mut bl_gaps: Vec<f64> = pts.windows(2)
                         .map(|w| w[1].timestamp - w[0].timestamp)
                         .filter(|&g| g > 0.5 && g < 30.0)

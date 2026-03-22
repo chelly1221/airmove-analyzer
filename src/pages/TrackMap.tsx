@@ -37,10 +37,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, AdsbTrack } from "../types";
 import LOSProfilePanel from "../components/Map/LOSProfilePanel";
-import { computeMainCoverage, computeLayersForAltitudes, isGPUCacheValidFor, invalidateGPUCache, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer } from "../utils/radarCoverage";
+import { computeMainCoverage, computeLayersForAltitudesAsync, isGPUCacheValidFor, isWorkerReady, invalidateGPUCache, buildPolygonsAsync, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer, type CoveragePolygonData } from "../utils/radarCoverage";
 import { fetchCloudGridKorea, getCloudFrameAtTime, fetchHistoricalWeather } from "../utils/weatherFetch";
 import { GPU2D, type RectData } from "../utils/gpu2d";
-import { addPlanOverlay, removePlanOverlay } from "../utils/planOverlay";
+import { addPlanOverlay, removePlanOverlay, updatePlanOpacity, updatePlanBounds, rotateBounds } from "../utils/planOverlay";
 import { generateGimpoOLS, OLS_COLORS, type OLSSurfaceData } from "../utils/olsSurfaces";
 
 /**
@@ -161,6 +161,7 @@ export default function TrackMap() {
   const [coverageAltMinInput, setCoverageAltMinInput] = useState(COVERAGE_MIN_ALT_FT); // 디바운스용 최소 입력값
   const [gpuCacheReady, setGpuCacheReady] = useState(false);
   const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
+  const [coveragePolygonsList, setCoveragePolygonsList] = useState<CoveragePolygonData[] | null>(null);
   const coverageVisible = useAppStore((s) => s.coverageVisible);
   const setCoverageVisible = useAppStore((s) => s.setCoverageVisible);
   const coverageLoading = useAppStore((s) => s.coverageLoading);
@@ -740,8 +741,13 @@ export default function TrackMap() {
     const activeIds = new Set<number>();
     activePlanOverlays.forEach((data, groupId) => {
       activeIds.add(groupId);
+      const rotated = rotateBounds(data.bounds, data.rotation);
       if (!map.getSource(`plan-image-${groupId}`)) {
-        addPlanOverlay(map, groupId, data.imageDataUrl, data.bounds, data.opacity);
+        addPlanOverlay(map, groupId, data.imageDataUrl, rotated, data.opacity);
+      } else {
+        // 투명도/회전 변경 시 기존 레이어 업데이트
+        updatePlanOpacity(map, groupId, data.opacity);
+        updatePlanBounds(map, groupId, rotated);
       }
     });
     // 비활성 오버레이 제거
@@ -771,63 +777,24 @@ export default function TrackMap() {
     return [Math.round((r1 + m) * 255), Math.round((g1 + m) * 255), Math.round((b1 + m) * 255)];
   }, []);
 
-  // 커버리지 deck.gl 데이터 (합성 스펙트럼: 동심 링 방식)
-  const coveragePolygonsList = useMemo(() => {
-    if (!coverageVisible || coverageLayers.length === 0) return null;
-    const rLat = radarSite.latitude;
-    const rLon = radarSite.longitude;
-    const CONE_PTS = 72;
-
-    const isSingle = coverageLayers.length === 1;
-
-    // 고도순 정렬 (낮→높 = 좁→넓)
-    const sorted = [...coverageLayers].sort((a, b) => a.altitudeFt - b.altitudeFt);
-
-    return sorted.map((layer, idx) => {
-      const altM = layer.altitudeM;
-      const zVal = isSingle ? altM * altScale : 0;
-      const outerRing: [number, number, number][] = layer.bearings.map((b) => [b.lon, b.lat, zVal]);
-      if (outerRing.length > 0) outerRing.push(outerRing[0]);
-
-      const polygon: [number, number, number][][] = [outerRing];
-      let coneRing: [number, number, number][] | null = null;
-
-      // 범위 모드: 안쪽 레이어(이전 고도)를 구멍으로 뚫어 동심 링 생성
-      const innerLayer = !isSingle && idx > 0 ? sorted[idx - 1] : null;
-      if (innerLayer) {
-        const innerHole: [number, number, number][] = innerLayer.bearings.map((b) => [b.lon, b.lat, zVal]);
-        if (innerHole.length > 0) innerHole.push(innerHole[0]);
-        innerHole.reverse(); // 홀은 반시계 방향
-        polygon.push(innerHole);
-      }
-
-      // 최내곽 레이어(idx===0)에만 Cone of Silence 구멍 적용
-      if (showConeOfSilence && layer.coneRadiusKm > 0.5 && (isSingle || idx === 0)) {
-        const hole: [number, number, number][] = [];
-        for (let i = CONE_PTS; i >= 0; i--) {
-          const deg = (i / CONE_PTS) * 360;
-          const rad = (deg * Math.PI) / 180;
-          const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
-          const lat = rLat + dLat * Math.cos(rad);
-          const lon = rLon + (dLat / Math.cos((rLat * Math.PI) / 180)) * Math.sin(rad);
-          hole.push([lon, lat, zVal]);
-        }
-        polygon.push(hole);
-        coneRing = [];
-        for (let i = 0; i <= CONE_PTS; i++) {
-          const deg = (i / CONE_PTS) * 360;
-          const rad = (deg * Math.PI) / 180;
-          const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
-          const lat = rLat + dLat * Math.cos(rad);
-          const lon = rLon + (dLat / Math.cos((rLat * Math.PI) / 180)) * Math.sin(rad);
-          coneRing.push([lon, lat, zVal]);
-        }
-      }
-
-      const fillColor = altToColor(layer.altitudeFt);
-      return { polygon, outerRing, coneRing, fillColor, altM, altFt: layer.altitudeFt };
-    });
-  }, [coverageLayers, coverageVisible, altScale, radarSite, altToColor, showConeOfSilence]);
+  // 커버리지 deck.gl 데이터 — Worker에서 비동기 폴리곤 구성 (UI 논블로킹)
+  useEffect(() => {
+    if (!coverageVisible || coverageLayers.length === 0) {
+      setCoveragePolygonsList(null);
+      return;
+    }
+    let stale = false;
+    buildPolygonsAsync(
+      coverageLayers,
+      radarSite.latitude,
+      radarSite.longitude,
+      coverageLayers.length === 1 ? altScale : 0,
+      showConeOfSilence,
+    ).then((polygons) => {
+      if (!stale) setCoveragePolygonsList(polygons as CoveragePolygonData[]);
+    }).catch(() => {});
+    return () => { stale = true; };
+  }, [coverageLayers, coverageVisible, altScale, radarSite, showConeOfSilence]);
 
   // 구름 오버레이 데이터 — 규칙적 격자(grid) 방식: 운량에 비례하여 점 밀도 조절
   const cloudDots = useMemo(() => {
@@ -960,7 +927,7 @@ export default function TrackMap() {
     }
   }, [radarSite.latitude, radarSite.longitude]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /** 커버리지 맵 계산 시작 — 지형 프로파일 한번 계산 후 캐시 (백그라운드 작동) */
+  /** 커버리지 맵 계산 시작 — GPU 계산 + Worker 점진적 렌더링 */
   const startCoverageCompute = useCallback(async (force = false) => {
     setCoverageLoading(true);
     setCoverageError("");
@@ -969,10 +936,18 @@ export default function TrackMap() {
     try {
       if (force) invalidateGPUCache();
 
-      const result = await computeMainCoverage(radarSite, (pct, msg) => {
-        setCoverageProgressPct(pct);
-        setCoverageProgress(msg);
-      });
+      const result = await computeMainCoverage(
+        radarSite,
+        (pct, msg) => {
+          setCoverageProgressPct(pct);
+          setCoverageProgress(msg);
+        },
+        // 점진적 렌더링: GPU 배치 완료마다 부분 폴리곤 표시
+        (progressivePolygons) => {
+          setCoveragePolygonsList(progressivePolygons as CoveragePolygonData[]);
+          if (!coverageVisible) setCoverageVisible(true);
+        },
+      );
       setGpuCacheReady(true);
       setCoverageVisible(true);
       setCoverageData(result);
@@ -985,7 +960,7 @@ export default function TrackMap() {
       setCoverageProgress("");
       setCoverageProgressPct(0);
     }
-  }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
+  }, [radarSite, coverageVisible, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
 
   // 슬라이더 디바운스: 입력값 변경 → 150ms 후 실제 고도 반영
   const handleCoverageAltChange = useCallback((val: number) => {
@@ -1008,7 +983,7 @@ export default function TrackMap() {
     return () => window.removeEventListener("keydown", handleEscape);
   }, [coverageModalOpen]);
 
-  // 고도 슬라이더 변경 시 레이어들 재계산 (최소~최대 고도 범위 겹침)
+  // 고도 슬라이더 변경 시 레이어들 재계산 (Worker 비동기, UI 논블로킹)
   useEffect(() => {
     if (!gpuCacheReady || !coverageVisible) return;
 
@@ -1028,7 +1003,13 @@ export default function TrackMap() {
       altFts.push(effMax);
     }
 
-    setCoverageLayers(computeLayersForAltitudes(altFts));
+    let stale = false;
+    if (isWorkerReady()) {
+      computeLayersForAltitudesAsync(altFts).then((layers) => {
+        if (!stale) setCoverageLayers(layers);
+      });
+    }
+    return () => { stale = true; };
   }, [coverageAlt, coverageAltMin, gpuCacheReady, coverageVisible]);
 
   // Mode-S별 트랙 패스 데이터 (gap + radar_type 변경 시 분할)
@@ -2094,7 +2075,7 @@ export default function TrackMap() {
       const [vs, ve] = zoomViewRef.current;
       const cursorAbs = vs + mouseRatio * (ve - vs);
       const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
-      let newRange = Math.max(0.005, Math.min(100, (ve - vs) * factor));
+      const newRange = Math.max(0.005, Math.min(100, (ve - vs) * factor));
       let ns = cursorAbs - mouseRatio * newRange;
       let ne = ns + newRange;
       if (ns < 0) { ns = 0; ne = Math.min(100, newRange); }

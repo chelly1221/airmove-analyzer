@@ -1,3 +1,4 @@
+import React, { useMemo } from "react";
 import EditableText from "./EditableText";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
 
@@ -29,7 +30,7 @@ function gradeOf(lossRate: number): { label: string; color: string; bg: string }
   return { label: "경고", color: "#b91c1c", bg: "#fee2e2" };
 }
 
-export default function ReportOMFindings({
+function ReportOMFindings({
   sectionNum,
   radarResults,
   selectedBuildings,
@@ -43,7 +44,7 @@ export default function ReportOMFindings({
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
     : "";
   // 레이더별 요약 계산
-  const radarSummaries = radarResults.map((rr) => {
+  const radarSummaries = useMemo(() => radarResults.map((rr) => {
     const stats = rr.daily_stats;
     const avgLoss = stats.length > 0
       ? stats.reduce((s, d) => s + d.loss_rate, 0) / stats.length
@@ -68,7 +69,20 @@ export default function ReportOMFindings({
       grade,
       dayCount: stats.length,
     };
-  });
+  }), [radarResults]);
+
+  // 건물별 거리 텍스트 사전 계산
+  const buildingDistTexts = useMemo(() =>
+    selectedBuildings.map((b) => ({
+      id: b.id,
+      name: b.name || `건물${b.id}`,
+      height: b.height,
+      dists: radarSites.map((rs) => {
+        const km = haversineKm(rs.latitude, rs.longitude, b.latitude, b.longitude);
+        return `${rs.name} ${km.toFixed(1)}km`;
+      }),
+    })),
+  [selectedBuildings, radarSites]);
 
   return (
     <div className="mb-8">
@@ -127,18 +141,12 @@ export default function ReportOMFindings({
       <div className="mb-4 p-2 bg-gray-50 rounded border border-gray-200">
         <h3 className="mb-2 text-[15px] font-semibold text-gray-700">분석 대상 장애물</h3>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-[12px]">
-          {selectedBuildings.map((b) => {
-            const dists = radarSites.map((rs) => {
-              const km = haversineKm(rs.latitude, rs.longitude, b.latitude, b.longitude);
-              return `${rs.name} ${km.toFixed(1)}km`;
-            });
-            return (
-              <span key={b.id} className="text-gray-700">
-                <span className="font-semibold">{b.name || `건물${b.id}`}</span>
-                {" "}({b.height}m) — {dists.join(", ")}
-              </span>
-            );
-          })}
+          {buildingDistTexts.map((bt) => (
+            <span key={bt.id} className="text-gray-700">
+              <span className="font-semibold">{bt.name}</span>
+              {" "}({bt.height}m) — {bt.dists.join(", ")}
+            </span>
+          ))}
         </div>
       </div>
 
@@ -159,3 +167,5 @@ export default function ReportOMFindings({
     </div>
   );
 }
+
+export default React.memo(ReportOMFindings);

@@ -14,6 +14,10 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         "
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA cache_size=-32000;
+        PRAGMA busy_timeout=5000;
+        PRAGMA temp_store=MEMORY;
 
         CREATE TABLE IF NOT EXISTS adsb_tracks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

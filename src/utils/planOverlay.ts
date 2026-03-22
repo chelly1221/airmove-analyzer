@@ -87,3 +87,29 @@ export function updatePlanBounds(map: maplibregl.Map, groupId: number, bounds: P
     ]);
   }
 }
+
+/** Rotate bounds around their center by angleDeg degrees */
+export function rotateBounds(bounds: PlanImageBounds, angleDeg: number): PlanImageBounds {
+  if (angleDeg === 0) return bounds;
+  const corners = [bounds.topLeft, bounds.topRight, bounds.bottomRight, bounds.bottomLeft];
+  const centerLat = corners.reduce((s, c) => s + c[0], 0) / 4;
+  const centerLon = corners.reduce((s, c) => s + c[1], 0) / 4;
+  const rad = (angleDeg * Math.PI) / 180;
+  const cosA = Math.cos(rad);
+  const sinA = Math.sin(rad);
+  // 위도 보정 — 경도 거리는 cos(lat) 비율
+  const cosLat = Math.cos((centerLat * Math.PI) / 180);
+  const rotate = (p: [number, number]): [number, number] => {
+    const dLat = p[0] - centerLat;
+    const dLon = (p[1] - centerLon) * cosLat; // 등거리 변환
+    const rLat = dLat * cosA - dLon * sinA;
+    const rLon = dLat * sinA + dLon * cosA;
+    return [centerLat + rLat, centerLon + rLon / cosLat];
+  };
+  return {
+    topLeft: rotate(bounds.topLeft),
+    topRight: rotate(bounds.topRight),
+    bottomRight: rotate(bounds.bottomRight),
+    bottomLeft: rotate(bounds.bottomLeft),
+  };
+}

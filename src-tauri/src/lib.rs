@@ -3,6 +3,7 @@ pub mod building;
 pub mod coord;
 pub mod db;
 pub mod declination;
+pub mod geo;
 pub mod models;
 pub mod parser;
 pub mod srtm;
@@ -1240,7 +1241,7 @@ fn presample_panorama_elevations(
             let az_deg = az_idx as f64 * az_step;
             (1..=num_steps).map(move |s| {
                 let d = s as f64 * r_step;
-                let (lat, lon) = analysis::panorama::destination_point_pub(
+                let (lat, lon) = geo::destination_point_m(
                     radar_lat, radar_lon, az_deg, d,
                 );
                 srtm::elevation_from_tiles(tiles, lat, lon) as f32

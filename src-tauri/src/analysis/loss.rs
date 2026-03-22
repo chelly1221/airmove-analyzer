@@ -117,18 +117,7 @@ fn detect_loss_for_track(
 
 /// Calculate the great-circle distance between two points using the Haversine formula.
 pub fn calculate_haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const EARTH_RADIUS_KM: f64 = 6371.0;
-
-    let lat1_rad = lat1.to_radians();
-    let lat2_rad = lat2.to_radians();
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.clamp(0.0, 1.0).sqrt().asin();
-
-    EARTH_RADIUS_KM * c
+    crate::geo::haversine_km(lat1, lon1, lat2, lon2)
 }
 
 /// 트랙의 중앙값 스캔 간격 추정

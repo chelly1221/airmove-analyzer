@@ -21,8 +21,6 @@ import {
   ChevronRight,
   RotateCw,
   FolderPlus,
-  Eye,
-  EyeOff,
   Image as ImageIcon,
   X,
 } from "lucide-react";
@@ -33,6 +31,7 @@ import { useAppStore } from "../store";
 import { consolidateFlights } from "../utils/flightConsolidation";
 import Modal from "../components/common/Modal";
 import ImagePositioner from "../components/Map/ImagePositioner";
+import { addPlanOverlay, removePlanOverlay } from "../utils/planOverlay";
 import type { AnalysisResult, BuildingGroup, FlightRecord, GeometryType, ManualBuilding, PlanImageBounds, UploadedFile } from "../types";
 
 // ─── 건물 입력 모달 ──────────────────────────────────────────────
@@ -269,6 +268,37 @@ function BuildingModal({
   const [form, setForm] = useState<BuildingFormData>(emptyForm);
   const [drawTool, setDrawTool] = useState<DrawTool>("point");
   const miniMapRef = useRef<MapRef>(null);
+  const [miniMapReady, setMiniMapReady] = useState(false);
+
+  // 선택 그룹의 plan overlay를 미니맵에 표시 (DB에서 직접 로드)
+  useEffect(() => {
+    const map = miniMapRef.current?.getMap();
+    if (!map || !miniMapReady) return;
+    // 이전 plan overlay 제거
+    for (const layer of map.getStyle().layers) {
+      if (layer.id.startsWith("plan-raster-")) {
+        const gid = Number(layer.id.replace("plan-raster-", ""));
+        removePlanOverlay(map, gid);
+      }
+    }
+    const gid = form.group_id;
+    if (gid == null) return;
+    const group = groups.find((g) => g.id === gid);
+    if (!group?.has_plan_image || !group.plan_bounds_json) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number } | null>(
+          "load_group_plan_image", { groupId: gid },
+        );
+        if (cancelled || !result?.bounds_json) return;
+        const bounds: PlanImageBounds = JSON.parse(result.bounds_json);
+        const m = miniMapRef.current?.getMap();
+        if (m) addPlanOverlay(m, gid, `data:image/jpeg;base64,${result.image_base64}`, bounds, result.opacity);
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, [form.group_id, groups, miniMapReady]);
 
   // 그리기 임시 상태: 클릭 포인트 축적 + 마우스 현재 위치
   const [clickPts, setClickPts] = useState<[number, number][]>([]); // [lat, lon][]
@@ -310,6 +340,7 @@ function BuildingModal({
     setClickPts([]);
     setMousePt(null);
     setRotatingEllipse(false);
+    setMiniMapReady(false);
   }, [initial, isOpen]);
 
   const handleSubmit = () => {
@@ -1095,7 +1126,9 @@ function BuildingModal({
               initialViewState={{
                 ...mapCenter,
                 zoom: hasMarker ? 14 : 7,
+                pitch: 0,
               }}
+              maxPitch={0}
               mapStyle={MAP_STYLE}
               style={{ width: "100%", height: "100%" }}
               cursor="crosshair"
@@ -1104,6 +1137,7 @@ function BuildingModal({
               onMouseMove={handleMapMouseMove}
               attributionControl={false}
               doubleClickZoom={drawTool !== "line"}
+              onLoad={() => setMiniMapReady(true)}
             >
               {/* 확정된 멀티 도형 (파란색) */}
               <Source
@@ -1242,8 +1276,9 @@ function ManualBuildingPanel() {
   // 오버레이 토글
   const activePlanOverlays = useAppStore((s) => s.activePlanOverlays);
   const setActivePlanOverlay = useAppStore((s) => s.setActivePlanOverlay);
+  const updatePlanOverlayProps = useAppStore((s) => s.updatePlanOverlayProps);
   // 위치 조정 맵 모달
-  const [positioningModal, setPositioningModal] = useState<{ groupId: number; imageDataUrl: string; initialBounds: PlanImageBounds | null } | null>(null);
+  const [positioningModal, setPositioningModal] = useState<{ groupId: number; imageDataUrl: string; initialBounds: PlanImageBounds | null; opacity?: number } | null>(null);
   // 그룹 필터 (null=전체, 0=미분류, 양수=그룹ID)
   const [filterGroupId, setFilterGroupId] = useState<number | null>(null);
   // 그룹 접기/펼치기
@@ -1417,26 +1452,6 @@ function ManualBuildingPanel() {
       loadData();
     } catch (e) { console.error("그룹 삭제 실패:", e); }
   };
-  /** 오버레이 토글 */
-  const togglePlanOverlay = async (g: BuildingGroup) => {
-    if (activePlanOverlays.has(g.id)) {
-      setActivePlanOverlay(g.id, null);
-      return;
-    }
-    if (!g.has_plan_image || !g.plan_bounds_json) return;
-    try {
-      const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number } | null>(
-        "load_group_plan_image", { groupId: g.id },
-      );
-      if (!result || !result.bounds_json) return;
-      const bounds: PlanImageBounds = JSON.parse(result.bounds_json);
-      setActivePlanOverlay(g.id, {
-        imageDataUrl: `data:image/jpeg;base64,${result.image_base64}`,
-        bounds, opacity: result.opacity,
-      });
-    } catch (e) { console.warn("[PlanOverlay] 토글 실패:", e); }
-  };
-
   const toggleCollapse = (groupId: number) => {
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
@@ -1650,17 +1665,6 @@ function ManualBuildingPanel() {
                     )}
                     {group && (
                       <div className="ml-auto flex items-center gap-1 opacity-0 group-hover/hdr:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
-                        {group.has_plan_image && group.plan_bounds_json && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); togglePlanOverlay(group); }}
-                            className="rounded p-1 hover:bg-gray-200 transition-colors"
-                            title={activePlanOverlays.has(group.id) ? "오버레이 숨기기" : "오버레이 표시"}
-                          >
-                            {activePlanOverlays.has(group.id)
-                              ? <Eye size={10} className="text-blue-500" />
-                              : <EyeOff size={10} className="text-gray-400" />}
-                          </button>
-                        )}
                         <button
                           onClick={(e) => { e.stopPropagation(); openGroupEdit(group); }}
                           className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700 transition-colors"
@@ -1750,9 +1754,15 @@ function ManualBuildingPanel() {
                   </button>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-gray-500 w-12">불투명도</span>
+                  <span className="text-[10px] text-gray-500 w-12">투명도</span>
                   <input type="range" min={0.1} max={1} step={0.05} value={planOpacity}
-                    onChange={(e) => setPlanOpacity(Number(e.target.value))}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setPlanOpacity(v);
+                      if (editGroup && activePlanOverlays.has(editGroup.id)) {
+                        updatePlanOverlayProps(editGroup.id, { opacity: v });
+                      }
+                    }}
                     className="flex-1 accent-[#a60739]" />
                   <span className="text-[10px] text-gray-500 w-7 text-right">{Math.round(planOpacity * 100)}%</span>
                 </div>
@@ -1773,6 +1783,7 @@ function ManualBuildingPanel() {
                         groupId: editGroup.id,
                         imageDataUrl: planImagePreview!,
                         initialBounds: bounds,
+                        opacity: planOpacity,
                       });
                     }}
                     className="w-full rounded-lg bg-blue-50 px-3 py-1.5 text-xs text-blue-600 hover:bg-blue-100 transition-colors"
@@ -1816,6 +1827,7 @@ function ManualBuildingPanel() {
           groupId={positioningModal.groupId}
           imageDataUrl={positioningModal.imageDataUrl}
           initialBounds={positioningModal.initialBounds}
+          opacity={positioningModal.opacity}
           onConfirm={async (bounds) => {
             try {
               const result = await invoke<{ image_base64: string; opacity: number } | null>(
@@ -1849,11 +1861,12 @@ function ManualBuildingPanel() {
 const POS_MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
 
 function PositioningMapModal({
-  groupId, imageDataUrl, initialBounds, onConfirm, onCancel,
+  groupId, imageDataUrl, initialBounds, opacity, onConfirm, onCancel,
 }: {
   groupId: number;
   imageDataUrl: string;
   initialBounds: PlanImageBounds | null;
+  opacity?: number;
   onConfirm: (bounds: PlanImageBounds) => void;
   onCancel: () => void;
 }) {
@@ -1885,6 +1898,7 @@ function PositioningMapModal({
                 groupId={groupId}
                 imageDataUrl={imageDataUrl}
                 initialBounds={initialBounds}
+                opacity={opacity}
                 onConfirm={onConfirm}
                 onCancel={onCancel}
               />
@@ -1928,22 +1942,26 @@ export default function FileUpload() {
   // 모달에 표시할 전체 레이더 사이트 목록
   const allRadarSites = customRadarSites;
 
-  // 등록 항공기별 비행 시간 범위
+  // 등록 항공기별 비행 시간 범위 (단일 패스 O(n))
   const registeredTrackRanges = useMemo(() => {
-    const ranges = new Map<string, { name: string; minTs: number; maxTs: number; points: number }>();
+    const activeMap = new Map<string, string>();
     for (const a of aircraft) {
       if (!a.active || !a.mode_s_code) continue;
-      const ms = a.mode_s_code.toUpperCase();
-      for (const p of rawTrackPoints) {
-        if (p.mode_s.toUpperCase() !== ms) continue;
-        const prev = ranges.get(ms);
-        if (!prev) {
-          ranges.set(ms, { name: a.name, minTs: p.timestamp, maxTs: p.timestamp, points: 1 });
-        } else {
-          if (p.timestamp < prev.minTs) prev.minTs = p.timestamp;
-          if (p.timestamp > prev.maxTs) prev.maxTs = p.timestamp;
-          prev.points++;
-        }
+      activeMap.set(a.mode_s_code.toUpperCase(), a.name);
+    }
+    const ranges = new Map<string, { name: string; minTs: number; maxTs: number; points: number }>();
+    if (activeMap.size === 0) return ranges;
+    for (const p of rawTrackPoints) {
+      const ms = p.mode_s.toUpperCase();
+      const name = activeMap.get(ms);
+      if (name === undefined) continue;
+      const prev = ranges.get(ms);
+      if (!prev) {
+        ranges.set(ms, { name, minTs: p.timestamp, maxTs: p.timestamp, points: 1 });
+      } else {
+        if (p.timestamp < prev.minTs) prev.minTs = p.timestamp;
+        if (p.timestamp > prev.maxTs) prev.maxTs = p.timestamp;
+        prev.points++;
       }
     }
     return ranges;

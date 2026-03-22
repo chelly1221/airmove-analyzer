@@ -16,6 +16,30 @@ const MIN_VALID_ALTITUDE_M = -100;
 /** 최대 고도 (m) — FL600 ≈ 18,288m, 이보다 높으면 이상값 */
 const MAX_VALID_ALTITUDE_M = 20000;
 
+function buildNextNormalIdx(isAnomalous: boolean[], n: number): Int32Array {
+  const next = new Int32Array(n).fill(-1);
+  for (let i = n - 2; i >= 0; i--) {
+    if (!isAnomalous[i + 1]) {
+      next[i] = i + 1;
+    } else {
+      next[i] = next[i + 1];
+    }
+  }
+  return next;
+}
+
+function buildPrevNormalIdx(isAnomalous: boolean[], n: number): Int32Array {
+  const prev = new Int32Array(n).fill(-1);
+  for (let i = 1; i < n; i++) {
+    if (!isAnomalous[i - 1]) {
+      prev[i] = i - 1;
+    } else {
+      prev[i] = prev[i - 1];
+    }
+  }
+  return prev;
+}
+
 /** 이상고도 보정 결과 */
 export interface AltitudeCorrectionResult {
   /** 보정된 포인트 배열 (원본과 같은 길이) */
@@ -56,36 +80,50 @@ export async function correctAnomalousAltitudes(
 
   // 2단계: 수직속도 기반 이상값 감지
   // 가장 가까운 정상 이전 포인트와 비교 (연속 이상값도 탐지 가능)
-  for (let i = 1; i < n - 1; i++) {
-    if (isAnomalous[i]) continue;
+  {
+    let lastSeenNormal = -1;
+    // Step 1에서 index 0이 정상이면 초기화
+    if (!isAnomalous[0]) lastSeenNormal = 0;
+    for (let i = 1; i < n - 1; i++) {
+      if (isAnomalous[i]) continue;
 
-    const curr = points[i];
-    const next = points[i + 1];
+      const curr = points[i];
+      const next = points[i + 1];
 
-    // 가장 가까운 정상 이전 포인트 찾기
-    let prevIdx = -1;
-    for (let j = i - 1; j >= 0; j--) {
-      if (!isAnomalous[j]) { prevIdx = j; break; }
-    }
-    if (prevIdx < 0) continue;
+      // lastSeenNormal은 i 이전에서 가장 가까운 정상 포인트 (Step 2에서 새로 마킹된 것도 반영됨)
+      const prevIdx = lastSeenNormal;
+      // 현재 포인트가 정상이면 lastSeenNormal 갱신 (마킹 전에 갱신하면 안 되므로 아래서 처리)
+      if (prevIdx < 0) {
+        // 이전에 정상 포인트 없으면 건너뜀 (갱신은 마킹 판정 후)
+        lastSeenNormal = i; // 현재는 아직 정상
+        continue;
+      }
 
-    const prev = points[prevIdx];
-    const dtPrev = curr.timestamp - prev.timestamp;
-    const dtNext = next.timestamp - curr.timestamp;
+      const prev = points[prevIdx];
+      const dtPrev = curr.timestamp - prev.timestamp;
+      const dtNext = next.timestamp - curr.timestamp;
 
-    if (dtPrev <= 0 || dtNext <= 0) continue;
+      if (dtPrev <= 0 || dtNext <= 0) {
+        lastSeenNormal = i;
+        continue;
+      }
 
-    const vrPrev = Math.abs(curr.altitude - prev.altitude) / dtPrev;
-    const vrNext = Math.abs(next.altitude - curr.altitude) / dtNext;
+      const vrPrev = Math.abs(curr.altitude - prev.altitude) / dtPrev;
+      const vrNext = Math.abs(next.altitude - curr.altitude) / dtNext;
 
-    // 앞뒤 모두 수직속도 초과 → 이 포인트가 이상값
-    if (vrPrev > MAX_VERTICAL_RATE_MS && vrNext > MAX_VERTICAL_RATE_MS) {
-      isAnomalous[i] = true;
-    }
-    // 한쪽이라도 극단적 수직속도 (500 m/s ≈ 100,000 ft/min, 물리적 불가) → 이상값
-    // Loss gap 직후 단일 스파이크 포인트 탐지용 (앞 포인트가 멀어 vrPrev가 낮은 경우)
-    else if (vrPrev > 500 || vrNext > 500) {
-      isAnomalous[i] = true;
+      // 앞뒤 모두 수직속도 초과 → 이 포인트가 이상값
+      if (vrPrev > MAX_VERTICAL_RATE_MS && vrNext > MAX_VERTICAL_RATE_MS) {
+        isAnomalous[i] = true;
+      }
+      // 한쪽이라도 극단적 수직속도 (500 m/s ≈ 100,000 ft/min, 물리적 불가) → 이상값
+      // Loss gap 직후 단일 스파이크 포인트 탐지용 (앞 포인트가 멀어 vrPrev가 낮은 경우)
+      else if (vrPrev > 500 || vrNext > 500) {
+        isAnomalous[i] = true;
+      }
+
+      if (!isAnomalous[i]) {
+        lastSeenNormal = i;
+      }
     }
   }
 
@@ -95,33 +133,43 @@ export async function correctAnomalousAltitudes(
   // 앞뒤 정상 포인트 간 선형 보간 대비 크게 벗어나는 포인트 탐지
   // (수직속도 기반으로 잡히지 않는 중간 크기 스파이크 보완)
   const SPIKE_DEVIATION_M = 300;
-  for (let i = 1; i < n - 1; i++) {
-    if (isAnomalous[i]) continue;
+  {
+    // Step 2에서 isAnomalous가 변경되었으므로 nextNormalIdx 재빌드
+    const nextNormal = buildNextNormalIdx(isAnomalous, n);
+    let lastSeenNormal25 = -1;
+    if (!isAnomalous[0]) lastSeenNormal25 = 0;
+    for (let i = 1; i < n - 1; i++) {
+      if (isAnomalous[i]) continue;
 
-    // 가장 가까운 양쪽 정상 포인트 찾기
-    let leftIdx = -1;
-    for (let j = i - 1; j >= 0; j--) {
-      if (!isAnomalous[j]) { leftIdx = j; break; }
-    }
-    let rightIdx = -1;
-    for (let j = i + 1; j < n; j++) {
-      if (!isAnomalous[j]) { rightIdx = j; break; }
-    }
-    if (leftIdx < 0 || rightIdx < 0) continue;
+      // 가장 가까운 양쪽 정상 포인트 찾기
+      const leftIdx = lastSeenNormal25;
+      const rightIdx = nextNormal[i];
+      if (leftIdx < 0 || rightIdx < 0) {
+        lastSeenNormal25 = i;
+        continue;
+      }
 
-    const left = points[leftIdx];
-    const right = points[rightIdx];
-    const curr = points[i];
-    const totalDt = right.timestamp - left.timestamp;
-    if (totalDt <= 0) continue;
+      const left = points[leftIdx];
+      const right = points[rightIdx];
+      const curr = points[i];
+      const totalDt = right.timestamp - left.timestamp;
+      if (totalDt <= 0) {
+        lastSeenNormal25 = i;
+        continue;
+      }
 
-    // 선형 보간으로 예상 고도 계산
-    const t = (curr.timestamp - left.timestamp) / totalDt;
-    const expectedAlt = left.altitude + (right.altitude - left.altitude) * t;
-    const deviation = Math.abs(curr.altitude - expectedAlt);
+      // 선형 보간으로 예상 고도 계산
+      const t = (curr.timestamp - left.timestamp) / totalDt;
+      const expectedAlt = left.altitude + (right.altitude - left.altitude) * t;
+      const deviation = Math.abs(curr.altitude - expectedAlt);
 
-    if (deviation > SPIKE_DEVIATION_M) {
-      isAnomalous[i] = true;
+      if (deviation > SPIKE_DEVIATION_M) {
+        isAnomalous[i] = true;
+      }
+
+      if (!isAnomalous[i]) {
+        lastSeenNormal25 = i;
+      }
     }
   }
 
@@ -194,24 +242,22 @@ export async function correctAnomalousAltitudes(
 
   await yieldUI();
 
+  // Step 2.5 이후 양쪽 lookup 배열 재빌드 (전파/보간 단계에서 사용)
+  let nextNormalIdx = buildNextNormalIdx(isAnomalous, n);
+  let prevNormalIdx = buildPrevNormalIdx(isAnomalous, n);
+
   // 앞쪽 연속 이상값 전파: 첫 포인트가 이상값이면 뒤따르는 포인트도 검사
   // (2단계에서 prevIdx < 0으로 건너뛴 포인트들)
   if (isAnomalous[0]) {
+    let lastSeenNormalFwd = -1;
     for (let i = 1; i < n - 1; i++) {
       if (isAnomalous[i]) continue;
 
       // 이전에 정상 포인트가 없으면 → 다음 정상 포인트와 비교
-      let hasPrevNormal = false;
-      for (let j = i - 1; j >= 0; j--) {
-        if (!isAnomalous[j]) { hasPrevNormal = true; break; }
-      }
-      if (hasPrevNormal) break; // 정상 포인트 나오면 전파 중단
+      if (lastSeenNormalFwd >= 0) break; // 정상 포인트 나오면 전파 중단
 
       // 다음 정상 포인트 찾기
-      let nextIdx = -1;
-      for (let j = i + 1; j < n; j++) {
-        if (!isAnomalous[j]) { nextIdx = j; break; }
-      }
+      const nextIdx = nextNormalIdx[i];
       if (nextIdx < 0) continue;
 
       const dtNext = points[nextIdx].timestamp - points[i].timestamp;
@@ -224,24 +270,23 @@ export async function correctAnomalousAltitudes(
       } else {
         break; // 정상 포인트 도달, 전파 중단
       }
+
+      if (!isAnomalous[i]) {
+        lastSeenNormalFwd = i;
+      }
     }
   }
 
   // 뒤쪽 연속 이상값 전파: 끝 포인트가 이상값이면 앞쪽 포인트도 검사
   if (isAnomalous[n - 1]) {
+    let lastSeenNormalBwd = -1;
     for (let i = n - 2; i > 0; i--) {
       if (isAnomalous[i]) continue;
 
-      let hasNextNormal = false;
-      for (let j = i + 1; j < n; j++) {
-        if (!isAnomalous[j]) { hasNextNormal = true; break; }
-      }
-      if (hasNextNormal) break;
+      // 뒤에 정상 포인트가 없으면 → 이전 정상 포인트와 비교
+      if (lastSeenNormalBwd >= 0) break;
 
-      let prevIdx = -1;
-      for (let j = i - 1; j >= 0; j--) {
-        if (!isAnomalous[j]) { prevIdx = j; break; }
-      }
+      const prevIdx = prevNormalIdx[i];
       if (prevIdx < 0) continue;
 
       const dtPrev = points[i].timestamp - points[prevIdx].timestamp;
@@ -253,27 +298,27 @@ export async function correctAnomalousAltitudes(
       } else {
         break;
       }
+
+      if (!isAnomalous[i]) {
+        lastSeenNormalBwd = i;
+      }
     }
   }
 
   await yieldUI();
 
   // 3단계: 이상값 보정 — 가장 가까운 양쪽 정상 포인트로 선형 보간
+  // 전파 단계에서 isAnomalous 변경되었으므로 lookup 배열 재빌드
+  prevNormalIdx = buildPrevNormalIdx(isAnomalous, n);
+  nextNormalIdx = buildNextNormalIdx(isAnomalous, n);
+
   let correctedCount = 0;
   const corrected = points.map((p, i) => {
     if (!isAnomalous[i]) return p;
 
-    // 왼쪽 정상 포인트 찾기
-    let leftIdx = -1;
-    for (let j = i - 1; j >= 0; j--) {
-      if (!isAnomalous[j]) { leftIdx = j; break; }
-    }
-
-    // 오른쪽 정상 포인트 찾기
-    let rightIdx = -1;
-    for (let j = i + 1; j < n; j++) {
-      if (!isAnomalous[j]) { rightIdx = j; break; }
-    }
+    // 왼쪽/오른쪽 정상 포인트 O(1) 조회
+    const leftIdx = prevNormalIdx[i];
+    const rightIdx = nextNormalIdx[i];
 
     let newAlt: number;
     if (leftIdx >= 0 && rightIdx >= 0) {

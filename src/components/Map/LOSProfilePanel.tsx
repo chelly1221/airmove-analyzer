@@ -659,7 +659,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     for (const h of heights) { if (h < rawMin) rawMin = h; if (h > rawMax) rawMax = h; }
     const range = rawMax - rawMin;
     const padding = Math.max(range * 0.12, 50); // 최소 50m 여유
-    let visMinY = rawMin - padding;
+    const visMinY = rawMin - padding;
     let visMaxY = rawMax + padding;
     // 0ft가 차트 40% 이하에 오도록 보장 (기존 로직과 동일)
     if (visMinY < 0) {
@@ -879,7 +879,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       // 커서가 가리키는 절대 위치 (%)
       const pivot = s + cursorRatio * range;
       const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
-      let newRange = Math.min(100, Math.max(1, range * factor));
+      const newRange = Math.min(100, Math.max(1, range * factor));
       let newStart = pivot - cursorRatio * newRange;
       let newEnd = pivot + (1 - cursorRatio) * newRange;
       if (newStart < 0) { newEnd -= newStart; newStart = 0; }

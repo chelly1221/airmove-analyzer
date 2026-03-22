@@ -317,7 +317,7 @@ pub fn query_buildings_along_path(
         },
     ).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
-    let total_dist = haversine_km(radar_lat, radar_lon, target_lat, target_lon);
+    let total_dist = crate::geo::haversine_km(radar_lat, radar_lon, target_lat, target_lon);
     if total_dist < 0.001 {
         return Ok(Vec::new());
     }
@@ -342,7 +342,7 @@ pub fn query_buildings_along_path(
         let proj_lon = radar_lon + t * dx;
         let proj_lat = radar_lat + t * dy;
 
-        let perp_dist_m = haversine_km(blat, blon, proj_lat, proj_lon) * 1000.0;
+        let perp_dist_m = crate::geo::haversine_km(blat, blon, proj_lat, proj_lon) * 1000.0;
         if perp_dist_m > corridor_width_m {
             continue;
         }
@@ -409,7 +409,7 @@ pub fn query_buildings_along_path(
             }
             let proj_lon = radar_lon + t * dx;
             let proj_lat = radar_lat + t * dy;
-            let perp_dist_m = haversine_km(*slat, *slon, proj_lat, proj_lon) * 1000.0;
+            let perp_dist_m = crate::geo::haversine_km(*slat, *slon, proj_lat, proj_lon) * 1000.0;
             if perp_dist_m > corridor_width_m {
                 continue;
             }
@@ -1221,16 +1221,6 @@ fn get_field_as_string(
         }
     }
     None
-}
-
-/// Haversine 거리 (km)
-fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6371.0;
-    let d_lat = (lat2 - lat1).to_radians();
-    let d_lon = (lon2 - lon1).to_radians();
-    let a = (d_lat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
-    r * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
 /// 수동 건물 geometry_json을 파싱하여 (lat, lon) 샘플 포인트 목록으로 확장.

@@ -1,3 +1,4 @@
+import React from "react";
 import type { DailyStats } from "../../types";
 
 interface Props {
@@ -20,7 +21,7 @@ interface WeekSummary {
   baselineLoss: number;
 }
 
-export default function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth }: Props) {
+function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth }: Props) {
   if (dailyStats.length === 0) return null;
 
   const monthLabel = analysisMonth
@@ -257,3 +258,5 @@ export default function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats,
     </div>
   );
 }
+
+export default React.memo(ReportOMWeeklyChart);

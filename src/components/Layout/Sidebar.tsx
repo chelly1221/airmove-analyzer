@@ -36,8 +36,8 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { id: "upload", label: "자료 관리", icon: Upload, path: "/" },
-  { id: "map", label: "항적 지도", icon: MapIcon, path: "/map" },
-  { id: "drawing", label: "도면", icon: PencilRuler, path: "/drawing" },
+  { id: "map", label: "지도", icon: MapIcon, path: "/map" },
+  { id: "drawing", label: "2D 항적도", icon: PencilRuler, path: "/drawing" },
   { id: "analysis", label: "통계 / 분석", icon: BarChart3, path: "/analysis" },
   { id: "report", label: "보고서", icon: FileText, path: "/report" },
 ];

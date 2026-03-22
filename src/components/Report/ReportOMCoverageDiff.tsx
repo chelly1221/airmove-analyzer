@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import React, { useMemo } from "react";
 import type { RadarSite, LossPointGeo, ManualBuilding } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 
@@ -112,7 +112,7 @@ function buildDiffPath(
 const SECTOR_PAD_DEG = 25;
 const FIXED_ALTS = [1000, 2000, 3000, 5000, 10000, 15000, 20000];
 
-export default function ReportOMCoverageDiff({
+function ReportOMCoverageDiff({
   sectionNum,
   radarSite,
   layersWithTargets,
@@ -483,3 +483,5 @@ export default function ReportOMCoverageDiff({
     </div>
   );
 }
+
+export default React.memo(ReportOMCoverageDiff);

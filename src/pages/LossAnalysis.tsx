@@ -468,7 +468,7 @@ export default function LossAnalysis() {
       const azAtCursor = azMin + frac * azSpan;
 
       const zoomFactor = e.deltaY > 0 ? 1.15 : 1 / 1.15;
-      let newSpan = Math.min(360, Math.max(10, azSpan * zoomFactor));
+      const newSpan = Math.min(360, Math.max(10, azSpan * zoomFactor));
 
       let newMin = azAtCursor - frac * newSpan;
       let newMax = azAtCursor + (1 - frac) * newSpan;
@@ -1046,11 +1046,10 @@ export default function LossAnalysis() {
                                         getFillColor: panoramaActivePoint.obstacle_type === "terrain"
                                           ? [34, 197, 94, 220] : [239, 68, 68, 240],
                                         getLineColor: [255, 255, 255, 255],
-                                        getRadius: 300,
+                                        getRadius: 12,
+                                        radiusUnits: "pixels" as const,
                                         stroked: true,
                                         lineWidthMinPixels: 2,
-                                        radiusMinPixels: 8,
-                                        radiusMaxPixels: 24,
                                       }),
                                       ...(panoramaActivePoint.obstacle_type === "terrain"
                                         ? [

@@ -184,6 +184,7 @@ function AircraftSection() {
           }}
           className="rounded p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
           title="수정"
+          aria-label="수정"
         >
           <Pencil size={14} />
         </button>
@@ -479,7 +480,7 @@ function RadarSiteEditor({
         <h3 className="text-sm font-semibold text-gray-800">
           {initial ? "레이더 사이트 수정" : "새 레이더 사이트 등록"}
         </h3>
-        <button onClick={onCancel} className="text-gray-500 hover:text-gray-900">
+        <button onClick={onCancel} className="text-gray-500 hover:text-gray-900" aria-label="닫기">
           <X size={16} />
         </button>
       </div>
@@ -1410,7 +1411,7 @@ function DevModeSection() {
             개발자 모드
           </h2>
           <p className="mt-0.5 text-xs text-gray-500">
-            GPU 사용 현황, 렌더링 API, 메모리 사용량을 화면에 실시간 표시합니다
+            UI 요소 우클릭 시 소스 파일 위치를 표시합니다
           </p>
         </div>
         <button
@@ -1428,7 +1429,7 @@ function DevModeSection() {
       </div>
       {devMode && (
         <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 p-3 text-xs text-amber-800">
-          개발자 오버레이가 화면 우측 하단에 표시됩니다. 각 컴포넌트의 GPU/CPU 사용 상태와 메모리 사용량을 확인할 수 있습니다.
+          UI 요소를 우클릭하면 해당 소스 파일 위치가 표시되고 클립보드에 복사됩니다.
         </div>
       )}
     </div>

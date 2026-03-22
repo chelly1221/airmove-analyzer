@@ -12,7 +12,7 @@ interface DataTableProps<T> {
   rowKey: (row: T, index: number) => string;
   onRowClick?: (row: T, index: number) => void;
   selectedKey?: string;
-  emptyMessage?: string;
+  emptyMessage?: React.ReactNode;
   maxHeight?: string;
 }
 

@@ -11,7 +11,8 @@ import LossAnalysis from "./pages/LossAnalysis";
 import ReportGeneration from "./pages/ReportGeneration";
 import Drawing from "./pages/Drawing";
 import { useAppStore } from "./store";
-import DevOverlay from "./components/DevOverlay";
+import SourceOverlay from "./dev/SourceOverlay";
+import { ToastContainer } from "./components/common/Toast";
 import { Loader2 } from "lucide-react";
 import type { Aircraft, ElevationPoint, FlightRecord, LOSProfileData, ParseStatistics, RadarSite, SavedReportSummary, TrackPoint, WeatherHourly, CloudGridFrame } from "./types";
 import { consolidateFlights } from "./utils/flightConsolidation";
@@ -587,7 +588,10 @@ export default function App() {
       </div>
 
       {/* Developer mode overlay */}
-      <DevOverlay />
+      <SourceOverlay />
+
+      {/* Toast notifications */}
+      <ToastContainer />
 
       {/* Global loading overlay */}
       {loading && (

@@ -2,6 +2,7 @@ import type { WeatherHourly, WeatherSnapshot, CloudGridData, CloudGridFrame, Clo
 import { invoke } from "@tauri-apps/api/core";
 
 const ARCHIVE_API = "https://archive-api.open-meteo.com/v1/archive";
+const FETCH_TIMEOUT_MS = 15_000;
 
 /** 날짜 범위를 일 단위 배열로 분해 */
 function getDateRange(startDate: string, endDate: string): string[] {
@@ -38,7 +39,16 @@ async function fetchWeatherForDay(lat: number, lon: number, date: string): Promi
     timezone: "UTC",
   });
 
-  const resp = await fetch(`${ARCHIVE_API}?${params}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch(`${ARCHIVE_API}?${params}`, { signal: controller.signal });
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+  clearTimeout(timeoutId);
   if (!resp.ok) throw new Error(`Weather API error: ${resp.status}`);
   const data = await resp.json();
 
@@ -76,7 +86,7 @@ export async function fetchHistoricalWeather(
   onProgress?: (msg: string) => void,
 ): Promise<WeatherSnapshot> {
   const allDates = getDateRange(startDate, endDate);
-  let allHourly: WeatherHourly[] = [];
+  const allHourly: WeatherHourly[] = [];
 
   // 1) DB에서 캐시된 날짜 확인
   let cachedDates: Set<string> = new Set();
@@ -171,6 +181,7 @@ async function fetchCloudGridForDay(
   points: { lat: number; lon: number }[],
   date: string,
   onProgress?: (msg: string) => void,
+  abortSignal?: AbortSignal,
 ): Promise<CloudGridFrame[]> {
   const BATCH_SIZE = 30;
   const allResults: { lat: number; lon: number; times: string[]; covers: number[]; lows: number[]; mids: number[]; highs: number[] }[] = [];
@@ -188,18 +199,30 @@ async function fetchCloudGridForDay(
         hourly: "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high",
         timezone: "UTC",
       });
-      const resp = await fetch(`${ARCHIVE_API}?${params}`);
-      if (!resp.ok) return null;
-      const data = await resp.json();
-      return {
-        lat: pt.lat,
-        lon: pt.lon,
-        times: data.hourly?.time ?? [],
-        covers: data.hourly?.cloud_cover ?? [],
-        lows: data.hourly?.cloud_cover_low ?? [],
-        mids: data.hourly?.cloud_cover_mid ?? [],
-        highs: data.hourly?.cloud_cover_high ?? [],
-      };
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      const onAbort = () => controller.abort();
+      abortSignal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        const resp = await fetch(`${ARCHIVE_API}?${params}`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        return {
+          lat: pt.lat,
+          lon: pt.lon,
+          times: data.hourly?.time ?? [],
+          covers: data.hourly?.cloud_cover ?? [],
+          lows: data.hourly?.cloud_cover_low ?? [],
+          mids: data.hourly?.cloud_cover_mid ?? [],
+          highs: data.hourly?.cloud_cover_high ?? [],
+        };
+      } catch {
+        clearTimeout(timeoutId);
+        return null;
+      } finally {
+        abortSignal?.removeEventListener("abort", onAbort);
+      }
     });
 
     const results = await Promise.all(promises);
@@ -268,7 +291,7 @@ export async function fetchCloudGridKorea(
   // 당일(최신)부터 과거로 역순 조회
   const allDates = [...flightDates].sort().reverse();
 
-  let allFrames: CloudGridFrame[] = [];
+  const allFrames: CloudGridFrame[] = [];
 
   // 1) DB 캐시 로드
   const cachedDates = new Set<string>();
@@ -302,7 +325,7 @@ export async function fetchCloudGridKorea(
     onProgress?.(`구름 ${date} (${i + 1}/${uncachedDates.length})`);
 
     try {
-      const frames = await fetchCloudGridForDay(points, date, onProgress);
+      const frames = await fetchCloudGridForDay(points, date, onProgress, abortSignal);
       allFrames.push(...frames);
       allFrames.sort((a, b) => a.timestamp - b.timestamp);
 

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import React, { useMemo } from "react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite, LOSProfileData, PanoramaPoint } from "../../types";
 
 interface Props {
@@ -98,7 +98,7 @@ const COMPASS_DIRS: Record<number, string> = {
   180: "S", 225: "SW", 270: "W", 315: "NW",
 };
 
-export default function ReportOMAltitudeDistribution({
+function ReportOMAltitudeDistribution({
   sectionNum,
   radarResults,
   selectedBuildings,
@@ -479,3 +479,5 @@ export default function ReportOMAltitudeDistribution({
     </div>
   );
 }
+
+export default React.memo(ReportOMAltitudeDistribution);

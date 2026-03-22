@@ -164,6 +164,7 @@ export default function AircraftManagement() {
             }}
             className="rounded p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
             title="수정"
+            aria-label="수정"
           >
             <Pencil size={14} />
           </button>
@@ -174,6 +175,7 @@ export default function AircraftManagement() {
             }}
             className="rounded p-1.5 text-gray-500 hover:bg-red-500/20 hover:text-red-600 transition-colors"
             title="삭제"
+            aria-label="삭제"
           >
             <Trash2 size={14} />
           </button>

@@ -112,17 +112,6 @@ fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
     ((dh - curv_drop) / d).atan().to_degrees()
 }
 
-/// 레이더→포인트 방위 계산 (0~360°)
-fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let lat1 = lat1.to_radians();
-    let lat2 = lat2.to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let y = dlon.sin() * lat2.cos();
-    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
-    let brng = y.atan2(x).to_degrees();
-    (brng + 360.0) % 360.0
-}
-
 /// 타임스탬프 → 날짜 문자열 (UTC)
 fn timestamp_to_date(ts: f64) -> String {
     let secs = ts as i64;
@@ -173,9 +162,9 @@ fn is_blocked_by_building(
     ac_lat: f64, ac_lon: f64, ac_alt: f64,   // 항공기 (해발고 m)
     bldg_lat: f64, bldg_lon: f64, bldg_top: f64,  // 건물 꼭대기 해발고 m
 ) -> bool {
-    let d_total = haversine_m(radar_lat, radar_lon, ac_lat, ac_lon);
+    let d_total = crate::geo::haversine_m(radar_lat, radar_lon, ac_lat, ac_lon);
     if d_total < 100.0 { return false; }
-    let d_bldg = haversine_m(radar_lat, radar_lon, bldg_lat, bldg_lon);
+    let d_bldg = crate::geo::haversine_m(radar_lat, radar_lon, bldg_lat, bldg_lon);
     if d_bldg > d_total || d_bldg < 100.0 { return false; }
 
     let t = d_bldg / d_total;  // 건물이 LOS 선 상의 비율 위치
@@ -192,16 +181,6 @@ fn is_blocked_by_building(
     bldg_top > los_height_at_bldg
 }
 
-/// Haversine 거리 (m)
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
-    r * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
-}
-
 /// 기존 지형에 의한 LOS 차단 여부 (건물 제외, SRTM 지형만)
 /// 레이더 → 항공기 경로 상 지형 스캔
 fn is_blocked_by_terrain(
@@ -210,7 +189,7 @@ fn is_blocked_by_terrain(
     srtm: &Mutex<SrtmReader>,
     num_samples: usize,
 ) -> bool {
-    let d_total = haversine_m(radar_lat, radar_lon, ac_lat, ac_lon);
+    let d_total = crate::geo::haversine_m(radar_lat, radar_lon, ac_lat, ac_lon);
     if d_total < 200.0 { return false; }
     let curv_drop_total = d_total * d_total / (2.0 * R_EFF);
 
@@ -264,8 +243,8 @@ pub fn analyze_pre_screening(
 
     let mut bldg_infos: Vec<BuildingInfo> = Vec::new();
     for b in buildings {
-        let dist = haversine_m(radar.radar_lat, radar.radar_lon, b.latitude, b.longitude);
-        let az = bearing_deg(radar.radar_lat, radar.radar_lon, b.latitude, b.longitude);
+        let dist = crate::geo::haversine_m(radar.radar_lat, radar.radar_lon, b.latitude, b.longitude);
+        let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, b.latitude, b.longitude);
         let bldg_top = b.ground_elev_m + b.height_m;
 
         // 기존 지형 앙각: SRTM 기반 레이더→건물 경로 상 최대 앙각
@@ -351,7 +330,7 @@ pub fn analyze_pre_screening(
                 continue;
             }
 
-            let az = bearing_deg(radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude);
+            let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude);
             let dist_to_radar = calculate_haversine_distance(
                 radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude,
             );
@@ -421,7 +400,7 @@ pub fn analyze_pre_screening(
             if pts.len() < 2 { continue; }
             pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
 
-            let track_time = pts.last().unwrap().timestamp - pts.first().unwrap().timestamp;
+            let track_time = pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
             total_track_time += track_time;
 
             // 스캔 간격 추정
@@ -492,7 +471,7 @@ pub fn analyze_pre_screening(
                         // 건물에 의해서만 추가로 차단됨 → 추가 Loss
                         let avg_alt_ft = ((prev.altitude + next.altitude) / 2.0) * 3.28084;
                         let mid_dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, mid_lat, mid_lon);
-                        let mid_az = bearing_deg(radar.radar_lat, radar.radar_lon, mid_lat, mid_lon);
+                        let mid_az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, mid_lat, mid_lon);
 
                         additional_losses.push(AdditionalLossEvent {
                             mode_s: prev.mode_s.clone(),

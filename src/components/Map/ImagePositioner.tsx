@@ -10,6 +10,8 @@ interface Props {
   imageDataUrl: string;
   /** 기존 bounds (없으면 현재 뷰포트 중앙에 배치) */
   initialBounds?: PlanImageBounds | null;
+  /** 토지이용계획도 불투명도 (0~1, 기본 0.6) */
+  opacity?: number;
   onConfirm: (bounds: PlanImageBounds) => void;
   onCancel: () => void;
 }
@@ -110,7 +112,7 @@ function updateSourceCoords(map: maplibregl.Map, sourceId: string, b: PlanImageB
   }
 }
 
-export default function ImagePositioner({ map, groupId, imageDataUrl, initialBounds, onConfirm, onCancel }: Props) {
+export default function ImagePositioner({ map, groupId, imageDataUrl, initialBounds, opacity = 0.6, onConfirm, onCancel }: Props) {
   const sourceId = `positioning-image-${groupId}`;
   const layerId = `positioning-raster-${groupId}`;
   const [bounds, setBounds] = useState<PlanImageBounds | null>(null);
@@ -146,6 +148,10 @@ export default function ImagePositioner({ map, groupId, imageDataUrl, initialBou
     try {
       if (map.getSource(sourceId)) {
         (map.getSource(sourceId) as maplibregl.ImageSource).setCoordinates(coords);
+        // opacity 변경 반영
+        if (map.getLayer(layerId)) {
+          map.setPaintProperty(layerId, "raster-opacity", opacity);
+        }
       } else {
         map.addSource(sourceId, {
           type: "image",
@@ -160,12 +166,12 @@ export default function ImagePositioner({ map, groupId, imageDataUrl, initialBou
             if (layer.type === "symbol") { beforeId = layer.id; break; }
           }
         }
-        map.addLayer({ id: layerId, type: "raster", source: sourceId, paint: { "raster-opacity": 0.6, "raster-fade-duration": 0 } }, beforeId);
+        map.addLayer({ id: layerId, type: "raster", source: sourceId, paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } }, beforeId);
       }
     } catch {
       // 맵이 파괴된 경우 무시
     }
-  }, [bounds, map, imageDataUrl, sourceId, layerId]);
+  }, [bounds, map, imageDataUrl, sourceId, layerId, opacity]);
 
   // Cleanup on unmount — 맵 파괴 여부 안전 체크
   useEffect(() => {

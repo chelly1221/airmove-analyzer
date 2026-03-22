@@ -64,34 +64,10 @@ fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
     ((dh - curv_drop) / d).atan().to_degrees()
 }
 
-/// Haversine 거리 (m)
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
-    r * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
-}
-
 /// 레이더→방위/거리 지점의 WGS84 좌표 계산 (공개: presample에서도 사용)
+/// geo::destination_point_m으로의 호환 래퍼
 pub fn destination_point_pub(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
-    destination_point(lat, lon, bearing_deg, distance_m)
-}
-
-/// 레이더→방위/거리 지점의 WGS84 좌표 계산
-fn destination_point(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
-    let r = 6_371_000.0;
-    let lat1 = lat.to_radians();
-    let lon1 = lon.to_radians();
-    let brg = bearing_deg.to_radians();
-    let d_r = distance_m / r;
-
-    let lat2 = (lat1.sin() * d_r.cos() + lat1.cos() * d_r.sin() * brg.cos()).asin();
-    let lon2 = lon1 + (brg.sin() * d_r.sin() * lat1.cos())
-        .atan2(d_r.cos() - lat1.sin() * lat2.sin());
-
-    (lat2.to_degrees(), lon2.to_degrees())
+    crate::geo::destination_point_m(lat, lon, bearing_deg, distance_m)
 }
 
 /// GPU 파노라마 지형 결과 (프론트엔드에서 전달)
@@ -104,18 +80,6 @@ pub struct TerrainResult {
     pub ground_elev_m: f64,
     pub lat: f64,
     pub lon: f64,
-}
-
-/// 레이더에서 대상까지의 방위 (°, 정북=0, 시계방향)
-fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let lat1 = lat1.to_radians();
-    let lat2 = lat2.to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-
-    let y = dlon.sin() * lat2.cos();
-    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
-    let brg = y.atan2(x).to_degrees();
-    (brg + 360.0) % 360.0
 }
 
 /// DB에서 건물 후보 조회 (GIS + 수동)
@@ -262,7 +226,7 @@ pub fn calculate_panorama(
 
             let mut d = range_step_m;
             while d <= max_range_m {
-                let (lat, lon) = destination_point(radar_lat, radar_lon, az, d);
+                let (lat, lon) = crate::geo::destination_point_m(radar_lat, radar_lon, az, d);
                 let elev = srtm::elevation_from_tiles(tiles, lat, lon);
                 let angle = elevation_angle_deg(d, elev, radar_height_m);
                 if angle > best.elevation_angle_deg {
@@ -352,7 +316,7 @@ fn apply_buildings(
         let buildings = query_building_candidates(conn, min_lat, max_lat, min_lon, max_lon, min_h, exclude_manual_ids);
 
         for bld in &buildings {
-            let dist_m = haversine_m(radar_lat, radar_lon, bld.lat, bld.lon);
+            let dist_m = crate::geo::haversine_m(radar_lat, radar_lon, bld.lat, bld.lon);
             if dist_m < min_d || dist_m > max_d {
                 continue;
             }
@@ -366,7 +330,7 @@ fn apply_buildings(
             let total_h = ground + bld.height_m;
             let angle = elevation_angle_deg(dist_m, total_h, radar_height_m);
 
-            let az = bearing_deg(radar_lat, radar_lon, bld.lat, bld.lon);
+            let az = crate::geo::bearing_deg(radar_lat, radar_lon, bld.lat, bld.lon);
             let bin = ((az / azimuth_step_deg).round() as usize) % num_azimuths;
 
             if angle > panorama[bin].elevation_angle_deg {
