@@ -1,7 +1,7 @@
-//! GIS건물통합정보 SHP 임포트 및 LOS 경로 건물 쿼리
+//! LoS 경로 건물 쿼리 및 수동 건물 관리
 //!
-//! vworld GIS건물통합정보 SHP(EPSG:5186) 파일을 파싱하여 SQLite에 저장하고,
-//! LOS 경로 상의 건물을 조회하여 높이 정보를 반환.
+//! LoS 경로 상의 건물을 조회하여 높이 정보를 반환하고,
+//! 수동 등록 건물 및 건물 그룹 CRUD를 제공.
 
 use std::io::{Read as IoRead, Seek};
 use std::path::Path;
@@ -16,24 +16,179 @@ use crate::coord::epsg5186_to_wgs84;
 /// 건물 높이 상한 (m) — 한국 최고층 롯데월드타워 ~555m, 여유 포함 650m
 const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
 
-/// 층당 최소/최대 높이 (m) — 층수 교차검증용
-const MIN_HEIGHT_PER_FLOOR: f64 = 2.5;
-const MAX_HEIGHT_PER_FLOOR: f64 = 6.0;
+// ─── 2D 기하학 헬퍼 (LoS 직선-건물 교차) ──────────────
 
-/// 이웃 비교 이상치 탐지 파라미터
-const NEIGHBOR_OUTLIER_MIN_HEIGHT_M: f64 = 40.0;   // 이 높이 이상인 건물만 검사
-const NEIGHBOR_RADIUS_DEG: f64 = 0.0014;            // ~150m (위도 기준)
-const NEIGHBOR_MIN_COUNT: usize = 3;                 // 최소 이웃 수
-const NEIGHBOR_RATIO_THRESHOLD: f64 = 2.0;           // 이웃 평균 대비 배수
-const NEIGHBOR_ABS_DIFF_THRESHOLD: f64 = 30.0;       // 이웃 평균 대비 절대 차이 (m)
+/// 2D 선분 교차: (ax,ay)→(bx,by)와 (cx,cy)→(dx,dy)
+/// 반환: Some(t) — AB 상 교차점 위치 (0=A, 1=B)
+fn line_seg_intersect_t(
+    ax: f64, ay: f64, bx: f64, by: f64,
+    cx: f64, cy: f64, dx: f64, dy: f64,
+) -> Option<f64> {
+    let rx = bx - ax;
+    let ry = by - ay;
+    let sx = dx - cx;
+    let sy = dy - cy;
+    let denom = rx * sy - ry * sx;
+    if denom.abs() < 1e-15 {
+        return None; // 평행
+    }
+    let t = ((cx - ax) * sy - (cy - ay) * sx) / denom;
+    let u = ((cx - ax) * ry - (cy - ay) * rx) / denom;
+    if t >= 0.0 && t <= 1.0 && u >= 0.0 && u <= 1.0 {
+        Some(t)
+    } else {
+        None
+    }
+}
 
-/// LOS 경로 상의 건물 정보 (프론트엔드 반환)
+/// 점이 폴리곤 내부인지 판정 (ray casting, (x,y) 좌표계)
+fn point_in_polygon_2d(px: f64, py: f64, polygon: &[(f64, f64)]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = polygon[i];
+        let (xj, yj) = polygon[j];
+        if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// LoS 직선과 폴리곤 교차 — 교차 거리(km) 목록 반환
+/// 좌표계: (lon, lat) = (x, y)
+fn line_polygon_intersections(
+    r_lon: f64,
+    r_lat: f64,
+    t_lon: f64,
+    t_lat: f64,
+    poly: &[(f64, f64)], // (lon, lat) 쌍
+    total_dist_km: f64,
+) -> Vec<f64> {
+    let n = poly.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let mut dists = Vec::new();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        if let Some(t) = line_seg_intersect_t(
+            r_lon,
+            r_lat,
+            t_lon,
+            t_lat,
+            poly[i].0,
+            poly[i].1,
+            poly[j].0,
+            poly[j].1,
+        ) {
+            dists.push(t.clamp(0.0, 1.0) * total_dist_km);
+        }
+    }
+    dists
+}
+
+/// 수동 건물 geometry → 폴리곤 링 (lon, lat) 변환
+/// rectangle/circle/ellipse → Some(ring), point/line → None
+fn manual_building_to_polygon_ring(
+    center_lat: f64,
+    center_lon: f64,
+    geo_type: Option<&str>,
+    geo_json: Option<&str>,
+) -> Option<Vec<(f64, f64)>> {
+    let gt = geo_type?;
+    let json_str = geo_json.filter(|s| !s.is_empty())?;
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+    match gt {
+        "rectangle" => {
+            if let Some(arr) = val.as_array() {
+                let pts: Vec<(f64, f64)> = arr
+                    .iter()
+                    .filter_map(|p| {
+                        let lat = p.get(0)?.as_f64()?;
+                        let lon = p.get(1)?.as_f64()?;
+                        Some((lon, lat)) // (lon, lat) 순서
+                    })
+                    .collect();
+                if pts.len() >= 3 {
+                    return Some(pts);
+                }
+                if pts.len() == 2 {
+                    // 레거시: [[minLat,minLon],[maxLat,maxLon]] → 4꼭짓점
+                    let (lon0, lat0) = pts[0];
+                    let (lon1, lat1) = pts[1];
+                    return Some(vec![
+                        (lon0, lat0),
+                        (lon1, lat0),
+                        (lon1, lat1),
+                        (lon0, lat1),
+                    ]);
+                }
+            }
+            None
+        }
+        "circle" => {
+            let clat = val
+                .get("center")
+                .and_then(|c| c.get(0))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(center_lat);
+            let clon = val
+                .get("center")
+                .and_then(|c| c.get(1))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(center_lon);
+            let semi_major = val
+                .get("semi_major_m")
+                .and_then(|v| v.as_f64())
+                .or_else(|| val.get("radius_m").and_then(|v| v.as_f64()))
+                .unwrap_or(0.0);
+            let semi_minor = val
+                .get("semi_minor_m")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(semi_major);
+            let rot_deg = val
+                .get("rotation_deg")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
+            if semi_major < 1.0 {
+                return None;
+            }
+
+            let rot_rad = rot_deg.to_radians();
+            let cos_lat = clat.to_radians().cos().max(0.01);
+            let n = 36;
+            let mut ring = Vec::with_capacity(n);
+            for i in 0..n {
+                let angle = (i as f64 / n as f64) * 2.0 * std::f64::consts::PI;
+                let lx = semi_major * angle.cos();
+                let ly = semi_minor * angle.sin();
+                let rx = lx * rot_rad.sin() + ly * rot_rad.cos();
+                let ry = lx * rot_rad.cos() - ly * rot_rad.sin();
+                let dlat = ry / 111_320.0;
+                let dlon = rx / (111_320.0 * cos_lat);
+                ring.push((clon + dlon, clat + dlat));
+            }
+            Some(ring)
+        }
+        _ => None,
+    }
+}
+
+/// LoS 경로 상의 건물 정보 (프론트엔드 반환)
 #[derive(Serialize, Clone, Debug)]
 pub struct BuildingOnPath {
     pub distance_km: f64,
-    /// LOS 경로 상 건물 시작 거리 (km) — 도형 건물은 near < far
+    /// LoS 경로 상 건물 시작 거리 (km) — 도형 건물은 near < far
     pub near_dist_km: f64,
-    /// LOS 경로 상 건물 끝 거리 (km)
+    /// LoS 경로 상 건물 끝 거리 (km)
     pub far_dist_km: f64,
     pub height_m: f64,
     pub ground_elev_m: f64,
@@ -43,241 +198,14 @@ pub struct BuildingOnPath {
     pub usage: Option<String>,
     pub lat: f64,
     pub lon: f64,
+    /// 건물 폴리곤 좌표 [[lat,lon],...] (WGS84) — 3D 렌더링용
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polygon: Option<Vec<[f64; 2]>>,
+    /// 수동 등록 건물 여부 (true이면 ground_elev_m은 사용자 입력값)
+    pub is_manual: bool,
 }
 
-/// 건물 데이터 임포트 상태
-#[derive(Serialize, Clone, Debug)]
-pub struct BuildingImportStatus {
-    pub region: String,
-    pub file_date: String,
-    pub imported_at: i64,
-    pub record_count: i64,
-}
-
-/// 임포트 진행률 이벤트
-#[derive(Clone, Serialize)]
-pub struct BuildingImportProgress {
-    pub region: String,
-    pub total: usize,
-    pub processed: usize,
-    pub status: String,
-}
-
-/// SHP ZIP 파일에서 건물 데이터를 임포트
-pub fn import_from_zip(
-    conn: &Connection,
-    zip_path: &str,
-    region: &str,
-    progress_fn: &dyn Fn(BuildingImportProgress),
-) -> Result<usize, String> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| format!("ZIP 파일 열기 실패: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| format!("ZIP 아카이브 읽기 실패: {}", e))?;
-
-    // ZIP 내에서 .shp와 .dbf 파일 찾기
-    let mut shp_name = None;
-    let mut dbf_name = None;
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i).map_err(|e| format!("ZIP 항목 읽기 실패: {}", e))?;
-        let name_lower = entry.name().to_lowercase();
-        if name_lower.ends_with(".shp") && !name_lower.contains("__macosx") {
-            shp_name = Some(entry.name().to_string());
-        }
-        if name_lower.ends_with(".dbf") && !name_lower.contains("__macosx") {
-            dbf_name = Some(entry.name().to_string());
-        }
-    }
-
-    let shp_entry_name = shp_name.ok_or("ZIP에서 .shp 파일을 찾을 수 없습니다")?;
-    let dbf_entry_name = dbf_name.ok_or("ZIP에서 .dbf 파일을 찾을 수 없습니다")?;
-
-    // 임시 디렉토리에 추출
-    let temp_dir = std::env::temp_dir().join(format!("airmove_bld_{}", region));
-    let _ = std::fs::create_dir_all(&temp_dir);
-
-    let shp_path = temp_dir.join("buildings.shp");
-    let dbf_path = temp_dir.join("buildings.dbf");
-
-    extract_zip_entry(&mut archive, &shp_entry_name, &shp_path)?;
-    extract_zip_entry(&mut archive, &dbf_entry_name, &dbf_path)?;
-
-    progress_fn(BuildingImportProgress {
-        region: region.to_string(),
-        total: 0,
-        processed: 0,
-        status: "SHP 파일 로딩 중...".to_string(),
-    });
-
-    // DBF 원본 바이트에서 EUC-KR 건물명/주소 인덱스 구축
-    // 건물명: A24(건축물명칭) 우선, A25(시군구건축물명칭) 차선
-    let euckr_bldg_names = parse_dbf_euckr_field(&dbf_path, &["BLD_NM", "BULD_NM", "BDTLNM", "A24"]);
-    let euckr_bldg_names2 = parse_dbf_euckr_field(&dbf_path, &["A25"]);
-    // 주소: A4(대지위치) 우선
-    let euckr_addrs = parse_dbf_euckr_field(&dbf_path, &["PLATPLC", "NEWPLATPLC", "A4", "DONG_NM", "NAM"]);
-    // 용도: A9(주용도코드명, 예: "단독주택", "아파트")
-    let euckr_usage = parse_dbf_euckr_field(&dbf_path, &["A9"]);
-
-    // shapefile 크레이트로 .shp + .dbf 동시 읽기
-    let mut reader = shapefile::Reader::from_path(&shp_path)
-        .map_err(|e| format!("SHP 파일 읽기 실패: {}", e))?;
-
-    // 기존 region 데이터 삭제
-    conn.execute("DELETE FROM buildings WHERE region = ?1", params![region])
-        .map_err(|e| format!("기존 데이터 삭제 실패: {}", e))?;
-    conn.execute("DELETE FROM building_import_log WHERE region = ?1", params![region])
-        .map_err(|e| format!("임포트 로그 삭제 실패: {}", e))?;
-
-    let mut count = 0usize;
-    let mut inserted = 0usize;
-    let batch_size = 10_000;
-
-    conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-
-    let mut stmt = conn.prepare(
-        "INSERT INTO buildings (region, centroid_lat, centroid_lon, bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon, height, ground_floors, building_name, address, usage)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-    ).map_err(|e| format!("INSERT 준비 실패: {}", e))?;
-
-    for result in reader.iter_shapes_and_records() {
-        let (shape, record) = result.map_err(|e| format!("레코드 읽기 실패: {}", e))?;
-
-        count += 1;
-
-        // 지상층수 먼저 추출 (높이 선택에 활용)
-        let ground_floors = get_field_as_f64(&record, &["A26", "GRND_FLR", "GRND_FLCNT", "GRD_FLR_CO"])
-            .map(|f| f as i32);
-
-        // 높이 추출 — 다중 필드 수집 후 층수 교차검증으로 최적값 선택
-        let height = get_best_height(&record, &["A16", "HEIGHT", "HEIGHT_M", "BDTYP_HG", "BULD_HG"], ground_floors);
-
-        let height = match height {
-            Some(h) if h > 0.0 && h <= MAX_BUILDING_HEIGHT_M => h,
-            _ => {
-                if count % batch_size == 0 {
-                    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-                    conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-                    progress_fn(BuildingImportProgress {
-                        region: region.to_string(),
-                        total: 0,
-                        processed: count,
-                        status: format!("처리 중... {}건 ({}건 유효)", count, inserted),
-                    });
-                }
-                continue;
-            }
-        };
-
-        // 건물명: A24 우선 → A25 fallback (실제 건축물명칭만)
-        let building_name = euckr_bldg_names.as_ref()
-            .and_then(|names| names.get(count - 1).cloned().flatten())
-            .or_else(|| {
-                euckr_bldg_names2.as_ref()
-                    .and_then(|names| names.get(count - 1).cloned().flatten())
-            })
-            .or_else(|| get_field_as_string(&record, &["BLD_NM", "BULD_NM", "BDTLNM"]));
-
-        // 주소: A4(대지위치) 우선
-        let address = euckr_addrs.as_ref()
-            .and_then(|addrs| addrs.get(count - 1).cloned().flatten())
-            .or_else(|| get_field_as_string(&record, &["PLATPLC", "NEWPLATPLC", "A4", "DONG_NM", "NAM"]));
-
-        // 용도: A9(주용도코드명, 예: "단독주택", "아파트")
-        let usage = euckr_usage.as_ref()
-            .and_then(|u| u.get(count - 1).cloned().flatten())
-            .or_else(|| get_field_as_string(&record, &["A9"]));
-
-        // bbox + centroid 계산 (EPSG:5186 좌표)
-        let bbox = match &shape {
-            shapefile::Shape::Polygon(poly) => {
-                compute_polygon_bbox_centroid(poly)
-            }
-            shapefile::Shape::PolygonZ(poly) => {
-                compute_polygon_z_bbox_centroid(poly)
-            }
-            _ => continue,
-        };
-
-        let (cx, cy, min_x, min_y, max_x, max_y) = match bbox {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // EPSG:5186 → WGS84
-        let (clat, clon) = epsg5186_to_wgs84(cx, cy);
-        let (min_lat, min_lon) = epsg5186_to_wgs84(min_x, min_y);
-        let (max_lat, max_lon) = epsg5186_to_wgs84(max_x, max_y);
-
-        // 한국 영역 검증
-        if clat < 33.0 || clat > 43.0 || clon < 124.0 || clon > 132.0 {
-            continue;
-        }
-
-        stmt.execute(params![
-            region, clat, clon, min_lat, min_lon, max_lat, max_lon,
-            height, ground_floors, building_name, address, usage,
-        ]).map_err(|e| format!("INSERT 실패: {}", e))?;
-
-        inserted += 1;
-
-        if count % batch_size == 0 {
-            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-            progress_fn(BuildingImportProgress {
-                region: region.to_string(),
-                total: 0,
-                processed: count,
-                status: format!("처리 중... {}건 ({}건 유효)", count, inserted),
-            });
-        }
-    }
-
-    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-
-    // 이웃 비교 이상치 필터링 (같은 단지 내 한 동만 비정상적으로 높은 경우 제거)
-    progress_fn(BuildingImportProgress {
-        region: region.to_string(),
-        total: count,
-        processed: count,
-        status: "이웃 비교 이상치 필터링 중...".to_string(),
-    });
-    let outlier_removed = remove_neighbor_outliers(conn, region)?;
-    if outlier_removed > 0 {
-        inserted -= outlier_removed.min(inserted);
-    }
-
-    // 임포트 로그 기록
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let file_date = today_yyyymm();
-
-    conn.execute(
-        "INSERT OR REPLACE INTO building_import_log (region, file_date, imported_at, record_count)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![region, file_date, now, inserted as i64],
-    ).map_err(|e| format!("임포트 로그 저장 실패: {}", e))?;
-
-    // 임시 파일 정리
-    let _ = std::fs::remove_dir_all(&temp_dir);
-
-    let outlier_msg = if outlier_removed > 0 {
-        format!(" (이웃 비교 이상치 {}건 제거)", outlier_removed)
-    } else {
-        String::new()
-    };
-    progress_fn(BuildingImportProgress {
-        region: region.to_string(),
-        total: count,
-        processed: count,
-        status: format!("완료: {}건 중 {}건 임포트{}", count, inserted, outlier_msg),
-    });
-
-    Ok(inserted)
-}
-
-/// LOS 경로(레이더→타겟) 상의 건물 조회
+/// LoS 경로(레이더→타겟) 상의 건물 조회
 pub fn query_buildings_along_path(
     conn: &Connection,
     radar_lat: f64,
@@ -286,7 +214,9 @@ pub fn query_buildings_along_path(
     target_lon: f64,
     corridor_width_m: f64,
 ) -> Result<Vec<BuildingOnPath>, String> {
-    let buffer_deg = corridor_width_m / 111_000.0;
+    // bbox 버퍼: 건물 폴리곤이 centroid에서 벗어날 수 있으므로 넉넉하게 (최소 200m)
+    let bbox_buffer_m = corridor_width_m.max(200.0);
+    let buffer_deg = bbox_buffer_m / 111_000.0;
 
     let min_lat = radar_lat.min(target_lat) - buffer_deg;
     let max_lat = radar_lat.max(target_lat) + buffer_deg;
@@ -294,8 +224,8 @@ pub fn query_buildings_along_path(
     let max_lon = radar_lon.max(target_lon) + buffer_deg;
 
     let mut stmt = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, ground_floors, building_name, address, usage
-         FROM buildings
+        "SELECT centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json
+         FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND height > 0
@@ -309,7 +239,7 @@ pub fn query_buildings_along_path(
                 row.get::<_, f64>(0)?,
                 row.get::<_, f64>(1)?,
                 row.get::<_, f64>(2)?,
-                row.get::<_, Option<i32>>(3)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
@@ -324,44 +254,67 @@ pub fn query_buildings_along_path(
 
     let dx = target_lon - radar_lon;
     let dy = target_lat - radar_lat;
-    let path_len_sq = dx * dx + dy * dy;
+    let _path_len_sq = dx * dx + dy * dy;
 
     let mut buildings = Vec::new();
 
     for row in rows {
-        let (blat, blon, height, _floors, name, address, usage) = row.map_err(|e| format!("행 읽기 실패: {}", e))?;
+        let (_blat, _blon, height, name, address, usage, polygon_json_str) = row.map_err(|e| format!("행 읽기 실패: {}", e))?;
 
-        let bx = blon - radar_lon;
-        let by = blat - radar_lat;
-        let t = (bx * dx + by * dy) / path_len_sq;
+        // 폴리곤 좌표 파싱 시도
+        let polygon_coords: Option<Vec<[f64; 2]>> = polygon_json_str.as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
 
-        if t < -0.01 || t > 1.01 {
+        if let Some(ref poly_pts) = polygon_coords {
+            // 정확한 직선-폴리곤 교차 테스트 (복도 근사 대신 기하학적 교차)
+            let poly_lonlat: Vec<(f64, f64)> =
+                poly_pts.iter().map(|p| (p[1], p[0])).collect();
+
+            let mut hit_distances = line_polygon_intersections(
+                radar_lon, radar_lat, target_lon, target_lat,
+                &poly_lonlat, total_dist,
+            );
+
+            // LoS 시작/끝점이 폴리곤 내부인 경우 (건물 안에서 시작/종료)
+            if point_in_polygon_2d(radar_lon, radar_lat, &poly_lonlat) {
+                hit_distances.push(0.0);
+            }
+            if point_in_polygon_2d(target_lon, target_lat, &poly_lonlat) {
+                hit_distances.push(total_dist);
+            }
+
+            if hit_distances.is_empty() {
+                continue;
+            }
+
+            let near_dist = hit_distances.iter().cloned().fold(f64::INFINITY, f64::min);
+            let far_dist = hit_distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let center_dist = (near_dist + far_dist) / 2.0;
+
+            // 대표 좌표: 교차 구간 중심점
+            let t_mid = (center_dist / total_dist).clamp(0.0, 1.0);
+            let rep_lon = radar_lon + t_mid * dx;
+            let rep_lat = radar_lat + t_mid * dy;
+
+            buildings.push(BuildingOnPath {
+                distance_km: center_dist,
+                near_dist_km: near_dist,
+                far_dist_km: far_dist,
+                height_m: height,
+                ground_elev_m: 0.0,
+                total_height_m: height,
+                name,
+                address,
+                usage,
+                lat: rep_lat,
+                lon: rep_lon,
+                polygon: Some(poly_pts.clone()),
+                is_manual: false,
+            });
+        } else {
+            // 폴리곤 없는 GIS 건물은 제외
             continue;
         }
-
-        let proj_lon = radar_lon + t * dx;
-        let proj_lat = radar_lat + t * dy;
-
-        let perp_dist_m = crate::geo::haversine_km(blat, blon, proj_lat, proj_lon) * 1000.0;
-        if perp_dist_m > corridor_width_m {
-            continue;
-        }
-
-        let distance_km = t.clamp(0.0, 1.0) * total_dist;
-
-        buildings.push(BuildingOnPath {
-            distance_km,
-            near_dist_km: distance_km,
-            far_dist_km: distance_km,
-            height_m: height,
-            ground_elev_m: 0.0,
-            total_height_m: height,
-            name,
-            address,
-            usage,
-            lat: blat,
-            lon: blon,
-        });
     }
 
     // 수동 등록 건물도 경로 분석에 포함
@@ -392,99 +345,99 @@ pub fn query_buildings_along_path(
     for row in manual_rows {
         let (mlat, mlon, height, ground_elev, name, memo, geo_type, geo_json) = row.map_err(|e| format!("수동 건물 행 읽기 실패: {}", e))?;
 
-        // geometry 확장하여 샘플 포인트 생성
-        let sample_pts = expand_manual_building_geometry(mlat, mlon, geo_type.as_deref(), geo_json.as_deref());
+        let geo_type_str = geo_type.as_deref().unwrap_or("point");
 
-        // 모든 샘플 포인트 중 경로 코리도 내에 있는 점들의 거리를 수집
-        let mut hit_distances: Vec<f64> = Vec::new();
-        let mut rep_lat = mlat;
-        let mut rep_lon = mlon;
+        // 폴리곤 형태(rectangle/circle/ellipse) → 정확한 직선-폴리곤 교차
+        if let Some(ring) = manual_building_to_polygon_ring(mlat, mlon, geo_type.as_deref(), geo_json.as_deref()) {
+            let mut hit_distances = line_polygon_intersections(
+                radar_lon, radar_lat, target_lon, target_lat,
+                &ring, total_dist,
+            );
+            if point_in_polygon_2d(radar_lon, radar_lat, &ring) {
+                hit_distances.push(0.0);
+            }
+            if point_in_polygon_2d(target_lon, target_lat, &ring) {
+                hit_distances.push(total_dist);
+            }
 
-        for (slat, slon) in &sample_pts {
-            let bx = slon - radar_lon;
-            let by = slat - radar_lat;
-            let t = (bx * dx + by * dy) / path_len_sq;
-            if t < -0.01 || t > 1.01 {
+            if hit_distances.is_empty() {
                 continue;
             }
-            let proj_lon = radar_lon + t * dx;
-            let proj_lat = radar_lat + t * dy;
-            let perp_dist_m = crate::geo::haversine_km(*slat, *slon, proj_lat, proj_lon) * 1000.0;
-            if perp_dist_m > corridor_width_m {
+
+            let near_dist = hit_distances.iter().cloned().fold(f64::INFINITY, f64::min);
+            let far_dist = hit_distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let center_dist = (near_dist + far_dist) / 2.0;
+
+            let t_mid = (center_dist / total_dist).clamp(0.0, 1.0);
+            let rep_lon = radar_lon + t_mid * dx;
+            let rep_lat = radar_lat + t_mid * dy;
+
+            buildings.push(BuildingOnPath {
+                distance_km: center_dist,
+                near_dist_km: near_dist,
+                far_dist_km: far_dist,
+                height_m: height,
+                ground_elev_m: ground_elev,
+                total_height_m: height + ground_elev,
+                name: name.clone(),
+                address: memo.clone(),
+                usage: None,
+                lat: rep_lat,
+                lon: rep_lon,
+                polygon: None,
+                is_manual: true,
+            });
+        } else if geo_type_str == "line" {
+            // 선형 건물 (벽/담) — LoS 직선과 각 세그먼트 교차 테스트
+            let line_pts = expand_manual_building_geometry(mlat, mlon, geo_type.as_deref(), geo_json.as_deref());
+            let mut hit_distances: Vec<f64> = Vec::new();
+            for k in 0..line_pts.len().saturating_sub(1) {
+                let (lat1, lon1) = line_pts[k];
+                let (lat2, lon2) = line_pts[k + 1];
+                if let Some(t) = line_seg_intersect_t(
+                    radar_lon, radar_lat, target_lon, target_lat,
+                    lon1, lat1, lon2, lat2,
+                ) {
+                    hit_distances.push(t.clamp(0.0, 1.0) * total_dist);
+                }
+            }
+
+            if hit_distances.is_empty() {
                 continue;
             }
-            let distance_km = t.clamp(0.0, 1.0) * total_dist;
-            hit_distances.push(distance_km);
-            if hit_distances.len() == 1 {
-                rep_lat = *slat;
-                rep_lon = *slon;
-            }
-        }
 
-        if hit_distances.is_empty() {
+            let near_dist = hit_distances.iter().cloned().fold(f64::INFINITY, f64::min);
+            let far_dist = hit_distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let center_dist = (near_dist + far_dist) / 2.0;
+
+            let t_mid = (center_dist / total_dist).clamp(0.0, 1.0);
+            let rep_lon = radar_lon + t_mid * dx;
+            let rep_lat = radar_lat + t_mid * dy;
+
+            buildings.push(BuildingOnPath {
+                distance_km: center_dist,
+                near_dist_km: near_dist,
+                far_dist_km: far_dist,
+                height_m: height,
+                ground_elev_m: ground_elev,
+                total_height_m: height + ground_elev,
+                name: name.clone(),
+                address: memo.clone(),
+                usage: None,
+                lat: rep_lat,
+                lon: rep_lon,
+                polygon: None,
+                is_manual: true,
+            });
+        } else {
+            // point 타입 등 geometry 없는 수동 건물은 제외
             continue;
         }
-
-        let near_dist = hit_distances.iter().cloned().fold(f64::INFINITY, f64::min);
-        let far_dist = hit_distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let center_dist = (near_dist + far_dist) / 2.0;
-
-        buildings.push(BuildingOnPath {
-            distance_km: center_dist,
-            near_dist_km: near_dist,
-            far_dist_km: far_dist,
-            height_m: height,
-            ground_elev_m: ground_elev,
-            total_height_m: height + ground_elev,
-            name: name.clone(),
-            address: memo.clone(), // 수동 건물은 memo를 address로
-            usage: None,
-            lat: rep_lat,
-            lon: rep_lon,
-        });
     }
 
     buildings.sort_by(|a, b| a.distance_km.partial_cmp(&b.distance_km).unwrap_or(std::cmp::Ordering::Equal));
 
     Ok(buildings)
-}
-
-/// 임포트 현황 조회
-pub fn get_import_status(conn: &Connection) -> Result<Vec<BuildingImportStatus>, String> {
-    let mut stmt = conn.prepare(
-        "SELECT region, file_date, imported_at, record_count FROM building_import_log ORDER BY region"
-    ).map_err(|e| format!("쿼리 실패: {}", e))?;
-
-    let rows = stmt.query_map([], |row| {
-        Ok(BuildingImportStatus {
-            region: row.get(0)?,
-            file_date: row.get(1)?,
-            imported_at: row.get(2)?,
-            record_count: row.get(3)?,
-        })
-    }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("결과 수집 실패: {}", e))
-}
-
-/// 건물 데이터 삭제
-pub fn clear_building_data(conn: &Connection, region: Option<&str>) -> Result<(), String> {
-    match region {
-        Some(r) => {
-            conn.execute("DELETE FROM buildings WHERE region = ?1", params![r])
-                .map_err(|e| format!("삭제 실패: {}", e))?;
-            conn.execute("DELETE FROM building_import_log WHERE region = ?1", params![r])
-                .map_err(|e| format!("로그 삭제 실패: {}", e))?;
-        }
-        None => {
-            conn.execute("DELETE FROM buildings", [])
-                .map_err(|e| format!("전체 삭제 실패: {}", e))?;
-            conn.execute("DELETE FROM building_import_log", [])
-                .map_err(|e| format!("전체 로그 삭제 실패: {}", e))?;
-        }
-    }
-    Ok(())
 }
 
 // ─── 영역 내 건물 조회 (커버리지 맵용) ──────────────────────────
@@ -497,98 +450,7 @@ pub struct BuildingInArea {
     pub height_m: f64,
 }
 
-/// 건물 오버레이용 상세 정보 (이름/주소/용도 포함)
-#[derive(Serialize, Clone, Debug)]
-pub struct BuildingForOverlay {
-    pub lat: f64,
-    pub lon: f64,
-    pub height_m: f64,
-    pub name: Option<String>,
-    pub address: Option<String>,
-    pub usage: Option<String>,
-    /// "gis" | "manual"
-    pub source: String,
-}
-
-/// 바운딩 박스 내 건물 조회 (오버레이용, 이름/주소/용도 포함)
-pub fn query_buildings_for_overlay(
-    conn: &Connection,
-    min_lat: f64,
-    max_lat: f64,
-    min_lon: f64,
-    max_lon: f64,
-    min_height_m: f64,
-) -> Result<Vec<BuildingForOverlay>, String> {
-    let mut result = Vec::new();
-
-    // 1) GIS 건물
-    let mut stmt = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, building_name, address, usage
-         FROM buildings
-         WHERE centroid_lat BETWEEN ?1 AND ?2
-           AND centroid_lon BETWEEN ?3 AND ?4
-           AND height >= ?5
-           AND height <= ?6"
-    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
-
-    let rows = stmt.query_map(
-        params![min_lat, max_lat, min_lon, max_lon, min_height_m, MAX_BUILDING_HEIGHT_M],
-        |row| {
-            Ok(BuildingForOverlay {
-                lat: row.get(0)?,
-                lon: row.get(1)?,
-                height_m: row.get(2)?,
-                name: row.get(3)?,
-                address: row.get(4)?,
-                usage: row.get(5)?,
-                source: "gis".to_string(),
-            })
-        },
-    ).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
-
-    for row in rows {
-        result.push(row.map_err(|e| format!("행 읽기 실패: {}", e))?);
-    }
-
-    // 2) 수동 등록 건물
-    let mut stmt2 = conn.prepare(
-        "SELECT name, latitude, longitude, height, ground_elev, memo
-         FROM manual_buildings
-         WHERE latitude BETWEEN ?1 AND ?2
-           AND longitude BETWEEN ?3 AND ?4"
-    ).map_err(|e| format!("수동 건물 쿼리 준비 실패: {}", e))?;
-
-    let rows2 = stmt2.query_map(
-        params![min_lat, max_lat, min_lon, max_lon],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, f64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        },
-    ).map_err(|e| format!("수동 건물 쿼리 실행 실패: {}", e))?;
-
-    for row in rows2 {
-        let (name, lat, lon, height, ground_elev, memo) = row.map_err(|e| format!("수동 건물 행 읽기 실패: {}", e))?;
-        result.push(BuildingForOverlay {
-            lat,
-            lon,
-            height_m: height + ground_elev,
-            name: if name.is_empty() { None } else { Some(name) },
-            address: None,
-            usage: if memo.is_empty() { None } else { Some(memo) },
-            source: "manual".to_string(),
-        });
-    }
-
-    Ok(result)
-}
-
-/// 바운딩 박스 내 건물 조회 (GIS건물통합정보 + 수동 등록 건물 통합)
+/// 바운딩 박스 내 건물 조회 (건물통합정보 + 수동 등록 건물 통합)
 pub fn query_buildings_in_bbox(
     conn: &Connection,
     min_lat: f64,
@@ -599,10 +461,10 @@ pub fn query_buildings_in_bbox(
 ) -> Result<Vec<BuildingInArea>, String> {
     let mut result = Vec::new();
 
-    // 1) GIS 건물 데이터
+    // 1) 건물통합정보
     let mut stmt = conn.prepare(
         "SELECT centroid_lat, centroid_lon, height
-         FROM buildings
+         FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND height >= ?5
@@ -668,6 +530,269 @@ pub fn query_buildings_in_bbox(
     Ok(result)
 }
 
+// ─── 3D 건물 조회 ───────────────────────────────────────────────
+
+/// 3D 건물 데이터 (폴리곤 포함)
+#[derive(Serialize, Clone, Debug)]
+pub struct Building3D {
+    pub lat: f64,
+    pub lon: f64,
+    pub height_m: f64,
+    /// 건물 폴리곤 [[lat,lon],...] (WGS84)
+    pub polygon: Vec<[f64; 2]>,
+    pub name: Option<String>,
+    pub usage: Option<String>,
+    /// 데이터 출처: "fac", "manual"
+    pub source: String,
+    /// 건물 그룹 색상 (수동 건물만, 예: "#ef4444")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_color: Option<String>,
+}
+
+/// 뷰포트 내 3D 건물 조회 (폴리곤 포함, 높은 건물 우선)
+/// `exclude_sources`: 제외할 출처 목록 (예: ["fac"], ["manual"])
+pub fn query_buildings_3d(
+    conn: &Connection,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: f64,
+    _max_count: usize,
+    exclude_sources: &[String],
+) -> Result<Vec<Building3D>, String> {
+    let mut result = Vec::new();
+
+    let skip_manual = exclude_sources.iter().any(|s| s == "manual");
+    let _skip_fac = exclude_sources.iter().any(|s| s == "fac");
+
+    // 2) 수동 건물 (도형 확장 → 폴리곤 생성)
+    if !skip_manual {
+        let geo_buffer = 0.01;
+        let mut stmt2 = conn.prepare(
+            "SELECT mb.latitude, mb.longitude, mb.height, mb.ground_elev, mb.name, mb.geometry_type, mb.geometry_json, bg.color
+             FROM manual_buildings mb
+             LEFT JOIN building_groups bg ON mb.group_id = bg.id
+             WHERE mb.latitude BETWEEN ?1 AND ?2
+               AND mb.longitude BETWEEN ?3 AND ?4
+               AND (mb.height + mb.ground_elev) >= ?5"
+        ).map_err(|e| format!("수동 건물 3D 쿼리 준비 실패: {}", e))?;
+
+        let rows2 = stmt2.query_map(
+            params![min_lat - geo_buffer, max_lat + geo_buffer, min_lon - geo_buffer, max_lon + geo_buffer, min_height_m],
+            |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        ).map_err(|e| format!("수동 건물 3D 쿼리 실행 실패: {}", e))?;
+
+        for row in rows2 {
+            let (lat, lon, height, ground_elev, name, geo_type, geo_json, group_color) =
+                row.map_err(|e| format!("수동 건물 3D 행 읽기 실패: {}", e))?;
+            let total_h = height + ground_elev;
+
+            // 수동 건물 geometry → 폴리곤 좌표 변환
+            let sample_pts = expand_manual_building_geometry(lat, lon, geo_type.as_deref(), geo_json.as_deref());
+            if sample_pts.len() < 3 {
+                // 점/선 → 작은 사각형 생성 (±5m)
+                let d = 0.000045; // ~5m
+                let polygon = vec![
+                    [lat - d, lon - d],
+                    [lat - d, lon + d],
+                    [lat + d, lon + d],
+                    [lat + d, lon - d],
+                ];
+                result.push(Building3D {
+                    lat, lon, height_m: total_h, polygon, name, usage: None, source: "manual".to_string(), group_color,
+                });
+            } else {
+                let polygon: Vec<[f64; 2]> = sample_pts.iter().map(|(la, lo)| [*la, *lo]).collect();
+                result.push(Building3D {
+                    lat, lon, height_m: total_h, polygon, name, usage: None, source: "manual".to_string(), group_color,
+                });
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+// ─── 타일 기반 Binary 건물 조회 ──────────────────────────────────
+
+/// 건물 메타데이터 (binary 전송 시 별도)
+#[derive(Serialize, Clone, Debug)]
+pub struct Building3DMeta {
+    pub name: Option<String>,
+    pub usage: Option<String>,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_color: Option<String>,
+}
+
+/// Binary 패킹된 3D 건물 데이터
+/// coords: base64 Float64Array [lon0, lat0, height0, vertexCount0, v0_lon, v0_lat, v1_lon, v1_lat, ..., lon1, lat1, height1, ...]
+/// meta: 건물별 메타데이터 배열
+#[derive(Serialize, Clone, Debug)]
+pub struct Buildings3DBinary {
+    pub coords: String,
+    pub meta: Vec<Building3DMeta>,
+    pub count: usize,
+}
+
+/// 타일 영역 내 수동+FAC 건물을 binary Float64Array로 반환
+/// 폴리곤 좌표를 Float64로 패킹: [lon, lat, height, vertexCount, v0_lon, v0_lat, ...]
+pub fn query_buildings_3d_binary(
+    conn: &Connection,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: f64,
+    max_count: usize,
+    exclude_sources: &[String],
+) -> Result<Buildings3DBinary, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let skip_manual = exclude_sources.iter().any(|s| s == "manual");
+    let skip_fac = exclude_sources.iter().any(|s| s == "fac");
+
+    // 좌표 데이터를 f64 벡터로 패킹
+    let mut floats: Vec<f64> = Vec::new();
+    let mut metas: Vec<Building3DMeta> = Vec::new();
+
+    // 수동 건물
+    if !skip_manual {
+        let geo_buffer = 0.01;
+        let mut stmt = conn.prepare(
+            "SELECT mb.latitude, mb.longitude, mb.height, mb.ground_elev, mb.name, mb.geometry_type, mb.geometry_json, bg.color
+             FROM manual_buildings mb
+             LEFT JOIN building_groups bg ON mb.group_id = bg.id
+             WHERE mb.latitude BETWEEN ?1 AND ?2
+               AND mb.longitude BETWEEN ?3 AND ?4
+               AND (mb.height + mb.ground_elev) >= ?5"
+        ).map_err(|e| format!("수동 건물 binary 쿼리 준비 실패: {}", e))?;
+
+        let rows = stmt.query_map(
+            params![min_lat - geo_buffer, max_lat + geo_buffer, min_lon - geo_buffer, max_lon + geo_buffer, min_height_m],
+            |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        ).map_err(|e| format!("수동 건물 binary 쿼리 실행 실패: {}", e))?;
+
+        for row in rows {
+            if metas.len() >= max_count { break; }
+            let (lat, lon, height, ground_elev, name, geo_type, geo_json, group_color) =
+                row.map_err(|e| format!("수동 건물 binary 행 읽기 실패: {}", e))?;
+            let total_h = height + ground_elev;
+
+            let sample_pts = expand_manual_building_geometry(lat, lon, geo_type.as_deref(), geo_json.as_deref());
+            let polygon: Vec<[f64; 2]> = if sample_pts.len() < 3 {
+                let d = 0.000045;
+                vec![[lat - d, lon - d], [lat - d, lon + d], [lat + d, lon + d], [lat + d, lon - d]]
+            } else {
+                sample_pts.iter().map(|(la, lo)| [*la, *lo]).collect()
+            };
+
+            // 패킹: [lon, lat, height, vertexCount, v0_lon, v0_lat, ...]
+            floats.push(lon);
+            floats.push(lat);
+            floats.push(total_h);
+            floats.push(polygon.len() as f64);
+            for [vlat, vlon] in &polygon {
+                floats.push(*vlon);
+                floats.push(*vlat);
+            }
+
+            metas.push(Building3DMeta {
+                name, usage: None, source: "manual".to_string(), group_color,
+            });
+        }
+    }
+
+    // FAC 건물 (fac_buildings 테이블 없을 수 있음 — 실패 시 무시)
+    if !skip_fac {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT centroid_lat, centroid_lon, height, building_name, usability, polygon_json
+             FROM fac_buildings
+             WHERE centroid_lat BETWEEN ?1 AND ?2
+               AND centroid_lon BETWEEN ?3 AND ?4
+               AND height >= ?5
+               AND height <= ?6
+             ORDER BY height DESC
+             LIMIT ?7"
+        ) {
+            let remaining = max_count.saturating_sub(metas.len());
+            if let Ok(rows) = stmt.query_map(
+                params![min_lat, max_lat, min_lon, max_lon, min_height_m, MAX_BUILDING_HEIGHT_M, remaining as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            ) {
+                for row in rows {
+                    let (lat, lon, height, name, usage, poly_json) = match row {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+
+                    let polygon: Vec<[f64; 2]> = match serde_json::from_str(&poly_json) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if polygon.len() < 3 { continue; }
+
+                    floats.push(lon);
+                    floats.push(lat);
+                    floats.push(height);
+                    floats.push(polygon.len() as f64);
+                    for [vlat, vlon] in &polygon {
+                        floats.push(*vlon);
+                        floats.push(*vlat);
+                    }
+
+                    metas.push(Building3DMeta {
+                        name, usage, source: "fac".to_string(), group_color: None,
+                    });
+                }
+            }
+        }
+    }
+
+    let count = metas.len();
+    // f64 → little-endian bytes → base64
+    let byte_len = floats.len() * 8;
+    let mut bytes = Vec::with_capacity(byte_len);
+    for f in &floats {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let coords = STANDARD.encode(&bytes);
+
+    Ok(Buildings3DBinary { coords, meta: metas, count })
+}
+
 // ─── 건물 그룹 CRUD ─────────────────────────────────────────────
 
 /// 건물 그룹
@@ -680,12 +805,15 @@ pub struct BuildingGroup {
     pub has_plan_image: bool,
     pub plan_bounds_json: Option<String>,
     pub plan_opacity: f64,
+    pub plan_rotation: f64,
+    /// 그룹 영역 바운드 JSON: [[minLat, minLon], [maxLat, maxLon]]
+    pub area_bounds_json: Option<String>,
 }
 
 /// 건물 그룹 전체 조회
 pub fn list_building_groups(conn: &Connection) -> Result<Vec<BuildingGroup>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, color, memo, (plan_image IS NOT NULL) AS has_plan_image, plan_bounds_json, plan_opacity FROM building_groups ORDER BY id"
+        "SELECT id, name, color, memo, (plan_image IS NOT NULL) AS has_plan_image, plan_bounds_json, plan_opacity, plan_rotation, area_bounds_json FROM building_groups ORDER BY id"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -697,6 +825,8 @@ pub fn list_building_groups(conn: &Connection) -> Result<Vec<BuildingGroup>, Str
             has_plan_image: row.get::<_, i32>(4).unwrap_or(0) != 0,
             plan_bounds_json: row.get(5)?,
             plan_opacity: row.get::<_, f64>(6).unwrap_or(0.5),
+            plan_rotation: row.get::<_, f64>(7).unwrap_or(0.0),
+            area_bounds_json: row.get(8)?,
         })
     }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
@@ -710,10 +840,11 @@ pub fn add_building_group(
     name: &str,
     color: &str,
     memo: &str,
+    area_bounds_json: Option<&str>,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO building_groups (name, color, memo) VALUES (?1, ?2, ?3)",
-        params![name, color, memo],
+        "INSERT INTO building_groups (name, color, memo, area_bounds_json) VALUES (?1, ?2, ?3, ?4)",
+        params![name, color, memo, area_bounds_json],
     ).map_err(|e| format!("INSERT 실패: {}", e))?;
     Ok(conn.last_insert_rowid())
 }
@@ -726,16 +857,24 @@ pub fn update_building_group(
     color: &str,
     memo: &str,
     plan_opacity: Option<f64>,
+    plan_rotation: Option<f64>,
+    area_bounds_json: Option<&str>,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE building_groups SET name=?1, color=?2, memo=?3 WHERE id=?4",
-        params![name, color, memo, id],
+        "UPDATE building_groups SET name=?1, color=?2, memo=?3, area_bounds_json=?4 WHERE id=?5",
+        params![name, color, memo, area_bounds_json, id],
     ).map_err(|e| format!("UPDATE 실패: {}", e))?;
     if let Some(opacity) = plan_opacity {
         conn.execute(
             "UPDATE building_groups SET plan_opacity = ?1 WHERE id = ?2",
             params![opacity, id],
         ).map_err(|e| format!("UPDATE opacity 실패: {}", e))?;
+    }
+    if let Some(rotation) = plan_rotation {
+        conn.execute(
+            "UPDATE building_groups SET plan_rotation = ?1 WHERE id = ?2",
+            params![rotation, id],
+        ).map_err(|e| format!("UPDATE rotation 실패: {}", e))?;
     }
     Ok(())
 }
@@ -754,10 +893,11 @@ pub fn save_group_plan_image(
     image_bytes: &[u8],
     bounds_json: &str,
     opacity: f64,
+    rotation: f64,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE building_groups SET plan_image = ?1, plan_bounds_json = ?2, plan_opacity = ?3 WHERE id = ?4",
-        params![image_bytes, bounds_json, opacity, group_id],
+        "UPDATE building_groups SET plan_image = ?1, plan_bounds_json = ?2, plan_opacity = ?3, plan_rotation = ?4 WHERE id = ?5",
+        params![image_bytes, bounds_json, opacity, rotation, group_id],
     ).map_err(|e| format!("UPDATE 실패: {}", e))?;
     Ok(())
 }
@@ -766,19 +906,42 @@ pub fn save_group_plan_image(
 pub fn load_group_plan_image(
     conn: &Connection,
     group_id: i64,
-) -> Result<Option<(Vec<u8>, String, f64)>, String> {
+) -> Result<Option<(Vec<u8>, String, f64, f64)>, String> {
     let mut stmt = conn.prepare(
-        "SELECT plan_image, plan_bounds_json, plan_opacity FROM building_groups WHERE id = ?1"
+        "SELECT plan_image, plan_bounds_json, plan_opacity, plan_rotation FROM building_groups WHERE id = ?1"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     let result = stmt.query_row(params![group_id], |row| {
         let image: Option<Vec<u8>> = row.get(0)?;
         let bounds: Option<String> = row.get(1)?;
         let opacity: f64 = row.get::<_, f64>(2).unwrap_or(0.5);
-        Ok(image.map(|img| (img, bounds.unwrap_or_default(), opacity)))
+        let rotation: f64 = row.get::<_, f64>(3).unwrap_or(0.0);
+        Ok(image.map(|img| (img, bounds.unwrap_or_default(), opacity, rotation)))
     }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
     Ok(result)
+}
+
+/// 건물 그룹 도면 오버레이 속성(투명도/회전) 업데이트
+pub fn update_plan_overlay_props(
+    conn: &Connection,
+    group_id: i64,
+    opacity: Option<f64>,
+    rotation: Option<f64>,
+) -> Result<(), String> {
+    if let Some(o) = opacity {
+        conn.execute(
+            "UPDATE building_groups SET plan_opacity = ?1 WHERE id = ?2",
+            params![o, group_id],
+        ).map_err(|e| format!("UPDATE opacity 실패: {}", e))?;
+    }
+    if let Some(r) = rotation {
+        conn.execute(
+            "UPDATE building_groups SET plan_rotation = ?1 WHERE id = ?2",
+            params![r, group_id],
+        ).map_err(|e| format!("UPDATE rotation 실패: {}", e))?;
+    }
+    Ok(())
 }
 
 /// 건물 그룹 토지이용계획도 이미지 삭제
@@ -802,7 +965,7 @@ pub struct ManualBuilding {
     pub height: f64,
     pub ground_elev: f64,
     pub memo: String,
-    /// 도형 유형: "point" | "rectangle" | "circle" | "line"
+    /// 도형 유형: "circle" | "line" | "multi"
     pub geometry_type: String,
     /// 도형 좌표 JSON (rectangle: [[lat,lon]x4] 4꼭짓점 (레거시: [[minLat,minLon],[maxLat,maxLon]]), circle: {center:[lat,lon],semi_major_m,semi_minor_m,rotation_deg}, line: [[lat,lon],...])
     pub geometry_json: Option<String>,
@@ -883,86 +1046,6 @@ pub fn delete_manual_building(conn: &Connection, id: i64) -> Result<(), String> 
     Ok(())
 }
 
-// ─── 이웃 비교 이상치 필터링 ─────────────────────────────────────
-
-/// 인접 건물과 비교하여 비정상적으로 높은 건물 제거
-/// 같은 단지(아파트 등)에서 한 동만 SHP 데이터 오류로 높이가 비정상인 경우를 탐지.
-/// 예: 온수 힐스테이트 — 대부분 동이 40~60m인데 한 동만 300m로 기록된 케이스.
-fn remove_neighbor_outliers(conn: &Connection, region: &str) -> Result<usize, String> {
-    // 1) 높이 > 0 인 전체 건물을 메모리로 로드 (lat 정렬)
-    let mut stmt = conn.prepare(
-        "SELECT rowid, centroid_lat, centroid_lon, height
-         FROM buildings
-         WHERE region = ?1 AND height > 0
-         ORDER BY centroid_lat"
-    ).map_err(|e| format!("건물 조회 실패: {}", e))?;
-
-    let all: Vec<(i64, f64, f64, f64)> = stmt.query_map(
-        params![region],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    ).map_err(|e| format!("건물 쿼리 실패: {}", e))?
-    .filter_map(|r| r.ok())
-    .collect();
-
-    if all.is_empty() {
-        return Ok(0);
-    }
-
-    // lat 값만 추출 (이진 탐색용)
-    let lats: Vec<f64> = all.iter().map(|b| b.1).collect();
-
-    // 2) 높이 40m 이상 후보에 대해 메모리 내 이웃 탐색 (이진 탐색으로 lat 범위 좁힘)
-    let mut outlier_ids = Vec::new();
-
-    for &(rowid, lat, lon, height) in &all {
-        if height < NEIGHBOR_OUTLIER_MIN_HEIGHT_M {
-            continue;
-        }
-
-        let lat_lo = lat - NEIGHBOR_RADIUS_DEG;
-        let lat_hi = lat + NEIGHBOR_RADIUS_DEG;
-        let lon_lo = lon - NEIGHBOR_RADIUS_DEG;
-        let lon_hi = lon + NEIGHBOR_RADIUS_DEG;
-
-        // 이진 탐색으로 lat 범위 내 시작/끝 인덱스
-        let start = lats.partition_point(|&l| l < lat_lo);
-        let end = lats.partition_point(|&l| l <= lat_hi);
-
-        let mut sum = 0.0f64;
-        let mut count = 0usize;
-
-        for &(rid, _, blon, bh) in &all[start..end] {
-            if rid != rowid && blon >= lon_lo && blon <= lon_hi {
-                sum += bh;
-                count += 1;
-            }
-        }
-
-        if count < NEIGHBOR_MIN_COUNT {
-            continue;
-        }
-
-        let avg = sum / count as f64;
-        if height > avg * NEIGHBOR_RATIO_THRESHOLD && height - avg > NEIGHBOR_ABS_DIFF_THRESHOLD {
-            outlier_ids.push(rowid);
-        }
-    }
-
-    // 3) 이상치 삭제
-    if !outlier_ids.is_empty() {
-        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-        let mut del_stmt = conn.prepare("DELETE FROM buildings WHERE rowid = ?1")
-            .map_err(|e| format!("이상치 삭제 준비 실패: {}", e))?;
-        for id in &outlier_ids {
-            del_stmt.execute(params![id])
-                .map_err(|e| format!("이상치 삭제 실패: {}", e))?;
-        }
-        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-    }
-
-    Ok(outlier_ids.len())
-}
-
 // ─── 헬퍼 함수 ─────────────────────────────────────────────────
 
 /// 인코딩 깨짐으로 인한 비정상 건물명 판별
@@ -981,7 +1064,7 @@ fn is_garbled_name(s: &str) -> bool {
 }
 
 /// DBF 파일에서 특정 문자열 필드의 원본 바이트를 EUC-KR로 디코딩하여 레코드별 Vec 반환
-fn parse_dbf_euckr_field(dbf_path: &Path, field_names: &[&str]) -> Option<Vec<Option<String>>> {
+pub(crate) fn parse_dbf_euckr_field(dbf_path: &Path, field_names: &[&str]) -> Option<Vec<Option<String>>> {
     let data = std::fs::read(dbf_path).ok()?;
     if data.len() < 32 { return None; }
 
@@ -1053,7 +1136,7 @@ fn parse_dbf_euckr_field(dbf_path: &Path, field_names: &[&str]) -> Option<Vec<Op
     Some(results)
 }
 
-fn extract_zip_entry<R: IoRead + Seek>(
+pub(crate) fn extract_zip_entry<R: IoRead + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
     dest_path: &Path,
@@ -1067,8 +1150,78 @@ fn extract_zip_entry<R: IoRead + Seek>(
     Ok(())
 }
 
+/// SHP 폴리곤 꼭짓점을 WGS84로 변환하여 JSON 직렬화
+/// 입력: EPSG:5186 좌표의 outer ring points (Point 또는 PointZ)
+/// 출력: [[lat,lon],[lat,lon],...] 형식 JSON 문자열
+pub(crate) fn extract_polygon_wgs84<P: shapefile::record::traits::HasXY>(points: Option<&[P]>) -> Option<String> {
+    let pts = points?;
+    if pts.len() < 3 {
+        return None;
+    }
+
+    let mut coords: Vec<[f64; 2]> = Vec::with_capacity(pts.len());
+    for pt in pts {
+        let (lat, lon) = epsg5186_to_wgs84(pt.x(), pt.y());
+        coords.push([lat, lon]);
+    }
+
+    // RDP 간소화: 꼭짓점 50개 초과 시 축소
+    if coords.len() > 50 {
+        coords = rdp_simplify(&coords, 0.000005); // ~0.5m
+        if coords.len() < 3 {
+            return None;
+        }
+    }
+
+    serde_json::to_string(&coords).ok()
+}
+
+/// Ramer-Douglas-Peucker 폴리곤 간소화
+fn rdp_simplify(points: &[[f64; 2]], epsilon: f64) -> Vec<[f64; 2]> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+
+    // 가장 먼 점 찾기
+    let first = points[0];
+    let last = points[points.len() - 1];
+    let mut max_dist = 0.0;
+    let mut max_idx = 0;
+
+    for (i, pt) in points.iter().enumerate().skip(1).take(points.len() - 2) {
+        let d = perpendicular_distance(pt, &first, &last);
+        if d > max_dist {
+            max_dist = d;
+            max_idx = i;
+        }
+    }
+
+    if max_dist > epsilon {
+        let mut left = rdp_simplify(&points[..=max_idx], epsilon);
+        let right = rdp_simplify(&points[max_idx..], epsilon);
+        left.pop(); // 중복 제거
+        left.extend_from_slice(&right);
+        left
+    } else {
+        vec![first, last]
+    }
+}
+
+/// 점에서 직선까지 수직 거리 (2D)
+fn perpendicular_distance(pt: &[f64; 2], line_start: &[f64; 2], line_end: &[f64; 2]) -> f64 {
+    let dx = line_end[0] - line_start[0];
+    let dy = line_end[1] - line_start[1];
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-20 {
+        let ex = pt[0] - line_start[0];
+        let ey = pt[1] - line_start[1];
+        return (ex * ex + ey * ey).sqrt();
+    }
+    ((pt[0] - line_start[0]) * dy - (pt[1] - line_start[1]) * dx).abs() / len_sq.sqrt()
+}
+
 /// Polygon bbox + centroid (EPSG:5186 좌표)
-fn compute_polygon_bbox_centroid(
+pub(crate) fn compute_polygon_bbox_centroid(
     poly: &shapefile::Polygon,
 ) -> Option<(f64, f64, f64, f64, f64, f64)> {
     let rings = poly.rings();
@@ -1101,7 +1254,7 @@ fn compute_polygon_bbox_centroid(
 }
 
 /// PolygonZ bbox + centroid
-fn compute_polygon_z_bbox_centroid(
+pub(crate) fn compute_polygon_z_bbox_centroid(
     poly: &shapefile::PolygonZ,
 ) -> Option<(f64, f64, f64, f64, f64, f64)> {
     let rings = poly.rings();
@@ -1134,7 +1287,7 @@ fn compute_polygon_z_bbox_centroid(
 }
 
 /// DBF 레코드에서 숫자 필드 추출 (여러 필드명 시도, 첫 번째 매칭 반환)
-fn get_field_as_f64(
+pub(crate) fn get_field_as_f64(
     record: &shapefile::dbase::Record,
     field_names: &[&str],
 ) -> Option<f64> {
@@ -1157,56 +1310,8 @@ fn get_field_as_f64(
     None
 }
 
-/// 높이 필드 다중 수집 후 최적값 선택
-/// - 층수 있으면: 층당 2.5~6.0m 범위에 드는 값 중 최대값 (가장 정확한 높이 채택)
-/// - 층수 없거나 범위 내 값 없으면: 최소 양수값 (보수적 fallback)
-fn get_best_height(
-    record: &shapefile::dbase::Record,
-    field_names: &[&str],
-    ground_floors: Option<i32>,
-) -> Option<f64> {
-    let mut values = Vec::new();
-    for name in field_names {
-        if let Some(value) = record.get(name) {
-            let v = match value {
-                FieldValue::Numeric(Some(v)) => Some(*v),
-                FieldValue::Float(Some(v)) => Some(*v as f64),
-                FieldValue::Double(v) => Some(*v),
-                FieldValue::Integer(v) => Some(*v as f64),
-                FieldValue::Character(Some(s)) => s.trim().parse::<f64>().ok(),
-                _ => None,
-            };
-            if let Some(h) = v {
-                if h > 0.0 {
-                    values.push(h);
-                }
-            }
-        }
-    }
-    if values.is_empty() {
-        return None;
-    }
-    // 층수 데이터가 있으면 층당 합리적 범위(2.5~6.0m) 내 값 필터 → 최대값
-    if let Some(floors) = ground_floors {
-        if floors > 0 {
-            let f = floors as f64;
-            let valid: Vec<f64> = values.iter().copied()
-                .filter(|h| {
-                    let per_floor = h / f;
-                    per_floor >= MIN_HEIGHT_PER_FLOOR && per_floor <= MAX_HEIGHT_PER_FLOOR
-                })
-                .collect();
-            if let Some(best) = valid.into_iter().reduce(f64::max) {
-                return Some(best);
-            }
-        }
-    }
-    // fallback: 최소 양수값 (보수적)
-    values.into_iter().reduce(f64::min)
-}
-
 /// DBF 레코드에서 문자열 필드 추출
-fn get_field_as_string(
+pub(crate) fn get_field_as_string(
     record: &shapefile::dbase::Record,
     field_names: &[&str],
 ) -> Option<String> {
@@ -1225,7 +1330,7 @@ fn get_field_as_string(
 
 /// 수동 건물 geometry_json을 파싱하여 (lat, lon) 샘플 포인트 목록으로 확장.
 /// geometry가 없으면 중심점만 반환.
-fn expand_manual_building_geometry(
+pub(crate) fn expand_manual_building_geometry(
     center_lat: f64,
     center_lon: f64,
     geo_type: Option<&str>,
@@ -1245,45 +1350,6 @@ fn expand_manual_building_geometry(
     };
 
     match geo_type {
-        "rectangle" => {
-            if let Some(arr) = val.as_array() {
-                if arr.len() == 4 {
-                    // 4꼭짓점 형식: [[lat1,lon1],[lat2,lon2],[lat3,lon3],[lat4,lon4]]
-                    let corners: Vec<(f64, f64)> = arr.iter().filter_map(|p| {
-                        let lat = p.get(0).and_then(|v| v.as_f64())?;
-                        let lon = p.get(1).and_then(|v| v.as_f64())?;
-                        Some((lat, lon))
-                    }).collect();
-                    if corners.len() == 4 {
-                        let mid_lat = corners.iter().map(|c| c.0).sum::<f64>() / 4.0;
-                        let mid_lon = corners.iter().map(|c| c.1).sum::<f64>() / 4.0;
-                        let mut pts = corners.clone();
-                        // 변 중점 4개
-                        for i in 0..4 {
-                            let j = (i + 1) % 4;
-                            pts.push(((corners[i].0 + corners[j].0) / 2.0, (corners[i].1 + corners[j].1) / 2.0));
-                        }
-                        pts.push((mid_lat, mid_lon));
-                        return pts;
-                    }
-                } else if arr.len() == 2 {
-                    // 레거시: [[minLat, minLon], [maxLat, maxLon]]
-                    let min_lat = arr[0].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
-                    let min_lon = arr[0].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
-                    let max_lat = arr[1].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
-                    let max_lon = arr[1].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
-                    let mid_lat = (min_lat + max_lat) / 2.0;
-                    let mid_lon = (min_lon + max_lon) / 2.0;
-                    return vec![
-                        (min_lat, min_lon), (min_lat, max_lon),
-                        (max_lat, min_lon), (max_lat, max_lon),
-                        (mid_lat, min_lon), (mid_lat, max_lon),
-                        (min_lat, mid_lon), (max_lat, mid_lon),
-                        (mid_lat, mid_lon),
-                    ];
-                }
-            }
-        }
         "circle" => {
             let clat = val.get("center").and_then(|c| c.get(0)).and_then(|v| v.as_f64()).unwrap_or(center_lat);
             let clon = val.get("center").and_then(|c| c.get(1)).and_then(|v| v.as_f64()).unwrap_or(center_lon);
@@ -1349,13 +1415,28 @@ fn expand_manual_building_geometry(
 }
 
 /// 오늘 날짜 문자열 (YYYY-MM)
-fn today_yyyymm() -> String {
-    let now = std::time::SystemTime::now()
+pub(crate) fn today_yyyymm() -> String {
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let days = now / 86400;
-    let years = 1970 + days / 365;
-    let month = (days % 365) / 30 + 1;
-    format!("{}-{:02}", years, month.min(12))
+    // 정확한 날짜 계산
+    let days = (secs / 86400) as i64;
+    let (y, m, _d) = days_to_ymd(days);
+    format!("{}-{:02}", y, m)
+}
+
+fn days_to_ymd(days_since_epoch: i64) -> (i64, u32, u32) {
+    // Civil calendar algorithm (Howard Hinnant)
+    let z = days_since_epoch + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }

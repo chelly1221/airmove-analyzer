@@ -22,7 +22,7 @@ function azLabel(deg: number): string {
 /** 장애물 유형 한글 */
 function obstacleLabel(type: string): string {
   if (type === "terrain") return "지형";
-  if (type === "gis_building") return "GIS 건물";
+  if (type === "gis_building") return "건물통합정보";
   if (type === "manual_building") return "수동 건물";
   return type;
 }
@@ -34,7 +34,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
   const buildings = panoramaData.filter((p) => p.obstacle_type !== "terrain");
   const gisBuildings = buildings.filter((p) => p.obstacle_type === "gis_building");
   const manualBuildings = buildings.filter((p) => p.obstacle_type === "manual_building");
-  const maxAnglePt = panoramaData.reduce((a, b) => a.elevation_angle_deg > b.elevation_angle_deg ? a : b);
+  const maxAnglePt = panoramaData.reduce((a, b) => a.elevation_angle_deg > b.elevation_angle_deg ? a : b, panoramaData[0]);
   const avgAngle = panoramaData.reduce((s, p) => s + p.elevation_angle_deg, 0) / panoramaData.length;
 
   // 주요 장애물 (앙각 상위 건물)
@@ -207,7 +207,7 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
             <rect x={0} y={0} width={6} height={6} fill="#22c55e" fillOpacity={0.5} rx={1} />
             <text x={8} y={6} fill="#374151" fontSize={7}>지형</text>
             <rect x={35} y={0} width={6} height={6} fill="#f97316" fillOpacity={0.7} rx={1} />
-            <text x={43} y={6} fill="#374151" fontSize={7}>GIS 건물</text>
+            <text x={43} y={6} fill="#374151" fontSize={7}>건물통합정보</text>
             <rect x={80} y={0} width={6} height={6} fill="#ef4444" fillOpacity={0.7} rx={1} />
             <text x={88} y={6} fill="#374151" fontSize={7}>수동 건물</text>
             <line x1={120} y1={3} x2={135} y2={3} stroke="#06b6d4" strokeWidth={0.7} strokeDasharray="3,2" />

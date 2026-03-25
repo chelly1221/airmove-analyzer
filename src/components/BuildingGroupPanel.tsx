@@ -20,6 +20,13 @@ import type { BuildingGroup, PlanImageBounds } from "../types";
 import Modal from "./common/Modal";
 import { EmptyState } from "./common/EmptyState";
 
+/** base64 매직 바이트로 이미지 mime 타입 판별 (투명도 유지) */
+function detectImageMime(base64: string): string {
+  if (base64.startsWith("iVBOR")) return "image/png";
+  if (base64.startsWith("UklGR")) return "image/webp";
+  return "image/jpeg";
+}
+
 /** 기본 색상 팔레트 */
 const COLOR_PRESETS = [
   "#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4",
@@ -51,6 +58,7 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
   const [formColor, setFormColor] = useState("#3b82f6");
   const [formMemo, setFormMemo] = useState("");
   const [formOpacity, setFormOpacity] = useState(0.5);
+  const [formRotation, setFormRotation] = useState(0);
   const [planImagePreview, setPlanImagePreview] = useState<string | null>(null);
   const [planImageBase64, setPlanImageBase64] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -71,6 +79,7 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
     setFormColor("#3b82f6");
     setFormMemo("");
     setFormOpacity(0.5);
+    setFormRotation(0);
     setPlanImagePreview(null);
     setPlanImageBase64(null);
     setEditModal({ mode: "add" });
@@ -81,19 +90,21 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
     setFormColor(group.color);
     setFormMemo(group.memo);
     setFormOpacity(group.plan_opacity);
+    setFormRotation(group.plan_rotation);
     setPlanImagePreview(null);
     setPlanImageBase64(null);
     // 기존 이미지 로드
     if (group.has_plan_image) {
       try {
-        const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number } | null>(
+        const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number; rotation: number } | null>(
           "load_group_plan_image",
           { groupId: group.id },
         );
         if (result) {
-          setPlanImagePreview(`data:image/jpeg;base64,${result.image_base64}`);
+          setPlanImagePreview(`data:${detectImageMime(result.image_base64)};base64,${result.image_base64}`);
           setPlanImageBase64(result.image_base64);
           setFormOpacity(result.opacity);
+          setFormRotation(result.rotation);
         }
       } catch (e) {
         console.warn("[PlanImage] 로드 실패:", e);
@@ -122,11 +133,12 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
     }
   };
 
-  /** 이미지 압축 (Canvas) */
+  /** 이미지 압축 (Canvas, PNG/WebP 투명도 유지) */
   const compressImage = (base64: string, path: string): Promise<{ base64: string; dataUrl: string }> => {
     return new Promise((resolve, reject) => {
       const ext = path.split(".").pop()?.toLowerCase() ?? "jpeg";
-      const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+      const hasAlpha = ext === "png" || ext === "webp";
+      const srcMime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
       const img = new Image();
       img.onload = () => {
         const MAX = 4096;
@@ -141,12 +153,12 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
         canvas.height = h;
         const ctx = canvas.getContext("2d")!;
         ctx.drawImage(img, 0, 0, w, h);
-        const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+        const dataUrl = hasAlpha ? canvas.toDataURL("image/png") : canvas.toDataURL("image/jpeg", 0.8);
         const b64 = dataUrl.split(",")[1];
         resolve({ base64: b64, dataUrl });
       };
       img.onerror = reject;
-      img.src = `data:${mime};base64,${base64}`;
+      img.src = `data:${srcMime};base64,${base64}`;
     });
   };
 
@@ -167,6 +179,7 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
             imageBase64: planImageBase64,
             boundsJson: "",
             opacity: formOpacity,
+            rotation: formRotation,
           });
         }
       } else if (editModal?.mode === "edit" && editModal.group) {
@@ -176,6 +189,8 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
           color: formColor,
           memo: formMemo,
           planOpacity: formOpacity,
+          planRotation: formRotation,
+          areaBoundsJson: editModal.group.area_bounds_json ?? null,
         });
         // 새 이미지가 있으면 저장
         if (planImageBase64 && planImagePreview?.startsWith("data:")) {
@@ -185,6 +200,7 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
             imageBase64: planImageBase64,
             boundsJson: existingBounds,
             opacity: formOpacity,
+            rotation: formRotation,
           });
         }
       }
@@ -236,16 +252,17 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
     }
     if (!group.has_plan_image || !group.plan_bounds_json) return;
     try {
-      const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number } | null>(
+      const result = await invoke<{ image_base64: string; bounds_json: string; opacity: number; rotation: number } | null>(
         "load_group_plan_image",
         { groupId: group.id },
       );
       if (!result || !result.bounds_json) return;
       const bounds: PlanImageBounds = JSON.parse(result.bounds_json);
       setActivePlanOverlay(group.id, {
-        imageDataUrl: `data:image/jpeg;base64,${result.image_base64}`,
+        imageDataUrl: `data:${detectImageMime(result.image_base64)};base64,${result.image_base64}`,
         bounds,
         opacity: result.opacity,
+        rotation: result.rotation,
       });
       onFitBounds?.(bounds);
     } catch (e) {
@@ -263,7 +280,7 @@ export default function BuildingGroupPanel({ onStartPositioning, onFitBounds }: 
           "load_group_plan_image",
           { groupId: group.id },
         );
-        if (result) imageDataUrl = `data:image/jpeg;base64,${result.image_base64}`;
+        if (result) imageDataUrl = `data:${detectImageMime(result.image_base64)};base64,${result.image_base64}`;
       } catch { /* ignore */ }
     }
     if (!imageDataUrl) return;

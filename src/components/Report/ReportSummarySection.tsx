@@ -1,10 +1,10 @@
 import EditableText from "./EditableText";
-import type { Flight, LOSProfileData } from "../../types";
+import type { Flight, LoSProfileData } from "../../types";
 
 interface SummarySectionProps {
   sectionNum: number;
   flights: Flight[];
-  losResults: LOSProfileData[];
+  losResults: LoSProfileData[];
   aircraftCount: number;
   editable: boolean;
   commentary: string;
@@ -42,7 +42,7 @@ export default function ReportSummarySection({
     { label: "평균 소실율", value: `${avgLossPercent.toFixed(1)}%`, accent: true },
     { label: "총 추적시간", value: `${totalTrackMin.toFixed(1)}분` },
     { label: "총 소실시간", value: `${totalLossTime.toFixed(1)}초` },
-    { label: "LOS 분석", value: `${losResults.length}건` },
+    { label: "LoS 분석", value: `${losResults.length}건` },
   ];
 
   return (

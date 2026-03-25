@@ -1,7 +1,7 @@
 //! 360° LoS 파노라마 계산
 //!
 //! 레이더 안테나 위치에서 전방위(0°~360°)로 ray를 쏘아
-//! 지형(SRTM) + GIS건물 + 수동건물 중 가장 높은 앙각의 장애물을 찾는다.
+//! 지형(SRTM) + 건물통합정보 + 수동건물 중 가장 높은 앙각의 장애물을 찾는다.
 
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
@@ -56,7 +56,7 @@ struct BuildingCandidate {
 /// 4/3 유효지구 모델 앙각 계산
 /// d: 지표 거리 (m), h_obs: 장애물 해발고 (m), h_radar: 레이더 안테나 해발고 (m)
 fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
-    if d < 1.0 || !d.is_finite() {
+    if d < 1.0 || !d.is_finite() || !h_obs.is_finite() || !h_radar.is_finite() {
         return 0.0;
     }
     let dh = h_obs - h_radar;
@@ -95,10 +95,10 @@ fn query_building_candidates(
 ) -> Vec<BuildingCandidate> {
     let mut result = Vec::new();
 
-    // GIS 건물
+    // 건물통합정보 (fac_buildings) — 폴리곤 있으면 꼭짓점별 후보 생성
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, building_name, address, usage
-         FROM buildings
+        "SELECT centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json
+         FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND height >= ?5
@@ -107,20 +107,44 @@ fn query_building_candidates(
         if let Ok(rows) = stmt.query_map(
             params![min_lat, max_lat, min_lon, max_lon, min_height_m, MAX_BUILDING_HEIGHT_M],
             |row| {
-                Ok(BuildingCandidate {
-                    lat: row.get(0)?,
-                    lon: row.get(1)?,
-                    height_m: row.get(2)?,
-                    ground_elev: 0.0,
-                    name: row.get(3)?,
-                    address: row.get(4)?,
-                    usage: row.get(5)?,
-                    is_manual: false,
-                })
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
             },
         ) {
             for row in rows.flatten() {
-                result.push(row);
+                let (_clat, _clon, height_m, name, address, usage, polygon_json) = row;
+
+                // 폴리곤이 있으면 꼭짓점별로 확장 (실제 건물 범위 반영)
+                let poly_pts: Option<Vec<[f64; 2]>> = polygon_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok());
+
+                if let Some(pts) = poly_pts {
+                    if pts.len() >= 3 {
+                        for pt in &pts {
+                            result.push(BuildingCandidate {
+                                lat: pt[0],
+                                lon: pt[1],
+                                height_m,
+                                ground_elev: 0.0,
+                                name: name.clone(),
+                                address: address.clone(),
+                                usage: usage.clone(),
+                                is_manual: false,
+                            });
+                        }
+                        continue;
+                    }
+                }
+
+                // 폴리곤 없는 GIS 건물은 제외
             }
         }
     }
@@ -350,7 +374,7 @@ fn apply_buildings(
                 };
             }
 
-            if dist_m < 5000.0 && bld.height_m > 20.0 {
+            if dist_m > 1.0 && dist_m < 5000.0 && bld.height_m > 20.0 {
                 let angular_width = (30.0 / dist_m).atan().to_degrees();
                 let spread_bins = (angular_width / azimuth_step_deg).ceil() as usize;
                 for offset in 1..=spread_bins {
@@ -403,42 +427,32 @@ fn expand_manual_geometry(
 
     match geo_type {
         "rectangle" => {
+            // [[lat, lon], ...] — 4꼭짓점 또는 레거시 2꼭짓점
             if let Some(arr) = val.as_array() {
-                if arr.len() == 4 {
-                    // 4꼭짓점 형식
-                    let corners: Vec<(f64, f64)> = arr.iter().filter_map(|p| {
-                        let lat = p.get(0).and_then(|v| v.as_f64())?;
-                        let lon = p.get(1).and_then(|v| v.as_f64())?;
+                let pts: Vec<(f64, f64)> = arr
+                    .iter()
+                    .filter_map(|p| {
+                        let lat = p.get(0)?.as_f64()?;
+                        let lon = p.get(1)?.as_f64()?;
                         Some((lat, lon))
-                    }).collect();
-                    if corners.len() == 4 {
-                        let mid_lat = corners.iter().map(|c| c.0).sum::<f64>() / 4.0;
-                        let mid_lon = corners.iter().map(|c| c.1).sum::<f64>() / 4.0;
-                        let mut pts = corners.clone();
-                        for i in 0..4 {
-                            let j = (i + 1) % 4;
-                            pts.push(((corners[i].0 + corners[j].0) / 2.0, (corners[i].1 + corners[j].1) / 2.0));
-                        }
-                        pts.push((mid_lat, mid_lon));
-                        return pts;
-                    }
-                } else if arr.len() == 2 {
-                    // 레거시: [[minLat, minLon], [maxLat, maxLon]]
-                    let min_lat = arr[0].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
-                    let min_lon = arr[0].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
-                    let max_lat = arr[1].get(0).and_then(|v| v.as_f64()).unwrap_or(center_lat);
-                    let max_lon = arr[1].get(1).and_then(|v| v.as_f64()).unwrap_or(center_lon);
-                    let mid_lat = (min_lat + max_lat) / 2.0;
-                    let mid_lon = (min_lon + max_lon) / 2.0;
+                    })
+                    .collect();
+                if pts.len() >= 3 {
+                    return pts;
+                }
+                if pts.len() == 2 {
+                    // 레거시: [[minLat,minLon],[maxLat,maxLon]] → 4꼭짓점
+                    let (lat0, lon0) = pts[0];
+                    let (lat1, lon1) = pts[1];
                     return vec![
-                        (min_lat, min_lon), (min_lat, max_lon),
-                        (max_lat, min_lon), (max_lat, max_lon),
-                        (mid_lat, min_lon), (mid_lat, max_lon),
-                        (min_lat, mid_lon), (max_lat, mid_lon),
-                        (mid_lat, mid_lon),
+                        (lat0, lon0),
+                        (lat0, lon1),
+                        (lat1, lon1),
+                        (lat1, lon0),
                     ];
                 }
             }
+            return vec![];
         }
         "circle" => {
             // {center: [lat, lon], semi_major_m, semi_minor_m, rotation_deg}

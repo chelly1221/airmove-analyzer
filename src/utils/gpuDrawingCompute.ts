@@ -5,7 +5,7 @@
  * (2) ewDists 좌표 변환 (lon/lat/alt → screenX/screenY)
  * (3) density histogram 버킷 계산
  *
- * GPU 미지원 시 CPU 폴백 함수 제공
+ * GPU 필수 — 미지원 시 에러 throw
  */
 
 import { getGPUDevice, createBuffer, readBuffer, runComputeShader } from "./gpuCompute";
@@ -26,6 +26,8 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> points: array<f32>;    // [lat0,lon0, lat1,lon1, ...]
 @group(0) @binding(2) var<storage, read_write> results: array<f32>; // 워크그룹당 1개 max
+
+var<workgroup> sdata: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -48,35 +50,32 @@ fn main(
   }
 
   // workgroup 내 shared memory 리덕션
-  var<workgroup> shared: array<f32, 256>;
-  shared[lid.x] = dist;
+  sdata[lid.x] = dist;
   workgroupBarrier();
 
   // 트리 리덕션
   for (var s = 128u; s > 0u; s >>= 1u) {
     if (lid.x < s) {
-      shared[lid.x] = max(shared[lid.x], shared[lid.x + s]);
+      sdata[lid.x] = max(sdata[lid.x], sdata[lid.x + s]);
     }
     workgroupBarrier();
   }
 
   if (lid.x == 0u) {
-    results[wid.x] = shared[0];
+    results[wid.x] = sdata[0];
   }
 }
 `;
 
 /**
  * GPU로 전체 포인트 중 레이더로부터 최대 거리(km) 계산
- * @returns maxDistKm 또는 GPU 미지원 시 null
  */
 export async function computeMaxDistanceGPU(
   radarLat: number,
   radarLon: number,
   latLonPairs: Float32Array, // [lat0,lon0, lat1,lon1, ...]
-): Promise<number | null> {
+): Promise<number> {
   const device = await getGPUDevice();
-  if (!device) return null;
 
   const count = latLonPairs.length / 2;
   if (count === 0) return 0;
@@ -157,9 +156,8 @@ export async function computeEwDistsGPU(
   radarLon: number,
   cosLat: number,
   lons: Float32Array,
-): Promise<EwDistResult | null> {
+): Promise<EwDistResult> {
   const device = await getGPUDevice();
-  if (!device) return null;
 
   const count = lons.length;
   if (count === 0) return { ewDists: new Float32Array(0), minEW: 0, maxEW: 0 };
@@ -236,16 +234,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /**
  * GPU로 밀도 히스토그램 계산
- * @returns 정규화된 밀도 배열 (0~1) 또는 GPU 미지원 시 null
  */
 export async function computeDensityHistogramGPU(
   timestamps: Float32Array,
   viewMinTs: number,
   viewMaxTs: number,
   numBuckets: number = 200,
-): Promise<number[] | null> {
+): Promise<number[]> {
   const device = await getGPUDevice();
-  if (!device) return null;
 
   const count = timestamps.length;
   if (count === 0 || viewMaxTs <= viewMinTs) return new Array(numBuckets).fill(0);
@@ -294,61 +290,3 @@ export async function computeDensityHistogramGPU(
   return normalized;
 }
 
-// ─── CPU 폴백 함수들 ─────────────────────────────────
-
-/** CPU 폴백: haversine 최대 거리 */
-export function computeMaxDistanceCPU(
-  radarLat: number,
-  radarLon: number,
-  points: { latitude: number; longitude: number }[],
-): number {
-  const R = 6371;
-  let maxDist = 0;
-  const lat1 = radarLat * Math.PI / 180;
-  const cosLat1 = Math.cos(lat1);
-
-  for (const p of points) {
-    const dLat = (p.latitude - radarLat) * Math.PI / 180;
-    const dLon = (p.longitude - radarLon) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) ** 2 + cosLat1 * Math.cos(p.latitude * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
-    const d = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    if (d > maxDist) maxDist = d;
-  }
-  return maxDist;
-}
-
-/** CPU 폴백: 동서 거리 */
-export function computeEwDistsCPU(
-  radarLon: number,
-  cosLat: number,
-  points: { longitude: number }[],
-): EwDistResult {
-  const ewDists = new Float32Array(points.length);
-  let minEW = 0, maxEW = 0;
-  for (let i = 0; i < points.length; i++) {
-    const d = (points[i].longitude - radarLon) * 111.32 * cosLat;
-    ewDists[i] = d;
-    if (d < minEW) minEW = d;
-    if (d > maxEW) maxEW = d;
-  }
-  return { ewDists, minEW, maxEW };
-}
-
-/** CPU 폴백: 밀도 히스토그램 */
-export function computeDensityHistogramCPU(
-  points: { timestamp: number }[],
-  viewMinTs: number,
-  viewMaxTs: number,
-  numBuckets: number = 200,
-): number[] {
-  const viewSpan = viewMaxTs - viewMinTs;
-  if (viewSpan <= 0 || points.length === 0) return new Array(numBuckets).fill(0);
-  const buckets = new Array(numBuckets).fill(0);
-  for (const p of points) {
-    if (p.timestamp < viewMinTs || p.timestamp > viewMaxTs) continue;
-    const idx = Math.min(numBuckets - 1, Math.floor(((p.timestamp - viewMinTs) / viewSpan) * numBuckets));
-    if (idx >= 0) buckets[idx]++;
-  }
-  const maxCount = Math.max(1, ...buckets);
-  return buckets.map((c: number) => c / maxCount);
-}

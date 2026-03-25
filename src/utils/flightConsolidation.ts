@@ -1,12 +1,90 @@
-import type { Aircraft, Flight, FlightRecord, RadarSite, TrackPoint } from "../types";
+import type { Aircraft, Flight, RadarSite, TrackPoint } from "../types";
+
+/** 운항이력 레코드 (내부용, 레거시 호환) */
+interface FlightRecord {
+  icao24: string;
+  first_seen: number;
+  last_seen: number;
+  est_departure_airport: string | null;
+  est_arrival_airport: string | null;
+  callsign: string | null;
+}
 import { correctAnomalousAltitudes } from "./altitudeCorrection";
 import { detectLoss } from "./lossDetection";
 
 /** 4시간 gap으로 비행 분리 */
 const GAP_THRESHOLD_SECS = 14400;
 
-/** OpenSky 매칭 시간 허용 오차 (초) */
+/** 운항이력 매칭 시간 허용 오차 (초) */
 const MATCH_TOLERANCE_SECS = 300; // ±5분
+
+/** 공항 ICAO → 한글 이름 */
+export const AIRPORT_NAMES: Record<string, string> = {
+  // 한국 민간/국제공항 (AIP)
+  RKSI: "인천", RKSS: "김포", RKPK: "김해", RKPC: "제주",
+  RKTN: "대구", RKJJ: "광주", RKNY: "양양", RKTU: "청주",
+  RKJK: "군산", RKNW: "원주", RKJY: "여수", RKPU: "울산",
+  RKPS: "사천", RKTH: "포항경주", RKJB: "무안",
+  RKTL: "울진", RKPD: "정석",
+  // 1. 전술항공작전기지
+  RKSO: "K-55", RKSG: "A-511", RKSM: "K-16",
+  RKSW: "K-13", RKTI: "K-75", RKTY: "K-58",
+  RKTP: "K-76", RKNN: "K-18",
+  // 2. 지원항공작전기지
+  RKPE: "K-10",
+  RKRS: "G-113", RKRO: "G-217", RKRA: "G-222",
+  RK13: "G-404", RKRN: "G-510", RKUL: "G-536",
+  // 3. 헬기전용작전기지
+  RKJM: "K-15", RKRB: "G-103", RKRP: "G-110",
+  RKRK: "G-213", RKRI: "G-231",
+  RK15: "G-237", RKRC: "G-280", RK27: "G-218",
+  RKRD: "G-290", RKRG: "G-301",
+  RK31: "G-307", RK16: "G-312", RK22: "G-313",
+  RK48: "G-419", RK32: "G-420",
+  RKRY: "G-501", RK51: "G-532",
+  RKUY: "G-801", RK25: "G-107", RKJU: "G-703",
+  RK38: "G-228", RKUC: "G-505",
+  // 4. 헬기예비작전기지
+  RK7H: "G-162", RK18: "G-233",
+  RK17: "G-406", RK44: "G-412", RK21: "G-413",
+  RK33: "G-418",
+  // 기타 군 비행장 (OurAirports)
+  RKST: "H-220", RKTE: "성무", RKNC: "춘천",
+  RKTA: "태안", RKTS: "상주", RKCH: "남지",
+  RK6O: "G-605", RK6X: "G-130",
+  RK40: "G-240", RK36: "G-238", RK28: "G-219",
+  RK42: "G-311", RK43: "G-414", RK49: "G-530",
+  RK50: "G-526", RK19: "G-314", RK41: "G-317",
+  RK82: "G-405", RK34: "G-417", RK14: "G-231",
+  RK52: "G-501", RK60: "G-712", RK6D: "G-710",
+  // 한국 헬리포트/헬리패드
+  RKDD: "독도", RKDU: "울릉도", RKPM: "모슬포", RKSY: "H-264",
+  RKSD: "N-200", RKSC: "수리산", RKSH: "중앙119",
+  RKSJ: "태성산", RKSN: "쿠니사격장", RKSQ: "연평도", RKSV: "표리산",
+  RKSU: "여주사격장", RKSX: "H-207",
+  RKNF: "황령", RKNR: "코타사격장",
+  RKTB: "백아도", RKTW: "웅천", RKJO: "용정리",
+  RKBN: "N-201", RKTG: "H-805", RKTM: "만길산",
+  RKSP: "백령도",
+  // 일본 주요
+  RJTT: "하네다", RJAA: "나리타", RJBB: "간사이", RJOO: "이타미",
+  RJFF: "후쿠오카", RJCC: "신치토세", RJGG: "주부", RJSN: "니가타",
+  RJFK: "가고시마", RJNK: "고마츠", ROAH: "나하",
+  // 중국 주요
+  ZBAA: "베이징", ZSPD: "상하이푸동", ZSSS: "상하이홍차오",
+  ZGGG: "광저우", ZGSZ: "선전", ZUUU: "청두", VHHH: "홍콩",
+  RCTP: "타오위안", RCSS: "쑹산",
+  // 동남아/기타
+  WSSS: "싱가포르", VTBS: "수완나품", RPLL: "마닐라",
+  WIII: "자카르타",
+};
+
+/** 공항 ICAO → 한글명 포함 라벨 (예: "RKSI(인천)") */
+export function airportLabel(code: string | null | undefined): string {
+  if (!code) return "?";
+  const name = AIRPORT_NAMES[code.toUpperCase()];
+  return name ? `${code}(${name})` : code;
+}
 
 /** 비행 라벨 생성 */
 export function flightLabel(f: Flight, aircraft: Aircraft[]): string {
@@ -16,7 +94,7 @@ export function flightLabel(f: Flight, aircraft: Aircraft[]): string {
   const parts = [name];
   if (f.callsign) parts.push(f.callsign);
   if (f.departure_airport || f.arrival_airport) {
-    parts.push(`${f.departure_airport ?? "?"} → ${f.arrival_airport ?? "?"}`);
+    parts.push(`${airportLabel(f.departure_airport)} → ${airportLabel(f.arrival_airport)}`);
   }
   return parts.join(" · ");
 }
@@ -133,7 +211,6 @@ export async function consolidateFlights(
 
   const flights: Flight[] = [];
 
-  let groupCount = 0;
   for (const [groupKey, points] of byModeSRadar) {
     const [modeS, radarName] = groupKey.split("|");
     points.sort((a, b) => a.timestamp - b.timestamp);
@@ -173,13 +250,14 @@ export async function consolidateFlights(
     for (const [ri, pts] of recordPoints) {
       const fr = matchingRecords[ri];
       const flight = await buildFlight(
-        modeS, pts, radarSite, "opensky", ac?.name,
+        modeS, pts, radarSite, "gap", ac?.name,
         fr.callsign?.trim() || undefined,
         fr.est_departure_airport ?? undefined,
         fr.est_arrival_airport ?? undefined,
         radarName || undefined,
       );
       flights.push(flight);
+      await yieldUI();
     }
 
     // 미매칭 포인트를 4시간 gap으로 분리
@@ -190,10 +268,9 @@ export async function consolidateFlights(
         const flight = await buildFlight(modeS, group, radarSite, "gap", ac?.name,
           undefined, undefined, undefined, radarName || undefined);
         flights.push(flight);
+        await yieldUI();
       }
     }
-
-    if (++groupCount % 3 === 0) await yieldUI();
   }
 
   // 시간순 정렬
@@ -207,7 +284,7 @@ async function buildFlight(
   modeS: string,
   points: TrackPoint[],
   radarSite: RadarSite,
-  matchType: "opensky" | "gap" | "manual",
+  matchType: "gap" | "manual",
   aircraftName?: string,
   callsign?: string,
   departure?: string,
@@ -232,6 +309,9 @@ async function buildFlight(
       track_points: [], loss_points: [], loss_segments: [],
       total_loss_time: 0, total_track_time: 0, loss_percentage: 0,
       max_radar_range_km: 0, match_type: matchType, radar_name: radarName,
+      point_count: 0,
+      bbox: { minLat: 0, maxLat: 0, minLon: 0, maxLon: 0 },
+      radar_type_counts: {},
     };
   }
 
@@ -272,7 +352,33 @@ async function buildFlight(
     max_radar_range_km: maxRadarRangeKm,
     match_type: matchType,
     radar_name: radarName,
+    point_count: correctedPoints.length,
+    bbox: computeBbox(correctedPoints),
+    radar_type_counts: computeRadarTypeCounts(correctedPoints),
   };
+}
+
+/** 포인트 배열에서 경위도 바운딩 박스 계산 */
+function computeBbox(points: TrackPoint[]) {
+  const bbox = { minLat: Infinity, maxLat: -Infinity, minLon: Infinity, maxLon: -Infinity };
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (p.latitude < bbox.minLat) bbox.minLat = p.latitude;
+    if (p.latitude > bbox.maxLat) bbox.maxLat = p.latitude;
+    if (p.longitude < bbox.minLon) bbox.minLon = p.longitude;
+    if (p.longitude > bbox.maxLon) bbox.maxLon = p.longitude;
+  }
+  return points.length === 0 ? { minLat: 0, maxLat: 0, minLon: 0, maxLon: 0 } : bbox;
+}
+
+/** 포인트 배열에서 레이더 탐지 유형별 카운트 */
+function computeRadarTypeCounts(points: TrackPoint[]) {
+  const counts: Record<string, number> = {};
+  for (let i = 0; i < points.length; i++) {
+    const rt = points[i].radar_type;
+    counts[rt] = (counts[rt] ?? 0) + 1;
+  }
+  return counts;
 }
 
 /**

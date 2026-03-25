@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { X, Save, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../../store";
-import type { ElevationPoint, LOSProfileData, RadarSite, BuildingOnPath } from "../../types";
+import type { ElevationPoint, LoSProfileData, RadarSite, BuildingOnPath, NearbyPeak } from "../../types";
 import { GPU2D, type CircleData } from "../../utils/gpu2d";
 
 const R_EARTH_M = 6_371_000;
@@ -23,7 +23,7 @@ function detectionTypeColor(rt: string): [number, number, number] {
   return DETECTION_TYPE_COLORS[rt] ?? [128, 128, 128];
 }
 
-interface LOSTrackPoint {
+interface LoSTrackPoint {
   distRatio: number;
   altitude: number;
   mode_s: string;
@@ -39,8 +39,8 @@ interface Props {
   onClose: () => void;
   /** 차트 호버 시 거리 비율(0~1) 콜백, null이면 호버 해제 */
   onHoverDistance?: (ratio: number | null) => void;
-  /** LOS 선상 항적/Loss 포인트 전체 */
-  losTrackPoints?: LOSTrackPoint[];
+  /** LoS 선상 항적/Loss 포인트 전체 */
+  losTrackPoints?: LoSTrackPoint[];
   /** 고도 프로파일 로딩 완료 시 콜백 */
   onLoaded?: () => void;
   /** 차트에서 항적 포인트 하이라이트 시 인덱스 콜백 (null이면 해제) */
@@ -101,8 +101,10 @@ function curvDrop43(dKm: number): number {
 
 
 
-export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail }: Props) {
-  const addLOSResult = useAppStore((s) => s.addLOSResult);
+export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail }: Props) {
+  const addLoSResult = useAppStore((s) => s.addLoSResult);
+  const manualBuildings = useAppStore((s) => s.manualBuildings);
+  const buildingGroups = useAppStore((s) => s.buildingGroups);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
   const [peakNames, setPeakNames] = useState<Map<number, string>>(new Map());
@@ -218,7 +220,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         }));
         setProfile(points);
 
-        // 건물 데이터 조회 (LOS 경로 ±100m 코리도)
+        // 건물 데이터 조회 (LoS 경로 ±100m 코리도)
         try {
           const bldgs: BuildingOnPath[] = await invoke("query_buildings_along_path", {
             radarLat: radarSite.latitude,
@@ -230,10 +232,16 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           if (!cancelled && bldgs.length > 0) {
             // 각 건물의 지형 고도를 프로파일에서 보간
             const enriched = bldgs.map((b) => {
+              // 수동 건물은 사용자 입력 지반고 유지
+              if (b.is_manual) {
+                return b;
+              }
+              // GIS 건물은 SRTM 지형 프로파일에서 지반고 보간
               let groundElev = 0;
               for (let i = 1; i < points.length; i++) {
                 if (points[i].distance >= b.distance_km) {
-                  const t = (b.distance_km - points[i - 1].distance) / (points[i].distance - points[i - 1].distance);
+                  const denom = points[i].distance - points[i - 1].distance;
+                  const t = denom > 1e-9 ? (b.distance_km - points[i - 1].distance) / denom : 0;
                   groundElev = points[i - 1].elevation + t * (points[i].elevation - points[i - 1].elevation);
                   break;
                 }
@@ -282,25 +290,16 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           }
         }
 
-        // 가장 영향력 있는 산 1개만 이름 조회
+        // 가장 영향력 있는 산 1개만 이름 조회 (로컬 DB)
         if (dominantPeakIdx >= 0 && !cancelled) {
           const peakLat = points[dominantPeakIdx].latitude;
           const peakLon = points[dominantPeakIdx].longitude;
           try {
-            const overpassUrl = `https://overpass-api.de/api/interpreter?data=[out:json];node["natural"="peak"](around:3000,${peakLat},${peakLon});out body;`;
-            const peakResp = await fetch(overpassUrl);
-            if (peakResp.ok) {
-              const peakData = await peakResp.json();
-              if (peakData.elements?.length > 0) {
-                let closest = peakData.elements[0];
-                let closestDist = Infinity;
-                for (const el of peakData.elements) {
-                  const d2 = haversine(peakLat, peakLon, el.lat, el.lon);
-                  if (d2 < closestDist) { closestDist = d2; closest = el; }
-                }
-                const name = closest.tags?.["name:ko"] || closest.tags?.name;
-                if (name && !cancelled) setPeakNames(new Map([[dominantPeakIdx, name]]));
-              }
+            const peaks = await invoke<NearbyPeak[]>("query_nearby_peaks", {
+              lat: peakLat, lon: peakLon, radiusKm: 3.0,
+            });
+            if (peaks.length > 0 && !cancelled) {
+              setPeakNames(new Map([[dominantPeakIdx, peaks[0].name]]));
             }
           } catch {
             // 산 이름 조회 실패 - 비치명적
@@ -386,7 +385,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       if (d >= profile[profile.length - 1].distance) return profile[profile.length - 1].elevation;
       for (let i = 1; i < profile.length; i++) {
         if (profile[i].distance >= d) {
-          const t = (d - profile[i - 1].distance) / (profile[i].distance - profile[i - 1].distance);
+          const denom = profile[i].distance - profile[i - 1].distance;
+          const t = denom > 1e-9 ? (d - profile[i - 1].distance) / denom : 0;
           return profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
         }
       }
@@ -421,7 +421,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       return elev;
     };
 
-    // 2) 최저 탐지가능 높이 - 직선 LOS (디스플레이 프레임에서 직접 shadow-casting → 직선)
+    // 2) 최저 탐지가능 높이 - 직선 LoS (디스플레이 프레임에서 직접 shadow-casting → 직선)
     const minDetStraight = uniqueDists.map((d) => {
       if (d <= 0) return { distance: d, height: radarHeight };
 
@@ -441,7 +441,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       };
     });
 
-    // 2.5) 최저 탐지가능 높이 - 직선 LOS + 프레넬존 80% 클리어런스
+    // 2.5) 최저 탐지가능 높이 - 직선 LoS + 프레넬존 80% 클리어런스
     const minDetFresnel = uniqueDists.map((d) => {
       if (d <= 0) return { distance: d, height: radarHeight };
       const dM = d * 1000;
@@ -714,7 +714,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         gpu2dRef.current.setResolution(W, H);
         gpuCanvasElRef.current = canvas;
       } catch (e) {
-        console.warn('[LOS] WebGL2 초기화 실패:', e);
+        console.warn('[LoS] WebGL2 초기화 실패:', e);
         return;
       }
     }
@@ -792,7 +792,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         }
       }
     } catch (e) {
-      console.warn("[LOS] 맵 스크린샷 실패:", e);
+      console.warn("[LoS] 맵 스크린샷 실패:", e);
     }
 
     // SVG 차트 스크린샷 캡처
@@ -832,10 +832,10 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
         });
       }
     } catch (e) {
-      console.warn("[LOS] 차트 스크린샷 실패:", e);
+      console.warn("[LoS] 차트 스크린샷 실패:", e);
     }
 
-    const result: LOSProfileData = {
+    const result: LoSProfileData = {
       id: `los-${Date.now()}`,
       radarSiteName: radarSite.name,
       radarLat: radarSite.latitude,
@@ -858,7 +858,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       chartScreenshot,
       timestamp: Date.now(),
     };
-    addLOSResult(result);
+    addLoSResult(result);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -1063,7 +1063,8 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     let fresnelH = 0;
     for (let i = 1; i < adjTerrain.length; i++) {
       if (adjTerrain[i].distance >= dist) {
-        const t = (dist - adjTerrain[i - 1].distance) / (adjTerrain[i].distance - adjTerrain[i - 1].distance);
+        const denom = adjTerrain[i].distance - adjTerrain[i - 1].distance;
+        const t = denom > 1e-9 ? (dist - adjTerrain[i - 1].distance) / denom : 0;
         terrainH = adjTerrain[i - 1].height + t * (adjTerrain[i].height - adjTerrain[i - 1].height);
         realElev = profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
         refractedH = minDetRefracted[i - 1].height + t * (minDetRefracted[i].height - minDetRefracted[i - 1].height);
@@ -1135,12 +1136,12 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
       .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
       .join(" ");
 
-    // 최저 탐지가능 높이 (직선 LOS)
+    // 최저 탐지가능 높이 (직선 LoS)
     const minDetStrPath = minDetStraight
       .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
       .join(" ");
 
-    // 최저 탐지가능 높이 (직선 LOS + 프레넬존 80% 클리어런스)
+    // 최저 탐지가능 높이 (직선 LoS + 프레넬존 80% 클리어런스)
     const minDetFresnelPath = minDetFresnel
       .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
       .join(" ");
@@ -1258,8 +1259,18 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           if (bHeight < 1) return null;
           const isHovered = hoveredBldgIdx === bi;
           const isClicked = clickedBldgIdx === bi;
-          const baseColor = isClicked ? "#f59e0b" : isHovered ? "#facc15" : b.isBlocking ? "rgba(239, 68, 68, 0.8)" : "rgba(71, 85, 105, 0.7)";
-          const fillColor = isClicked ? "rgba(245,158,11,0.3)" : isHovered ? "rgba(250,204,21,0.25)" : b.isBlocking ? "rgba(239,68,68,0.15)" : "rgba(71,85,105,0.12)";
+          // 수동 건물 그룹 색상 조회
+          let manualGroupColor: string | null = null;
+          if (b.is_manual) {
+            const mb = manualBuildings.find((m) => Math.abs(m.latitude - b.lat) < 1e-6 && Math.abs(m.longitude - b.lon) < 1e-6);
+            if (mb?.group_id) {
+              const grp = buildingGroups.find((g) => g.id === mb.group_id);
+              if (grp) manualGroupColor = grp.color;
+            }
+          }
+          const manualColor = manualGroupColor || "#f97316"; // 그룹색 or 주황색
+          const baseColor = isClicked ? "#f59e0b" : isHovered ? "#facc15" : b.is_manual ? manualColor : b.isBlocking ? "rgba(239, 68, 68, 0.8)" : "rgba(148, 163, 184, 0.5)";
+          const fillColor = isClicked ? "rgba(245,158,11,0.3)" : isHovered ? "rgba(250,204,21,0.25)" : b.is_manual ? `${manualColor}20` : b.isBlocking ? "rgba(239,68,68,0.15)" : "rgba(148,163,184,0.08)";
 
           if (hasExtent) {
             // 도형 건물: 채워진 사각형 (사다리꼴 — 곡률 보정으로 양쪽 높이 다름)
@@ -1280,7 +1291,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 />
                 {/* 채워진 사각형 + 윤곽선 */}
                 <path d={pathD} fill={fillColor} stroke={baseColor}
-                  strokeWidth={isClicked ? 2.5 : isHovered ? 2 : 1.5}
+                  strokeWidth={isClicked ? 2 : isHovered ? 1.5 : 1}
                   pointerEvents="none"
                 />
               </g>
@@ -1307,18 +1318,18 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
               <line
                 x1={bxNear} y1={byBottomNear} x2={bxNear} y2={byTopNear}
                 stroke={baseColor}
-                strokeWidth={isClicked ? 3.5 : isHovered ? 3 : 2}
+                strokeWidth={isClicked ? 2.5 : isHovered ? 2 : 1}
                 pointerEvents="none"
               />
             </g>
           );
         })}
 
-        {/* 최저 탐지가능 높이 - 직선 LOS (굴절 미적용, 실제 지구반경) */}
+        {/* 최저 탐지가능 높이 - 직선 LoS (굴절 미적용, 실제 지구반경) */}
         <path d={minDetStrPath} fill="none"
           stroke="rgba(107,114,128,0.6)" strokeWidth={1.8} />
 
-        {/* 최저 탐지가능 높이 - 직선 LOS + 프레넬존 80% 클리어런스 */}
+        {/* 최저 탐지가능 높이 - 직선 LoS + 프레넬존 80% 클리어런스 */}
         <path d={minDetFresnelPath} fill="none"
           stroke="#ec4899" strokeWidth={1.2} strokeDasharray="6 3" />
 
@@ -1391,13 +1402,25 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })()}
 
-        {/* LOS 선상 항적/Loss 포인트: GPU 캔버스에서 렌더링 (아래 trackCanvasRef) */}
+        {/* LoS 선상 항적/Loss 포인트: GPU 캔버스에서 렌더링 (아래 trackCanvasRef) */}
 
         </g>{/* /chart-clip */}
 
         {/* 범례 (왼쪽 위) */}
         <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5})`}>
-          <rect x={-4} y={-6} width={270} height={(chartData.significantBuildings.length > 0 ? 94 : 80) + (showCustomAngle ? 14 : 0)} rx={4} fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
+          <rect x={-4} y={-6} width={270} height={(() => {
+            let h = 80;
+            if (chartData.significantBuildings.length > 0) {
+              const hasBlocking = chartData.significantBuildings.some(b => b.isBlocking);
+              const hasNonBlocking = chartData.significantBuildings.some(b => !b.isBlocking);
+              const hasManual = chartData.significantBuildings.some(b => b.is_manual);
+              if (hasBlocking) h += 14;
+              if (hasNonBlocking) h += 14;
+              if (hasManual) h += 14;
+            }
+            if (showCustomAngle) h += 14;
+            return h;
+          })()} rx={4} fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
           <line x1={0} y1={0} x2={20} y2={0}
             stroke="#f59e0b" strokeWidth={1.8} />
           <text x={24} y={3} fill="#374151" fontSize={8}>
@@ -1406,12 +1429,12 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           <line x1={0} y1={14} x2={20} y2={14}
             stroke="rgba(107,114,128,0.6)" strokeWidth={1.8} />
           <text x={24} y={17} fill="#374151" fontSize={8}>
-            최저 탐지가능 높이 (직선 LOS, 굴절 미적용)
+            최저 탐지가능 높이 (직선 LoS, 굴절 미적용)
           </text>
           <line x1={0} y1={28} x2={20} y2={28}
             stroke="#ec4899" strokeWidth={1.2} strokeDasharray="6 3" />
           <text x={24} y={31} fill="#374151" fontSize={8}>
-            최저 탐지가능 높이 (직선 LOS, 프레넬존 80% 클리어런스)
+            최저 탐지가능 높이 (직선 LoS, 프레넬존 80% 클리어런스)
           </text>
           <line x1={0} y1={42} x2={20} y2={42}
             stroke="#22d3ee" strokeWidth={1} strokeDasharray="8 4" />
@@ -1427,23 +1450,59 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           <text x={24} y={73} fill="#374151" fontSize={8}>
             지형 (지구곡률 보정)
           </text>
-          {chartData.significantBuildings.length > 0 && (
-            <>
-              <rect x={2} y={80} width={16} height={8} fill="rgba(100, 116, 139, 0.5)" stroke="rgba(71, 85, 105, 0.7)" strokeWidth={0.5} />
-              <text x={24} y={87} fill="#374151" fontSize={8}>
-                차폐 건물 ({chartData.significantBuildings.length}동)
-              </text>
-            </>
-          )}
-          {showCustomAngle && (
-            <>
-              <line x1={0} y1={80 + (chartData.significantBuildings.length > 0 ? 14 : 0)} x2={20} y2={80 + (chartData.significantBuildings.length > 0 ? 14 : 0)}
-                stroke="#f43f5e" strokeWidth={1.5} strokeDasharray="6 4" />
-              <text x={24} y={80 + (chartData.significantBuildings.length > 0 ? 14 : 0) + 3} fill="#374151" fontSize={8}>
-                사용자 각도선 ({customAngleDeg.toFixed(2)}°)
-              </text>
-            </>
-          )}
+          {chartData.significantBuildings.length > 0 && (() => {
+            const blockingCount = chartData.significantBuildings.filter(b => b.isBlocking).length;
+            const manualCount = chartData.significantBuildings.filter(b => b.is_manual).length;
+            const nonBlockingCount = chartData.significantBuildings.length - blockingCount;
+            let legendY = 80;
+            return (
+              <>
+                {blockingCount > 0 && (
+                  <>
+                    <rect x={2} y={legendY} width={16} height={8} fill="rgba(239,68,68,0.15)" stroke="rgba(239,68,68,0.8)" strokeWidth={0.5} />
+                    <text x={24} y={legendY + 7} fill="#374151" fontSize={8}>
+                      LoS 차단 건물 ({blockingCount}동)
+                    </text>
+                    {(() => { legendY += 14; return null; })()}
+                  </>
+                )}
+                {nonBlockingCount > 0 && (
+                  <>
+                    <rect x={2} y={legendY} width={16} height={8} fill="rgba(148,163,184,0.08)" stroke="rgba(148,163,184,0.5)" strokeWidth={0.5} />
+                    <text x={24} y={legendY + 7} fill="#374151" fontSize={8}>
+                      비차단 건물 ({nonBlockingCount}동)
+                    </text>
+                    {(() => { legendY += 14; return null; })()}
+                  </>
+                )}
+                {manualCount > 0 && (
+                  <>
+                    <rect x={2} y={legendY} width={16} height={8} fill="rgba(249,115,22,0.15)" stroke="#f97316" strokeWidth={0.5} />
+                    <text x={24} y={legendY + 7} fill="#374151" fontSize={8}>
+                      수동 등록 건물 ({manualCount}동)
+                    </text>
+                  </>
+                )}
+              </>
+            );
+          })()}
+          {showCustomAngle && (() => {
+            let caY = 80;
+            if (chartData.significantBuildings.length > 0) {
+              if (chartData.significantBuildings.some(b => b.isBlocking)) caY += 14;
+              if (chartData.significantBuildings.some(b => !b.isBlocking)) caY += 14;
+              if (chartData.significantBuildings.some(b => b.is_manual)) caY += 14;
+            }
+            return (
+              <>
+                <line x1={0} y1={caY} x2={20} y2={caY}
+                  stroke="#f43f5e" strokeWidth={1.5} strokeDasharray="6 4" />
+                <text x={24} y={caY + 3} fill="#374151" fontSize={8}>
+                  사용자 각도선 ({customAngleDeg.toFixed(2)}°)
+                </text>
+              </>
+            );
+          })()}
         </g>
 
         {/* 인터랙티브 크로스헤어 + 호버 툴팁 */}
@@ -1467,7 +1526,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 stroke="#f59e0b" strokeWidth={0.8} strokeDasharray="2 2" strokeOpacity={0.5} />
               <circle cx={hXPos} cy={yScale(hoverData.refractedH)} r={3}
                 fill="#f59e0b" stroke="white" strokeWidth={0.8} />
-              {/* 직선 LOS: 지면→포인트 수직 가이드 */}
+              {/* 직선 LoS: 지면→포인트 수직 가이드 */}
               <line x1={hXPos} y1={yScale(hoverData.terrainH)} x2={hXPos} y2={yScale(hoverData.straightH)}
                 stroke="rgba(107,114,128,0.5)" strokeWidth={0.8} strokeDasharray="2 2" strokeOpacity={0.5} />
               <circle cx={hXPos} cy={yScale(hoverData.straightH)} r={2.5}
@@ -1568,7 +1627,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 <tspan fill="#374151" fontWeight="bold">{Math.round(b.ground_elev_m + b.height_m)}m AMSL</tspan>
               </text>
               <text x={tooltipX + 8} y={(lineY += 14, lineY)} fill={b.isBlocking ? "#ef4444" : "#6b7280"} fontSize={8} fontWeight={b.isBlocking ? "bold" : "normal"}>
-                {b.isBlocking ? "⚠ LOS 차단 기여" : "차폐 영향"}
+                {b.isBlocking ? "⚠ LoS 차단 기여" : "차폐 영향"}
               </text>
               {isClicked && (
                 <text x={tooltipX + tooltipW - 8} y={lineY} textAnchor="end"
@@ -1638,7 +1697,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
     <div className="border-t border-gray-200 bg-white/95 backdrop-blur-sm shadow-lg">
       {/* Header */}
       <div className="flex items-center gap-3 border-b border-gray-200 px-4 py-2">
-        <span className="text-xs font-semibold text-gray-800">LOS 단면도</span>
+        <span className="text-xs font-semibold text-gray-800">LoS 단면도</span>
         <span className="text-[10px] text-gray-500">
           {radarSite.name} → {targetLat.toFixed(4)}°N {targetLon.toFixed(4)}°E
         </span>
@@ -1648,7 +1707,7 @@ export default function LOSProfilePanel({ radarSite, targetLat, targetLon, onClo
           <span>방위: {bearing.toFixed(0)}°</span>
           {chartData && (
             <span className={chartData.blocked ? "text-[#a60739]" : "text-emerald-600"}>
-              {chartData.blocked ? "LOS 차단" : "LOS 양호"}
+              {chartData.blocked ? "LoS 차단" : "LoS 양호"}
             </span>
           )}
           {xZoom[0] !== 0 || xZoom[1] !== 100 ? (

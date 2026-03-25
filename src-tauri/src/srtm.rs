@@ -109,6 +109,11 @@ impl SrtmReader {
         // 픽셀 좌표 (북→남이므로 row는 반전)
         let row_f = (tile_lat as f64 + 1.0 - lat) * (SRTM1_SAMPLES - 1) as f64;
         let col_f = (lon - tile_lon as f64) * (SRTM1_SAMPLES - 1) as f64;
+
+        // 부동소수점 경계 케이스: 음수 인덱스 방어 (usize 캐스트 전 검사)
+        if row_f < 0.0 || col_f < 0.0 || row_f >= (SRTM1_SAMPLES - 1) as f64 || col_f >= (SRTM1_SAMPLES - 1) as f64 {
+            return Some(0.0);
+        }
         let row = row_f.floor() as usize;
         let col = col_f.floor() as usize;
 
@@ -213,6 +218,11 @@ pub fn elevation_from_tiles(tiles: &HashMap<String, Option<Vec<i16>>>, lat: f64,
 
     let row_f = (tile_lat as f64 + 1.0 - lat) * (SRTM1_SAMPLES - 1) as f64;
     let col_f = (lon - tile_lon as f64) * (SRTM1_SAMPLES - 1) as f64;
+
+    // 부동소수점 경계 케이스: 음수 인덱스 방어 (usize 캐스트 전 검사)
+    if row_f < 0.0 || col_f < 0.0 || row_f >= (SRTM1_SAMPLES - 1) as f64 || col_f >= (SRTM1_SAMPLES - 1) as f64 {
+        return 0.0;
+    }
     let row = row_f.floor() as usize;
     let col = col_f.floor() as usize;
 

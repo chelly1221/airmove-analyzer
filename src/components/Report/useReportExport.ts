@@ -11,11 +11,11 @@ export interface ExportResult {
 
 /** WebView2 네이티브 PrintToPdf — 벡터 PDF, GPU 가속
  *
- * DOM 직접 조작 방식:
- * 1. 보고서 [data-page] 요소들을 body 직속 래퍼로 이동
- * 2. 기존 body 자식 요소 전부 숨김
+ * DOM 숨김 방식 (페이지 이동 없음):
+ * 1. 컨테이너에 프린트 래퍼 ID 부여, 내부 비페이지 요소 숨김
+ * 2. 컨테이너~body 경로 외 모든 형제 요소 숨김
  * 3. CDP Page.printToPDF 호출
- * 4. DOM 원복
+ * 4. 숨김 해제 (페이지가 원래 위치에 그대로 있으므로 detach 위험 없음)
  */
 async function exportViaNative(
   containerRef: React.RefObject<HTMLDivElement | null>,
@@ -31,20 +31,42 @@ async function exportViaNative(
     return { success: false, error: "보고서 페이지가 없습니다" };
   }
 
-  // 1. 프린트 래퍼 생성 (body 직속)
-  const wrapper = document.createElement("div");
-  wrapper.id = "__print-wrapper__";
+  // 1. 컨테이너에 프린트 래퍼 ID 부여 (페이지를 이동하지 않음)
+  const prevContainerId = container.id;
+  container.id = "__print-wrapper__";
 
-  // 2. 페이지 요소들을 래퍼로 이동 (원래 부모 컨테이너 기록)
-  const pageArray = Array.from(pages);
-  pageArray.forEach((page) => wrapper.appendChild(page));
+  // 2. 컨테이너 내부에서 [data-page] 외 요소 숨김
+  const containerChildren = Array.from(container.children) as HTMLElement[];
+  const hiddenContainerChildren: HTMLElement[] = [];
+  containerChildren.forEach((el) => {
+    if (!el.hasAttribute("data-page")) {
+      hiddenContainerChildren.push(el);
+      el.style.setProperty("display", "none", "important");
+    }
+  });
 
-  // 3. 기존 body 자식 전부 숨김
+  // 3. body 자식 중 컨테이너 조상 경로 외 전부 숨김
+  const hiddenBodyChildren: HTMLElement[] = [];
   const bodyChildren = Array.from(document.body.children) as HTMLElement[];
-  bodyChildren.forEach((el) => el.style.setProperty("display", "none", "important"));
+  bodyChildren.forEach((el) => {
+    if (!el.contains(container) && el !== container) {
+      hiddenBodyChildren.push(el);
+      el.style.setProperty("display", "none", "important");
+    }
+  });
 
-  // 4. 래퍼를 body에 추가
-  document.body.appendChild(wrapper);
+  // 4. 컨테이너~body 사이 조상 경로의 형제도 숨김
+  const hiddenAncestorSiblings: HTMLElement[] = [];
+  let ancestor: HTMLElement | null = container.parentElement;
+  while (ancestor && ancestor !== document.body) {
+    Array.from(ancestor.parentElement?.children ?? []).forEach((sibling) => {
+      if (sibling !== ancestor && sibling instanceof HTMLElement) {
+        hiddenAncestorSiblings.push(sibling);
+        sibling.style.setProperty("display", "none", "important");
+      }
+    });
+    ancestor = ancestor.parentElement;
+  }
 
   // 5. 인쇄 전용 스타일 주입
   const styleEl = document.createElement("style");
@@ -95,12 +117,12 @@ async function exportViaNative(
       error: `WebView2 PDF 생성 실패: ${err instanceof Error ? err.message : String(err)}`,
     };
   } finally {
-    // DOM 원복
+    // DOM 원복 — 페이지는 이동하지 않았으므로 숨김만 해제
     styleEl.remove();
-    bodyChildren.forEach((el) => el.style.removeProperty("display"));
-    // 페이지를 원래 컨테이너로 복원
-    pageArray.forEach((page) => container.appendChild(page));
-    wrapper.remove();
+    container.id = prevContainerId;
+    hiddenContainerChildren.forEach((el) => el.style.removeProperty("display"));
+    hiddenBodyChildren.forEach((el) => el.style.removeProperty("display"));
+    hiddenAncestorSiblings.forEach((el) => el.style.removeProperty("display"));
   }
 }
 

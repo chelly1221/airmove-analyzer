@@ -1,6 +1,7 @@
 import React, { useMemo } from "react";
 import EditableText from "./EditableText";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
+import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedPsrStdDev, weightedBaselineLossAvg, weightedBaselineLossStdDev, gradeWithConfidence } from "../../utils/omStats";
 
 interface Props {
   sectionNum: number;
@@ -23,12 +24,6 @@ function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): nu
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-/** 등급 판정 */
-function gradeOf(lossRate: number): { label: string; color: string; bg: string } {
-  if (lossRate < 0.5) return { label: "양호", color: "#15803d", bg: "#dcfce7" };
-  if (lossRate < 2.0) return { label: "주의", color: "#b45309", bg: "#fef3c7" };
-  return { label: "경고", color: "#b91c1c", bg: "#fee2e2" };
-}
 
 function ReportOMFindings({
   sectionNum,
@@ -46,24 +41,21 @@ function ReportOMFindings({
   // 레이더별 요약 계산
   const radarSummaries = useMemo(() => radarResults.map((rr) => {
     const stats = rr.daily_stats;
-    const avgLoss = stats.length > 0
-      ? stats.reduce((s, d) => s + d.loss_rate, 0) / stats.length
-      : 0;
-    const avgPsr = stats.length > 0
-      ? stats.reduce((s, d) => s + d.psr_rate, 0) / stats.length
-      : 0;
-    const avgBaseline = stats.length > 0
-      ? stats.reduce((s, d) => s + d.baseline_loss_rate, 0) / stats.length
-      : 0;
+    const avgLoss = weightedLossAvg(stats);
+    const lossSigma = weightedLossStdDev(stats);
+    const avgPsr = weightedPsrAvg(stats);
+    const psrSigma = weightedPsrStdDev(stats);
+    const avgBaseline = weightedBaselineLossAvg(stats);
+    const baselineSigma = weightedBaselineLossStdDev(stats);
     const deviation = avgLoss - avgBaseline;
     const totalLoss = stats.flatMap((d) => d.loss_points_summary).length;
-    const grade = gradeOf(avgLoss);
+    const grade = gradeWithConfidence(avgLoss, stats.length);
 
     return {
       radarName: rr.radar_name,
-      avgLoss,
-      avgPsr,
-      avgBaseline,
+      avgLoss, lossSigma,
+      avgPsr, psrSigma,
+      avgBaseline, baselineSigma,
       deviation,
       totalLoss,
       grade,
@@ -110,12 +102,12 @@ function ReportOMFindings({
                 <tr>
                   <td className="py-0.5 text-gray-500">평균 표적소실율</td>
                   <td className="py-0.5 text-right font-mono font-bold" style={{ color: rs.avgLoss >= 2 ? "#dc2626" : "#374151" }}>
-                    {rs.avgLoss.toFixed(2)}%
+                    {rs.avgLoss.toFixed(2)}% <span className="text-gray-400 font-normal">±{rs.lossSigma.toFixed(2)}</span>
                   </td>
                 </tr>
                 <tr>
                   <td className="py-0.5 text-gray-500">기준선 표적소실율</td>
-                  <td className="py-0.5 text-right font-mono">{rs.avgBaseline.toFixed(2)}%</td>
+                  <td className="py-0.5 text-right font-mono">{rs.avgBaseline.toFixed(2)}% <span className="text-gray-400">±{rs.baselineSigma.toFixed(2)}</span></td>
                 </tr>
                 <tr>
                   <td className="py-0.5 text-gray-500">편차</td>
@@ -125,7 +117,7 @@ function ReportOMFindings({
                 </tr>
                 <tr>
                   <td className="py-0.5 text-gray-500">평균 PSR율</td>
-                  <td className="py-0.5 text-right font-mono">{(rs.avgPsr * 100).toFixed(1)}%</td>
+                  <td className="py-0.5 text-right font-mono">{(rs.avgPsr * 100).toFixed(1)}% <span className="text-gray-400">±{(rs.psrSigma * 100).toFixed(1)}</span></td>
                 </tr>
                 <tr>
                   <td className="py-0.5 text-gray-500">소실표적 건수</td>

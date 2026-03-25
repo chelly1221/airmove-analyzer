@@ -15,8 +15,8 @@ export interface ElevationPoint {
   longitude: number;
 }
 
-/** LOS 분석 단면도 결과 */
-export interface LOSProfileData {
+/** LoS 분석 단면도 결과 */
+export interface LoSProfileData {
   id: string;
   radarSiteName: string;
   radarLat: number;

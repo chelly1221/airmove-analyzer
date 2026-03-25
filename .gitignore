@@ -28,3 +28,6 @@ src-tauri/target/
 
 # Reference ASS data files (large binary)
 ass/
+
+# vworld 다운로드
+downloads/

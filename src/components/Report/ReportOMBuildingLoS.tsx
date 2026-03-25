@@ -1,12 +1,12 @@
 import React, { useMemo } from "react";
-import type { ManualBuilding, RadarSite, LOSProfileData } from "../../types";
+import type { ManualBuilding, RadarSite, LoSProfileData } from "../../types";
 
 interface Props {
   sectionNum: number;
   selectedBuildings: ManualBuilding[];
   radarSites: RadarSite[];
-  /** 건물별 × 레이더별 LOS 결과 (key: `${radarName}_${buildingId}`) */
-  losMap: Map<string, LOSProfileData>;
+  /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) */
+  losMap: Map<string, LoSProfileData>;
 }
 
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -25,7 +25,7 @@ function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): num
   return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
-function ReportOMBuildingLOS({ sectionNum, selectedBuildings, radarSites, losMap }: Props) {
+function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap }: Props) {
   // 방위/거리 사전 계산 (렌더 중 재계산 방지)
   const buildingRadarInfo = useMemo(() => {
     const info = new Map<string, { az: number; dist: number }>();
@@ -150,4 +150,4 @@ function ReportOMBuildingLOS({ sectionNum, selectedBuildings, radarSites, losMap
   );
 }
 
-export default React.memo(ReportOMBuildingLOS);
+export default React.memo(ReportOMBuildingLoS);

@@ -3,9 +3,10 @@
  * 각 항목별 분석 결과를 토대로 소견 템플릿을 자동 작성
  */
 import type {
-  RadarMonthlyResult, ManualBuilding, RadarSite, LOSProfileData,
+  RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData,
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
+import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg } from "./omStats";
 
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371;
@@ -25,7 +26,7 @@ interface GenerateOMFindingsParams {
   radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
   radarSites: RadarSite[];
-  losMap: Map<string, LOSProfileData>;
+  losMap: Map<string, LoSProfileData>;
   covLayersWithBuildings: CoverageLayer[];
   covLayersWithout: CoverageLayer[];
   analysisMonth: string;
@@ -67,15 +68,16 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       continue;
     }
 
-    const avgLoss = stats.reduce((s, d) => s + d.loss_rate, 0) / stats.length;
-    const avgBaseline = stats.reduce((s, d) => s + d.baseline_loss_rate, 0) / stats.length;
-    const avgPsr = stats.reduce((s, d) => s + d.psr_rate, 0) / stats.length;
+    const avgLoss = weightedLossAvg(stats);
+    const lossSigma = weightedLossStdDev(stats);
+    const avgBaseline = weightedBaselineLossAvg(stats);
+    const avgPsr = weightedPsrAvg(stats);
     const deviation = avgLoss - avgBaseline;
-    const grade = gradeLabel(avgLoss);
+    const grade = stats.length < 7 ? "판정 보류" : gradeLabel(avgLoss);
     const totalLossEvents = stats.flatMap((d) => d.loss_points_summary).length;
 
-    lines.push(`[${rr.radar_name}] 종합 판정: ${grade}`);
-    lines.push(`  - 분석 기간: ${stats.length}일, 평균 표적소실율: ${avgLoss.toFixed(2)}%, 기준선: ${avgBaseline.toFixed(2)}%, 편차: ${deviation > 0 ? "+" : ""}${deviation.toFixed(2)}%p`);
+    lines.push(`[${rr.radar_name}] 종합 판정: ${grade}${stats.length < 7 ? ` (관측일수 ${stats.length}일 < 7일)` : ""}`);
+    lines.push(`  - 분석 기간: ${stats.length}일, 평균 표적소실율: ${avgLoss.toFixed(2)}%(±${lossSigma.toFixed(2)}), 기준선: ${avgBaseline.toFixed(2)}%, 편차: ${deviation > 0 ? "+" : ""}${deviation.toFixed(2)}%p`);
     lines.push(`  - 평균 PSR 탐지율: ${(avgPsr * 100).toFixed(1)}%, 소실 이벤트: ${totalLossEvents}건`);
 
     // 편차 해석
@@ -122,9 +124,9 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   }
   lines.push("");
 
-  // ── 3. LOS 분석 결과 ──
+  // ── 3. LoS 분석 결과 ──
   if (losMap.size > 0) {
-    lines.push(`■ LOS(가시선) 분석`);
+    lines.push(`■ LoS(가시선) 분석`);
     let hasBlocked = false;
     for (const [key, los] of losMap) {
       const blocked = los.losBlocked;
@@ -139,9 +141,9 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       lines.push(detail);
     }
     if (hasBlocked) {
-      lines.push(`  → 일부 방향에서 LOS 차단이 확인되어, 해당 방위 저고도 표적의 탐지 제한이 예상된다.`);
+      lines.push(`  → 일부 방향에서 LoS 차단이 확인되어, 해당 방위 저고도 표적의 탐지 제한이 예상된다.`);
     } else {
-      lines.push(`  → 모든 방향에서 LOS가 확보되어 있으며, 장애물에 의한 전파 차단은 확인되지 않는다.`);
+      lines.push(`  → 모든 방향에서 LoS가 확보되어 있으며, 장애물에 의한 전파 차단은 확인되지 않는다.`);
     }
     lines.push("");
   }
@@ -177,10 +179,9 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   // ── 5. 종합 판정 ──
   lines.push(`■ 종합 판정`);
   const allGrades = radarResults.map((rr) => {
-    const avg = rr.daily_stats.length > 0
-      ? rr.daily_stats.reduce((s, d) => s + d.loss_rate, 0) / rr.daily_stats.length
-      : 0;
-    return { radar: rr.radar_name, avg, grade: gradeLabel(avg) };
+    const avg = weightedLossAvg(rr.daily_stats);
+    const grade = rr.daily_stats.length < 7 ? "판정 보류" : gradeLabel(avg);
+    return { radar: rr.radar_name, avg, grade };
   });
 
   const worstGrade = allGrades.some((g) => g.grade === "경고")
@@ -199,6 +200,14 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   } else {
     lines.push(`일부 레이더에서 표적소실율이 경고 수준으로, 분석 대상 장애물에 의한 탐지 성능 저하가 우려되며, 운용 관련 대책 검토가 필요하다.`);
   }
+
+  // ── 산식 근거 ──
+  lines.push("");
+  lines.push(`[산식 근거]`);
+  lines.push(`- 평균값: 관측량 가중 평균 x̄w = Σ(wi·xi)/Σwi (Loss: w=비행시간, PSR: w=SSR포인트수)`);
+  lines.push(`- ±σ: 가중 모표준편차 σw = √(Σ(wi·(xi-x̄w)²)/Σwi)`);
+  lines.push(`- 판정 기준: 양호(<0.5%) / 주의(0.5–2.0%) / 경고(≥2.0%) / 보류(관측<7일)`);
+  lines.push(`- Loss 탐지: 스캔 주기 자동 추정(중앙값), 임계값 = 주기 × 1.4`);
 
   return lines.join("\n");
 }

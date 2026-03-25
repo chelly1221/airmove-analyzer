@@ -1,7 +1,9 @@
+import { useState, useEffect, useMemo } from "react";
 import { format } from "date-fns";
-import type { Flight, RadarSite } from "../../types";
+import type { Flight, RadarSite, TrackPoint } from "../../types";
 import { flightLabel } from "../../utils/flightConsolidation";
 import { useAppStore } from "../../store";
+import { queryFlightPoints } from "../../utils/flightConsolidationWorker";
 
 interface Props {
   sectionNum: number;
@@ -20,24 +22,34 @@ export default function ReportFlightProfileSection({ sectionNum, flight, radarSi
   const aircraft = useAppStore((s) => s.aircraft);
   const label = flightLabel(flight, aircraft);
   const grade = getGrade(flight.loss_percentage);
-  const matchTypeLabel = flight.match_type === "opensky" ? "OpenSky 매칭" : flight.match_type === "manual" ? "수동 병합" : "Gap 분리";
+  const matchTypeLabel = flight.match_type === "manual" ? "수동 병합" : "Gap 분리";
 
-  // 고도/속도 범위
-  let minAlt = Infinity, maxAlt = -Infinity, minSpd = Infinity, maxSpd = -Infinity;
-  for (const p of flight.track_points) {
-    if (p.altitude < minAlt) minAlt = p.altitude;
-    if (p.altitude > maxAlt) maxAlt = p.altitude;
-    if (p.speed < minSpd) minSpd = p.speed;
-    if (p.speed > maxSpd) maxSpd = p.speed;
-  }
-  if (!isFinite(minAlt)) { minAlt = 0; maxAlt = 0; minSpd = 0; maxSpd = 0; }
+  // Worker에서 비행 포인트 비동기 로드
+  const [chartPoints, setChartPoints] = useState<TrackPoint[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    queryFlightPoints(flight.id).then((pts) => {
+      if (!cancelled) setChartPoints(pts);
+    });
+    return () => { cancelled = true; };
+  }, [flight.id]);
+
+  // 고도/속도 범위 (로드된 포인트 기반)
+  const { minAlt, maxAlt, minSpd, maxSpd } = useMemo(() => {
+    let mnA = Infinity, mxA = -Infinity, mnS = Infinity, mxS = -Infinity;
+    for (const p of chartPoints) {
+      if (p.altitude < mnA) mnA = p.altitude;
+      if (p.altitude > mxA) mxA = p.altitude;
+      if (p.speed < mnS) mnS = p.speed;
+      if (p.speed > mxS) mxS = p.speed;
+    }
+    if (!isFinite(mnA)) { mnA = 0; mxA = 0; mnS = 0; mxS = 0; }
+    return { minAlt: mnA, maxAlt: mxA, minSpd: mnS, maxSpd: mxS };
+  }, [chartPoints]);
 
   // 최대 gap 시간
   let maxGap = 0;
   for (const lp of flight.loss_points) if (lp.gap_duration_secs > maxGap) maxGap = lp.gap_duration_secs;
-
-  // 고도-시간 미니차트
-  const chartPoints = flight.track_points;
   const chartW = 560;
   const chartH = 100;
   const padL = 45;
@@ -109,7 +121,7 @@ export default function ReportFlightProfileSection({ sectionNum, flight, radarSi
           { label: "총 소실시간", value: `${flight.total_loss_time.toFixed(1)}초` },
           { label: "최대 gap", value: `${maxGap.toFixed(1)}초` },
           { label: "추적 시간", value: `${(flight.total_track_time / 60).toFixed(1)}분` },
-          { label: "추적 포인트", value: `${flight.track_points.length.toLocaleString()}개` },
+          { label: "추적 포인트", value: `${flight.point_count.toLocaleString()}개` },
           { label: "고도 범위", value: `${minAlt.toFixed(0)}~${maxAlt.toFixed(0)}m` },
           { label: "속도 범위", value: `${minSpd.toFixed(0)}~${maxSpd.toFixed(0)}kts` },
         ].map((kpi) => (

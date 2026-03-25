@@ -1,5 +1,6 @@
 import React from "react";
 import type { DailyStats } from "../../types";
+import { weightedAvg, weightedStdDev } from "../../utils/omStats";
 
 interface Props {
   sectionNum: number;
@@ -52,11 +53,18 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
     if (values[i] === 0 && baselineValues[i] === 0) return 0;
     return values[i] - baselineValues[i];
   });
-  const dataValues = values.filter((v) => v > 0);
-  const dataBaseline = baselineValues.filter((v) => v > 0);
   const maxVal = Math.max(...values, ...baselineValues, mode === "psr" ? 100 : 1) * 1.1;
-  const avg = dataValues.length > 0 ? dataValues.reduce((a, b) => a + b, 0) / dataValues.length : 0;
-  const avgBaseline = dataBaseline.length > 0 ? dataBaseline.reduce((a, b) => a + b, 0) / dataBaseline.length : 0;
+  // 가중 평균 x̄_w = Σ(w·x) / Σ(w)
+  // PSR: 가중치 = SSR포인트수 (분모가 클수록 안정적), Loss: 가중치 = 비행시간(초)
+  const getVal = (d: DailyStats) => mode === "psr" ? d.psr_rate * 100 : d.loss_rate;
+  const getWeight = (d: DailyStats) => mode === "psr" ? d.ssr_combined_points : d.total_track_time_secs;
+  const activeDays = dailyStats.filter((d) => getVal(d) > 0);
+  const avg = activeDays.length > 0 ? weightedAvg(activeDays, getVal, getWeight) : 0;
+  // σ_w = √( Σ(w·(x - x̄)²) / Σ(w) ) — 일별 산포 (관측량 가중)
+  const sigma = activeDays.length > 0 ? weightedStdDev(activeDays, getVal, getWeight) : 0;
+  const getBaseVal = (d: DailyStats) => mode === "psr" ? d.baseline_psr_rate * 100 : d.baseline_loss_rate;
+  const baselineDays = dailyStats.filter((d) => getBaseVal(d) > 0);
+  const avgBaseline = baselineDays.length > 0 ? weightedAvg(baselineDays, getBaseVal, getWeight) : 0;
 
   // SVG 레이아웃 (한 페이지 채움, 섹션 제목은 SVG 외부 h2)
   const condLineCount = conditions?.length ?? 0;
@@ -148,7 +156,7 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
               opacity={0.6}
             />
             <text x={xScale(avg)} y={margin.top - 6} textAnchor="middle" fill={color} fontSize={9.5} fontWeight={600}>
-              평균 {avg.toFixed(2)}%
+              평균 {avg.toFixed(2)}%{sigma > 0 ? ` ±${sigma.toFixed(2)}` : ""}
             </text>
           </>
         )}
@@ -262,12 +270,18 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
                   {hasData && (val > 0 || blVal > 0) && (
                     <text
                       x={svgW - margin.right + 6}
-                      y={cy + 3}
+                      y={cy - 2}
                       fill={dev > 0 ? DEV_POS_COLOR : dev < 0 ? DEV_NEG_COLOR : "#9ca3af"}
                       fontSize={9}
                       fontWeight={600}
                     >
                       {dev > 0 ? "+" : ""}{dev.toFixed(dev < 1 && dev > -1 ? 2 : 1)}
+                    </text>
+                  )}
+                  {/* N 뱃지 (우측 편차 아래) */}
+                  {hasData && (
+                    <text x={svgW - margin.right + 6} y={cy + 9} fill="#b0b0b0" fontSize={7}>
+                      N={dayDataMap.get(day)!.total_points.toLocaleString()}
                     </text>
                   )}
 
@@ -302,6 +316,11 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
                         {val.toFixed(val < 1 ? 2 : 1)}%
                       </text>
                     </>
+                  )}
+                  {hasData && (
+                    <text x={svgW - margin.right + 6} y={cy + 3} fill="#b0b0b0" fontSize={7}>
+                      N={dayDataMap.get(day)!.total_points.toLocaleString()}
+                    </text>
                   )}
                   {!hasData && (
                     <text x={margin.left + 6} y={cy + 3} fill="#d1d5db" fontSize={8.5}>

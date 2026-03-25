@@ -8,7 +8,10 @@ export type PageId =
   | "tracks"
   | "analysis"
   | "report"
-  | "settings";
+  | "radar"
+  | "settings"
+  | "aircraft"
+  | "obstacle";
 
 /** 파일 업로드 상태 */
 export interface UploadedFile {

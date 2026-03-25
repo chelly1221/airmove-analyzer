@@ -1,9 +1,9 @@
-/** LOS 경로 상의 건물 */
+/** LoS 경로 상의 건물 */
 export interface BuildingOnPath {
   distance_km: number;
-  /** LOS 경로 상 건물 시작 거리 (km) — 도형 건물은 near < far */
+  /** LoS 경로 상 건물 시작 거리 (km) — 도형 건물은 near < far */
   near_dist_km: number;
-  /** LOS 경로 상 건물 끝 거리 (km) */
+  /** LoS 경로 상 건물 끝 거리 (km) */
   far_dist_km: number;
   height_m: number;
   ground_elev_m: number;
@@ -13,18 +13,48 @@ export interface BuildingOnPath {
   usage: string | null;
   lat: number;
   lon: number;
+  /** 건물 폴리곤 좌표 [[lat,lon],...] (WGS84) — 3D 렌더링용 */
+  polygon?: [number, number][];
+  /** 수동 등록 건물 여부 (true이면 ground_elev_m은 사용자 입력값) */
+  is_manual: boolean;
 }
 
-/** 건물 데이터 임포트 상태 */
-export interface BuildingImportStatus {
-  region: string;
-  file_date: string;
+/** 3D 건물 데이터 (맵 뷰포트 내 건물) */
+export interface Building3D {
+  lat: number;
+  lon: number;
+  height_m: number;
+  /** 건물 폴리곤 좌표 [[lat,lon],...] (WGS84) */
+  polygon: [number, number][];
+  name: string | null;
+  usage: string | null;
+  /** 데이터 출처: "fac", "manual" */
+  source: string;
+  /** 건물 그룹 색상 (수동 건물만, 예: "#ef4444") */
+  group_color?: string;
+}
+
+/** 인근 산봉우리 (query_nearby_peaks 결과) */
+export interface NearbyPeak {
+  name: string;
+  height_m: number | null;
+  latitude: number;
+  longitude: number;
+  distance_km: number;
+}
+
+/** 산봉우리 임포트 상태 */
+export interface PeakImportStatus {
+  file_name: string;
   imported_at: number;
   record_count: number;
 }
 
+/** SRTM 타일 상태 [타일 수, 최신 다운로드 일시(epoch)] */
+export type SrtmStatus = [number, number] | null;
+
 /** 도형 유형 */
-export type GeometryType = "point" | "rectangle" | "circle" | "line" | "multi";
+export type GeometryType = "point" | "circle" | "line" | "multi";
 
 /** 건물 그룹 */
 export interface BuildingGroup {
@@ -36,6 +66,9 @@ export interface BuildingGroup {
   has_plan_image: boolean;
   plan_bounds_json: string | null;
   plan_opacity: number;
+  plan_rotation: number;
+  /** 그룹 영역 바운드 JSON: [[minLat, minLon], [maxLat, maxLon]] */
+  area_bounds_json: string | null;
 }
 
 /** 토지이용계획도 오버레이 경계 (4코너 좌표) */

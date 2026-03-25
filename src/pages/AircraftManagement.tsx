@@ -114,7 +114,7 @@ export default function AircraftManagement() {
   const columns = [
     {
       key: "active",
-      header: "상태",
+      header: "활성",
       width: "60px",
       render: (a: Aircraft) => (
         <div className="flex justify-center">
@@ -135,6 +135,13 @@ export default function AircraftManagement() {
       ),
     },
     {
+      key: "model",
+      header: "기체 모델",
+      render: (a: Aircraft) => (
+        <span className="text-gray-500">{a.model || "-"}</span>
+      ),
+    },
+    {
       key: "mode_s_code",
       header: "Mode-S",
       render: (a: Aircraft) => (
@@ -144,13 +151,6 @@ export default function AircraftManagement() {
       ),
     },
     { key: "organization", header: "운용 기관" },
-    {
-      key: "memo",
-      header: "메모",
-      render: (a: Aircraft) => (
-        <span className="text-gray-500">{a.memo || "-"}</span>
-      ),
-    },
     {
       key: "actions",
       header: "관리",
@@ -247,6 +247,19 @@ export default function AircraftManagement() {
             )}
           </div>
 
+          {/* Model */}
+          <div>
+            <label className="mb-1 block text-sm text-gray-600">
+              기체 모델
+            </label>
+            <input
+              value={form.model}
+              onChange={(e) => setForm({ ...form, model: e.target.value })}
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 outline-none focus:border-[#a60739]/50 transition-colors"
+              placeholder="예: King Air 350"
+            />
+          </div>
+
           {/* Registration */}
           <div>
             <label className="mb-1 block text-sm text-gray-600">
@@ -301,18 +314,6 @@ export default function AircraftManagement() {
             )}
           </div>
 
-          {/* Memo */}
-          <div>
-            <label className="mb-1 block text-sm text-gray-600">메모</label>
-            <textarea
-              value={form.memo}
-              onChange={(e) => setForm({ ...form, memo: e.target.value })}
-              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 outline-none focus:border-[#a60739]/50 transition-colors"
-              placeholder="비고 사항"
-              rows={2}
-            />
-          </div>
-
           {/* Active */}
           <div className="flex items-center gap-3">
             <button
@@ -330,19 +331,29 @@ export default function AircraftManagement() {
           </div>
 
           {/* Buttons */}
-          <div className="flex justify-end gap-3 pt-2">
-            <button
-              onClick={() => setModalOpen(false)}
-              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
-            >
-              취소
-            </button>
-            <button
-              onClick={handleSave}
-              className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] transition-colors"
-            >
-              {editId ? "수정" : "추가"}
-            </button>
+          <div className="flex items-center justify-between pt-2">
+            {editId ? (
+              <button
+                onClick={() => { setModalOpen(false); setDeleteConfirm(editId); }}
+                className="rounded-lg px-3 py-2 text-sm text-red-500 hover:bg-red-50 transition-colors"
+              >
+                삭제
+              </button>
+            ) : <div />}
+            <div className="flex gap-3">
+              <button
+                onClick={() => setModalOpen(false)}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+              >
+                취소
+              </button>
+              <button
+                onClick={handleSave}
+                className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] transition-colors"
+              >
+                {editId ? "수정" : "추가"}
+              </button>
+            </div>
           </div>
         </div>
       </Modal>

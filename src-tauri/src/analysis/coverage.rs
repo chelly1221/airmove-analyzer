@@ -210,7 +210,7 @@ fn compute_layer_inner(profile: &CoverageProfile, alt_ft: f64, bearing_step: usi
         let ray_offset = r * n;
         let bearing_deg = r as f64 * step_deg;
 
-        // Binary search: LOS block point
+        // Binary search: LoS block point
         let mut los_block_idx = n;
         let mut lo: usize = 1;
         let mut hi: usize = n - 1;
@@ -219,7 +219,7 @@ fn compute_layer_inner(profile: &CoverageProfile, alt_ft: f64, bearing_step: usi
             let dist = ((mid + 1) as f64 / n as f64) * max_range_km;
             let adj_alt = alt_m - curv_drop(dist);
             let target_angle = (adj_alt as f32 - radar_h as f32) / dist as f32;
-            if profile.max_angles[ray_offset + mid - 1] > target_angle {
+            if profile.max_angles[ray_offset + mid] > target_angle {
                 los_block_idx = mid;
                 if mid == 0 { break; }
                 hi = mid - 1;
@@ -295,6 +295,7 @@ pub fn invalidate_cache() {
 }
 
 /// Query buildings for coverage computation (returns (lat, lon, height) tuples)
+/// GIS 건물은 폴리곤 꼭짓점별로 확장, 수동 건물은 geometry별 샘플 포인트 확장
 fn query_buildings_for_coverage(
     conn: &rusqlite::Connection,
     radar_lat: f64,
@@ -308,35 +309,67 @@ fn query_buildings_for_coverage(
     let min_lon = radar_lon - range_deg;
     let max_lon = radar_lon + range_deg;
 
-    // GIS buildings
+    // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height FROM buildings
+        "SELECT centroid_lat, centroid_lon, height, polygon_json FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND height >= 3.0 AND height <= 1000.0"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],
-            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?)),
+            |row| Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            )),
         ) {
             for r in rows.flatten() {
-                result.push(r);
+                let (_clat, _clon, height, polygon_json) = r;
+                let poly_pts: Option<Vec<[f64; 2]>> = polygon_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok());
+                if let Some(pts) = poly_pts {
+                    if pts.len() >= 3 {
+                        for pt in &pts {
+                            result.push((pt[0], pt[1], height));
+                        }
+                    }
+                }
+                // 폴리곤 없는 GIS 건물은 제외
             }
         }
     }
 
-    // Manual buildings
+    // Manual buildings — geometry 확장
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT latitude, longitude, height FROM manual_buildings
+        "SELECT latitude, longitude, height, geometry_type, geometry_json FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2
            AND longitude BETWEEN ?3 AND ?4"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],
-            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?)),
+            |row| Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            )),
         ) {
             for r in rows.flatten() {
-                result.push(r);
+                let (lat, lon, height, geo_type, geo_json) = r;
+                let sample_pts = crate::building::expand_manual_building_geometry(
+                    lat, lon, geo_type.as_deref(), geo_json.as_deref(),
+                );
+                if sample_pts.len() > 1 {
+                    for (slat, slon) in sample_pts {
+                        result.push((slat, slon, height));
+                    }
+                } else {
+                    result.push((lat, lon, height));
+                }
             }
         }
     }
@@ -345,6 +378,7 @@ fn query_buildings_for_coverage(
 }
 
 /// Query buildings excluding specific manual building IDs
+/// GIS 건물은 폴리곤 꼭짓점별 확장, 수동 건물은 geometry별 샘플 포인트 확장
 fn query_buildings_for_coverage_excluding(
     conn: &rusqlite::Connection,
     radar_lat: f64,
@@ -359,36 +393,69 @@ fn query_buildings_for_coverage_excluding(
     let min_lon = radar_lon - range_deg;
     let max_lon = radar_lon + range_deg;
 
-    // GIS buildings (동일 — GIS 건물은 제외 대상 아님)
+    // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height FROM buildings
+        "SELECT centroid_lat, centroid_lon, height, polygon_json FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND height >= 3.0 AND height <= 1000.0"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],
-            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?)),
+            |row| Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            )),
         ) {
             for r in rows.flatten() {
-                result.push(r);
+                let (_clat, _clon, height, polygon_json) = r;
+                let poly_pts: Option<Vec<[f64; 2]>> = polygon_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok());
+                if let Some(pts) = poly_pts {
+                    if pts.len() >= 3 {
+                        for pt in &pts {
+                            result.push((pt[0], pt[1], height));
+                        }
+                    }
+                }
+                // 폴리곤 없는 GIS 건물은 제외
             }
         }
     }
 
-    // Manual buildings — 제외 ID 필터링
+    // Manual buildings — 제외 ID 필터링 + geometry 확장
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, latitude, longitude, height FROM manual_buildings
+        "SELECT id, latitude, longitude, height, geometry_type, geometry_json FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2
            AND longitude BETWEEN ?3 AND ?4"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?, row.get::<_, f64>(3)?)),
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            )),
         ) {
             for r in rows.flatten() {
-                let (id, lat, lon, height) = r;
-                if !exclude_manual_ids.contains(&id) {
+                let (id, lat, lon, height, geo_type, geo_json) = r;
+                if exclude_manual_ids.contains(&id) {
+                    continue;
+                }
+                let sample_pts = crate::building::expand_manual_building_geometry(
+                    lat, lon, geo_type.as_deref(), geo_json.as_deref(),
+                );
+                if sample_pts.len() > 1 {
+                    for (slat, slon) in sample_pts {
+                        result.push((slat, slon, height));
+                    }
+                } else {
                     result.push((lat, lon, height));
                 }
             }

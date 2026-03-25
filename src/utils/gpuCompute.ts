@@ -1,39 +1,47 @@
 /**
  * WebGPU Compute infrastructure — prefer discrete GPU
  * Used for Coverage Phase 2, Loss Detection, and other large parallel computations
- * Falls back to CPU when WebGPU is not available
+ * GPU 필수 — 미지원 시 에러 throw
  */
 
 let _device: GPUDevice | null = null;
-let _initPromise: Promise<GPUDevice | null> | null = null;
+let _initPromise: Promise<GPUDevice> | null = null;
 let _available: boolean | null = null;
+let _lastError: string | null = null;
 
-/** WebGPU device initialization (singleton, prefer discrete GPU) */
-export async function getGPUDevice(): Promise<GPUDevice | null> {
+/** GPU 에러 메시지 (초기화 실패 시) */
+export function getGPUError(): string | null {
+  return _lastError;
+}
+
+/** WebGPU device initialization (singleton, prefer discrete GPU) — 실패 시 throw */
+export async function getGPUDevice(): Promise<GPUDevice> {
+  // 이전에 실패했으면 동일 에러 재발생 (재시도 없음)
+  if (_lastError) throw new Error(_lastError);
   if (_device) return _device;
   if (_initPromise) return _initPromise;
 
   _initPromise = (async () => {
+    if (!navigator.gpu) {
+      _available = false;
+      _lastError = "이 브라우저에서 WebGPU를 지원하지 않습니다. Chromium 기반 브라우저가 필요합니다.";
+      throw new Error(_lastError);
+    }
+
+    const adapter = await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance", // discrete GPU preferred
+    });
+    if (!adapter) {
+      _available = false;
+      _lastError = "GPU 어댑터를 찾을 수 없습니다. 외장/내장 GPU가 설치되어 있는지 확인하세요.";
+      throw new Error(_lastError);
+    }
+
+    // Log adapter info
+    const info = adapter.info;
+    console.log(`[GPU] Adapter: ${info.vendor} ${info.device} (${info.description})`);
+
     try {
-      if (!navigator.gpu) {
-        console.warn("[GPU] WebGPU not available in this browser");
-        _available = false;
-        return null;
-      }
-
-      const adapter = await navigator.gpu.requestAdapter({
-        powerPreference: "high-performance", // discrete GPU preferred
-      });
-      if (!adapter) {
-        console.warn("[GPU] No GPU adapter found");
-        _available = false;
-        return null;
-      }
-
-      // Log adapter info
-      const info = adapter.info;
-      console.log(`[GPU] Adapter: ${info.vendor} ${info.device} (${info.description})`);
-
       _device = await adapter.requestDevice({
         requiredLimits: {
           maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
@@ -41,22 +49,24 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
           maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension,
         },
       });
-
-      _device.lost.then((lostInfo) => {
-        console.warn(`[GPU] Device lost: ${lostInfo.message}`);
-        _device = null;
-        _initPromise = null;
-        _available = null;
-      });
-
-      _available = true;
-      console.log("[GPU] WebGPU device initialized (high-performance)");
-      return _device;
     } catch (err) {
-      console.warn("[GPU] WebGPU init failed:", err);
       _available = false;
-      return null;
+      _lastError = `GPU 디바이스 생성 실패: ${err instanceof Error ? err.message : String(err)}`;
+      throw new Error(_lastError);
     }
+
+    _device.lost.then((lostInfo) => {
+      console.warn(`[GPU] Device lost: ${lostInfo.message}`);
+      // _lastError를 설정하지 않음 — 다음 getGPUDevice() 호출 시 재초기화 시도 허용
+      _device = null;
+      _initPromise = null;
+      _available = null;
+    });
+
+    _available = true;
+    _lastError = null;
+    console.log("[GPU] WebGPU device initialized (high-performance)");
+    return _device;
   })();
 
   return _initPromise;

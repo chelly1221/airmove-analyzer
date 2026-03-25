@@ -16,149 +16,170 @@ interface Props {
   onCancel: () => void;
 }
 
+/** 파라미터 기반 이미지 위치/크기/회전 */
+interface ImageParams {
+  centerLat: number;
+  centerLon: number;
+  halfW: number;   // 반폭 (degrees, lon 방향)
+  halfH: number;   // 반높이 (degrees, lat 방향)
+  rotDeg: number;  // 회전 각도 (degrees, 반시계 방향)
+}
+
 /** [lat, lon] → [lon, lat] for MapLibre */
 function toCoord(ll: [number, number]): [number, number] {
   return [ll[1], ll[0]];
 }
 
-/** Compute initial bounds from map viewport */
-function defaultBoundsFromView(map: maplibregl.Map, aspectRatio: number): PlanImageBounds {
+/** 파라미터 → PlanImageBounds (4 코너) 변환 */
+function paramsToBounds(p: ImageParams): PlanImageBounds {
+  const θ = p.rotDeg * Math.PI / 180;
+  const cos = Math.cos(θ), sin = Math.sin(θ);
+
+  const offsets: [number, number][] = [
+    [-p.halfW, +p.halfH],  // topLeft
+    [+p.halfW, +p.halfH],  // topRight
+    [+p.halfW, -p.halfH],  // bottomRight
+    [-p.halfW, -p.halfH],  // bottomLeft
+  ];
+
+  const corners = offsets.map(([dLon, dLat]) => [
+    p.centerLat + dLon * sin + dLat * cos,
+    p.centerLon + dLon * cos - dLat * sin,
+  ] as [number, number]);
+
+  return {
+    topLeft: corners[0],
+    topRight: corners[1],
+    bottomRight: corners[2],
+    bottomLeft: corners[3],
+  };
+}
+
+/** PlanImageBounds → 파라미터 역추출 */
+function boundsToParams(b: PlanImageBounds): ImageParams {
+  const centerLat = (b.topLeft[0] + b.bottomRight[0]) / 2;
+  const centerLon = (b.topLeft[1] + b.bottomRight[1]) / 2;
+
+  const wDLon = b.topRight[1] - b.topLeft[1];
+  const wDLat = b.topRight[0] - b.topLeft[0];
+  const fullWidth = Math.sqrt(wDLon * wDLon + wDLat * wDLat);
+
+  const hDLon = b.bottomLeft[1] - b.topLeft[1];
+  const hDLat = b.bottomLeft[0] - b.topLeft[0];
+  const fullHeight = Math.sqrt(hDLon * hDLon + hDLat * hDLat);
+
+  const rotRad = Math.atan2(wDLat, wDLon);
+
+  return { centerLat, centerLon, halfW: fullWidth / 2, halfH: fullHeight / 2, rotDeg: rotRad * 180 / Math.PI };
+}
+
+/** 뷰포트 기반 초기 파라미터 */
+function defaultParamsFromView(map: maplibregl.Map, aspectRatio: number): ImageParams {
   const bounds = map.getBounds();
   const center = map.getCenter();
   const lonSpan = (bounds.getEast() - bounds.getWest()) * 0.4;
   const latSpan = lonSpan / aspectRatio;
-  const halfLon = lonSpan / 2;
-  const halfLat = latSpan / 2;
-  return {
-    topLeft: [center.lat + halfLat, center.lng - halfLon],
-    topRight: [center.lat + halfLat, center.lng + halfLon],
-    bottomRight: [center.lat - halfLat, center.lng + halfLon],
-    bottomLeft: [center.lat - halfLat, center.lng - halfLon],
-  };
+  return { centerLat: center.lat, centerLon: center.lng, halfW: lonSpan / 2, halfH: latSpan / 2, rotDeg: 0 };
 }
 
-/** 원본 비율 유지하면서 코너 드래그 시 새 bounds 계산 */
-function resizeKeepingAspect(
-  corner: keyof PlanImageBounds,
-  lat: number,
-  lon: number,
-  prev: PlanImageBounds,
-  aspectRatio: number,
-): PlanImageBounds {
-  // 드래그 코너의 대각 고정점
-  const oppositeMap: Record<keyof PlanImageBounds, keyof PlanImageBounds> = {
-    topLeft: "bottomRight",
-    topRight: "bottomLeft",
-    bottomRight: "topLeft",
-    bottomLeft: "topRight",
-  };
-  const anchor = prev[oppositeMap[corner]];
-  const anchorLat = anchor[0];
-  const anchorLon = anchor[1];
-
-  // 드래그 지점과 고정점 간의 거리
-  let dLat = Math.abs(lat - anchorLat);
-  let dLon = Math.abs(lon - anchorLon);
-
-  // 비율 유지: 더 작은 축을 비율에 맞게 확장
-  const currentRatio = dLon / (dLat || 0.0001);
-  if (currentRatio > aspectRatio) {
-    // 가로가 넓으면 → 세로를 확장
-    dLat = dLon / aspectRatio;
-  } else {
-    // 세로가 넓으면 → 가로를 확장
-    dLon = dLat * aspectRatio;
-  }
-
-  // 최소 크기 제한
-  dLat = Math.max(dLat, 0.0005);
-  dLon = Math.max(dLon, 0.0005);
-
-  // 드래그 방향에 따라 부호 결정
-  const signLat = lat >= anchorLat ? 1 : -1;
-  const signLon = lon >= anchorLon ? 1 : -1;
-
-  const dragLat = anchorLat + signLat * dLat;
-  const dragLon = anchorLon + signLon * dLon;
-
-  // top/bottom, left/right 결정
-  const minLat = Math.min(anchorLat, dragLat);
-  const maxLat = Math.max(anchorLat, dragLat);
-  const minLon = Math.min(anchorLon, dragLon);
-  const maxLon = Math.max(anchorLon, dragLon);
-
-  return {
-    topLeft: [maxLat, minLon],
-    topRight: [maxLat, maxLon],
-    bottomRight: [minLat, maxLon],
-    bottomLeft: [minLat, minLon],
-  };
-}
-
-/** 맵 source 좌표 업데이트 헬퍼 */
+/** 맵 source 좌표 업데이트 */
 function updateSourceCoords(map: maplibregl.Map, sourceId: string, b: PlanImageBounds) {
   try {
     const source = map.getSource(sourceId) as maplibregl.ImageSource | undefined;
     if (source) {
-      source.setCoordinates([
-        toCoord(b.topLeft),
-        toCoord(b.topRight),
-        toCoord(b.bottomRight),
-        toCoord(b.bottomLeft),
-      ]);
+      source.setCoordinates([toCoord(b.topLeft), toCoord(b.topRight), toCoord(b.bottomRight), toCoord(b.bottomLeft)]);
     }
-  } catch {
-    // 맵이 이미 파괴된 경우 무시
-  }
+  } catch { /* 맵 파괴 시 무시 */ }
 }
+
+/** GeoJSON line source 데이터 업데이트 */
+function updateGeoJSONLine(map: maplibregl.Map, sourceId: string, coords: [number, number][]) {
+  try {
+    const src = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
+    if (src) {
+      src.setData({ type: "Feature", geometry: { type: "LineString", coordinates: coords }, properties: {} });
+    }
+  } catch { /* 맵 파괴 시 무시 */ }
+}
+
+/** degrees → 근사 미터 */
+function degToMeters(deg: number, lat: number, isLon: boolean): number {
+  if (isLon) return deg * 111320 * Math.cos(lat * Math.PI / 180);
+  return deg * 111320;
+}
+
+/** 두 점의 중점 */
+function midpoint(a: [number, number], b: [number, number]): [number, number] {
+  return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+}
+
+/** 회전 핸들 위치 (상단 중앙 위) */
+function rotationHandlePos(p: ImageParams, offset: number): [number, number] {
+  const θ = p.rotDeg * Math.PI / 180;
+  return [
+    p.centerLat + (p.halfH + offset) * Math.cos(θ),
+    p.centerLon - (p.halfH + offset) * Math.sin(θ),
+  ];
+}
+
+type EdgeKey = "top" | "right" | "bottom" | "left";
 
 export default function ImagePositioner({ map, groupId, imageDataUrl, initialBounds, opacity = 0.6, onConfirm, onCancel }: Props) {
   const sourceId = `positioning-image-${groupId}`;
   const layerId = `positioning-raster-${groupId}`;
-  const [bounds, setBounds] = useState<PlanImageBounds | null>(null);
-  const boundsRef = useRef<PlanImageBounds | null>(null);
-  const rafRef = useRef<number>(0);
-  // 이미지 종횡비 (width / height, lon방향 / lat방향)
-  const aspectRef = useRef<number>(1);
+  const outlineSrcId = `positioning-outline-${groupId}`;
+  const outlineLayId = `positioning-outline-l-${groupId}`;
+  const rotLineSrcId = `positioning-rotline-${groupId}`;
+  const rotLineLayId = `positioning-rotline-l-${groupId}`;
 
-  // 이미지 로드 → 종횡비 계산 → 초기 bounds 설정
+  const [params, setParams] = useState<ImageParams | null>(null);
+  const paramsRef = useRef<ImageParams | null>(null);
+  const rafRef = useRef<number>(0);
+  const aspectRef = useRef(1); // halfW / halfH 비율
+  const shiftRef = useRef(false);
+  const rotatingRef = useRef(false); // 회전 드래그 중 여부
+
+  // Shift 키 추적 (비율 유지 리사이즈)
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { if (e.key === "Shift") shiftRef.current = true; };
+    const up = (e: KeyboardEvent) => { if (e.key === "Shift") shiftRef.current = false; };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
+  }, []);
+
+  // 이미지 로드 → 종횡비 계산 → 초기 params
   useEffect(() => {
     const img = new Image();
     img.onload = () => {
       const aspect = img.width / img.height;
-      aspectRef.current = aspect;
-      const b = initialBounds && initialBounds.topLeft ? initialBounds : defaultBoundsFromView(map, aspect);
-      setBounds(b);
-      boundsRef.current = b;
+      let p: ImageParams;
+      if (initialBounds && initialBounds.topLeft) {
+        p = boundsToParams(initialBounds);
+      } else {
+        p = defaultParamsFromView(map, aspect);
+      }
+      aspectRef.current = p.halfW / p.halfH;
+      setParams(p);
+      paramsRef.current = p;
     };
     img.src = imageDataUrl;
   }, [imageDataUrl, initialBounds, map]);
 
+  const bounds = params ? paramsToBounds(params) : null;
+
   // MapLibre image source 추가/업데이트
   useEffect(() => {
     if (!bounds) return;
-
     const coords: [[number, number], [number, number], [number, number], [number, number]] = [
-      toCoord(bounds.topLeft),
-      toCoord(bounds.topRight),
-      toCoord(bounds.bottomRight),
-      toCoord(bounds.bottomLeft),
+      toCoord(bounds.topLeft), toCoord(bounds.topRight), toCoord(bounds.bottomRight), toCoord(bounds.bottomLeft),
     ];
-
     try {
       if (map.getSource(sourceId)) {
         (map.getSource(sourceId) as maplibregl.ImageSource).setCoordinates(coords);
-        // opacity 변경 반영
-        if (map.getLayer(layerId)) {
-          map.setPaintProperty(layerId, "raster-opacity", opacity);
-        }
+        if (map.getLayer(layerId)) map.setPaintProperty(layerId, "raster-opacity", opacity);
       } else {
-        map.addSource(sourceId, {
-          type: "image",
-          url: imageDataUrl,
-          coordinates: coords,
-        });
-        // Insert below first symbol layer
+        map.addSource(sourceId, { type: "image", url: imageDataUrl, coordinates: coords });
         let beforeId: string | undefined;
         const style = map.getStyle();
         if (style?.layers) {
@@ -168,82 +189,203 @@ export default function ImagePositioner({ map, groupId, imageDataUrl, initialBou
         }
         map.addLayer({ id: layerId, type: "raster", source: sourceId, paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } }, beforeId);
       }
-    } catch {
-      // 맵이 파괴된 경우 무시
-    }
+    } catch { /* 맵 파괴 */ }
   }, [bounds, map, imageDataUrl, sourceId, layerId, opacity]);
 
-  // Cleanup on unmount — 맵 파괴 여부 안전 체크
+  // 테두리선 + 회전라인 GeoJSON 생성
+  useEffect(() => {
+    if (!params || !bounds) return;
+    const rotOff = Math.max(params.halfH, params.halfW) * 0.2;
+    const topMid = midpoint(bounds.topLeft, bounds.topRight);
+    const rotPos = rotationHandlePos(params, rotOff);
+
+    const outlineCoords = [
+      toCoord(bounds.topLeft), toCoord(bounds.topRight),
+      toCoord(bounds.bottomRight), toCoord(bounds.bottomLeft), toCoord(bounds.topLeft),
+    ];
+    const rotLineCoords = [toCoord(topMid), toCoord(rotPos)];
+
+    const createOrUpdate = (sid: string, lid: string, coords: [number, number][], paint: Record<string, unknown>) => {
+      try {
+        if (map.getSource(sid)) {
+          updateGeoJSONLine(map, sid, coords);
+        } else {
+          const data = { type: "Feature" as const, geometry: { type: "LineString" as const, coordinates: coords }, properties: {} };
+          map.addSource(sid, { type: "geojson", data: data as never });
+          map.addLayer({ id: lid, type: "line", source: sid, paint } as never);
+        }
+      } catch { /* 맵 파괴 */ }
+    };
+
+    createOrUpdate(outlineSrcId, outlineLayId, outlineCoords, {
+      "line-color": "#3b82f6", "line-width": 1.5, "line-dasharray": [4, 3],
+    });
+    createOrUpdate(rotLineSrcId, rotLineLayId, rotLineCoords, {
+      "line-color": "#22c55e", "line-width": 1.5,
+    });
+  }, [params, bounds, map, outlineSrcId, outlineLayId, rotLineSrcId, rotLineLayId]);
+
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       cancelAnimationFrame(rafRef.current);
+      rotatingRef.current = false;
+      map.dragPan.enable();
       try {
-        if (map.getLayer(layerId)) map.removeLayer(layerId);
-        if (map.getSource(sourceId)) map.removeSource(sourceId);
-      } catch {
-        // 맵이 이미 파괴된 경우 무시 (모달 닫기 시 MapGL 먼저 언마운트)
-      }
+        for (const lid of [layerId, outlineLayId, rotLineLayId]) {
+          if (map.getLayer(lid)) map.removeLayer(lid);
+        }
+        for (const sid of [sourceId, outlineSrcId, rotLineSrcId]) {
+          if (map.getSource(sid)) map.removeSource(sid);
+        }
+      } catch { /* 맵 파괴 */ }
     };
-  }, [map, sourceId, layerId]);
+  }, [map, sourceId, layerId, outlineSrcId, outlineLayId, rotLineSrcId, rotLineLayId]);
 
-  /** 코너 드래그 — 원본 비율 유지 리사이즈 */
-  const handleCornerDrag = useCallback((corner: keyof PlanImageBounds, lat: number, lon: number) => {
-    setBounds((prev) => {
-      if (!prev) return prev;
-      const next = resizeKeepingAspect(corner, lat, lon, prev, aspectRef.current);
-      boundsRef.current = next;
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = requestAnimationFrame(() => {
-        if (boundsRef.current) updateSourceCoords(map, sourceId, boundsRef.current);
-      });
-      return next;
-    });
-  }, [map, sourceId]);
-
-  /** Center marker drag — moves all 4 corners */
-  const handleCenterDragStart = useCallback(() => {
-    // 드래그 시작 시 현재 중심 기록 (boundsRef 직접 참조)
-  }, []);
-
-  const handleCenterDrag = useCallback((e: { lngLat: { lat: number; lng: number } }) => {
-    if (!boundsRef.current) return;
-    const b = boundsRef.current;
-    const prevCLat = (b.topLeft[0] + b.bottomRight[0]) / 2;
-    const prevCLon = (b.topLeft[1] + b.bottomRight[1]) / 2;
-    const dLat = e.lngLat.lat - prevCLat;
-    const dLon = e.lngLat.lng - prevCLon;
-    const next: PlanImageBounds = {
-      topLeft: [b.topLeft[0] + dLat, b.topLeft[1] + dLon],
-      topRight: [b.topRight[0] + dLat, b.topRight[1] + dLon],
-      bottomRight: [b.bottomRight[0] + dLat, b.bottomRight[1] + dLon],
-      bottomLeft: [b.bottomLeft[0] + dLat, b.bottomLeft[1] + dLon],
-    };
-    boundsRef.current = next;
-    setBounds(next);
+  /** 파라미터 적용 + 모든 source 업데이트 (RAF) */
+  const applyParams = useCallback((p: ImageParams) => {
+    paramsRef.current = p;
+    setParams(p);
     cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(() => {
-      if (boundsRef.current) updateSourceCoords(map, sourceId, boundsRef.current);
+      const cur = paramsRef.current;
+      if (!cur) return;
+      const b = paramsToBounds(cur);
+      updateSourceCoords(map, sourceId, b);
+
+      const rotOff = Math.max(cur.halfH, cur.halfW) * 0.2;
+      const topMid = midpoint(b.topLeft, b.topRight);
+      const rotHandle = rotationHandlePos(cur, rotOff);
+      updateGeoJSONLine(map, outlineSrcId, [
+        toCoord(b.topLeft), toCoord(b.topRight), toCoord(b.bottomRight), toCoord(b.bottomLeft), toCoord(b.topLeft),
+      ]);
+      updateGeoJSONLine(map, rotLineSrcId, [toCoord(topMid), toCoord(rotHandle)]);
     });
-  }, [map, sourceId]);
+  }, [map, sourceId, outlineSrcId, rotLineSrcId]);
 
-  if (!bounds) return null;
+  /** 코너 드래그 — 비율 유지 리사이즈 */
+  const handleCornerDrag = useCallback((_corner: string, lat: number, lon: number) => {
+    const p = paramsRef.current;
+    if (!p) return;
+    const θ = p.rotDeg * Math.PI / 180;
+    const cos = Math.cos(θ), sin = Math.sin(θ);
+    const dLon = lon - p.centerLon, dLat = lat - p.centerLat;
+    const projW = Math.abs(dLon * cos + dLat * sin);
+    const projH = Math.abs(-dLon * sin + dLat * cos);
 
-  const center: [number, number] = [
-    (bounds.topLeft[0] + bounds.bottomRight[0]) / 2,
-    (bounds.topLeft[1] + bounds.bottomRight[1]) / 2,
-  ];
+    // 항상 비율 유지: 더 큰 변화량 기준
+    const ar = aspectRef.current;
+    const scale = Math.max(projW / ar, projH, 0.0005);
+    applyParams({ ...p, halfW: scale * ar, halfH: scale });
+  }, [applyParams]);
 
-  const corners: { key: keyof PlanImageBounds; pos: [number, number] }[] = [
+  /** 변 중점 드래그 — 반대편 고정, 해당 변만 이동 */
+  const handleEdgeDrag = useCallback((edge: EdgeKey, lat: number, lon: number) => {
+    const p = paramsRef.current;
+    if (!p) return;
+    const θ = p.rotDeg * Math.PI / 180;
+    const cosθ = Math.cos(θ), sinθ = Math.sin(θ);
+    // 축 방향 (lat, lon): height=상단 방향, width=우측 방향
+    const hLat = cosθ, hLon = -sinθ;
+    const wLat = sinθ, wLon = cosθ;
+    const minDim = 0.0005;
+
+    if (edge === "top" || edge === "bottom") {
+      const sign = edge === "top" ? 1 : -1;
+      // 앵커 = 반대편 변 중점
+      const ancLat = p.centerLat - sign * p.halfH * hLat;
+      const ancLon = p.centerLon - sign * p.halfH * hLon;
+      // 드래그 위치를 높이축에 투영
+      const proj = sign * ((lat - ancLat) * hLat + (lon - ancLon) * hLon);
+      const fullH = Math.max(proj, minDim);
+      const newHalfH = fullH / 2;
+      applyParams({
+        ...p, halfH: newHalfH,
+        centerLat: ancLat + sign * newHalfH * hLat,
+        centerLon: ancLon + sign * newHalfH * hLon,
+      });
+    } else {
+      const sign = edge === "right" ? 1 : -1;
+      const ancLat = p.centerLat - sign * p.halfW * wLat;
+      const ancLon = p.centerLon - sign * p.halfW * wLon;
+      const proj = sign * ((lat - ancLat) * wLat + (lon - ancLon) * wLon);
+      const fullW = Math.max(proj, minDim);
+      const newHalfW = fullW / 2;
+      applyParams({
+        ...p, halfW: newHalfW,
+        centerLat: ancLat + sign * newHalfW * wLat,
+        centerLon: ancLon + sign * newHalfW * wLon,
+      });
+    }
+  }, [applyParams]);
+
+  /** 회전: 맵 mousemove로 각도 계산 (핸들은 고정 위치 유지) */
+  const onRotationMove = useCallback((e: maplibregl.MapMouseEvent) => {
+    if (!rotatingRef.current) return;
+    const p = paramsRef.current;
+    if (!p) return;
+    const { lat, lng } = e.lngLat;
+    const dLat = lat - p.centerLat;
+    const dLon = lng - p.centerLon;
+    let newRot = Math.atan2(-dLon, dLat) * 180 / Math.PI;
+    if (shiftRef.current) newRot = Math.round(newRot / 15) * 15;
+    applyParams({ ...p, rotDeg: newRot });
+  }, [applyParams]);
+
+  const onRotationUp = useCallback(() => {
+    rotatingRef.current = false;
+    map.getCanvas().style.cursor = "";
+    map.off("mousemove", onRotationMove);
+    map.off("mouseup", onRotationUp);
+    map.dragPan.enable();
+  }, [map, onRotationMove]);
+
+  const startRotation = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    rotatingRef.current = true;
+    map.getCanvas().style.cursor = "grabbing";
+    map.dragPan.disable();
+    map.on("mousemove", onRotationMove);
+    map.on("mouseup", onRotationUp);
+  }, [map, onRotationMove, onRotationUp]);
+
+  /** 중앙 마커 드래그 — 전체 이동 */
+  const handleCenterDrag = useCallback((e: { lngLat: { lat: number; lng: number } }) => {
+    const p = paramsRef.current;
+    if (!p) return;
+    applyParams({ ...p, centerLat: e.lngLat.lat, centerLon: e.lngLat.lng });
+  }, [applyParams]);
+
+  if (!params || !bounds) return null;
+
+  // 핸들 위치 계산
+  const cornerHandles: { key: string; pos: [number, number] }[] = [
     { key: "topLeft", pos: bounds.topLeft },
     { key: "topRight", pos: bounds.topRight },
     { key: "bottomRight", pos: bounds.bottomRight },
     { key: "bottomLeft", pos: bounds.bottomLeft },
   ];
 
+  const edgeHandles: { key: EdgeKey; pos: [number, number] }[] = [
+    { key: "top", pos: midpoint(bounds.topLeft, bounds.topRight) },
+    { key: "right", pos: midpoint(bounds.topRight, bounds.bottomRight) },
+    { key: "bottom", pos: midpoint(bounds.bottomRight, bounds.bottomLeft) },
+    { key: "left", pos: midpoint(bounds.bottomLeft, bounds.topLeft) },
+  ];
+
+  const rotOff = Math.max(params.halfH, params.halfW) * 0.2;
+  const rotPos = rotationHandlePos(params, rotOff);
+
+  // 크기 표시용
+  const widthM = Math.round(degToMeters(params.halfW * 2, params.centerLat, true));
+  const heightM = Math.round(degToMeters(params.halfH * 2, params.centerLat, false));
+  const rotDisplay = Math.round(params.rotDeg * 10) / 10;
+
   return (
     <>
-      {/* 코너 마커 (비율 유지 리사이즈) */}
-      {corners.map(({ key, pos }) => (
+      {/* 코너 핸들 (4개) — 자유 리사이즈 */}
+      {cornerHandles.map(({ key, pos }) => (
         <Marker
           key={key}
           latitude={pos[0]}
@@ -252,33 +394,65 @@ export default function ImagePositioner({ map, groupId, imageDataUrl, initialBou
           onDrag={(e) => handleCornerDrag(key, e.lngLat.lat, e.lngLat.lng)}
           anchor="center"
         >
-          <div className="h-4 w-4 rounded-full border-2 border-white bg-red-500 shadow cursor-nwse-resize" />
+          <div className="h-[10px] w-[10px] border-[2px] border-blue-500 bg-white shadow-sm cursor-nwse-resize" />
         </Marker>
       ))}
 
-      {/* 중앙 마커 (전체 이동) */}
+      {/* 변 중점 핸들 (4개) — 단축 리사이즈 */}
+      {edgeHandles.map(({ key, pos }) => (
+        <Marker
+          key={key}
+          latitude={pos[0]}
+          longitude={pos[1]}
+          draggable
+          onDrag={(e) => handleEdgeDrag(key, e.lngLat.lat, e.lngLat.lng)}
+          anchor="center"
+        >
+          <div className={`h-[8px] w-[8px] border-[2px] border-blue-500 bg-white shadow-sm ${
+            key === "top" || key === "bottom" ? "cursor-ns-resize" : "cursor-ew-resize"
+          }`} />
+        </Marker>
+      ))}
+
+      {/* 회전 핸들 — 상단 녹색 원 (고정 위치, mousedown으로 회전) */}
       <Marker
-        latitude={center[0]}
-        longitude={center[1]}
+        latitude={rotPos[0]}
+        longitude={rotPos[1]}
+        anchor="center"
+      >
+        <div
+          onMouseDown={startRotation}
+          className="h-[12px] w-[12px] rounded-full border-[2px] border-green-500 bg-white shadow-sm cursor-grab active:cursor-grabbing"
+        />
+      </Marker>
+
+      {/* 중앙 이동 핸들 */}
+      <Marker
+        latitude={params.centerLat}
+        longitude={params.centerLon}
         draggable
-        onDragStart={handleCenterDragStart}
         onDrag={handleCenterDrag}
         anchor="center"
       >
-        <div className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white bg-blue-500 shadow cursor-move">
-          <Move size={14} className="text-white" />
+        <div className="flex h-6 w-6 items-center justify-center rounded-full border-[2px] border-blue-500/50 bg-white/80 shadow-sm cursor-move">
+          <Move size={12} className="text-blue-500" />
         </div>
       </Marker>
 
-      {/* 확인/취소 툴바 */}
-      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 rounded-lg bg-white px-3 py-2 shadow-lg border border-gray-200">
-        <span className="text-xs text-gray-600 mr-2">코너를 드래그하여 크기 조정, 중앙을 드래그하여 이동</span>
+      {/* 최소 툴바 — 크기/각도 + 확인/취소 */}
+      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-lg bg-white px-3 py-2 shadow-lg border border-gray-200">
+        <span className="text-[11px] text-gray-500 tabular-nums">
+          {widthM} × {heightM} m
+          {rotDisplay !== 0 && <span className="ml-1.5 text-green-600">{rotDisplay}°</span>}
+        </span>
+        <span className="text-gray-200">|</span>
+        <span className="text-[10px] text-gray-400">Shift: 15° 스냅</span>
         <button
           onClick={() => bounds && onConfirm(bounds)}
           className="flex items-center gap-1 rounded bg-[#a60739] px-3 py-1 text-xs text-white hover:bg-[#8a062f]"
         >
           <Check size={12} />
-          위치 확정
+          확정
         </button>
         <button
           onClick={onCancel}

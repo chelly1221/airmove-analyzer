@@ -91,7 +91,7 @@ export default function ReportFlightComparisonSection({ sectionNum, flights, rad
                 <td className="border border-gray-200 px-1.5 py-1 text-center text-[9px]">
                   {format(new Date(f.start_time * 1000), "MM-dd HH:mm")}~{format(new Date(f.end_time * 1000), "HH:mm")}
                 </td>
-                <td className="border border-gray-200 px-1.5 py-1 text-right">{f.track_points.length.toLocaleString()}</td>
+                <td className="border border-gray-200 px-1.5 py-1 text-right">{f.point_count.toLocaleString()}</td>
                 <td className="border border-gray-200 px-1.5 py-1 text-right">{(f.total_track_time / 60).toFixed(1)}</td>
                 <td className="border border-gray-200 px-1.5 py-1 text-right">{f.loss_points.length}</td>
                 <td className="border border-gray-200 px-1.5 py-1 text-right">{f.total_loss_time.toFixed(1)}</td>

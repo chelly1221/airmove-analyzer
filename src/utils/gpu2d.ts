@@ -253,6 +253,9 @@ export class GPU2D {
     gl.bindVertexArray(null);
   }
 
+  /** 바인딩된 캔버스 엘리먼트 */
+  get canvas(): HTMLCanvasElement { return this.gl.canvas as HTMLCanvasElement; }
+
   /** 가상 해상도 설정 (SVG viewBox 또는 CSS 픽셀 크기) */
   setResolution(w: number, h: number) { this.vw = w; this.vh = h; }
 

@@ -20,23 +20,25 @@ export default function Modal({
   const dialogRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
 
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
+    if (!open) return;
     const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
-    if (open) {
-      document.addEventListener("keydown", handleEsc);
-      dialogRef.current?.focus();
-    }
+    document.addEventListener("keydown", handleEsc);
+    dialogRef.current?.focus();
     return () => document.removeEventListener("keydown", handleEsc);
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
   return (
     <div
       ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm"
       onClick={(e) => {
         if (e.target === overlayRef.current) onClose();
       }}

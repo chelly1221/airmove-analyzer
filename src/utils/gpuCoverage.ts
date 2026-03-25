@@ -104,7 +104,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = params.num_samples;
   let max_range = params.max_range_km;
 
-  // 이진 탐색: max_angles에서 LOS 차단점
+  // 이진 탐색: max_angles에서 LoS 차단점
   var los_block: u32 = n;
   var lo: u32 = 1u;
   var hi: u32 = n - 1u;
@@ -114,9 +114,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let curv_drop = dist * dist / (2.0 * R_EARTH_M);
     let adj_alt = alt_m - curv_drop;
     let target_angle = (adj_alt - params.radar_height_m) / dist;
-    if (max_angles[base + mid - 1u] > target_angle) {
+    if (max_angles[base + mid] > target_angle) {
       los_block = mid;
-      if (mid == 0u) { break; }
       hi = mid - 1u;
     } else {
       lo = mid + 1u;
@@ -141,7 +140,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// ─── destination_point (OM 보고서용 동기 폴백) ───────
+// ─── destination_point (OM 보고서용 동기 레이어 생성) ───────
 
 function destinationPoint(
   latDeg: number, lonDeg: number, bearingDeg: number, distKm: number,
@@ -458,7 +457,7 @@ interface GPUCoverageCache {
 
 let _cache: GPUCoverageCache | null = null;
 
-/** 캐시에서 CoverageLayer[] 생성 (OM 보고서용 동기 폴백) */
+/** 캐시에서 CoverageLayer[] 생성 (OM 보고서용 동기 레이어 생성) */
 function buildLayers(
   cache: GPUCoverageCache,
   altFts: number[],
@@ -618,7 +617,6 @@ export async function computeMainCoverage(
 
   // GPU 계산
   const device = await getGPUDevice();
-  if (!device) throw new Error("WebGPU를 사용할 수 없습니다. GPU가 필요합니다.");
 
   onProgress?.(2, "GPU 커버리지 계산 준비...");
 
@@ -681,7 +679,7 @@ export async function computeMainCoverage(
 }
 
 /**
- * 캐시에서 특정 고도 레이어 추출 (슬라이더용, 동기 폴백)
+ * 캐시에서 특정 고도 레이어 추출 (슬라이더용, 동기)
  * Worker가 준비되지 않았을 때만 사용
  */
 export function computeLayersForAltitudes(
@@ -783,7 +781,6 @@ export async function computeCoverageLayersOM(
   onProgress?: (msg: string) => void,
 ): Promise<{ layersWith: CoverageLayer[]; layersWithout: CoverageLayer[] }> {
   const device = await getGPUDevice();
-  if (!device) throw new Error("WebGPU를 사용할 수 없습니다. GPU가 필요합니다.");
 
   const totalRays = Math.floor(360 / params.bearingStepDeg);
   console.log(`[Coverage] GPU 모드, ${params.bearingStepDeg}° (${totalRays} rays)`);

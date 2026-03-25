@@ -1,17 +1,17 @@
-import type { LOSProfileData } from "../../types";
+import type { LoSProfileData } from "../../types";
 
-interface LOSSectionProps {
+interface LoSSectionProps {
   sectionNum: number;
-  losResults: LOSProfileData[];
+  losResults: LoSProfileData[];
 }
 
-export default function ReportLOSSection({ sectionNum, losResults }: LOSSectionProps) {
+export default function ReportLoSSection({ sectionNum, losResults }: LoSSectionProps) {
   if (losResults.length === 0) return null;
 
   return (
     <div className="mb-8">
       <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. LOS 분석 결과
+        {sectionNum}. LoS 분석 결과
       </h2>
 
       <table className="w-full border-collapse text-[14px]">

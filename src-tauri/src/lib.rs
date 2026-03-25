@@ -3,20 +3,25 @@ pub mod building;
 pub mod coord;
 pub mod db;
 pub mod declination;
+pub mod fac_building;
 pub mod geo;
+pub mod landuse;
 pub mod models;
 pub mod parser;
+pub mod peak;
 pub mod srtm;
+pub mod vworld;
 
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use log::info;
+use rusqlite::params;
 
 use tauri::{Emitter, Manager};
 
-use models::{AdsbTrack, Aircraft, AnalysisResult, FlightRecord, ParsedFile, TrackPoint};
+use models::{Aircraft, AnalysisResult, ParsedFile, TrackPoint};
 
 /// TrackPoint 청크 스트리밍 이벤트 페이로드
 #[derive(Clone, serde::Serialize)]
@@ -44,104 +49,11 @@ fn emit_and_drain_track_points(
     points.shrink_to_fit();
 }
 
-/// OAuth2 토큰 캐시
-struct OAuthToken {
-    access_token: String,
-    expires_at: std::time::Instant,
-}
-
 /// Application state for managing aircraft data.
 struct AppState {
     app_data_dir: Mutex<PathBuf>,
     db: Mutex<db::Db>,
-    oauth_token: Mutex<Option<OAuthToken>>,
     srtm: Mutex<srtm::SrtmReader>,
-}
-
-/// OAuth2 토큰 응답
-#[derive(serde::Deserialize)]
-struct OAuthTokenResponse {
-    access_token: String,
-    expires_in: u64,
-}
-
-/// OpenSky OAuth2 토큰 발급/갱신
-async fn get_opensky_token(
-    client: &reqwest::Client,
-    client_id: &str,
-    client_secret: &str,
-) -> Result<(String, u64), String> {
-    let resp = client
-        .post("https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token")
-        .form(&[
-            ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("OAuth2 token request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("OAuth2 token error: HTTP {}", resp.status()));
-    }
-
-    let token_resp: OAuthTokenResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("OAuth2 token parse error: {}", e))?;
-
-    Ok((token_resp.access_token, token_resp.expires_in))
-}
-
-/// 캐싱된 토큰 반환 (만료 시 자동 갱신, 여유 60초)
-async fn ensure_opensky_token(
-    app_handle: &tauri::AppHandle,
-    client: &reqwest::Client,
-) -> Result<Option<String>, String> {
-    let (client_id, client_secret) = {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-        let id = db::get_setting(&conn, "opensky_client_id")
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let secret = db::get_setting(&conn, "opensky_client_secret")
-            .unwrap_or(None)
-            .unwrap_or_default();
-        (id, secret)
-    };
-
-    if client_id.is_empty() || client_secret.is_empty() {
-        return Ok(None);
-    }
-
-    // 캐시된 토큰 확인
-    {
-        let state = app_handle.state::<AppState>();
-        let cache = state.oauth_token.lock().map_err(|e| format!("Token lock: {}", e))?;
-        if let Some(ref token) = *cache {
-            if token.expires_at > std::time::Instant::now() + std::time::Duration::from_secs(60) {
-                return Ok(Some(token.access_token.clone()));
-            }
-        }
-    }
-
-    // 새 토큰 발급
-    info!("Requesting new OpenSky OAuth2 token...");
-    let (access_token, expires_in) = get_opensky_token(client, &client_id, &client_secret).await?;
-
-    // 캐시 저장
-    {
-        let state = app_handle.state::<AppState>();
-        let mut cache = state.oauth_token.lock().map_err(|e| format!("Token lock: {}", e))?;
-        *cache = Some(OAuthToken {
-            access_token: access_token.clone(),
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(expires_in),
-        });
-    }
-
-    info!("OAuth2 token acquired (expires in {}s)", expires_in);
-    Ok(Some(access_token))
 }
 
 /// 앱 데이터 디렉토리 경로 확보
@@ -164,12 +76,15 @@ fn get_app_data_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// Parse an ASS binary file and return structured track data.
 #[tauri::command]
-async fn parse_ass_file(path: String, radar_lat: f64, radar_lon: f64, mode_s_filter: Vec<String>, app_handle: tauri::AppHandle) -> Result<ParsedFile, String> {
-    info!("Command: parse_ass_file({}, radar={},{}, filter={:?})", path, radar_lat, radar_lon, mode_s_filter);
+async fn parse_ass_file(path: String, radar_lat: f64, radar_lon: f64, mode_s_filter: Vec<String>, mode3a_filter: Vec<u16>, filter_logic: Option<String>, mode_s_exclude: Option<bool>, mode3a_exclude: Option<bool>, app_handle: tauri::AppHandle) -> Result<ParsedFile, String> {
+    info!("Command: parse_ass_file({}, radar={},{}, filter={:?}, squawk={:?}, logic={:?})", path, radar_lat, radar_lon, mode_s_filter, mode3a_filter, filter_logic);
+    let logic = filter_logic.unwrap_or_else(|| "and".to_string());
+    let ms_exclude = mode_s_exclude.unwrap_or(false);
+    let m3a_exclude = mode3a_exclude.unwrap_or(false);
     // 편각 조회 (파일 날짜 + 레이더 좌표)
     let mag_dec = resolve_declination(&app_handle, &path, radar_lat, radar_lon).await;
     tauri::async_runtime::spawn_blocking(move || {
-        parser::ass::parse_ass_file(&path, radar_lat, radar_lon, &mode_s_filter, mag_dec, |_| {}).map_err(|e| e.to_string())
+        parser::ass::parse_ass_file(&path, radar_lat, radar_lon, &mode_s_filter, &mode3a_filter, mag_dec, &logic, ms_exclude, m3a_exclude, |_| {}).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -217,7 +132,7 @@ fn delete_aircraft(id: String, state: tauri::State<'_, AppState>) -> Result<(), 
     Ok(())
 }
 
-/// Parse an ASS file and immediately analyze it (결과를 DB에 자동 저장).
+/// Parse an ASS file and immediately analyze it.
 #[tauri::command]
 async fn parse_and_analyze(
     app_handle: tauri::AppHandle,
@@ -225,24 +140,21 @@ async fn parse_and_analyze(
     radar_lat: f64,
     radar_lon: f64,
     mode_s_filter: Vec<String>,
+    mode3a_filter: Vec<u16>,
+    filter_logic: Option<String>,
+    mode_s_exclude: Option<bool>,
+    mode3a_exclude: Option<bool>,
 ) -> Result<AnalysisResult, String> {
-    info!("Command: parse_and_analyze({}, radar={},{}, filter={:?})", file_path, radar_lat, radar_lon, mode_s_filter);
+    info!("Command: parse_and_analyze({}, radar={},{}, filter={:?}, squawk={:?}, logic={:?})", file_path, radar_lat, radar_lon, mode_s_filter, mode3a_filter, filter_logic);
+    let logic = filter_logic.unwrap_or_else(|| "and".to_string());
+    let ms_exclude = mode_s_exclude.unwrap_or(false);
+    let m3a_exclude = mode3a_exclude.unwrap_or(false);
     let mag_dec = resolve_declination(&app_handle, &file_path, radar_lat, radar_lon).await;
-    let handle = app_handle.clone();
     let fp = file_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_filter, mag_dec, |_| {})
+        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_filter, &mode3a_filter, mag_dec, &logic, ms_exclude, m3a_exclude, |_| {})
             .map_err(|e| e.to_string())?;
         let analysis = analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS);
-
-        // DB에 자동 저장
-        let state = handle.state::<AppState>();
-        if let Ok(conn) = state.db.lock() {
-            let name = fp.split(['/', '\\']).last().unwrap_or(&fp).to_string();
-            if let Err(e) = db::save_parsed_file_data(&conn, &fp, &name, &analysis) {
-                log::warn!("Failed to save parsed data to DB: {}", e);
-            }
-        }
 
         Ok(analysis)
     })
@@ -291,13 +203,19 @@ async fn parse_and_analyze_batch(
     radar_lat: f64,
     radar_lon: f64,
     mode_s_filter: Vec<String>,
+    mode3a_filter: Vec<u16>,
+    filter_logic: Option<String>,
+    mode_s_exclude: Option<bool>,
+    mode3a_exclude: Option<bool>,
 ) -> Result<(), String> {
     info!(
-        "Command: parse_and_analyze_batch({} files, radar={},{}, filter={:?})",
+        "Command: parse_and_analyze_batch({} files, radar={},{}, filter={:?}, squawk={:?}, logic={:?})",
         file_paths.len(),
         radar_lat,
         radar_lon,
-        mode_s_filter
+        mode_s_filter,
+        mode3a_filter,
+        filter_logic,
     );
 
     // 배치 전체에 대해 편각 1회 조회 (첫 번째 파일 날짜 기준, 배치 내 날짜 차이는 무시 가능)
@@ -309,6 +227,9 @@ async fn parse_and_analyze_batch(
 
     let handle = app_handle.clone();
     let total = file_paths.len();
+    let logic = filter_logic.unwrap_or_else(|| "and".to_string());
+    let ms_exclude = mode_s_exclude.unwrap_or(false);
+    let m3a_exclude = mode3a_exclude.unwrap_or(false);
 
     tauri::async_runtime::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<(String, Result<AnalysisResult, String>)>();
@@ -316,12 +237,15 @@ async fn parse_and_analyze_batch(
         // 병렬 파싱 스레드: 완료 즉시 채널로 전송 (메모리 일괄 보유 방지)
         let filter = mode_s_filter;
         let filter_ref = &filter;
+        let m3a_filter = mode3a_filter;
+        let m3a_filter_ref = &m3a_filter;
+        let logic_ref = &logic;
         rayon::scope(|s| {
             let tx = &tx;
             for path in &file_paths {
                 let path = path.clone();
                 s.spawn(move |_| {
-                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, filter_ref, mag_dec, |_| {})
+                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, filter_ref, m3a_filter_ref, mag_dec, logic_ref, ms_exclude, m3a_exclude, |_| {})
                         .map_err(|e| e.to_string())
                         .map(|parsed| {
                             analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)
@@ -341,21 +265,6 @@ async fn parse_and_analyze_batch(
             let event = match result {
                 Ok(mut analysis) => {
                     succeeded += 1;
-                    // DB에 자동 저장 (메모리 해제 전)
-                    let state = handle.state::<AppState>();
-                    if let Ok(conn) = state.db.lock() {
-                        let name = path.split(['/', '\\']).last().unwrap_or(&path).to_string();
-                        if let Err(e) = db::save_parsed_file_data(&conn, &path, &name, &analysis) {
-                            log::warn!("Failed to save parsed data to DB: {}", e);
-                            analysis.file_info.parse_errors.push(
-                                format!("DB 저장 실패: {}", e)
-                            );
-                        }
-                    } else {
-                        analysis.file_info.parse_errors.push(
-                            "DB 잠금 획득 실패: 파싱 데이터가 저장되지 않았습니다".to_string()
-                        );
-                    }
                     // 메타정보만 추출 (clone 없이, track_points 제외)
                     let file_info = BatchFileInfo {
                         filename: analysis.file_info.filename.clone(),
@@ -447,9 +356,15 @@ async fn webview_print_to_pdf(
     {
         use std::sync::mpsc;
 
-        let window = app_handle
-            .get_webview_window("main")
-            .ok_or("메인 윈도우를 찾을 수 없습니다")?;
+        // 호출한 창의 WebView에서 PDF 생성 (멀티윈도우 대응)
+        let window = {
+            let windows = app_handle.webview_windows();
+            // 호출 창을 찾기: trackmap 우선, 없으면 main
+            windows.get("trackmap")
+                .or_else(|| windows.get("main"))
+                .cloned()
+                .ok_or("윈도우를 찾을 수 없습니다")?
+        };
 
         let (tx, rx) = mpsc::channel::<Result<String, String>>();
 
@@ -536,422 +451,6 @@ async fn webview_print_to_pdf(
     }
 }
 
-/// OpenSky Network API로 ADS-B 항적 조회
-#[derive(serde::Deserialize)]
-struct AdsbQuery {
-    icao24: String,
-    time: i64,
-}
-
-#[tauri::command]
-async fn fetch_adsb_tracks(
-    app_handle: tauri::AppHandle,
-    queries: Vec<AdsbQuery>,
-) -> Result<Vec<AdsbTrack>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("AirMoveAnalyzer/0.1")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    // OAuth2 토큰 발급 (인증정보 필수 — 익명 접근 차단됨)
-    let token = ensure_opensky_token(&app_handle, &client).await?;
-    if token.is_none() {
-        return Err("OpenSky 인증정보가 설정되지 않았습니다. 설정에서 Client ID/Secret을 입력하세요.".to_string());
-    }
-    let has_auth = true;
-
-    let mut tracks = Vec::new();
-    let total = queries.len();
-
-    for (i, query) in queries.iter().enumerate() {
-        let icao_lower = query.icao24.to_lowercase();
-        let url = format!(
-            "https://opensky-network.org/api/tracks/all?icao24={}&time={}",
-            icao_lower, query.time
-        );
-        info!("Fetching ADS-B track ({}/{}): {}", i + 1, total, url);
-
-        // 진행 상황 이벤트
-        let _ = app_handle.emit("adsb-progress", serde_json::json!({
-            "current": i + 1,
-            "total": total,
-            "icao24": &query.icao24,
-        }));
-
-        let mut retries = 0u32;
-        loop {
-            let mut req = client.get(&url);
-            if let Some(ref t) = token {
-                req = req.bearer_auth(t);
-            }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        if let Some(path_arr) = json.get("path").and_then(|p| p.as_array()) {
-                            let points: Vec<models::AdsbPoint> = path_arr
-                                .iter()
-                                .filter_map(|entry| {
-                                    let arr = entry.as_array()?;
-                                    Some(models::AdsbPoint {
-                                        time: arr.get(0)?.as_f64()?,
-                                        latitude: arr.get(1)?.as_f64()?,
-                                        longitude: arr.get(2)?.as_f64()?,
-                                        altitude: arr.get(3)?.as_f64().unwrap_or(0.0),
-                                        heading: arr.get(4)?.as_f64().unwrap_or(0.0),
-                                        on_ground: arr.get(5)?.as_bool().unwrap_or(false),
-                                    })
-                                })
-                                .collect();
-
-                            if !points.is_empty() {
-                                let track = AdsbTrack {
-                                    icao24: query.icao24.clone(),
-                                    callsign: json
-                                        .get("callsign")
-                                        .and_then(|c| c.as_str())
-                                        .map(|s| s.trim().to_string()),
-                                    start_time: json
-                                        .get("startTime")
-                                        .and_then(|t| t.as_f64())
-                                        .unwrap_or(0.0),
-                                    end_time: json
-                                        .get("endTime")
-                                        .and_then(|t| t.as_f64())
-                                        .unwrap_or(0.0),
-                                    path: points,
-                                };
-                                // DB 저장 (건별 즉시 영속화)
-                                let state = app_handle.state::<AppState>();
-                                if let Ok(conn) = state.db.lock() {
-                                    let _ = db::save_adsb_track(&conn, &track);
-                                }
-                                drop(state);
-                                tracks.push(track);
-                            }
-                        }
-                    }
-                    break;
-                }
-                Ok(resp) if resp.status().as_u16() == 429 && retries < 3 => {
-                    // X-Rate-Limit-Retry-After-Seconds 헤더 활용
-                    let retry_after = resp.headers()
-                        .get("X-Rate-Limit-Retry-After-Seconds")
-                        .or_else(|| resp.headers().get("x-rate-limit-retry-after-seconds"))
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
-                    retries += 1;
-                    let wait = retry_after.unwrap_or(10 * retries as u64);
-                    info!("Rate limited, retry {}/3 after {}s (header: {:?})", retries, wait, retry_after);
-                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                    continue;
-                }
-                Ok(resp) => {
-                    info!("ADS-B API returned {}: {}", resp.status(), query.icao24);
-                    break;
-                }
-                Err(e) => {
-                    log::warn!("Failed to fetch ADS-B for {}: {}", query.icao24, e);
-                    break;
-                }
-            }
-        }
-
-        // OpenSky rate limit 준수 (인증시 1초, 익명 10초)
-        if i + 1 < total {
-            let delay = if has_auth { 1 } else { 10 };
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-        }
-    }
-
-    Ok(tracks)
-}
-
-/// ADS-B 트랙 DB 조회 (ICAO24 목록 + 시간 범위)
-#[tauri::command]
-fn load_adsb_tracks_for_range(
-    icao24_list: Vec<String>,
-    start: f64,
-    end: f64,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<AdsbTrack>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_adsb_tracks(&conn, &icao24_list, start, end)
-        .map_err(|e| format!("DB load error: {}", e))
-}
-
-/// OpenSky /flights/aircraft API 응답
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpenSkyFlight {
-    icao24: String,
-    first_seen: f64,
-    last_seen: f64,
-    est_departure_airport: Option<String>,
-    est_arrival_airport: Option<String>,
-    callsign: Option<String>,
-}
-
-/// 운항이력 조회 (OpenSky API + DB 저장)
-#[tauri::command]
-async fn fetch_flight_history(
-    app_handle: tauri::AppHandle,
-    icao24: String,
-    begin: i64,
-    end: i64,
-) -> Result<Vec<FlightRecord>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("AirMoveAnalyzer/0.1")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    // OAuth2 토큰 발급 (인증정보 필수 — 익명 접근 차단됨)
-    let token = ensure_opensky_token(&app_handle, &client).await?;
-    if token.is_none() {
-        return Err("OpenSky 인증정보가 설정되지 않았습니다. 설정에서 Client ID/Secret을 입력하세요.".to_string());
-    }
-    let has_auth = true;
-
-    let window = 86400i64; // 1일 (OpenSky는 calendar day 기준 파티션 → 2일 윈도우 시 3파티션 에러)
-    let total_windows = ((end - begin) as f64 / window as f64).ceil() as usize;
-    // 최신→과거 순서로 조회 (최근 데이터 우선)
-    let mut cursor = end;
-    let mut window_idx = 0usize;
-    let mut rate_limited = false;
-
-    info!("Flight history sync: icao24={}, {} windows (1-day each), newest→oldest", icao24, total_windows);
-
-    while cursor > begin {
-        let w_start = std::cmp::max(cursor - window, begin);
-        let w_end = cursor;
-        window_idx += 1;
-
-        // 이미 조회한 구간이면 스킵 (결과 유무와 무관)
-        let already_queried = {
-            let state = app_handle.state::<AppState>();
-            let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-            db::is_window_queried(&conn, &icao24, w_start, w_end)
-                .unwrap_or(false)
-        };
-
-        if already_queried {
-            cursor = w_start;
-            continue;
-        }
-
-        // 진행 상황 이벤트
-        let _ = app_handle.emit(
-            "flight-history-progress",
-            serde_json::json!({
-                "current": window_idx,
-                "total": total_windows,
-                "icao24": &icao24,
-            }),
-        );
-
-        let url = format!(
-            "https://opensky-network.org/api/flights/aircraft?icao24={}&begin={}&end={}",
-            icao24.to_lowercase(),
-            w_start,
-            w_end
-        );
-
-        let mut retries = 0u32;
-        loop {
-            let mut req = client.get(&url);
-            if let Some(ref t) = token {
-                req = req.bearer_auth(t);
-            }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    // 남은 크레딧 로깅
-                    let remaining_credits = resp.headers()
-                        .get("X-Rate-Limit-Remaining")
-                        .or_else(|| resp.headers().get("x-rate-limit-remaining"))
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<i64>().ok());
-                    if let Some(rem) = remaining_credits {
-                        info!("OpenSky credits remaining: {}", rem);
-                    }
-                    if let Ok(flights) = resp.json::<Vec<OpenSkyFlight>>().await {
-                        let state = app_handle.state::<AppState>();
-                        let conn =
-                            state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                        let mut new_records = Vec::new();
-                        for f in &flights {
-                            let record = FlightRecord {
-                                icao24: f.icao24.clone(),
-                                first_seen: f.first_seen,
-                                last_seen: f.last_seen,
-                                est_departure_airport: f.est_departure_airport.clone(),
-                                est_arrival_airport: f.est_arrival_airport.clone(),
-                                callsign: f
-                                    .callsign
-                                    .as_ref()
-                                    .map(|s| s.trim().to_string()),
-                            };
-                            let _ = db::save_flight_record(&conn, &record);
-                            new_records.push(record);
-                        }
-                        // 조회 완료 기록 (결과 0건이어도 기록)
-                        let _ = db::mark_window_queried(&conn, &icao24, w_start, w_end);
-                        // 프론트엔드에 증분 전송
-                        if !new_records.is_empty() {
-                            info!("Flight history: {} found {} records (window {}/{})",
-                                icao24, new_records.len(), window_idx, total_windows);
-                            let _ = app_handle.emit("flight-history-records", &new_records);
-                        }
-                    }
-                    break;
-                }
-                Ok(resp) if resp.status().as_u16() == 404 => {
-                    // 해당 구간 데이터 없음 — 조회 완료로 기록
-                    info!("Flight history: {} no data for window {}/{}", icao24, window_idx, total_windows);
-                    let state = app_handle.state::<AppState>();
-                    if let Ok(conn) = state.db.lock() {
-                        let _ = db::mark_window_queried(&conn, &icao24, w_start, w_end);
-                    }
-                    break;
-                }
-                Ok(resp) if resp.status().as_u16() == 403 => {
-                    let body = resp.text().await.unwrap_or_default();
-                    log::warn!("Flight history 403 Forbidden for {}: {}", icao24, body);
-                    return Err(format!("OpenSky 접근 거부: {}. 인증정보를 확인하세요.", body.trim()));
-                }
-                Ok(resp) if resp.status().as_u16() == 429 => {
-                    // X-Rate-Limit-Retry-After-Seconds 헤더에서 대기 시간 읽기
-                    let retry_after_secs = resp.headers()
-                        .get("X-Rate-Limit-Retry-After-Seconds")
-                        .or_else(|| resp.headers().get("x-rate-limit-retry-after-seconds"))
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
-
-                    let remaining = resp.headers()
-                        .get("X-Rate-Limit-Remaining")
-                        .or_else(|| resp.headers().get("x-rate-limit-remaining"))
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<i64>().ok());
-
-                    info!("Flight history 429 for {}: retry_after={}s, remaining={:?}",
-                        icao24,
-                        retry_after_secs.unwrap_or(0),
-                        remaining,
-                    );
-
-                    if retries < 3 {
-                        retries += 1;
-                        let wait = retry_after_secs.unwrap_or(10 * retries as u64);
-                        info!("Flight history rate limited, retry {}/3 after {}s", retries, wait);
-                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                        continue;
-                    }
-
-                    // 일일 한도 초과 — 이 항공기 중단, retry_after 정보 포함
-                    info!("Daily rate limit reached for {}, stopping (retry_after={}s)",
-                        icao24, retry_after_secs.unwrap_or(0));
-                    rate_limited = true;
-                    // rate_limit_retry_after를 에러 메시지에 포함하여 프론트엔드가 활용
-                    if let Some(secs) = retry_after_secs {
-                        let _ = app_handle.emit("flight-history-progress", serde_json::json!({
-                            "current": window_idx,
-                            "total": total_windows,
-                            "icao24": &icao24,
-                            "retry_after_secs": secs,
-                        }));
-                    }
-                    break;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    log::warn!(
-                        "Flight history API returned {} for {}: {}",
-                        status,
-                        icao24,
-                        body
-                    );
-                    // 4xx 에러는 재시도해도 의미 없으므로 조회 완료 처리
-                    if status.as_u16() >= 400 && status.as_u16() < 500 {
-                        let state = app_handle.state::<AppState>();
-                        if let Ok(conn) = state.db.lock() {
-                            let _ = db::mark_window_queried(&conn, &icao24, w_start, w_end);
-                        };
-                    }
-                    break;
-                }
-                Err(e) => {
-                    log::warn!("Flight history fetch failed for {}: {}", icao24, e);
-                    break;
-                }
-            }
-        }
-
-        if rate_limited {
-            break;
-        }
-
-        cursor = w_start;
-        // Rate limit 회피 (인증시 0.5초, 익명 1초)
-        let delay_ms = if has_auth { 500 } else { 1000 };
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-    }
-
-    // Rate limit 시 에러 반환 (프론트엔드가 재시도 스케줄링)
-    if rate_limited {
-        return Err("rate_limit_reached".to_string());
-    }
-
-    // DB에서 전체 결과 로드
-    let state = app_handle.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_flight_history(&conn, &[icao24], begin as f64, end as f64)
-        .map_err(|e| format!("DB load error: {}", e))
-}
-
-/// 운항이력 DB 조회
-#[tauri::command]
-fn load_flight_history(
-    icao24_list: Vec<String>,
-    start: f64,
-    end: f64,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<FlightRecord>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_flight_history(&conn, &icao24_list, start, end)
-        .map_err(|e| format!("DB load error: {}", e))
-}
-
-/// OpenSky 인증정보 저장
-#[tauri::command]
-fn save_opensky_credentials(
-    client_id: String,
-    client_secret: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::set_setting(&conn, "opensky_client_id", &client_id)
-        .map_err(|e| format!("DB error: {}", e))?;
-    db::set_setting(&conn, "opensky_client_secret", &client_secret)
-        .map_err(|e| format!("DB error: {}", e))?;
-    Ok(())
-}
-
-/// OpenSky 인증정보 로드
-#[tauri::command]
-fn load_opensky_credentials(
-    state: tauri::State<'_, AppState>,
-) -> Result<(String, String), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    let id = db::get_setting(&conn, "opensky_client_id")
-        .map_err(|e| format!("DB error: {}", e))?
-        .unwrap_or_default();
-    let secret = db::get_setting(&conn, "opensky_client_secret")
-        .map_err(|e| format!("DB error: {}", e))?
-        .unwrap_or_default();
-    Ok((id, secret))
-}
-
 /// 설정값 로드 (프론트엔드용)
 #[tauri::command]
 fn load_setting(
@@ -971,136 +470,6 @@ fn save_setting(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     db::set_setting(&conn, &key, &value).map_err(|e| format!("DB error: {}", e))
-}
-
-/// DB에서 저장된 파싱 데이터 로드 (앱 시작 시 호출) — 레거시 (소량 데이터 호환)
-#[tauri::command]
-fn load_saved_data(
-    state: tauri::State<'_, AppState>,
-) -> Result<db::SavedParsedData, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_all_parsed_data(&conn).map_err(|e| format!("DB load error: {}", e))
-}
-
-/// 파일 메타데이터만 로드 (포인트 제외, 스트리밍 복원 1단계)
-#[tauri::command]
-fn load_saved_file_metas(
-    state: tauri::State<'_, AppState>,
-) -> Result<db::SavedParsedMeta, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_parsed_file_metas(&conn).map_err(|e| format!("DB load error: {}", e))
-}
-
-/// 특정 파일의 track_points를 로드 (파일 단위 분할 복원)
-#[tauri::command]
-async fn load_file_track_points(
-    state: tauri::State<'_, AppState>,
-    file_id: i64,
-) -> Result<Vec<TrackPoint>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    let mut points = Vec::new();
-    db::load_track_points_chunked(&conn, file_id, 50000, |chunk| {
-        points.extend(chunk);
-    }).map_err(|e| format!("DB load error: {}", e))?;
-    Ok(points)
-}
-
-/// 저장된 파싱 데이터 전체 삭제
-#[tauri::command]
-fn clear_saved_data(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::clear_all_parsed_data(&conn).map_err(|e| format!("DB clear error: {}", e))
-}
-
-/// 특정 파싱 파일 삭제 (건별)
-#[tauri::command]
-fn delete_parsed_file(
-    file_path: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::delete_parsed_file(&conn, &file_path).map_err(|e| format!("DB delete error: {}", e))
-}
-
-/// 여러 파싱 파일 삭제 (경로 목록)
-#[tauri::command]
-fn delete_parsed_files(
-    file_paths: Vec<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::delete_parsed_files(&conn, &file_paths).map_err(|e| format!("DB delete error: {}", e))
-}
-
-// ========== 기상 데이터 캐시 ==========
-
-/// 일 단위 기상 데이터 저장
-#[tauri::command]
-fn save_weather_day(
-    date: String,
-    radar_lat: f64,
-    radar_lon: f64,
-    hourly_json: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::save_weather_day(&conn, &date, radar_lat, radar_lon, &hourly_json)
-        .map_err(|e| format!("DB error: {}", e))
-}
-
-/// 일 단위 구름 그리드 저장
-#[tauri::command]
-fn save_cloud_grid_day(
-    date: String,
-    radar_lat: f64,
-    radar_lon: f64,
-    grid_spacing_km: f64,
-    frames_json: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::save_cloud_grid_day(&conn, &date, radar_lat, radar_lon, grid_spacing_km, &frames_json)
-        .map_err(|e| format!("DB error: {}", e))
-}
-
-/// 캐시된 기상/구름 날짜 목록 조회
-#[tauri::command]
-fn get_weather_cached_dates(
-    radar_lat: f64,
-    radar_lon: f64,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::get_weather_cached_dates(&conn, radar_lat, radar_lon)
-        .map_err(|e| format!("DB error: {}", e))
-}
-
-/// 캐시된 기상 데이터 로드 (날짜 목록)
-#[tauri::command]
-fn load_weather_cache(
-    radar_lat: f64,
-    radar_lon: f64,
-    dates: Vec<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<(String, String)>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_weather_cache(&conn, radar_lat, radar_lon, &dates)
-        .map_err(|e| format!("DB error: {}", e))
-}
-
-/// 캐시된 구름 그리드 로드 (날짜 목록)
-#[tauri::command]
-fn load_cloud_grid_cache(
-    radar_lat: f64,
-    radar_lon: f64,
-    dates: Vec<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<(String, String, f64)>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::load_cloud_grid_cache(&conn, radar_lat, radar_lon, &dates)
-        .map_err(|e| format!("DB error: {}", e))
 }
 
 /// DB 파일 경로 반환 (내보내기/가져오기 용)
@@ -1144,19 +513,22 @@ fn import_database(
         return Err("유효한 SQLite 데이터베이스 파일이 아닙니다.".to_string());
     }
 
-    // 기존 연결 닫고 파일 교체 후 재연결
-    let mut conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    // WAL/SHM 파일 정리
-    drop(std::mem::replace(&mut *conn, rusqlite::Connection::open_in_memory().map_err(|e| format!("임시 DB 오류: {}", e))?));
+    // 기존 연결 닫기 (락 해제 후 파일 I/O 수행)
+    {
+        let mut conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        // 기존 연결을 in-memory로 교체하여 파일 핸들 해제
+        drop(std::mem::replace(&mut *conn, rusqlite::Connection::open_in_memory().map_err(|e| format!("임시 DB 오류: {}", e))?));
+    } // 락 해제
 
-    // DB 파일 교체
+    // DB 파일 교체 (락 없이 수행 — 대용량 파일도 다른 명령 차단 안 함)
     fs::copy(src, &db_path)
         .map_err(|e| format!("파일 복사 실패: {}", e))?;
     // WAL/SHM 잔여 파일 제거
     let _ = fs::remove_file(db_path.with_extension("db-wal"));
     let _ = fs::remove_file(db_path.with_extension("db-shm"));
 
-    // 새 연결 수립
+    // 새 연결 수립 (락 재획득)
+    let mut conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     let new_conn = db::init_db(&db_path)
         .map_err(|e| format!("DB 재연결 실패: {}", e))?;
     *conn = new_conn;
@@ -1165,7 +537,7 @@ fn import_database(
     Ok(())
 }
 
-/// 360° LoS 파노라마 계산 (지형 + GIS건물 + 수동건물)
+/// 360° LoS 파노라마 계산 (지형 + 건물통합정보 + 수동건물)
 #[tauri::command]
 fn calculate_los_panorama(
     state: tauri::State<'_, AppState>,
@@ -1351,6 +723,14 @@ fn fetch_elevation(
 }
 
 /// 한국 SRTM 타일 다운로드 (AWS Terrain Tiles, 인증 불필요)
+#[tauri::command]
+fn get_srtm_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<(i64, i64)>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    db::get_srtm_status(&conn).map_err(|e| e.to_string())
+}
+
 /// lat 33~38, lon 124~131 → 최대 42타일 (~250MB)
 #[tauri::command]
 async fn download_srtm_korea(
@@ -1488,26 +868,7 @@ async fn download_srtm_korea(
     Ok(msg)
 }
 
-// ---------- 건물 데이터 (GIS건물통합정보) ----------
-
-#[tauri::command]
-async fn import_building_data(
-    app_handle: tauri::AppHandle,
-    zip_path: String,
-    region: String,
-) -> Result<String, String> {
-    let state = app_handle.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-
-    let handle = app_handle.clone();
-    let region_clone = region.clone();
-
-    let count = building::import_from_zip(&conn, &zip_path, &region, &|progress| {
-        let _ = handle.emit("building-import-progress", progress);
-    })?;
-
-    Ok(format!("{} 건물 {}건 임포트 완료", region_clone, count))
-}
+// ---------- 건물 데이터 ----------
 
 #[tauri::command]
 fn query_buildings_along_path(
@@ -1523,21 +884,159 @@ fn query_buildings_along_path(
     building::query_buildings_along_path(&conn, radar_lat, radar_lon, target_lat, target_lon, width)
 }
 
+// ---------- 건물통합정보 (F_FAC_BUILDING) ----------
+
 #[tauri::command]
-fn get_building_import_status(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<building::BuildingImportStatus>, String> {
+async fn import_fac_building_data(
+    app_handle: tauri::AppHandle,
+    zip_path: String,
+    region: String,
+) -> Result<String, String> {
+    let state = app_handle.state::<AppState>();
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    building::get_import_status(&conn)
+
+    let handle = app_handle.clone();
+    let region_clone = region.clone();
+
+    let count = fac_building::import_from_zip(&conn, &zip_path, &region, &|progress| {
+        let _ = handle.emit("fac-building-import-progress", progress);
+    })?;
+
+    Ok(format!("{} 건물통합정보 {}건 임포트 완료", region_clone, count))
 }
 
 #[tauri::command]
-fn clear_building_data(
+fn query_fac_buildings_3d(
+    state: tauri::State<'_, AppState>,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: Option<f64>,
+    max_count: Option<usize>,
+) -> Result<Vec<building::Building3D>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    fac_building::query_fac_buildings_3d(
+        &conn,
+        min_lat, max_lat, min_lon, max_lon,
+        min_height_m.unwrap_or(3.0),
+        max_count.unwrap_or(10_000),
+    )
+}
+
+#[tauri::command]
+fn get_fac_building_import_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<fac_building::FacBuildingImportStatus>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    fac_building::get_import_status(&conn)
+}
+
+#[tauri::command]
+fn clear_fac_building_data(
     state: tauri::State<'_, AppState>,
     region: Option<String>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    building::clear_building_data(&conn, region.as_deref())
+    fac_building::clear_data(&conn, region.as_deref())
+}
+
+// ---------- 토지이용계획정보 ----------
+
+#[tauri::command]
+async fn import_landuse_data(
+    app_handle: tauri::AppHandle,
+    zip_path: String,
+    region: String,
+) -> Result<String, String> {
+    let state = app_handle.state::<AppState>();
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    let handle = app_handle.clone();
+    let region_clone = region.clone();
+
+    let count = landuse::import_from_zip(&conn, &zip_path, &region, &|progress| {
+        let _ = handle.emit("landuse-import-progress", serde_json::json!({
+            "region": &progress.region,
+            "processed": progress.processed,
+            "status": &progress.status,
+        }));
+    })?;
+
+    Ok(format!("{} 토지이용계획 {}건 임포트 완료", region_clone, count))
+}
+
+#[tauri::command]
+fn query_landuse_in_bbox(
+    state: tauri::State<'_, AppState>,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    max_count: Option<usize>,
+) -> Result<Vec<landuse::LandUseZone>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    landuse::query_in_bbox(&conn, min_lat, max_lat, min_lon, max_lon, max_count.unwrap_or(50_000))
+}
+
+#[tauri::command]
+fn get_landuse_import_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<landuse::LandUseImportStatus>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    landuse::get_import_status(&conn)
+}
+
+#[tauri::command]
+fn clear_landuse_data(
+    state: tauri::State<'_, AppState>,
+    region: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    landuse::clear_data(&conn, region.as_deref())
+}
+
+// ---------- 산봉우리 지명 데이터 ----------
+
+#[tauri::command]
+async fn import_peak_data(
+    app_handle: tauri::AppHandle,
+    zip_path: String,
+) -> Result<String, String> {
+    let state = app_handle.state::<AppState>();
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let handle = app_handle.clone();
+    let count = peak::import_from_zip(&conn, &zip_path, &|progress| {
+        let _ = handle.emit("peak-import-progress", progress);
+    })?;
+    Ok(format!("산 정보 {}건 임포트 완료", count))
+}
+
+#[tauri::command]
+fn query_nearby_peaks(
+    state: tauri::State<'_, AppState>,
+    lat: f64,
+    lon: f64,
+    radius_km: f64,
+) -> Result<Vec<peak::NearbyPeak>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    peak::query_nearby_peaks(&conn, lat, lon, radius_km)
+}
+
+#[tauri::command]
+fn get_peak_import_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<peak::PeakImportStatus>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    peak::get_import_status(&conn)
+}
+
+#[tauri::command]
+fn clear_peak_data(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    peak::clear_data(&conn)
 }
 
 // ---------- 영역 내 건물 조회 (커버리지 맵용) ----------
@@ -1555,19 +1054,48 @@ fn query_buildings_in_bbox(
     building::query_buildings_in_bbox(&conn, min_lat, max_lat, min_lon, max_lon, min_height_m.unwrap_or(3.0))
 }
 
-// ---------- 영역 내 건물 조회 (맵 오버레이용) ----------
+// ---------- 3D 건물 조회 ----------
 
 #[tauri::command]
-fn query_buildings_for_overlay(
+fn query_buildings_3d(
     state: tauri::State<'_, AppState>,
     min_lat: f64,
     max_lat: f64,
     min_lon: f64,
     max_lon: f64,
     min_height_m: Option<f64>,
-) -> Result<Vec<building::BuildingForOverlay>, String> {
+    max_count: Option<usize>,
+    exclude_sources: Option<Vec<String>>,
+) -> Result<Vec<building::Building3D>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    building::query_buildings_for_overlay(&conn, min_lat, max_lat, min_lon, max_lon, min_height_m.unwrap_or(3.0))
+    building::query_buildings_3d(
+        &conn,
+        min_lat, max_lat, min_lon, max_lon,
+        min_height_m.unwrap_or(3.0),
+        max_count.unwrap_or(10_000),
+        &exclude_sources.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+fn query_buildings_3d_binary(
+    state: tauri::State<'_, AppState>,
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_height_m: Option<f64>,
+    max_count: Option<usize>,
+    exclude_sources: Option<Vec<String>>,
+) -> Result<building::Buildings3DBinary, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::query_buildings_3d_binary(
+        &conn,
+        min_lat, max_lat, min_lon, max_lon,
+        min_height_m.unwrap_or(3.0),
+        max_count.unwrap_or(15_000),
+        &exclude_sources.unwrap_or_default(),
+    )
 }
 
 // ---------- 건물 그룹 ----------
@@ -1586,9 +1114,10 @@ fn add_building_group(
     name: String,
     color: String,
     memo: String,
+    area_bounds_json: Option<String>,
 ) -> Result<i64, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    building::add_building_group(&conn, &name, &color, &memo)
+    building::add_building_group(&conn, &name, &color, &memo, area_bounds_json.as_deref())
 }
 
 #[tauri::command]
@@ -1599,9 +1128,11 @@ fn update_building_group(
     color: String,
     memo: String,
     plan_opacity: Option<f64>,
+    plan_rotation: Option<f64>,
+    area_bounds_json: Option<String>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    building::update_building_group(&conn, id, &name, &color, &memo, plan_opacity)
+    building::update_building_group(&conn, id, &name, &color, &memo, plan_opacity, plan_rotation, area_bounds_json.as_deref())
 }
 
 #[tauri::command]
@@ -1620,13 +1151,14 @@ fn save_group_plan_image(
     image_base64: String,
     bounds_json: String,
     opacity: f64,
+    rotation: f64,
 ) -> Result<(), String> {
     use base64::Engine;
     let image_bytes = base64::engine::general_purpose::STANDARD
         .decode(&image_base64)
         .map_err(|e| format!("base64 디코드 실패: {}", e))?;
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    building::save_group_plan_image(&conn, group_id, &image_bytes, &bounds_json, opacity)
+    building::save_group_plan_image(&conn, group_id, &image_bytes, &bounds_json, opacity, rotation)
 }
 
 #[tauri::command]
@@ -1636,17 +1168,29 @@ fn load_group_plan_image(
 ) -> Result<Option<serde_json::Value>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     match building::load_group_plan_image(&conn, group_id)? {
-        Some((image_bytes, bounds_json, opacity)) => {
+        Some((image_bytes, bounds_json, opacity, rotation)) => {
             use base64::Engine;
             let image_base64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
             Ok(Some(serde_json::json!({
                 "image_base64": image_base64,
                 "bounds_json": bounds_json,
                 "opacity": opacity,
+                "rotation": rotation,
             })))
         }
         None => Ok(None),
     }
+}
+
+#[tauri::command]
+fn update_plan_overlay_props(
+    state: tauri::State<'_, AppState>,
+    group_id: i64,
+    opacity: Option<f64>,
+    rotation: Option<f64>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    building::update_plan_overlay_props(&conn, group_id, opacity, rotation)
 }
 
 #[tauri::command]
@@ -1716,7 +1260,7 @@ fn delete_manual_building(
     building::delete_manual_building(&conn, id)
 }
 
-// ========== LOS 분석 결과 영속화 ==========
+// ========== LoS 분석 결과 영속화 ==========
 
 #[tauri::command]
 fn save_los_result(
@@ -1851,6 +1395,15 @@ fn load_coverage_cache(
 ) -> Result<Option<String>, String> {
     let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
     db::load_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+fn has_coverage_cache(
+    state: tauri::State<'_, AppState>,
+    radar_name: String,
+) -> Result<bool, String> {
+    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    db::has_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
 }
 
 #[tauri::command]
@@ -2313,6 +1866,544 @@ fn invalidate_coverage_profile() {
     analysis::coverage::invalidate_cache();
 }
 
+// ---------- vworld 건물 데이터 자동 다운로드 ----------
+
+#[tauri::command]
+async fn vworld_download_buildings(
+    app_handle: tauri::AppHandle,
+    id: String,
+    pw: String,
+    region_codes: Vec<String>,
+) -> Result<String, String> {
+    let emit = |stage: &str, msg: &str, cur: usize, total: usize| {
+        let _ = app_handle.emit(
+            "vworld-progress",
+            serde_json::json!({
+                "stage": stage, "message": msg, "current": cur, "total": total,
+            }),
+        );
+    };
+
+    // 1. 로그인
+    emit("login", "vworld 로그인 중...", 0, 0);
+    let mut client = vworld::login(&id, &pw).await?;
+
+    // 2. 파일 목록 수집 (지역별 쿼리, 세션 만료 시 재로그인)
+    emit("listing", "파일 목록 수집 중...", 0, 0);
+    let targets = match vworld::list_files_by_regions(&client, &region_codes).await {
+        Ok(t) => t,
+        Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+            emit("login", "세션 만료, 재로그인 중...", 0, 0);
+            client = vworld::login(&id, &pw).await?;
+            vworld::list_files_by_regions(&client, &region_codes).await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    if targets.is_empty() {
+        return Err(format!(
+            "매칭 파일 없음: sidoCd={:?} 에 해당하는 파일이 없습니다.",
+            region_codes
+        ));
+    }
+
+    // 3. 다운로드 + 임포트
+    let total = targets.len();
+    let mut imported = 0;
+
+    for (i, file) in targets.iter().enumerate() {
+        // 다운로드 (세션 만료 시 재로그인 후 재시도)
+        emit(
+            "downloading",
+            &format!("{} 다운로드 중... ({}/{})", file.file_name, i + 1, total),
+            i + 1,
+            total,
+        );
+        let data = match vworld::download_file(&client, &file.ds_id, &file.file_no).await {
+            Ok(d) => d,
+            Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+                // 세션 만료 → 재로그인 후 재시도
+                emit("login", "세션 만료, 재로그인 중...", i + 1, total);
+                client = vworld::login(&id, &pw).await?;
+                vworld::download_file(&client, &file.ds_id, &file.file_no).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 임시 파일 저장
+        let temp_path = std::env::temp_dir().join(format!("vworld_{}.zip", file.file_no));
+        std::fs::write(&temp_path, &data)
+            .map_err(|e| format!("임시 파일 저장 실패: {e}"))?;
+        drop(data);
+
+        // 임포트 (DB lock은 이 블록에서만)
+        emit(
+            "importing",
+            &format!("{} 임포트 중... ({}/{})", file.file_name, i + 1, total),
+            i + 1,
+            total,
+        );
+        {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let region_key = vworld::region_code_to_key(&file.region_code);
+            let handle_clone = app_handle.clone();
+            let rk = region_key.to_string();
+            fac_building::import_from_zip(&conn, temp_path.to_str().unwrap(), region_key, &|p| {
+                let _ = handle_clone.emit(
+                    "building-import-progress",
+                    serde_json::json!({
+                        "region": &rk,
+                        "processed": p.processed,
+                        "status": &p.status,
+                    }),
+                );
+            })
+            .map_err(|e| format!("{} 임포트 실패: {e}", file.file_name))?;
+        }
+
+        let _ = std::fs::remove_file(&temp_path);
+        imported += 1;
+    }
+
+    emit(
+        "done",
+        &format!("{imported}개 지역 건물 데이터 완료"),
+        imported,
+        total,
+    );
+    Ok(format!("{imported}개 지역 건물 데이터 다운로드 및 임포트 완료"))
+}
+
+// ---------- 토지이용계획도 타일 다운로드 ----------
+
+/// 토지이용계획도 타일 일괄 다운로드 (proxy.do 경유, 로그인 불필요)
+#[tauri::command]
+async fn download_landuse_tiles(
+    app_handle: tauri::AppHandle,
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+    min_zoom: u32,
+    max_zoom: u32,
+) -> Result<String, String> {
+    let emit = |msg: &str, cur: usize, total: usize| {
+        let _ = app_handle.emit(
+            "landuse-tile-progress",
+            serde_json::json!({ "message": msg, "current": cur, "total": total }),
+        );
+    };
+
+    // 타일 목록 생성
+    let mut tiles: Vec<(u32, u32, u32)> = Vec::new();
+    for z in min_zoom..=max_zoom {
+        let n = 1u64 << z;
+        let x_min = ((west + 180.0) / 360.0 * n as f64).floor() as u32;
+        let x_max = ((east + 180.0) / 360.0 * n as f64).ceil() as u32;
+        let y_min = ((1.0 - (north.to_radians().tan() + 1.0 / north.to_radians().cos()).ln() / std::f64::consts::PI) / 2.0 * n as f64).floor() as u32;
+        let y_max = ((1.0 - (south.to_radians().tan() + 1.0 / south.to_radians().cos()).ln() / std::f64::consts::PI) / 2.0 * n as f64).ceil() as u32;
+        for x in x_min..x_max {
+            for y in y_min..y_max {
+                tiles.push((z, x, y));
+            }
+        }
+    }
+
+    let total = tiles.len();
+
+    // 기존 타일 삭제 후 새로 다운로드
+    {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+        conn.execute("DELETE FROM landuse_tiles", [])
+            .map_err(|e| format!("기존 타일 삭제 실패: {e}"))?;
+    }
+
+    emit(&format!("총 {} 타일 다운로드 시작...", total), 0, total);
+
+    let mut downloaded = 0usize;
+    let mut errors = 0usize;
+
+    for (i, &(z, x, y)) in tiles.iter().enumerate() {
+        match vworld::download_landuse_tile(z, x, y).await {
+            Ok(data) => {
+                let state = app_handle.state::<AppState>();
+                let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO landuse_tiles (z, x, y, data) VALUES (?1, ?2, ?3, ?4)",
+                    params![z as i64, x as i64, y as i64, data],
+                )
+                .map_err(|e| format!("타일 저장 실패: {e}"))?;
+                downloaded += 1;
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+
+        if (i + 1) % 10 == 0 || i + 1 == total {
+            emit(
+                &format!("{}/{} 타일 ({} 완료, {} 오류)", i + 1, total, downloaded, errors),
+                i + 1,
+                total,
+            );
+        }
+
+        // 서버 부하 방지 딜레이
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    emit("완료", downloaded, total);
+    Ok(format!(
+        "토지이용계획도 타일 다운로드 완료: {} 완료 / {} 오류 (총 {})",
+        downloaded, errors, total
+    ))
+}
+
+/// 캐시된 타일 수 조회
+#[tauri::command]
+fn get_landuse_tile_count(
+    state: tauri::State<'_, AppState>,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.query_row("SELECT COUNT(*) FROM landuse_tiles", [], |row| row.get(0))
+        .map_err(|e| format!("타일 카운트 실패: {e}"))
+}
+
+/// 캐시된 타일 삭제
+#[tauri::command]
+fn clear_landuse_tiles(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM landuse_tiles", [])
+        .map_err(|e| format!("타일 삭제 실패: {e}"))?;
+    Ok(())
+}
+
+/// 단일 타일 조회 (DB 캐시에서 base64 반환)
+#[tauri::command]
+fn get_landuse_tile(
+    state: tauri::State<'_, AppState>,
+    z: i64,
+    x: i64,
+    y: i64,
+) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    match conn.query_row(
+        "SELECT data FROM landuse_tiles WHERE z=?1 AND x=?2 AND y=?3",
+        params![z, x, y],
+        |row| row.get::<_, Vec<u8>>(0),
+    ) {
+        Ok(data) => {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            Ok(Some(STANDARD.encode(&data)))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("타일 조회 실패: {e}")),
+    }
+}
+
+// ---------- vworld 건물통합정보 (F_FAC_BUILDING) 자동 다운로드 ----------
+
+#[tauri::command]
+async fn vworld_download_fac_buildings(
+    app_handle: tauri::AppHandle,
+    id: String,
+    pw: String,
+    region_codes: Vec<String>,
+) -> Result<String, String> {
+    let emit = |stage: &str, msg: &str, cur: usize, total: usize| {
+        let _ = app_handle.emit(
+            "fac-building-vworld-progress",
+            serde_json::json!({
+                "stage": stage, "message": msg, "current": cur, "total": total,
+            }),
+        );
+    };
+
+    // 1. 로그인
+    emit("login", "vworld 로그인 중...", 0, 0);
+    let mut client = vworld::login(&id, &pw).await?;
+
+    // 2. 파일 목록 수집
+    emit("listing", "건물통합정보 파일 목록 수집 중...", 0, 0);
+    let targets = match vworld::list_fac_building_files(&client, &region_codes).await {
+        Ok(t) => t,
+        Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+            emit("login", "세션 만료, 재로그인 중...", 0, 0);
+            client = vworld::login(&id, &pw).await?;
+            vworld::list_fac_building_files(&client, &region_codes).await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    if targets.is_empty() {
+        return Err(format!(
+            "매칭 파일 없음: 지역={:?} 에 해당하는 건물통합정보 파일이 없습니다.",
+            region_codes
+        ));
+    }
+
+    // 3. 다운로드 + 임포트
+    let total = targets.len();
+    let mut imported = 0;
+
+    for (i, file) in targets.iter().enumerate() {
+        emit(
+            "downloading",
+            &format!("{} 다운로드 중... ({}/{})", file.file_name, i + 1, total),
+            i + 1,
+            total,
+        );
+        let data = match vworld::download_file(&client, &file.ds_id, &file.file_no).await {
+            Ok(d) => d,
+            Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+                emit("login", "세션 만료, 재로그인 중...", i + 1, total);
+                client = vworld::login(&id, &pw).await?;
+                vworld::download_file(&client, &file.ds_id, &file.file_no).await?
+            }
+            Err(e) => {
+                log::warn!("건물통합정보 다운로드 실패 (건너뜀): {} — {e}", file.file_name);
+                continue;
+            }
+        };
+
+        let temp_path = std::env::temp_dir().join(format!("vworld_fac_{}.zip", file.file_no));
+        std::fs::write(&temp_path, &data)
+            .map_err(|e| format!("임시 파일 저장 실패: {e}"))?;
+        drop(data);
+
+        // 파일명에서 지역코드 추출 (F_FAC_BUILDING_41570_202603.zip → 41570)
+        let region_key = {
+            let fname = &file.file_name;
+            let code_match = fname
+                .split(|c: char| c == '_' || c == '.')
+                .find(|s| s.len() == 5 && s.chars().all(|c| c.is_ascii_digit()));
+            code_match.unwrap_or(fname.trim_end_matches(".zip")).to_string()
+        };
+
+        emit(
+            "importing",
+            &format!("{} 임포트 중... ({}/{})", file.file_name, i + 1, total),
+            i + 1,
+            total,
+        );
+        {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let handle_clone = app_handle.clone();
+            let rk = region_key.clone();
+            fac_building::import_from_zip(&conn, temp_path.to_str().unwrap(), &region_key, &|p| {
+                let _ = handle_clone.emit(
+                    "fac-building-import-progress",
+                    serde_json::json!({
+                        "region": &rk,
+                        "processed": p.processed,
+                        "status": &p.status,
+                    }),
+                );
+            })
+            .map_err(|e| format!("{} 임포트 실패: {e}", file.file_name))?;
+        }
+
+        let _ = std::fs::remove_file(&temp_path);
+        imported += 1;
+    }
+
+    emit(
+        "done",
+        &format!("{imported}개 건물통합정보 파일 완료"),
+        imported,
+        total,
+    );
+    Ok(format!("{imported}개 건물통합정보 파일 다운로드 및 임포트 완료 (총 {total}개 중)"))
+}
+
+// ---------- vworld 토지이용계획정보 자동 다운로드 ----------
+
+#[tauri::command]
+async fn vworld_download_landuse(
+    app_handle: tauri::AppHandle,
+    id: String,
+    pw: String,
+    region_codes: Vec<String>,
+) -> Result<String, String> {
+    let emit = |stage: &str, msg: &str, cur: usize, total: usize| {
+        let _ = app_handle.emit(
+            "landuse-download-progress",
+            serde_json::json!({
+                "stage": stage, "message": msg, "current": cur, "total": total,
+            }),
+        );
+    };
+
+    // 1. 로그인
+    emit("login", "vworld 로그인 중...", 0, 0);
+    let mut client = vworld::login(&id, &pw).await?;
+
+    // 2. 파일 목록 수집
+    emit("listing", "토지이용계획 파일 목록 수집 중...", 0, 0);
+    let targets = match vworld::list_landuse_files(&client, &region_codes).await {
+        Ok(t) => t,
+        Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+            emit("login", "세션 만료, 재로그인 중...", 0, 0);
+            client = vworld::login(&id, &pw).await?;
+            vworld::list_landuse_files(&client, &region_codes).await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    if targets.is_empty() {
+        return Err(format!(
+            "매칭 파일 없음: sidoCd={:?} 에 해당하는 토지이용계획 파일이 없습니다.",
+            region_codes
+        ));
+    }
+
+    // 3. 다운로드 + 임포트
+    let total = targets.len();
+    let mut imported = 0;
+
+    for (i, file) in targets.iter().enumerate() {
+        emit(
+            "downloading",
+            &format!("{} 다운로드 중... ({}/{})", file.file_name, i + 1, total),
+            i + 1,
+            total,
+        );
+        let data = match vworld::download_file(&client, &file.ds_id, &file.file_no).await {
+            Ok(d) => d,
+            Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+                emit("login", "세션 만료, 재로그인 중...", i + 1, total);
+                client = vworld::login(&id, &pw).await?;
+                vworld::download_file(&client, &file.ds_id, &file.file_no).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        let temp_path = std::env::temp_dir().join(format!("vworld_landuse_{}.zip", file.file_no));
+        std::fs::write(&temp_path, &data)
+            .map_err(|e| format!("임시 파일 저장 실패: {e}"))?;
+        drop(data);
+
+        emit(
+            "importing",
+            &format!("{} 임포트 중... ({}/{})", file.file_name, i + 1, total),
+            i + 1,
+            total,
+        );
+        {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let region_key = vworld::region_code_to_key(&file.region_code);
+            let handle_clone = app_handle.clone();
+            let rk = region_key.to_string();
+            landuse::import_from_zip(&conn, temp_path.to_str().unwrap(), region_key, &|p| {
+                let _ = handle_clone.emit(
+                    "landuse-import-progress",
+                    serde_json::json!({
+                        "region": &rk,
+                        "processed": p.processed,
+                        "status": &p.status,
+                    }),
+                );
+            })
+            .map_err(|e| format!("{} 임포트 실패: {e}", file.file_name))?;
+        }
+
+        let _ = std::fs::remove_file(&temp_path);
+        imported += 1;
+    }
+
+    emit(
+        "done",
+        &format!("{imported}개 지역 토지이용계획 완료"),
+        imported,
+        total,
+    );
+    Ok(format!("{imported}개 지역 토지이용계획정보 다운로드 및 임포트 완료"))
+}
+
+#[tauri::command]
+async fn vworld_download_n3p(
+    app_handle: tauri::AppHandle,
+    id: String,
+    pw: String,
+) -> Result<String, String> {
+    let emit = |stage: &str, msg: &str, cur: usize, total: usize| {
+        let _ = app_handle.emit(
+            "n3p-download-progress",
+            serde_json::json!({
+                "stage": stage, "message": msg, "current": cur, "total": total,
+            }),
+        );
+    };
+
+    // 1. 로그인
+    emit("login", "vworld 로그인 중...", 0, 0);
+    let mut client = vworld::login(&id, &pw).await?;
+
+    // 2. N3P 파일 목록
+    emit("listing", "N3P 파일 목록 수집 중...", 0, 0);
+    let targets = match vworld::list_n3p_files(&client).await {
+        Ok(t) => t,
+        Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+            emit("login", "세션 만료, 재로그인 중...", 0, 0);
+            client = vworld::login(&id, &pw).await?;
+            vworld::list_n3p_files(&client).await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    if targets.is_empty() {
+        return Err("N3P 파일을 찾을 수 없습니다. vworld에서 연속수치지형도 데이터셋을 확인해 주세요.".into());
+    }
+
+    let file = &targets[0];
+
+    // 3. 다운로드
+    emit(
+        "downloading",
+        &format!("{} 다운로드 중...", file.file_name),
+        0,
+        1,
+    );
+    let data = match vworld::download_file(&client, &file.ds_id, &file.file_no).await {
+        Ok(d) => d,
+        Err(e) if e.contains("세션") || e.contains("만료") || e.contains("로그인") => {
+            emit("login", "세션 만료, 재로그인 중...", 0, 1);
+            client = vworld::login(&id, &pw).await?;
+            vworld::download_file(&client, &file.ds_id, &file.file_no).await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    // 4. 임시 파일 저장
+    let temp_path = std::env::temp_dir().join(format!("vworld_n3p_{}.zip", file.file_no));
+    std::fs::write(&temp_path, &data)
+        .map_err(|e| format!("임시 파일 저장 실패: {e}"))?;
+    drop(data);
+
+    // 5. 임포트
+    emit("importing", "산 이름 데이터 임포트 중...", 1, 1);
+    {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+        let handle_clone = app_handle.clone();
+        peak::import_from_zip(&conn, temp_path.to_str().unwrap(), &|progress| {
+            let _ = handle_clone.emit("peak-import-progress", &progress);
+        })
+        .map_err(|e| format!("N3P 임포트 실패: {e}"))?;
+    }
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    emit("done", "산 이름 데이터 다운로드 및 임포트 완료", 1, 1);
+    Ok("산 이름 데이터(N3P) 다운로드 및 임포트 완료".to_string())
+}
+
 // ---------- App Entry Point ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2338,14 +2429,6 @@ pub fn run() {
             })?;
             info!("Database path: {:?}", db_path);
 
-            // 기존 JSON 캐시 → DB 마이그레이션
-            let cache_path = app_data_dir.join("adsb_cache.json");
-            if cache_path.exists() {
-                info!("Migrating adsb_cache.json to SQLite...");
-                if let Err(e) = db::migrate_json_cache(&db_conn, &cache_path) {
-                    log::warn!("Migration failed: {}", e);
-                }
-            }
 
             // 기존 aircraft.json → DB 마이그레이션
             let aircraft_json_path = app_data_dir.join("aircraft.json");
@@ -2366,9 +2449,14 @@ pub fn run() {
             app.manage(AppState {
                 app_data_dir: Mutex::new(app_data_dir.clone()),
                 db: Mutex::new(db_conn),
-                oauth_token: Mutex::new(None),
                 srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir, db_path.clone())),
             });
+
+            // 프로덕션 빌드에서도 DevTools 활성화 (F12)
+            #[cfg(not(debug_assertions))]
+            if let Some(w) = app.get_webview_window("main") {
+                w.open_devtools();
+            }
 
             // 백그라운드: WMM fallback 편각을 NOAA 데이터로 치환
             let bg_handle = app.handle().clone();
@@ -2394,18 +2482,6 @@ pub fn run() {
             filter_tracks_by_mode_s,
             read_file_base64,
             write_file_base64,
-            fetch_adsb_tracks,
-            load_adsb_tracks_for_range,
-            fetch_flight_history,
-            load_flight_history,
-            save_opensky_credentials,
-            load_opensky_credentials,
-            load_saved_data,
-            load_saved_file_metas,
-            load_file_track_points,
-            clear_saved_data,
-            delete_parsed_file,
-            delete_parsed_files,
             load_setting,
             save_setting,
             export_database,
@@ -2418,30 +2494,35 @@ pub fn run() {
             load_panorama_cache,
             clear_panorama_cache,
             fetch_elevation,
+            get_srtm_status,
             download_srtm_korea,
-            import_building_data,
             query_buildings_along_path,
             query_buildings_in_bbox,
-            query_buildings_for_overlay,
-            get_building_import_status,
-            clear_building_data,
+            query_buildings_3d,
+            query_buildings_3d_binary,
+            // 건물통합정보 (F_FAC_BUILDING)
+            import_fac_building_data,
+            query_fac_buildings_3d,
+            get_fac_building_import_status,
+            clear_fac_building_data,
+            // 산봉우리 지명
+            import_peak_data,
+            query_nearby_peaks,
+            get_peak_import_status,
+            clear_peak_data,
             list_building_groups,
             add_building_group,
             update_building_group,
             delete_building_group,
             save_group_plan_image,
             load_group_plan_image,
+            update_plan_overlay_props,
             delete_group_plan_image,
             list_manual_buildings,
             add_manual_building,
             update_manual_building,
             delete_manual_building,
-            save_weather_day,
-            save_cloud_grid_day,
-            get_weather_cached_dates,
-            load_weather_cache,
-            load_cloud_grid_cache,
-            // LOS 결과 영속화
+            // LoS 결과 영속화
             save_los_result,
             load_los_results,
             delete_los_result,
@@ -2453,6 +2534,7 @@ pub fn run() {
             // 커버리지 캐시
             save_coverage_cache,
             load_coverage_cache,
+            has_coverage_cache,
             clear_coverage_cache,
             // 커버리지 계산 (rayon 최적화)
             compute_coverage_terrain_profile,
@@ -2474,6 +2556,21 @@ pub fn run() {
             analyze_pre_screening,
             compute_coverage_terrain_profile_excluding,
             compute_coverage_layers_batch_excluded,
+            // 토지이용계획정보
+            import_landuse_data,
+            query_landuse_in_bbox,
+            get_landuse_import_status,
+            clear_landuse_data,
+            // 토지이용계획도 타일
+            download_landuse_tiles,
+            get_landuse_tile_count,
+            clear_landuse_tiles,
+            get_landuse_tile,
+            // vworld 자동 다운로드
+            vworld_download_buildings,
+            vworld_download_fac_buildings,
+            vworld_download_landuse,
+            vworld_download_n3p,
             // WebView2 네이티브 PDF
             webview_print_to_pdf,
         ])

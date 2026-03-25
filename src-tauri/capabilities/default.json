@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for all windows",
+  "windows": ["main", "trackmap", "drawing"],
   "permissions": [
     "core:default",
+    "core:window:allow-create",
     "core:window:allow-start-dragging",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
@@ -12,6 +13,8 @@
     "core:window:allow-is-maximized",
     "core:window:allow-set-size",
     "core:window:allow-set-focus",
+    "core:window:allow-destroy",
+    "core:webview:allow-create-webview-window",
     "opener:default",
     "dialog:default",
     "dialog:allow-open",

@@ -11,4 +11,6 @@ export interface RadarSite {
   antenna_height: number;
   /** 제원상 지원범위 (NM) */
   range_nm: number;
+  /** 활성 여부 (비활성 시 분석/표시에서 제외) */
+  active?: boolean;
 }

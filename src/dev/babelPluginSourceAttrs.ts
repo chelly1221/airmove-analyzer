@@ -18,6 +18,13 @@ export default function babelPluginSourceAttrs({ types: t }: { types: any }) {
         )
           return;
 
+        // react-map-gl Source/Layer 스킵 (MapLibre에 unknown property로 전달됨)
+        if (
+          t.isJSXIdentifier(name) &&
+          (name.name === "Source" || name.name === "Layer")
+        )
+          return;
+
         // 이미 data-source가 있으면 스킵
         if (
           path.node.attributes.some(

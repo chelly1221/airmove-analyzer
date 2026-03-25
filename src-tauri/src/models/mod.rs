@@ -203,40 +203,6 @@ pub struct LineOfSightResult {
     pub target_altitude: f64,
 }
 
-/// ADS-B 트랙 포인트 (OpenSky Network)
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AdsbPoint {
-    pub time: f64,
-    pub latitude: f64,
-    pub longitude: f64,
-    /// 기압 고도 (m)
-    pub altitude: f64,
-    /// 방위 (degrees)
-    pub heading: f64,
-    pub on_ground: bool,
-}
-
-/// ADS-B 트랙 (한 비행 구간)
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AdsbTrack {
-    pub icao24: String,
-    pub callsign: Option<String>,
-    pub start_time: f64,
-    pub end_time: f64,
-    pub path: Vec<AdsbPoint>,
-}
-
-/// 운항이력 (OpenSky /flights/aircraft)
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct FlightRecord {
-    pub icao24: String,
-    pub first_seen: f64,
-    pub last_seen: f64,
-    pub est_departure_airport: Option<String>,
-    pub est_arrival_airport: Option<String>,
-    pub callsign: Option<String>,
-}
-
 /// Custom serialization for Vec<u8> as base64, so JSON transport works cleanly.
 mod serde_bytes_base64 {
     use serde::{Deserialize, Deserializer, Serializer};

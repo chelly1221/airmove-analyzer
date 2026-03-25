@@ -54,8 +54,8 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
     ? Array.from({ length: 10 }, (_, i) => getWeekStats(flights, i))
     : [];
 
-  // 비행검사기별 그룹핑 (OpenSky 매칭된 실제 비행만)
-  const realFlights = flights.filter((f) => f.match_type === "opensky");
+  // 비행검사기별 그룹핑
+  const realFlights = flights;
   const byAircraft = new Map<string, Flight[]>();
   for (const f of realFlights) {
     const name = f.aircraft_name ?? f.mode_s;
@@ -115,7 +115,7 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
         </div>
       )}
 
-      {/* 비행검사기별 비행 분석 (OpenSky 매칭 비행만) */}
+      {/* 비행검사기별 비행 분석 */}
       {[...byAircraft.entries()].sort(([a], [b]) => a.localeCompare(b, "ko")).map(([acName, acFlights]) => (
         <div key={acName} className="mb-5">
           <h3 className="mb-2 text-[15px] font-semibold text-gray-700">
@@ -138,7 +138,7 @@ export default function ReportStatsSection({ sectionNum, flights, template = "we
                 return (
                   <tr key={i} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
                     <td className="border border-gray-200 px-2 py-1.5">{label}</td>
-                    <td className="border border-gray-200 px-2 py-1.5 text-right">{f.track_points.length.toLocaleString()}</td>
+                    <td className="border border-gray-200 px-2 py-1.5 text-right">{f.point_count.toLocaleString()}</td>
                     <td className="border border-gray-200 px-2 py-1.5 text-right">{f.loss_points.length}</td>
                     <td className="border border-gray-200 px-2 py-1.5 text-right">{f.total_loss_time.toFixed(1)}</td>
                     <td className="border border-gray-200 px-2 py-1.5 text-right">{(f.total_track_time / 60).toFixed(1)}</td>

@@ -1,18 +1,19 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from "react";
-import { Filter, ChevronDown } from "lucide-react";
 import { format } from "date-fns";
 import MapGL, { Source, Layer, Marker } from "react-map-gl/maplibre";
 import { ScatterplotLayer } from "@deck.gl/layers";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { useAppStore } from "../store";
 import type { TrackPoint } from "../types";
+import { queryViewportPoints, queryFlightPoints } from "../utils/flightConsolidationWorker";
 import { GPU2D, type CircleData, type LineData } from "../utils/gpu2d";
 import {
-  computeMaxDistanceGPU, computeMaxDistanceCPU,
-  computeEwDistsGPU, computeEwDistsCPU,
-  computeDensityHistogramGPU, computeDensityHistogramCPU,
+  computeMaxDistanceGPU,
+  computeEwDistsGPU,
+  computeDensityHistogramGPU,
   type EwDistResult,
 } from "../utils/gpuDrawingCompute";
+import { useToastStore } from "../components/common/Toast";
 
 /** 탐지 유형별 색상 (항적지도와 동일) */
 const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
@@ -58,6 +59,9 @@ function circleCoords(lat: number, lon: number, radiusKm: number, steps = 64): [
 
 export default function Drawing() {
   const allFlights = useAppStore((s) => s.flights);
+  const consolidating = useAppStore((s) => s.consolidating);
+  const consolidationProgress = useAppStore((s) => s.consolidationProgress);
+
   const aircraft = useAppStore((s) => s.aircraft);
   const radarSite = useAppStore((s) => s.radarSite);
   const flights = useMemo(
@@ -65,10 +69,7 @@ export default function Drawing() {
     [allFlights, radarSite.name],
   );
   const selectedModeS = useAppStore((s) => s.selectedModeS);
-  const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
   const selectedFlightId = useAppStore((s) => s.selectedFlightId);
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
   const sideCanvasRef = useRef<HTMLCanvasElement>(null);
   const gpuRef = useRef<GPU2D | null>(null);
   const gpuCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -94,16 +95,6 @@ export default function Drawing() {
   const zoomVEnd = zoomView[1];
   const zoomRange = zoomVEnd - zoomVStart;
   const absToScreen = (abs: number) => zoomRange > 0 ? ((abs - zoomVStart) / zoomRange) * 100 : 0;
-
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setDropdownOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, []);
 
   // GPU2D 정리 (언마운트 시)
   useEffect(() => {
@@ -145,9 +136,7 @@ export default function Drawing() {
   const modeSCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const f of flights) {
-      for (const p of f.track_points) {
-        counts.set(p.mode_s, (counts.get(p.mode_s) ?? 0) + 1);
-      }
+      counts.set(f.mode_s, (counts.get(f.mode_s) ?? 0) + f.point_count);
     }
     return counts;
   }, [flights]);
@@ -160,37 +149,49 @@ export default function Drawing() {
     return valid;
   }, [modeSCounts]);
 
-  // 포인트 필터링
-  const { filteredPoints, legendEntries } = useMemo(() => {
-    const registeredModeS = new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
-    const showAll = selectedModeS === "__ALL__";
-    const pts: TrackPoint[] = [];
-    for (const f of flights) {
-      for (const p of f.track_points) {
-        if (!validModeS.has(p.mode_s)) continue;
-        if (showAll) { pts.push(p); }
-        else if (!selectedModeS) {
-          if (registeredModeS.has(p.mode_s.toUpperCase())) pts.push(p);
-        } else {
-          if (p.mode_s === selectedModeS) pts.push(p);
-        }
-      }
+  // 포인트 필터링 (Worker 쿼리 기반)
+  const [filteredPoints, setFilteredPoints] = useState<TrackPoint[]>([]);
+  const legendEntries = useMemo(() => {
+    const usedTypes = new Set<string>();
+    for (const p of filteredPoints) usedTypes.add(p.radar_type);
+    return Array.from(usedTypes).sort().map((rt) => ({
+      radarType: rt,
+      label: radarTypeLabel(rt),
+      color: DETECTION_TYPE_COLORS[rt] ?? [128, 128, 128] as [number, number, number],
+    }));
+  }, [filteredPoints]);
+
+  useEffect(() => {
+    if (flights.length === 0) { setFilteredPoints([]); return; }
+
+    let cancelled = false;
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const doQuery = () => {
+      const registeredMS = aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase());
+      queryViewportPoints({
+        radarName: radarSite.name,
+        selectedModeS,
+        registeredModeS: registeredMS,
+      }).then(({ points: pts }) => {
+        if (!cancelled) setFilteredPoints(pts);
+      });
+    };
+
+    // 통합 진행 중에는 debounce — 빈번한 재계산 방지
+    if (consolidating) {
+      debounceTimer = setTimeout(() => {
+        if (!cancelled) doQuery();
+      }, 500);
+    } else {
+      doQuery();
     }
 
-    // 탐지 유형별 색상 매핑 (항적지도와 동일)
-    const usedTypes = new Set<string>();
-    for (const p of pts) usedTypes.add(p.radar_type);
-
-    const legendEntries = Array.from(usedTypes)
-      .sort()
-      .map((rt) => ({
-        radarType: rt,
-        label: radarTypeLabel(rt),
-        color: DETECTION_TYPE_COLORS[rt] ?? [128, 128, 128] as [number, number, number],
-      }));
-
-    return { filteredPoints: pts, legendEntries };
-  }, [flights, aircraft, selectedModeS, validModeS]);
+    return () => {
+      cancelled = true;
+      if (debounceTimer !== undefined) clearTimeout(debounceTimer);
+    };
+  }, [flights, consolidating, radarSite.name, aircraft, selectedModeS, validModeS]);
 
   // 시간 범위
   const timeRange = useMemo(() => {
@@ -216,16 +217,18 @@ export default function Drawing() {
 
   // 비행 선택 시 해당 비행의 시간 범위로 표시 (앞뒤 1시간 여유)
   const displayTimeRange = useMemo(() => {
-    const pts = selectedFlightId
-      ? (filteredFlights.find((f) => f.id === selectedFlightId)?.track_points ?? [])
-      : filteredPoints;
+    if (selectedFlightId) {
+      const f = filteredFlights.find((fl) => fl.id === selectedFlightId);
+      if (f && f.point_count > 0) return { min: f.start_time - 3600, max: f.end_time + 3600 };
+      return { min: 0, max: 0 };
+    }
+    const pts = filteredPoints;
     if (pts.length === 0) return { min: 0, max: 0 };
     let min = Infinity, max = -Infinity;
     for (const p of pts) {
       if (p.timestamp < min) min = p.timestamp;
       if (p.timestamp > max) max = p.timestamp;
     }
-    // 비행 선택 시 앞뒤 1시간 여유
     if (selectedFlightId) {
       min -= 3600;
       max += 3600;
@@ -309,33 +312,21 @@ export default function Drawing() {
   }, []);
 
   // 등록 항공기 Mode-S 세트
-  const registeredModeSSet = useMemo(
-    () => new Set(aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase())),
-    [aircraft]
-  );
-
-  // Mode-S 드롭다운 옵션 (등록 항공기 제외, 공유된 modeSCounts 재사용)
-  const modeSOptions = useMemo(() => {
-    const valid: string[] = [];
-    for (const ms of validModeS) {
-      if (!registeredModeSSet.has(ms.toUpperCase())) valid.push(ms);
-    }
-    return valid.sort();
-  }, [validModeS, registeredModeSSet]);
-
-  // 비행 선택 시 해당 비행 전체 포인트 (구간 미적용, 맵 뷰/줌 고정용)
-  const flightBasePoints = useMemo(() => {
-    if (!selectedFlightId) return filteredPoints;
-    const flight = filteredFlights.find((f) => f.id === selectedFlightId);
-    return flight ? flight.track_points : filteredPoints;
-  }, [selectedFlightId, filteredFlights, filteredPoints]);
+  // 비행 선택 시 해당 비행 전체 포인트 (Worker 쿼리, 비동기)
+  const [flightBasePoints, setFlightBasePoints] = useState<TrackPoint[]>([]);
+  useEffect(() => {
+    if (!selectedFlightId) { setFlightBasePoints(filteredPoints); return; }
+    let cancelled = false;
+    queryFlightPoints(selectedFlightId).then((pts) => {
+      if (!cancelled) setFlightBasePoints(pts);
+    });
+    return () => { cancelled = true; };
+  }, [selectedFlightId, filteredPoints]);
 
   // 비행 선택 시 해당 비행만 필터 + 구간 선택 적용, 선택 해제 시 전체
   const flightFilteredPoints = useMemo(() => {
     if (!selectedFlightId) return displayPoints;
-    const flight = filteredFlights.find((f) => f.id === selectedFlightId);
-    if (!flight) return displayPoints;
-    let pts = flight.track_points;
+    let pts = flightBasePoints;
     // 구간 선택 적용 (displayTimeRange 기준)
     if (rangeStart > 0 || rangeEnd < 100) {
       const minTs = displayPctToTs(rangeStart);
@@ -343,7 +334,7 @@ export default function Drawing() {
       pts = pts.filter((p) => p.timestamp >= minTs && p.timestamp <= maxTs);
     }
     return pts;
-  }, [selectedFlightId, filteredFlights, displayPoints, rangeStart, rangeEnd, displayPctToTs]);
+  }, [selectedFlightId, flightBasePoints, displayPoints, rangeStart, rangeEnd, displayPctToTs]);
 
   // ── WebGPU 계산용 사전 추출 배열 (포인트 변경 시 1회 생성) ──
   const { lonsArray, timestampsArray } = useMemo(() => {
@@ -380,14 +371,11 @@ export default function Drawing() {
     const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
     let cancelled = false;
 
-    computeEwDistsGPU(radarSite.longitude, cosLat, lonsArray).then((gpuResult) => {
+    computeEwDistsGPU(radarSite.longitude, cosLat, lonsArray).then((result) => {
       if (cancelled) return;
-      if (gpuResult) {
-        setEwDistResult(gpuResult);
-      } else {
-        // CPU 폴백
-        setEwDistResult(computeEwDistsCPU(radarSite.longitude, cosLat, flightFilteredPoints));
-      }
+      setEwDistResult(result);
+    }).catch((err) => {
+      if (!cancelled) useToastStore.getState().addToast(`GPU EW 거리 계산 실패: ${err instanceof Error ? err.message : String(err)}`, "error");
     });
 
     return () => { cancelled = true; };
@@ -439,7 +427,11 @@ export default function Drawing() {
     // GPU 초기화 (lazy-init)
     const gpuCanvas = gpuCanvasRef.current;
     if (gpuCanvas && !gpuRef.current) {
-      try { gpuRef.current = new GPU2D(gpuCanvas); } catch { /* WebGL2 불가 시 무시 */ }
+      try {
+        gpuRef.current = new GPU2D(gpuCanvas);
+      } catch (e) {
+        useToastStore.getState().addToast(`WebGL2 초기화 실패: ${e instanceof Error ? e.message : "GPU를 사용할 수 없습니다."}`, "error");
+      }
     }
     const gpu = gpuRef.current;
 
@@ -500,40 +492,6 @@ export default function Drawing() {
       });
       gpu.drawCircles(circles);
       gpu.flush();
-    } else {
-      // GPU 불가 시 Canvas 2D 폴백
-      ctx.strokeStyle = "rgba(0,0,0,0.3)";
-      ctx.lineWidth = 0.5;
-      const altRangeFt = (maxAlt - minAlt) * M_TO_FT;
-      const yStepFt = altRangeFt > 30000 ? 5000 : altRangeFt > 15000 ? 2000 : altRangeFt > 5000 ? 1000 : altRangeFt > 1500 ? 500 : 100;
-      for (let ft = Math.ceil(minAltFt / yStepFt) * yStepFt; ft <= maxAltFt; ft += yStepFt) {
-        const y = yScale(ft / M_TO_FT);
-        ctx.beginPath(); ctx.moveTo(PAD, y); ctx.lineTo(w - PAD, y); ctx.stroke();
-      }
-      const maxAbsEW_NM = maxAbsEW * KM_TO_NM;
-      const ewStepNM = maxAbsEW_NM > 100 ? 20 : maxAbsEW_NM > 50 ? 10 : maxAbsEW_NM > 20 ? 5 : maxAbsEW_NM > 10 ? 2 : 1;
-      for (let nm = -Math.ceil(maxAbsEW_NM / ewStepNM) * ewStepNM; nm <= maxAbsEW_NM; nm += ewStepNM) {
-        const x = xScale(nm * NM_TO_KM);
-        if (x < PAD || x > w - PAD) continue;
-        ctx.beginPath(); ctx.moveTo(x, PAD); ctx.lineTo(x, h - PAD); ctx.stroke();
-      }
-      ctx.strokeStyle = "rgba(59,130,246,0.3)";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath(); ctx.moveTo(centerX, PAD); ctx.lineTo(centerX, h - PAD); ctx.stroke();
-      ctx.setLineDash([]);
-      for (let i = 0; i < flightFilteredPoints.length; i++) {
-        const p = flightFilteredPoints[i];
-        const c = DETECTION_TYPE_COLORS[p.radar_type] ?? [128, 128, 128];
-        ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.7)`;
-        ctx.beginPath();
-        ctx.arc(xScale(ewDists[i]), yScale(p.altitude), DOT_R, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.fillStyle = "rgba(59,130,246,1)";
-      ctx.beginPath();
-      ctx.arc(centerX, yScale(radarSite.altitude + radarSite.antenna_height), 4, 0, Math.PI * 2);
-      ctx.fill();
     }
 
     // ── 축 라인 + 눈금 (Canvas 2D) ──
@@ -595,14 +553,11 @@ export default function Drawing() {
     if (flightBasePoints.length === 0) { setMaxDistKm(0); return; }
     let cancelled = false;
 
-    computeMaxDistanceGPU(radarSite.latitude, radarSite.longitude, baseLatLonArray).then((gpuResult) => {
+    computeMaxDistanceGPU(radarSite.latitude, radarSite.longitude, baseLatLonArray).then((result) => {
       if (cancelled) return;
-      if (gpuResult !== null) {
-        setMaxDistKm(gpuResult);
-      } else {
-        // CPU 폴백
-        setMaxDistKm(computeMaxDistanceCPU(radarSite.latitude, radarSite.longitude, flightBasePoints));
-      }
+      setMaxDistKm(result);
+    }).catch((err) => {
+      if (!cancelled) useToastStore.getState().addToast(`GPU 최대거리 계산 실패: ${err instanceof Error ? err.message : String(err)}`, "error");
     });
 
     return () => { cancelled = true; };
@@ -687,9 +642,7 @@ export default function Drawing() {
 
   useEffect(() => {
     const range = selectedFlightId ? displayTimeRange : timeRange;
-    const pts = selectedFlightId
-      ? (filteredFlights.find((f) => f.id === selectedFlightId)?.track_points ?? filteredPoints)
-      : filteredPoints;
+    const pts = selectedFlightId ? flightBasePoints : filteredPoints;
     if (pts.length === 0 || range.max <= range.min) { setDensityBuckets([]); return; }
     const fullSpan = range.max - range.min;
     const viewMinTs = range.min + (zoomVStart / 100) * fullSpan;
@@ -704,91 +657,41 @@ export default function Drawing() {
       ? (() => { const a = new Float32Array(pts.length); for (let i = 0; i < pts.length; i++) a[i] = pts[i].timestamp; return a; })()
       : timestampsArray;
 
-    computeDensityHistogramGPU(tsArr, viewMinTs, viewMaxTs, NUM_BUCKETS).then((gpuResult) => {
+    computeDensityHistogramGPU(tsArr, viewMinTs, viewMaxTs, NUM_BUCKETS).then((result) => {
       if (cancelled) return;
-      if (gpuResult) {
-        setDensityBuckets(gpuResult);
-      } else {
-        setDensityBuckets(computeDensityHistogramCPU(pts, viewMinTs, viewMaxTs, NUM_BUCKETS));
-      }
+      setDensityBuckets(result);
+    }).catch((err) => {
+      if (!cancelled) useToastStore.getState().addToast(`GPU 히스토그램 계산 실패: ${err instanceof Error ? err.message : String(err)}`, "error");
     });
 
     return () => { cancelled = true; };
   }, [filteredPoints, filteredFlights, selectedFlightId, timeRange, displayTimeRange, zoomVStart, zoomVEnd, timestampsArray]);
 
-  const getFilterLabel = () => {
-    if (!selectedModeS) return "비행검사기 (등록)";
-    if (selectedModeS === "__ALL__") return "전체 항적";
-    const ac = aircraft.find((a) => a.mode_s_code.toUpperCase() === selectedModeS.toUpperCase());
-    return ac ? ac.name : selectedModeS;
-  };
-
   return (
-    <div className="flex h-full flex-col space-y-4">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-800">2D 항적도</h1>
-          <p className="mt-1 text-sm text-gray-500">
-            측면도와 평면도를 나란히 표시합니다
-          </p>
-        </div>
-
-        {/* Mode-S 필터 */}
-        <div className="relative" ref={dropdownRef}>
-          <button
-            onClick={() => setDropdownOpen(!dropdownOpen)}
-            className="flex items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800 hover:border-gray-300"
-          >
-            <Filter size={14} />
-            <span>{getFilterLabel()}</span>
-            <ChevronDown size={14} />
-          </button>
-          {dropdownOpen && (
-            <div className="absolute right-0 top-full z-50 mt-1 w-64 overflow-auto rounded-lg border border-gray-200 bg-gray-50 py-1 shadow-xl max-h-72">
-              <button
-                onClick={() => { setSelectedModeS(null); setDropdownOpen(false); }}
-                className={`w-full px-3 py-2 text-left text-sm ${!selectedModeS ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-              >
-                비행검사기 (등록)
-              </button>
-              {aircraft.filter((a) => a.active).map((a) => (
-                <button
-                  key={a.id}
-                  onClick={() => { setSelectedModeS(a.mode_s_code); setDropdownOpen(false); }}
-                  className={`w-full px-3 py-2 text-left text-sm ${selectedModeS === a.mode_s_code ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-                >
-                  {a.name} ({a.mode_s_code})
-                </button>
-              ))}
-              <div className="my-1 h-px bg-gray-200" />
-              <button
-                onClick={() => { setSelectedModeS("__ALL__"); setDropdownOpen(false); }}
-                className={`w-full px-3 py-2 text-left text-sm ${selectedModeS === "__ALL__" ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-              >
-                전체 항적
-              </button>
-              {modeSOptions.length > 0 && <div className="my-1 h-px bg-gray-200" />}
-              {modeSOptions.map((ms) => (
-                <button
-                  key={ms}
-                  onClick={() => { setSelectedModeS(ms); setDropdownOpen(false); }}
-                  className={`w-full px-3 py-2 text-left text-sm font-mono ${selectedModeS === ms ? "bg-[#a60739] text-white" : "text-gray-600 hover:bg-gray-100"}`}
-                >
-                  {ms}
-                </button>
-              ))}
+    <div className="relative flex h-full flex-col px-2 pb-2">
+          {/* 통합 진행률 오버레이 */}
+          {consolidating && filteredPoints.length === 0 && (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-white/60 backdrop-blur-[2px] rounded-xl">
+              <div className="text-center min-w-[240px] px-6">
+                <div className="flex items-center justify-center gap-2 mb-2">
+                  <svg className="w-4 h-4 text-[#a60739] animate-spin" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="50 20" /></svg>
+                  <p className="text-sm font-medium text-gray-600">
+                    {consolidationProgress?.stage === "loading" ? "DB에서 항적 로드 중..."
+                      : consolidationProgress?.stage === "history" ? "운항이력 로드 중..."
+                      : consolidationProgress?.stage === "grouping" ? "항적 그룹핑 중..."
+                      : consolidationProgress?.stage === "building" ? "비행 데이터 생성 중..."
+                      : "비행 통합 처리 중..."}
+                  </p>
+                </div>
+                {consolidationProgress && consolidationProgress.total > 0 && (
+                  <div className="w-full bg-gray-200 rounded-full h-1.5 overflow-hidden">
+                    <div className="h-full rounded-full bg-[#a60739] transition-all duration-200" style={{ width: `${Math.min(100, (consolidationProgress.current / consolidationProgress.total) * 100)}%` }} />
+                  </div>
+                )}
+              </div>
             </div>
           )}
-        </div>
-      </div>
 
-      {filteredPoints.length === 0 ? (
-        <div className="flex flex-1 items-center justify-center rounded-xl border border-gray-200 bg-gray-50">
-          <p className="text-sm text-gray-500">표시할 항적 데이터가 없습니다</p>
-        </div>
-      ) : (
-        <>
           {/* 범례 (탐지 유형별, 항적지도와 동일) */}
           {legendEntries.length > 0 && (
             <div className="flex flex-wrap items-center gap-3 text-xs">
@@ -965,8 +868,6 @@ export default function Drawing() {
               </div>
             </div>
           </div>
-        </>
-      )}
     </div>
   );
 }

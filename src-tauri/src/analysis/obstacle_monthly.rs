@@ -25,6 +25,7 @@ impl AzSector {
     /// 주어진 방위(0~360)가 이 구간에 포함되는지 확인.
     /// start > end인 경우 (예: 350°~10°) 북쪽 wrap-around 처리.
     pub fn contains(&self, az: f64) -> bool {
+        let az = ((az % 360.0) + 360.0) % 360.0; // normalize to [0, 360)
         if self.start_deg <= self.end_deg {
             az >= self.start_deg && az <= self.end_deg
         } else {
@@ -237,7 +238,11 @@ pub fn analyze_radar_monthly(
             radar.radar_lat,
             radar.radar_lon,
             &[],   // 전체 항공기
+            &[],   // 전체 squawk
             mag_dec_deg,
+            "and",
+            false,
+            false,
             |_| {},
         ) {
             Ok(p) => p,

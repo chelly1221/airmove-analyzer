@@ -104,7 +104,7 @@ pub struct PreScreeningResult {
 
 /// 4/3 유효지구 모델 앙각 계산 (도)
 fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
-    if d < 1.0 || !d.is_finite() {
+    if d < 1.0 || !d.is_finite() || !h_obs.is_finite() || !h_radar.is_finite() {
         return 0.0;
     }
     let dh = h_obs - h_radar;
@@ -153,10 +153,10 @@ impl LightPoint {
     }
 }
 
-/// 항공기의 특정 위치에서 건물에 의한 LOS 차단 여부 판정
+/// 항공기의 특정 위치에서 건물에 의한 LoS 차단 여부 판정
 ///
 /// 레이더 → 항공기 직선 경로 상에서 건물 위치를 통과할 때
-/// 건물 꼭대기가 LOS 선보다 높으면 차단 (4/3 유효지구 모델)
+/// 건물 꼭대기가 LoS 선보다 높으면 차단 (4/3 유효지구 모델)
 fn is_blocked_by_building(
     radar_lat: f64, radar_lon: f64, radar_height: f64,
     ac_lat: f64, ac_lon: f64, ac_alt: f64,   // 항공기 (해발고 m)
@@ -167,9 +167,9 @@ fn is_blocked_by_building(
     let d_bldg = crate::geo::haversine_m(radar_lat, radar_lon, bldg_lat, bldg_lon);
     if d_bldg > d_total || d_bldg < 100.0 { return false; }
 
-    let t = d_bldg / d_total;  // 건물이 LOS 선 상의 비율 위치
+    let t = d_bldg / d_total;  // 건물이 LoS 선 상의 비율 위치
 
-    // 4/3 유효지구 모델: LOS 선 높이 at building distance
+    // 4/3 유효지구 모델: LoS 선 높이 at building distance
     // curvature drop at building location
     let curv_drop_bldg = d_bldg * d_bldg / (2.0 * R_EFF);
     let curv_drop_total = d_total * d_total / (2.0 * R_EFF);
@@ -181,7 +181,7 @@ fn is_blocked_by_building(
     bldg_top > los_height_at_bldg
 }
 
-/// 기존 지형에 의한 LOS 차단 여부 (건물 제외, SRTM 지형만)
+/// 기존 지형에 의한 LoS 차단 여부 (건물 제외, SRTM 지형만)
 /// 레이더 → 항공기 경로 상 지형 스캔
 fn is_blocked_by_terrain(
     radar_lat: f64, radar_lon: f64, radar_height: f64,
@@ -315,7 +315,7 @@ pub fn analyze_pre_screening(
         });
 
         let parsed = match parser::ass::parse_ass_file(
-            path, radar.radar_lat, radar.radar_lon, &[], mag_dec_deg, |_| {},
+            path, radar.radar_lat, radar.radar_lon, &[], &[], mag_dec_deg, "and", false, false, |_| {},
         ) {
             Ok(p) => p,
             Err(e) => {

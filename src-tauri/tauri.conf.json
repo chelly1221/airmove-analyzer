@@ -12,7 +12,8 @@
   "app": {
     "windows": [
       {
-        "title": "AirMove Analyzer — Gimpo Radar Flight Inspection Track Analysis",
+        "label": "main",
+        "title": "공항감시레이더 종합분석체계",
         "width": 1280,
         "height": 800,
         "minWidth": 1024,

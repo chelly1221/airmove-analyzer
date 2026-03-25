@@ -1,12 +1,12 @@
 import React, { useMemo } from "react";
-import type { RadarMonthlyResult, ManualBuilding, RadarSite, LOSProfileData, PanoramaPoint } from "../../types";
+import type { RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
 
 interface Props {
   sectionNum: number;
   radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
   radarSites: RadarSite[];
-  losMap: Map<string, LOSProfileData>;
+  losMap: Map<string, LoSProfileData>;
   panoWithTargets?: Map<string, PanoramaPoint[]>;
   panoWithoutTargets?: Map<string, PanoramaPoint[]>;
 }

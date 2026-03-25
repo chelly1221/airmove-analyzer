@@ -1,844 +1,25 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
-  Plus,
-  Pencil,
-  Plane,
-  Radio,
-  X,
-  MapPin,
-  Key,
   Check,
-  Eye,
-  EyeOff,
   Database,
   Download,
   Upload,
   AlertTriangle,
   Mountain,
   Building2,
-  Trash2,
   ExternalLink,
   Loader2,
+  Globe,
+  Eye,
+  EyeOff,
+  Save,
+  KeyRound,
+  ChevronDown,
 } from "lucide-react";
-import maplibregl from "maplibre-gl";
 import { invoke } from "@tauri-apps/api/core";
 import Modal from "../components/common/Modal";
-import DataTable from "../components/common/DataTable";
 import { useAppStore } from "../store";
-import type { Aircraft, RadarSite, BuildingImportStatus } from "../types";
-
-/** 기본 레이더 사이트 */
-const DEFAULT_RADAR_SITE: RadarSite = {
-  name: "김포 #1", latitude: 37.5490, longitude: 126.7937, altitude: 9.11, antenna_height: 19.8, range_nm: 200,
-};
-
-// ─── 비행검사기 관리 ───────────────────────────────────────────────────
-
-function generateId(): string {
-  return crypto.randomUUID();
-}
-
-const emptyForm: Omit<Aircraft, "id"> = {
-  name: "",
-  registration: "",
-  model: "",
-  mode_s_code: "",
-  organization: "",
-  memo: "",
-  active: true,
-};
-
-function AircraftSection() {
-  const aircraft = useAppStore((s) => s.aircraft);
-  const addAircraft = useAppStore((s) => s.addAircraft);
-  const updateAircraft = useAppStore((s) => s.updateAircraft);
-  const removeAircraft = useAppStore((s) => s.removeAircraft);
-
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editId, setEditId] = useState<string | null>(null);
-  const [form, setForm] = useState(emptyForm);
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
-
-  const openAdd = () => {
-    setEditId(null);
-    setForm(emptyForm);
-    setErrors({});
-    setModalOpen(true);
-  };
-
-  const openEdit = (a: Aircraft) => {
-    setEditId(a.id);
-    setForm({
-      name: a.name,
-      registration: a.registration ?? "",
-      model: a.model,
-      mode_s_code: a.mode_s_code,
-      organization: a.organization,
-      memo: a.memo,
-      active: a.active,
-    });
-    setErrors({});
-    setModalOpen(true);
-  };
-
-  const validate = (): boolean => {
-    const errs: Record<string, string> = {};
-    if (!form.name.trim()) errs.name = "이름을 입력하세요";
-    if (!form.mode_s_code.trim()) {
-      errs.mode_s_code = "Mode-S 코드를 입력하세요";
-    } else if (!/^[0-9a-fA-F]{6}$/.test(form.mode_s_code.trim())) {
-      errs.mode_s_code = "Mode-S 코드는 6자리 HEX 값이어야 합니다";
-    }
-    if (!form.organization.trim())
-      errs.organization = "운용 기관을 입력하세요";
-
-    const duplicate = aircraft.find(
-      (a) =>
-        a.mode_s_code.toLowerCase() === form.mode_s_code.trim().toLowerCase() &&
-        a.id !== editId
-    );
-    if (duplicate) {
-      errs.mode_s_code = "이미 등록된 Mode-S 코드입니다";
-    }
-
-    setErrors(errs);
-    return Object.keys(errs).length === 0;
-  };
-
-  const handleSave = () => {
-    if (!validate()) return;
-
-    if (editId) {
-      updateAircraft(editId, {
-        name: form.name.trim(),
-        registration: form.registration.trim(),
-        model: form.model.trim(),
-        mode_s_code: form.mode_s_code.trim().toUpperCase(),
-        organization: form.organization.trim(),
-        memo: form.memo.trim(),
-        active: form.active,
-      });
-    } else {
-      addAircraft({
-        id: generateId(),
-        name: form.name.trim(),
-        registration: form.registration.trim(),
-        model: form.model.trim(),
-        mode_s_code: form.mode_s_code.trim().toUpperCase(),
-        organization: form.organization.trim(),
-        memo: form.memo.trim(),
-        active: form.active,
-      });
-    }
-    setModalOpen(false);
-  };
-
-  const handleDelete = (id: string) => {
-    removeAircraft(id);
-    setDeleteConfirm(null);
-  };
-
-  const columns = [
-    { key: "name", header: "이름" },
-    {
-      key: "registration",
-      header: "등록번호",
-      render: (a: Aircraft) => (
-        <span className="font-mono text-xs text-gray-500">{a.registration || "-"}</span>
-      ),
-    },
-    {
-      key: "model",
-      header: "기체 모델",
-      render: (a: Aircraft) => (
-        <span className="text-gray-500">{a.model || "-"}</span>
-      ),
-    },
-    {
-      key: "mode_s_code",
-      header: "Mode-S",
-      render: (a: Aircraft) => (
-        <span className="rounded bg-gray-100 px-2 py-0.5 font-mono text-xs">
-          {a.mode_s_code}
-        </span>
-      ),
-    },
-    { key: "organization", header: "운용 기관" },
-    {
-      key: "memo",
-      header: "메모",
-      render: (a: Aircraft) => (
-        <span className="text-gray-500">{a.memo || "-"}</span>
-      ),
-    },
-    {
-      key: "actions",
-      header: "",
-      width: "50px",
-      render: (a: Aircraft) => (
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            openEdit(a);
-          }}
-          className="rounded p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
-          title="수정"
-          aria-label="수정"
-        >
-          <Pencil size={14} />
-        </button>
-      ),
-    },
-  ];
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Plane size={16} className="text-[#a60739]" />
-          <h2 className="text-lg font-semibold text-gray-800">비행검사기 관리</h2>
-          <span className="text-xs text-gray-500">({aircraft.length}/10)</span>
-        </div>
-        <button
-          onClick={openAdd}
-          disabled={aircraft.length >= 10}
-          className="flex items-center gap-2 rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          <Plus size={16} />
-          <span>비행검사기 추가</span>
-        </button>
-      </div>
-
-      {aircraft.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-gray-200 bg-gray-50 py-16">
-          <Plane size={40} className="mb-3 text-gray-600" />
-          <p className="text-sm font-medium text-gray-500">
-            등록된 비행검사기가 없습니다
-          </p>
-          <p className="mt-1 text-xs text-gray-600">
-            &quot;비행검사기 추가&quot; 버튼을 눌러 등록하세요
-          </p>
-        </div>
-      ) : (
-        <DataTable
-          columns={columns}
-          data={aircraft}
-          rowKey={(a) => a.id}
-          emptyMessage="등록된 비행검사기가 없습니다"
-        />
-      )}
-
-      {/* Add/Edit Modal */}
-      <Modal
-        open={modalOpen}
-        onClose={() => setModalOpen(false)}
-        title={editId ? "비행검사기 수정" : "비행검사기 추가"}
-      >
-        <div className="space-y-4">
-          <div>
-            <label className="mb-1 block text-sm text-gray-600">
-              이름 <span className="text-[#a60739]">*</span>
-            </label>
-            <input
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-              placeholder="예: 1호기"
-            />
-            {errors.name && (
-              <p className="mt-1 text-xs text-[#a60739]">{errors.name}</p>
-            )}
-          </div>
-          <div>
-            <label className="mb-1 block text-sm text-gray-600">
-              기체 모델
-            </label>
-            <input
-              value={form.model}
-              onChange={(e) => setForm({ ...form, model: e.target.value })}
-              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-              placeholder="예: King Air 350"
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-sm text-gray-600">
-              등록번호
-            </label>
-            <input
-              value={form.registration}
-              onChange={(e) => setForm({ ...form, registration: e.target.value })}
-              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-mono text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-              placeholder="예: FL7779"
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-sm text-gray-600">
-              Mode-S 코드 <span className="text-[#a60739]">*</span>
-            </label>
-            <input
-              value={form.mode_s_code}
-              onChange={(e) =>
-                setForm({ ...form, mode_s_code: e.target.value })
-              }
-              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-mono text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-              placeholder="예: A1B2C3"
-              maxLength={6}
-            />
-            {errors.mode_s_code && (
-              <p className="mt-1 text-xs text-[#a60739]">
-                {errors.mode_s_code}
-              </p>
-            )}
-          </div>
-          <div>
-            <label className="mb-1 block text-sm text-gray-600">
-              운용 기관 <span className="text-[#a60739]">*</span>
-            </label>
-            <input
-              value={form.organization}
-              onChange={(e) =>
-                setForm({ ...form, organization: e.target.value })
-              }
-              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-              placeholder="예: 항공우주연구원"
-            />
-            {errors.organization && (
-              <p className="mt-1 text-xs text-[#a60739]">
-                {errors.organization}
-              </p>
-            )}
-          </div>
-          <div>
-            <label className="mb-1 block text-sm text-gray-600">메모</label>
-            <textarea
-              value={form.memo}
-              onChange={(e) => setForm({ ...form, memo: e.target.value })}
-              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-              placeholder="비고 사항"
-              rows={2}
-            />
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={() => setForm({ ...form, active: !form.active })}
-              className={`relative h-6 w-11 rounded-full transition-colors ${form.active ? "bg-[#a60739]" : "bg-gray-600"}`}
-            >
-              <div
-                className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${form.active ? "left-[22px]" : "left-0.5"}`}
-              />
-            </button>
-            <span className="text-sm text-gray-600">
-              {form.active ? "활성" : "비활성"}
-            </span>
-          </div>
-          <div className="flex items-center justify-between pt-2">
-            {editId ? (
-              <button
-                onClick={() => { setModalOpen(false); setDeleteConfirm(editId); }}
-                className="rounded-lg px-3 py-2 text-sm text-red-500 hover:bg-red-50 transition-colors"
-              >
-                삭제
-              </button>
-            ) : <div />}
-            <div className="flex gap-3">
-              <button
-                onClick={() => setModalOpen(false)}
-                className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
-              >
-                취소
-              </button>
-              <button
-                onClick={handleSave}
-                className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] transition-colors"
-              >
-                {editId ? "수정" : "추가"}
-              </button>
-            </div>
-          </div>
-        </div>
-      </Modal>
-
-      {/* Delete Confirmation */}
-      <Modal
-        open={deleteConfirm !== null}
-        onClose={() => setDeleteConfirm(null)}
-        title="비행검사기 삭제"
-        width="max-w-sm"
-      >
-        <div className="space-y-4">
-          <p className="text-sm text-gray-600">
-            이 비행검사기를 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.
-          </p>
-          <div className="flex justify-end gap-3">
-            <button
-              onClick={() => setDeleteConfirm(null)}
-              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
-            >
-              취소
-            </button>
-            <button
-              onClick={() => deleteConfirm && handleDelete(deleteConfirm)}
-              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
-            >
-              삭제
-            </button>
-          </div>
-        </div>
-      </Modal>
-    </div>
-  );
-}
-
-// ─── 레이더 사이트 편집 폼 ─────────────────────────────────────────────
-
-function RadarSiteEditor({
-  initial,
-  onSave,
-  onCancel,
-  onDelete,
-}: {
-  initial?: RadarSite;
-  onSave: (site: RadarSite) => void;
-  onCancel: () => void;
-  onDelete?: () => void;
-}) {
-  const [name, setName] = useState(initial?.name ?? "");
-  const [lat, setLat] = useState(initial?.latitude.toString() ?? "");
-  const [lon, setLon] = useState(initial?.longitude.toString() ?? "");
-  const [alt, setAlt] = useState(initial?.altitude.toString() ?? "0");
-  const [antH, setAntH] = useState(initial?.antenna_height.toString() ?? "25");
-  const [rangeNm, setRangeNm] = useState(initial?.range_nm?.toString() ?? "60");
-  const [pickMode, setPickMode] = useState(false);
-  const mapContainerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<maplibregl.Map | null>(null);
-  const markerRef = useRef<maplibregl.Marker | null>(null);
-
-  const latRef = useRef(lat);
-  const lonRef = useRef(lon);
-  latRef.current = lat;
-  lonRef.current = lon;
-
-  useEffect(() => {
-    if (!pickMode || !mapContainerRef.current) return;
-
-    // ref에서 최신 좌표값 읽기 (stale closure 방지)
-    const parsedLat = parseFloat(latRef.current);
-    const parsedLon = parseFloat(lonRef.current);
-
-    const map = new maplibregl.Map({
-      container: mapContainerRef.current,
-      style: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-      center: [
-        !isNaN(parsedLon) ? parsedLon : 127.0,
-        !isNaN(parsedLat) ? parsedLat : 36.5,
-      ],
-      zoom: 6,
-    });
-
-    if (!isNaN(parsedLat) && !isNaN(parsedLon)) {
-      markerRef.current = new maplibregl.Marker({ color: "#a60739" })
-        .setLngLat([parsedLon, parsedLat])
-        .addTo(map);
-    }
-
-    map.on("click", (e) => {
-      const { lng, lat: clickLat } = e.lngLat;
-      setLat(clickLat.toFixed(4));
-      setLon(lng.toFixed(4));
-
-      if (markerRef.current) {
-        markerRef.current.setLngLat([lng, clickLat]);
-      } else {
-        markerRef.current = new maplibregl.Marker({ color: "#a60739" })
-          .setLngLat([lng, clickLat])
-          .addTo(map);
-      }
-    });
-
-    mapRef.current = map;
-    return () => {
-      markerRef.current = null;
-      map.remove();
-    };
-  }, [pickMode]);
-
-  const handleSave = () => {
-    const latitude = parseFloat(lat);
-    const longitude = parseFloat(lon);
-    const altitude = parseFloat(alt) || 0;
-    const antenna_height = parseFloat(antH) || 25;
-    const range_nm = parseFloat(rangeNm) || 60;
-    if (!name.trim() || isNaN(latitude) || isNaN(longitude)) return;
-    onSave({ name: name.trim(), latitude, longitude, altitude, antenna_height, range_nm });
-  };
-
-  return (
-    <div className="rounded-xl border border-gray-200 bg-gray-100 p-4 space-y-3">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-gray-800">
-          {initial ? "레이더 사이트 수정" : "새 레이더 사이트 등록"}
-        </h3>
-        <button onClick={onCancel} className="text-gray-500 hover:text-gray-900" aria-label="닫기">
-          <X size={16} />
-        </button>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div className="col-span-2">
-          <label className="block text-xs text-gray-500 mb-1">사이트 이름</label>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="예: 서울레이더"
-            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 focus:border-[#a60739] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">위도 (°N)</label>
-          <input
-            value={lat}
-            onChange={(e) => setLat(e.target.value)}
-            placeholder="37.5585"
-            type="number"
-            step="0.0001"
-            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 focus:border-[#a60739] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">경도 (°E)</label>
-          <input
-            value={lon}
-            onChange={(e) => setLon(e.target.value)}
-            placeholder="126.7906"
-            type="number"
-            step="0.0001"
-            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 focus:border-[#a60739] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">해발 고도 (m)</label>
-          <input
-            value={alt}
-            onChange={(e) => setAlt(e.target.value)}
-            placeholder="0"
-            type="number"
-            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 focus:border-[#a60739] focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">안테나 높이 (m)</label>
-          <input
-            value={antH}
-            onChange={(e) => setAntH(e.target.value)}
-            placeholder="25"
-            type="number"
-            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 focus:border-[#a60739] focus:outline-none"
-          />
-        </div>
-        <div className="col-span-2">
-          <label className="block text-xs text-gray-500 mb-1">제원상 지원범위 (NM)</label>
-          <input
-            value={rangeNm}
-            onChange={(e) => setRangeNm(e.target.value)}
-            placeholder="60"
-            type="number"
-            step="1"
-            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-500 focus:border-[#a60739] focus:outline-none"
-          />
-        </div>
-      </div>
-
-      <button
-        onClick={() => setPickMode(!pickMode)}
-        className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
-          pickMode
-            ? "bg-[#a60739] text-white"
-            : "border border-gray-200 text-gray-500 hover:border-gray-400 hover:text-gray-900"
-        }`}
-      >
-        <MapPin size={14} />
-        {pickMode ? "지도 닫기" : "지도에서 클릭하여 좌표 선택"}
-      </button>
-
-      {pickMode && (
-        <div
-          ref={mapContainerRef}
-          className="h-64 w-full rounded-lg overflow-hidden border border-gray-200"
-        />
-      )}
-
-      <div className="flex items-center justify-between">
-        {initial && onDelete ? (
-          <button
-            onClick={onDelete}
-            className="rounded-lg px-3 py-2 text-sm text-red-500 hover:bg-red-50 transition-colors"
-          >
-            삭제
-          </button>
-        ) : <div />}
-        <div className="flex gap-2">
-          <button
-            onClick={onCancel}
-            className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100"
-          >
-            취소
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={!name.trim() || !lat || !lon}
-            className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] disabled:opacity-40"
-          >
-            {initial ? "수정" : "등록"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── 레이더사이트 관리 섹션 ────────────────────────────────────────────
-
-function RadarSiteSection() {
-  const radarSite = useAppStore((s) => s.radarSite);
-  const setRadarSite = useAppStore((s) => s.setRadarSite);
-  const customRadarSites = useAppStore((s) => s.customRadarSites);
-  const addCustomRadarSite = useAppStore((s) => s.addCustomRadarSite);
-  const updateCustomRadarSite = useAppStore((s) => s.updateCustomRadarSite);
-  const removeCustomRadarSite = useAppStore((s) => s.removeCustomRadarSite);
-
-  const [showEditor, setShowEditor] = useState(false);
-  const [editingSite, setEditingSite] = useState<RadarSite | undefined>();
-
-  const handleSaveCustomSite = (site: RadarSite) => {
-    if (editingSite) {
-      updateCustomRadarSite(editingSite.name, site);
-      if (radarSite.name === editingSite.name) {
-        setRadarSite(site);
-      }
-    } else {
-      addCustomRadarSite(site);
-    }
-    setRadarSite(site);
-    setShowEditor(false);
-    setEditingSite(undefined);
-  };
-
-  const handleEditSite = (site: RadarSite) => {
-    if (!customRadarSites.some((s) => s.name === site.name)) {
-      addCustomRadarSite(site);
-    }
-    setEditingSite(site);
-    setShowEditor(true);
-  };
-
-  const handleDeleteSite = (site: RadarSite) => {
-    removeCustomRadarSite(site.name);
-    if (radarSite.name === site.name) {
-      setRadarSite(DEFAULT_RADAR_SITE);
-    }
-  };
-
-  const allSites = customRadarSites;
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Radio size={16} className="text-[#a60739]" />
-          <h2 className="text-lg font-semibold text-gray-800">레이더사이트 관리</h2>
-          <span className="text-xs text-gray-500">
-            현재: {radarSite.name} ({radarSite.latitude.toFixed(4)}°N, {radarSite.longitude.toFixed(4)}°E)
-          </span>
-        </div>
-        <button
-          onClick={() => {
-            setEditingSite(undefined);
-            setShowEditor(!showEditor);
-          }}
-          className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-500 hover:border-gray-400 hover:text-gray-900 transition-colors"
-        >
-          <Plus size={14} />
-          직접 등록
-        </button>
-      </div>
-
-      {/* 사이트 목록 */}
-      <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
-        <div className="flex flex-wrap gap-2">
-          {allSites.map((site) => (
-            <button
-              key={site.name}
-              onClick={() => setRadarSite(site)}
-              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                radarSite.name === site.name
-                  ? "bg-[#a60739] text-white"
-                  : "border border-gray-200 text-gray-500 hover:border-gray-400 hover:text-gray-900"
-              }`}
-            >
-              {site.name}
-            </button>
-          ))}
-        </div>
-
-        {/* 선택된 사이트 상세 정보 */}
-        <div className="mt-3 grid grid-cols-3 gap-3 text-xs">
-          <div className="rounded-lg bg-gray-100 p-2.5">
-            <span className="text-gray-500">좌표</span>
-            <p className="text-gray-800 font-mono mt-0.5">
-              {radarSite.latitude.toFixed(4)}°N, {radarSite.longitude.toFixed(4)}°E
-            </p>
-          </div>
-          <div className="rounded-lg bg-gray-100 p-2.5">
-            <span className="text-gray-500">해발 고도 / 안테나</span>
-            <p className="text-gray-800 font-mono mt-0.5">
-              {radarSite.altitude}m / {radarSite.antenna_height}m
-            </p>
-          </div>
-          <div className="rounded-lg bg-gray-100 p-2.5">
-            <span className="text-gray-500">지원범위</span>
-            <p className="text-gray-800 font-mono mt-0.5">{radarSite.range_nm} NM</p>
-          </div>
-        </div>
-        <div className="mt-2 flex justify-end">
-          <button
-            onClick={() => handleEditSite(radarSite)}
-            className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-200 hover:text-gray-900 transition-colors"
-          >
-            <Pencil size={12} />
-            수정
-          </button>
-        </div>
-      </div>
-
-      {/* 사이트 편집 폼 */}
-      {showEditor && (
-        <RadarSiteEditor
-          initial={editingSite}
-          onSave={handleSaveCustomSite}
-          onCancel={() => {
-            setShowEditor(false);
-            setEditingSite(undefined);
-          }}
-          onDelete={editingSite && allSites.length > 1 ? () => {
-            handleDeleteSite(editingSite);
-            setShowEditor(false);
-            setEditingSite(undefined);
-          } : undefined}
-        />
-      )}
-    </div>
-  );
-}
-
-// ─── OpenSky 인증정보 섹션 ────────────────────────────────────────────
-
-export function OpenSkyCredentialsSection() {
-  const [clientId, setClientId] = useState("");
-  const [clientSecret, setClientSecret] = useState("");
-  const [showSecret, setShowSecret] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const triggerOpenskySync = useAppStore((s) => s.triggerOpenskySync);
-
-  useEffect(() => {
-    invoke<[string, string]>("load_opensky_credentials")
-      .then(([id, secret]) => {
-        setClientId(id);
-        setClientSecret(secret);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
-
-  const handleSave = async () => {
-    try {
-      await invoke("save_opensky_credentials", {
-        clientId: clientId.trim(),
-        clientSecret: clientSecret.trim(),
-      });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-      // 저장 즉시 동기화 시작
-      if (clientId.trim() && clientSecret.trim()) {
-        triggerOpenskySync();
-      }
-    } catch (e) {
-      console.error("Failed to save credentials:", e);
-    }
-  };
-
-  const hasCredentials = clientId.trim() && clientSecret.trim();
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center gap-2">
-        <Key size={16} className="text-[#a60739]" />
-        <h2 className="text-lg font-semibold text-gray-800">OpenSky API 인증</h2>
-        {!loading && (
-          <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-            hasCredentials
-              ? "bg-emerald-100 text-emerald-700"
-              : "bg-amber-100 text-amber-700"
-          }`}>
-            {hasCredentials ? "인증됨" : "미설정"}
-          </span>
-        )}
-      </div>
-      <p className="text-xs text-gray-500">
-        OpenSky Network 계정 인증정보를 등록하면 과거 항적/운항이력 조회가 가능하고, API 호출 제한이 완화됩니다.
-      </p>
-
-      {loading ? (
-        <div className="py-4 text-center text-sm text-gray-500">로딩 중...</div>
-      ) : (
-        <div className="space-y-3">
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Client ID (Username)</label>
-            <input
-              value={clientId}
-              onChange={(e) => setClientId(e.target.value)}
-              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-mono text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-              placeholder="OpenSky username"
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Client Secret (Password)</label>
-            <div className="relative">
-              <input
-                type={showSecret ? "text" : "password"}
-                value={clientSecret}
-                onChange={(e) => setClientSecret(e.target.value)}
-                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 pr-10 font-mono text-sm text-gray-800 placeholder-gray-500 outline-none focus:border-[#a60739] transition-colors"
-                placeholder="OpenSky password"
-              />
-              <button
-                type="button"
-                onClick={() => setShowSecret(!showSecret)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700"
-              >
-                {showSecret ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={handleSave}
-              className="flex items-center gap-2 rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] transition-colors"
-            >
-              {saved ? <Check size={14} /> : <Key size={14} />}
-              {saved ? "저장 완료" : "저장"}
-            </button>
-            <span className="text-[11px] text-gray-500">
-              인증정보는 로컬 DB에 저장됩니다
-            </span>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+import type { PeakImportStatus } from "../types";
 
 // ─── DB 내보내기/가져오기 섹션 ────────────────────────────────────────
 
@@ -892,8 +73,6 @@ export function DatabaseSection() {
       setImporting(true);
       setStatus(null);
       setConfirmImport(null);
-      // 진행 중인 OpenSky 동기화 중단
-      useAppStore.getState().cancelOpenskySync();
       await invoke("import_database", { srcPath: confirmImport });
       setStatus({ type: "success", message: "데이터베이스를 가져왔습니다. 페이지를 새로고침합니다..." });
       // 상태 반영을 위해 앱 새로고침
@@ -981,34 +160,38 @@ export function DatabaseSection() {
 // ─── 고도 데이터 사전 적재 ────────────────────────────────────────────────
 
 export function SrtmDownloadSection() {
-  const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState<{ total: number; downloaded: number; skipped?: number; current_tile?: string; status: string } | null>(null);
-  const [result, setResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [srtmStatus, setSrtmStatus] = useState<[number, number] | null>(null);
+  const [statusLoading, setStatusLoading] = useState(true);
 
+  const loading = useAppStore((s) => s.srtmDownloading);
+  const progress = useAppStore((s) => s.srtmProgress);
+  const result = useAppStore((s) => s.srtmResult);
+  const startSrtmDownload = useAppStore((s) => s.startSrtmDownload);
+
+  const loadStatus = async () => {
+    try {
+      const s = await invoke<[number, number] | null>("get_srtm_status");
+      setSrtmStatus(s);
+    } catch {
+      // 무시
+    } finally {
+      setStatusLoading(false);
+    }
+  };
+
+  useEffect(() => { loadStatus(); }, []);
+
+  // 다운로드 완료 감지 → 상태 갱신
+  const prevLoading = useRef(loading);
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ total: number; downloaded: number; skipped?: number; current_tile?: string; status: string }>(
-        "srtm-download-progress",
-        (event) => setProgress(event.payload),
-      );
-    })();
-    return () => { unlisten?.(); };
-  }, []);
+    if (prevLoading.current && !loading) {
+      loadStatus();
+    }
+    prevLoading.current = loading;
+  }, [loading]);
 
   const handleDownload = async () => {
-    setLoading(true);
-    setResult(null);
-    setProgress(null);
-    try {
-      const msg = await invoke<string>("download_srtm_korea");
-      setResult({ type: "success", message: msg });
-    } catch (err) {
-      setResult({ type: "error", message: String(err) });
-    } finally {
-      setLoading(false);
-    }
+    await startSrtmDownload();
   };
 
   const done = progress ? (progress.downloaded + (progress.skipped ?? 0)) : 0;
@@ -1016,87 +199,388 @@ export function SrtmDownloadSection() {
     ? Math.round((done / progress.total) * 100)
     : 0;
 
+  const hasExtra = (loading && progress) || result;
+
   return (
-    <div className="space-y-4">
-      <div className="flex items-center gap-2">
-        <Mountain size={16} className="text-emerald-600" />
-        <h2 className="text-lg font-semibold text-gray-800">SRTM 지형 데이터 (30m 해상도)</h2>
-      </div>
-      <p className="text-xs text-gray-500">
-        NASA SRTM 30m 해상도 고도 데이터를 다운로드합니다 (한국 영역, ~250MB).
-        다운로드 후 LOS 단면도와 레이더 커버리지에서 API 호출 없이 오프라인으로 30m 정밀 지형 데이터를 사용합니다.
-      </p>
-
-      <button
-        onClick={handleDownload}
-        disabled={loading}
-        className="flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-emerald-400 hover:text-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
-      >
-        <Download size={14} />
-        {loading ? "다운로드 중..." : "한국 SRTM 데이터 다운로드"}
-      </button>
-
-      {loading && progress && (
-        <div className="space-y-1">
-          <div className="h-2 w-full rounded-full bg-gray-200 overflow-hidden">
-            <div
-              className="h-full rounded-full bg-emerald-500 transition-all duration-300"
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-          <p className="text-xs text-gray-500">
-            {progress.current_tile && <span className="font-mono">{progress.current_tile}</span>}
-            {" "}{done} / {progress.total} 타일 ({pct}%)
-            {progress.downloaded > 0 && <span> · {progress.downloaded}개 다운로드</span>}
-            {(progress.skipped ?? 0) > 0 && <span> · {progress.skipped}개 스킵(해양)</span>}
-          </p>
+    <div className="px-5 py-[13px]">
+      <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
+        <div className="flex items-center gap-2">
+          <Mountain size={16} className="text-[#a60739] shrink-0" />
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">NASA SRTM 지형 데이터 (30m)</h2>
         </div>
-      )}
+        <div className="flex items-center gap-2 min-w-0">
+          {!statusLoading && srtmStatus ? (
+            <>
+              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {srtmStatus[0]}개 타일</span>
+              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{new Date(srtmStatus[1] * 1000).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\.$/, "")}</span>
+            </>
+          ) : (
+            <span className="text-xs text-gray-400">한국 영역 ~250MB · LoS/커버리지 오프라인 지형</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleDownload}
+            disabled={loading}
+            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Download size={13} />
+            {loading ? "다운로드 중..." : "다운로드"}
+          </button>
+        </div>
+      </div>
 
-      {result && (
-        <div className={`rounded-lg px-4 py-3 text-sm ${
-          result.type === "success"
-            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-            : "bg-red-50 text-red-700 border border-red-200"
-        }`}>
-          {result.message}
+      {hasExtra && (
+        <div className="mt-3 space-y-2">
+          {loading && progress && (
+            <div className="space-y-1">
+              <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <p className="text-xs text-gray-500">
+                {progress.current_tile && <span className="font-mono">{progress.current_tile}</span>}
+                {" "}{done} / {progress.total} 타일 ({pct}%)
+                {progress.downloaded > 0 && <span> · {progress.downloaded}개 다운로드</span>}
+                {(progress.skipped ?? 0) > 0 && <span> · {progress.skipped}개 스킵(해양)</span>}
+              </p>
+            </div>
+          )}
+
+          {result && (
+            <div className={`rounded-lg px-3 py-2 text-xs ${
+              result.type === "success"
+                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                : "bg-red-50 text-red-700 border border-red-200"
+            }`}>
+              {result.message}
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-// ─── 건물 데이터 (GIS건물통합정보) ────────────────────────────────────
+// ─── vworld 계정 관리 ────────────────────────────────────────────────
 
-const REGIONS = [
-  { key: "seoul", label: "서울특별시", code: "11" },
-  { key: "incheon", label: "인천광역시", code: "28" },
-  { key: "gyeonggi", label: "경기도", code: "41" },
-] as const;
+export function VworldAccountSection() {
+  const [id, setId] = useState("");
+  const [pw, setPw] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
-/** 파일명에서 행정구역코드로 지역 자동 감지 (예: AL_D010_11_20260309.zip → seoul) */
-function detectRegionFromFilename(filename: string): { key: string; label: string } | null {
-  const base = filename.replace(/\\/g, "/").split("/").pop() ?? "";
-  for (const r of REGIONS) {
-    if (base.includes(`_${r.code}_`) || base.includes(`_${r.code}.`)) {
-      return { key: r.key, label: r.label };
+  // DB에서 저장된 계정 로드
+  useEffect(() => {
+    (async () => {
+      try {
+        const savedId = await invoke<string | null>("load_setting", { key: "vworld_id" });
+        const savedPw = await invoke<string | null>("load_setting", { key: "vworld_pw" });
+        if (savedId) setId(savedId);
+        if (savedPw) setPw(atob(savedPw));
+        setLoaded(true);
+      } catch {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  const handleSave = async () => {
+    if (!id.trim()) {
+      setStatus({ type: "error", message: "아이디를 입력해 주세요." });
+      return;
     }
-  }
-  return null;
+    setSaving(true);
+    setStatus(null);
+    try {
+      await invoke("save_setting", { key: "vworld_id", value: id.trim() });
+      await invoke("save_setting", { key: "vworld_pw", value: btoa(pw) });
+      setStatus({ type: "success", message: "vworld 계정이 저장되었습니다." });
+    } catch (e) {
+      setStatus({ type: "error", message: `저장 실패: ${e}` });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!loaded) return null;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <KeyRound size={16} className="text-blue-600" />
+        <h2 className="text-lg font-semibold text-gray-800">vworld 계정</h2>
+      </div>
+      <p className="text-xs text-gray-500">
+        건물통합정보 / 산 이름 데이터 자동 다운로드에 사용하는 vworld 계정입니다.
+      </p>
+
+      <div className="flex items-end gap-3">
+        <div className="flex-1">
+          <label className="block text-[11px] font-medium text-gray-500 mb-1">vworld ID</label>
+          <input
+            type="text"
+            value={id}
+            onChange={(e) => { setId(e.target.value); setStatus(null); }}
+            placeholder="아이디"
+            className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-800 placeholder-gray-400 focus:border-blue-400 focus:outline-none"
+          />
+        </div>
+        <div className="flex-1">
+          <label className="block text-[11px] font-medium text-gray-500 mb-1">비밀번호</label>
+          <div className="relative">
+            <input
+              type={showPw ? "text" : "password"}
+              value={pw}
+              onChange={(e) => { setPw(e.target.value); setStatus(null); }}
+              placeholder="비밀번호"
+              className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 pr-8 text-sm text-gray-800 placeholder-gray-400 focus:border-blue-400 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => setShowPw(!showPw)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+              tabIndex={-1}
+            >
+              {showPw ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </div>
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          <Save size={14} />
+          {saving ? "저장 중..." : "저장"}
+        </button>
+      </div>
+
+      {status && (
+        <div className={`rounded-lg px-4 py-2.5 text-sm ${
+          status.type === "success"
+            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+            : "bg-red-50 text-red-700 border border-red-200"
+        }`}>
+          {status.message}
+        </div>
+      )}
+    </div>
+  );
 }
 
-export function BuildingDataSection() {
-  const [importStatus, setImportStatus] = useState<BuildingImportStatus[]>([]);
+
+// ─── 토지이용계획도 (vworld WMS 타일 직접 다운로드) ──────────────────
+
+export function LandUseDataSection() {
+  const [tileCount, setTileCount] = useState(0);
+  const [downloadedAt, setDownloadedAt] = useState<number | null>(null);
+  const [collapsed, setCollapsed] = useState(true);
+
+  const downloading = useAppStore((s) => s.landuseDownloading);
+  const landuseProgress = useAppStore((s) => s.landuseProgress);
+  const result = useAppStore((s) => s.landuseResult);
+  const startLanduseDownload = useAppStore((s) => s.startLanduseDownload);
+
+  // landuseProgress를 기존 UI가 기대하는 형태로 변환
+  const progress = landuseProgress ? { message: landuseProgress.message, current: landuseProgress.current, total: landuseProgress.total } : null;
+
+  const loadTileCount = async () => {
+    try {
+      const count = await invoke<number>("get_landuse_tile_count");
+      setTileCount(count);
+    } catch { /* ignore */ }
+  };
+
+  const loadDownloadedAt = async () => {
+    try {
+      const val = await invoke<string | null>("load_setting", { key: "landuse_downloaded_at" });
+      if (val) setDownloadedAt(Number(val));
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => { loadTileCount(); loadDownloadedAt(); }, []);
+
+  // 다운로드 완료 감지 → 타일 수 갱신 + 다운로드 일시 저장
+  const prevDownloading = useRef(downloading);
+  useEffect(() => {
+    if (prevDownloading.current && !downloading) {
+      loadTileCount();
+      const now = Math.floor(Date.now() / 1000);
+      invoke("save_setting", { key: "landuse_downloaded_at", value: String(now) });
+      setDownloadedAt(now);
+    }
+    prevDownloading.current = downloading;
+  }, [downloading]);
+
+  const handleDownload = async () => {
+    await startLanduseDownload();
+  };
+
+  const pct = progress && progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+  const hasExtra = (downloading && progress) || result;
+  const isCollapsible = tileCount > 0 && !downloading && hasExtra;
+  const isExpanded = !isCollapsible || !collapsed;
+
+  return (
+    <div className={`px-5 py-[13px] ${isCollapsible ? "cursor-pointer select-none" : ""}`} onClick={(e) => { if (isCollapsible && !(e.target as HTMLElement).closest("button, a")) setCollapsed((c) => !c); }}>
+      <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
+        <div
+          className="flex items-center gap-2"
+        >
+          {isCollapsible && (
+            <ChevronDown
+              size={14}
+              className={`text-gray-400 shrink-0 transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`}
+            />
+          )}
+          <Globe size={16} className="text-[#a60739] shrink-0" />
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">토지이용계획도</h2>
+        </div>
+        <div className="flex items-center gap-2 min-w-0">
+          {tileCount > 0 ? (
+            <>
+              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {tileCount.toLocaleString()}개 타일</span>
+              {downloadedAt && <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{new Date(downloadedAt * 1000).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\.$/, "")}</span>}
+            </>
+          ) : (
+            <span className="text-xs text-gray-400">vworld WMS · 서울/인천/경기</span>
+          )}
+          <a
+            href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%ED%86%A0%EC%A7%80%EC%9D%B4%EC%9A%A9&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=DT&dsId=DAT_0000000000000128&listPageIndex=1"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-0.5 text-xs text-blue-500 hover:text-blue-700 transition-colors shrink-0"
+            onClick={(e) => {
+              e.preventDefault();
+              import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
+                openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%ED%86%A0%EC%A7%80%EC%9D%B4%EC%9A%A9&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=DT&dsId=DAT_0000000000000128&listPageIndex=1")
+              );
+            }}
+          >
+            <ExternalLink size={11} />
+            vworld
+          </a>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleDownload}
+            disabled={downloading}
+            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {downloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+            {downloading ? "다운로드 중..." : "다운로드"}
+          </button>
+        </div>
+      </div>
+
+      {hasExtra && isExpanded && (
+        <div className="mt-3 space-y-2" onClick={(e) => e.stopPropagation()}>
+          {downloading && progress && (
+            <div className="space-y-1">
+              <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <p className="text-xs text-gray-500">{progress.message} ({pct}%)</p>
+            </div>
+          )}
+
+          {result && !downloading && (
+            <div className={`rounded-lg px-3 py-2 text-xs ${
+              result.type === "success"
+                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                : "bg-red-50 text-red-700 border border-red-200"
+            }`}>
+              {result.message}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── 건물통합정보 (F_FAC_BUILDING) ──────────────────────────────────
+
+interface FacBuildingImportStatus {
+  region: string;
+  file_date: string;
+  imported_at: number;
+  record_count: number;
+}
+
+export function FacBuildingDataSection() {
+  const [importStatus, setImportStatus] = useState<FacBuildingImportStatus[]>([]);
   const [loading, setLoading] = useState(true);
-  const [importing, setImporting] = useState<string | null>(null);
-  const [progress, setProgress] = useState<{ region: string; processed: number; status: string } | null>(null);
-  const [result, setResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
-  const [batchResults, setBatchResults] = useState<{ label: string; ok: boolean; msg: string }[]>([]);
+  const [collapsed, setCollapsed] = useState(true); // 데이터 있으면 접힌 상태 기본
+
+  // ─── vworld 자동 다운로드 (store에서 관리 — 페이지 이동해도 유지) ───
+  const facDownloading = useAppStore((s) => s.facBuildingDownloading);
+  const facProgress = useAppStore((s) => s.facBuildingProgress);
+  const facResult = useAppStore((s) => s.facBuildingResult);
+  const startFacDownload = useAppStore((s) => s.startFacBuildingDownload);
+
+  const [zipImporting, setZipImporting] = useState(false);
+  const [zipResult, setZipResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+
+  const handleDownload = async () => {
+    await startFacDownload();
+    await loadStatus();
+  };
+
+  const handleZipImport = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        title: "건물통합정보 가져오기 (SHP ZIP)",
+        filters: [{ name: "ZIP", extensions: ["zip"] }],
+        multiple: true,
+      });
+      if (!selected) return;
+      const paths = Array.isArray(selected) ? selected : [selected];
+      setZipImporting(true);
+      setZipResult(null);
+      let totalCount = 0;
+      for (const p of paths) {
+        const fname = (p as string).replace(/\\/g, "/").split("/").pop() || "";
+        // 파일명에서 행정구역 코드 추정
+        let region = "기타";
+        if (fname.includes("_11_") || fname.includes("_11.")) region = "서울";
+        else if (fname.includes("_28_") || fname.includes("_28.")) region = "인천";
+        else if (fname.includes("_41_") || fname.includes("_41.")) region = "경기";
+        const msg = await invoke<string>("import_fac_building_data", { zipPath: p, region });
+        const m = msg.match(/(\d[\d,]*)건/);
+        if (m) totalCount += parseInt(m[1].replace(/,/g, ""), 10);
+      }
+      setZipResult({ type: "success", message: `건물통합정보 ${totalCount.toLocaleString()}건 임포트 완료` });
+      await loadStatus();
+    } catch (e) {
+      setZipResult({ type: "error", message: `임포트 실패: ${e}` });
+    } finally {
+      setZipImporting(false);
+    }
+  };
+
+  // 다운로드 완료 감지 → 테이블 갱신
+  const prevDownloading = useRef(facDownloading);
+  useEffect(() => {
+    if (prevDownloading.current && !facDownloading && facResult?.type === "success") {
+      loadStatus();
+    }
+    prevDownloading.current = facDownloading;
+  }, [facDownloading]);
 
   const loadStatus = async () => {
     try {
-      const status = await invoke<BuildingImportStatus[]>("get_building_import_status");
+      const status = await invoke<FacBuildingImportStatus[]>("get_fac_building_import_status");
       setImportStatus(status);
     } catch {
       // 무시
@@ -1109,260 +593,147 @@ export function BuildingDataSection() {
     loadStatus();
   }, []);
 
-  // 진행률 이벤트 리스너
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ region: string; processed: number; status: string }>(
-        "building-import-progress",
-        (event) => setProgress(event.payload),
-      );
-    })();
-    return () => { unlisten?.(); };
-  }, []);
-
-  const handleImport = async (regionKey: string) => {
-    try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const src = await open({
-        title: `건물 데이터 가져오기 (${regionKey})`,
-        filters: [{ name: "SHP ZIP 파일", extensions: ["zip"] }],
-        multiple: false,
-        directory: false,
-      });
-      if (!src) return;
-
-      setImporting(regionKey);
-      setResult(null);
-      setProgress(null);
-      const msg = await invoke<string>("import_building_data", {
-        zipPath: src as string,
-        region: regionKey,
-      });
-      setResult({ type: "success", message: msg });
-      await loadStatus();
-    } catch (e) {
-      setResult({ type: "error", message: `임포트 실패: ${e}` });
-    } finally {
-      setImporting(null);
-      setProgress(null);
-    }
-  };
-
-  const handleBatchImport = async () => {
-    try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const files = await open({
-        title: "건물 데이터 일괄 가져오기 (여러 ZIP 선택)",
-        filters: [{ name: "SHP ZIP 파일", extensions: ["zip"] }],
-        multiple: true,
-        directory: false,
-      });
-      if (!files || (Array.isArray(files) && files.length === 0)) return;
-
-      const paths = Array.isArray(files) ? files : [files];
-
-      // 파일명에서 지역 자동 감지
-      const queue: { region: string; path: string; label: string }[] = [];
-      const unknown: string[] = [];
-      for (const p of paths) {
-        const detected = detectRegionFromFilename(p as string);
-        if (detected) {
-          queue.push({ region: detected.key, path: p as string, label: detected.label });
-        } else {
-          unknown.push((p as string).replace(/\\/g, "/").split("/").pop() ?? (p as string));
-        }
-      }
-
-      if (unknown.length > 0) {
-        setResult({ type: "error", message: `지역 감지 실패 (파일명에 행정구역코드 없음): ${unknown.join(", ")}` });
-        if (queue.length === 0) return;
-      }
-
-      // 순차 임포트
-      setResult(null);
-      setBatchResults([]);
-      const results: { label: string; ok: boolean; msg: string }[] = [];
-
-      for (let i = 0; i < queue.length; i++) {
-        const item = queue[i];
-        setImporting(item.region);
-        setProgress(null);
-        try {
-          const msg = await invoke<string>("import_building_data", {
-            zipPath: item.path,
-            region: item.region,
-          });
-          results.push({ label: item.label, ok: true, msg });
-        } catch (e) {
-          results.push({ label: item.label, ok: false, msg: `${e}` });
-        }
-        setBatchResults([...results]);
-      }
-
-      setImporting(null);
-      setProgress(null);
-      await loadStatus();
-
-      const ok = results.filter(r => r.ok).length;
-      const fail = results.filter(r => !r.ok).length;
-      setResult({
-        type: fail > 0 ? "error" : "success",
-        message: `일괄 임포트 완료: ${ok}건 성공${fail > 0 ? `, ${fail}건 실패` : ""}`,
-      });
-    } catch (e) {
-      setImporting(null);
-      setProgress(null);
-      setResult({ type: "error", message: `일괄 임포트 실패: ${e}` });
-    }
-  };
-
   const handleClear = async (regionKey: string) => {
     try {
-      await invoke("clear_building_data", { region: regionKey });
+      await invoke("clear_fac_building_data", { region: regionKey });
       setDeleteConfirm(null);
-      setResult({ type: "success", message: `${regionKey} 건물 데이터 삭제 완료` });
       await loadStatus();
     } catch (e) {
-      setResult({ type: "error", message: `삭제 실패: ${e}` });
+      console.warn("삭제 실패:", e);
     }
   };
 
-  const getRegionStatus = (regionKey: string) =>
-    importStatus.find((s) => s.region === regionKey);
+  const totalRecords = importStatus.reduce((sum, s) => sum + s.record_count, 0);
+  const latestImport = importStatus.length > 0
+    ? Math.max(...importStatus.map((s) => s.imported_at))
+    : 0;
+
+  const facHasExtra = (facDownloading && facProgress) || facResult || zipResult || (!loading && importStatus.length > 0);
+  const isCollapsible = !loading && totalRecords > 0 && !facDownloading && !zipImporting;
+  const isExpanded = !isCollapsible || !collapsed;
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Building2 size={16} className="text-slate-600" />
-          <h2 className="text-lg font-semibold text-gray-800">건물 데이터 (GIS건물통합정보)</h2>
+    <div className={`px-5 py-[13px] ${isCollapsible ? "cursor-pointer select-none" : ""}`} onClick={(e) => { if (isCollapsible && !(e.target as HTMLElement).closest("button, a")) setCollapsed((c) => !c); }}>
+      <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
+        <div
+          className="flex items-center gap-2"
+        >
+          {isCollapsible && (
+            <ChevronDown
+              size={14}
+              className={`text-gray-400 shrink-0 transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`}
+            />
+          )}
+          <Building2 size={16} className="text-[#a60739] shrink-0" />
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">건물 데이터 (건물통합정보)</h2>
         </div>
-        <a
-          href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=NA&dsId=18&listPageIndex=1"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 transition-colors"
-          onClick={(e) => {
-            e.preventDefault();
-            import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
-              openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=NA&dsId=18&listPageIndex=1")
-            );
-          }}
-        >
-          <ExternalLink size={12} />
-          vworld 다운로드
-        </a>
-      </div>
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-gray-500">
-          국토교통부 GIS건물통합정보 SHP 데이터를 임포트하여 LOS 분석에 건물 차폐를 반영합니다.
-          vworld에서 서울/인천/경기도 ZIP 파일을 다운로드한 후 아래에서 가져오기 하세요.
-        </p>
-        <button
-          onClick={handleBatchImport}
-          disabled={importing !== null}
-          className="flex-shrink-0 flex items-center gap-1.5 rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          <Upload size={12} />
-          일괄 가져오기
-        </button>
+        <div className="flex items-center gap-2 min-w-0">
+          {!loading && totalRecords > 0 ? (
+            <>
+              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {totalRecords.toLocaleString()}건</span>
+              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{new Date(latestImport * 1000).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\.$/, "")}</span>
+            </>
+          ) : (
+            <span className="text-xs text-gray-400">F_FAC_BUILDING SHP · 3D 건물 시각화</span>
+          )}
+          <a
+            href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EA%B1%B4%EB%AC%BC%ED%86%B5%ED%95%A9%EC%A0%95%EB%B3%B4&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30524&listPageIndex=1"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-0.5 text-xs text-blue-500 hover:text-blue-700 transition-colors shrink-0"
+            onClick={(e) => {
+              e.preventDefault();
+              import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
+                openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EA%B1%B4%EB%AC%BC%ED%86%B5%ED%95%A9%EC%A0%95%EB%B3%B4&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30524&listPageIndex=1")
+              );
+            }}
+          >
+            <ExternalLink size={11} />
+            vworld
+          </a>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleZipImport}
+            disabled={zipImporting || facDownloading}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Upload size={13} />
+            {zipImporting ? "임포트 중..." : "ZIP 가져오기"}
+          </button>
+          <button
+            onClick={handleDownload}
+            disabled={facDownloading || zipImporting}
+            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {facDownloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+            {facDownloading ? "다운로드 중..." : "다운로드"}
+          </button>
+        </div>
       </div>
 
-      {batchResults.length > 0 && importing !== null && (
-        <div className="space-y-1">
-          {batchResults.map((r, i) => (
-            <div key={i} className={`flex items-center gap-2 text-xs ${r.ok ? "text-emerald-600" : "text-red-500"}`}>
-              {r.ok ? <Check size={12} /> : <X size={12} />}
-              <span>{r.label}: {r.msg}</span>
-            </div>
-          ))}
-          {importing && (
-            <div className="flex items-center gap-2 text-xs text-gray-500">
-              <Loader2 size={12} className="animate-spin" />
-              <span>{REGIONS.find(r => r.key === importing)?.label ?? importing} 임포트 중...</span>
+      {facHasExtra && isExpanded && (
+        <div className="mt-3 space-y-2" onClick={(e) => e.stopPropagation()}>
+          {facDownloading && facProgress && (
+            <div className="space-y-1">
+              <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                  style={{
+                    width: `${Math.round((facProgress.current / facProgress.total) * 100)}%`,
+                  }}
+                />
+              </div>
+              <p className="text-xs text-gray-500">{facProgress.message}</p>
             </div>
           )}
-        </div>
-      )}
 
-      {loading ? (
-        <div className="py-4 text-center text-sm text-gray-500">로딩 중...</div>
-      ) : (
-        <div className="grid grid-cols-2 gap-4">
-          {REGIONS.map(({ key, label }) => {
-            const status = getRegionStatus(key);
-            const isImporting = importing === key;
-            return (
-              <div key={key} className="rounded-xl border border-gray-200 bg-gray-100 p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="text-sm font-semibold text-gray-800">{label}</h3>
-                  </div>
-                  {status ? (
-                    <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                      {status.record_count.toLocaleString()}건
-                    </span>
-                  ) : (
-                    <span className="rounded-full bg-gray-200 px-2 py-0.5 text-[10px] font-medium text-gray-500">
-                      미임포트
-                    </span>
-                  )}
-                </div>
+          {facResult && !facDownloading && (
+            <div
+              className={`rounded-lg px-3 py-2 text-xs ${
+                facResult.type === "success"
+                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                  : "bg-red-50 text-red-600 border border-red-200"
+              }`}
+            >
+              {facResult.message}
+            </div>
+          )}
 
-                {status && (
-                  <div className="text-xs text-gray-500">
-                    <span>임포트: {new Date(status.imported_at * 1000).toLocaleDateString("ko-KR")}</span>
-                    <span className="ml-2">데이터: {status.file_date}</span>
-                  </div>
-                )}
+          {zipResult && !zipImporting && (
+            <div
+              className={`rounded-lg px-3 py-2 text-xs ${
+                zipResult.type === "success"
+                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                  : "bg-red-50 text-red-600 border border-red-200"
+              }`}
+            >
+              {zipResult.message}
+            </div>
+          )}
 
-                {isImporting && progress && (
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                      <Loader2 size={12} className="animate-spin text-slate-600" />
-                      <span className="text-xs text-gray-600">{progress.status}</span>
-                    </div>
-                    <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
-                      <div className="h-full rounded-full bg-slate-500 animate-pulse" style={{ width: "60%" }} />
-                    </div>
-                  </div>
-                )}
-
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => handleImport(key)}
-                    disabled={isImporting || importing !== null}
-                    className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-gray-400 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    <Upload size={12} />
-                    {isImporting ? "임포트 중..." : status ? "재임포트" : "가져오기"}
-                  </button>
-                  {status && (
-                    <button
-                      onClick={() => setDeleteConfirm(key)}
-                      disabled={isImporting || importing !== null}
-                      className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-red-500 hover:bg-red-50 transition-colors disabled:opacity-40"
-                    >
-                      <Trash2 size={12} />
-                      삭제
-                    </button>
-                  )}
-                </div>
+          {!loading && importStatus.length > 0 && (
+            <div className="rounded-xl border border-gray-200 overflow-hidden">
+              <div className="grid grid-cols-[minmax(120px,1fr)_80px_100px] gap-2 bg-gray-100 px-4 py-1 text-[11px] font-normal text-gray-500 uppercase tracking-wider">
+                <span>지역</span>
+                <span className="text-right">건물 수</span>
+                <span className="text-right">업로드 일자</span>
               </div>
-            );
-          })}
-        </div>
-      )}
-
-      {result && (
-        <div className={`rounded-lg px-4 py-3 text-sm ${
-          result.type === "success"
-            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-            : "bg-red-50 text-red-700 border border-red-200"
-        }`}>
-          {result.message}
+              {importStatus.map((s, idx) => (
+                <div key={s.region}>
+                  <div className={`grid grid-cols-[minmax(120px,1fr)_80px_100px] items-center gap-2 px-4 py-1 ${idx % 2 === 0 ? "bg-white" : "bg-gray-50"}`}>
+                    <span className="text-xs font-normal text-gray-800">{s.region}</span>
+                    <span className="text-right text-xs tabular-nums text-gray-700">
+                      {s.record_count.toLocaleString()}
+                    </span>
+                    <span className="text-right text-xs text-gray-500">
+                      {new Date(s.imported_at * 1000).toLocaleDateString("ko-KR")}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -1370,12 +741,12 @@ export function BuildingDataSection() {
       <Modal
         open={deleteConfirm !== null}
         onClose={() => setDeleteConfirm(null)}
-        title="건물 데이터 삭제"
+        title="건물통합정보 삭제"
         width="max-w-sm"
       >
         <div className="space-y-4">
           <p className="text-sm text-gray-600">
-            {deleteConfirm} 지역의 건물 데이터를 삭제하시겠습니까?
+            {deleteConfirm} 지역의 건물통합정보를 삭제하시겠습니까?
           </p>
           <div className="flex justify-end gap-3">
             <button
@@ -1393,6 +764,198 @@ export function BuildingDataSection() {
           </div>
         </div>
       </Modal>
+    </div>
+  );
+}
+
+// ─── 산 이름 데이터 (연속수치지형도) ──────────────────────────────────
+
+export function PeakDataSection() {
+  const [status, setStatus] = useState<PeakImportStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  // ─── N3P 자동 다운로드 (store에서 관리 — 페이지 이동해도 유지) ───
+  const n3pDownloading = useAppStore((s) => s.n3pDownloading);
+  const n3pProgress = useAppStore((s) => s.n3pProgress);
+  const n3pResult = useAppStore((s) => s.n3pResult);
+  const startN3pDownload = useAppStore((s) => s.startN3pDownload);
+
+  // ─── 산 ZIP 임포트 (store에서 관리 — 페이지 이동해도 유지) ───
+  const importing = useAppStore((s) => s.peakImporting);
+  const progress = useAppStore((s) => s.peakImportProgress);
+  const result = useAppStore((s) => s.peakImportResult);
+  const startPeakImport = useAppStore((s) => s.startPeakImport);
+
+  const handleN3pDownload = async () => {
+    await startN3pDownload();
+    await loadStatus();
+  };
+
+  // 다른 페이지 갔다가 돌아올 때: 다운로드/임포트 완료 상태면 테이블 갱신
+  const prevN3pDownloading = useRef(n3pDownloading);
+  useEffect(() => {
+    if (prevN3pDownloading.current && !n3pDownloading && n3pResult?.type === "success") {
+      loadStatus();
+    }
+    prevN3pDownloading.current = n3pDownloading;
+  }, [n3pDownloading]);
+
+  const prevImporting = useRef(importing);
+  useEffect(() => {
+    if (prevImporting.current && !importing) {
+      loadStatus();
+    }
+    prevImporting.current = importing;
+  }, [importing]);
+
+  const loadStatus = async () => {
+    try {
+      const s = await invoke<PeakImportStatus | null>("get_peak_import_status");
+      setStatus(s);
+    } catch {
+      // 무시
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadStatus();
+  }, []);
+
+  const handleImport = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        title: "산 이름 데이터 가져오기 (연속수치지형도 N3P ZIP)",
+        filters: [{ name: "ZIP", extensions: ["zip"] }],
+        multiple: false,
+      });
+      if (!selected) return;
+      await startPeakImport(selected as string);
+    } catch (e) {
+      console.warn("[PeakImport] 파일 선택 실패:", e);
+    }
+  };
+
+  const pct = progress && progress.total > 0
+    ? Math.round((progress.processed / progress.total) * 100)
+    : 0;
+
+  const hasExtra = (importing && progress) || result;
+
+  return (
+    <div className="px-5 py-[13px]">
+      <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
+        <div className="flex items-center gap-2">
+          <Mountain size={16} className="text-[#a60739] shrink-0" />
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">산 이름 데이터 (N3P)</h2>
+        </div>
+        <div className="flex items-center gap-2 min-w-0">
+          {!loading && status ? (
+            <>
+              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {status.record_count.toLocaleString()}건</span>
+              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{new Date(status.imported_at * 1000).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\.$/, "")}</span>
+            </>
+          ) : (
+            <span className="text-xs text-gray-400">연속수치지형도 · LoS/파노라마 산 이름 오프라인 조회</span>
+          )}
+          <a
+            href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EC%82%B0%EB%A7%A5&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30193&listPageIndex=1"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-0.5 text-xs text-blue-500 hover:text-blue-700 transition-colors shrink-0"
+            onClick={(e) => {
+              e.preventDefault();
+              import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
+                openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EC%82%B0%EB%A7%A5&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30193&listPageIndex=1")
+              );
+            }}
+          >
+            <ExternalLink size={11} />
+            vworld
+          </a>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleImport}
+            disabled={importing || n3pDownloading}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Upload size={13} />
+            {importing ? "임포트 중..." : "ZIP 가져오기"}
+          </button>
+          <button
+            onClick={handleN3pDownload}
+            disabled={n3pDownloading || importing}
+            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {n3pDownloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+            {n3pDownloading ? "다운로드 중..." : "다운로드"}
+          </button>
+        </div>
+      </div>
+
+      {/* N3P 자동 다운로드 진행률 */}
+      {n3pDownloading && n3pProgress && (
+        <div className="mt-2 space-y-1">
+          <div className="flex items-center gap-2 text-xs text-emerald-700">
+            <Loader2 size={12} className="animate-spin" />
+            {n3pProgress.message}
+          </div>
+          {n3pProgress.total > 0 && (
+            <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                style={{
+                  width: `${Math.round((n3pProgress.current / n3pProgress.total) * 100)}%`,
+                }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* N3P 자동 다운로드 결과 */}
+      {n3pResult && !n3pDownloading && (
+        <div
+          className={`mt-2 rounded-lg px-3 py-2 text-xs ${
+            n3pResult.type === "success"
+              ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+              : "bg-red-50 text-red-600 border border-red-200"
+          }`}
+        >
+          {n3pResult.message}
+        </div>
+      )}
+
+      {hasExtra && (
+        <div className="mt-3 space-y-2">
+          {importing && progress && (
+            <div className="space-y-1">
+              <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <p className="text-xs text-gray-500">
+                {progress.status} ({pct}%)
+              </p>
+            </div>
+          )}
+
+          {result && (
+            <div className={`rounded-lg px-3 py-2 text-xs ${
+              result.type === "success"
+                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                : "bg-red-50 text-red-700 border border-red-200"
+            }`}>
+              {result.message}
+            </div>
+          )}
+        </div>
+      )}
+
     </div>
   );
 }
@@ -1445,18 +1008,18 @@ export default function Settings() {
       <div>
         <h1 className="text-2xl font-bold text-gray-800">설정</h1>
         <p className="mt-1 text-sm text-gray-500">
-          비행검사기 및 레이더사이트를 관리합니다
+          앱 설정을 관리합니다
         </p>
       </div>
 
-      {/* 비행검사기 관리 */}
+      {/* vworld 계정 */}
       <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
-        <AircraftSection />
+        <VworldAccountSection />
       </div>
 
-      {/* 레이더사이트 관리 */}
+      {/* DB 관리 */}
       <div className="rounded-xl border border-gray-200 bg-gray-50 p-5">
-        <RadarSiteSection />
+        <DatabaseSection />
       </div>
 
       {/* 개발자 모드 */}

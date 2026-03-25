@@ -6,6 +6,15 @@
 /* MapLibre GL CSS (항적 지도 GPU) */
 @import "maplibre-gl/dist/maplibre-gl.css";
 
+/* Pretendard Variable (self-hosted) */
+@font-face {
+  font-family: "Pretendard Variable";
+  font-weight: 45 920;
+  font-style: normal;
+  font-display: swap;
+  src: url("/fonts/PretendardVariable.woff2") format("woff2-variations");
+}
+
 /* White + #a60739 accent theme */
 :root {
   --color-bg-primary: #ffffff;

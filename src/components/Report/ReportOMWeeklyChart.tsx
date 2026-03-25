@@ -1,5 +1,6 @@
 import React from "react";
 import type { DailyStats } from "../../types";
+import { weightedAvg } from "../../utils/omStats";
 
 interface Props {
   sectionNum: number;
@@ -40,10 +41,10 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth 
 
   const weeks: WeekSummary[] = [];
   for (const [wk, stats] of weekMap) {
-    const avgPsr = stats.reduce((s, d) => s + d.psr_rate * 100, 0) / stats.length;
-    const avgLoss = stats.reduce((s, d) => s + d.loss_rate, 0) / stats.length;
-    const baselinePsr = stats.reduce((s, d) => s + d.baseline_psr_rate * 100, 0) / stats.length;
-    const baselineLoss = stats.reduce((s, d) => s + d.baseline_loss_rate, 0) / stats.length;
+    const avgPsr = weightedAvg(stats, (d) => d.psr_rate * 100, (d) => d.ssr_combined_points);
+    const avgLoss = weightedAvg(stats, (d) => d.loss_rate, (d) => d.total_track_time_secs);
+    const baselinePsr = weightedAvg(stats, (d) => d.baseline_psr_rate * 100, (d) => d.ssr_combined_points);
+    const baselineLoss = weightedAvg(stats, (d) => d.baseline_loss_rate, (d) => d.total_track_time_secs);
     weeks.push({ week: wk, label: `${wk}주차`, avgPsr, avgLoss, days: stats.length, baselinePsr, baselineLoss });
   }
   weeks.sort((a, b) => a.week - b.week);

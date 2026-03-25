@@ -9,7 +9,7 @@
  * SRTM 타일을 GPU로 전송하지 않고, Rust에서 elevation만 pre-sample하여 전송.
  * 전송 크기: ~72MB f32 (기존 raw tile 방식의 ~5GB 대비 14배 감소)
  *
- * GPU 미지원 시 null 반환 → 호출측에서 CPU 폴백
+ * GPU 필수 — 미지원 시 에러 throw
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -110,7 +110,7 @@ function destinationPoint(
 
 /**
  * WebGPU로 파노라마 앙각 계산 실행
- * @returns TerrainResult[] 또는 GPU 미지원 시 null
+ * GPU 필수 — 미지원 시 에러 throw
  */
 export async function computePanoramaTerrainGPU(
   radarLat: number,
@@ -119,25 +119,18 @@ export async function computePanoramaTerrainGPU(
   maxRangeKm: number,
   azimuthStepDeg: number,
   rangeStepM: number,
-): Promise<TerrainResult[] | null> {
+): Promise<TerrainResult[]> {
   const device = await getGPUDevice();
-  if (!device) return null;
 
   // 1. Rust에서 pre-sampled elevation 가져오기 (SRTM 조회는 Rust rayon이 수행)
   console.time("[GPU Panorama] Rust presample");
-  let preSampled: PreSampledElevations;
-  try {
-    preSampled = await invoke<PreSampledElevations>("presample_panorama_elevations", {
-      radarLat,
-      radarLon,
-      maxRangeKm,
-      azimuthStepDeg,
-      rangeStepM,
-    });
-  } catch (e) {
-    console.warn("[GPU Panorama] Rust presample failed:", e);
-    return null;
-  }
+  const preSampled = await invoke<PreSampledElevations>("presample_panorama_elevations", {
+    radarLat,
+    radarLon,
+    maxRangeKm,
+    azimuthStepDeg,
+    rangeStepM,
+  });
   console.timeEnd("[GPU Panorama] Rust presample");
 
   const { num_azimuths: numAzimuths, num_steps: numSteps } = preSampled;
@@ -156,8 +149,7 @@ export async function computePanoramaTerrainGPU(
   // 버퍼 크기 제한 확인
   const maxBufSize = device.limits.maxStorageBufferBindingSize;
   if (elevF32.byteLength > maxBufSize) {
-    console.warn(`[GPU Panorama] Elevation data ${(elevF32.byteLength / 1e6).toFixed(0)}MB exceeds GPU limit ${(maxBufSize / 1e6).toFixed(0)}MB`);
-    return null;
+    throw new Error(`파노라마 고도 데이터(${(elevF32.byteLength / 1e6).toFixed(0)}MB)가 GPU 버퍼 한계(${(maxBufSize / 1e6).toFixed(0)}MB)를 초과합니다.`);
   }
 
   // 3. GPU 버퍼 생성
