@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo, useEffect, startTransition } from "react";
+import { useState, useCallback, useMemo, useEffect, startTransition } from "react";
 import {
   FileText,
   Download,
@@ -8,7 +8,6 @@ import {
   Map as MapIcon,
   BarChart3,
   Crosshair,
-  ArrowLeft,
   Eye,
   Plane,
   Calendar,
@@ -29,201 +28,23 @@ import { format } from "date-fns";
 import { useAppStore } from "../store";
 import Modal from "../components/common/Modal";
 import MonthPicker from "../components/common/MonthPicker";
-import ReportPage from "../components/Report/ReportPage";
-import ReportCoverPage from "../components/Report/ReportCoverPage";
-import ReportSummarySection from "../components/Report/ReportSummarySection";
-import ReportMapSection from "../components/Report/ReportMapSection";
-import ReportStatsSection from "../components/Report/ReportStatsSection";
-import ReportLossSection from "../components/Report/ReportLossSection";
-import ReportLoSSection from "../components/Report/ReportLoSSection";
-import ReportAircraftSection from "../components/Report/ReportAircraftSection";
-import ReportFlightComparisonSection from "../components/Report/ReportFlightComparisonSection";
-import ReportFlightProfileSection from "../components/Report/ReportFlightProfileSection";
-import ReportFlightLossAnalysisSection from "../components/Report/ReportFlightLossAnalysisSection";
-import ReportPanoramaSection from "../components/Report/ReportPanoramaSection";
-import ReportOMSummarySection from "../components/Report/ReportOMSummarySection";
-import ReportOMDailyChart from "../components/Report/ReportOMDailyChart";
-import ReportOMWeeklyChart from "../components/Report/ReportOMWeeklyChart";
-import ReportOMCoverageDiff from "../components/Report/ReportOMCoverageDiff";
-import ReportOMBuildingLoS from "../components/Report/ReportOMBuildingLoS";
-import ReportOMAltitudeDistribution from "../components/Report/ReportOMAltitudeDistribution";
-import ReportOMFindings from "../components/Report/ReportOMFindings";
-import ReportOMLossEvents from "../components/Report/ReportOMLossEvents";
-import ReportOMAzDistScatter from "../components/Report/ReportOMAzDistScatter";
-import OMSectionImage from "../components/Report/OMSectionImage";
-import ReportPSSummarySection from "../components/Report/ReportPSSummarySection";
-import ReportPSAngleHeight from "../components/Report/ReportPSAngleHeight";
-import ReportPSAdditionalLoss from "../components/Report/ReportPSAdditionalLoss";
-import { useReportExport } from "../components/Report/useReportExport";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { flightLabel } from "../utils/flightConsolidation";
 import { computeLayersForAltitudes, isGPUCacheValidFor, type CoverageLayer } from "../utils/radarCoverage";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import { haversineKm } from "../utils/geo";
+import {
+  writeReportPayload, serializeOMData,
+  templateDisplayLabel, DEFAULT_SECTIONS,
+  type ReportTemplate, type ReportSections,
+} from "../utils/reportTransfer";
 import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata, PanoramaPoint, NearbyPeak,
   ManualBuilding, BuildingGroup, RadarSite, AzSector, ObstacleMonthlyResult, ObstacleMonthlyProgress, SavedReportSummary,
   PreScreeningResult, OMReportData,
 } from "../types";
-
-type ReportTemplate = "weekly" | "monthly" | "flights" | "single" | "obstacle" | "obstacle_monthly";
-type ReportMode = "config" | "preview";
-
-interface ReportSections {
-  cover: boolean;
-  summary: boolean;
-  trackMap: boolean;
-  stats: boolean;
-  los: boolean;
-  panorama: boolean;
-  aircraft: boolean;
-  // 건별 보고서 전용
-  flightComparison: boolean;
-  lossDetail: boolean;
-  // 단일 상세 전용
-  flightProfile: boolean;
-  flightLossAnalysis: boolean;
-  // 장애물 사전검토 보고서 전용
-  obstacleSummary: boolean;
-  coverageMap: boolean;
-  psAdditionalLoss: boolean;
-  psAngleHeight: boolean;
-  // 장애물 월간 보고서 전용
-  omSummary: boolean;
-  omDailyPsr: boolean;
-  omDailyLoss: boolean;
-  omWeekly: boolean;
-  omCoverageDiff: boolean;
-  omAzDistScatter: boolean;
-  omBuildingLos: boolean;
-  omAltitude: boolean;
-  omLossEvents: boolean;
-  omFindings: boolean;
-}
-
-/** 뷰포트 기반 지연 렌더링 래퍼 — 화면 밖 무거운 섹션을 스크롤 시 점진적 마운트 */
-function LazySection({ children, fallbackHeight = "297mm", forceVisible = false }: {
-  children: React.ReactNode;
-  fallbackHeight?: string;
-  forceVisible?: boolean;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(false);
-
-  useEffect(() => {
-    if (forceVisible) return;
-    const el = ref.current;
-    if (!el) return;
-    const obs = new IntersectionObserver(
-      ([entry]) => { if (entry.isIntersecting) { setVisible(true); obs.disconnect(); } },
-      { rootMargin: "200px" },
-    );
-    obs.observe(el);
-    return () => obs.disconnect();
-  }, [forceVisible]);
-
-  if (forceVisible || visible) return <>{children}</>;
-  return <div ref={ref} style={{ minHeight: fallbackHeight }} />;
-}
-
-const DEFAULT_SECTIONS: ReportSections = {
-  cover: true,
-  summary: true,
-  trackMap: true,
-  stats: true,
-  los: true,
-  panorama: true,
-  aircraft: true,
-  flightComparison: true,
-  lossDetail: true,
-  flightProfile: true,
-  flightLossAnalysis: true,
-  obstacleSummary: true,
-  coverageMap: true,
-  psAdditionalLoss: true,
-  psAngleHeight: true,
-  omSummary: true,
-  omDailyPsr: true,
-  omDailyLoss: true,
-  omWeekly: true,
-  omCoverageDiff: true,
-  omAzDistScatter: true,
-  omBuildingLos: true,
-  omAltitude: true,
-  omLossEvents: true,
-  omFindings: true,
-};
-
-/** 템플릿별 표시할 섹션 토글 목록 */
-function getSectionToggles(template: ReportTemplate, _sections: ReportSections): { key: keyof ReportSections; label: string }[] {
-  if (template === "flights") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "flightComparison", label: "비교" },
-      { key: "trackMap", label: "지도" },
-      { key: "lossDetail", label: "소실" },
-      { key: "los", label: "LoS" },
-      { key: "panorama", label: "장애물" },
-    ];
-  }
-  if (template === "obstacle") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "obstacleSummary", label: "요약" },
-      { key: "psAngleHeight", label: "앙각/높이" },
-      { key: "psAdditionalLoss", label: "추가Loss" },
-      { key: "coverageMap", label: "커버리지" },
-      { key: "los", label: "LoS" },
-    ];
-  }
-  if (template === "obstacle_monthly") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "omSummary", label: "요약" },
-      { key: "omDailyPsr", label: "PSR" },
-      { key: "omDailyLoss", label: "표적소실" },
-      { key: "omWeekly", label: "주차" },
-      { key: "omCoverageDiff", label: "커버리지" },
-      { key: "omAzDistScatter", label: "산점도" },
-      { key: "omBuildingLos", label: "LoS" },
-      { key: "omAltitude", label: "고도분포" },
-      { key: "omLossEvents", label: "표적소실상세" },
-      { key: "omFindings", label: "소견" },
-    ];
-  }
-  if (template === "single") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "flightProfile", label: "프로파일" },
-      { key: "trackMap", label: "지도" },
-      { key: "flightLossAnalysis", label: "소실분석" },
-      { key: "los", label: "LoS" },
-      { key: "panorama", label: "장애물" },
-    ];
-  }
-  return [
-    { key: "cover", label: "표지" },
-    { key: "summary", label: "요약" },
-    { key: "trackMap", label: "지도" },
-    { key: "stats", label: "통계" },
-    { key: "los", label: "LoS" },
-    { key: "panorama", label: "장애물" },
-    { key: "aircraft", label: "검사기" },
-  ];
-}
-
-function templateDisplayLabel(tpl: ReportTemplate): string {
-  switch (tpl) {
-    case "weekly": return "주간";
-    case "monthly": return "월간";
-    case "flights": return "건별";
-    case "single": return "상세";
-    case "obstacle": return "사전검토";
-    case "obstacle_monthly": return "장애물월간";
-  }
-}
 
 export default function ReportGeneration() {
   const allFlights = useAppStore((s) => s.flights);
@@ -238,12 +59,7 @@ export default function ReportGeneration() {
 
   const customRadarSites = useAppStore((s) => s.customRadarSites);
 
-  const [mode, setMode] = useState<ReportMode>("config");
-  const [template, setTemplate] = useState<ReportTemplate>("weekly");
   const [sections, setSections] = useState<ReportSections>({ ...DEFAULT_SECTIONS });
-  const [generating, setGenerating] = useState(false);
-  const [forceAllVisible, setForceAllVisible] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [mapImage, setMapImage] = useState<string | null>(null);
 
   // 장애물 월간 분석 상태 (통합)
@@ -274,22 +90,6 @@ export default function ReportGeneration() {
   const [psCovLayersWith, setPsCovLayersWith] = useState<CoverageLayer[]>([]);
   const [psCovLayersWithout, setPsCovLayersWithout] = useState<CoverageLayer[]>([]);
   const [psAnalysisMonth, setPsAnalysisMonth] = useState<string>("");
-
-  // 2주 초과 데이터 → 최근 31일만 사용
-  const omResultTrimmed = useMemo(() => {
-    if (!omData.result) return null;
-    const MAX_DAYS = 31;
-    const TWO_WEEKS = 14;
-    return {
-      ...omData.result,
-      radar_results: omData.result.radar_results.map((rr) => {
-        if (rr.daily_stats.length <= TWO_WEEKS) return rr;
-        const sorted = [...rr.daily_stats].sort((a, b) => b.date.localeCompare(a.date));
-        const trimmed = sorted.slice(0, MAX_DAYS).sort((a, b) => a.date.localeCompare(b.date));
-        return { ...rr, daily_stats: trimmed };
-      }),
-    };
-  }, [omData.result]);
 
   // 파노라마 데이터 (캐시에서 로드)
   const [panoramaData, setPanoramaData] = useState<PanoramaPoint[]>([]);
@@ -450,135 +250,13 @@ export default function ReportGeneration() {
   // 템플릿 모달
   const [templateModalOpen, setTemplateModalOpen] = useState<ReportTemplate | null>(null);
 
-  // 저장된 보고서 수정 모드
-  const [editingReportId, setEditingReportId] = useState<string | null>(null);
-
-  // 편집 가능 텍스트 상태
-  const [coverTitle, setCoverTitle] = useState("비행검사 주간 보고서");
-  const [coverSubtitle, setCoverSubtitle] = useState(
-    `${format(new Date(), "yyyy년 MM월 dd일")} 기준 주간 보고`
-  );
+  // 저장된 보고서 수정 모드 (보고서 창으로 전달용, 메인에선 항상 null)
+  const editingReportId: string | null = null;
 
   const avgLossPercent =
     flights.length > 0
       ? flights.reduce((s, r) => s + r.loss_percentage, 0) / flights.length
       : 0;
-  const [commentary, setCommentary] = useState(() => {
-    const grade = avgLossPercent < 1 ? "양호" : avgLossPercent < 5 ? "주의" : "경고";
-    return `금주 비행검사 항적 분석 결과, 평균 소실율은 ${avgLossPercent.toFixed(1)}%로 종합 판정 '${grade}' 수준입니다. 특이사항 없음.`;
-  });
-
-  const previewRef = useRef<HTMLDivElement>(null);
-  const { exportPDF } = useReportExport();
-
-  // 보고서 준비 상태 (프리뷰 진입 시 렌더링 완료까지 오버레이)
-  const [reportPreparing, setReportPreparing] = useState(false);
-  const [prepPageCount, setPrepPageCount] = useState(0);
-  const prepTotalEstimate = useRef(1);
-
-  /** 프리뷰 진입 시 예상 페이지 수 계산 */
-  const estimateTotalPages = useCallback((tpl: ReportTemplate, sects: ReportSections) => {
-    let total = 0;
-    if (sects.cover) total++;
-    if (tpl === "weekly" || tpl === "monthly") {
-      if (sects.summary || sects.trackMap) total++;
-      if (sects.stats && flights.length > 0) total++;
-      if (sects.los && losResults.length > 0) total++;
-      if (sects.panorama && panoramaData.length > 0) total++;
-      if (sects.aircraft && aircraft.length > 0) total++;
-    } else if (tpl === "obstacle") {
-      if (sects.obstacleSummary) total++;
-      if (sects.psAngleHeight) total++;
-      if (sects.psAdditionalLoss) total++;
-      if (sects.coverageMap) total++;
-      if (sects.los) total++;
-    } else if (tpl === "obstacle_monthly") {
-      const nRadars = Math.max(omData.selectedRadarSites.length, 1);
-      if (sects.omSummary) total++;
-      if (sects.omDailyPsr) total += nRadars;
-      if (sects.omDailyLoss) total += nRadars;
-      if (sects.omWeekly) total += nRadars;
-      if (sects.omCoverageDiff) total += nRadars;
-      if (sects.omAzDistScatter) total += nRadars;
-      if (sects.omBuildingLos) total++;
-      if (sects.omAltitude) total++;
-      if (sects.omLossEvents) total++;
-      if (sects.omFindings) total++;
-    } else if (tpl === "flights") {
-      if (sects.flightComparison || sects.trackMap) total++;
-      if (sects.lossDetail) total++;
-      if (sects.los && losResults.length > 0) total++;
-      if (sects.panorama && panoramaData.length > 0) total++;
-    } else if (tpl === "single") {
-      if (sects.flightProfile || sects.trackMap) total++;
-      if (sects.flightLossAnalysis) total++;
-      if (sects.los && losResults.length > 0) total++;
-      if (sects.panorama && panoramaData.length > 0) total++;
-    }
-    return Math.max(total, 1);
-  }, [flights.length, losResults.length, panoramaData.length, aircraft.length, omData.selectedRadarSites.length]);
-
-  /** MutationObserver로 [data-page] 요소 수를 추적하여 렌더링 완료 감지 */
-  useEffect(() => {
-    if (mode !== "preview" || !reportPreparing) return;
-    const container = previewRef.current;
-    if (!container) return;
-
-    let stableFrames = 0;
-    let lastCount = 0;
-    let rafId = 0;
-
-    const countPages = () => container.querySelectorAll("[data-page]").length;
-
-    const checkStable = () => {
-      const count = countPages();
-      setPrepPageCount(count);
-      if (count >= prepTotalEstimate.current && count === lastCount) {
-        stableFrames++;
-        if (stableFrames >= 3) {
-          // 렌더링 안정 → 준비 완료
-          setReportPreparing(false);
-          return;
-        }
-      } else {
-        stableFrames = 0;
-      }
-      lastCount = count;
-      rafId = requestAnimationFrame(checkStable);
-    };
-
-    const observer = new MutationObserver(() => {
-      const count = countPages();
-      setPrepPageCount(count);
-    });
-    observer.observe(container, { childList: true, subtree: true });
-
-    // 초기 체크 시작
-    rafId = requestAnimationFrame(checkStable);
-
-    // 안전 타임아웃 (5초 후 강제 완료)
-    const timeout = setTimeout(() => {
-      setReportPreparing(false);
-    }, 5000);
-
-    return () => {
-      observer.disconnect();
-      cancelAnimationFrame(rafId);
-      clearTimeout(timeout);
-    };
-  }, [mode, reportPreparing]);
-
-  // 선택된 비행 목록 (preview용)
-  const reportFlights = useMemo(() => {
-    if (template === "flights") {
-      return flights.filter((f) => selectedFlightIds.has(f.id));
-    }
-    if (template === "single") {
-      const found = flights.find((f) => f.id === singleFlightId);
-      return found ? [found] : [];
-    }
-    return flights;
-  }, [template, flights, selectedFlightIds, singleFlightId]);
 
   // 맵 캡처
   const captureMap = useCallback((targetFlights: Flight[]): Promise<string | null> => {
@@ -624,152 +302,210 @@ export default function ReportGeneration() {
     });
   }, []);
 
-  // 보고서 생성 (config → preview)
+  /** 보고서 창 열기 헬퍼 */
+  const openReportWindow = useCallback(async () => {
+    const { WebviewWindow, getAllWebviewWindows } = await import("@tauri-apps/api/webviewWindow");
+    const existing = (await getAllWebviewWindows()).find((w) => w.label === "report");
+    if (existing) {
+      // 기존 창이 있으면 데이터 갱신 후 포커스
+      await emit("report:reload-data");
+      await existing.setFocus();
+    } else {
+      new WebviewWindow("report", {
+        url: "index.html",
+        title: "보고서 편집 — AirMove Analyzer",
+        width: 900,
+        height: 1000,
+        minWidth: 800,
+        minHeight: 700,
+        decorations: false,
+        center: true,
+      });
+    }
+  }, []);
+
+  // 보고서 창에서 저장 완료 시 목록 갱신
+  useEffect(() => {
+    const unlisten = listen<{ summary: SavedReportSummary; isEdit: boolean }>(
+      "report:saved",
+      (event) => {
+        const { summary, isEdit } = event.payload;
+        if (isEdit) {
+          useAppStore.setState((state) => ({
+            savedReports: state.savedReports.map((r) => r.id === summary.id ? summary : r),
+          }));
+        } else {
+          useAppStore.getState().addSavedReport(summary);
+        }
+      },
+    );
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // 보고서 준비 진행 상태
+  const [preparing, setPreparing] = useState(false);
+  const [prepProgress, setPrepProgress] = useState("");
+
+  /** 데이터 override (모달에서 직접 전달, state race condition 방지) */
+  interface DataOverride {
+    omData?: OMReportData;
+    psResult?: PreScreeningResult;
+    psSelectedBuildings?: ManualBuilding[];
+    psSelectedRadarSites?: RadarSite[];
+    psLosMap?: Map<string, LoSProfileData>;
+    psCovLayersWith?: CoverageLayer[];
+    psCovLayersWithout?: CoverageLayer[];
+    psAnalysisMonth?: string;
+  }
+
+  // 보고서 생성 → IDB에 저장 → 별도 창 열기
   const handleGenerate = useCallback(async (
     tpl: ReportTemplate,
     sects: ReportSections,
     flightIds?: Set<string>,
     singleId?: string | null,
+    dataOverride?: DataOverride,
   ) => {
-    // 비행 선택 상태 저장
-    if (flightIds) setSelectedFlightIds(flightIds);
-    if (singleId !== undefined) setSingleFlightId(singleId);
+    setPreparing(true);
+    setPrepProgress("데이터 준비 중...");
 
-    // 타이틀/서브타이틀 설정
-    if (tpl === "weekly" || tpl === "monthly") {
-      const label = tpl === "weekly" ? "주간" : "월간";
-      setCoverTitle(`비행검사 ${label} 보고서`);
-      setCoverSubtitle(
-        tpl === "weekly"
-          ? `${format(new Date(), "yyyy년 MM월 dd일")} 기준 주간 보고`
-          : `${format(new Date(), "yyyy년 MM월")} 보고`
-      );
-      const grade = avgLossPercent < 1 ? "양호" : avgLossPercent < 5 ? "주의" : "경고";
-      setCommentary(
-        `금${tpl === "weekly" ? "주" : "월"} 비행검사 항적 분석 결과, 평균 소실율은 ${avgLossPercent.toFixed(1)}%로 종합 판정 '${grade}' 수준입니다. 특이사항 없음.`
-      );
-    } else if (tpl === "flights") {
-      const ids = flightIds ?? selectedFlightIds;
-      setCoverTitle("비행 건별 분석 보고서");
-      setCoverSubtitle(`${format(new Date(), "yyyy년 MM월 dd일")} · 선택 ${ids.size}건 비행 분석`);
-    } else if (tpl === "obstacle") {
-      setCoverTitle("전파 장애물 분석 보고서");
-      setCoverSubtitle(`${radarSite?.name ?? ""} 레이더 장애물 종합 분석 · ${format(new Date(), "yyyy년 MM월 dd일")}`);
-    } else if (tpl === "obstacle_monthly") {
-      const radarNames = omData.selectedRadarSites.map((r) => r.name).join(", ");
-      setCoverTitle("장애물 월간 분석 보고서");
-      const monthLabel = omData.analysisMonth
-        ? `${omData.analysisMonth.slice(0, 4)}년 ${omData.analysisMonth.slice(5, 7)}월`
-        : format(new Date(), "yyyy년 MM월");
-      setCoverSubtitle(radarNames ? `${radarNames} ${monthLabel}` : monthLabel);
-    } else if (tpl === "single") {
-      const f = flights.find((fl) => fl.id === (singleId ?? singleFlightId));
-      if (f) {
-        const label = flightLabel(f, aircraft);
-        setCoverTitle("비행검사 상세 분석 보고서");
-        setCoverSubtitle(`${label} · ${format(new Date(f.start_time * 1000), "yyyy-MM-dd")}`);
-      }
-    }
-
-    // 맵 캡처 (선택 비행 기준, 장애물 보고서는 항적지도 불포함)
-    if (sects.trackMap && tpl !== "obstacle" && tpl !== "obstacle_monthly") {
-      let targetFlights: Flight[];
-      if (tpl === "flights" && flightIds) {
-        targetFlights = flights.filter((f) => flightIds.has(f.id));
-      } else if (tpl === "single" && singleId) {
-        const found = flights.find((f) => f.id === singleId);
-        targetFlights = found ? [found] : flights;
-      } else {
-        targetFlights = flights;
-      }
-      const img = await captureMap(targetFlights);
-      setMapImage(img);
-    }
-
-    setTemplate(tpl);
-    setSections(sects);
-    setTemplateModalOpen(null);
-    // 준비 오버레이 시작 → 프리뷰 진입
-    prepTotalEstimate.current = estimateTotalPages(tpl, sects);
-    setPrepPageCount(0);
-    setReportPreparing(true);
-    setMode("preview");
-  }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite, omData.selectedRadarSites, omData.analysisMonth, estimateTotalPages]);
-
-  // PDF 내보내기 + DB 저장
-  const handleExportPDF = useCallback(async () => {
-    setGenerating(true);
-    setForceAllVisible(true);
-    setError(null);
-    // LazySection 강제 마운트 후 렌더링 완료 대기
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     try {
-      const dateStr = format(new Date(), "yyyyMMdd_HHmmss");
-      const tplLabel = templateDisplayLabel(template);
-      const filename = `비행검사_${tplLabel}_보고서_${dateStr}.pdf`;
-      const result = await exportPDF(previewRef, filename);
-      if (!result.success && result.error && result.error !== "저장이 취소되었습니다") {
-        setError(result.error);
-      }
-      // 보고서 DB 저장
-      if (result.success && result.pdfBase64) {
-        const reportId = editingReportId ?? `rpt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const title = coverTitle;
-        const configJson = JSON.stringify({
-          template,
-          sections,
-          selectedFlightIds: Array.from(selectedFlightIds),
-          singleFlightId,
-          // 편집 가능 텍스트 포함
-          coverTitle,
-          coverSubtitle,
-          commentary,
-          omFindingsText: omData.findingsText,
-          omRecommendText: omData.recommendText,
-          mapImage,
-        });
-        const metaJson = JSON.stringify(reportMetadata);
-        invoke("save_report", {
-          id: reportId,
-          title,
-          template,
-          radarName: radarSite?.name ?? "",
-          reportConfigJson: configJson,
-          pdfBase64: result.pdfBase64,
-          metadataJson: metaJson,
-        })
-          .then(() => {
-            const summary: SavedReportSummary = {
-              id: reportId,
-              title,
-              template,
-              radar_name: radarSite?.name ?? "",
-              created_at: Math.floor(Date.now() / 1000),
-              has_pdf: true,
-            };
-            if (editingReportId) {
-              // 기존 보고서 업데이트: 목록에서 교체
-              useAppStore.setState((state) => ({
-                savedReports: state.savedReports.map((r) => r.id === reportId ? summary : r),
-              }));
-            } else {
-              useAppStore.getState().addSavedReport(summary);
-            }
-            setEditingReportId(null);
-            console.log(`[Report] 보고서 DB 저장: ${reportId}`);
-          })
-          .catch((e) => console.warn("[Report] DB 저장 실패:", e));
-      }
-    } catch (err) {
-      setError(`PDF 내보내기 실패: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setGenerating(false);
-      setForceAllVisible(false);
-    }
-  }, [template, exportPDF, coverTitle, coverSubtitle, commentary, omData.findingsText, omData.recommendText, mapImage, sections, selectedFlightIds, singleFlightId, reportMetadata, radarSite, editingReportId]);
+      if (flightIds) setSelectedFlightIds(flightIds);
+      if (singleId !== undefined) setSingleFlightId(singleId);
 
-  // 저장된 보고서 수정 (config → preview 복원)
+      // override 또는 현재 state 사용 (state race condition 방지)
+      const curOmData = dataOverride?.omData ?? omData;
+      const curPsResult = dataOverride?.psResult ?? psResult;
+      const curPsBuildings = dataOverride?.psSelectedBuildings ?? psSelectedBuildings;
+      const curPsRadars = dataOverride?.psSelectedRadarSites ?? psSelectedRadarSites;
+      const curPsLosMap = dataOverride?.psLosMap ?? psLosMap;
+      const curPsCovWith = dataOverride?.psCovLayersWith ?? psCovLayersWith;
+      const curPsCovWithout = dataOverride?.psCovLayersWithout ?? psCovLayersWithout;
+      const curPsMonth = dataOverride?.psAnalysisMonth ?? psAnalysisMonth;
+
+      // 타이틀/서브타이틀 결정
+      let title = "비행검사 보고서";
+      let subtitle = "";
+      const grade = avgLossPercent < 1 ? "양호" : avgLossPercent < 5 ? "주의" : "경고";
+      let comm = `금주 비행검사 항적 분석 결과, 평균 소실율은 ${avgLossPercent.toFixed(1)}%로 종합 판정 '${grade}' 수준입니다. 특이사항 없음.`;
+      if (tpl === "weekly" || tpl === "monthly") {
+        const label = tpl === "weekly" ? "주간" : "월간";
+        title = `비행검사 ${label} 보고서`;
+        subtitle = tpl === "weekly"
+          ? `${format(new Date(), "yyyy년 MM월 dd일")} 기준 주간 보고`
+          : `${format(new Date(), "yyyy년 MM월")} 보고`;
+        comm = `금${tpl === "weekly" ? "주" : "월"} 비행검사 항적 분석 결과, 평균 소실율은 ${avgLossPercent.toFixed(1)}%로 종합 판정 '${grade}' 수준입니다. 특이사항 없음.`;
+      } else if (tpl === "flights") {
+        const ids = flightIds ?? selectedFlightIds;
+        title = "비행 건별 분석 보고서";
+        subtitle = `${format(new Date(), "yyyy년 MM월 dd일")} · 선택 ${ids.size}건 비행 분석`;
+      } else if (tpl === "obstacle") {
+        title = "전파 장애물 분석 보고서";
+        subtitle = `${radarSite?.name ?? ""} 레이더 장애물 종합 분석 · ${format(new Date(), "yyyy년 MM월 dd일")}`;
+      } else if (tpl === "obstacle_monthly") {
+        const radarNames = curOmData.selectedRadarSites.map((r) => r.name).join(", ");
+        title = "장애물 월간 분석 보고서";
+        const monthLabel = curOmData.analysisMonth
+          ? `${curOmData.analysisMonth.slice(0, 4)}년 ${curOmData.analysisMonth.slice(5, 7)}월`
+          : format(new Date(), "yyyy년 MM월");
+        subtitle = radarNames ? `${radarNames} ${monthLabel}` : monthLabel;
+      } else if (tpl === "single") {
+        const f = flights.find((fl) => fl.id === (singleId ?? singleFlightId));
+        if (f) {
+          title = "비행검사 상세 분석 보고서";
+          subtitle = `${flightLabel(f, aircraft)} · ${format(new Date(f.start_time * 1000), "yyyy-MM-dd")}`;
+        }
+      }
+
+      // 맵 캡처
+      let capturedMap = mapImage;
+      if (sects.trackMap && tpl !== "obstacle" && tpl !== "obstacle_monthly") {
+        setPrepProgress("맵 캡처 중...");
+        let targetFlights: Flight[];
+        if (tpl === "flights" && flightIds) {
+          targetFlights = flights.filter((f) => flightIds.has(f.id));
+        } else if (tpl === "single" && singleId) {
+          const found = flights.find((f) => f.id === singleId);
+          targetFlights = found ? [found] : flights;
+        } else {
+          targetFlights = flights;
+        }
+        capturedMap = await captureMap(targetFlights);
+        setMapImage(capturedMap);
+      }
+
+      // reportFlights 계산
+      const ids = flightIds ?? selectedFlightIds;
+      const sid = singleId !== undefined ? singleId : singleFlightId;
+      let reportFlights: Flight[];
+      if (tpl === "flights") {
+        reportFlights = flights.filter((f) => ids.has(f.id));
+      } else if (tpl === "single") {
+        const found = flights.find((f) => f.id === sid);
+        reportFlights = found ? [found] : [];
+      } else {
+        reportFlights = flights;
+      }
+
+      setPrepProgress("보고서 데이터 저장 중...");
+
+      // 템플릿별 필요 데이터만 선별 (IDB 페이로드 최소화)
+      const isObstacle = tpl === "obstacle" || tpl === "obstacle_monthly";
+      const needsFlights = !isObstacle;
+      const needsPanorama = !isObstacle && sects.panorama;
+      const needsLoS = (tpl === "weekly" || tpl === "monthly" || tpl === "flights" || tpl === "single") && sects.los;
+      const needsOm = tpl === "obstacle_monthly";
+      const needsPs = tpl === "obstacle";
+
+      // IDB에 페이로드 저장 (override된 데이터, 필요분만)
+      await writeReportPayload({
+        template: tpl,
+        sections: sects,
+        selectedFlightIds: [...ids],
+        singleFlightId: sid ?? null,
+        editingReportId,
+        coverTitle: title,
+        coverSubtitle: subtitle,
+        commentary: comm,
+        flights: needsFlights ? reportFlights : [],
+        reportFlights,
+        losResults: needsLoS ? losResults : [],
+        aircraft: needsFlights ? aircraft : [],
+        radarSite,
+        reportMetadata,
+        panoramaData: needsPanorama ? panoramaData : [],
+        panoramaPeakNames: needsPanorama ? [...panoramaPeakNames] : [],
+        coverageLayers: [],
+        mapImage: capturedMap,
+        omData: needsOm ? serializeOMData(curOmData) : serializeOMData(omData),
+        psResult: needsPs ? curPsResult : null,
+        psSelectedBuildings: needsPs ? curPsBuildings : [],
+        psSelectedRadarSites: needsPs ? curPsRadars : [],
+        psLosMap: needsPs ? [...curPsLosMap] : [],
+        psCovLayersWith: needsPs ? curPsCovWith : [],
+        psCovLayersWithout: needsPs ? curPsCovWithout : [],
+        psAnalysisMonth: needsPs ? curPsMonth : "",
+      });
+
+      setSections(sects);
+      setTemplateModalOpen(null);
+
+      setPrepProgress("보고서 창 열기...");
+      // 창을 먼저 열어 로딩 화면 표시 → IDB 쓰기 완료 후 reload 이벤트
+      await openReportWindow();
+    } finally {
+      setPreparing(false);
+      setPrepProgress("");
+    }
+  }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite,
+      omData, reportMetadata, panoramaData, panoramaPeakNames, coverageLayers, losResults, mapImage,
+      psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap, psCovLayersWith, psCovLayersWithout,
+      psAnalysisMonth, editingReportId, openReportWindow]);
+
+  // 저장된 보고서 수정 → 별도 창에서 열기
   const handleEditReport = useCallback(async (reportId: string) => {
+    setPreparing(true);
+    setPrepProgress("보고서 불러오는 중...");
     try {
       const json = await invoke<string | null>("load_report_detail", { id: reportId });
       if (!json) return;
@@ -792,121 +528,84 @@ export default function ReportGeneration() {
         mapImage?: string | null;
       };
 
-      // 상태 복원
       const tpl = (config.template ?? detail.template) as ReportTemplate;
-      setTemplate(tpl);
-      if (config.sections) setSections(config.sections);
-      if (config.selectedFlightIds) setSelectedFlightIds(new Set(config.selectedFlightIds));
-      if (config.singleFlightId !== undefined) setSingleFlightId(config.singleFlightId);
-      setCoverTitle(config.coverTitle ?? detail.title);
-      setCoverSubtitle(config.coverSubtitle ?? "");
-      if (config.commentary) setCommentary(config.commentary);
-      if (config.omFindingsText || config.omRecommendText) {
-        setOmData((prev) => ({
-          ...prev,
-          findingsText: config.omFindingsText ?? prev.findingsText,
-          recommendText: config.omRecommendText ?? prev.recommendText,
-        }));
-      }
-      if (config.mapImage !== undefined) setMapImage(config.mapImage ?? null);
-
-      setEditingReportId(reportId);
-      // 준비 오버레이 시작
       const sects = config.sections ?? { ...DEFAULT_SECTIONS };
-      prepTotalEstimate.current = estimateTotalPages(tpl, sects);
-      setPrepPageCount(0);
-      setReportPreparing(true);
-      setMode("preview");
+      const restoredOmData: OMReportData = {
+        ...omData,
+        findingsText: config.omFindingsText ?? omData.findingsText,
+        recommendText: config.omRecommendText ?? omData.recommendText,
+      };
+
+      // reportFlights 계산
+      const ids = config.selectedFlightIds ?? [];
+      const sid = config.singleFlightId ?? null;
+      let reportFlights: Flight[];
+      if (tpl === "flights") {
+        const idSet = new Set(ids);
+        reportFlights = flights.filter((f) => idSet.has(f.id));
+      } else if (tpl === "single") {
+        const found = flights.find((f) => f.id === sid);
+        reportFlights = found ? [found] : [];
+      } else {
+        reportFlights = flights;
+      }
+
+      await writeReportPayload({
+        template: tpl,
+        sections: sects,
+        selectedFlightIds: ids,
+        singleFlightId: sid,
+        editingReportId: reportId,
+        coverTitle: config.coverTitle ?? detail.title,
+        coverSubtitle: config.coverSubtitle ?? "",
+        commentary: config.commentary ?? "",
+        flights,
+        reportFlights,
+        losResults,
+        aircraft,
+        radarSite,
+        reportMetadata,
+        panoramaData,
+        panoramaPeakNames: [...panoramaPeakNames],
+        coverageLayers,
+        mapImage: config.mapImage ?? null,
+        omData: serializeOMData(restoredOmData),
+        psResult,
+        psSelectedBuildings,
+        psSelectedRadarSites,
+        psLosMap: [...psLosMap],
+        psCovLayersWith,
+        psCovLayersWithout,
+        psAnalysisMonth,
+      });
+
+      setPrepProgress("보고서 창 열기...");
+      await openReportWindow();
     } catch (e) {
       console.warn("[Report] 보고서 로드 실패:", e);
+    } finally {
+      setPreparing(false);
+      setPrepProgress("");
     }
-  }, [estimateTotalPages]);
+  }, [flights, losResults, aircraft, radarSite, reportMetadata, panoramaData, panoramaPeakNames,
+      coverageLayers, omData, psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap,
+      psCovLayersWith, psCovLayersWithout, psAnalysisMonth, openReportWindow]);
 
-  // 활성 섹션 번호 계산
-  const sectionNumbers = useMemo(() => {
-    const nums: Record<string, number> = {};
-    let n = 1;
-    if (template === "flights") {
-      if (sections.flightComparison) nums.flightComparison = n++;
-      if (sections.trackMap) nums.trackMap = n++;
-      if (sections.lossDetail) nums.lossDetail = n++;
-      if (sections.los && losResults.length > 0) nums.los = n++;
-      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
-    } else if (template === "obstacle") {
-      if (sections.obstacleSummary) nums.obstacleSummary = n++;
-      if (sections.psAngleHeight && psResult) nums.psAngleHeight = n++;
-      if (sections.psAdditionalLoss && psResult) nums.psAdditionalLoss = n++;
-      if (sections.coverageMap && (psCovLayersWith.length > 0 || psCovLayersWithout.length > 0)) nums.coverageMap = n++;
-      if (sections.los && psLosMap.size > 0) nums.los = n++;
-    } else if (template === "obstacle_monthly") {
-      if (sections.omSummary) nums.omSummary = n++;
-      if (sections.omDailyPsr) nums.omDailyPsr = n++;
-      if (sections.omDailyLoss) nums.omDailyLoss = n++;
-      if (sections.omWeekly) nums.omWeekly = n++;
-      if (sections.omCoverageDiff) nums.omCoverageDiff = n++;
-      if (sections.omAzDistScatter) nums.omAzDistScatter = n++;
-      if (sections.omBuildingLos) nums.omBuildingLos = n++;
-      if (sections.omAltitude) nums.omAltitude = n++;
-      if (sections.omLossEvents) nums.omLossEvents = n++;
-      if (sections.omFindings) nums.omFindings = n++;
-    } else if (template === "single") {
-      if (sections.flightProfile) nums.flightProfile = n++;
-      if (sections.trackMap) nums.trackMap = n++;
-      if (sections.flightLossAnalysis) nums.flightLossAnalysis = n++;
-      if (sections.los && losResults.length > 0) nums.los = n++;
-      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
-    } else {
-      if (sections.summary) nums.summary = n++;
-      if (sections.trackMap) nums.trackMap = n++;
-      if (sections.stats && flights.length > 0) nums.stats = n++;
-      if (sections.los && losResults.length > 0) nums.los = n++;
-      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
-      if (sections.aircraft && aircraft.length > 0) nums.aircraft = n++;
-    }
-    return nums;
-  }, [template, sections, losResults, flights, aircraft, panoramaData, coverageLayers]);
+  const totalLoss = flights.reduce((s, r) => s + r.loss_points.length, 0);
 
-  // OM 레이더별 조건 텍스트 사전 계산 (렌더 내 haversine 반복 제거)
-  const omRadarConditions = useMemo(() => {
-    if (!omResultTrimmed) return new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
-    const map = new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
-    for (const rr of omResultTrimmed.radar_results) {
-      const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
-      const azText = sectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ");
-      const bldgNames = omData.selectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
-      const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
-      let minDistKm = Infinity;
-      if (rs) {
-        const toRad = Math.PI / 180;
-        for (const b of omData.selectedBuildings) {
-          const dLat = (b.latitude - rs.latitude) * toRad;
-          const dLon = (b.longitude - rs.longitude) * toRad;
-          const a = Math.sin(dLat / 2) ** 2 + Math.cos(rs.latitude * toRad) * Math.cos(b.latitude * toRad) * Math.sin(dLon / 2) ** 2;
-          const d = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-          if (d < minDistKm) minDistKm = d;
-        }
-      }
-      if (!isFinite(minDistKm)) minDistKm = 0;
-      map.set(rr.radar_name, { azText, bldgNames, minDistNm: (minDistKm / 1.852).toFixed(1) });
-    }
-    return map;
-  }, [omResultTrimmed, omData.azSectorsByRadar, omData.selectedRadarSites, omData.selectedBuildings]);
+  return (
+      <div className="relative space-y-6">
+        {/* 보고서 준비 오버레이 */}
+        {preparing && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center rounded-xl bg-white/80 backdrop-blur-sm">
+            <div className="min-w-[280px] rounded-xl bg-white px-8 py-7 text-center shadow-lg border border-gray-200">
+              <Loader2 size={20} className="mx-auto mb-3 animate-spin text-[#a60739]" />
+              <p className="mb-2 text-sm font-medium text-gray-700">보고서 준비 중</p>
+              <p className="text-xs text-gray-400">{prepProgress}</p>
+            </div>
+          </div>
+        )}
 
-  // OM 섹션 이미지 캡처 콜백 (안정적 참조)
-  const handleOMSectionCaptured = useCallback((key: string, dataUrl: string) => {
-    setOmData((prev) => {
-      const next = new Map(prev.sectionImages);
-      next.set(key, dataUrl);
-      return { ...prev, sectionImages: next };
-    });
-  }, []);
-
-  // ── 설정 모드 (Config) ──
-  if (mode === "config") {
-    const totalLoss = flights.reduce((s, r) => s + r.loss_points.length, 0);
-
-    return (
-      <div className="space-y-6">
         {/* Header */}
         <div>
           <h1 className="text-2xl font-bold text-gray-800">보고서 생성</h1>
@@ -957,8 +656,7 @@ export default function ReportGeneration() {
             metadata={reportMetadata}
             onClose={() => setTemplateModalOpen(null)}
             onGenerate={(result, buildings, radars, azMap, losMap, covWith, covWithout, monthStr) => {
-              setOmData((prev) => ({
-                ...prev,
+              const newOmData: OMReportData = {
                 result,
                 selectedBuildings: buildings,
                 selectedRadarSites: radars,
@@ -978,9 +676,13 @@ export default function ReportGeneration() {
                 }),
                 recommendText: "",
                 coverageStatus: covWith.length > 0 ? "done" : "loading",
-                sectionImages: new Map(), // 새 분석 시 이미지 캐시 초기화
-              }));
-              handleGenerate("obstacle_monthly", sections);
+                panoramaStatus: "idle",
+                sectionImages: new Map(),
+                panoWithTargets: new Map(),
+                panoWithoutTargets: new Map(),
+              };
+              setOmData(newOmData);
+              handleGenerate("obstacle_monthly", sections, undefined, undefined, { omData: newOmData });
             }}
             onCoverageReady={(covWith, covWithout) => {
               startTransition(() => {
@@ -997,6 +699,12 @@ export default function ReportGeneration() {
                     coverageStatus: "done",
                     sectionImages: nextImages,
                   };
+                });
+                // 보고서 창에 커버리지 업데이트 전달
+                emit("report:coverage-update", {
+                  covLayersWithBuildings: covWith,
+                  covLayersWithout: covWithout,
+                  coverageStatus: "done",
                 });
               });
             }}
@@ -1022,7 +730,15 @@ export default function ReportGeneration() {
               setPsCovLayersWith(covWith);
               setPsCovLayersWithout(covWithout);
               setPsAnalysisMonth(monthStr ?? "");
-              handleGenerate("obstacle", sections);
+              handleGenerate("obstacle", sections, undefined, undefined, {
+                psResult: result,
+                psSelectedBuildings: buildings,
+                psSelectedRadarSites: radars,
+                psLosMap: losMap,
+                psCovLayersWith: covWith,
+                psCovLayersWithout: covWithout,
+                psAnalysisMonth: monthStr ?? "",
+              });
             }}
             onCoverageReady={(covWith, covWithout) => {
               setPsCovLayersWith(covWith);
@@ -1032,579 +748,6 @@ export default function ReportGeneration() {
         )}
       </div>
     );
-  }
-
-  // ── 미리보기 모드 (Preview) ──
-  const toggles = getSectionToggles(template, sections);
-  const singleFlight = template === "single" ? reportFlights[0] : null;
-
-  return (
-    <div className="absolute inset-0 z-10 flex flex-col">
-      {/* 상단 툴바 */}
-      <div className="z-20 flex shrink-0 items-center gap-3 border-b border-gray-200 bg-white px-4 py-2">
-        <button
-          onClick={() => { setMode("config"); setEditingReportId(null); }}
-          className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-600 transition-colors hover:bg-gray-100"
-        >
-          <ArrowLeft size={14} />
-          돌아가기
-        </button>
-
-        {/* 섹션 토글 (컴팩트) */}
-        <div className="ml-2 flex items-center gap-1">
-          {toggles.map((s) => (
-            <button
-              key={s.key}
-              onClick={() => setSections((prev) => ({ ...prev, [s.key]: !prev[s.key] }))}
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
-                sections[s.key]
-                  ? "bg-[#a60739]/10 text-[#a60739] font-medium"
-                  : "text-gray-400 hover:bg-gray-100"
-              }`}
-            >
-              {s.label}
-            </button>
-          ))}
-        </div>
-
-        <div className="flex-1" />
-
-        {editingReportId && (
-          <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-[11px] font-medium text-blue-600">
-            수정 모드
-          </span>
-        )}
-
-        {error && (
-          <span className="text-xs text-red-500">{error}</span>
-        )}
-
-        <button
-          onClick={handleExportPDF}
-          disabled={generating || reportPreparing}
-          className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40"
-        >
-          {generating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-          {generating ? "생성 중..." : editingReportId ? "PDF 재저장" : "PDF 다운로드"}
-        </button>
-      </div>
-
-      {/* 보고서 미리보기 영역 */}
-      <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">
-        {/* 보고서 준비 오버레이 */}
-        {reportPreparing && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-gray-300">
-            <div className="min-w-[280px] rounded-xl bg-white px-8 py-7 text-center shadow-lg">
-              <svg className="mx-auto mb-3 h-5 w-5 animate-spin text-[#a60739]" viewBox="0 0 24 24" fill="none">
-                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="50 20" />
-              </svg>
-              <p className="mb-1 text-sm font-medium text-gray-700">보고서 준비 중...</p>
-              <p className="mb-3 text-xs text-gray-400">
-                {prepPageCount} / {prepTotalEstimate.current} 페이지
-              </p>
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-200">
-                <div
-                  className="h-full rounded-full bg-[#a60739] transition-all duration-300"
-                  style={{ width: `${Math.min(100, (prepPageCount / prepTotalEstimate.current) * 100)}%` }}
-                />
-              </div>
-            </div>
-          </div>
-        )}
-        {/* 섹션 컨테이너 (준비 중에는 숨김 — 렌더링은 계속 진행) */}
-        <div style={reportPreparing ? { visibility: "hidden", position: "absolute", top: 0, left: 0, right: 0 } : undefined}>
-        {/* 표지 (공통) */}
-        {sections.cover && (
-          <ReportCoverPage
-            template={template}
-            radarName={radarSite?.name ?? ""}
-            metadata={reportMetadata}
-            editable
-            title={coverTitle}
-            onTitleChange={setCoverTitle}
-            subtitle={coverSubtitle}
-            onSubtitleChange={setCoverSubtitle}
-          />
-        )}
-
-        {/* ─── 주간/월간 ─── */}
-        {(template === "weekly" || template === "monthly") && (
-          <>
-            {(sections.summary || sections.trackMap) && (
-              <ReportPage>
-                {sections.summary && (
-                  <ReportSummarySection
-                    sectionNum={sectionNumbers.summary ?? 1}
-                    flights={flights}
-                    losResults={losResults}
-                    aircraftCount={aircraft.filter((a) => a.active).length}
-                    editable
-                    commentary={commentary}
-                    onCommentaryChange={setCommentary}
-                  />
-                )}
-                {sections.trackMap && (
-                  <ReportMapSection
-                    sectionNum={sectionNumbers.trackMap ?? 2}
-                    mapImage={mapImage}
-                  />
-                )}
-              </ReportPage>
-            )}
-
-            {sections.stats && flights.length > 0 && (
-              <ReportPage>
-                <ReportStatsSection
-                  sectionNum={sectionNumbers.stats ?? 3}
-                  flights={flights}
-                  template={template}
-                />
-              </ReportPage>
-            )}
-
-
-            {sections.los && losResults.length > 0 && (
-              <ReportPage>
-                <ReportLoSSection
-                  sectionNum={sectionNumbers.los ?? 5}
-                  losResults={losResults}
-                />
-              </ReportPage>
-            )}
-
-            {sections.panorama && panoramaData.length > 0 && radarSite && (
-              <ReportPage>
-                <ReportPanoramaSection
-                  sectionNum={sectionNumbers.panorama ?? 6}
-                  panoramaData={panoramaData}
-                  radarSite={radarSite}
-                  peakNames={panoramaPeakNames}
-                />
-              </ReportPage>
-            )}
-
-            {sections.aircraft && aircraft.length > 0 && (
-              <ReportPage>
-                <ReportAircraftSection
-                  sectionNum={sectionNumbers.aircraft ?? 6}
-                  aircraft={aircraft}
-                />
-                <div className="absolute bottom-[20mm] left-[20mm] right-[20mm]">
-                  <div className="border-t-[2px] border-gray-300" />
-                  <p className="mt-2 text-center text-[9px] text-gray-400">
-                    {reportMetadata.footer}
-                  </p>
-                </div>
-              </ReportPage>
-            )}
-          </>
-        )}
-
-        {/* ─── 장애물 전파영향 사전검토 ─── */}
-        {template === "obstacle" && psResult && (
-          <>
-            {sections.obstacleSummary && (
-              <ReportPage>
-                <ReportPSSummarySection
-                  sectionNum={sectionNumbers.obstacleSummary ?? 1}
-                  result={psResult}
-                  buildings={psSelectedBuildings}
-                  radars={psSelectedRadarSites}
-                  analysisMonth={psAnalysisMonth}
-                />
-              </ReportPage>
-            )}
-
-            {sections.psAngleHeight && (
-              <ReportPage>
-                <ReportPSAngleHeight
-                  sectionNum={sectionNumbers.psAngleHeight ?? 2}
-                  result={psResult}
-                />
-              </ReportPage>
-            )}
-
-            {sections.psAdditionalLoss && (
-              <ReportPage>
-                <ReportPSAdditionalLoss
-                  sectionNum={sectionNumbers.psAdditionalLoss ?? 3}
-                  result={psResult}
-                />
-              </ReportPage>
-            )}
-
-            {sections.coverageMap && (psCovLayersWith.length > 0 || psCovLayersWithout.length > 0) && psSelectedRadarSites[0] && (
-              <ReportPage>
-                <ReportOMCoverageDiff
-                  sectionNum={sectionNumbers.coverageMap ?? 4}
-                  layersWithTargets={psCovLayersWith}
-                  layersWithoutTargets={psCovLayersWithout}
-                  radarSite={psSelectedRadarSites[0]}
-                  lossPoints={[]}
-                  defaultAltFt={5000}
-                  selectedBuildings={psSelectedBuildings}
-                />
-              </ReportPage>
-            )}
-
-            {sections.los && psLosMap.size > 0 && (
-              <ReportPage>
-                <ReportLoSSection
-                  sectionNum={sectionNumbers.los ?? 5}
-                  losResults={[...psLosMap.values()]}
-                />
-              </ReportPage>
-            )}
-          </>
-        )}
-
-        {/* ─── 장애물 월간 ─── */}
-        {template === "obstacle_monthly" && omResultTrimmed && (
-          <>
-            {sections.omSummary && (
-              <ReportOMSummarySection
-                sectionNum={sectionNumbers.omSummary ?? 1}
-                radarResults={omResultTrimmed.radar_results}
-                selectedBuildings={omData.selectedBuildings}
-                radarSites={omData.selectedRadarSites}
-                azimuthSectorsByRadar={omData.azSectorsByRadar}
-                analysisMonth={omData.analysisMonth}
-              />
-            )}
-
-            {sections.omDailyPsr && omResultTrimmed.radar_results.map((rr) => {
-              const info = omRadarConditions.get(rr.radar_name);
-              const imgKey = `psr-${rr.radar_name}`;
-              return (
-                <ReportPage key={imgKey}>
-                  <OMSectionImage
-                    preCaptured={omData.sectionImages.get(imgKey)}
-                    onCaptured={(url) => handleOMSectionCaptured(imgKey, url)}
-                  >
-                    <ReportOMDailyChart
-                      sectionNum={sectionNumbers.omDailyPsr ?? 2}
-                      mode="psr"
-                      radarName={rr.radar_name}
-                      dailyStats={rr.daily_stats}
-                      analysisMonth={omData.analysisMonth}
-                      conditions={[
-                        `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                        `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                        `• PSR 거리 제한: 레이더 60NM 이내`,
-                        `• PSR율 = PSR 포함 탐지 / 전체 탐지 (SSR+Combined 기준)`,
-                      ]}
-                    />
-                  </OMSectionImage>
-                </ReportPage>
-              );
-            })}
-
-            {sections.omDailyLoss && omResultTrimmed.radar_results.map((rr) => {
-              const info = omRadarConditions.get(rr.radar_name);
-              const imgKey = `loss-${rr.radar_name}`;
-              return (
-                <ReportPage key={imgKey}>
-                  <OMSectionImage
-                    preCaptured={omData.sectionImages.get(imgKey)}
-                    onCaptured={(url) => handleOMSectionCaptured(imgKey, url)}
-                  >
-                    <ReportOMDailyChart
-                      sectionNum={sectionNumbers.omDailyLoss ?? 3}
-                      mode="loss"
-                      radarName={rr.radar_name}
-                      dailyStats={rr.daily_stats}
-                      analysisMonth={omData.analysisMonth}
-                      conditions={[
-                        `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                        `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                        `• 표적소실(Signal Loss)만 포함 (범위이탈 Out of Range 제외)`,
-                        `• 표적소실율 = 소실 시간 / 총 항적 시간 × 100`,
-                      ]}
-                    />
-                  </OMSectionImage>
-                </ReportPage>
-              );
-            })}
-
-            {sections.omWeekly && omResultTrimmed.radar_results.map((rr) => {
-              const imgKey = `wk-${rr.radar_name}`;
-              return (
-                <ReportPage key={imgKey}>
-                  <OMSectionImage
-                    preCaptured={omData.sectionImages.get(imgKey)}
-                    onCaptured={(url) => handleOMSectionCaptured(imgKey, url)}
-                  >
-                    <ReportOMWeeklyChart
-                      sectionNum={sectionNumbers.omWeekly ?? 4}
-                      radarName={rr.radar_name}
-                      dailyStats={rr.daily_stats}
-                      analysisMonth={omData.analysisMonth}
-                    />
-                  </OMSectionImage>
-                </ReportPage>
-              );
-            })}
-
-            {sections.omCoverageDiff && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.length > 0 ? omData.selectedRadarSites.map((rs) => {
-              const rr = omResultTrimmed.radar_results.find((r) => r.radar_name === rs.name);
-              const allLoss = rr?.daily_stats.flatMap((d) => d.loss_points_summary) ?? [];
-              const covImgKey = `cov-${rs.name}`;
-              return (
-                <LazySection key={covImgKey} forceVisible={forceAllVisible}>
-                  <ReportPage>
-                    <OMSectionImage
-                      preCaptured={omData.sectionImages.get(covImgKey)}
-                      onCaptured={(url) => handleOMSectionCaptured(covImgKey, url)}
-                      delay={800}
-                    >
-                      <ReportOMCoverageDiff
-                        sectionNum={sectionNumbers.omCoverageDiff ?? 5}
-                        radarSite={rs}
-                        layersWithTargets={omData.covLayersWithBuildings}
-                        layersWithoutTargets={omData.covLayersWithout}
-                        lossPoints={allLoss}
-                        defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
-                        selectedBuildings={omData.selectedBuildings}
-                      />
-                    </OMSectionImage>
-                  </ReportPage>
-                </LazySection>
-              );
-            }) : omData.coverageStatus === "error" ? (
-              <ReportPage>
-                <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                  <p className="text-sm text-red-400">커버리지 계산 실패</p>
-                  <p className="mt-1 text-xs">SRTM 데이터 또는 건물 데이터를 확인하세요</p>
-                </div>
-              </ReportPage>
-            ) : (
-              <ReportPage>
-                <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                  <Loader2 size={24} className="mb-3 animate-spin" />
-                  <p className="text-sm">커버리지 비교맵 계산 중...</p>
-                </div>
-              </ReportPage>
-            ))}
-
-            {sections.omAzDistScatter && omResultTrimmed.radar_results.map((rr) => {
-              const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
-              const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
-              if (!rs) return null;
-              const azImgKey = `azdist-${rr.radar_name}`;
-              return (
-                <LazySection key={azImgKey} forceVisible={forceAllVisible}>
-                  <ReportPage>
-                    <OMSectionImage
-                      preCaptured={omData.sectionImages.get(azImgKey)}
-                      onCaptured={(url) => handleOMSectionCaptured(azImgKey, url)}
-                    >
-                      <ReportOMAzDistScatter
-                        sectionNum={sectionNumbers.omAzDistScatter ?? 6}
-                        radarSite={rs}
-                        dailyStats={rr.daily_stats}
-                        selectedBuildings={omData.selectedBuildings}
-                        azSectors={sectors}
-                        analysisMonth={omData.analysisMonth}
-                      />
-                    </OMSectionImage>
-                  </ReportPage>
-                </LazySection>
-              );
-            })}
-
-            {sections.omBuildingLos && (
-              <ReportPage>
-                <OMSectionImage
-                  preCaptured={omData.sectionImages.get("buildingLos")}
-                  onCaptured={(url) => handleOMSectionCaptured("buildingLos", url)}
-                >
-                  <ReportOMBuildingLoS
-                    sectionNum={sectionNumbers.omBuildingLos ?? 7}
-                    selectedBuildings={omData.selectedBuildings}
-                    radarSites={omData.selectedRadarSites}
-                    losMap={omData.losMap}
-                  />
-                </OMSectionImage>
-              </ReportPage>
-            )}
-
-            {sections.omAltitude && (
-              <LazySection forceVisible={forceAllVisible}>
-                <ReportPage>
-                  <OMSectionImage
-                    preCaptured={omData.sectionImages.get("altitude")}
-                    onCaptured={(url) => handleOMSectionCaptured("altitude", url)}
-                    delay={800}
-                  >
-                    <ReportOMAltitudeDistribution
-                      sectionNum={sectionNumbers.omAltitude ?? 7}
-                      radarResults={omResultTrimmed.radar_results}
-                      selectedBuildings={omData.selectedBuildings}
-                      radarSites={omData.selectedRadarSites}
-                      losMap={omData.losMap}
-                      panoWithTargets={omData.panoWithTargets}
-                      panoWithoutTargets={omData.panoWithoutTargets}
-                    />
-                  </OMSectionImage>
-                </ReportPage>
-              </LazySection>
-            )}
-
-            {sections.omLossEvents && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.length > 0 ? (
-              <LazySection forceVisible={forceAllVisible}>
-                <ReportPage>
-                  <ReportOMLossEvents
-                    sectionNum={sectionNumbers.omLossEvents ?? 8}
-                    radarResults={omResultTrimmed.radar_results}
-                    selectedBuildings={omData.selectedBuildings}
-                    radarSites={omData.selectedRadarSites}
-                    layersWithTargets={omData.covLayersWithBuildings}
-                    layersWithoutTargets={omData.covLayersWithout}
-                  />
-                </ReportPage>
-              </LazySection>
-            ) : omData.coverageStatus === "error" ? (
-              <ReportPage>
-                <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                  <p className="text-sm text-red-400">커버리지 계산 실패 — Loss 상세 표시 불가</p>
-                </div>
-              </ReportPage>
-            ) : (
-              <ReportPage>
-                <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                  <Loader2 size={24} className="mb-3 animate-spin" />
-                  <p className="text-sm">Loss 상세 계산 중...</p>
-                </div>
-              </ReportPage>
-            ))}
-
-            {sections.omFindings && (
-              <ReportPage>
-                <ReportOMFindings
-                  sectionNum={sectionNumbers.omFindings ?? 9}
-                  radarResults={omResultTrimmed.radar_results}
-                  selectedBuildings={omData.selectedBuildings}
-                  radarSites={omData.selectedRadarSites}
-                  findingsText={omData.findingsText}
-                  onFindingsChange={(text) => setOmData((prev) => ({ ...prev, findingsText: text }))}
-                  editable={true}
-                  analysisMonth={omData.analysisMonth}
-                />
-              </ReportPage>
-            )}
-          </>
-        )}
-
-        {/* ─── 비행 건별 ─── */}
-        {template === "flights" && (
-          <>
-            {(sections.flightComparison || sections.trackMap) && (
-              <ReportPage>
-                {sections.flightComparison && (
-                  <ReportFlightComparisonSection
-                    sectionNum={sectionNumbers.flightComparison ?? 1}
-                    flights={reportFlights}
-                    radarSite={radarSite}
-                  />
-                )}
-                {sections.trackMap && (
-                  <ReportMapSection
-                    sectionNum={sectionNumbers.trackMap ?? 2}
-                    mapImage={mapImage}
-                  />
-                )}
-              </ReportPage>
-            )}
-
-            {sections.lossDetail && reportFlights.some((f) => f.loss_points.length > 0) && (
-              <ReportPage>
-                <ReportLossSection
-                  sectionNum={sectionNumbers.lossDetail ?? 3}
-                  flights={reportFlights}
-                  template="flights"
-                />
-              </ReportPage>
-            )}
-
-
-            {sections.los && losResults.length > 0 && (
-              <ReportPage>
-                <ReportLoSSection
-                  sectionNum={sectionNumbers.los ?? 5}
-                  losResults={losResults}
-                />
-              </ReportPage>
-            )}
-
-            {sections.panorama && panoramaData.length > 0 && radarSite && (
-              <ReportPage>
-                <ReportPanoramaSection
-                  sectionNum={sectionNumbers.panorama ?? 6}
-                  panoramaData={panoramaData}
-                  radarSite={radarSite}
-                  peakNames={panoramaPeakNames}
-                />
-              </ReportPage>
-            )}
-          </>
-        )}
-
-        {/* ─── 단일비행 상세 ─── */}
-        {template === "single" && singleFlight && (
-          <>
-            {(sections.flightProfile || sections.trackMap) && (
-              <ReportPage>
-                {sections.flightProfile && (
-                  <ReportFlightProfileSection
-                    sectionNum={sectionNumbers.flightProfile ?? 1}
-                    flight={singleFlight}
-                    radarSite={radarSite}
-                  />
-                )}
-                {sections.trackMap && (
-                  <ReportMapSection
-                    sectionNum={sectionNumbers.trackMap ?? 2}
-                    mapImage={mapImage}
-                  />
-                )}
-              </ReportPage>
-            )}
-
-            {sections.flightLossAnalysis && (
-              <ReportPage>
-                <ReportFlightLossAnalysisSection
-                  sectionNum={sectionNumbers.flightLossAnalysis ?? 3}
-                  flight={singleFlight}
-                />
-              </ReportPage>
-            )}
-
-
-            {sections.los && losResults.length > 0 && (
-              <ReportPage>
-                <ReportLoSSection
-                  sectionNum={sectionNumbers.los ?? 5}
-                  losResults={losResults}
-                />
-              </ReportPage>
-            )}
-
-            {sections.panorama && panoramaData.length > 0 && radarSite && (
-              <ReportPage>
-                <ReportPanoramaSection
-                  sectionNum={sectionNumbers.panorama ?? 6}
-                  panoramaData={panoramaData}
-                  radarSite={radarSite}
-                  peakNames={panoramaPeakNames}
-                />
-              </ReportPage>
-            )}
-          </>
-        )}
-        </div>{/* /섹션 컨테이너 */}
-      </div>
-    </div>
-  );
 }
 
 // ── 템플릿 테이블 (expandable list) ──

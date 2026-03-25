@@ -338,6 +338,7 @@ fn write_file_base64(path: String, data: String) -> Result<(), String> {
 async fn webview_print_to_pdf(
     _app_handle: tauri::AppHandle,
     _path: String,
+    _window_label: Option<String>,
 ) -> Result<String, String> {
     #[cfg(windows)]
     {
@@ -346,8 +347,8 @@ async fn webview_print_to_pdf(
         // 호출한 창의 WebView에서 PDF 생성 (멀티윈도우 대응)
         let window = {
             let windows = _app_handle.webview_windows();
-            // 호출 창을 찾기: trackmap 우선, 없으면 main
-            windows.get("trackmap")
+            let label = _window_label.as_deref().unwrap_or("main");
+            windows.get(label)
                 .or_else(|| windows.get("main"))
                 .cloned()
                 .ok_or("윈도우를 찾을 수 없습니다")?
@@ -2561,6 +2562,19 @@ pub fn run() {
             // WebView2 네이티브 PDF
             webview_print_to_pdf,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // 모든 윈도우가 닫히면 프로세스 명시적 종료
+            // (백그라운드 async 태스크가 남아있어도 확실히 종료)
+            if let tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } = &event
+            {
+                if app_handle.webview_windows().is_empty() {
+                    app_handle.exit(0);
+                }
+            }
+        });
 }

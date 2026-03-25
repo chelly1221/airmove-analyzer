@@ -2,6 +2,7 @@ import React, { useMemo } from "react";
 import type { RadarSite, LossPointGeo, ManualBuilding } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
 function altToColor(altFt: number, minAlt: number, maxAlt: number): string {
@@ -22,6 +23,8 @@ interface Props {
   /** 기본 고도 (ft) — 미사용, 호환성 유지 */
   defaultAltFt: number;
   selectedBuildings: ManualBuilding[];
+  /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
+  hideHeader?: boolean;
 }
 
 /** 방위별 커버리지 범위(km) lookup — O(1) 인덱스 기반 */
@@ -105,6 +108,7 @@ function ReportOMCoverageDiff({
   layersWithoutTargets,
   lossPoints,
   selectedBuildings,
+  hideHeader,
 }: Props) {
   const MIN_ALT = 1000;
   const MAX_ALT = 20000;
@@ -279,9 +283,7 @@ function ReportOMCoverageDiff({
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[17px] font-bold text-gray-900">
-        {sectionNum}. 커버리지 비교맵
-      </h2>
+      {!hideHeader && <ReportOMSectionHeader sectionNum={sectionNum} title="커버리지 비교맵" />}
 
       {/* 정보 요약 바 */}
       <div className="mb-2 flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] text-gray-500">

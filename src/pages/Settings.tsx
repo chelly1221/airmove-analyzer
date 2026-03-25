@@ -206,7 +206,7 @@ export function SrtmDownloadSection() {
       <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
         <div className="flex items-center gap-2">
           <Mountain size={16} className="text-[#a60739] shrink-0" />
-          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">NASA SRTM 지형 데이터 (30m)</h2>
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">SRTM 지형 데이터 (30m)</h2>
         </div>
         <div className="flex items-center gap-2 min-w-0">
           {!statusLoading && srtmStatus ? (
@@ -217,6 +217,21 @@ export function SrtmDownloadSection() {
           ) : (
             <span className="text-xs text-gray-400">한국 영역 ~250MB · LoS/커버리지 오프라인 지형</span>
           )}
+          <a
+            href="https://www.earthdata.nasa.gov/data/instruments/srtm"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-0.5 text-xs text-blue-500 hover:text-blue-700 transition-colors shrink-0"
+            onClick={(e) => {
+              e.preventDefault();
+              import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
+                openUrl("https://www.earthdata.nasa.gov/data/instruments/srtm")
+              );
+            }}
+          >
+            <ExternalLink size={11} />
+            NASA
+          </a>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button

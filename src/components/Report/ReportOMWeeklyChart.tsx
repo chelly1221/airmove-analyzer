@@ -2,6 +2,7 @@ import React from "react";
 import { Calendar } from "lucide-react";
 import type { DailyStats } from "../../types";
 import { weightedAvg } from "../../utils/omStats";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
   sectionNum: number;
@@ -9,6 +10,8 @@ interface Props {
   dailyStats: DailyStats[];
   /** 분석 대상 월 (YYYY-MM) */
   analysisMonth?: string;
+  /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
+  hideHeader?: boolean;
 }
 
 const WEEK_COLOR = "#6b7280"; // 주차 라벨 통일 색상
@@ -23,22 +26,26 @@ interface WeekSummary {
   baselineLoss: number;
 }
 
-function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth }: Props) {
+function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth, hideHeader }: Props) {
+  const monthLabel = analysisMonth
+    ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
+    : "";
+
   if (dailyStats.length === 0) return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. 주간 집계 — {radarName}
-      </h2>
+      {!hideHeader && (
+        <ReportOMSectionHeader
+          sectionNum={sectionNum}
+          title={`${monthLabel ? `${monthLabel} ` : ""}주차별 비교`}
+          radarName={radarName}
+        />
+      )}
       <div className="flex flex-col items-center py-12 text-gray-400">
         <Calendar size={28} strokeWidth={1.2} className="mb-2" />
         <p className="text-sm">해당 기간 분석 데이터 없음</p>
       </div>
     </div>
   );
-
-  const monthLabel = analysisMonth
-    ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
-    : "";
 
   const hasBaseline = dailyStats.some((d) => d.baseline_loss_rate > 0 || d.baseline_psr_rate > 0);
 
@@ -79,10 +86,13 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth 
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. {monthLabel ? `${monthLabel} ` : ""}주차별 비교
-      </h2>
-      <h3 className="mb-2 text-[15px] font-semibold text-gray-700">{radarName}</h3>
+      {!hideHeader && (
+        <ReportOMSectionHeader
+          sectionNum={sectionNum}
+          title={`${monthLabel ? `${monthLabel} ` : ""}주차별 비교`}
+          radarName={radarName}
+        />
+      )}
 
       <svg viewBox={`0 0 ${svgW} ${svgH}`} className="w-full">
         <rect x={0} y={0} width={svgW} height={svgH} fill="#fafafa" rx={3} />

@@ -2,6 +2,7 @@ import React, { useMemo } from "react";
 import { Building } from "lucide-react";
 import type { ManualBuilding, RadarSite, LoSProfileData } from "../../types";
 import { haversineKm, bearingDeg } from "../../utils/geo";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
   sectionNum: number;
@@ -9,9 +10,11 @@ interface Props {
   radarSites: RadarSite[];
   /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) */
   losMap: Map<string, LoSProfileData>;
+  /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
+  hideHeader?: boolean;
 }
 
-function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap }: Props) {
+function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap, hideHeader }: Props) {
   // 방위/거리 사전 계산 (렌더 중 재계산 방지)
   const buildingRadarInfo = useMemo(() => {
     const info = new Map<string, { az: number; dist: number }>();
@@ -28,9 +31,7 @@ function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap
 
   if (selectedBuildings.length === 0) return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. 건물별 LoS 분석
-      </h2>
+      {!hideHeader && <ReportOMSectionHeader sectionNum={sectionNum} title="건물별 LoS 분석" />}
       <div className="flex flex-col items-center py-12 text-gray-400">
         <Building size={28} strokeWidth={1.2} className="mb-2" />
         <p className="text-sm">분석 대상 건물 없음</p>
@@ -40,9 +41,7 @@ function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. 건물별 LoS 분석
-      </h2>
+      {!hideHeader && <ReportOMSectionHeader sectionNum={sectionNum} title="건물별 LoS 분석" />}
 
       <table className="w-full border-collapse text-[13px]">
         <thead>

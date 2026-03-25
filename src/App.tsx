@@ -140,7 +140,7 @@ function useRestoreSettings() {
   }, []);
 }
 
-/** Main 창 종료 시 모든 자식 창 닫기 */
+/** Main 창 종료 시 모든 자식 창 닫고 프로세스 종료 */
 function useCloseAllOnExit() {
   useEffect(() => {
     const appWindow = getCurrentWindow();

@@ -3,6 +3,7 @@ import EditableText from "./EditableText";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
 import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedPsrStdDev, weightedBaselineLossAvg, weightedBaselineLossStdDev, gradeWithConfidence } from "../../utils/omStats";
 import { haversineKm } from "../../utils/geo";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
   sectionNum: number;
@@ -71,9 +72,10 @@ function ReportOMFindings({
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. 종합 소견{monthLabel && ` (${monthLabel})`}
-      </h2>
+      <ReportOMSectionHeader
+        sectionNum={sectionNum}
+        title={`종합 소견${monthLabel ? ` (${monthLabel})` : ""}`}
+      />
 
       {/* 종합 판정 카드 */}
       <div className="mb-4 grid gap-3" style={{ gridTemplateColumns: `repeat(${Math.min(radarSummaries.length, 3)}, 1fr)` }}>

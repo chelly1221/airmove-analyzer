@@ -3,6 +3,7 @@ import { AlertTriangle } from "lucide-react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
   sectionNum: number;
@@ -125,9 +126,7 @@ function ReportOMLossEvents({
     const hasDailyData = radarResults.some((rr) => rr.daily_stats.length > 0);
     return (
       <div className="mb-8">
-        <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-          {sectionNum}. 장애물 기인 표적소실 상세
-        </h2>
+        <ReportOMSectionHeader sectionNum={sectionNum} title="장애물 기인 표적소실 상세" />
         <div className="flex flex-col items-center py-12 text-gray-400">
           <AlertTriangle size={28} strokeWidth={1.2} className="mb-2" />
           <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
@@ -138,9 +137,7 @@ function ReportOMLossEvents({
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. 장애물 기인 표적소실 상세
-      </h2>
+      <ReportOMSectionHeader sectionNum={sectionNum} title="장애물 기인 표적소실 상세" />
 
       {eventsByRadar.map(({ radarName, events, obstacleCausedCount, totalCount }) => {
         if (events.length === 0) {

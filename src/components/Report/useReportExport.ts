@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { save } from "@tauri-apps/plugin-dialog";
 
 export interface ExportResult {
@@ -108,7 +109,10 @@ async function exportViaNative(
 
   try {
     // WebView2 PrintToPdf IPC 호출 — base64 PDF 반환
-    const pdfBase64 = await invoke<string>("webview_print_to_pdf", { path: savePath });
+    const pdfBase64 = await invoke<string>("webview_print_to_pdf", {
+      path: savePath,
+      windowLabel: getCurrentWindow().label,
+    });
 
     return { success: true, pdfBase64 };
   } catch (err) {

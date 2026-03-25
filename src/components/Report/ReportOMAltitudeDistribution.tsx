@@ -2,6 +2,7 @@ import React, { useMemo } from "react";
 import { BarChart3 } from "lucide-react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
 import { haversineKm, bearingDeg } from "../../utils/geo";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
   sectionNum: number;
@@ -11,6 +12,8 @@ interface Props {
   losMap: Map<string, LoSProfileData>;
   panoWithTargets?: Map<string, PanoramaPoint[]>;
   panoWithoutTargets?: Map<string, PanoramaPoint[]>;
+  /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
+  hideHeader?: boolean;
 }
 
 const R_EARTH = 6_371_000; // 실제 지구반경 (m)
@@ -92,6 +95,7 @@ function ReportOMAltitudeDistribution({
   losMap,
   panoWithTargets,
   panoWithoutTargets,
+  hideHeader,
 }: Props) {
   const radarAnalysis = useMemo(() => {
     return radarResults.map((rr) => {
@@ -184,9 +188,7 @@ function ReportOMAltitudeDistribution({
     const hasDailyData = radarResults.some((rr) => rr.daily_stats.length > 0);
     return (
       <div className="mb-8">
-        <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-          {sectionNum}. LoS 차단 양각 대비 표적소실 분포
-        </h2>
+        {!hideHeader && <ReportOMSectionHeader sectionNum={sectionNum} title="LoS 차단 양각 대비 표적소실 분포" />}
         <div className="flex flex-col items-center py-12 text-gray-400">
           <BarChart3 size={28} strokeWidth={1.2} className="mb-2" />
           <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
@@ -197,9 +199,7 @@ function ReportOMAltitudeDistribution({
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-        {sectionNum}. LoS 차단 양각 대비 표적소실 분포
-      </h2>
+      <ReportOMSectionHeader sectionNum={sectionNum} title="LoS 차단 양각 대비 표적소실 분포" />
 
       {radarAnalysis.map(({ radarName, losses, buildings, radarSite: _rs }, rIdx) => {
         if (losses.length === 0) {

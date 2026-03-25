@@ -41,7 +41,7 @@ pub struct PanoramaPoint {
     pub lon: f64,
 }
 
-/// 건물 후보 (DB 조회 결과)
+/// 건물 후보 (DB 조회 결과) — point-only 폴백용
 struct BuildingCandidate {
     lat: f64,
     lon: f64,
@@ -51,6 +51,61 @@ struct BuildingCandidate {
     address: Option<String>,
     usage: Option<String>,
     is_manual: bool,
+}
+
+/// 건물 폴리곤 (3D 실루엣 계산용)
+struct BuildingPolygon {
+    polygon: Vec<[f64; 2]>,  // [[lat, lon], ...] WGS84 꼭짓점
+    centroid_lat: f64,
+    centroid_lon: f64,
+    height_m: f64,
+    ground_elev: f64,        // manual: DB값, GIS: 0 (SRTM 조회 필요)
+    name: Option<String>,
+    address: Option<String>,
+    usage: Option<String>,
+    is_manual: bool,
+}
+
+/// WGS84 → 레이더 중심 ENU 평면좌표 변환 (east, north) [m]
+/// 건물 규모(~60km)에서 평면 근사 유효
+fn wgs84_to_enu(radar_lat_rad_cos: f64, radar_lat: f64, radar_lon: f64, lat: f64, lon: f64) -> (f64, f64) {
+    const R: f64 = 6_371_000.0;
+    let east = (lon - radar_lon).to_radians() * R * radar_lat_rad_cos;
+    let north = (lat - radar_lat).to_radians() * R;
+    (east, north)
+}
+
+/// 원점(레이더)에서 방위각 방향 ray와 선분(e1,n1)-(e2,n2)의 교차 거리 반환
+/// az_rad: 방위각 (라디안, 정북=0, 시계방향)
+/// 반환: 교차점까지의 직선 거리 (m), 교차하지 않으면 None
+fn ray_segment_intersection(
+    ray_dx: f64, ray_dy: f64,  // (sin(az), cos(az)) — ENU에서 east, north 방향
+    e1: f64, n1: f64,
+    e2: f64, n2: f64,
+) -> Option<f64> {
+    // Ray: P = t * (ray_dx, ray_dy), t >= 0
+    // Segment: Q = (e1,n1) + s * (se, sn), s ∈ [0, 1]
+    let se = e2 - e1;
+    let sn = n2 - n1;
+
+    let denom = ray_dx * sn - ray_dy * se;
+    if denom.abs() < 1e-12 {
+        return None; // 평행
+    }
+
+    let s = (ray_dx * n1 - ray_dy * e1) / denom;
+    if s < 0.0 || s > 1.0 {
+        return None; // 선분 밖
+    }
+
+    // t = 교차점까지 ray 파라미터 (거리)
+    let t = if ray_dx.abs() > ray_dy.abs() {
+        (e1 + s * se) / ray_dx
+    } else {
+        (n1 + s * sn) / ray_dy
+    };
+
+    if t > 0.0 { Some(t) } else { None }
 }
 
 /// 4/3 유효지구 모델 앙각 계산
@@ -82,9 +137,9 @@ pub struct TerrainResult {
     pub lon: f64,
 }
 
-/// DB에서 건물 후보 조회 (GIS + 수동)
-/// `exclude_manual_ids`가 비어있지 않으면 해당 ID의 수동 건물은 제외
-fn query_building_candidates(
+/// DB에서 건물 폴리곤 조회 (3D 실루엣 계산용)
+/// 폴리곤이 있는 건물은 BuildingPolygon으로, 없는 건물은 BuildingCandidate(폴백)로 반환
+fn query_building_polygons(
     conn: &Connection,
     min_lat: f64,
     max_lat: f64,
@@ -92,10 +147,11 @@ fn query_building_candidates(
     max_lon: f64,
     min_height_m: f64,
     exclude_manual_ids: &[i64],
-) -> Vec<BuildingCandidate> {
-    let mut result = Vec::new();
+) -> (Vec<BuildingPolygon>, Vec<BuildingCandidate>) {
+    let mut polygons = Vec::new();
+    let mut point_buildings = Vec::new();
 
-    // 건물통합정보 (fac_buildings) — 폴리곤 있으면 꼭짓점별 후보 생성
+    // 건물통합정보 (fac_buildings) — 폴리곤 단위로 반환
     if let Ok(mut stmt) = conn.prepare(
         "SELECT centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json
          FROM fac_buildings
@@ -119,38 +175,34 @@ fn query_building_candidates(
             },
         ) {
             for row in rows.flatten() {
-                let (_clat, _clon, height_m, name, address, usage, polygon_json) = row;
+                let (clat, clon, height_m, name, address, usage, polygon_json) = row;
 
-                // 폴리곤이 있으면 꼭짓점별로 확장 (실제 건물 범위 반영)
                 let poly_pts: Option<Vec<[f64; 2]>> = polygon_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());
 
                 if let Some(pts) = poly_pts {
                     if pts.len() >= 3 {
-                        for pt in &pts {
-                            result.push(BuildingCandidate {
-                                lat: pt[0],
-                                lon: pt[1],
-                                height_m,
-                                ground_elev: 0.0,
-                                name: name.clone(),
-                                address: address.clone(),
-                                usage: usage.clone(),
-                                is_manual: false,
-                            });
-                        }
-                        continue;
+                        polygons.push(BuildingPolygon {
+                            polygon: pts,
+                            centroid_lat: clat,
+                            centroid_lon: clon,
+                            height_m,
+                            ground_elev: 0.0,
+                            name,
+                            address,
+                            usage,
+                            is_manual: false,
+                        });
                     }
                 }
-
                 // 폴리곤 없는 GIS 건물은 제외
             }
         }
     }
 
-    // 수동 등록 건물 (geometry 확장을 위해 넉넉한 버퍼 적용)
-    let geo_buffer = 0.01; // ~1.1km 버퍼 — 대형 도형 커버
+    // 수동 등록 건물
+    let geo_buffer = 0.01;
     let exclude_clause = if exclude_manual_ids.is_empty() {
         String::new()
     } else {
@@ -182,30 +234,35 @@ fn query_building_candidates(
         ) {
             for row in rows.flatten() {
                 let (lat, lon, height_m, ground_elev, name, memo, geo_type, geo_json) = row;
-                let base = BuildingCandidate {
-                    lat, lon, height_m, ground_elev,
-                    name: name.clone(), address: None, usage: memo.clone(),
-                    is_manual: true,
-                };
 
-                // geometry_json이 있으면 다중 샘플 포인트로 확장
+                // geometry_json → 폴리곤 추출 시도
                 let sample_pts = expand_manual_geometry(lat, lon, geo_type.as_deref(), geo_json.as_deref());
-                if sample_pts.is_empty() {
-                    result.push(base);
+                if sample_pts.len() >= 3 {
+                    let poly: Vec<[f64; 2]> = sample_pts.iter().map(|&(la, lo)| [la, lo]).collect();
+                    polygons.push(BuildingPolygon {
+                        polygon: poly,
+                        centroid_lat: lat,
+                        centroid_lon: lon,
+                        height_m,
+                        ground_elev,
+                        name,
+                        address: None,
+                        usage: memo,
+                        is_manual: true,
+                    });
                 } else {
-                    for (slat, slon) in sample_pts {
-                        result.push(BuildingCandidate {
-                            lat: slat, lon: slon, height_m, ground_elev,
-                            name: name.clone(), address: None, usage: memo.clone(),
-                            is_manual: true,
-                        });
-                    }
+                    // point-only 수동 건물 → 폴백
+                    point_buildings.push(BuildingCandidate {
+                        lat, lon, height_m, ground_elev,
+                        name, address: None, usage: memo,
+                        is_manual: true,
+                    });
                 }
             }
         }
     }
 
-    result
+    (polygons, point_buildings)
 }
 
 /// 360° LoS 파노라마 계산
@@ -307,7 +364,7 @@ pub fn merge_buildings_into_panorama(
     panorama
 }
 
-/// Phase 2: 건물 조회 + 기존 파노라마에 병합 (공통 로직)
+/// Phase 2: 건물 3D 실루엣 — ray-polygon 교차 기반 정밀 병합
 fn apply_buildings(
     panorama: &mut Vec<PanoramaPoint>,
     srtm: &mut SrtmReader,
@@ -321,6 +378,7 @@ fn apply_buildings(
 ) {
     let num_azimuths = panorama.len();
     let cos_lat = radar_lat.to_radians().cos().max(0.5);
+    let az_step_rad = azimuth_step_deg.to_radians();
 
     let tiers: [(f64, f64, f64); 3] = [
         (0.0, 10_000.0, 10.0),
@@ -332,14 +390,110 @@ fn apply_buildings(
         let outer_deg = max_d / 111_000.0;
         let outer_deg_lon = max_d / (111_000.0 * cos_lat);
 
-        let min_lat = radar_lat - outer_deg;
-        let max_lat = radar_lat + outer_deg;
-        let min_lon = radar_lon - outer_deg_lon;
-        let max_lon = radar_lon + outer_deg_lon;
+        let bb_min_lat = radar_lat - outer_deg;
+        let bb_max_lat = radar_lat + outer_deg;
+        let bb_min_lon = radar_lon - outer_deg_lon;
+        let bb_max_lon = radar_lon + outer_deg_lon;
 
-        let buildings = query_building_candidates(conn, min_lat, max_lat, min_lon, max_lon, min_h, exclude_manual_ids);
+        let (poly_buildings, point_buildings) = query_building_polygons(
+            conn, bb_min_lat, bb_max_lat, bb_min_lon, bb_max_lon, min_h, exclude_manual_ids,
+        );
 
-        for bld in &buildings {
+        // ── 폴리곤 건물: ray-edge 교차로 정밀 실루엣 ──
+        for bld in &poly_buildings {
+            // centroid 거리로 quick reject (여유 버퍼 포함)
+            let centroid_dist = crate::geo::haversine_m(radar_lat, radar_lon, bld.centroid_lat, bld.centroid_lon);
+            // 건물 최대 반경 ~500m 여유
+            if centroid_dist < min_d.max(1.0) - 500.0 || centroid_dist > max_d + 500.0 {
+                continue;
+            }
+
+            // 지면 표고 (centroid 기준 1회 조회)
+            let ground = if bld.is_manual {
+                bld.ground_elev
+            } else {
+                srtm.get_elevation(bld.centroid_lat, bld.centroid_lon).unwrap_or(0.0)
+            };
+            let total_h = ground + bld.height_m;
+
+            // 꼭짓점 → ENU 변환 + 방위각 계산
+            let n = bld.polygon.len();
+            let mut enu: Vec<(f64, f64)> = Vec::with_capacity(n);
+            let mut vertex_az_deg: Vec<f64> = Vec::with_capacity(n);
+
+            for pt in &bld.polygon {
+                let (e, nn) = wgs84_to_enu(cos_lat, radar_lat, radar_lon, pt[0], pt[1]);
+                let az = e.atan2(nn).to_degrees().rem_euclid(360.0);
+                enu.push((e, nn));
+                vertex_az_deg.push(az);
+            }
+
+            // 방위각 범위 결정 (0/360 wrap 처리)
+            let (az_start, az_span) = azimuth_span(&vertex_az_deg);
+
+            // 안전장치: 건물이 180° 이상 차지하면 데이터 이상 → skip
+            if az_span > 180.0 {
+                continue;
+            }
+
+            // 빈 범위 계산
+            let bin_start = (az_start / azimuth_step_deg).floor() as i64;
+            let bin_count = ((az_span / azimuth_step_deg).ceil() as i64 + 1).min(num_azimuths as i64);
+
+            let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
+
+            for bi in 0..bin_count {
+                let bin_idx = ((bin_start + bi) as i64).rem_euclid(num_azimuths as i64) as usize;
+                let az_rad = (bin_start + bi) as f64 * az_step_rad;
+                let ray_dx = az_rad.sin();
+                let ray_dy = az_rad.cos();
+
+                // 모든 edge와 교차 테스트 → 최소 거리
+                let mut nearest_dist = f64::INFINITY;
+                for i in 0..n {
+                    let j = (i + 1) % n;
+                    if let Some(d) = ray_segment_intersection(
+                        ray_dx, ray_dy,
+                        enu[i].0, enu[i].1,
+                        enu[j].0, enu[j].1,
+                    ) {
+                        if d < nearest_dist {
+                            nearest_dist = d;
+                        }
+                    }
+                }
+
+                if nearest_dist == f64::INFINITY || nearest_dist < 1.0 {
+                    continue;
+                }
+
+                // 거리 범위 확인
+                if nearest_dist < min_d || nearest_dist > max_d {
+                    continue;
+                }
+
+                let angle = elevation_angle_deg(nearest_dist, total_h, radar_height_m);
+                if angle > panorama[bin_idx].elevation_angle_deg {
+                    panorama[bin_idx] = PanoramaPoint {
+                        azimuth_deg: bin_idx as f64 * azimuth_step_deg,
+                        elevation_angle_deg: angle,
+                        distance_km: nearest_dist / 1000.0,
+                        obstacle_height_m: bld.height_m,
+                        ground_elev_m: ground,
+                        obstacle_type: obs_type.to_string(),
+                        name: bld.name.clone(),
+                        address: bld.address.clone(),
+                        usage: bld.usage.clone(),
+                        // centroid 좌표 → 프론트엔드 dedup 시 1건물=1마커
+                        lat: bld.centroid_lat,
+                        lon: bld.centroid_lon,
+                    };
+                }
+            }
+        }
+
+        // ── point-only 건물 폴백 (폴리곤 없는 수동 건물) ──
+        for bld in &point_buildings {
             let dist_m = crate::geo::haversine_m(radar_lat, radar_lon, bld.lat, bld.lon);
             if dist_m < min_d || dist_m > max_d {
                 continue;
@@ -350,7 +504,6 @@ fn apply_buildings(
             } else {
                 srtm.get_elevation(bld.lat, bld.lon).unwrap_or(0.0)
             };
-
             let total_h = ground + bld.height_m;
             let angle = elevation_angle_deg(dist_m, total_h, radar_height_m);
 
@@ -373,34 +526,55 @@ fn apply_buildings(
                     lon: bld.lon,
                 };
             }
-
-            if dist_m > 1.0 && dist_m < 5000.0 && bld.height_m > 20.0 {
-                let angular_width = (30.0 / dist_m).atan().to_degrees();
-                let spread_bins = (angular_width / azimuth_step_deg).ceil() as usize;
-                for offset in 1..=spread_bins {
-                    for &dir in &[-1i32, 1] {
-                        let adj_bin = ((bin as i32 + dir * offset as i32).rem_euclid(num_azimuths as i32)) as usize;
-                        if angle > panorama[adj_bin].elevation_angle_deg {
-                            let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
-                            panorama[adj_bin] = PanoramaPoint {
-                                azimuth_deg: adj_bin as f64 * azimuth_step_deg,
-                                elevation_angle_deg: angle,
-                                distance_km: dist_m / 1000.0,
-                                obstacle_height_m: bld.height_m,
-                                ground_elev_m: ground,
-                                obstacle_type: obs_type.to_string(),
-                                name: bld.name.clone(),
-                                address: bld.address.clone(),
-                                usage: bld.usage.clone(),
-                                lat: bld.lat,
-                                lon: bld.lon,
-                            };
-                        }
-                    }
-                }
-            }
         }
     }
+}
+
+/// 방위각 목록에서 실제 건물이 차지하는 (시작각, 각도폭) 계산
+/// 0/360° 경계를 올바르게 처리: 최대 갭의 반대편이 건물 구간
+fn azimuth_span(azimuths: &[f64]) -> (f64, f64) {
+    if azimuths.is_empty() {
+        return (0.0, 0.0);
+    }
+    if azimuths.len() == 1 {
+        return (azimuths[0], 0.0);
+    }
+
+    let mut sorted: Vec<f64> = azimuths.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    // 인접 방위각 간 갭 중 최대값 탐색 (마지막→처음 wrap 포함)
+    let mut max_gap = 0.0_f64;
+    let mut max_gap_end = 0usize;
+    let n = sorted.len();
+
+    for i in 0..n {
+        let gap = if i + 1 < n {
+            sorted[i + 1] - sorted[i]
+        } else {
+            (sorted[0] + 360.0) - sorted[n - 1]
+        };
+        if gap > max_gap {
+            max_gap = gap;
+            max_gap_end = (i + 1) % n;
+        }
+    }
+
+    // 건물 시작 = 최대 갭 끝, 건물 끝 = 최대 갭 시작
+    let az_start = sorted[max_gap_end];
+    let az_end = if max_gap_end == 0 {
+        sorted[n - 1]
+    } else {
+        sorted[max_gap_end - 1]
+    };
+
+    let span = if az_end >= az_start {
+        az_end - az_start
+    } else {
+        (az_end + 360.0) - az_start
+    };
+
+    (az_start, span)
 }
 
 /// 수동 건물 geometry_json을 파싱하여 샘플 포인트 (lat, lon) 목록으로 확장.

@@ -3,6 +3,8 @@ import type { RadarMonthlyResult, ManualBuilding, RadarSite, AzSector } from "..
 import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedPsrStdDev, gradeWithConfidence } from "../../utils/omStats";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportPage from "./ReportPage";
+import KatexMath from "./KatexMath";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
   sectionNum: number;
@@ -161,10 +163,12 @@ function ReportOMSummarySection({
       {/* 통계 산식 주석 (보고서 인쇄 시 근거 명시) */}
       <div className="mb-4 rounded border border-gray-200 bg-gray-50/70 px-3 py-2 text-[10px] leading-relaxed text-gray-500">
         <span className="font-semibold text-gray-600">통계 산식 · </span>
-        평균: 관측량 가중 평균 x̄<sub>w</sub> = Σ(w<sub>i</sub>·x<sub>i</sub>)/Σw<sub>i</sub>
-        {" "}(Loss: w=비행시간, PSR: w=SSR포인트수)
-        {" · "}±σ: 가중 모표준편차
-        {" · "}N: 일별 총 탐지포인트
+        평균: 관측량 가중 평균{" "}
+        <KatexMath math="\bar{x}_w = \frac{\sum w_i \cdot x_i}{\sum w_i}" className="mx-0.5" />
+        {" "}(Loss: <KatexMath math="w" />=비행시간, PSR: <KatexMath math="w" />=SSR포인트수)
+        {" · "}<KatexMath math="\pm\sigma" />: 가중 모표준편차{" "}
+        <KatexMath math="\sigma_w = \sqrt{\frac{\sum w_i (x_i - \bar{x}_w)^2}{\sum w_i}}" className="mx-0.5" />
+        {" · "}<KatexMath math="N" />: 일별 총 탐지포인트
         {" · "}판정: 양호(&lt;0.5%) / 주의(0.5–2%) / 경고(≥2%) / 보류(&lt;7일)
       </div>
     </>
@@ -175,9 +179,10 @@ function ReportOMSummarySection({
     return (
       <ReportPage>
         <div className="mb-8">
-          <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-            {sectionNum}. 분석 요약{monthLabel && ` (${monthLabel})`}
-          </h2>
+          <ReportOMSectionHeader
+            sectionNum={sectionNum}
+            title={`분석 요약${monthLabel ? ` (${monthLabel})` : ""}`}
+          />
           <div className="mb-4">
             <h3 className="mb-2 text-[15px] font-semibold text-gray-700">분석 대상 장애물</h3>
             {renderBuildingTable(selectedBuildings, 0)}
@@ -197,9 +202,10 @@ function ReportOMSummarySection({
   pages.push(
     <ReportPage key="summary-0">
       <div className="mb-8">
-        <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-          {sectionNum}. 분석 요약{monthLabel && ` (${monthLabel})`}
-        </h2>
+        <ReportOMSectionHeader
+          sectionNum={sectionNum}
+          title={`분석 요약${monthLabel ? ` (${monthLabel})` : ""}`}
+        />
         <div className="mb-4">
           <h3 className="mb-2 text-[15px] font-semibold text-gray-700">
             분석 대상 장애물 ({totalBuildings}건 중 1–{maxRowsFirstPage})
@@ -220,9 +226,10 @@ function ReportOMSummarySection({
     pages.push(
       <ReportPage key={`summary-${pageIdx}`}>
         <div className="mb-8">
-          <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-            {sectionNum}. 분석 요약 (계속) — 장애물 {offset + 1}–{Math.min(offset + maxRowsNextPage, totalBuildings)}/{totalBuildings}
-          </h2>
+          <ReportOMSectionHeader
+            sectionNum={sectionNum}
+            title={`분석 요약 (계속) — 장애물 ${offset + 1}–${Math.min(offset + maxRowsNextPage, totalBuildings)}/${totalBuildings}`}
+          />
           {renderBuildingTable(slice, offset)}
         </div>
       </ReportPage>

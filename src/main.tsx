@@ -10,6 +10,7 @@ const windowLabel = getCurrentWindow().label;
 const App = lazy(() => import("./App"));
 const TrackMapApp = lazy(() => import("./apps/TrackMapApp"));
 const DrawingApp = lazy(() => import("./apps/DrawingApp"));
+const ReportApp = lazy(() => import("./apps/ReportApp"));
 
 // 프론트엔드 크래시 시 오류 다이얼로그 (개발자 모드 전용)
 function showErrorDialog(title: string, detail: string) {
@@ -101,6 +102,7 @@ function RootApp() {
   // drawing 창: 도면 전용 (자체 업로드+도면)
   if (windowLabel === "trackmap") return <TrackMapApp />;
   if (windowLabel === "drawing") return <DrawingApp />;
+  if (windowLabel === "report") return <ReportApp />;
   return <App />;
 }
 

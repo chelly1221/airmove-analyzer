@@ -2,6 +2,8 @@ import React, { useMemo } from "react";
 import { Crosshair } from "lucide-react";
 import type { DailyStats, RadarSite, ManualBuilding, AzSector } from "../../types";
 import { azimuthAndDist } from "../../utils/geo";
+import KatexMath from "./KatexMath";
+import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
   sectionNum: number;
@@ -10,6 +12,8 @@ interface Props {
   selectedBuildings: ManualBuilding[];
   azSectors: AzSector[];
   analysisMonth?: string;
+  /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
+  hideHeader?: boolean;
 }
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
@@ -48,7 +52,7 @@ const DURATION_EXAMPLES = [5, 30, 120]; // 초
  */
 
 function ReportOMAzDistScatter({
-  sectionNum, radarSite, dailyStats, selectedBuildings, azSectors, analysisMonth,
+  sectionNum, radarSite, dailyStats, selectedBuildings, azSectors, analysisMonth, hideHeader,
 }: Props) {
   const monthLabel = analysisMonth
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
@@ -85,9 +89,13 @@ function ReportOMAzDistScatter({
     const hasDailyData = dailyStats.length > 0;
     return (
       <div className="mb-8">
-        <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
-          {sectionNum}. 방위별 표적소실 산점도 — {radarSite.name}
-        </h2>
+        {!hideHeader && (
+          <ReportOMSectionHeader
+            sectionNum={sectionNum}
+            title="방위별 표적소실 산점도"
+            radarName={radarSite.name}
+          />
+        )}
         <div className="flex flex-col items-center py-12 text-gray-400">
           <Crosshair size={28} strokeWidth={1.2} className="mb-2" />
           <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
@@ -146,10 +154,13 @@ function ReportOMAzDistScatter({
 
   return (
     <div className="mb-8">
-      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[17px] font-bold text-gray-900">
-        {sectionNum}. 방위-거리 소실표적 산점도{monthLabel && ` (${monthLabel})`}
-      </h2>
-      <h3 className="mb-2 text-[15px] font-semibold text-gray-700">{radarSite.name}</h3>
+      {!hideHeader && (
+        <ReportOMSectionHeader
+          sectionNum={sectionNum}
+          title={`방위-거리 소실표적 산점도${monthLabel ? ` (${monthLabel})` : ""}`}
+          radarName={radarSite.name}
+        />
+      )}
 
       {/* 정보 요약 */}
       <div className="mb-2 flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] text-gray-500">
@@ -348,9 +359,12 @@ function ReportOMAzDistScatter({
 
       {/* 산식 근거 주석 */}
       <div className="mt-1 rounded border border-gray-200 bg-gray-50/70 px-3 py-1.5 text-[9px] leading-relaxed text-gray-500">
-        점 크기: √(지속시간/2) — 면적이 소실 지속시간에 비례
-        {" · "}색상: 고도별 HSL 스펙트럼 (1kft 빨강 → 20kft 파랑)
-        {" · "}차폐 영역: 건물 높이/거리 비율 기반 시각적 근사 (정량 판정 아님)
+        <span className="font-semibold text-gray-600">산식 근거 · </span>
+        점 크기: <KatexMath math="r = \sqrt{\dfrac{t}{2}}" className="mx-0.5" />
+        <span className="text-gray-400 mx-0.5">—</span>
+        <KatexMath math="A \propto \pi r^2 \propto t" className="mx-0.5" /> (면적이 소실 지속시간 <KatexMath math="t" />에 비례)
+        {" · "}색상: <KatexMath math="\text{hue} = \frac{\text{alt} - 1000}{19000} \times 240°" className="mx-0.5" /> (1kft 빨강 → 20kft 파랑)
+        {" · "}차폐 반각: <KatexMath math="\theta = \max\!\bigl(1°,\;\min\!\bigl(5°,\;\frac{h}{d} \times 0.5\bigr)\bigr)" className="mx-0.5" /> (시각적 근사, 정량 판정 아님)
       </div>
 
       {/* 하단 범례 */}
