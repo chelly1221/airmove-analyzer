@@ -65,3 +65,23 @@ export interface ObstacleMonthlyProgress {
   total: number;
   message: string;
 }
+
+/** OM 보고서 통합 상태 (12개 useState → 1개로 통합, 캐스케이딩 리렌더 방지) */
+export interface OMReportData {
+  result: ObstacleMonthlyResult | null;
+  selectedBuildings: import("./building").ManualBuilding[];
+  selectedRadarSites: import("./radar").RadarSite[];
+  azSectorsByRadar: Map<string, AzSector[]>;
+  losMap: Map<string, import("./los").LoSProfileData>;
+  covLayersWithBuildings: import("../utils/radarCoverage").CoverageLayer[];
+  covLayersWithout: import("../utils/radarCoverage").CoverageLayer[];
+  analysisMonth: string;
+  findingsText: string;
+  recommendText: string;
+  panoWithTargets: Map<string, import("./panorama").PanoramaPoint[]>;
+  panoWithoutTargets: Map<string, import("./panorama").PanoramaPoint[]>;
+  coverageStatus: "idle" | "loading" | "done" | "error";
+  panoramaStatus: "idle" | "loading" | "done" | "error";
+  /** 차트 섹션 사전 캡처 이미지 (key: sectionId, value: WebP data URL) */
+  sectionImages: Map<string, string>;
+}

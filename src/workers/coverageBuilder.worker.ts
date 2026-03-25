@@ -278,6 +278,71 @@ self.onmessage = (e: MessageEvent) => {
       break;
     }
 
+    // 3D 커버리지 면 생성 (surfaceAngles → quad mesh)
+    case "BUILD_3D_SURFACE": {
+      const { surfaceAngles: saBuffer, surfaceRays, surfaceSamples,
+              radarLat, radarLon, radarHeightM, maxRangeKm, bearingStepDeg } = e.data;
+      const angles = new Float32Array(saBuffer);
+      const R_EARTH_M = 6371000.0;
+      const M_TO_FT = 3.28084;
+      const MAX_ALT_FT = 30000;
+
+      const quads: any[] = [];
+      for (let r = 0; r < surfaceRays - 1; r++) {
+        const az0 = r * bearingStepDeg;
+        const az1 = (r + 1) * bearingStepDeg;
+        for (let s = 0; s < surfaceSamples - 1; s++) {
+          // 각 꼭짓점의 거리 (km)
+          const distFrac0 = (s + 1) / surfaceSamples;
+          const distFrac1 = (s + 2) / surfaceSamples;
+          const d0km = distFrac0 * maxRangeKm;
+          const d1km = distFrac1 * maxRangeKm;
+          const d0m = d0km * 1000;
+          const d1m = d1km * 1000;
+
+          // 4개 꼭짓점의 max_angle
+          const a00 = angles[r * surfaceSamples + s];
+          const a10 = angles[(r + 1) * surfaceSamples + s];
+          const a01 = angles[r * surfaceSamples + s + 1];
+          const a11 = angles[(r + 1) * surfaceSamples + s + 1];
+
+          // 최저 탐지 고도 계산: min_alt = max_angle × dist + radar_height + dist²/(2R)
+          const alt00m = a00 * d0m + radarHeightM + (d0m * d0m) / (2 * R_EARTH_M);
+          const alt10m = a10 * d0m + radarHeightM + (d0m * d0m) / (2 * R_EARTH_M);
+          const alt01m = a01 * d1m + radarHeightM + (d1m * d1m) / (2 * R_EARTH_M);
+          const alt11m = a11 * d1m + radarHeightM + (d1m * d1m) / (2 * R_EARTH_M);
+
+          // 중심 고도 (ft) — 고도 클램핑
+          const centerAltFt = ((alt00m + alt10m + alt01m + alt11m) / 4) * M_TO_FT;
+          if (centerAltFt > MAX_ALT_FT || centerAltFt < 0) continue;
+
+          // 좌표 계산 (4개 꼭짓점)
+          const [lat00, lon00] = destinationPoint(radarLat, radarLon, az0, d0km);
+          const [lat10, lon10] = destinationPoint(radarLat, radarLon, az1, d0km);
+          const [lat01, lon01] = destinationPoint(radarLat, radarLon, az0, d1km);
+          const [lat11, lon11] = destinationPoint(radarLat, radarLon, az1, d1km);
+
+          // 고도 색상 매핑
+          const fillColor = altToColor(centerAltFt);
+
+          quads.push({
+            polygon: [
+              [lon00, lat00, alt00m],
+              [lon10, lat10, alt10m],
+              [lon11, lat11, alt11m],
+              [lon01, lat01, alt01m],
+              [lon00, lat00, alt00m], // 닫기
+            ] as [number, number, number][],
+            fillColor,
+            altFt: Math.round(centerAltFt),
+          });
+        }
+      }
+
+      self.postMessage({ type: "3D_SURFACE_RESULT", id, quads });
+      break;
+    }
+
     // 캐시 ranges 반환 (IndexedDB 저장용, Transfer)
     case "EXPORT_CACHE": {
       if (!_cache) {

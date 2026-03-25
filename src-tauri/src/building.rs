@@ -94,92 +94,34 @@ fn line_polygon_intersections(
 }
 
 /// 수동 건물 geometry → 폴리곤 링 (lon, lat) 변환
-/// rectangle/circle/ellipse → Some(ring), point/line → None
+/// polygon 좌표 배열 [[lat,lon],...] → Some(ring), 그 외 → None
 fn manual_building_to_polygon_ring(
-    center_lat: f64,
-    center_lon: f64,
+    _center_lat: f64,
+    _center_lon: f64,
     geo_type: Option<&str>,
     geo_json: Option<&str>,
 ) -> Option<Vec<(f64, f64)>> {
     let gt = geo_type?;
+    if gt != "polygon" {
+        return None;
+    }
     let json_str = geo_json.filter(|s| !s.is_empty())?;
     let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
 
-    match gt {
-        "rectangle" => {
-            if let Some(arr) = val.as_array() {
-                let pts: Vec<(f64, f64)> = arr
-                    .iter()
-                    .filter_map(|p| {
-                        let lat = p.get(0)?.as_f64()?;
-                        let lon = p.get(1)?.as_f64()?;
-                        Some((lon, lat)) // (lon, lat) 순서
-                    })
-                    .collect();
-                if pts.len() >= 3 {
-                    return Some(pts);
-                }
-                if pts.len() == 2 {
-                    // 레거시: [[minLat,minLon],[maxLat,maxLon]] → 4꼭짓점
-                    let (lon0, lat0) = pts[0];
-                    let (lon1, lat1) = pts[1];
-                    return Some(vec![
-                        (lon0, lat0),
-                        (lon1, lat0),
-                        (lon1, lat1),
-                        (lon0, lat1),
-                    ]);
-                }
-            }
-            None
+    if let Some(arr) = val.as_array() {
+        let pts: Vec<(f64, f64)> = arr
+            .iter()
+            .filter_map(|p| {
+                let lat = p.get(0)?.as_f64()?;
+                let lon = p.get(1)?.as_f64()?;
+                Some((lon, lat)) // (lon, lat) 순서
+            })
+            .collect();
+        if pts.len() >= 3 {
+            return Some(pts);
         }
-        "circle" => {
-            let clat = val
-                .get("center")
-                .and_then(|c| c.get(0))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(center_lat);
-            let clon = val
-                .get("center")
-                .and_then(|c| c.get(1))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(center_lon);
-            let semi_major = val
-                .get("semi_major_m")
-                .and_then(|v| v.as_f64())
-                .or_else(|| val.get("radius_m").and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            let semi_minor = val
-                .get("semi_minor_m")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(semi_major);
-            let rot_deg = val
-                .get("rotation_deg")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-
-            if semi_major < 1.0 {
-                return None;
-            }
-
-            let rot_rad = rot_deg.to_radians();
-            let cos_lat = clat.to_radians().cos().max(0.01);
-            let n = 36;
-            let mut ring = Vec::with_capacity(n);
-            for i in 0..n {
-                let angle = (i as f64 / n as f64) * 2.0 * std::f64::consts::PI;
-                let lx = semi_major * angle.cos();
-                let ly = semi_minor * angle.sin();
-                let rx = lx * rot_rad.sin() + ly * rot_rad.cos();
-                let ry = lx * rot_rad.cos() - ly * rot_rad.sin();
-                let dlat = ry / 111_320.0;
-                let dlon = rx / (111_320.0 * cos_lat);
-                ring.push((clon + dlon, clat + dlat));
-            }
-            Some(ring)
-        }
-        _ => None,
     }
+    None
 }
 
 /// LoS 경로 상의 건물 정보 (프론트엔드 반환)
@@ -345,9 +287,9 @@ pub fn query_buildings_along_path(
     for row in manual_rows {
         let (mlat, mlon, height, ground_elev, name, memo, geo_type, geo_json) = row.map_err(|e| format!("수동 건물 행 읽기 실패: {}", e))?;
 
-        let geo_type_str = geo_type.as_deref().unwrap_or("point");
+        let geo_type_str = geo_type.as_deref().unwrap_or("polygon");
 
-        // 폴리곤 형태(rectangle/circle/ellipse) → 정확한 직선-폴리곤 교차
+        // 폴리곤 형태 → 정확한 직선-폴리곤 교차
         if let Some(ring) = manual_building_to_polygon_ring(mlat, mlon, geo_type.as_deref(), geo_json.as_deref()) {
             let mut hit_distances = line_polygon_intersections(
                 radar_lon, radar_lat, target_lon, target_lat,
@@ -965,9 +907,9 @@ pub struct ManualBuilding {
     pub height: f64,
     pub ground_elev: f64,
     pub memo: String,
-    /// 도형 유형: "circle" | "line" | "multi"
+    /// 도형 유형: "polygon" | "multi"
     pub geometry_type: String,
-    /// 도형 좌표 JSON (rectangle: [[lat,lon]x4] 4꼭짓점 (레거시: [[minLat,minLon],[maxLat,maxLon]]), circle: {center:[lat,lon],semi_major_m,semi_minor_m,rotation_deg}, line: [[lat,lon],...])
+    /// 도형 좌표 JSON (polygon: [[lat,lon],...])
     pub geometry_json: Option<String>,
     /// 소속 그룹 ID (null이면 미분류)
     pub group_id: Option<i64>,
@@ -988,7 +930,7 @@ pub fn list_manual_buildings(conn: &Connection) -> Result<Vec<ManualBuilding>, S
             height: row.get(4)?,
             ground_elev: row.get(5)?,
             memo: row.get(6)?,
-            geometry_type: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "point".to_string()),
+            geometry_type: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "polygon".to_string()),
             geometry_json: row.get(8)?,
             group_id: row.get(9)?,
         })
@@ -1337,7 +1279,7 @@ pub(crate) fn expand_manual_building_geometry(
     geo_json: Option<&str>,
 ) -> Vec<(f64, f64)> {
     let geo_type = match geo_type {
-        Some(t) if t != "point" => t,
+        Some(t) if t == "polygon" || t == "multi" => t,
         _ => return vec![(center_lat, center_lon)],
     };
     let json_str = match geo_json {
@@ -1350,38 +1292,7 @@ pub(crate) fn expand_manual_building_geometry(
     };
 
     match geo_type {
-        "circle" => {
-            let clat = val.get("center").and_then(|c| c.get(0)).and_then(|v| v.as_f64()).unwrap_or(center_lat);
-            let clon = val.get("center").and_then(|c| c.get(1)).and_then(|v| v.as_f64()).unwrap_or(center_lon);
-            let semi_major = val.get("semi_major_m").and_then(|v| v.as_f64())
-                .or_else(|| val.get("radius_m").and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            let semi_minor = val.get("semi_minor_m").and_then(|v| v.as_f64()).unwrap_or(semi_major);
-            let rot_deg = val.get("rotation_deg").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-            if semi_major < 1.0 {
-                return vec![(center_lat, center_lon)];
-            }
-
-            let rot_rad = rot_deg.to_radians();
-            let cos_lat = clat.to_radians().cos().max(0.01);
-            let num_samples = 12;
-            let mut pts = Vec::with_capacity(num_samples + 1);
-            pts.push((clat, clon));
-
-            for i in 0..num_samples {
-                let angle = (i as f64 / num_samples as f64) * 2.0 * std::f64::consts::PI;
-                let lx = semi_major * angle.cos();
-                let ly = semi_minor * angle.sin();
-                let rx = lx * rot_rad.sin() + ly * rot_rad.cos();
-                let ry = lx * rot_rad.cos() - ly * rot_rad.sin();
-                let dlat = ry / 111_320.0;
-                let dlon = rx / (111_320.0 * cos_lat);
-                pts.push((clat + dlat, clon + dlon));
-            }
-            return pts;
-        }
-        "line" => {
+        "polygon" => {
             if let Some(arr) = val.as_array() {
                 let pts: Vec<(f64, f64)> = arr.iter().filter_map(|p| {
                     let lat = p.get(0).and_then(|v| v.as_f64())?;

@@ -188,7 +188,7 @@ impl TrackAssembler {
     }
 
     /// ATCRBS 병합: Mode 3/A 매핑 + 시공간 근접 검증
-    fn merge_atcrbs(&mut self, filter_set: &std::collections::HashSet<String>) {
+    fn merge_atcrbs(&mut self, incl_ms: &std::collections::HashSet<String>, excl_ms: &std::collections::HashSet<String>) {
         if self.atcrbs_pool.is_empty() {
             return;
         }
@@ -232,8 +232,12 @@ impl TrackAssembler {
                 }
             };
 
-            // 필터 체크
-            if !filter_set.is_empty() && !filter_set.contains(&ms_code.to_uppercase()) {
+            // 포함/제외 필터 체크
+            let ms_upper = ms_code.to_uppercase();
+            if !incl_ms.is_empty() && !incl_ms.contains(&ms_upper) {
+                continue;
+            }
+            if excl_ms.contains(&ms_upper) {
                 continue;
             }
 
@@ -802,12 +806,11 @@ pub fn parse_ass_file(
     path: &str,
     radar_lat: f64,
     radar_lon: f64,
-    mode_s_filter: &[String],
-    mode3a_filter: &[u16],
+    mode_s_include: &[String],
+    mode_s_exclude: &[String],
+    mode3a_include: &[u16],
+    mode3a_exclude: &[u16],
     mag_dec_deg: f64,
-    filter_logic: &str,
-    mode_s_exclude: bool,
-    mode3a_exclude: bool,
     _progress: impl Fn(f64),
 ) -> Result<crate::models::ParsedFile, ParseError> {
     let data = std::fs::read(path).map_err(|e| ParseError::FileReadError(e.to_string()))?;
@@ -824,12 +827,13 @@ pub fn parse_ass_file(
         .unwrap_or_else(|| path.to_string());
 
     info!(
-        "Parsing ASS file: {} ({} bytes, radar={},{}, filter={:?})",
+        "Parsing ASS file: {} ({} bytes, radar={},{}, include={:?}, exclude={:?})",
         filename,
         data.len(),
         radar_lat,
         radar_lon,
-        mode_s_filter
+        mode_s_include,
+        mode_s_exclude
     );
 
     // Detect NEC frame pattern
@@ -853,23 +857,13 @@ pub fn parse_ass_file(
         );
     }
 
-    // Build Mode-S filter set for quick lookup
-    let filter_set: std::collections::HashSet<String> = mode_s_filter
-        .iter()
-        .map(|s| s.to_uppercase())
-        .collect();
-    let filtering = !filter_set.is_empty();
-
-    // Build Mode-3/A (squawk) filter set
-    let m3a_filter_set: std::collections::HashSet<u16> = mode3a_filter.iter().copied().collect();
-    let m3a_filtering = !m3a_filter_set.is_empty();
-
-    // 필터 논리: "or"이면 Mode-S/Squawk 중 하나만 매칭되면 통과
-    let use_or_logic = filter_logic.eq_ignore_ascii_case("or") && filtering && m3a_filtering;
-
-    // 제외 모드: 매칭되면 거부 (NOT)
-    let ms_excl = mode_s_exclude && filtering;
-    let m3a_excl = mode3a_exclude && m3a_filtering;
+    // 포함/제외 필터 셋 구성
+    let incl_ms: std::collections::HashSet<String> = mode_s_include.iter().map(|s| s.to_uppercase()).collect();
+    let excl_ms: std::collections::HashSet<String> = mode_s_exclude.iter().map(|s| s.to_uppercase()).collect();
+    let incl_m3a: std::collections::HashSet<u16> = mode3a_include.iter().copied().collect();
+    let excl_m3a: std::collections::HashSet<u16> = mode3a_exclude.iter().copied().collect();
+    let has_incl_ms = !incl_ms.is_empty();
+    let has_incl_m3a = !incl_m3a.is_empty();
 
     let mut assembler = TrackAssembler::new();
     let mut total_records = 0usize;
@@ -976,20 +970,14 @@ pub fn parse_ass_file(
                                     assembler.stats.discarded_psr_none += 1;
                                 }
                                 RecordOutcome::ModesSPoint(tp, mode3a, extra) => {
-                                    // Mode-S 필터: 포함(contains→true) / 제외(contains→false)
-                                    let ms_match = filter_set.contains(&tp.mode_s.to_uppercase());
-                                    let ms_ok = !filtering || (if ms_excl { !ms_match } else { ms_match });
-                                    // Mode-3/A 필터: 포함/제외
-                                    let m3a_match = mode3a.map_or(false, |v| m3a_filter_set.contains(&v));
-                                    let m3a_ok = !m3a_filtering || (if m3a_excl { !m3a_match } else { m3a_match });
-                                    let pass = if use_or_logic {
-                                        // OR: 한쪽이라도 통과하면 포함
-                                        let ms_pass = if ms_excl { !ms_match } else { ms_match };
-                                        let m3a_pass = if m3a_excl { !m3a_match } else { m3a_match };
-                                        ms_pass || m3a_pass
-                                    } else {
-                                        ms_ok && m3a_ok
-                                    };
+                                    // 포함 판정: 포함 목록이 비어있으면 통과, 아니면 매칭 필요
+                                    let ms_upper = tp.mode_s.to_uppercase();
+                                    let incl_ok = (!has_incl_ms || incl_ms.contains(&ms_upper))
+                                        && (!has_incl_m3a || mode3a.map_or(false, |v| incl_m3a.contains(&v)));
+                                    // 제외 판정: 제외 목록에 있으면 거부
+                                    let not_excluded = !excl_ms.contains(&ms_upper)
+                                        && !mode3a.map_or(false, |v| excl_m3a.contains(&v));
+                                    let pass = incl_ok && not_excluded;
                                     if pass {
                                         let rtp = RichTrackPoint {
                                             point: tp,
@@ -1002,10 +990,12 @@ pub fn parse_ass_file(
                                     }
                                 }
                                 RecordOutcome::AtcrbsPoint(tp, mode3a) => {
-                                    // Mode-3/A (squawk) 필터 적용 — ATCRBS에도 적용
-                                    let m3a_match = mode3a.map_or(false, |v| m3a_filter_set.contains(&v));
-                                    let m3a_ok = !m3a_filtering || (if m3a_excl { !m3a_match } else { m3a_match });
-                                    if m3a_ok {
+                                    // ATCRBS: squawk 포함/제외 필터 적용
+                                    let m3a_incl_ok = !has_incl_m3a || mode3a.map_or(false, |v| incl_m3a.contains(&v));
+                                    let m3a_not_excluded = !mode3a.map_or(false, |v| excl_m3a.contains(&v));
+                                    // Mode-S 포함 필터가 있으면 ATCRBS는 통과 불가 (Mode-S 없으므로)
+                                    let ms_incl_ok = !has_incl_ms;
+                                    if ms_incl_ok && m3a_incl_ok && m3a_not_excluded {
                                         assembler.insert_atcrbs(tp, mode3a);
                                     }
                                 }
@@ -1054,17 +1044,14 @@ pub fn parse_ass_file(
     }
 
     // ATCRBS 병합
-    assembler.merge_atcrbs(&filter_set);
+    assembler.merge_atcrbs(&incl_ms, &excl_ms);
 
-    // Mode-S 필터 적용 (ATCRBS 병합 후)
-    // OR 모드에서는 squawk 매칭으로 삽입된 트랙이 있으므로 mode_s retain 생략
-    if filtering && !use_or_logic {
-        if ms_excl {
-            // 제외 모드: filter_set에 포함된 트랙 제거
-            assembler.tracks.retain(|ms, _| !filter_set.contains(&ms.to_uppercase()));
-        } else {
-            assembler.tracks.retain(|ms, _| filter_set.contains(&ms.to_uppercase()));
-        }
+    // Mode-S 포함/제외 필터 적용 (ATCRBS 병합 후)
+    if has_incl_ms {
+        assembler.tracks.retain(|ms, _| incl_ms.contains(&ms.to_uppercase()));
+    }
+    if !excl_ms.is_empty() {
+        assembler.tracks.retain(|ms, _| !excl_ms.contains(&ms.to_uppercase()));
     }
 
     // 유령 표적 제거 (동일 스캔 내 공간 불일치 포인트 + 공간 이상점)

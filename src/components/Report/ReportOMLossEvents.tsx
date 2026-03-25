@@ -1,6 +1,8 @@
 import React, { useMemo } from "react";
+import { AlertTriangle } from "lucide-react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
+import { azimuthAndDist } from "../../utils/geo";
 
 interface Props {
   sectionNum: number;
@@ -11,21 +13,6 @@ interface Props {
   layersWithTargets: CoverageLayer[];
   /** 건물 제외 커버리지 레이어 */
   layersWithoutTargets: CoverageLayer[];
-}
-
-/** 레이더→포인트 방위(°) 및 거리(km) */
-function azimuthAndDist(
-  radarLat: number, radarLon: number,
-  lat: number, lon: number,
-): { azDeg: number; distKm: number } {
-  const dLat = lat - radarLat;
-  const dLon = lon - radarLon;
-  const latKm = dLat * 111.32;
-  const lonKm = dLon * 111.32 * Math.cos((radarLat * Math.PI) / 180);
-  const distKm = Math.sqrt(latKm * latKm + lonKm * lonKm);
-  let azDeg = (Math.atan2(lonKm, latKm) * 180) / Math.PI;
-  if (azDeg < 0) azDeg += 360;
-  return { azDeg, distKm };
 }
 
 /** 방위별 커버리지 범위(km) lookup — O(1) 인덱스 기반 */
@@ -134,7 +121,20 @@ function ReportOMLossEvents({
     return result;
   }, [radarResults, radarSites, layersWithTargets, layersWithoutTargets]);
 
-  if (eventsByRadar.length === 0) return null;
+  if (eventsByRadar.length === 0) {
+    const hasDailyData = radarResults.some((rr) => rr.daily_stats.length > 0);
+    return (
+      <div className="mb-8">
+        <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
+          {sectionNum}. 장애물 기인 표적소실 상세
+        </h2>
+        <div className="flex flex-col items-center py-12 text-gray-400">
+          <AlertTriangle size={28} strokeWidth={1.2} className="mb-2" />
+          <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mb-8">

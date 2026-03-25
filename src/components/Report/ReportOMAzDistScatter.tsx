@@ -1,5 +1,7 @@
 import React, { useMemo } from "react";
+import { Crosshair } from "lucide-react";
 import type { DailyStats, RadarSite, ManualBuilding, AzSector } from "../../types";
+import { azimuthAndDist } from "../../utils/geo";
 
 interface Props {
   sectionNum: number;
@@ -8,21 +10,6 @@ interface Props {
   selectedBuildings: ManualBuilding[];
   azSectors: AzSector[];
   analysisMonth?: string;
-}
-
-/** 레이더→포인트 방위(°, 0=N, CW) 및 거리(km) */
-function azimuthAndDist(
-  radarLat: number, radarLon: number,
-  lat: number, lon: number,
-): { azDeg: number; distKm: number } {
-  const dLat = lat - radarLat;
-  const dLon = lon - radarLon;
-  const latKm = dLat * 111.32;
-  const lonKm = dLon * 111.32 * Math.cos((radarLat * Math.PI) / 180);
-  const distKm = Math.sqrt(latKm * latKm + lonKm * lonKm);
-  let azDeg = (Math.atan2(lonKm, latKm) * 180) / Math.PI;
-  if (azDeg < 0) azDeg += 360;
-  return { azDeg, distKm };
 }
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
@@ -94,7 +81,20 @@ function ReportOMAzDistScatter({
     })),
   [selectedBuildings, radarSite]);
 
-  if (lossData.length === 0) return null;
+  if (lossData.length === 0) {
+    const hasDailyData = dailyStats.length > 0;
+    return (
+      <div className="mb-8">
+        <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
+          {sectionNum}. 방위별 표적소실 산점도 — {radarSite.name}
+        </h2>
+        <div className="flex flex-col items-center py-12 text-gray-400">
+          <Crosshair size={28} strokeWidth={1.2} className="mb-2" />
+          <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
+        </div>
+      </div>
+    );
+  }
 
   // SVG 레이아웃
   const svgSize = 700;

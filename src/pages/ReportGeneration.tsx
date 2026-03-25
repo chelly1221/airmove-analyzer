@@ -23,6 +23,7 @@ import {
   Clock,
   FilePlus,
   Pencil,
+  MinusSquare,
 } from "lucide-react";
 import { format } from "date-fns";
 import { useAppStore } from "../store";
@@ -49,6 +50,7 @@ import ReportOMAltitudeDistribution from "../components/Report/ReportOMAltitudeD
 import ReportOMFindings from "../components/Report/ReportOMFindings";
 import ReportOMLossEvents from "../components/Report/ReportOMLossEvents";
 import ReportOMAzDistScatter from "../components/Report/ReportOMAzDistScatter";
+import OMSectionImage from "../components/Report/OMSectionImage";
 import ReportPSSummarySection from "../components/Report/ReportPSSummarySection";
 import ReportPSAngleHeight from "../components/Report/ReportPSAngleHeight";
 import ReportPSAdditionalLoss from "../components/Report/ReportPSAdditionalLoss";
@@ -59,10 +61,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { flightLabel } from "../utils/flightConsolidation";
 import { computeLayersForAltitudes, isGPUCacheValidFor, type CoverageLayer } from "../utils/radarCoverage";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
+import { haversineKm } from "../utils/geo";
 import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata, PanoramaPoint, NearbyPeak,
   ManualBuilding, BuildingGroup, RadarSite, AzSector, ObstacleMonthlyResult, ObstacleMonthlyProgress, SavedReportSummary,
-  PreScreeningResult,
+  PreScreeningResult, OMReportData,
 } from "../types";
 
 type ReportTemplate = "weekly" | "monthly" | "flights" | "single" | "obstacle" | "obstacle_monthly";
@@ -243,19 +246,25 @@ export default function ReportGeneration() {
   const [error, setError] = useState<string | null>(null);
   const [mapImage, setMapImage] = useState<string | null>(null);
 
-  // 장애물 월간 분석 상태
-  const [omResult, setOmResult] = useState<ObstacleMonthlyResult | null>(null);
-  const [omSelectedBuildings, setOmSelectedBuildings] = useState<ManualBuilding[]>([]);
-  const [omSelectedRadarSites, setOmSelectedRadarSites] = useState<RadarSite[]>([]);
-  const [omAzSectorsByRadar, setOmAzSectorsByRadar] = useState<Map<string, AzSector[]>>(new Map());
-  const [omLosMap, setOmLosMap] = useState<Map<string, LoSProfileData>>(new Map());
-  const [omCovLayersWithBuildings, setOmCovLayersWithBuildings] = useState<CoverageLayer[]>([]);
-  const [omCovLayersWithout, setOmCovLayersWithout] = useState<CoverageLayer[]>([]);
-  const [omAnalysisMonth, setOmAnalysisMonth] = useState<string>("");
-  const [omFindingsText, setOmFindingsText] = useState<string>("");
-  const [omRecommendText, setOmRecommendText] = useState<string>("");
-  const [omPanoWithTargets, setOmPanoWithTargets] = useState<Map<string, PanoramaPoint[]>>(new Map());
-  const [omPanoWithoutTargets, setOmPanoWithoutTargets] = useState<Map<string, PanoramaPoint[]>>(new Map());
+  // 장애물 월간 분석 상태 (통합)
+  const initialOMData: OMReportData = {
+    result: null,
+    selectedBuildings: [],
+    selectedRadarSites: [],
+    azSectorsByRadar: new Map(),
+    losMap: new Map(),
+    covLayersWithBuildings: [],
+    covLayersWithout: [],
+    analysisMonth: "",
+    findingsText: "",
+    recommendText: "",
+    panoWithTargets: new Map(),
+    panoWithoutTargets: new Map(),
+    coverageStatus: "idle",
+    panoramaStatus: "idle",
+    sectionImages: new Map(),
+  };
+  const [omData, setOmData] = useState<OMReportData>(initialOMData);
 
   // 사전검토 분석 상태
   const [psResult, setPsResult] = useState<PreScreeningResult | null>(null);
@@ -268,20 +277,19 @@ export default function ReportGeneration() {
 
   // 2주 초과 데이터 → 최근 31일만 사용
   const omResultTrimmed = useMemo(() => {
-    if (!omResult) return null;
+    if (!omData.result) return null;
     const MAX_DAYS = 31;
     const TWO_WEEKS = 14;
     return {
-      ...omResult,
-      radar_results: omResult.radar_results.map((rr) => {
+      ...omData.result,
+      radar_results: omData.result.radar_results.map((rr) => {
         if (rr.daily_stats.length <= TWO_WEEKS) return rr;
-        // date 기준 내림차순 정렬 후 최근 MAX_DAYS만
         const sorted = [...rr.daily_stats].sort((a, b) => b.date.localeCompare(a.date));
         const trimmed = sorted.slice(0, MAX_DAYS).sort((a, b) => a.date.localeCompare(b.date));
         return { ...rr, daily_stats: trimmed };
       }),
     };
-  }, [omResult]);
+  }, [omData.result]);
 
   // 파노라마 데이터 (캐시에서 로드)
   const [panoramaData, setPanoramaData] = useState<PanoramaPoint[]>([]);
@@ -310,13 +318,7 @@ export default function ReportGeneration() {
     if (panoramaData.length === 0) return;
     let cancelled = false;
 
-    const haversineKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-      const R = 6371;
-      const dLat = ((lat2 - lat1) * Math.PI) / 180;
-      const dLon = ((lon2 - lon1) * Math.PI) / 180;
-      const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    };
+    // haversineKm imported from ../utils/geo at top level
 
     const terrainPeaks: { idx: number; lat: number; lon: number; angle: number }[] = [];
     for (let i = 0; i < panoramaData.length; i++) {
@@ -391,9 +393,10 @@ export default function ReportGeneration() {
 
   // OM 분석 완료 시 파노라마 자동 계산 (0.01° 해상도, 포함/미포함 2회)
   useEffect(() => {
-    if (omSelectedRadarSites.length === 0) return;
+    if (omData.selectedRadarSites.length === 0) return;
     let cancelled = false;
-    const excludeIds = omSelectedBuildings.map((b) => b.id);
+    setOmData((prev) => ({ ...prev, panoramaStatus: "loading" }));
+    const excludeIds = omData.selectedBuildings.map((b) => b.id);
     const panoArgs = (radar: RadarSite) => ({
       radarLat: radar.latitude,
       radarLon: radar.longitude,
@@ -405,19 +408,16 @@ export default function ReportGeneration() {
     (async () => {
       const withMap = new Map<string, PanoramaPoint[]>();
       const withoutMap = new Map<string, PanoramaPoint[]>();
-      for (const radar of omSelectedRadarSites) {
+      for (const radar of omData.selectedRadarSites) {
         if (cancelled) break;
         try {
-          // 1) 분석 대상 포함 (전체)
           const withPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", panoArgs(radar));
           if (!cancelled) withMap.set(radar.name, withPts);
-          // 캐시 저장 (전체 버전)
           await invoke("save_panorama_cache", {
             radarLat: radar.latitude, radarLon: radar.longitude,
             radarHeightM: radar.altitude + radar.antenna_height,
             dataJson: JSON.stringify(withPts),
           }).catch(() => {});
-          // 2) 분석 대상 제외 (베이스라인)
           if (excludeIds.length > 0) {
             const withoutPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", {
               ...panoArgs(radar),
@@ -431,13 +431,17 @@ export default function ReportGeneration() {
       }
       if (!cancelled) {
         startTransition(() => {
-          setOmPanoWithTargets(withMap);
-          setOmPanoWithoutTargets(withoutMap);
+          setOmData((prev) => ({
+            ...prev,
+            panoWithTargets: withMap,
+            panoWithoutTargets: withoutMap,
+            panoramaStatus: "done",
+          }));
         });
       }
     })();
     return () => { cancelled = true; };
-  }, [omSelectedRadarSites, omSelectedBuildings]);
+  }, [omData.selectedRadarSites, omData.selectedBuildings]);
 
   // 비행 선택 (건별/단일 상세용)
   const [selectedFlightIds, setSelectedFlightIds] = useState<Set<string>>(new Set());
@@ -489,7 +493,7 @@ export default function ReportGeneration() {
       if (sects.coverageMap) total++;
       if (sects.los) total++;
     } else if (tpl === "obstacle_monthly") {
-      const nRadars = Math.max(omSelectedRadarSites.length, 1);
+      const nRadars = Math.max(omData.selectedRadarSites.length, 1);
       if (sects.omSummary) total++;
       if (sects.omDailyPsr) total += nRadars;
       if (sects.omDailyLoss) total += nRadars;
@@ -512,7 +516,7 @@ export default function ReportGeneration() {
       if (sects.panorama && panoramaData.length > 0) total++;
     }
     return Math.max(total, 1);
-  }, [flights.length, losResults.length, panoramaData.length, aircraft.length, omSelectedRadarSites.length]);
+  }, [flights.length, losResults.length, panoramaData.length, aircraft.length, omData.selectedRadarSites.length]);
 
   /** MutationObserver로 [data-page] 요소 수를 추적하여 렌더링 완료 감지 */
   useEffect(() => {
@@ -652,10 +656,10 @@ export default function ReportGeneration() {
       setCoverTitle("전파 장애물 분석 보고서");
       setCoverSubtitle(`${radarSite?.name ?? ""} 레이더 장애물 종합 분석 · ${format(new Date(), "yyyy년 MM월 dd일")}`);
     } else if (tpl === "obstacle_monthly") {
-      const radarNames = omSelectedRadarSites.map((r) => r.name).join(", ");
+      const radarNames = omData.selectedRadarSites.map((r) => r.name).join(", ");
       setCoverTitle("장애물 월간 분석 보고서");
-      const monthLabel = omAnalysisMonth
-        ? `${omAnalysisMonth.slice(0, 4)}년 ${omAnalysisMonth.slice(5, 7)}월`
+      const monthLabel = omData.analysisMonth
+        ? `${omData.analysisMonth.slice(0, 4)}년 ${omData.analysisMonth.slice(5, 7)}월`
         : format(new Date(), "yyyy년 MM월");
       setCoverSubtitle(radarNames ? `${radarNames} ${monthLabel}` : monthLabel);
     } else if (tpl === "single") {
@@ -690,7 +694,7 @@ export default function ReportGeneration() {
     setPrepPageCount(0);
     setReportPreparing(true);
     setMode("preview");
-  }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite, omSelectedRadarSites, omAnalysisMonth, estimateTotalPages]);
+  }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite, omData.selectedRadarSites, omData.analysisMonth, estimateTotalPages]);
 
   // PDF 내보내기 + DB 저장
   const handleExportPDF = useCallback(async () => {
@@ -720,8 +724,8 @@ export default function ReportGeneration() {
           coverTitle,
           coverSubtitle,
           commentary,
-          omFindingsText,
-          omRecommendText,
+          omFindingsText: omData.findingsText,
+          omRecommendText: omData.recommendText,
           mapImage,
         });
         const metaJson = JSON.stringify(reportMetadata);
@@ -762,7 +766,7 @@ export default function ReportGeneration() {
       setGenerating(false);
       setForceAllVisible(false);
     }
-  }, [template, exportPDF, coverTitle, coverSubtitle, commentary, omFindingsText, omRecommendText, mapImage, sections, selectedFlightIds, singleFlightId, reportMetadata, radarSite, editingReportId]);
+  }, [template, exportPDF, coverTitle, coverSubtitle, commentary, omData.findingsText, omData.recommendText, mapImage, sections, selectedFlightIds, singleFlightId, reportMetadata, radarSite, editingReportId]);
 
   // 저장된 보고서 수정 (config → preview 복원)
   const handleEditReport = useCallback(async (reportId: string) => {
@@ -797,8 +801,13 @@ export default function ReportGeneration() {
       setCoverTitle(config.coverTitle ?? detail.title);
       setCoverSubtitle(config.coverSubtitle ?? "");
       if (config.commentary) setCommentary(config.commentary);
-      if (config.omFindingsText) setOmFindingsText(config.omFindingsText);
-      if (config.omRecommendText) setOmRecommendText(config.omRecommendText);
+      if (config.omFindingsText || config.omRecommendText) {
+        setOmData((prev) => ({
+          ...prev,
+          findingsText: config.omFindingsText ?? prev.findingsText,
+          recommendText: config.omRecommendText ?? prev.recommendText,
+        }));
+      }
       if (config.mapImage !== undefined) setMapImage(config.mapImage ?? null);
 
       setEditingReportId(reportId);
@@ -862,14 +871,14 @@ export default function ReportGeneration() {
     if (!omResultTrimmed) return new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
     const map = new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
     for (const rr of omResultTrimmed.radar_results) {
-      const sectors = omAzSectorsByRadar.get(rr.radar_name) ?? [];
+      const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
       const azText = sectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ");
-      const bldgNames = omSelectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
-      const rs = omSelectedRadarSites.find((r) => r.name === rr.radar_name);
+      const bldgNames = omData.selectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
+      const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
       let minDistKm = Infinity;
       if (rs) {
         const toRad = Math.PI / 180;
-        for (const b of omSelectedBuildings) {
+        for (const b of omData.selectedBuildings) {
           const dLat = (b.latitude - rs.latitude) * toRad;
           const dLon = (b.longitude - rs.longitude) * toRad;
           const a = Math.sin(dLat / 2) ** 2 + Math.cos(rs.latitude * toRad) * Math.cos(b.latitude * toRad) * Math.sin(dLon / 2) ** 2;
@@ -881,7 +890,16 @@ export default function ReportGeneration() {
       map.set(rr.radar_name, { azText, bldgNames, minDistNm: (minDistKm / 1.852).toFixed(1) });
     }
     return map;
-  }, [omResultTrimmed, omAzSectorsByRadar, omSelectedRadarSites, omSelectedBuildings]);
+  }, [omResultTrimmed, omData.azSectorsByRadar, omData.selectedRadarSites, omData.selectedBuildings]);
+
+  // OM 섹션 이미지 캡처 콜백 (안정적 참조)
+  const handleOMSectionCaptured = useCallback((key: string, dataUrl: string) => {
+    setOmData((prev) => {
+      const next = new Map(prev.sectionImages);
+      next.set(key, dataUrl);
+      return { ...prev, sectionImages: next };
+    });
+  }, []);
 
   // ── 설정 모드 (Config) ──
   if (mode === "config") {
@@ -939,32 +957,54 @@ export default function ReportGeneration() {
             metadata={reportMetadata}
             onClose={() => setTemplateModalOpen(null)}
             onGenerate={(result, buildings, radars, azMap, losMap, covWith, covWithout, monthStr) => {
-              setOmResult(result);
-              setOmSelectedBuildings(buildings);
-              setOmSelectedRadarSites(radars);
-              setOmAzSectorsByRadar(azMap);
-              setOmLosMap(losMap);
-              setOmCovLayersWithBuildings(covWith);
-              setOmCovLayersWithout(covWithout);
-              setOmAnalysisMonth(monthStr ?? "");
-              // 소견 자동 생성
-              setOmFindingsText(generateOMFindingsText({
-                radarResults: result.radar_results,
+              setOmData((prev) => ({
+                ...prev,
+                result,
                 selectedBuildings: buildings,
-                radarSites: radars,
-                losMap: losMap,
+                selectedRadarSites: radars,
+                azSectorsByRadar: azMap,
+                losMap,
                 covLayersWithBuildings: covWith,
                 covLayersWithout: covWithout,
                 analysisMonth: monthStr ?? "",
+                findingsText: generateOMFindingsText({
+                  radarResults: result.radar_results,
+                  selectedBuildings: buildings,
+                  radarSites: radars,
+                  losMap,
+                  covLayersWithBuildings: covWith,
+                  covLayersWithout: covWithout,
+                  analysisMonth: monthStr ?? "",
+                }),
+                recommendText: "",
+                coverageStatus: covWith.length > 0 ? "done" : "loading",
+                sectionImages: new Map(), // 새 분석 시 이미지 캐시 초기화
               }));
-              setOmRecommendText("");
               handleGenerate("obstacle_monthly", sections);
             }}
             onCoverageReady={(covWith, covWithout) => {
               startTransition(() => {
-                setOmCovLayersWithBuildings(covWith);
-                setOmCovLayersWithout(covWithout);
+                setOmData((prev) => {
+                  // 커버리지 도착 시 관련 섹션 이미지 캐시 무효화
+                  const nextImages = new Map(prev.sectionImages);
+                  for (const key of nextImages.keys()) {
+                    if (key.startsWith("cov-") || key.startsWith("loss-ev")) nextImages.delete(key);
+                  }
+                  return {
+                    ...prev,
+                    covLayersWithBuildings: covWith,
+                    covLayersWithout: covWithout,
+                    coverageStatus: "done",
+                    sectionImages: nextImages,
+                  };
+                });
               });
+            }}
+            onCoverageError={() => {
+              setOmData((prev) => ({
+                ...prev,
+                coverageStatus: "error",
+              }));
             }}
           />
         )}
@@ -1225,85 +1265,119 @@ export default function ReportGeneration() {
               <ReportOMSummarySection
                 sectionNum={sectionNumbers.omSummary ?? 1}
                 radarResults={omResultTrimmed.radar_results}
-                selectedBuildings={omSelectedBuildings}
-                radarSites={omSelectedRadarSites}
-                azimuthSectorsByRadar={omAzSectorsByRadar}
-                analysisMonth={omAnalysisMonth}
+                selectedBuildings={omData.selectedBuildings}
+                radarSites={omData.selectedRadarSites}
+                azimuthSectorsByRadar={omData.azSectorsByRadar}
+                analysisMonth={omData.analysisMonth}
               />
             )}
 
             {sections.omDailyPsr && omResultTrimmed.radar_results.map((rr) => {
               const info = omRadarConditions.get(rr.radar_name);
+              const imgKey = `psr-${rr.radar_name}`;
               return (
-                <ReportPage key={`psr-${rr.radar_name}`}>
-                  <ReportOMDailyChart
-                    sectionNum={sectionNumbers.omDailyPsr ?? 2}
-                    mode="psr"
-                    radarName={rr.radar_name}
-                    dailyStats={rr.daily_stats}
-                    analysisMonth={omAnalysisMonth}
-                    conditions={[
-                      `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                      `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                      `• PSR 거리 제한: 레이더 60NM 이내`,
-                      `• PSR율 = PSR 포함 탐지 / 전체 탐지 (SSR+Combined 기준)`,
-                    ]}
-                  />
+                <ReportPage key={imgKey}>
+                  <OMSectionImage
+                    preCaptured={omData.sectionImages.get(imgKey)}
+                    onCaptured={(url) => handleOMSectionCaptured(imgKey, url)}
+                  >
+                    <ReportOMDailyChart
+                      sectionNum={sectionNumbers.omDailyPsr ?? 2}
+                      mode="psr"
+                      radarName={rr.radar_name}
+                      dailyStats={rr.daily_stats}
+                      analysisMonth={omData.analysisMonth}
+                      conditions={[
+                        `• 대상 장애물: ${info?.bldgNames ?? ""}`,
+                        `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
+                        `• PSR 거리 제한: 레이더 60NM 이내`,
+                        `• PSR율 = PSR 포함 탐지 / 전체 탐지 (SSR+Combined 기준)`,
+                      ]}
+                    />
+                  </OMSectionImage>
                 </ReportPage>
               );
             })}
 
             {sections.omDailyLoss && omResultTrimmed.radar_results.map((rr) => {
               const info = omRadarConditions.get(rr.radar_name);
+              const imgKey = `loss-${rr.radar_name}`;
               return (
-                <ReportPage key={`loss-${rr.radar_name}`}>
-                  <ReportOMDailyChart
-                    sectionNum={sectionNumbers.omDailyLoss ?? 3}
-                    mode="loss"
-                    radarName={rr.radar_name}
-                    dailyStats={rr.daily_stats}
-                    analysisMonth={omAnalysisMonth}
-                    conditions={[
-                      `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                      `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                      `• 표적소실(Signal Loss)만 포함 (범위이탈 Out of Range 제외)`,
-                      `• 표적소실율 = 소실 시간 / 총 항적 시간 × 100`,
-                    ]}
-                  />
+                <ReportPage key={imgKey}>
+                  <OMSectionImage
+                    preCaptured={omData.sectionImages.get(imgKey)}
+                    onCaptured={(url) => handleOMSectionCaptured(imgKey, url)}
+                  >
+                    <ReportOMDailyChart
+                      sectionNum={sectionNumbers.omDailyLoss ?? 3}
+                      mode="loss"
+                      radarName={rr.radar_name}
+                      dailyStats={rr.daily_stats}
+                      analysisMonth={omData.analysisMonth}
+                      conditions={[
+                        `• 대상 장애물: ${info?.bldgNames ?? ""}`,
+                        `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
+                        `• 표적소실(Signal Loss)만 포함 (범위이탈 Out of Range 제외)`,
+                        `• 표적소실율 = 소실 시간 / 총 항적 시간 × 100`,
+                      ]}
+                    />
+                  </OMSectionImage>
                 </ReportPage>
               );
             })}
 
-            {sections.omWeekly && omResultTrimmed.radar_results.map((rr) => (
-              <ReportPage key={`wk-${rr.radar_name}`}>
-                <ReportOMWeeklyChart
-                  sectionNum={sectionNumbers.omWeekly ?? 4}
-                  radarName={rr.radar_name}
-                  dailyStats={rr.daily_stats}
-                  analysisMonth={omAnalysisMonth}
-                />
-              </ReportPage>
-            ))}
+            {sections.omWeekly && omResultTrimmed.radar_results.map((rr) => {
+              const imgKey = `wk-${rr.radar_name}`;
+              return (
+                <ReportPage key={imgKey}>
+                  <OMSectionImage
+                    preCaptured={omData.sectionImages.get(imgKey)}
+                    onCaptured={(url) => handleOMSectionCaptured(imgKey, url)}
+                  >
+                    <ReportOMWeeklyChart
+                      sectionNum={sectionNumbers.omWeekly ?? 4}
+                      radarName={rr.radar_name}
+                      dailyStats={rr.daily_stats}
+                      analysisMonth={omData.analysisMonth}
+                    />
+                  </OMSectionImage>
+                </ReportPage>
+              );
+            })}
 
-            {sections.omCoverageDiff && (omCovLayersWithBuildings.length > 0 ? omSelectedRadarSites.map((rs) => {
+            {sections.omCoverageDiff && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.length > 0 ? omData.selectedRadarSites.map((rs) => {
               const rr = omResultTrimmed.radar_results.find((r) => r.radar_name === rs.name);
               const allLoss = rr?.daily_stats.flatMap((d) => d.loss_points_summary) ?? [];
+              const covImgKey = `cov-${rs.name}`;
               return (
-                <LazySection key={`cov-${rs.name}`} forceVisible={forceAllVisible}>
+                <LazySection key={covImgKey} forceVisible={forceAllVisible}>
                   <ReportPage>
-                    <ReportOMCoverageDiff
-                      sectionNum={sectionNumbers.omCoverageDiff ?? 5}
-                      radarSite={rs}
-                      layersWithTargets={omCovLayersWithBuildings}
-                      layersWithoutTargets={omCovLayersWithout}
-                      lossPoints={allLoss}
-                      defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
-                      selectedBuildings={omSelectedBuildings}
-                    />
+                    <OMSectionImage
+                      preCaptured={omData.sectionImages.get(covImgKey)}
+                      onCaptured={(url) => handleOMSectionCaptured(covImgKey, url)}
+                      delay={800}
+                    >
+                      <ReportOMCoverageDiff
+                        sectionNum={sectionNumbers.omCoverageDiff ?? 5}
+                        radarSite={rs}
+                        layersWithTargets={omData.covLayersWithBuildings}
+                        layersWithoutTargets={omData.covLayersWithout}
+                        lossPoints={allLoss}
+                        defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
+                        selectedBuildings={omData.selectedBuildings}
+                      />
+                    </OMSectionImage>
                   </ReportPage>
                 </LazySection>
               );
-            }) : (
+            }) : omData.coverageStatus === "error" ? (
+              <ReportPage>
+                <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                  <p className="text-sm text-red-400">커버리지 계산 실패</p>
+                  <p className="mt-1 text-xs">SRTM 데이터 또는 건물 데이터를 확인하세요</p>
+                </div>
+              </ReportPage>
+            ) : (
               <ReportPage>
                 <div className="flex flex-col items-center justify-center py-20 text-gray-400">
                   <Loader2 size={24} className="mb-3 animate-spin" />
@@ -1313,20 +1387,26 @@ export default function ReportGeneration() {
             ))}
 
             {sections.omAzDistScatter && omResultTrimmed.radar_results.map((rr) => {
-              const rs = omSelectedRadarSites.find((r) => r.name === rr.radar_name);
-              const sectors = omAzSectorsByRadar.get(rr.radar_name) ?? [];
+              const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
+              const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
               if (!rs) return null;
+              const azImgKey = `azdist-${rr.radar_name}`;
               return (
-                <LazySection key={`azdist-${rr.radar_name}`} forceVisible={forceAllVisible}>
+                <LazySection key={azImgKey} forceVisible={forceAllVisible}>
                   <ReportPage>
-                    <ReportOMAzDistScatter
-                      sectionNum={sectionNumbers.omAzDistScatter ?? 6}
-                      radarSite={rs}
-                      dailyStats={rr.daily_stats}
-                      selectedBuildings={omSelectedBuildings}
-                      azSectors={sectors}
-                      analysisMonth={omAnalysisMonth}
-                    />
+                    <OMSectionImage
+                      preCaptured={omData.sectionImages.get(azImgKey)}
+                      onCaptured={(url) => handleOMSectionCaptured(azImgKey, url)}
+                    >
+                      <ReportOMAzDistScatter
+                        sectionNum={sectionNumbers.omAzDistScatter ?? 6}
+                        radarSite={rs}
+                        dailyStats={rr.daily_stats}
+                        selectedBuildings={omData.selectedBuildings}
+                        azSectors={sectors}
+                        analysisMonth={omData.analysisMonth}
+                      />
+                    </OMSectionImage>
                   </ReportPage>
                 </LazySection>
               );
@@ -1334,44 +1414,61 @@ export default function ReportGeneration() {
 
             {sections.omBuildingLos && (
               <ReportPage>
-                <ReportOMBuildingLoS
-                  sectionNum={sectionNumbers.omBuildingLos ?? 7}
-                  selectedBuildings={omSelectedBuildings}
-                  radarSites={omSelectedRadarSites}
-                  losMap={omLosMap}
-                />
+                <OMSectionImage
+                  preCaptured={omData.sectionImages.get("buildingLos")}
+                  onCaptured={(url) => handleOMSectionCaptured("buildingLos", url)}
+                >
+                  <ReportOMBuildingLoS
+                    sectionNum={sectionNumbers.omBuildingLos ?? 7}
+                    selectedBuildings={omData.selectedBuildings}
+                    radarSites={omData.selectedRadarSites}
+                    losMap={omData.losMap}
+                  />
+                </OMSectionImage>
               </ReportPage>
             )}
 
             {sections.omAltitude && (
               <LazySection forceVisible={forceAllVisible}>
                 <ReportPage>
-                  <ReportOMAltitudeDistribution
-                    sectionNum={sectionNumbers.omAltitude ?? 7}
-                    radarResults={omResultTrimmed.radar_results}
-                    selectedBuildings={omSelectedBuildings}
-                    radarSites={omSelectedRadarSites}
-                    losMap={omLosMap}
-                    panoWithTargets={omPanoWithTargets}
-                    panoWithoutTargets={omPanoWithoutTargets}
-                  />
+                  <OMSectionImage
+                    preCaptured={omData.sectionImages.get("altitude")}
+                    onCaptured={(url) => handleOMSectionCaptured("altitude", url)}
+                    delay={800}
+                  >
+                    <ReportOMAltitudeDistribution
+                      sectionNum={sectionNumbers.omAltitude ?? 7}
+                      radarResults={omResultTrimmed.radar_results}
+                      selectedBuildings={omData.selectedBuildings}
+                      radarSites={omData.selectedRadarSites}
+                      losMap={omData.losMap}
+                      panoWithTargets={omData.panoWithTargets}
+                      panoWithoutTargets={omData.panoWithoutTargets}
+                    />
+                  </OMSectionImage>
                 </ReportPage>
               </LazySection>
             )}
 
-            {sections.omLossEvents && (omCovLayersWithBuildings.length > 0 ? (
+            {sections.omLossEvents && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.length > 0 ? (
               <LazySection forceVisible={forceAllVisible}>
                 <ReportPage>
                   <ReportOMLossEvents
                     sectionNum={sectionNumbers.omLossEvents ?? 8}
                     radarResults={omResultTrimmed.radar_results}
-                    selectedBuildings={omSelectedBuildings}
-                    radarSites={omSelectedRadarSites}
-                    layersWithTargets={omCovLayersWithBuildings}
-                    layersWithoutTargets={omCovLayersWithout}
+                    selectedBuildings={omData.selectedBuildings}
+                    radarSites={omData.selectedRadarSites}
+                    layersWithTargets={omData.covLayersWithBuildings}
+                    layersWithoutTargets={omData.covLayersWithout}
                   />
                 </ReportPage>
               </LazySection>
+            ) : omData.coverageStatus === "error" ? (
+              <ReportPage>
+                <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                  <p className="text-sm text-red-400">커버리지 계산 실패 — Loss 상세 표시 불가</p>
+                </div>
+              </ReportPage>
             ) : (
               <ReportPage>
                 <div className="flex flex-col items-center justify-center py-20 text-gray-400">
@@ -1386,12 +1483,12 @@ export default function ReportGeneration() {
                 <ReportOMFindings
                   sectionNum={sectionNumbers.omFindings ?? 9}
                   radarResults={omResultTrimmed.radar_results}
-                  selectedBuildings={omSelectedBuildings}
-                  radarSites={omSelectedRadarSites}
-                  findingsText={omFindingsText}
-                  onFindingsChange={setOmFindingsText}
+                  selectedBuildings={omData.selectedBuildings}
+                  radarSites={omData.selectedRadarSites}
+                  findingsText={omData.findingsText}
+                  onFindingsChange={(text) => setOmData((prev) => ({ ...prev, findingsText: text }))}
                   editable={true}
-                  analysisMonth={omAnalysisMonth}
+                  analysisMonth={omData.analysisMonth}
                 />
               </ReportPage>
             )}
@@ -2118,30 +2215,15 @@ function calcBuildingAzExtent(
     return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
   };
 
-  const haversineKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const R = 6371;
-    const dLat = (lat2 - lat1) * toRad;
-    const dLon = (lon2 - lon1) * toRad;
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  };
-
   const geo = building.geometry_json ? JSON.parse(building.geometry_json) : null;
   const bearings: number[] = [bearingTo(building.latitude, building.longitude)];
 
-  if (building.geometry_type === "line" && geo && Array.isArray(geo)) {
+  if (building.geometry_type === "polygon" && geo && Array.isArray(geo)) {
     for (const pt of geo) {
       if (Array.isArray(pt) && pt.length === 2) {
         bearings.push(bearingTo(pt[0], pt[1]));
       }
     }
-  } else if (building.geometry_type === "circle" && geo) {
-    const center = geo.center ?? [building.latitude, building.longitude];
-    const semiMajor = geo.semi_major_m ?? geo.radius_m ?? 50;
-    const dist = haversineKm(radarLat, radarLon, center[0], center[1]);
-    const angExtent = dist > 0.01 ? Math.atan(semiMajor / 1000 / dist) * 180 / Math.PI : 5;
-    const centerAz = bearingTo(center[0], center[1]);
-    return { start_deg: (centerAz - angExtent + 360) % 360, end_deg: (centerAz + angExtent) % 360 };
   } else if (building.geometry_type === "multi" && geo && Array.isArray(geo)) {
     // 복합 도형: 서브 도형 재귀 처리하여 방위 합산
     for (const sub of geo) {
@@ -2198,6 +2280,7 @@ function ObstacleMonthlyConfigModal({
   onClose,
   onGenerate,
   onCoverageReady,
+  onCoverageError,
 }: {
   customRadarSites: RadarSite[];
   aircraft: AircraftType[];
@@ -2214,6 +2297,7 @@ function ObstacleMonthlyConfigModal({
     analysisMonth?: string,
   ) => void;
   onCoverageReady: (covWith: CoverageLayer[], covWithout: CoverageLayer[]) => void;
+  onCoverageError?: () => void;
 }) {
   // 1단계: 레이더 선택
   const [checkedRadars, setCheckedRadars] = useState<Set<string>>(new Set());
@@ -2287,13 +2371,6 @@ function ObstacleMonthlyConfigModal({
 
       const radarFileSets = selectedRadars.map((r) => {
         // 선택된 건물 중 레이더에서 가장 가까운 건물까지의 거리 (km)
-        const toRad = Math.PI / 180;
-        const haversineKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-          const dLat = (lat2 - lat1) * toRad;
-          const dLon = (lon2 - lon1) * toRad;
-          const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) ** 2;
-          return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        };
         let minObstacleDist = 0;
         for (const b of selectedBuildings) {
           const d = haversineKm(r.latitude, r.longitude, b.latitude, b.longitude);
@@ -2452,7 +2529,10 @@ function ObstacleMonthlyConfigModal({
             excludeIds,
           ).then(({ layersWith, layersWithout }) => {
             onCoverageReady(layersWith, layersWithout);
-          }).catch((err) => console.warn("커버리지 계산 실패:", err)),
+          }).catch((err) => {
+            console.warn("커버리지 계산 실패:", err);
+            onCoverageError?.();
+          }),
         );
       }
     } catch (err) {
@@ -2461,7 +2541,7 @@ function ObstacleMonthlyConfigModal({
       unlistenFn?.();
       setAnalyzing(false);
     }
-  }, [analyzing, selectedRadars, selectedBuildings, radarFiles, azSectorsByRadar, aircraft, onGenerate, analysisMonth]);
+  }, [analyzing, selectedRadars, selectedBuildings, radarFiles, azSectorsByRadar, aircraft, onGenerate, onCoverageError, analysisMonth]);
 
   const allFilesSelected = selectedRadars.every((r) => (radarFiles.get(r.name)?.length ?? 0) > 0);
   const canAnalyze = selectedRadars.length > 0 && selectedBuildings.length > 0 && allFilesSelected && !analyzing;
@@ -2606,6 +2686,23 @@ function ObstacleMonthlyConfigModal({
                       <div key={gid ?? "ungrouped"} className="mb-1">
                         {/* 그룹 헤더 */}
                         <div className="flex items-center gap-1">
+                          {/* 그룹 체크박스 — 그룹 전체 선택/해제 */}
+                          <button
+                            onClick={() => setCheckedBldgIds((prev) => {
+                              const next = new Set(prev);
+                              if (allChecked) groupBldgIds.forEach((id) => next.delete(id));
+                              else groupBldgIds.forEach((id) => next.add(id));
+                              return next;
+                            })}
+                            className="shrink-0 p-0.5"
+                          >
+                            {allChecked
+                              ? <CheckSquare size={14} className="text-[#a60739]" />
+                              : someChecked
+                              ? <MinusSquare size={14} className="text-[#a60739]/50" />
+                              : <Square size={14} className="text-gray-300" />
+                            }
+                          </button>
                           <button
                             onClick={() => setCollapsedGroups((prev) => {
                               const next = new Set(prev);
@@ -2620,22 +2717,10 @@ function ObstacleMonthlyConfigModal({
                             <span>{groupName}</span>
                             <span className="ml-1 font-normal text-gray-400">({buildings.length})</span>
                           </button>
-                          {/* 그룹 일괄 선택/해제 */}
-                          <button
-                            onClick={() => setCheckedBldgIds((prev) => {
-                              const next = new Set(prev);
-                              if (allChecked) groupBldgIds.forEach((id) => next.delete(id));
-                              else groupBldgIds.forEach((id) => next.add(id));
-                              return next;
-                            })}
-                            className="ml-auto text-[10px] text-gray-400 hover:text-[#a60739]"
-                          >
-                            {allChecked ? "해제" : someChecked ? "나머지 선택" : "전체 선택"}
-                          </button>
                         </div>
                         {/* 그룹 내 건물 목록 */}
                         {!collapsed && (
-                          <div className="ml-3 mt-0.5 space-y-0.5">
+                          <div className="ml-6 mt-0.5 space-y-0.5">
                             {buildings.map(renderBuilding)}
                           </div>
                         )}
@@ -3095,6 +3180,23 @@ function ObstaclePreScreeningModal({
                     return (
                       <div key={gid ?? "ungrouped"} className="mb-1">
                         <div className="flex items-center gap-1">
+                          {/* 그룹 체크박스 — 그룹 전체 선택/해제 */}
+                          <button
+                            onClick={() => setCheckedBldgIds((prev) => {
+                              const next = new Set(prev);
+                              if (allChecked) groupBldgIds.forEach((id) => next.delete(id));
+                              else groupBldgIds.forEach((id) => next.add(id));
+                              return next;
+                            })}
+                            className="shrink-0 p-0.5"
+                          >
+                            {allChecked
+                              ? <CheckSquare size={14} className="text-[#a60739]" />
+                              : someChecked
+                              ? <MinusSquare size={14} className="text-[#a60739]/50" />
+                              : <Square size={14} className="text-gray-300" />
+                            }
+                          </button>
                           <button
                             onClick={() => setCollapsedGroups((prev) => {
                               const next = new Set(prev);
@@ -3109,20 +3211,9 @@ function ObstaclePreScreeningModal({
                             <span>{groupName}</span>
                             <span className="ml-1 font-normal text-gray-400">({buildings.length})</span>
                           </button>
-                          <button
-                            onClick={() => setCheckedBldgIds((prev) => {
-                              const next = new Set(prev);
-                              if (allChecked) groupBldgIds.forEach((id) => next.delete(id));
-                              else groupBldgIds.forEach((id) => next.add(id));
-                              return next;
-                            })}
-                            className="ml-auto text-[10px] text-gray-400 hover:text-[#a60739]"
-                          >
-                            {allChecked ? "해제" : someChecked ? "나머지 선택" : "전체 선택"}
-                          </button>
                         </div>
                         {!collapsed && (
-                          <div className="ml-3 mt-0.5 space-y-0.5">
+                          <div className="ml-6 mt-0.5 space-y-0.5">
                             {buildings.map(renderBuilding)}
                           </div>
                         )}

@@ -36,7 +36,7 @@ import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, Building3D } from "../types";
 import { queryViewportPoints } from "../utils/flightConsolidationWorker";
 import LoSProfilePanel from "../components/Map/LoSProfilePanel";
-import { computeMainCoverage, computeLayersForAltitudesAsync, isGPUCacheValidFor, isWorkerReady, invalidateGPUCache, buildPolygonsAsync, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer, type CoveragePolygonData } from "../utils/radarCoverage";
+import { computeMainCoverage, computeLayersForAltitudesAsync, isGPUCacheValidFor, isWorkerReady, invalidateGPUCache, buildPolygonsAsync, hasSurfaceAngles, build3DSurfaceAsync, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer, type CoveragePolygonData, type Coverage3DQuad } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
 import { addPlanOverlay, removePlanOverlay, updatePlanOpacity, updatePlanBounds, rotateBounds } from "../utils/planOverlay";
 import { fetchBuildingsForViewport, invalidateBuildingCache, buildingsToGeoJSON } from "../utils/buildingTileCache";
@@ -171,6 +171,10 @@ export default function TrackMap() {
   const setCoverageError = useAppStore((s) => s.setCoverageError);
   const setCoverageData = useAppStore((s) => s.setCoverageData);
   const [showConeOfSilence, setShowConeOfSilence] = useState(true);
+  const [coverageMode, setCoverageMode] = useState<"2d" | "3d">("2d");
+  const [coverage3DQuads, setCoverage3DQuads] = useState<Coverage3DQuad[] | null>(null);
+  const [surfaceOpacity, setSurfaceOpacity] = useState(120);
+  const [coverage3DLoading, setCoverage3DLoading] = useState(false);
   const coverageAltRef = useRef<HTMLDivElement>(null);
   const [coverageModalOpen, setCoverageModalOpen] = useState(false);
   const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -698,7 +702,7 @@ export default function TrackMap() {
       if (!stale) setCoveragePolygonsList(polygons as CoveragePolygonData[]);
     }).catch(() => {});
     return () => { stale = true; };
-  }, [coverageLayers, coverageVisible, altScale, radarSite, showConeOfSilence]);
+  }, [coverageLayers, coverageVisible, altScale, radarSite.latitude, radarSite.longitude, showConeOfSilence]);
 
 
   // ── 타일 기반 건물 캐시 로딩 ──────────────────────────────────
@@ -946,12 +950,12 @@ export default function TrackMap() {
   const handleCoverageAltChange = useCallback((val: number) => {
     setCoverageAltInput(val);
     if (coverageAltTimerRef.current) clearTimeout(coverageAltTimerRef.current);
-    coverageAltTimerRef.current = setTimeout(() => setCoverageAlt(val), 150);
+    coverageAltTimerRef.current = setTimeout(() => setCoverageAlt(val), 300);
   }, []);
   const handleCoverageAltMinChange = useCallback((val: number) => {
     setCoverageAltMinInput(val);
     if (coverageAltMinTimerRef.current) clearTimeout(coverageAltMinTimerRef.current);
-    coverageAltMinTimerRef.current = setTimeout(() => setCoverageAltMin(val), 150);
+    coverageAltMinTimerRef.current = setTimeout(() => setCoverageAltMin(val), 300);
   }, []);
 
   // 커버리지 슬라이더 타이머 정리 (언마운트 시)
@@ -970,6 +974,23 @@ export default function TrackMap() {
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
   }, [coverageModalOpen]);
+
+  // WASD 키로 맵 패닝
+  useEffect(() => {
+    const PAN_PX = 100;
+    const keyMap: Record<string, [number, number]> = {
+      w: [0, -PAN_PX], a: [-PAN_PX, 0], s: [0, PAN_PX], d: [PAN_PX, 0],
+    };
+    const handleWASD = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || (e.target as HTMLElement).isContentEditable) return;
+      const dir = keyMap[e.key.toLowerCase()];
+      if (!dir) return;
+      const map = mapRef.current?.getMap();
+      if (map) { e.preventDefault(); map.panBy(dir, { duration: 200 }); }
+    };
+    window.addEventListener("keydown", handleWASD);
+    return () => window.removeEventListener("keydown", handleWASD);
+  }, []);
 
   // 고도 슬라이더 변경 시 레이어들 재계산 (Worker 비동기, UI 논블로킹)
   useEffect(() => {
@@ -1415,6 +1436,337 @@ export default function TrackMap() {
     return pts;
   }, [losTarget, radarSite, allPoints, signalLossPoints, visibleMinTs, visibleMaxTs]);
 
+  // 커버리지 전용 deck.gl 레이어 (coveragePolygonsList 변경 시에만 재생성)
+  const coverageDeckLayers = useMemo(() => {
+    if (!coveragePolygonsList || coveragePolygonsList.length === 0) return [];
+    const covLayers: any[] = [];
+    const n = coveragePolygonsList.length;
+    const isSingle = n === 1;
+    const fillAlpha = isSingle ? 40 : 100;
+
+    // 단일 PolygonLayer로 모든 커버리지 폴리곤 통합
+    covLayers.push(
+      new PolygonLayer({
+        id: "coverage-fill",
+        data: coveragePolygonsList,
+        getPolygon: (d: any) => d.polygon,
+        getFillColor: (d: any) => [...d.fillColor, fillAlpha] as [number, number, number, number],
+        getLineColor: [0, 0, 0, 0],
+        filled: true,
+        stroked: false,
+        extruded: false,
+        _full3d: true,
+        parameters: { depthWriteEnabled: false },
+      })
+    );
+
+    // 최외곽 경계선
+    const outermost = coveragePolygonsList[n - 1];
+    covLayers.push(
+      new PathLayer({
+        id: "coverage-outline",
+        data: [{ path: outermost.outerRing }],
+        getPath: (d: any) => d.path,
+        getColor: [...outermost.fillColor, isSingle ? 255 : 180],
+        getWidth: isSingle ? 2.5 : 1.5,
+        widthMinPixels: isSingle ? 2 : 1,
+        widthMaxPixels: isSingle ? 4 : 3,
+        widthUnits: "pixels" as const,
+      })
+    );
+
+    // Cone of Silence 경계선 (최내곽 레이어)
+    const innermost = coveragePolygonsList[0];
+    if (innermost.coneRing) {
+      covLayers.push(
+        new PathLayer({
+          id: "cone-outline",
+          data: [{ path: innermost.coneRing }],
+          getPath: (d: any) => d.path,
+          getColor: [...innermost.fillColor, 100],
+          getWidth: 1,
+          widthMinPixels: 1,
+          widthMaxPixels: 2,
+          widthUnits: "pixels" as const,
+        })
+      );
+    }
+
+    return covLayers;
+  }, [coveragePolygonsList]);
+
+  // 3D 커버리지 면 deck.gl 레이어
+  const coverage3DDeckLayers = useMemo(() => {
+    if (!coverage3DQuads || coverage3DQuads.length === 0) return [];
+    return [
+      new PolygonLayer({
+        id: "coverage-3d-surface",
+        data: coverage3DQuads,
+        getPolygon: (d: Coverage3DQuad) => d.polygon,
+        getFillColor: (d: Coverage3DQuad) => [...d.fillColor, surfaceOpacity] as [number, number, number, number],
+        getLineColor: [0, 0, 0, 0],
+        filled: true,
+        stroked: false,
+        extruded: false,
+        _full3d: true,
+        parameters: { depthWriteEnabled: true },
+      }),
+    ];
+  }, [coverage3DQuads, surfaceOpacity]);
+
+  // LoS 전용 deck.gl 레이어 (LoS 모드 상태 변경 시에만 재생성)
+  const losDeckLayers = useMemo(() => {
+    if (!losMode) return [];
+    const layers: any[] = [];
+    const losPreviewTarget = losTarget ?? losCursor;
+    const losRadarPos = radarInfo
+      ? [radarInfo.lon, radarInfo.lat]
+      : [radarSite.longitude, radarSite.latitude];
+    if (losPreviewTarget) {
+      layers.push(
+        new LineLayer({
+          id: "los-preview-line",
+          data: [{ from: losRadarPos, to: [losPreviewTarget.lon, losPreviewTarget.lat] }],
+          getSourcePosition: (d: any) => d.from,
+          getTargetPosition: (d: any) => d.to,
+          getColor: losTarget ? [233, 69, 96, 200] : [233, 69, 96, 120],
+          getWidth: losTarget ? 2 : 1,
+          widthUnits: "pixels" as const,
+        })
+      );
+
+      // LoS 단면도 호버 위치 → 지도 위 점
+      if (losTarget && losHoverRatio !== null) {
+        const rLat = radarSite.latitude;
+        const rLon = radarSite.longitude;
+        const hoverLat = rLat + (losTarget.lat - rLat) * losHoverRatio;
+        const hoverLon = rLon + (losTarget.lon - rLon) * losHoverRatio;
+        layers.push(
+          new ScatterplotLayer({
+            id: "los-hover-dot",
+            data: [{ position: [hoverLon, hoverLat] }],
+            getPosition: (d: any) => d.position,
+            getFillColor: [255, 255, 255, 255],
+            getLineColor: [233, 69, 96, 255],
+            getRadius: 6,
+            radiusMinPixels: 5,
+            radiusMaxPixels: 10,
+            radiusUnits: "pixels",
+            lineWidthMinPixels: 2,
+            stroked: true,
+            pickable: false,
+          })
+        );
+      }
+
+      // LoS 선상 항적/Loss 포인트 (맵에서 클릭 가능)
+      if (losTrackPoints.length > 0) {
+        const losTPData = losTrackPoints.map((tp, idx) => ({
+          position: [tp.longitude, tp.latitude],
+          idx,
+          isLoss: tp.isLoss,
+          radar_type: tp.radar_type,
+        }));
+        layers.push(
+          new ScatterplotLayer({
+            id: "los-track-points",
+            data: losTPData,
+            getPosition: (d: any) => d.position,
+            getFillColor: (d: any) => d.isLoss ? [239, 68, 68, 180] : [...detectionTypeColor(d.radar_type), 140],
+            getLineColor: [255, 255, 255, 100],
+            getRadius: 3,
+            radiusMinPixels: 2,
+            radiusMaxPixels: 6,
+            radiusUnits: "pixels",
+            lineWidthMinPixels: 0.5,
+            stroked: true,
+            pickable: true,
+            onClick: (info: any) => {
+              if (info.object) {
+                losPointClickedRef.current = true;
+                const clickedIdx = info.object.idx;
+                setLosHighlightIdx((prev) => prev === clickedIdx ? null : clickedIdx);
+              }
+            },
+            onHover: (info: any) => {
+              setLosHoverIdx(info.object ? info.object.idx : null);
+            },
+          })
+        );
+      }
+
+      // LoS 맵 호버 마커 (핀과 별도)
+      const effectiveHoverIdx = losHoverIdx !== null ? losHoverIdx : null;
+      if (effectiveHoverIdx !== null && effectiveHoverIdx !== losHighlightIdx && losTrackPoints[effectiveHoverIdx]) {
+        const htp = losTrackPoints[effectiveHoverIdx];
+        layers.push(
+          new ScatterplotLayer({
+            id: "los-track-hover",
+            data: [{ position: [htp.longitude, htp.latitude] }],
+            getPosition: (d: any) => d.position,
+            getFillColor: htp.isLoss ? [239, 68, 68, 200] : [...detectionTypeColor(htp.radar_type), 200],
+            getLineColor: [255, 255, 255, 200],
+            getRadius: 6,
+            radiusMinPixels: 5,
+            radiusMaxPixels: 11,
+            radiusUnits: "pixels",
+            lineWidthMinPixels: 1.5,
+            stroked: true,
+            pickable: false,
+          })
+        );
+      }
+
+      // LoS 단면도 항적 포인트 하이라이트 (핀) → 지도 위 마커
+      if (losHighlightIdx !== null && losTrackPoints[losHighlightIdx]) {
+        const tp = losTrackPoints[losHighlightIdx];
+        layers.push(
+          new ScatterplotLayer({
+            id: "los-track-highlight",
+            data: [{ position: [tp.longitude, tp.latitude] }],
+            getPosition: (d: any) => d.position,
+            getFillColor: tp.isLoss ? [239, 68, 68, 255] : [...detectionTypeColor(tp.radar_type), 255],
+            getLineColor: [255, 255, 255, 255],
+            getRadius: 8,
+            radiusMinPixels: 7,
+            radiusMaxPixels: 14,
+            radiusUnits: "pixels",
+            lineWidthMinPixels: 2.5,
+            stroked: true,
+            pickable: false,
+          })
+        );
+      }
+    }
+    return layers;
+  }, [losMode, losTarget, losCursor, radarInfo, radarSite.latitude, radarSite.longitude, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints]);
+
+  // Loss 포인트 전용 deck.gl 레이어 (Loss 데이터 변경 시에만 재생성)
+  const lossDeckLayers = useMemo(() => {
+    if (signalLossPoints.length === 0 || hiddenLegendItems.has("loss")) return [];
+    const acName = (ms: string) => {
+      const a = aircraft.find((ac) => ac.mode_s_code.toLowerCase() === ms.toLowerCase());
+      return a ? a.name : ms;
+    };
+    return [
+      new ScatterplotLayer<LossPoint>({
+        id: "loss-points",
+        data: signalLossPoints,
+        getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
+        updateTriggers: { getPosition: [losMode, altScale] },
+        getFillColor: [233, 69, 96, 200],
+        getRadius: 3,
+        radiusMinPixels: 1.5,
+        radiusMaxPixels: 5,
+        radiusUnits: "pixels",
+        billboard: true,
+        pickable: true,
+        onClick: () => { if (losTarget) losPointClickedRef.current = true; },
+        onHover: (info) => {
+          if (info.object) {
+            const d = info.object;
+            const name = acName(d.mode_s);
+            const altFt = Math.round(d.altitude / 0.3048);
+            setHoverInfo({
+              x: info.x,
+              y: info.y,
+              lines: [
+                { label: "표적소실", value: name !== d.mode_s ? `${name} (${d.mode_s})` : d.mode_s, color: "#e94560" },
+                { label: "예상시각", value: format(new Date(d.timestamp * 1000), "HH:mm:ss") },
+                { label: "미탐지", value: `${d.scan_index}/${d.total_missed_scans} 스캔` },
+                { label: "gap", value: `${d.gap_duration_secs.toFixed(1)}초` },
+                { label: "고도", value: `FL${Math.round(altFt / 100)} (${Math.round(d.altitude)}m)` },
+                { label: "레이더거리", value: `${d.radar_distance_km.toFixed(1)}km` },
+                { label: "좌표", value: `${d.latitude.toFixed(4)}°N ${d.longitude.toFixed(4)}°E` },
+              ],
+            });
+          } else {
+            setHoverInfo(null);
+          }
+        },
+      }),
+    ];
+  }, [signalLossPoints, hiddenLegendItems, losMode, altScale, aircraft]);
+
+  // 건물 2D 오버레이 전용 deck.gl 레이어
+  const buildingDeckLayers = useMemo(() => {
+    if (!showBuildings || buildings3dData.length === 0 || buildings3dMode) return [];
+    const srcLabel = (s: string) => s === "fac" ? "건물통합정보" : "수동 등록";
+    const srcColor = (d: Building3D) => d.group_color ? d.group_color : d.source === "fac" ? "#e5e7eb" : d.source === "manual" ? "#ef4444" : "#d1d5db";
+    const hexToRgb = (hex: string): [number, number, number] => {
+      const h = hex.replace("#", "");
+      return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
+    };
+    const fillColor = (d: Building3D): [number, number, number, number] => {
+      if (d.group_color) { const c = hexToRgb(d.group_color); return [c[0], c[1], c[2], 200]; }
+      return d.source === "fac" ? [229, 231, 235, 220]
+        : d.source === "manual" ? [239, 68, 68, 220]
+        : [209, 213, 219, 220];
+    };
+    const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
+      if (info.object) {
+        const d = info.object;
+        const lines: { label: string; value: string; color?: string }[] = [
+          { label: "건물", value: d.name || "(이름 없음)", color: srcColor(d) },
+          { label: "높이", value: `${d.height_m.toFixed(1)}m` },
+        ];
+        if (d.usage) lines.push({ label: "용도", value: d.usage });
+        lines.push({ label: "출처", value: srcLabel(d.source) });
+        lines.push({ label: "좌표", value: `${d.lat.toFixed(5)}°N ${d.lon.toFixed(5)}°E` });
+        setHoverInfo({ x: info.x, y: info.y, lines });
+      } else {
+        setHoverInfo(null);
+      }
+    };
+    return [
+      new ScatterplotLayer({
+        id: "buildings-dots",
+        data: buildings3dData,
+        getPosition: (d: Building3D) => [d.lon, d.lat],
+        getRadius: 3,
+        radiusUnits: "pixels" as const,
+        getFillColor: fillColor,
+        pickable: true,
+        onClick: () => { if (losTarget) losPointClickedRef.current = true; },
+        onHover: buildingHover,
+      }),
+    ];
+  }, [showBuildings, buildings3dData, buildings3dMode]);
+
+  // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
+  const panoramaDeckLayers = useMemo(() => {
+    if (!panoramaViewActive || !panoramaActivePoint) return [];
+    const pt = panoramaActivePoint;
+    const isBuilding = pt.obstacle_type !== "terrain";
+    const color: [number, number, number, number] = isBuilding
+      ? [239, 68, 68, 230]
+      : [34, 197, 94, 230];
+    return [
+      new LineLayer({
+        id: "panorama-direction-line",
+        data: [pt],
+        getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
+        getTargetPosition: (d) => [d.lon, d.lat],
+        getColor: [...color.slice(0, 3), 100] as [number, number, number, number],
+        getWidth: 2,
+        widthMinPixels: 1.5,
+        widthUnits: "pixels" as const,
+      }),
+      new ScatterplotLayer({
+        id: "panorama-highlight-point",
+        data: [pt],
+        getPosition: (d) => [d.lon, d.lat],
+        getFillColor: color,
+        getLineColor: [255, 255, 255, 200] as [number, number, number, number],
+        getRadius: panoramaPinned ? 8 : 6,
+        radiusUnits: "pixels" as const,
+        lineWidthMinPixels: panoramaPinned ? 2.5 : 1.5,
+        stroked: true,
+        pickable: false,
+      }),
+    ];
+  }, [panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite.latitude, radarSite.longitude]);
+
   // deck.gl 레이어
   const deckLayers = useMemo(() => {
     const layers = [];
@@ -1593,48 +1945,6 @@ export default function TrackMap() {
       );
     }
 
-    // Signal Loss 포인트 (개별 미탐지 스캔 — 항적 dot과 동일 스타일)
-    if (signalLossPoints.length > 0 && !hiddenLegendItems.has("loss")) {
-      layers.push(
-        new ScatterplotLayer<LossPoint>({
-          id: "loss-points",
-          data: signalLossPoints,
-          getPosition: (d) => losMode ? [d.longitude, d.latitude, 0] : [d.longitude, d.latitude, d.altitude * altScale],
-          updateTriggers: { getPosition: [losMode, altScale] },
-          getFillColor: [233, 69, 96, 200],
-          getRadius: 3,
-          radiusMinPixels: 1.5,
-          radiusMaxPixels: 5,
-          radiusUnits: "pixels",
-          billboard: true,
-          pickable: true,
-          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
-          onHover: (info) => {
-            if (info.object) {
-              const d = info.object;
-              const name = acName(d.mode_s);
-              const altFt = Math.round(d.altitude / 0.3048);
-              setHoverInfo({
-                x: info.x,
-                y: info.y,
-                lines: [
-                  { label: "표적소실", value: name !== d.mode_s ? `${name} (${d.mode_s})` : d.mode_s, color: "#e94560" },
-                  { label: "예상시각", value: format(new Date(d.timestamp * 1000), "HH:mm:ss") },
-                  { label: "미탐지", value: `${d.scan_index}/${d.total_missed_scans} 스캔` },
-                  { label: "gap", value: `${d.gap_duration_secs.toFixed(1)}초` },
-                  { label: "고도", value: `FL${Math.round(altFt / 100)} (${Math.round(d.altitude)}m)` },
-                  { label: "레이더거리", value: `${d.radar_distance_km.toFixed(1)}km` },
-                  { label: "좌표", value: `${d.latitude.toFixed(4)}°N ${d.longitude.toFixed(4)}°E` },
-                ],
-              });
-            } else {
-              setHoverInfo(null);
-            }
-          },
-        })
-      );
-    }
-
     // 레이더 아이콘
     if (radarInfo) {
       layers.push(
@@ -1675,229 +1985,14 @@ export default function TrackMap() {
       );
     }
 
-    // LoS 모드: 레이더 → 커서 미리보기 선
-    const losPreviewTarget = losTarget ?? losCursor;
-    const losRadarPos = radarInfo
-      ? [radarInfo.lon, radarInfo.lat]
-      : [radarSite.longitude, radarSite.latitude];
-    if (losMode && losPreviewTarget) {
-      layers.push(
-        new LineLayer({
-          id: "los-preview-line",
-          data: [{ from: losRadarPos, to: [losPreviewTarget.lon, losPreviewTarget.lat] }],
-          getSourcePosition: (d: any) => d.from,
-          getTargetPosition: (d: any) => d.to,
-          getColor: losTarget ? [233, 69, 96, 200] : [233, 69, 96, 120],
-          getWidth: losTarget ? 2 : 1,
-          widthUnits: "pixels" as const,
-        })
-      );
+    // LoS 레이어 합성 (별도 useMemo)
+    layers.push(...losDeckLayers);
 
-      // LoS 단면도 호버 위치 → 지도 위 점
-      if (losTarget && losHoverRatio !== null) {
-        const rLat = radarSite.latitude;
-        const rLon = radarSite.longitude;
-        const hoverLat = rLat + (losTarget.lat - rLat) * losHoverRatio;
-        const hoverLon = rLon + (losTarget.lon - rLon) * losHoverRatio;
-        layers.push(
-          new ScatterplotLayer({
-            id: "los-hover-dot",
-            data: [{ position: [hoverLon, hoverLat] }],
-            getPosition: (d: any) => d.position,
-            getFillColor: [255, 255, 255, 255],
-            getLineColor: [233, 69, 96, 255],
-            getRadius: 6,
-            radiusMinPixels: 5,
-            radiusMaxPixels: 10,
-            radiusUnits: "pixels",
-            lineWidthMinPixels: 2,
-            stroked: true,
-            pickable: false,
-          })
-        );
-      }
+    // 커버리지 맵 합성 (2D/3D 모드에 따라 선택)
+    layers.push(...(coverageMode === "3d" ? coverage3DDeckLayers : coverageDeckLayers));
 
-      // LoS 선상 항적/Loss 포인트 (맵에서 클릭 가능)
-      if (losTrackPoints.length > 0) {
-        const losTPData = losTrackPoints.map((tp, idx) => ({
-          position: [tp.longitude, tp.latitude],
-          idx,
-          isLoss: tp.isLoss,
-          radar_type: tp.radar_type,
-        }));
-        layers.push(
-          new ScatterplotLayer({
-            id: "los-track-points",
-            data: losTPData,
-            getPosition: (d: any) => d.position,
-            getFillColor: (d: any) => d.isLoss ? [239, 68, 68, 180] : [...detectionTypeColor(d.radar_type), 140],
-            getLineColor: [255, 255, 255, 100],
-            getRadius: 3,
-            radiusMinPixels: 2,
-            radiusMaxPixels: 6,
-            radiusUnits: "pixels",
-            lineWidthMinPixels: 0.5,
-            stroked: true,
-            pickable: true,
-            onClick: (info: any) => {
-              if (info.object) {
-                losPointClickedRef.current = true; // 빈 영역 클릭과 구분
-                const clickedIdx = info.object.idx;
-                setLosHighlightIdx((prev) => prev === clickedIdx ? null : clickedIdx);
-              }
-            },
-            onHover: (info: any) => {
-              setLosHoverIdx(info.object ? info.object.idx : null);
-            },
-          })
-        );
-      }
-
-      // LoS 맵 호버 마커 (핀과 별도)
-      const effectiveHoverIdx = losHoverIdx !== null ? losHoverIdx : null;
-      if (effectiveHoverIdx !== null && effectiveHoverIdx !== losHighlightIdx && losTrackPoints[effectiveHoverIdx]) {
-        const htp = losTrackPoints[effectiveHoverIdx];
-        layers.push(
-          new ScatterplotLayer({
-            id: "los-track-hover",
-            data: [{ position: [htp.longitude, htp.latitude] }],
-            getPosition: (d: any) => d.position,
-            getFillColor: htp.isLoss ? [239, 68, 68, 200] : [...detectionTypeColor(htp.radar_type), 200],
-            getLineColor: [255, 255, 255, 200],
-            getRadius: 6,
-            radiusMinPixels: 5,
-            radiusMaxPixels: 11,
-            radiusUnits: "pixels",
-            lineWidthMinPixels: 1.5,
-            stroked: true,
-            pickable: false,
-          })
-        );
-      }
-
-      // LoS 단면도 항적 포인트 하이라이트 (핀) → 지도 위 마커
-      if (losHighlightIdx !== null && losTrackPoints[losHighlightIdx]) {
-        const tp = losTrackPoints[losHighlightIdx];
-        layers.push(
-          new ScatterplotLayer({
-            id: "los-track-highlight",
-            data: [{ position: [tp.longitude, tp.latitude] }],
-            getPosition: (d: any) => d.position,
-            getFillColor: tp.isLoss ? [239, 68, 68, 255] : [...detectionTypeColor(tp.radar_type), 255],
-            getLineColor: [255, 255, 255, 255],
-            getRadius: 8,
-            radiusMinPixels: 7,
-            radiusMaxPixels: 14,
-            radiusUnits: "pixels",
-            lineWidthMinPixels: 2.5,
-            stroked: true,
-            pickable: false,
-          })
-        );
-      }
-
-    }
-
-    // 커버리지 맵 (합성 스펙트럼: 동심 링 — 단일 레이어로 통합하여 GPU 오버헤드 최소화)
-    if (coveragePolygonsList && coveragePolygonsList.length > 0) {
-      const n = coveragePolygonsList.length;
-      const isSingle = n === 1;
-      const fillAlpha = isSingle ? 40 : 100;
-
-      // 단일 PolygonLayer로 모든 커버리지 폴리곤 통합
-      layers.push(
-        new PolygonLayer({
-          id: "coverage-fill",
-          data: coveragePolygonsList,
-          getPolygon: (d: any) => d.polygon,
-          getFillColor: (d: any) => [...d.fillColor, fillAlpha] as [number, number, number, number],
-          getLineColor: [0, 0, 0, 0],
-          filled: true,
-          stroked: false,
-          extruded: false,
-          _full3d: true,
-          parameters: { depthWriteEnabled: false },
-        })
-      );
-
-      // 최외곽 경계선
-      const outermost = coveragePolygonsList[n - 1];
-      layers.push(
-        new PathLayer({
-          id: "coverage-outline",
-          data: [{ path: outermost.outerRing }],
-          getPath: (d: any) => d.path,
-          getColor: [...outermost.fillColor, isSingle ? 255 : 180],
-          getWidth: isSingle ? 2.5 : 1.5,
-          widthMinPixels: isSingle ? 2 : 1,
-          widthMaxPixels: isSingle ? 4 : 3,
-          widthUnits: "pixels" as const,
-        })
-      );
-
-      // Cone of Silence 경계선 (최내곽 레이어)
-      const innermost = coveragePolygonsList[0];
-      if (innermost.coneRing) {
-        layers.push(
-          new PathLayer({
-            id: "cone-outline",
-            data: [{ path: innermost.coneRing }],
-            getPath: (d: any) => d.path,
-            getColor: [...innermost.fillColor, 100],
-            getWidth: 1,
-            widthMinPixels: 1,
-            widthMaxPixels: 2,
-            widthUnits: "pixels" as const,
-          })
-        );
-      }
-    }
-
-    // 건물 오버레이 — 2D dots (deck.gl ScatterplotLayer, 줌 < 14)
-    // 3D 모드는 MapLibre fill-extrusion으로 처리 (deck.gl 외부)
-    if (showBuildings && buildings3dData.length > 0 && !buildings3dMode) {
-      const srcLabel = (s: string) => s === "fac" ? "건물통합정보" : "수동 등록";
-      const srcColor = (d: Building3D) => d.group_color ? d.group_color : d.source === "fac" ? "#e5e7eb" : d.source === "manual" ? "#ef4444" : "#d1d5db";
-      const hexToRgb = (hex: string): [number, number, number] => {
-        const h = hex.replace("#", "");
-        return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
-      };
-      const fillColor = (d: Building3D): [number, number, number, number] => {
-        if (d.group_color) { const c = hexToRgb(d.group_color); return [c[0], c[1], c[2], 200]; }
-        return d.source === "fac" ? [229, 231, 235, 220]
-          : d.source === "manual" ? [239, 68, 68, 220]
-          : [209, 213, 219, 220];
-      };
-      const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
-        if (info.object) {
-          const d = info.object;
-          const lines: { label: string; value: string; color?: string }[] = [
-            { label: "건물", value: d.name || "(이름 없음)", color: srcColor(d) },
-            { label: "높이", value: `${d.height_m.toFixed(1)}m` },
-          ];
-          if (d.usage) lines.push({ label: "용도", value: d.usage });
-          lines.push({ label: "출처", value: srcLabel(d.source) });
-          lines.push({ label: "좌표", value: `${d.lat.toFixed(5)}°N ${d.lon.toFixed(5)}°E` });
-          setHoverInfo({ x: info.x, y: info.y, lines });
-        } else {
-          setHoverInfo(null);
-        }
-      };
-
-      layers.push(
-        new ScatterplotLayer({
-          id: "buildings-dots",
-          data: buildings3dData,
-          getPosition: (d: Building3D) => [d.lon, d.lat],
-          getRadius: 3,
-          radiusUnits: "pixels" as const,
-          getFillColor: fillColor,
-          pickable: true,
-          onClick: () => { if (losTarget) losPointClickedRef.current = true; },
-          onHover: buildingHover,
-        })
-      );
-    }
+    // 건물 2D 오버레이 합성 (별도 useMemo)
+    layers.push(...buildingDeckLayers);
 
     // LoS 단면도 건물 호버/클릭 하이라이트 (건물 오버레이 비활성 상태에서도 표시)
     if (losBuildingHighlight) {
@@ -1964,47 +2059,14 @@ export default function TrackMap() {
       );
     }
 
-    // ── 파노라마 장애물 하이라이트 (hover/click → 메인 지도 표시) ──
-    if (panoramaViewActive && panoramaActivePoint) {
-      const pt = panoramaActivePoint;
-      const isBuilding = pt.obstacle_type !== "terrain";
-      const color: [number, number, number, number] = isBuilding
-        ? [239, 68, 68, 230]   // 건물: 빨간색
-        : [34, 197, 94, 230];  // 지형: 녹색
+    // Loss 포인트 합성 (별도 useMemo)
+    layers.push(...lossDeckLayers);
 
-      // 레이더→장애물 방향선
-      layers.push(
-        new LineLayer({
-          id: "panorama-direction-line",
-          data: [pt],
-          getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
-          getTargetPosition: (d) => [d.lon, d.lat],
-          getColor: [...color.slice(0, 3), 100] as [number, number, number, number],
-          getWidth: 2,
-          widthMinPixels: 1.5,
-          widthUnits: "pixels" as const,
-        })
-      );
-
-      // 장애물 포인트 마커
-      layers.push(
-        new ScatterplotLayer({
-          id: "panorama-highlight-point",
-          data: [pt],
-          getPosition: (d) => [d.lon, d.lat],
-          getFillColor: color,
-          getLineColor: [255, 255, 255, 200] as [number, number, number, number],
-          getRadius: panoramaPinned ? 8 : 6,
-          radiusUnits: "pixels" as const,
-          lineWidthMinPixels: panoramaPinned ? 2.5 : 1.5,
-          stroked: true,
-          pickable: false,
-        })
-      );
-    }
+    // 파노라마 레이어 합성 (별도 useMemo)
+    layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [trackPaths, singlePoints, signalLoss, signalLossPoints, altScale, radarInfo, losMode, losTarget, losCursor, dotMode, dotPoints, aircraft, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, allPoints, selectedModeS, coveragePolygonsList, showBuildings, buildings3dData, losBuildingHighlight, panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite, airplaneMarkers, hiddenLegendItems, hiddenBuildingSources, buildings3dMode]);
+  }, [trackPaths, singlePoints, altScale, radarInfo, losMode, dotMode, dotPoints, aircraft, allPoints, selectedModeS, losDeckLayers, coverageDeckLayers, coverage3DDeckLayers, coverageMode, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, losBuildingHighlight, airplaneMarkers, hiddenLegendItems]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2598,6 +2660,73 @@ export default function TrackMap() {
                     {/* 구분선 */}
                     <div className="border-t border-gray-100" />
 
+                    {/* 2D/3D 모드 세그먼트 토글 */}
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs text-gray-600">표시 모드</label>
+                      <div className="flex rounded-lg border border-gray-200 overflow-hidden text-xs">
+                        <button
+                          onClick={() => {
+                            setCoverageMode("2d");
+                            setCoverage3DQuads(null);
+                          }}
+                          className={`px-3 py-1 transition-colors ${coverageMode === "2d" ? "bg-[#a60739] text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+                        >
+                          2D
+                        </button>
+                        <button
+                          onClick={async () => {
+                            setCoverageMode("3d");
+                            setTerrainEnabled(true);
+                            if (!coverage3DQuads && hasSurfaceAngles()) {
+                              setCoverage3DLoading(true);
+                              try {
+                                const quads = await build3DSurfaceAsync();
+                                setCoverage3DQuads(quads);
+                              } catch (err) {
+                                console.error("3D 면 생성 실패:", err);
+                              } finally {
+                                setCoverage3DLoading(false);
+                              }
+                            }
+                          }}
+                          className={`px-3 py-1 transition-colors ${coverageMode === "3d" ? "bg-[#a60739] text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+                          disabled={!hasSurfaceAngles()}
+                          title={!hasSurfaceAngles() ? "커버리지 계산 후 사용 가능" : "3D 최저 탐지고도 면"}
+                        >
+                          3D
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 3D 로딩 표시 */}
+                    {coverage3DLoading && (
+                      <div className="flex items-center gap-2 text-xs text-[#a60739]">
+                        <Loader2 size={12} className="animate-spin" />
+                        <span>3D 면 생성 중...</span>
+                      </div>
+                    )}
+
+                    {/* 3D 투명도 슬라이더 (3D 모드에서만 표시) */}
+                    {coverageMode === "3d" && (
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <label className="text-xs text-gray-600">투명도</label>
+                          <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-[10px] font-semibold text-[#a60739]">
+                            {Math.round((surfaceOpacity / 255) * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={20}
+                          max={255}
+                          step={5}
+                          value={surfaceOpacity}
+                          onChange={(e) => setSurfaceOpacity(Number(e.target.value))}
+                          className="w-full accent-[#a60739]"
+                        />
+                      </div>
+                    )}
+
                     {/* 표시/숨기기 토글 */}
                     <div className="flex items-center justify-between">
                       <label htmlFor="coverage-toggle" className="text-xs text-gray-600">커버리지 표시</label>
@@ -2626,8 +2755,8 @@ export default function TrackMap() {
                       </button>
                     </div>
 
-                    {/* 고도 범위 슬라이더 */}
-                    <div className="space-y-2">
+                    {/* 고도 범위 슬라이더 (2D 모드에서만 표시) */}
+                    {coverageMode === "2d" && <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <label className="text-xs text-gray-600">표시 고도 범위</label>
                         <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-xs font-semibold text-[#a60739]">
@@ -2684,7 +2813,7 @@ export default function TrackMap() {
                         <span>{COVERAGE_MIN_ALT_FT.toLocaleString()}ft</span>
                         <span>{COVERAGE_MAX_ALT_FT.toLocaleString()}ft</span>
                       </div>
-                    </div>
+                    </div>}
                   </>
                 )}
               </div>

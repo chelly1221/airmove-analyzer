@@ -76,15 +76,12 @@ fn get_app_data_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// Parse an ASS binary file and return structured track data.
 #[tauri::command]
-async fn parse_ass_file(path: String, radar_lat: f64, radar_lon: f64, mode_s_filter: Vec<String>, mode3a_filter: Vec<u16>, filter_logic: Option<String>, mode_s_exclude: Option<bool>, mode3a_exclude: Option<bool>, app_handle: tauri::AppHandle) -> Result<ParsedFile, String> {
-    info!("Command: parse_ass_file({}, radar={},{}, filter={:?}, squawk={:?}, logic={:?})", path, radar_lat, radar_lon, mode_s_filter, mode3a_filter, filter_logic);
-    let logic = filter_logic.unwrap_or_else(|| "and".to_string());
-    let ms_exclude = mode_s_exclude.unwrap_or(false);
-    let m3a_exclude = mode3a_exclude.unwrap_or(false);
+async fn parse_ass_file(path: String, radar_lat: f64, radar_lon: f64, mode_s_include: Vec<String>, mode_s_exclude: Vec<String>, mode3a_include: Vec<u16>, mode3a_exclude: Vec<u16>, app_handle: tauri::AppHandle) -> Result<ParsedFile, String> {
+    info!("Command: parse_ass_file({}, radar={},{}, include={:?}, exclude={:?})", path, radar_lat, radar_lon, mode_s_include, mode_s_exclude);
     // 편각 조회 (파일 날짜 + 레이더 좌표)
     let mag_dec = resolve_declination(&app_handle, &path, radar_lat, radar_lon).await;
     tauri::async_runtime::spawn_blocking(move || {
-        parser::ass::parse_ass_file(&path, radar_lat, radar_lon, &mode_s_filter, &mode3a_filter, mag_dec, &logic, ms_exclude, m3a_exclude, |_| {}).map_err(|e| e.to_string())
+        parser::ass::parse_ass_file(&path, radar_lat, radar_lon, &mode_s_include, &mode_s_exclude, &mode3a_include, &mode3a_exclude, mag_dec, |_| {}).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -139,20 +136,16 @@ async fn parse_and_analyze(
     file_path: String,
     radar_lat: f64,
     radar_lon: f64,
-    mode_s_filter: Vec<String>,
-    mode3a_filter: Vec<u16>,
-    filter_logic: Option<String>,
-    mode_s_exclude: Option<bool>,
-    mode3a_exclude: Option<bool>,
+    mode_s_include: Vec<String>,
+    mode_s_exclude: Vec<String>,
+    mode3a_include: Vec<u16>,
+    mode3a_exclude: Vec<u16>,
 ) -> Result<AnalysisResult, String> {
-    info!("Command: parse_and_analyze({}, radar={},{}, filter={:?}, squawk={:?}, logic={:?})", file_path, radar_lat, radar_lon, mode_s_filter, mode3a_filter, filter_logic);
-    let logic = filter_logic.unwrap_or_else(|| "and".to_string());
-    let ms_exclude = mode_s_exclude.unwrap_or(false);
-    let m3a_exclude = mode3a_exclude.unwrap_or(false);
+    info!("Command: parse_and_analyze({}, radar={},{}, include={:?}, exclude={:?})", file_path, radar_lat, radar_lon, mode_s_include, mode_s_exclude);
     let mag_dec = resolve_declination(&app_handle, &file_path, radar_lat, radar_lon).await;
     let fp = file_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_filter, &mode3a_filter, mag_dec, &logic, ms_exclude, m3a_exclude, |_| {})
+        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_include, &mode_s_exclude, &mode3a_include, &mode3a_exclude, mag_dec, |_| {})
             .map_err(|e| e.to_string())?;
         let analysis = analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS);
 
@@ -202,20 +195,18 @@ async fn parse_and_analyze_batch(
     file_paths: Vec<String>,
     radar_lat: f64,
     radar_lon: f64,
-    mode_s_filter: Vec<String>,
-    mode3a_filter: Vec<u16>,
-    filter_logic: Option<String>,
-    mode_s_exclude: Option<bool>,
-    mode3a_exclude: Option<bool>,
+    mode_s_include: Vec<String>,
+    mode_s_exclude: Vec<String>,
+    mode3a_include: Vec<u16>,
+    mode3a_exclude: Vec<u16>,
 ) -> Result<(), String> {
     info!(
-        "Command: parse_and_analyze_batch({} files, radar={},{}, filter={:?}, squawk={:?}, logic={:?})",
+        "Command: parse_and_analyze_batch({} files, radar={},{}, include={:?}, exclude={:?})",
         file_paths.len(),
         radar_lat,
         radar_lon,
-        mode_s_filter,
-        mode3a_filter,
-        filter_logic,
+        mode_s_include,
+        mode_s_exclude,
     );
 
     // 배치 전체에 대해 편각 1회 조회 (첫 번째 파일 날짜 기준, 배치 내 날짜 차이는 무시 가능)
@@ -227,25 +218,21 @@ async fn parse_and_analyze_batch(
 
     let handle = app_handle.clone();
     let total = file_paths.len();
-    let logic = filter_logic.unwrap_or_else(|| "and".to_string());
-    let ms_exclude = mode_s_exclude.unwrap_or(false);
-    let m3a_exclude = mode3a_exclude.unwrap_or(false);
 
     tauri::async_runtime::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<(String, Result<AnalysisResult, String>)>();
 
         // 병렬 파싱 스레드: 완료 즉시 채널로 전송 (메모리 일괄 보유 방지)
-        let filter = mode_s_filter;
-        let filter_ref = &filter;
-        let m3a_filter = mode3a_filter;
-        let m3a_filter_ref = &m3a_filter;
-        let logic_ref = &logic;
+        let ms_incl_ref = &mode_s_include;
+        let ms_excl_ref = &mode_s_exclude;
+        let m3a_incl_ref = &mode3a_include;
+        let m3a_excl_ref = &mode3a_exclude;
         rayon::scope(|s| {
             let tx = &tx;
             for path in &file_paths {
                 let path = path.clone();
                 s.spawn(move |_| {
-                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, filter_ref, m3a_filter_ref, mag_dec, logic_ref, ms_exclude, m3a_exclude, |_| {})
+                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, ms_incl_ref, ms_excl_ref, m3a_incl_ref, m3a_excl_ref, mag_dec, |_| {})
                         .map_err(|e| e.to_string())
                         .map(|parsed| {
                             analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)
@@ -349,8 +336,8 @@ fn write_file_base64(path: String, data: String) -> Result<(), String> {
 /// 반환: PDF base64 (DB 저장용)
 #[tauri::command]
 async fn webview_print_to_pdf(
-    app_handle: tauri::AppHandle,
-    path: String,
+    _app_handle: tauri::AppHandle,
+    _path: String,
 ) -> Result<String, String> {
     #[cfg(windows)]
     {
@@ -358,7 +345,7 @@ async fn webview_print_to_pdf(
 
         // 호출한 창의 WebView에서 PDF 생성 (멀티윈도우 대응)
         let window = {
-            let windows = app_handle.webview_windows();
+            let windows = _app_handle.webview_windows();
             // 호출 창을 찾기: trackmap 우선, 없으면 main
             windows.get("trackmap")
                 .or_else(|| windows.get("main"))
@@ -438,7 +425,7 @@ async fn webview_print_to_pdf(
             .decode(pdf_base64)
             .map_err(|e| format!("PDF base64 디코딩 실패: {}", e))?;
 
-        fs::write(&path, &pdf_bytes)
+        fs::write(&_path, &pdf_bytes)
             .map_err(|e| format!("PDF 파일 저장 실패: {}", e))?;
 
         // base64 반환 (DB 저장용)
@@ -1226,7 +1213,7 @@ fn add_manual_building(
     group_id: Option<i64>,
 ) -> Result<i64, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let gt = geometry_type.as_deref().unwrap_or("point");
+    let gt = geometry_type.as_deref().unwrap_or("polygon");
     let gj = geometry_json.as_deref();
     building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
 }
@@ -1246,7 +1233,7 @@ fn update_manual_building(
     group_id: Option<i64>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let gt = geometry_type.as_deref().unwrap_or("point");
+    let gt = geometry_type.as_deref().unwrap_or("polygon");
     let gj = geometry_json.as_deref();
     building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
 }

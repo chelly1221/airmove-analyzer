@@ -54,7 +54,7 @@ export interface PeakImportStatus {
 export type SrtmStatus = [number, number] | null;
 
 /** 도형 유형 */
-export type GeometryType = "point" | "circle" | "line" | "multi";
+export type GeometryType = "polygon" | "multi";
 
 /** 건물 그룹 */
 export interface BuildingGroup {

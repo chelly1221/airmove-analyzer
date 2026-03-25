@@ -27,6 +27,7 @@ export type {
   RadarMonthlyResult,
   ObstacleMonthlyResult,
   ObstacleMonthlyProgress,
+  OMReportData,
 } from "./obstacle";
 export type {
   AdditionalLossEvent,

@@ -42,9 +42,11 @@ export {
   isGPUCacheValidFor,
   isWorkerReady,
   invalidateGPUCache,
+  hasSurfaceAngles,
+  build3DSurfaceAsync,
 } from "./gpuCoverage";
 
-export type { CoveragePolygonData } from "./gpuCoverage";
+export type { CoveragePolygonData, Coverage3DQuad } from "./gpuCoverage";
 
 // ─── GeoJSON 변환 ───────────────────────────────────
 

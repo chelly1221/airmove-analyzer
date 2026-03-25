@@ -1,6 +1,7 @@
 import React from "react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite, AzSector } from "../../types";
 import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedPsrStdDev, gradeWithConfidence } from "../../utils/omStats";
+import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 
 interface Props {
@@ -12,23 +13,6 @@ interface Props {
   azimuthSectorsByRadar: Map<string, AzSector[]>;
   /** 분석 대상 월 (YYYY-MM) */
   analysisMonth?: string;
-}
-
-/** bearing from radar to building center */
-function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const toRad = Math.PI / 180;
-  const y = Math.sin((lon2 - lon1) * toRad) * Math.cos(lat2 * toRad);
-  const x = Math.cos(lat1 * toRad) * Math.sin(lat2 * toRad) -
-    Math.sin(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.cos((lon2 - lon1) * toRad);
-  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
-}
-
-function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 /**

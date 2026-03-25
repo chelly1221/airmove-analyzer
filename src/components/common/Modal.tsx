@@ -18,6 +18,7 @@ export default function Modal({
 }: ModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const mouseDownTargetRef = useRef<EventTarget | null>(null);
   const titleId = useId();
 
   const onCloseRef = useRef(onClose);
@@ -39,8 +40,11 @@ export default function Modal({
     <div
       ref={overlayRef}
       className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      onMouseDown={(e) => {
+        mouseDownTargetRef.current = e.target;
+      }}
       onClick={(e) => {
-        if (e.target === overlayRef.current) onClose();
+        if (e.target === overlayRef.current && mouseDownTargetRef.current === overlayRef.current) onClose();
       }}
     >
       <div

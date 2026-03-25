@@ -232,17 +232,16 @@ pub fn analyze_radar_monthly(
             ),
         });
 
-        // 파싱 (모든 항공기 포함 — mode_s_filter 빈 배열)
+        // 파싱 (모든 항공기 포함 — 필터 없음)
         let parsed = match parser::ass::parse_ass_file(
             path,
             radar.radar_lat,
             radar.radar_lon,
-            &[],   // 전체 항공기
-            &[],   // 전체 squawk
+            &[],   // 포함 Mode-S 없음
+            &[],   // 제외 Mode-S 없음
+            &[],   // 포함 Squawk 없음
+            &[],   // 제외 Squawk 없음
             mag_dec_deg,
-            "and",
-            false,
-            false,
             |_| {},
         ) {
             Ok(p) => p,
@@ -366,18 +365,19 @@ pub fn analyze_radar_monthly(
             }
             pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
 
-            // 비행 시간
-            let track_time = pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
-            day_track_time += track_time;
-
             // 스캔 간격 추정 (median)
             let mut gaps: Vec<f64> = pts.windows(2)
                 .map(|w| w[1].timestamp - w[0].timestamp)
                 .filter(|&g| g > 0.5 && g < 30.0)
                 .collect();
             if gaps.len() < 3 {
+                // 유효 gap이 부족하면 Loss 계산 불가 — track_time도 누적하지 않음
                 continue;
             }
+
+            // 비행 시간 (gap 유효성 확인 후 누적)
+            let track_time = pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
+            day_track_time += track_time;
             gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let scan_interval = gaps[gaps.len() / 2];
 

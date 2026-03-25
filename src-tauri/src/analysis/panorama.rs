@@ -412,7 +412,7 @@ fn expand_manual_geometry(
     geo_json: Option<&str>,
 ) -> Vec<(f64, f64)> {
     let geo_type = match geo_type {
-        Some(t) if t != "point" => t,
+        Some(t) if t == "polygon" || t == "multi" => t,
         _ => return vec![],
     };
     let json_str = match geo_json {
@@ -426,68 +426,7 @@ fn expand_manual_geometry(
     };
 
     match geo_type {
-        "rectangle" => {
-            // [[lat, lon], ...] — 4꼭짓점 또는 레거시 2꼭짓점
-            if let Some(arr) = val.as_array() {
-                let pts: Vec<(f64, f64)> = arr
-                    .iter()
-                    .filter_map(|p| {
-                        let lat = p.get(0)?.as_f64()?;
-                        let lon = p.get(1)?.as_f64()?;
-                        Some((lat, lon))
-                    })
-                    .collect();
-                if pts.len() >= 3 {
-                    return pts;
-                }
-                if pts.len() == 2 {
-                    // 레거시: [[minLat,minLon],[maxLat,maxLon]] → 4꼭짓점
-                    let (lat0, lon0) = pts[0];
-                    let (lat1, lon1) = pts[1];
-                    return vec![
-                        (lat0, lon0),
-                        (lat0, lon1),
-                        (lat1, lon1),
-                        (lat1, lon0),
-                    ];
-                }
-            }
-            return vec![];
-        }
-        "circle" => {
-            // {center: [lat, lon], semi_major_m, semi_minor_m, rotation_deg}
-            let clat = val.get("center").and_then(|c| c.get(0)).and_then(|v| v.as_f64()).unwrap_or(center_lat);
-            let clon = val.get("center").and_then(|c| c.get(1)).and_then(|v| v.as_f64()).unwrap_or(center_lon);
-            let semi_major = val.get("semi_major_m").and_then(|v| v.as_f64())
-                .or_else(|| val.get("radius_m").and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            let semi_minor = val.get("semi_minor_m").and_then(|v| v.as_f64()).unwrap_or(semi_major);
-            let rot_deg = val.get("rotation_deg").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-            if semi_major < 1.0 {
-                return vec![];
-            }
-
-            let rot_rad = rot_deg.to_radians();
-            let cos_lat = clat.to_radians().cos().max(0.01);
-            let num_samples = 12;
-            let mut pts = Vec::with_capacity(num_samples + 1);
-            pts.push((clat, clon)); // 중심
-
-            for i in 0..num_samples {
-                let angle = (i as f64 / num_samples as f64) * 2.0 * std::f64::consts::PI;
-                let lx = semi_major * angle.cos();
-                let ly = semi_minor * angle.sin();
-                // 회전 적용 (북=위도+ 기준 시계방향)
-                let rx = lx * rot_rad.sin() + ly * rot_rad.cos(); // east (m)
-                let ry = lx * rot_rad.cos() - ly * rot_rad.sin(); // north (m)
-                let dlat = ry / 111_320.0;
-                let dlon = rx / (111_320.0 * cos_lat);
-                pts.push((clat + dlat, clon + dlon));
-            }
-            return pts;
-        }
-        "line" => {
+        "polygon" => {
             // [[lat, lon], [lat, lon], ...]
             if let Some(arr) = val.as_array() {
                 let pts: Vec<(f64, f64)> = arr.iter().filter_map(|p| {

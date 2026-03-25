@@ -315,7 +315,7 @@ pub fn analyze_pre_screening(
         });
 
         let parsed = match parser::ass::parse_ass_file(
-            path, radar.radar_lat, radar.radar_lon, &[], &[], mag_dec_deg, "and", false, false, |_| {},
+            path, radar.radar_lat, radar.radar_lon, &[], &[], &[], &[], mag_dec_deg, |_| {},
         ) {
             Ok(p) => p,
             Err(e) => {

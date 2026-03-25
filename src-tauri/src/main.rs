@@ -17,7 +17,7 @@ fn main() {
             .map(|loc| format!("\n\n위치: {}:{}:{}", loc.file(), loc.line(), loc.column()))
             .unwrap_or_default();
 
-        let full_message = format!(
+        let _full_message = format!(
             "프로그램에서 예기치 않은 오류가 발생했습니다.\n\n{}{}\n\n이 오류를 개발팀에 보고해 주세요.",
             message, location
         );
@@ -28,7 +28,7 @@ fn main() {
             use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
             let title: Vec<u16> = "항적분석체계 오류\0".encode_utf16().collect();
-            let body: Vec<u16> = format!("{}\0", full_message).encode_utf16().collect();
+            let body: Vec<u16> = format!("{}\0", _full_message).encode_utf16().collect();
 
             unsafe {
                 MessageBoxW(

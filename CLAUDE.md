@@ -482,7 +482,7 @@ public/                 # 정적 자산
 ### 수동 건물
 - **그룹 관리**: `building_groups` 테이블 (name, color, memo, plan_image BLOB, plan_bounds_json, plan_opacity, plan_rotation, area_bounds_json)
 - **도면 오버레이**: 그룹별 도면 이미지 MapLibre raster 레이어 (위치/투명도/회전 조절)
-- **도형 유형**: point, rectangle, circle/ellipse, line, multi (`GeometryType`)
+- **도형 유형**: polygon, multi (`GeometryType`)
 - **CRUD**: `manual_buildings` 테이블, Drawing.tsx에서 도형 그리기 (도형 확정 후 자동 맵핏)
 - **LOS 반영**: GIS 건물과 함께 경로 분석에 통합 (도형별 샘플 포인트 생성으로 공간 쿼리)
 
@@ -495,7 +495,7 @@ public/                 # 정적 자산
 - **모듈**: `src-tauri/src/analysis/panorama.rs`
 - **원리**: 레이더 안테나에서 0°~360° 방위별 ray → 지형(SRTM) + GIS/수동 건물 중 최대 앙각 장애물
 - **건물 높이 필터**: MAX_BUILDING_HEIGHT_M = 650m (비현실적 높이 제외)
-- **수동 건물 지오메트리 확장**: rectangle(9점), circle/ellipse(13점), line(전체점), point(중심점) 샘플링
+- **수동 건물 지오메트리 확장**: polygon(좌표 배열 그대로), multi(서브 도형 재귀 확장) 샘플링
 - **출력**: `PanoramaPoint[]` — 방위, 거리, 높이, 앙각, 지면고도, 장애물 유형(terrain/gis_building/manual_building)/이름/주소/용도
 - **캐싱**: `save_panorama_cache` / `load_panorama_cache` — 계산 결과 DB 영속화, 보고서 재활용
 - **4/3 유효지구 모델**: R_EFF = 6,371,000 × 4/3, 앙각 계산에 굴절 모델 적용

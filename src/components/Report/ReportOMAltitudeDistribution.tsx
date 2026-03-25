@@ -1,5 +1,7 @@
 import React, { useMemo } from "react";
+import { BarChart3 } from "lucide-react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
+import { haversineKm, bearingDeg } from "../../utils/geo";
 
 interface Props {
   sectionNum: number;
@@ -15,22 +17,6 @@ const R_EARTH = 6_371_000; // 실제 지구반경 (m)
 const FT_PER_M = 3.28084;
 const KM_PER_NM = 1.852;
 const AZ_TOLERANCE = 10; // 방위 허용 오차 (°)
-
-function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const toRad = Math.PI / 180;
-  const y = Math.sin((lon2 - lon1) * toRad) * Math.cos(lat2 * toRad);
-  const x = Math.cos(lat1 * toRad) * Math.sin(lat2 * toRad) -
-    Math.sin(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.cos((lon2 - lon1) * toRad);
-  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
-}
 
 /** elevationProfile에서 running max angle 추출 (지형+건물 통합)
  *  cutoffDistKm 이전까지만 계산 (건물 전/후 분리 가능) */
@@ -194,7 +180,20 @@ function ReportOMAltitudeDistribution({
     });
   }, [radarResults, radarSites, selectedBuildings, losMap]);
 
-  if (radarAnalysis.every((r) => r.losses.length === 0)) return null;
+  if (radarAnalysis.every((r) => r.losses.length === 0)) {
+    const hasDailyData = radarResults.some((rr) => rr.daily_stats.length > 0);
+    return (
+      <div className="mb-8">
+        <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
+          {sectionNum}. LoS 차단 양각 대비 표적소실 분포
+        </h2>
+        <div className="flex flex-col items-center py-12 text-gray-400">
+          <BarChart3 size={28} strokeWidth={1.2} className="mb-2" />
+          <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mb-8">

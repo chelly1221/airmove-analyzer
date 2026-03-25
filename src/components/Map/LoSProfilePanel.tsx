@@ -421,28 +421,37 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       return elev;
     };
 
-    // 2) 최저 탐지가능 높이 - 직선 LoS (디스플레이 프레임에서 직접 shadow-casting → 직선)
+    // 2) 최저 탐지가능 높이 - 직선 LoS (Running Max Angle: 계곡에서 꺾이지 않음)
+    let maxAngleStraight = -Infinity;
+    let obIdxStraight = 0;
     const minDetStraight = uniqueDists.map((d) => {
       if (d <= 0) return { distance: d, height: radarHeight };
+      const dM = d * 1000;
 
-      let maxShadow = radarHeight;
-      for (const ob of obstacles) {
-        if (ob.distance <= 0 || ob.distance >= d) continue;
-        const adjH = ob.elevation - curvDrop(ob.distance);
-        const shadow = radarHeight + (adjH - radarHeight) * (d / ob.distance);
-        if (shadow > maxShadow) maxShadow = shadow;
+      // 현재 거리까지의 장애물(지형+건물)에서 최대 앙각 갱신
+      while (obIdxStraight < obstacles.length && obstacles[obIdxStraight].distance <= d + 1e-9) {
+        const ob = obstacles[obIdxStraight];
+        if (ob.distance > 0) {
+          const adjH = ob.elevation - curvDrop(ob.distance);
+          const angle = (adjH - radarHeight) / (ob.distance * 1000);
+          if (angle > maxAngleStraight) maxAngleStraight = angle;
+        }
+        obIdxStraight++;
       }
 
+      // 현재 지점의 유효 고도(건물 포함)도 앙각에 반영
       const terrElev = effectiveElevAt(d);
       const adjH = terrElev - curvDrop(d);
-      return {
-        distance: d,
-        height: Math.max(adjH, maxShadow),
-      };
+      const terrAngle = (adjH - radarHeight) / dM;
+      if (terrAngle > maxAngleStraight) maxAngleStraight = terrAngle;
+
+      const losH = radarHeight + maxAngleStraight * dM;
+      return { distance: d, height: Math.max(adjH, losH) };
     });
 
     // 2.5) 최저 탐지가능 높이 - 직선 LoS + 프레넬존 80% 클리어런스
-    const minDetFresnel = uniqueDists.map((d) => {
+    //   프레넬 반경이 평가 거리에 의존하므로 O(n²) 유지, 직선 LoS를 floor로 적용
+    const minDetFresnel = uniqueDists.map((d, idx) => {
       if (d <= 0) return { distance: d, height: radarHeight };
       const dM = d * 1000;
 
@@ -459,27 +468,36 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
       const terrElev = effectiveElevAt(d);
       const adjH = terrElev - curvDrop(d);
+      // 직선 LoS(running max angle 적용됨)를 floor로 사용하여 계곡 꺾임 방지
       return {
         distance: d,
-        height: Math.max(adjH, maxShadow),
+        height: Math.max(adjH, maxShadow, minDetStraight[idx].height),
       };
     });
 
-    // 3) 최저 탐지가능 높이 - 4/3 굴절 적용
+    // 3) 최저 탐지가능 높이 - 4/3 굴절 적용 (Running Max Angle in 4/3 frame)
+    let maxAngle43 = -Infinity;
+    let obIdx43 = 0;
     const minDetRefracted = uniqueDists.map((d) => {
       if (d <= 0) return { distance: d, height: radarHeight };
+      const dM = d * 1000;
 
-      let maxShadow = radarHeight;
-      for (const ob of obstacles) {
-        if (ob.distance <= 0 || ob.distance >= d) continue;
-        const adjH = ob.elevation - curvDrop43(ob.distance);
-        const shadow = radarHeight + (adjH - radarHeight) * (d / ob.distance);
-        if (shadow > maxShadow) maxShadow = shadow;
+      while (obIdx43 < obstacles.length && obstacles[obIdx43].distance <= d + 1e-9) {
+        const ob = obstacles[obIdx43];
+        if (ob.distance > 0) {
+          const adjH = ob.elevation - curvDrop43(ob.distance);
+          const angle = (adjH - radarHeight) / (ob.distance * 1000);
+          if (angle > maxAngle43) maxAngle43 = angle;
+        }
+        obIdx43++;
       }
 
       const terrElev = effectiveElevAt(d);
       const adjTerrain43 = terrElev - curvDrop43(d);
-      const h43 = Math.max(adjTerrain43, maxShadow);
+      const terrAngle = (adjTerrain43 - radarHeight) / dM;
+      if (terrAngle > maxAngle43) maxAngle43 = terrAngle;
+
+      const h43 = Math.max(adjTerrain43, radarHeight + maxAngle43 * dM);
       const amslH = h43 + curvDrop43(d);
       return { distance: d, height: amslH - curvDrop(d) };
     });

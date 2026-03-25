@@ -1,4 +1,5 @@
 import React from "react";
+import { Calendar } from "lucide-react";
 import type { DailyStats } from "../../types";
 import { weightedAvg } from "../../utils/omStats";
 
@@ -23,7 +24,17 @@ interface WeekSummary {
 }
 
 function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth }: Props) {
-  if (dailyStats.length === 0) return null;
+  if (dailyStats.length === 0) return (
+    <div className="mb-8">
+      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
+        {sectionNum}. 주간 집계 — {radarName}
+      </h2>
+      <div className="flex flex-col items-center py-12 text-gray-400">
+        <Calendar size={28} strokeWidth={1.2} className="mb-2" />
+        <p className="text-sm">해당 기간 분석 데이터 없음</p>
+      </div>
+    </div>
+  );
 
   const monthLabel = analysisMonth
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`

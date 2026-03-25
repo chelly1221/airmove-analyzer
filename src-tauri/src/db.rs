@@ -251,8 +251,19 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     let _ = conn.execute("DROP TABLE IF EXISTS cloud_grid_cache", []);
 
     // 수동 건물에 도형 컬럼 추가
-    let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_type TEXT NOT NULL DEFAULT 'point'", []);
+    let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_type TEXT NOT NULL DEFAULT 'polygon'", []);
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN geometry_json TEXT", []);
+
+    // 레거시 geometry_type 마이그레이션: point/circle/rectangle/line → polygon
+    let _ = conn.execute(
+        "UPDATE manual_buildings SET geometry_type = 'polygon' WHERE geometry_type IN ('point','circle','rectangle','line')",
+        [],
+    );
+    // multi 내부 서브 도형 JSON도 일괄 변환
+    let _ = conn.execute(
+        "UPDATE manual_buildings SET geometry_json = REPLACE(REPLACE(REPLACE(REPLACE(geometry_json, '\"type\":\"line\"', '\"type\":\"polygon\"'), '\"type\":\"circle\"', '\"type\":\"polygon\"'), '\"type\":\"rectangle\"', '\"type\":\"polygon\"'), '\"type\":\"point\"', '\"type\":\"polygon\"') WHERE geometry_type = 'multi' AND geometry_json IS NOT NULL",
+        [],
+    );
 
     // 수동 건물에 그룹 컬럼 추가
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN group_id INTEGER REFERENCES building_groups(id) ON DELETE SET NULL", []);

@@ -1,6 +1,7 @@
 import React, { useMemo } from "react";
 import type { RadarSite, LossPointGeo, ManualBuilding } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
+import { azimuthAndDist } from "../../utils/geo";
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
 function altToColor(altFt: number, minAlt: number, maxAlt: number): string {
@@ -21,21 +22,6 @@ interface Props {
   /** 기본 고도 (ft) — 미사용, 호환성 유지 */
   defaultAltFt: number;
   selectedBuildings: ManualBuilding[];
-}
-
-/** 레이더→포인트 방위(°, 0=N, CW) 및 거리(km) */
-function azimuthAndDist(
-  radarLat: number, radarLon: number,
-  lat: number, lon: number,
-): { azDeg: number; distKm: number } {
-  const dLat = lat - radarLat;
-  const dLon = lon - radarLon;
-  const latKm = dLat * 111.32;
-  const lonKm = dLon * 111.32 * Math.cos((radarLat * Math.PI) / 180);
-  const distKm = Math.sqrt(latKm * latKm + lonKm * lonKm);
-  let azDeg = (Math.atan2(lonKm, latKm) * 180) / Math.PI;
-  if (azDeg < 0) azDeg += 360;
-  return { azDeg, distKm };
 }
 
 /** 방위별 커버리지 범위(km) lookup — O(1) 인덱스 기반 */
@@ -181,7 +167,11 @@ function ReportOMCoverageDiff({
     });
   }, [lossPoints, radarSite, lowestWith, layersWithTargets, layersWithoutTargets]);
 
-  if (fixedWith.length === 0 && fixedWithout.length === 0) return null;
+  if (fixedWith.length === 0 && fixedWithout.length === 0) return (
+    <div className="flex flex-col items-center py-16 text-gray-400">
+      <p className="text-sm">커버리지 비교 데이터 없음</p>
+    </div>
+  );
 
   // SVG 레이아웃
   const svgSize = 700;

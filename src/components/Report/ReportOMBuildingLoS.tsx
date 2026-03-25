@@ -1,5 +1,7 @@
 import React, { useMemo } from "react";
+import { Building } from "lucide-react";
 import type { ManualBuilding, RadarSite, LoSProfileData } from "../../types";
+import { haversineKm, bearingDeg } from "../../utils/geo";
 
 interface Props {
   sectionNum: number;
@@ -7,22 +9,6 @@ interface Props {
   radarSites: RadarSite[];
   /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) */
   losMap: Map<string, LoSProfileData>;
-}
-
-function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const toRad = Math.PI / 180;
-  const y = Math.sin((lon2 - lon1) * toRad) * Math.cos(lat2 * toRad);
-  const x = Math.cos(lat1 * toRad) * Math.sin(lat2 * toRad) -
-    Math.sin(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.cos((lon2 - lon1) * toRad);
-  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
 function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap }: Props) {
@@ -40,7 +26,17 @@ function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap
     return info;
   }, [selectedBuildings, radarSites]);
 
-  if (selectedBuildings.length === 0) return null;
+  if (selectedBuildings.length === 0) return (
+    <div className="mb-8">
+      <h2 className="mb-4 border-b-2 border-[#a60739] pb-1 text-[19px] font-bold text-gray-900">
+        {sectionNum}. 건물별 LoS 분석
+      </h2>
+      <div className="flex flex-col items-center py-12 text-gray-400">
+        <Building size={28} strokeWidth={1.2} className="mb-2" />
+        <p className="text-sm">분석 대상 건물 없음</p>
+      </div>
+    </div>
+  );
 
   return (
     <div className="mb-8">

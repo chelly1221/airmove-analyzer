@@ -90,10 +90,9 @@ function useAssFilePicker() {
         filePaths: paths,
         radarLat: site.latitude,
         radarLon: site.longitude,
-        modeSFilter: filter.modeSFilter,
-        mode3aFilter: filter.mode3aFilter,
-        filterLogic: filter.filterLogic,
+        modeSInclude: filter.modeSInclude,
         modeSExclude: filter.modeSExclude,
+        mode3aInclude: filter.mode3aInclude,
         mode3aExclude: filter.mode3aExclude,
       });
     } catch (e) {

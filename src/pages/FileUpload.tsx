@@ -17,7 +17,6 @@ import {
   ChevronRight,
   ChevronDown,
   Folder,
-  Circle,
   Minus,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
@@ -74,7 +73,7 @@ const emptyForm: BuildingFormData = {
   height: "",
   ground_elev: "0",
   memo: "",
-  geometry_type: "line",
+  geometry_type: "polygon",
   geometry_json: null,
   group_id: null,
 };
@@ -109,7 +108,7 @@ function shapeCentroid(shape: { type: GeometryType; json: string | null }): [num
 /** 도형 유형 한글 라벨 */
 function shapeTypeLabel(type: string): string {
   switch (type) {
-    case "line": return "다각형";
+    case "polygon": return "다각형";
     case "multi": return "복합";
     default: return type;
   }
@@ -119,7 +118,7 @@ function shapeTypeLabel(type: string): string {
 function shapeToGeoJsonFeature(shape: { type: GeometryType; json: string | null }, index?: number): GeoJSON.Feature | null {
   if (!shape.json) return null;
   try {
-    if (shape.type === "line") {
+    if (shape.type === "polygon") {
       const pts: [number, number][] = JSON.parse(shape.json);
       if (pts.length >= 2) {
         const first = pts[0], last = pts[pts.length - 1];
@@ -228,7 +227,7 @@ function BuildingModal({
         height: String(initial.height),
         ground_elev: String(initial.ground_elev),
         memo: initial.memo,
-        geometry_type: isMulti ? "line" : (initial.geometry_type || "line"),
+        geometry_type: isMulti ? "polygon" : (initial.geometry_type || "polygon"),
         geometry_json: isMulti ? null : (initial.geometry_json || null),
         group_id: initial.group_id ?? null,
       });
@@ -318,7 +317,7 @@ function BuildingModal({
 
       // 2) 확정된 현재 도형 취소
       if (form.geometry_json) {
-        setForm((f) => ({ ...f, geometry_type: "line" as GeometryType, geometry_json: null }));
+        setForm((f) => ({ ...f, geometry_type: "polygon" as GeometryType, geometry_json: null }));
         return;
       }
 
@@ -343,7 +342,7 @@ function BuildingModal({
       if (pts.length < 2) return;
     } catch { return; }
     setConfirmedShapes((prev) => [...prev, { type: form.geometry_type, json: form.geometry_json! }]);
-    setForm((f) => ({ ...f, geometry_type: "line" as GeometryType, geometry_json: null }));
+    setForm((f) => ({ ...f, geometry_type: "polygon" as GeometryType, geometry_json: null }));
     setClickPts([]);
   }, [form.geometry_json, form.geometry_type]);
 
@@ -452,7 +451,7 @@ function BuildingModal({
         ...f,
         latitude: lat.toFixed(6),
         longitude: lon.toFixed(6),
-        geometry_type: "line",
+        geometry_type: "polygon",
         geometry_json: JSON.stringify([pt]),
       }));
       return;
@@ -481,7 +480,7 @@ function BuildingModal({
             ...f,
             latitude: center[0].toFixed(6),
             longitude: center[1].toFixed(6),
-            geometry_type: "line",
+            geometry_type: "polygon",
             geometry_json: JSON.stringify(closed),
           }));
           return [];
@@ -497,7 +496,7 @@ function BuildingModal({
         ...f,
         latitude: center[0].toFixed(6),
         longitude: center[1].toFixed(6),
-        geometry_type: "line",
+        geometry_type: "polygon",
         geometry_json: JSON.stringify(updated),
       }));
       return updated;
@@ -523,7 +522,7 @@ function BuildingModal({
         ...f,
         latitude: center[0].toFixed(6),
         longitude: center[1].toFixed(6),
-        geometry_type: "line" as GeometryType,
+        geometry_type: "polygon" as GeometryType,
         geometry_json: JSON.stringify(cleaned),
       }));
       return [];
@@ -802,7 +801,7 @@ function BuildingModal({
               disabled={
                 !form.name.trim() || !form.latitude || !form.longitude || !form.height
                 || clickPts.length > 0 // 그리기 중에는 제출 불가
-                || (form.geometry_type === "line" && !!form.geometry_json && (() => { try { return (JSON.parse(form.geometry_json!) as any[]).length < 2; } catch { return true; } })())
+                || (form.geometry_type === "polygon" && !!form.geometry_json && (() => { try { return (JSON.parse(form.geometry_json!) as any[]).length < 2; } catch { return true; } })())
               }
               className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#85062e] disabled:opacity-40 transition-colors"
             >
@@ -828,7 +827,7 @@ function BuildingModal({
               <button
                 onClick={() => {
                   setClickPts([]);
-                  setForm((f) => ({ ...f, geometry_type: "line" as GeometryType, geometry_json: null }));
+                  setForm((f) => ({ ...f, geometry_type: "polygon" as GeometryType, geometry_json: null }));
                 }}
                 className="rounded-lg bg-gray-100 px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-200 transition-colors"
               >
@@ -1002,7 +1001,7 @@ function BuildingModal({
                       e.stopPropagation();
                       if (hoveredShapeIdx === -1) {
                         // 현재 완성 도형 삭제
-                        setForm((f) => ({ ...f, geometry_type: "line" as GeometryType, geometry_json: null }));
+                        setForm((f) => ({ ...f, geometry_type: "polygon" as GeometryType, geometry_json: null }));
                       } else if (hoveredShapeIdx !== null && hoveredShapeIdx >= 0) {
                         setConfirmedShapes((prev) => prev.filter((_, j) => j !== hoveredShapeIdx));
                       }
@@ -1074,7 +1073,7 @@ function ManualBuildingPanel() {
           height: parseFloat(data.height),
           groundElev: parseFloat(data.ground_elev) || 0,
           memo: data.memo,
-          geometryType: data.geometry_type || "line",
+          geometryType: data.geometry_type || "polygon",
           geometryJson: data.geometry_json || null,
           groupId: data.group_id,
         });
@@ -1086,7 +1085,7 @@ function ManualBuildingPanel() {
           height: parseFloat(data.height),
           groundElev: parseFloat(data.ground_elev) || 0,
           memo: data.memo,
-          geometryType: data.geometry_type || "line",
+          geometryType: data.geometry_type || "polygon",
           geometryJson: data.geometry_json || null,
           groupId: data.group_id,
         });
@@ -1209,8 +1208,7 @@ function ManualBuildingPanel() {
   const renderBuildingRow = (b: ManualBuilding) => (
     <div key={b.id} className="flex items-center gap-3 px-3 py-2 hover:bg-gray-100 transition-colors group">
       {b.geometry_type === "multi" ? <Plus size={14} className="shrink-0 text-blue-400" />
-        : b.geometry_type === "circle" ? <Circle size={14} className="shrink-0 text-gray-400" />
-        : b.geometry_type === "line" ? <Minus size={14} className="shrink-0 text-gray-400" />
+        : b.geometry_type === "polygon" ? <Minus size={14} className="shrink-0 text-gray-400" />
         : <Building2 size={14} className="shrink-0 text-gray-400" />}
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
@@ -1846,8 +1844,10 @@ export default function FileUpload() {
         filePath: file.path,
         radarLat: currentSite.latitude,
         radarLon: currentSite.longitude,
-        modeSFilter,
-        mode3aFilter: [],
+        modeSInclude: modeSFilter,
+        modeSExclude: [],
+        mode3aInclude: [],
+        mode3aExclude: [],
       });
 
       // 원시 포인트에 radar_name 태깅 후 Worker에 직접 전송 (메인 축적 안 함)
