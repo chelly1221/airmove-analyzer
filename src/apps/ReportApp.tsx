@@ -32,21 +32,6 @@ import SourceOverlay from "../dev/SourceOverlay";
 
 const appWindow = getCurrentWindow();
 
-/** OM result에서 2주 초과 시 최근 31일만 사용 */
-function trimOMResult(result: ObstacleMonthlyResult | null): ObstacleMonthlyResult | null {
-  if (!result) return null;
-  const MAX_DAYS = 31;
-  const TWO_WEEKS = 14;
-  return {
-    ...result,
-    radar_results: result.radar_results.map((rr) => {
-      if (rr.daily_stats.length <= TWO_WEEKS) return rr;
-      const sorted = [...rr.daily_stats].sort((a, b) => b.date.localeCompare(a.date));
-      const trimmed = sorted.slice(0, MAX_DAYS).sort((a, b) => a.date.localeCompare(b.date));
-      return { ...rr, daily_stats: trimmed };
-    }),
-  };
-}
 
 // ── 로드 상태 ──
 
@@ -86,7 +71,7 @@ function payloadToState(p: ReportWindowPayload): LoadedState {
     sections: p.sections,
     editingReportId: p.editingReportId,
     coverTitle: p.coverTitle,
-    coverSubtitle: p.coverSubtitle,
+    coverSubtitle: p.coverSubtitle ?? format(new Date(), "yyyy년 MM월"),
     commentary: p.commentary,
     flights: p.flights,
     reportFlights: p.reportFlights,
@@ -130,7 +115,7 @@ export default function ReportApp() {
 
   // 편집 가능 텍스트
   const [coverTitle, setCoverTitle] = useState("");
-  const [coverSubtitle, setCoverSubtitle] = useState("");
+  const [coverSubtitle, setCoverSubtitle] = useState(() => format(new Date(), "yyyy년 MM월"));
   const [commentary, setCommentary] = useState("");
   const [editingReportId, setEditingReportId] = useState<string | null>(null);
 
@@ -294,16 +279,6 @@ export default function ReportApp() {
     };
   }, [loadFromIDB, loadConfigFromIDB]);
 
-  // OM trimmed result
-  const omResultTrimmed = useMemo(() => {
-    return trimOMResult(omData?.result ?? null);
-  }, [omData?.result]);
-
-  // OM 데이터 트리밍 알림
-  const omWasTrimmed = useMemo(() => {
-    if (!omData?.result) return false;
-    return omData.result.radar_results.some((rr) => rr.daily_stats.length > 14);
-  }, [omData?.result]);
 
   // 현재 활성 sections
   const activeSections = sections ?? state?.sections;
@@ -520,6 +495,53 @@ export default function ReportApp() {
     setOmData((prev) => prev ? { ...prev, coverageStatus: "error" } : prev);
   }, []);
 
+  // ── 파노라마 자동 계산 (보고서 창 내부) ──
+  useEffect(() => {
+    if (!omData || omData.panoramaStatus !== "idle" || omData.selectedRadarSites.length === 0) return;
+    let cancelled = false;
+    setOmData((prev) => prev ? { ...prev, panoramaStatus: "loading" } : prev);
+    const excludeIds = omData.selectedBuildings.map((b) => b.id);
+    const panoArgs = (radar: RadarSite) => ({
+      radarLat: radar.latitude,
+      radarLon: radar.longitude,
+      radarHeightM: radar.altitude + radar.antenna_height,
+      maxRangeKm: 100,
+      azimuthStepDeg: 0.01,
+      rangeStepM: 200,
+    });
+    (async () => {
+      const withMap = new Map<string, PanoramaPoint[]>();
+      const withoutMap = new Map<string, PanoramaPoint[]>();
+      for (const radar of omData.selectedRadarSites) {
+        if (cancelled) break;
+        try {
+          const withPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", panoArgs(radar));
+          if (!cancelled) withMap.set(radar.name, withPts);
+          if (excludeIds.length > 0) {
+            const withoutPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", {
+              ...panoArgs(radar),
+              excludeManualIds: excludeIds,
+            });
+            if (!cancelled) withoutMap.set(radar.name, withoutPts);
+          }
+        } catch (err) {
+          console.warn(`Panorama failed for ${radar.name}:`, err);
+        }
+      }
+      if (!cancelled) {
+        startTransition(() => {
+          setOmData((prev) => prev ? {
+            ...prev,
+            panoWithTargets: withMap,
+            panoWithoutTargets: withoutMap,
+            panoramaStatus: "done",
+          } : prev);
+        });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [omData?.panoramaStatus, omData?.selectedRadarSites, omData?.selectedBuildings]);
+
   // ── 설정 모달 표시 ──
   if (configPayload && !state) {
     const { template: tpl } = configPayload;
@@ -628,13 +650,7 @@ export default function ReportApp() {
           </span>
         )}
 
-        {omWasTrimmed && (
-          <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-medium text-amber-600">
-            14일 초과 데이터 — 최근 31일만 표시
-          </span>
-        )}
-
-        {activeTemplate === "obstacle_monthly" && !omData?.result && editingReportId && (
+{activeTemplate === "obstacle_monthly" && !omData?.result && editingReportId && (
           <span className="rounded-full bg-orange-100 px-2.5 py-0.5 text-[11px] font-medium text-orange-600">
             분석 데이터 없음 — 소견 텍스트만 복원됨 (재분석 필요)
           </span>
@@ -701,7 +717,7 @@ export default function ReportApp() {
         coverageLayers={state.coverageLayers}
         mapImage={state.mapImage}
         omData={omData}
-        omResultTrimmed={omResultTrimmed}
+        omResultTrimmed={omData?.result ?? null}
         psResult={state.psResult}
         psSelectedBuildings={state.psSelectedBuildings}
         psSelectedRadarSites={state.psSelectedRadarSites}

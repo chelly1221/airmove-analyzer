@@ -344,7 +344,7 @@ export default function LoSObstacle() {
       const azAtCursor = azMin + frac * azSpan;
 
       const zoomFactor = e.deltaY > 0 ? 1.15 : 1 / 1.15;
-      const newSpan = Math.min(360, Math.max(10, azSpan * zoomFactor));
+      const newSpan = Math.min(360, Math.max(1, azSpan * zoomFactor));
 
       let newMin = azAtCursor - frac * newSpan;
       let newMax = azAtCursor + (1 - frac) * newSpan;

@@ -74,7 +74,7 @@ export interface ReportWindowPayload {
 
   // 편집 가능 텍스트
   coverTitle: string;
-  coverSubtitle: string;
+  coverSubtitle?: string;
   commentary: string;
 
   // 데이터

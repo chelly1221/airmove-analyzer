@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState, useEffect } from "react";
 import type { RadarSite, LossPointGeo, ManualBuilding } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
@@ -98,6 +98,100 @@ function buildDiffPath(
   return segments.length > 0 ? segments.join(" ") : null;
 }
 
+/* ── 타일 좌표 유틸 (Slippy Map) ── */
+function lon2tile(lon: number, z: number): number {
+  return Math.floor(((lon + 180) / 360) * (1 << z));
+}
+function lat2tile(lat: number, z: number): number {
+  const r = (lat * Math.PI) / 180;
+  return Math.floor(((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * (1 << z));
+}
+function tile2lon(x: number, z: number): number {
+  return (x / (1 << z)) * 360 - 180;
+}
+function tile2lat(y: number, z: number): number {
+  const n = Math.PI - (2 * Math.PI * y) / (1 << z);
+  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+interface MapImageResult {
+  dataUrl: string;
+  lonMin: number; lonMax: number;
+  latMin: number; latMax: number;
+}
+
+/** 레이더 중심 + 범위(km)에 해당하는 정적 지도 배경 이미지 생성 */
+function useStaticMapImage(
+  radarLat: number, radarLon: number, maxRangeKm: number,
+): MapImageResult | null {
+  const [result, setResult] = useState<MapImageResult | null>(null);
+
+  useEffect(() => {
+    if (maxRangeKm <= 0) return;
+    let cancelled = false;
+
+    const dLat = maxRangeKm / 111.32;
+    const dLon = maxRangeKm / (111.32 * Math.cos((radarLat * Math.PI) / 180));
+
+    // 줌 레벨 선택: 가로 4–8 타일
+    let zoom = 6;
+    for (let z = 1; z <= 14; z++) {
+      const xTiles = lon2tile(radarLon + dLon, z) - lon2tile(radarLon - dLon, z) + 1;
+      if (xTiles > 8) { zoom = z - 1; break; }
+      zoom = z;
+    }
+    zoom = Math.max(4, Math.min(zoom, 10));
+
+    const xMin = lon2tile(radarLon - dLon, zoom);
+    const xMax = lon2tile(radarLon + dLon, zoom);
+    const yMin = lat2tile(radarLat + dLat, zoom);
+    const yMax = lat2tile(radarLat - dLat, zoom);
+    const tilesX = xMax - xMin + 1;
+    const tilesY = yMax - yMin + 1;
+    if (tilesX * tilesY > 64) return; // 안전 제한
+
+    const TS = 256;
+    const canvas = document.createElement("canvas");
+    canvas.width = tilesX * TS;
+    canvas.height = tilesY * TS;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = "#f0f0f0";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const promises: Promise<void>[] = [];
+    for (let ty = yMin; ty <= yMax; ty++) {
+      for (let tx = xMin; tx <= xMax; tx++) {
+        const url = `https://basemaps.cartocdn.com/light_nolabels/${zoom}/${tx}/${ty}.png`;
+        const px = (tx - xMin) * TS;
+        const py = (ty - yMin) * TS;
+        promises.push(new Promise<void>((resolve) => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.onload = () => { ctx.drawImage(img, px, py); resolve(); };
+          img.onerror = () => resolve();
+          img.src = url;
+        }));
+      }
+    }
+
+    Promise.all(promises).then(() => {
+      if (cancelled) return;
+      setResult({
+        dataUrl: canvas.toDataURL("image/png"),
+        lonMin: tile2lon(xMin, zoom),
+        lonMax: tile2lon(xMax + 1, zoom),
+        latMax: tile2lat(yMin, zoom),
+        latMin: tile2lat(yMax + 1, zoom),
+      });
+    });
+
+    return () => { cancelled = true; };
+  }, [radarLat, radarLon, maxRangeKm]);
+
+  return result;
+}
+
 const SECTOR_PAD_DEG = 25;
 const FIXED_ALTS = [1000, 2000, 3000, 5000, 10000, 15000, 20000];
 
@@ -171,13 +265,7 @@ function ReportOMCoverageDiff({
     });
   }, [lossPoints, radarSite, lowestWith, layersWithTargets, layersWithoutTargets]);
 
-  if (fixedWith.length === 0 && fixedWithout.length === 0) return (
-    <div className="flex flex-col items-center py-16 text-gray-400">
-      <p className="text-sm">커버리지 비교 데이터 없음</p>
-    </div>
-  );
-
-  // SVG 레이아웃
+  // SVG 레이아웃 (상수)
   const svgSize = 700;
   const fullCx = svgSize / 2;
   const fullCy = svgSize / 2;
@@ -190,6 +278,15 @@ function ReportOMCoverageDiff({
     for (const l of fixedWithout) for (const b of l.bearings) { if (b.maxRangeKm > maxR) maxR = b.maxRangeKm; }
     return { globalMaxRange: maxR, scale: fullMaxR / maxR };
   }, [fixedWith, fixedWithout, radarSite.range_nm, fullMaxR]);
+
+  // 지도 배경 타일 이미지
+  const mapImage = useStaticMapImage(radarSite.latitude, radarSite.longitude, globalMaxRange);
+
+  if (fixedWith.length === 0 && fixedWithout.length === 0) return (
+    <div className="flex flex-col items-center py-16 text-gray-400">
+      <p className="text-sm">커버리지 비교 데이터 없음</p>
+    </div>
+  );
 
   // 섹터 viewBox
   const { vbX, vbY, vbW, vbH, cx, cy, maxR } = useMemo(() => {
@@ -297,8 +394,33 @@ function ReportOMCoverageDiff({
       {/* 커버리지 비교맵 */}
       <div className="rounded-md border border-gray-200 p-2">
         <svg viewBox={`${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}`} className="w-full">
+          <defs>
+            <clipPath id="om-map-clip">
+              <circle cx={cx} cy={cy} r={maxR + 2} />
+            </clipPath>
+          </defs>
+
           {/* 배경 */}
           <rect x={vbX} y={vbY} width={vbW} height={vbH} fill="#fafafa" rx={4} />
+
+          {/* 지도 배경 */}
+          {mapImage && (() => {
+            const kmPerDegLon = 111.32 * Math.cos((radarSite.latitude * Math.PI) / 180);
+            const kmPerDegLat = 111.32;
+            const imgX = cx + (mapImage.lonMin - radarSite.longitude) * kmPerDegLon * scale;
+            const imgY = cy - (mapImage.latMax - radarSite.latitude) * kmPerDegLat * scale;
+            const imgW = (mapImage.lonMax - mapImage.lonMin) * kmPerDegLon * scale;
+            const imgH = (mapImage.latMax - mapImage.latMin) * kmPerDegLat * scale;
+            return (
+              <image
+                href={mapImage.dataUrl}
+                x={imgX} y={imgY} width={imgW} height={imgH}
+                preserveAspectRatio="none"
+                opacity={0.5}
+                clipPath="url(#om-map-clip)"
+              />
+            );
+          })()}
 
           {/* 거리 링 */}
           {rings.map((ring, i) => {
@@ -437,6 +559,16 @@ function ReportOMCoverageDiff({
           })()}
         </svg>
       </div>
+
+      {/* 장애물 영향 차이 없음 안내 */}
+      {diffPaths.length === 0 && fixedWith.length > 0 && fixedWithout.length > 0 && (
+        <div className="mt-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-center text-[11px] text-blue-700">
+          분석 대상 장애물에 의한 실질적인 커버리지 차이가 발생하지 않았습니다.
+          {filteredLoss.length === 0
+            ? " 장애물 기인 Loss 또한 없습니다."
+            : ` (단, 장애물 기인 Loss ${filteredLoss.length}건 존재)`}
+        </div>
+      )}
 
       {/* 범례 */}
       <div className="mt-2 flex flex-wrap justify-center gap-4 text-[10px] text-gray-600">

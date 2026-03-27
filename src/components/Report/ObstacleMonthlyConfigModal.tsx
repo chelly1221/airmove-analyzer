@@ -477,9 +477,6 @@ export default function ObstacleMonthlyConfigModal({
                   const files = radarFiles.get(r.name) ?? [];
                   const monthFiles = filterFilesByMonth(files, analysisMonth);
                   const skipped = files.length - monthFiles.length;
-                  const [ay, am] = analysisMonth.split("-").map(Number);
-                  const prevLast = format(lastDayOfMonth(subMonths(new Date(ay, am - 1, 1), 1)), "yyyy-MM-dd");
-                  const prevLastCount = files.filter((f) => extractDateFromFilename(f) === prevLast).length;
                   return (
                     <div key={r.name} className="rounded-xl border border-gray-200 p-3.5">
                       <div className="flex items-center justify-between">
@@ -498,7 +495,6 @@ export default function ObstacleMonthlyConfigModal({
                           <p className="text-[10px] font-medium text-[#a60739]">
                             {files.length}개 파일 선택됨
                             {` (${monthFiles.length}개 파싱 예정`}
-                            {prevLastCount > 0 ? `, 전월 말일 ${prevLastCount}개 포함` : ""}
                             {skipped > 0 ? `, ${skipped}개 월 불일치 제외` : ""}
                             {")"}
                           </p>

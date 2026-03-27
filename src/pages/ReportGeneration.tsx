@@ -21,7 +21,6 @@ import { format } from "date-fns";
 import { useAppStore } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { flightLabel } from "../utils/flightConsolidation";
 import { queryFlightPoints } from "../utils/flightConsolidationWorker";
 import { computeLayersForAltitudes, isGPUCacheValidFor, type CoverageLayer } from "../utils/radarCoverage";
 import { haversineKm } from "../utils/geo";
@@ -385,38 +384,22 @@ export default function ReportGeneration() {
       const curPsCovWithout = dataOverride?.psCovLayersWithout ?? psCovLayersWithout;
       const curPsMonth = dataOverride?.psAnalysisMonth ?? psAnalysisMonth;
 
-      // 타이틀/서브타이틀 결정
+      // 타이틀/코멘터리 결정
       let title = "비행검사 보고서";
-      let subtitle = "";
       const grade = avgLossPercent < 1 ? "양호" : avgLossPercent < 5 ? "주의" : "경고";
       let comm = `금주 비행검사 항적 분석 결과, 평균 소실율은 ${avgLossPercent.toFixed(1)}%로 종합 판정 '${grade}' 수준입니다. 특이사항 없음.`;
       if (tpl === "weekly" || tpl === "monthly") {
         const label = tpl === "weekly" ? "주간" : "월간";
         title = `비행검사 ${label} 보고서`;
-        subtitle = tpl === "weekly"
-          ? `${format(new Date(), "yyyy년 MM월 dd일")} 기준 주간 보고`
-          : `${format(new Date(), "yyyy년 MM월")} 보고`;
         comm = `금${tpl === "weekly" ? "주" : "월"} 비행검사 항적 분석 결과, 평균 소실율은 ${avgLossPercent.toFixed(1)}%로 종합 판정 '${grade}' 수준입니다. 특이사항 없음.`;
       } else if (tpl === "flights") {
-        const ids = flightIds ?? selectedFlightIds;
         title = "비행 건별 분석 보고서";
-        subtitle = `${format(new Date(), "yyyy년 MM월 dd일")} · 선택 ${ids.size}건 비행 분석`;
       } else if (tpl === "obstacle") {
         title = "전파 장애물 분석 보고서";
-        subtitle = `${radarSite?.name ?? ""} 레이더 장애물 종합 분석 · ${format(new Date(), "yyyy년 MM월 dd일")}`;
       } else if (tpl === "obstacle_monthly") {
-        const radarNames = curOmData.selectedRadarSites.map((r) => r.name).join(", ");
         title = "장애물 월간 분석 보고서";
-        const monthLabel = curOmData.analysisMonth
-          ? `${curOmData.analysisMonth.slice(0, 4)}년 ${curOmData.analysisMonth.slice(5, 7)}월`
-          : format(new Date(), "yyyy년 MM월");
-        subtitle = radarNames ? `${radarNames} ${monthLabel}` : monthLabel;
       } else if (tpl === "single") {
-        const f = flights.find((fl) => fl.id === (singleId ?? singleFlightId));
-        if (f) {
-          title = "비행검사 상세 분석 보고서";
-          subtitle = `${flightLabel(f, aircraft)} · ${format(new Date(f.start_time * 1000), "yyyy-MM-dd")}`;
-        }
+        title = "비행검사 상세 분석 보고서";
       }
 
       // 맵 캡처 대상 결정 (실제 캡처는 창 열고 나서 비동기)
@@ -480,7 +463,6 @@ export default function ReportGeneration() {
         singleFlightId: sid ?? null,
         editingReportId,
         coverTitle: title,
-        coverSubtitle: subtitle,
         commentary: comm,
         flights: needsFlights ? reportFlights : [],
         reportFlights,
@@ -652,7 +634,7 @@ export default function ReportGeneration() {
         singleFlightId: sid,
         editingReportId: reportId,
         coverTitle: config.coverTitle ?? detail.title,
-        coverSubtitle: config.coverSubtitle ?? "",
+        coverSubtitle: config.coverSubtitle,
         commentary: config.commentary ?? "",
         flights: needsFlights ? reportFlights : [],
         reportFlights,

@@ -325,6 +325,12 @@ function ReportOMAltitudeDistribution({
                 </g>
               ))}
 
+              {/* 0° 수평선 */}
+              {minAngle <= 0 && maxAngle >= 0 && (
+                <line x1={MARGIN.left} y1={yScale(0)} x2={MARGIN.left + INNER_W} y2={yScale(0)}
+                  stroke="#374151" strokeWidth={0.8} />
+              )}
+
               {/* 파노라마 차단 프로파일 (미포함=베이스라인 점선, 포함=실선) */}
               {(() => {
                 const filterSort = (pts: PanoramaPoint[]) =>
