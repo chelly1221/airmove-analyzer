@@ -742,6 +742,8 @@ fn classify_and_convert(
     let timestamp = if base_date_secs > 0.0 {
         base_date_secs + tod
     } else {
+        // 파일명에서 날짜 추출 실패 → 폴백 타임스탬프 (2023-11-14 부근)
+        // 월간 보고서에서 분석월 필터 시 날짜 불일치로 "데이터 없음" 발생 가능
         1700000000.0 + tod
     };
 
@@ -1267,6 +1269,10 @@ fn extract_base_date_and_start_tod(filename: &str) -> (f64, Option<f64>) {
             (base, None)
         }
     } else {
+        log::warn!(
+            "[ASS] 파일명에서 날짜 추출 실패: '{}' — YYMMDD 패턴 없음. 타임스탬프가 부정확할 수 있습니다.",
+            filename,
+        );
         (0.0, None)
     }
 }

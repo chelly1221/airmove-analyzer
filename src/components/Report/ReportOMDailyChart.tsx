@@ -77,7 +77,8 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
   // PSR: 가중치 = SSR포인트수 (분모가 클수록 안정적), Loss: 가중치 = 비행시간(초)
   const getVal = (d: DailyStats) => mode === "psr" ? d.psr_rate * 100 : d.loss_rate;
   const getWeight = (d: DailyStats) => mode === "psr" ? d.ssr_combined_points : d.total_track_time_secs;
-  const activeDays = dailyStats.filter((d) => getVal(d) > 0);
+  // 가중치 > 0인 일자만 평균 계산 (데이터 없는 일자 제외 — 0값 편향 방지)
+  const activeDays = dailyStats.filter((d) => getWeight(d) > 0);
   const avg = activeDays.length > 0 ? weightedAvg(activeDays, getVal, getWeight) : 0;
   // σ_w = √( Σ(w·(x - x̄)²) / Σ(w) ) — 일별 산포 (관측량 가중)
   const sigma = activeDays.length > 0 ? weightedStdDev(activeDays, getVal, getWeight) : 0;

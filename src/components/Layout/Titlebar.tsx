@@ -6,7 +6,7 @@ import { useAppStore } from "../../store";
 
 const appWindow = getCurrentWindow();
 
-export default function Titlebar({ title, controlsOnly }: { title?: string; controlsOnly?: boolean }) {
+export default function Titlebar({ title, controlsOnly, children }: { title?: string; controlsOnly?: boolean; children?: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
   const setActivePage = useAppStore((s) => s.setActivePage);
@@ -24,7 +24,12 @@ export default function Titlebar({ title, controlsOnly }: { title?: string; cont
 
   if (controlsOnly) {
     return (
-      <div className="flex h-full select-none">
+      <div data-tauri-drag-region className="flex h-8 shrink-0 select-none items-center border-b border-gray-200 bg-white">
+        {children ? (
+          <div className="flex flex-1 items-center gap-3 px-4">{children}</div>
+        ) : (
+          <div data-tauri-drag-region className="flex-1" />
+        )}
         <button onClick={() => appWindow.minimize()} className="flex h-full w-11 items-center justify-center text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors" aria-label="Minimize"><Minus size={14} /></button>
         <button onClick={() => appWindow.toggleMaximize()} className="flex h-full w-11 items-center justify-center text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors" aria-label="Maximize">{maximized ? <Copy size={12} /> : <Square size={12} />}</button>
         <button onClick={() => appWindow.close()} className="flex h-full w-11 items-center justify-center text-gray-400 hover:bg-[#e81123] hover:text-white transition-colors" aria-label="Close"><X size={14} /></button>

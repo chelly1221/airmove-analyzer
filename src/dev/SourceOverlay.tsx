@@ -3,11 +3,22 @@
  * UI 요소 우클릭 시 해당 요소의 소스 파일:줄번호를 툴팁으로 표시 + 클립보드 복사
  */
 import { useEffect, useState, useCallback, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store";
 
 export default function SourceOverlay() {
-  const devMode = useAppStore((s) => s.devMode);
+  const storeDevMode = useAppStore((s) => s.devMode);
+  const [dbDevMode, setDbDevMode] = useState(false);
+  const devMode = storeDevMode || dbDevMode;
   const tooltipRef = useRef<HTMLDivElement>(null);
+
+  // 별도 윈도우(보고서 등)에서는 스토어가 공유되지 않으므로 DB에서 직접 로드
+  useEffect(() => {
+    if (storeDevMode) return; // 이미 스토어에서 true면 불필요
+    invoke<string | null>("load_setting", { key: "dev_mode" })
+      .then((v) => { if (v) setDbDevMode(JSON.parse(v) === true); })
+      .catch(() => {});
+  }, [storeDevMode]);
   const [info, setInfo] = useState<{
     text: string;
     x: number;

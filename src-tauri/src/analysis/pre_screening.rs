@@ -219,6 +219,7 @@ pub fn analyze_pre_screening(
     exclude_mode_s: &[String],
     mag_dec_deg: f64,
     srtm: &Mutex<SrtmReader>,
+    cancel: &std::sync::atomic::AtomicBool,
     progress_fn: &dyn Fn(ObstacleMonthlyProgress),
 ) -> Result<PreScreeningRadarResult, String> {
     let total_files = radar.file_paths.len();
@@ -302,6 +303,11 @@ pub fn analyze_pre_screening(
     let mut failed_files: Vec<String> = Vec::new();
 
     for (fi, path) in radar.file_paths.iter().enumerate() {
+        // 취소 체크
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("분석이 취소되었습니다".to_string());
+        }
+
         progress_fn(ObstacleMonthlyProgress {
             radar_name: radar.radar_name.clone(),
             stage: "parsing".to_string(),

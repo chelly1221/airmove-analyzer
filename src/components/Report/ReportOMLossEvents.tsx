@@ -33,24 +33,28 @@ function isInCoverageDiffArea(
 ): boolean {
   const { azDeg, distKm } = azimuthAndDist(radarLat, radarLon, lat, lon);
 
-  // 해당 고도에 가장 가까운 레이어 찾기
-  const findClosest = (layers: CoverageLayer[]) => {
-    if (layers.length === 0) return null;
-    let best = layers[0];
-    let bestDiff = Math.abs(layers[0].altitudeFt - altFt);
-    for (const l of layers) {
-      const d = Math.abs(l.altitudeFt - altFt);
-      if (d < bestDiff) { bestDiff = d; best = l; }
+  // 해당 고도의 커버리지 범위를 보간으로 계산 (nearest 대신 linear interpolation)
+  const interpolatedRange = (layers: CoverageLayer[]) => {
+    if (layers.length === 0) return 0;
+    // 고도순 정렬
+    const sorted = [...layers].sort((a, b) => a.altitudeFt - b.altitudeFt);
+    // 정확 일치 또는 범위 밖
+    if (altFt <= sorted[0].altitudeFt) return coverageRangeAt(sorted[0], azDeg);
+    if (altFt >= sorted[sorted.length - 1].altitudeFt) return coverageRangeAt(sorted[sorted.length - 1], azDeg);
+    // 두 레이어 간 보간
+    for (let i = 0; i < sorted.length - 1; i++) {
+      if (altFt >= sorted[i].altitudeFt && altFt <= sorted[i + 1].altitudeFt) {
+        const t = (altFt - sorted[i].altitudeFt) / (sorted[i + 1].altitudeFt - sorted[i].altitudeFt);
+        const r0 = coverageRangeAt(sorted[i], azDeg);
+        const r1 = coverageRangeAt(sorted[i + 1], azDeg);
+        return r0 + t * (r1 - r0);
+      }
     }
-    return best;
+    return coverageRangeAt(sorted[0], azDeg);
   };
 
-  const withLayer = findClosest(withLayers);
-  const withoutLayer = findClosest(withoutLayers);
-  if (!withLayer || !withoutLayer) return false;
-
-  const rangeWith = coverageRangeAt(withLayer, azDeg);
-  const rangeWithout = coverageRangeAt(withoutLayer, azDeg);
+  const rangeWith = interpolatedRange(withLayers);
+  const rangeWithout = interpolatedRange(withoutLayers);
 
   // 건물 제외 시 커버리지에 포함되지만 건물 포함 시 커버리지 밖 → 장애물 기인
   return distKm <= rangeWithout && distKm > rangeWith;

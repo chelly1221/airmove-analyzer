@@ -6,7 +6,7 @@
 import type {
   Flight, LoSProfileData, Aircraft, RadarSite, ReportMetadata,
   PanoramaPoint, ManualBuilding, AzSector, ObstacleMonthlyResult,
-  PreScreeningResult, OMReportData,
+  PreScreeningResult, OMReportData, TrackPoint,
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
 
@@ -44,7 +44,7 @@ export interface ReportSections {
 
 // ── 직렬화 가능한 OMReportData (Map → Array) ──
 
-interface SerializedOMData {
+export interface SerializedOMData {
   result: ObstacleMonthlyResult | null;
   selectedBuildings: ManualBuilding[];
   selectedRadarSites: RadarSite[];
@@ -100,6 +100,9 @@ export interface ReportWindowPayload {
   psCovLayersWith: CoverageLayer[];
   psCovLayersWithout: CoverageLayer[];
   psAnalysisMonth: string;
+
+  // 단일비행 차트 포인트 (보고서 윈도우에서 Worker가 없으므로 사전 전달)
+  singleFlightChartPoints?: TrackPoint[];
 }
 
 // ── Map ↔ Array 변환 ──
@@ -120,7 +123,8 @@ export function serializeOMData(om: OMReportData): SerializedOMData {
     panoWithoutTargets: [...om.panoWithoutTargets],
     coverageStatus: om.coverageStatus,
     panoramaStatus: om.panoramaStatus,
-    sectionImages: [...om.sectionImages],
+    // IDB 전송 시 sectionImages 제외 — 보고서 윈도우에서 자체 캡처
+    sectionImages: [],
   };
 }
 
@@ -185,11 +189,47 @@ export const DEFAULT_SECTIONS: ReportSections = {
   omFindings: true,
 };
 
+// ── 모달 설정 페이로드 (메인 → 보고서 창, 모달 표시용) ──
+
+export interface ReportConfigPayload {
+  template: ReportTemplate;
+  flights: Flight[];
+  losResults: LoSProfileData[];
+  aircraft: Aircraft[];
+  metadata: ReportMetadata;
+  radarSite: RadarSite;
+  panoramaData: PanoramaPoint[];
+  panoramaPeakNames: [number, string][];
+  coverageLayers: CoverageLayer[];
+  customRadarSites: RadarSite[];
+}
+
+// ── 생성 요청 (보고서 창 → 메인, 모달 설정 완료 후) ──
+
+export interface ReportGenerateRequest {
+  template: ReportTemplate;
+  sections: ReportSections;
+  selectedFlightIds?: string[];
+  singleFlightId?: string | null;
+  // 장애물 월간 분석 결과 (serialized)
+  omData?: SerializedOMData;
+  // 사전검토 분석 결과
+  psResult?: PreScreeningResult | null;
+  psSelectedBuildings?: ManualBuilding[];
+  psSelectedRadarSites?: RadarSite[];
+  psLosMap?: [string, LoSProfileData][];
+  psCovLayersWith?: CoverageLayer[];
+  psCovLayersWithout?: CoverageLayer[];
+  psAnalysisMonth?: string;
+}
+
 // ── IndexedDB 헬퍼 ──
 
 const DB_NAME = "report-transfer";
 const STORE_NAME = "data";
 const KEY = "current";
+const CONFIG_KEY = "config";
+const REQUEST_KEY = "request";
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -210,7 +250,17 @@ export async function writeReportPayload(payload: ReportWindowPayload): Promise<
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite");
-    tx.objectStore(STORE_NAME).put(payload, KEY);
+    const req = tx.objectStore(STORE_NAME).put(payload, KEY);
+    req.onerror = () => {
+      db.close();
+      // DOMException: QuotaExceededError
+      const err = req.error;
+      if (err?.name === "QuotaExceededError") {
+        reject(new Error("보고서 데이터가 너무 큽니다. 브라우저 저장소 용량을 초과했습니다. 불필요한 저장 보고서를 삭제 후 다시 시도하세요."));
+      } else {
+        reject(err);
+      }
+    };
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => { db.close(); reject(tx.error); };
   });
@@ -233,6 +283,76 @@ export async function clearReportPayload(): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite");
     tx.objectStore(STORE_NAME).delete(KEY);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// ── 설정 페이로드 (모달용) ──
+
+/** 메인 창 → IDB에 설정 페이로드 저장 (보고서 창 모달 표시용) */
+export async function writeReportConfig(payload: ReportConfigPayload): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(payload, CONFIG_KEY);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+/** 보고서 창 → IDB에서 설정 페이로드 읽기 */
+export async function readReportConfig(): Promise<ReportConfigPayload | null> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const req = tx.objectStore(STORE_NAME).get(CONFIG_KEY);
+    req.onsuccess = () => { db.close(); resolve(req.result ?? null); };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+
+/** 설정 페이로드 정리 */
+export async function clearReportConfig(): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).delete(CONFIG_KEY);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// ── 생성 요청 (보고서 창 → 메인) ──
+
+/** 보고서 창 → IDB에 생성 요청 저장 */
+export async function writeGenerateRequest(req: ReportGenerateRequest): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(req, REQUEST_KEY);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+/** 메인 창 → IDB에서 생성 요청 읽기 */
+export async function readGenerateRequest(): Promise<ReportGenerateRequest | null> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const req = tx.objectStore(STORE_NAME).get(REQUEST_KEY);
+    req.onsuccess = () => { db.close(); resolve(req.result ?? null); };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+
+/** 생성 요청 정리 */
+export async function clearGenerateRequest(): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).delete(REQUEST_KEY);
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => { db.close(); reject(tx.error); };
   });

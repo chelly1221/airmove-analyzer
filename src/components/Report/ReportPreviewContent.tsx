@@ -33,7 +33,7 @@ import ReportPSAdditionalLoss from "./ReportPSAdditionalLoss";
 import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
   PanoramaPoint, ManualBuilding, RadarSite, ObstacleMonthlyResult,
-  PreScreeningResult, OMReportData,
+  PreScreeningResult, OMReportData, TrackPoint,
 } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import type { ReportTemplate, ReportSections } from "../../utils/reportTransfer";
@@ -108,6 +108,9 @@ export interface ReportPreviewContentProps {
 
   // OM 콜백
   onOmDataChange: (updater: (prev: OMReportData) => OMReportData) => void;
+
+  // 단일비행 차트 포인트 (보고서 윈도우용)
+  singleFlightChartPoints?: TrackPoint[];
 
   // ref
   previewRef: React.RefObject<HTMLDivElement | null>;
@@ -185,6 +188,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     commentary, onCommentaryChange,
     forceAllVisible,
     onOmDataChange,
+    singleFlightChartPoints,
     previewRef,
   } = props;
 
@@ -322,23 +326,19 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
 
           {sections.los && losResults.length > 0 && (
-            <ReportPage>
-              <ReportLoSSection
-                sectionNum={sectionNumbers.los ?? 5}
-                losResults={losResults}
-              />
-            </ReportPage>
+            <ReportLoSSection
+              sectionNum={sectionNumbers.los ?? 5}
+              losResults={losResults}
+            />
           )}
 
           {sections.panorama && panoramaData.length > 0 && radarSite && (
-            <ReportPage>
-              <ReportPanoramaSection
-                sectionNum={sectionNumbers.panorama ?? 6}
-                panoramaData={panoramaData}
-                radarSite={radarSite}
-                peakNames={panoramaPeakNames}
-              />
-            </ReportPage>
+            <ReportPanoramaSection
+              sectionNum={sectionNumbers.panorama ?? 6}
+              panoramaData={panoramaData}
+              radarSite={radarSite}
+              peakNames={panoramaPeakNames}
+            />
           )}
 
           {sections.aircraft && aircraft.length > 0 && (
@@ -406,12 +406,10 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
 
           {sections.los && psLosMap.size > 0 && (
-            <ReportPage>
-              <ReportLoSSection
-                sectionNum={sectionNumbers.los ?? 5}
-                losResults={[...psLosMap.values()]}
-              />
-            </ReportPage>
+            <ReportLoSSection
+              sectionNum={sectionNumbers.los ?? 5}
+              losResults={[...psLosMap.values()]}
+            />
           )}
         </>
       )}
@@ -560,14 +558,12 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           })}
 
           {sections.omBuildingLos && (
-            <ReportPage>
-              <ReportOMBuildingLoS
-                sectionNum={sectionNumbers.omBuildingLos ?? 7}
-                selectedBuildings={omData.selectedBuildings}
-                radarSites={omData.selectedRadarSites}
-                losMap={omData.losMap}
-              />
-            </ReportPage>
+            <ReportOMBuildingLoS
+              sectionNum={sectionNumbers.omBuildingLos ?? 7}
+              selectedBuildings={omData.selectedBuildings}
+              radarSites={omData.selectedRadarSites}
+              losMap={omData.losMap}
+            />
           )}
 
           {sections.omAltitude && (
@@ -634,21 +630,19 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       {/* ─── 비행 건별 ─── */}
       {template === "flights" && (
         <>
-          {(sections.flightComparison || sections.trackMap) && (
+          {sections.flightComparison && (
+            <ReportFlightComparisonSection
+              sectionNum={sectionNumbers.flightComparison ?? 1}
+              flights={reportFlights}
+              radarSite={radarSite}
+            />
+          )}
+          {sections.trackMap && (
             <ReportPage>
-              {sections.flightComparison && (
-                <ReportFlightComparisonSection
-                  sectionNum={sectionNumbers.flightComparison ?? 1}
-                  flights={reportFlights}
-                  radarSite={radarSite}
-                />
-              )}
-              {sections.trackMap && (
-                <ReportMapSection
-                  sectionNum={sectionNumbers.trackMap ?? 2}
-                  mapImage={mapImage}
-                />
-              )}
+              <ReportMapSection
+                sectionNum={sectionNumbers.trackMap ?? 2}
+                mapImage={mapImage}
+              />
             </ReportPage>
           )}
 
@@ -663,23 +657,19 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
 
           {sections.los && losResults.length > 0 && (
-            <ReportPage>
-              <ReportLoSSection
-                sectionNum={sectionNumbers.los ?? 5}
-                losResults={losResults}
-              />
-            </ReportPage>
+            <ReportLoSSection
+              sectionNum={sectionNumbers.los ?? 5}
+              losResults={losResults}
+            />
           )}
 
           {sections.panorama && panoramaData.length > 0 && radarSite && (
-            <ReportPage>
-              <ReportPanoramaSection
-                sectionNum={sectionNumbers.panorama ?? 6}
-                panoramaData={panoramaData}
-                radarSite={radarSite}
-                peakNames={panoramaPeakNames}
-              />
-            </ReportPage>
+            <ReportPanoramaSection
+              sectionNum={sectionNumbers.panorama ?? 6}
+              panoramaData={panoramaData}
+              radarSite={radarSite}
+              peakNames={panoramaPeakNames}
+            />
           )}
         </>
       )}
@@ -694,6 +684,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                   sectionNum={sectionNumbers.flightProfile ?? 1}
                   flight={singleFlight}
                   radarSite={radarSite}
+                  preloadedPoints={singleFlightChartPoints}
                 />
               )}
               {sections.trackMap && (
@@ -715,23 +706,19 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
 
           {sections.los && losResults.length > 0 && (
-            <ReportPage>
-              <ReportLoSSection
-                sectionNum={sectionNumbers.los ?? 5}
-                losResults={losResults}
-              />
-            </ReportPage>
+            <ReportLoSSection
+              sectionNum={sectionNumbers.los ?? 5}
+              losResults={losResults}
+            />
           )}
 
           {sections.panorama && panoramaData.length > 0 && radarSite && (
-            <ReportPage>
-              <ReportPanoramaSection
-                sectionNum={sectionNumbers.panorama ?? 6}
-                panoramaData={panoramaData}
-                radarSite={radarSite}
-                peakNames={panoramaPeakNames}
-              />
-            </ReportPage>
+            <ReportPanoramaSection
+              sectionNum={sectionNumbers.panorama ?? 6}
+              panoramaData={panoramaData}
+              radarSite={radarSite}
+              peakNames={panoramaPeakNames}
+            />
           )}
         </>
       )}

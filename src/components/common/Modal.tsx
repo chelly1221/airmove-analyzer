@@ -7,6 +7,8 @@ interface ModalProps {
   title: string;
   children: ReactNode;
   width?: string;
+  /** false이면 배경 클릭/ESC로 닫히지 않음 (X 버튼·취소만 가능) */
+  closable?: boolean;
 }
 
 export default function Modal({
@@ -15,6 +17,7 @@ export default function Modal({
   title,
   children,
   width = "max-w-lg",
+  closable = true,
 }: ModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -27,12 +30,12 @@ export default function Modal({
   useEffect(() => {
     if (!open) return;
     const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCloseRef.current();
+      if (e.key === "Escape" && closable) onCloseRef.current();
     };
     document.addEventListener("keydown", handleEsc);
     dialogRef.current?.focus();
     return () => document.removeEventListener("keydown", handleEsc);
-  }, [open]);
+  }, [open, closable]);
 
   if (!open) return null;
 
@@ -44,7 +47,7 @@ export default function Modal({
         mouseDownTargetRef.current = e.target;
       }}
       onClick={(e) => {
-        if (e.target === overlayRef.current && mouseDownTargetRef.current === overlayRef.current) onClose();
+        if (closable && e.target === overlayRef.current && mouseDownTargetRef.current === overlayRef.current) onClose();
       }}
     >
       <div

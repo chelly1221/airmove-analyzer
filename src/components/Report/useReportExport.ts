@@ -6,8 +6,18 @@ import { save } from "@tauri-apps/plugin-dialog";
 export interface ExportResult {
   success: boolean;
   error?: string;
-  /** 생성된 PDF base64 (DB 저장용) */
+  /** 생성된 PDF base64 (DB 저장용) — 통합 커맨드 사용 시 undefined */
   pdfBase64?: string;
+}
+
+/** 통합 커맨드에 전달할 보고서 메타데이터 */
+export interface ReportSaveMeta {
+  reportId: string;
+  title: string;
+  template: string;
+  radarName: string;
+  reportConfigJson: string;
+  metadataJson?: string;
 }
 
 /** WebView2 네이티브 PrintToPdf — 벡터 PDF, GPU 가속
@@ -21,6 +31,7 @@ export interface ExportResult {
 async function exportViaNative(
   containerRef: React.RefObject<HTMLDivElement | null>,
   savePath: string,
+  reportMeta?: ReportSaveMeta,
 ): Promise<ExportResult> {
   if (!containerRef.current) {
     return { success: false, error: "미리보기 컨테이너를 찾을 수 없습니다" };
@@ -107,26 +118,49 @@ async function exportViaNative(
   // 렌더링 안정화 대기
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-  try {
-    // WebView2 PrintToPdf IPC 호출 — base64 PDF 반환
-    const pdfBase64 = await invoke<string>("webview_print_to_pdf", {
-      path: savePath,
-      windowLabel: getCurrentWindow().label,
-    });
+  // DOM 복원 함수 (정상 흐름 + 비정상 종료 양쪽에서 사용)
+  const restoreDOM = () => {
+    styleEl.remove();
+    container.id = prevContainerId;
+    hiddenContainerChildren.forEach((el) => el.style.removeProperty("display"));
+    hiddenBodyChildren.forEach((el) => el.style.removeProperty("display"));
+    hiddenAncestorSiblings.forEach((el) => el.style.removeProperty("display"));
+  };
 
-    return { success: true, pdfBase64 };
+  // 비정상 종료 시 DOM 복원 보장
+  const onBeforeUnload = () => restoreDOM();
+  window.addEventListener("beforeunload", onBeforeUnload);
+
+  try {
+    if (reportMeta) {
+      // 통합 커맨드: PDF 생성 + 파일 저장 + DB BLOB 저장을 Rust에서 일괄 처리
+      await invoke<boolean>("webview_print_and_save_report", {
+        savePath,
+        windowLabel: getCurrentWindow().label,
+        reportId: reportMeta.reportId,
+        title: reportMeta.title,
+        template: reportMeta.template,
+        radarName: reportMeta.radarName,
+        reportConfigJson: reportMeta.reportConfigJson,
+        metadataJson: reportMeta.metadataJson ?? null,
+      });
+      return { success: true };
+    } else {
+      // 기존 경로: base64 반환
+      const pdfBase64 = await invoke<string>("webview_print_to_pdf", {
+        path: savePath,
+        windowLabel: getCurrentWindow().label,
+      });
+      return { success: true, pdfBase64 };
+    }
   } catch (err) {
     return {
       success: false,
       error: `WebView2 PDF 생성 실패: ${err instanceof Error ? err.message : String(err)}`,
     };
   } finally {
-    // DOM 원복 — 페이지는 이동하지 않았으므로 숨김만 해제
-    styleEl.remove();
-    container.id = prevContainerId;
-    hiddenContainerChildren.forEach((el) => el.style.removeProperty("display"));
-    hiddenBodyChildren.forEach((el) => el.style.removeProperty("display"));
-    hiddenAncestorSiblings.forEach((el) => el.style.removeProperty("display"));
+    window.removeEventListener("beforeunload", onBeforeUnload);
+    restoreDOM();
   }
 }
 
@@ -135,6 +169,7 @@ export function useReportExport() {
     async (
       containerRef: React.RefObject<HTMLDivElement | null>,
       defaultFilename: string,
+      reportMeta?: ReportSaveMeta,
     ): Promise<ExportResult> => {
       // 저장 경로 먼저 선택
       const savePath = await save({
@@ -146,7 +181,7 @@ export function useReportExport() {
         return { success: false, error: "저장이 취소되었습니다" };
       }
 
-      return exportViaNative(containerRef, savePath);
+      return exportViaNative(containerRef, savePath, reportMeta);
     },
     []
   );

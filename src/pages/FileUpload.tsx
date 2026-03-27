@@ -26,6 +26,7 @@ import { useAppStore } from "../store";
 import { sendPointsToWorker, startConsolidate, clearWorkerPoints, getPointSummary, createThrottledChunkHandler, setConsolidationProgressCallback } from "../utils/flightConsolidationWorker";
 import maplibregl from "maplibre-gl";
 import Modal from "../components/common/Modal";
+import { Dropdown } from "../components/common/Dropdown";
 import { SrtmDownloadSection, FacBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
 import type { AnalysisResult, BuildingGroup, Flight, GeometryType, ManualBuilding, UploadedFile } from "../types";
 
@@ -216,6 +217,7 @@ function BuildingModal({
 
   // hover 중인 도형 인덱스 (확정된 도형 위에 삭제 버튼 표시)
   const [hoveredShapeIdx, setHoveredShapeIdx] = useState<number | null>(null);
+  const [noGeomWarning, setNoGeomWarning] = useState(false);
 
   useEffect(() => {
     if (initial) {
@@ -247,6 +249,7 @@ function BuildingModal({
     setClickPts([]);
     setMousePt(null);
     setHoveredShapeIdx(null);
+    setNoGeomWarning(false);
     setMiniMapReady(false);
   }, [initial, isOpen]);
 
@@ -257,6 +260,22 @@ function BuildingModal({
     const allShapes = [...confirmedShapes];
     if (form.geometry_json && form.geometry_type !== "multi") {
       allShapes.push({ type: form.geometry_type, json: form.geometry_json });
+    }
+
+    // 도형 유효성 검증: 최소 하나의 유효한 도형 필요
+    const hasValidGeometry = allShapes.some((s) => {
+      if (!s.json) return false;
+      try {
+        const parsed = JSON.parse(s.json);
+        if (s.type === "polygon" && Array.isArray(parsed)) return parsed.length >= 3;
+        if (s.type === "multi" && Array.isArray(parsed)) return parsed.length >= 1;
+        return false;
+      } catch { return false; }
+    });
+
+    if (!hasValidGeometry) {
+      setNoGeomWarning(true);
+      return;
     }
 
     const finalForm = { ...form };
@@ -698,6 +717,30 @@ function BuildingModal({
       <div className="flex gap-4">
         {/* 왼쪽: 입력 폼 */}
         <div className="w-64 shrink-0 space-y-2.5">
+          {/* 그룹 선택 (최상단) */}
+          {groups.length > 0 && (
+            <div>
+              <label className="mb-0.5 block text-xs font-medium text-gray-600">그룹</label>
+              <Dropdown
+                trigger={
+                  <div className="flex w-60 items-center justify-between rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm">
+                    <span className={form.group_id != null ? "text-gray-800" : "text-gray-400"}>
+                      {form.group_id != null ? (groups.find((g) => g.id === form.group_id)?.name ?? "미분류") : "미분류"}
+                    </span>
+                    <ChevronDown size={14} className="text-gray-400" />
+                  </div>
+                }
+                options={[
+                  { key: "", label: "미분류" },
+                  ...groups.map((g) => ({ key: String(g.id), label: g.name })),
+                ]}
+                selected={form.group_id != null ? String(form.group_id) : ""}
+                onSelect={(key) => setForm((f) => ({ ...f, group_id: key ? Number(key) : null }))}
+                width="w-full"
+              />
+            </div>
+          )}
+
           {fields.map(({ key, label, placeholder, type, required }) => (
             <div key={key}>
               <label className="mb-0.5 block text-xs font-medium text-gray-600">
@@ -772,24 +815,13 @@ function BuildingModal({
             </div>
           )}
 
-          {/* 그룹 선택 */}
-          {groups.length > 0 && (
-            <div>
-              <label className="mb-0.5 block text-xs font-medium text-gray-600">그룹</label>
-              <select
-                value={form.group_id ?? ""}
-                onChange={(e) => setForm((f) => ({ ...f, group_id: e.target.value ? Number(e.target.value) : null }))}
-                className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-800 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30"
-              >
-                <option value="">미분류</option>
-                {groups.map((g) => (
-                  <option key={g.id} value={g.id}>{g.name}</option>
-                ))}
-              </select>
-            </div>
-          )}
-
           <div className="flex items-center justify-end gap-2 pt-2">
+            {noGeomWarning && (
+              <div className="flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-700">
+                <span>건물 도형을 그려주세요. 도형이 없으면 장애물 분석에서 방위 구간을 산출할 수 없습니다.</span>
+                <button onClick={() => setNoGeomWarning(false)} className="shrink-0 text-amber-400 hover:text-amber-600">✕</button>
+              </div>
+            )}
             <button
               onClick={onClose}
               className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
@@ -1145,13 +1177,17 @@ function ManualBuildingPanel() {
           memo: groupForm.memo,
           areaBoundsJson: groupForm.area_bounds_json || null,
         });
+        // 수정된 그룹 펼치기
+        setCollapsedGroups((prev) => { const next = new Set(prev); next.delete(editGroup.id); return next; });
       } else {
-        await invoke<number>("add_building_group", {
+        const newId = await invoke<number>("add_building_group", {
           name: groupForm.name.trim(),
           color: groupForm.color,
           memo: groupForm.memo,
           areaBoundsJson: groupForm.area_bounds_json || null,
         });
+        // 새 그룹 펼치기
+        setCollapsedGroups((prev) => { const next = new Set(prev); next.delete(newId); return next; });
       }
       setGroupModalOpen(false);
       loadData();
@@ -1295,7 +1331,7 @@ function ManualBuildingPanel() {
           <div className="flex items-center justify-center py-12 text-gray-400">
             <Loader2 size={20} className="animate-spin" />
           </div>
-        ) : buildings.length === 0 ? (
+        ) : buildings.length === 0 && groups.length === 0 ? (
           <div className="rounded-xl border border-dashed border-gray-300 py-12 text-center">
             <Building2 size={32} className="mx-auto mb-2 text-gray-300" />
             <p className="text-sm text-gray-400">등록된 건물이 없습니다</p>
@@ -1566,7 +1602,7 @@ function ManualBuildingPanel() {
                       setTimeout(() => {
                         groupMapRef.current?.fitBounds(
                           [[minLon, minLat], [maxLon, maxLat]],
-                          { padding: 30, maxZoom: 18, duration: 0 },
+                          { padding: 30, maxZoom: 18, duration: 500 },
                         );
                       }, 50);
                     } catch { /* ignore */ }

@@ -143,10 +143,12 @@ fn in_any_sector(az: f64, sectors: &[AzSector]) -> bool {
     sectors.iter().any(|s| s.contains(az))
 }
 
-/// 타임스탬프 → 날짜 문자열 (UTC)
-/// ASS 파일의 타임스탬프는 자정 기준 초 + 날짜 보정이 이미 적용된 Unix epoch 초.
+/// 타임스탬프 → 날짜 문자열 (KST = UTC+9)
+/// ASS 파일의 타임스탬프는 Unix epoch 초(UTC). 분석월/파일명이 KST 기준이므로
+/// 일별 집계도 KST 기준으로 수행한다.
 fn timestamp_to_date(ts: f64) -> String {
-    let secs = ts as i64;
+    const KST_OFFSET: i64 = 9 * 3600; // UTC+9
+    let secs = ts as i64 + KST_OFFSET;
     let days = if secs >= 0 { secs / 86400 } else { (secs - 86399) / 86400 };
     let (y, m, d) = days_to_ymd(days);
     format!("{:04}-{:02}-{:02}", y, m, d)
@@ -200,6 +202,7 @@ pub fn analyze_radar_monthly(
     radar: &RadarFileSet,
     exclude_mode_s: &[String],
     mag_dec_deg: f64,
+    cancel: &std::sync::atomic::AtomicBool,
     progress_fn: &dyn Fn(ObstacleMonthlyProgress),
 ) -> Result<RadarMonthlyResult, String> {
     let total_files = radar.file_paths.len();
@@ -219,6 +222,11 @@ pub fn analyze_radar_monthly(
     let has_sectors = !radar.azimuth_sectors.is_empty();
 
     for (i, path) in radar.file_paths.iter().enumerate() {
+        // 취소 체크
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("분석이 취소되었습니다".to_string());
+        }
+
         progress_fn(ObstacleMonthlyProgress {
             radar_name: radar.radar_name.clone(),
             stage: "parsing".to_string(),
@@ -320,6 +328,20 @@ pub fn analyze_radar_monthly(
 
     let mut sorted_dates: Vec<String> = daily_points.keys().cloned().collect();
     sorted_dates.sort();
+
+    // 날짜 범위 진단 로그
+    if sorted_dates.is_empty() {
+        info!("[ObstacleMonthly] 레이더 '{}': 필터링 후 데이터 없음 (총 파일 {}개)", radar.radar_name, total_files);
+    } else {
+        info!(
+            "[ObstacleMonthly] 레이더 '{}': 날짜 범위 {} ~ {} ({} 일, {} 포인트)",
+            radar.radar_name,
+            sorted_dates.first().unwrap(),
+            sorted_dates.last().unwrap(),
+            total_days,
+            daily_points.values().map(|v| v.len()).sum::<usize>()
+        );
+    }
 
     for (di, date) in sorted_dates.iter().enumerate() {
         progress_fn(ObstacleMonthlyProgress {

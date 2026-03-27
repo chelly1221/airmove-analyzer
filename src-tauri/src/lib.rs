@@ -14,7 +14,8 @@ pub mod vworld;
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use log::info;
 use rusqlite::params;
@@ -52,8 +53,9 @@ fn emit_and_drain_track_points(
 /// Application state for managing aircraft data.
 struct AppState {
     app_data_dir: Mutex<PathBuf>,
-    db: Mutex<db::Db>,
+    db: Mutex<db::DbPool>,
     srtm: Mutex<srtm::SrtmReader>,
+    analysis_cancel: Arc<AtomicBool>,
 }
 
 /// 앱 데이터 디렉토리 경로 확보
@@ -105,7 +107,7 @@ fn analyze_tracks(parsed: ParsedFile, threshold: f64) -> Result<AnalysisResult, 
 /// Get the list of registered aircraft.
 #[tauri::command]
 fn get_aircraft_list(state: tauri::State<'_, AppState>) -> Result<Vec<Aircraft>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::get_aircraft_list(&conn).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -113,7 +115,7 @@ fn get_aircraft_list(state: tauri::State<'_, AppState>) -> Result<Vec<Aircraft>,
 #[tauri::command]
 fn save_aircraft(aircraft: Aircraft, state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("Command: save_aircraft(id={}, name={})", aircraft.id, aircraft.name);
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::save_aircraft(&conn, &aircraft).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -121,7 +123,7 @@ fn save_aircraft(aircraft: Aircraft, state: tauri::State<'_, AppState>) -> Resul
 #[tauri::command]
 fn delete_aircraft(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("Command: delete_aircraft(id={})", id);
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     let changed = db::delete_aircraft(&conn, &id).map_err(|e| format!("DB error: {}", e))?;
     if changed == 0 {
         return Err(format!("Aircraft with id '{}' not found", id));
@@ -439,13 +441,52 @@ async fn webview_print_to_pdf(
     }
 }
 
+/// WebView2 PrintToPdf + 파일 저장 + DB BLOB 저장을 Rust 내부에서 일괄 처리
+/// base64 PDF 데이터를 프론트엔드로 전송하지 않아 IPC 오버헤드 제거
+#[tauri::command]
+async fn webview_print_and_save_report(
+    app_handle: tauri::AppHandle,
+    save_path: String,
+    window_label: Option<String>,
+    report_id: String,
+    title: String,
+    template: String,
+    radar_name: String,
+    report_config_json: String,
+    metadata_json: Option<String>,
+) -> Result<bool, String> {
+    // 1. 기존 webview_print_to_pdf 로직으로 base64 획득
+    let pdf_base64 = webview_print_to_pdf(
+        app_handle.clone(),
+        save_path.clone(),
+        window_label,
+    ).await?;
+
+    // 2. base64 → bytes
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let pdf_bytes = STANDARD.decode(&pdf_base64)
+        .map_err(|e| format!("PDF base64 decode: {}", e))?;
+
+    // 3. 파일은 이미 webview_print_to_pdf에서 저장됨
+
+    // 4. DB에 BLOB 저장
+    let state = app_handle.state::<AppState>();
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+    db::save_report(
+        &conn, &report_id, &title, &template, &radar_name,
+        &report_config_json, Some(&pdf_bytes), metadata_json.as_deref(),
+    ).map_err(|e| format!("DB error: {}", e))?;
+
+    Ok(true)
+}
+
 /// 설정값 로드 (프론트엔드용)
 #[tauri::command]
 fn load_setting(
     key: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::get_setting(&conn, &key).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -456,7 +497,7 @@ fn save_setting(
     value: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::set_setting(&conn, &key, &value).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -475,7 +516,7 @@ fn export_database(
     let db_path = get_db_path(&state)?;
     // WAL 체크포인트 → 단일 파일로 정리
     {
-        let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(|e| format!("WAL checkpoint error: {}", e))?;
     }
@@ -485,7 +526,7 @@ fn export_database(
     Ok(())
 }
 
-/// DB 가져오기 (지정 경로의 DB로 교체, 연결 재수립)
+/// DB 가져오기 (지정 경로의 DB로 교체, 풀 재생성)
 #[tauri::command]
 fn import_database(
     src_path: String,
@@ -501,25 +542,26 @@ fn import_database(
         return Err("유효한 SQLite 데이터베이스 파일이 아닙니다.".to_string());
     }
 
-    // 기존 연결 닫기 (락 해제 후 파일 I/O 수행)
-    {
-        let mut conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-        // 기존 연결을 in-memory로 교체하여 파일 핸들 해제
-        drop(std::mem::replace(&mut *conn, rusqlite::Connection::open_in_memory().map_err(|e| format!("임시 DB 오류: {}", e))?));
-    } // 락 해제
+    // 풀 교체 (Mutex 잠금 상태에서 수행 → 다른 커맨드 차단)
+    let mut pool_guard = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
 
-    // DB 파일 교체 (락 없이 수행 — 대용량 파일도 다른 명령 차단 안 함)
+    // 기존 풀 drop → 모든 연결 해제
+    // 인메모리 풀로 임시 교체하여 파일 핸들 확실히 해제
+    let temp_manager = r2d2_sqlite::SqliteConnectionManager::memory();
+    let temp_pool = r2d2::Pool::builder().max_size(1).build(temp_manager)
+        .map_err(|e| format!("임시 풀 오류: {}", e))?;
+    *pool_guard = temp_pool;
+
+    // DB 파일 교체
     fs::copy(src, &db_path)
         .map_err(|e| format!("파일 복사 실패: {}", e))?;
     // WAL/SHM 잔여 파일 제거
     let _ = fs::remove_file(db_path.with_extension("db-wal"));
     let _ = fs::remove_file(db_path.with_extension("db-shm"));
 
-    // 새 연결 수립 (락 재획득)
-    let mut conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    let new_conn = db::init_db(&db_path)
-        .map_err(|e| format!("DB 재연결 실패: {}", e))?;
-    *conn = new_conn;
+    // 새 풀 생성 (마이그레이션 포함)
+    let new_pool = db::init_db_pool(&db_path)?;
+    *pool_guard = new_pool;
 
     info!("Database imported from: {}", src_path);
     Ok(())
@@ -542,7 +584,7 @@ fn calculate_los_panorama(
     let r_step = range_step_m.unwrap_or(200.0);
     let exclude_ids = exclude_manual_ids.unwrap_or_default();
 
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
 
     Ok(analysis::panorama::calculate_panorama(
@@ -642,7 +684,7 @@ fn panorama_merge_buildings(
     let max_range = max_range_km.unwrap_or(100.0);
     let az_step = azimuth_step_deg.unwrap_or(0.01);
 
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
 
     Ok(analysis::panorama::merge_buildings_into_panorama(
@@ -662,7 +704,7 @@ fn save_panorama_cache(
     radar_height_m: f64,
     data_json: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::save_panorama_cache(&conn, radar_lat, radar_lon, radar_height_m, &data_json)
         .map_err(|e| format!("DB error: {}", e))
 }
@@ -674,7 +716,7 @@ fn load_panorama_cache(
     radar_lat: f64,
     radar_lon: f64,
 ) -> Result<Option<String>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::load_panorama_cache(&conn, radar_lat, radar_lon)
         .map_err(|e| format!("DB error: {}", e))
 }
@@ -686,7 +728,7 @@ fn clear_panorama_cache(
     radar_lat: f64,
     radar_lon: f64,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::clear_panorama_cache(&conn, radar_lat, radar_lon)
         .map_err(|e| format!("DB error: {}", e))
 }
@@ -715,7 +757,7 @@ fn fetch_elevation(
 fn get_srtm_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<(i64, i64)>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     db::get_srtm_status(&conn).map_err(|e| e.to_string())
 }
 
@@ -867,7 +909,7 @@ fn query_buildings_along_path(
     target_lon: f64,
     corridor_width_m: Option<f64>,
 ) -> Result<Vec<building::BuildingOnPath>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     let width = corridor_width_m.unwrap_or(100.0);
     building::query_buildings_along_path(&conn, radar_lat, radar_lon, target_lat, target_lon, width)
 }
@@ -881,7 +923,7 @@ async fn import_fac_building_data(
     region: String,
 ) -> Result<String, String> {
     let state = app_handle.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
 
     let handle = app_handle.clone();
     let region_clone = region.clone();
@@ -903,7 +945,7 @@ fn query_fac_buildings_3d(
     min_height_m: Option<f64>,
     max_count: Option<usize>,
 ) -> Result<Vec<building::Building3D>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     fac_building::query_fac_buildings_3d(
         &conn,
         min_lat, max_lat, min_lon, max_lon,
@@ -916,7 +958,7 @@ fn query_fac_buildings_3d(
 fn get_fac_building_import_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<fac_building::FacBuildingImportStatus>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     fac_building::get_import_status(&conn)
 }
 
@@ -925,7 +967,7 @@ fn clear_fac_building_data(
     state: tauri::State<'_, AppState>,
     region: Option<String>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     fac_building::clear_data(&conn, region.as_deref())
 }
 
@@ -938,7 +980,7 @@ async fn import_landuse_data(
     region: String,
 ) -> Result<String, String> {
     let state = app_handle.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
 
     let handle = app_handle.clone();
     let region_clone = region.clone();
@@ -963,7 +1005,7 @@ fn query_landuse_in_bbox(
     max_lon: f64,
     max_count: Option<usize>,
 ) -> Result<Vec<landuse::LandUseZone>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     landuse::query_in_bbox(&conn, min_lat, max_lat, min_lon, max_lon, max_count.unwrap_or(50_000))
 }
 
@@ -971,7 +1013,7 @@ fn query_landuse_in_bbox(
 fn get_landuse_import_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<landuse::LandUseImportStatus>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     landuse::get_import_status(&conn)
 }
 
@@ -980,7 +1022,7 @@ fn clear_landuse_data(
     state: tauri::State<'_, AppState>,
     region: Option<String>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     landuse::clear_data(&conn, region.as_deref())
 }
 
@@ -992,7 +1034,7 @@ async fn import_peak_data(
     zip_path: String,
 ) -> Result<String, String> {
     let state = app_handle.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     let handle = app_handle.clone();
     let count = peak::import_from_zip(&conn, &zip_path, &|progress| {
         let _ = handle.emit("peak-import-progress", progress);
@@ -1007,7 +1049,7 @@ fn query_nearby_peaks(
     lon: f64,
     radius_km: f64,
 ) -> Result<Vec<peak::NearbyPeak>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     peak::query_nearby_peaks(&conn, lat, lon, radius_km)
 }
 
@@ -1015,7 +1057,7 @@ fn query_nearby_peaks(
 fn get_peak_import_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<peak::PeakImportStatus>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     peak::get_import_status(&conn)
 }
 
@@ -1023,7 +1065,7 @@ fn get_peak_import_status(
 fn clear_peak_data(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     peak::clear_data(&conn)
 }
 
@@ -1038,7 +1080,7 @@ fn query_buildings_in_bbox(
     max_lon: f64,
     min_height_m: Option<f64>,
 ) -> Result<Vec<building::BuildingInArea>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::query_buildings_in_bbox(&conn, min_lat, max_lat, min_lon, max_lon, min_height_m.unwrap_or(3.0))
 }
 
@@ -1055,7 +1097,7 @@ fn query_buildings_3d(
     max_count: Option<usize>,
     exclude_sources: Option<Vec<String>>,
 ) -> Result<Vec<building::Building3D>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::query_buildings_3d(
         &conn,
         min_lat, max_lat, min_lon, max_lon,
@@ -1076,7 +1118,7 @@ fn query_buildings_3d_binary(
     max_count: Option<usize>,
     exclude_sources: Option<Vec<String>>,
 ) -> Result<building::Buildings3DBinary, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::query_buildings_3d_binary(
         &conn,
         min_lat, max_lat, min_lon, max_lon,
@@ -1092,7 +1134,7 @@ fn query_buildings_3d_binary(
 fn list_building_groups(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<building::BuildingGroup>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::list_building_groups(&conn)
 }
 
@@ -1104,7 +1146,7 @@ fn add_building_group(
     memo: String,
     area_bounds_json: Option<String>,
 ) -> Result<i64, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::add_building_group(&conn, &name, &color, &memo, area_bounds_json.as_deref())
 }
 
@@ -1119,7 +1161,7 @@ fn update_building_group(
     plan_rotation: Option<f64>,
     area_bounds_json: Option<String>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::update_building_group(&conn, id, &name, &color, &memo, plan_opacity, plan_rotation, area_bounds_json.as_deref())
 }
 
@@ -1128,7 +1170,7 @@ fn delete_building_group(
     state: tauri::State<'_, AppState>,
     id: i64,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::delete_building_group(&conn, id)
 }
 
@@ -1145,7 +1187,7 @@ fn save_group_plan_image(
     let image_bytes = base64::engine::general_purpose::STANDARD
         .decode(&image_base64)
         .map_err(|e| format!("base64 디코드 실패: {}", e))?;
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::save_group_plan_image(&conn, group_id, &image_bytes, &bounds_json, opacity, rotation)
 }
 
@@ -1154,7 +1196,7 @@ fn load_group_plan_image(
     state: tauri::State<'_, AppState>,
     group_id: i64,
 ) -> Result<Option<serde_json::Value>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     match building::load_group_plan_image(&conn, group_id)? {
         Some((image_bytes, bounds_json, opacity, rotation)) => {
             use base64::Engine;
@@ -1177,7 +1219,7 @@ fn update_plan_overlay_props(
     opacity: Option<f64>,
     rotation: Option<f64>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::update_plan_overlay_props(&conn, group_id, opacity, rotation)
 }
 
@@ -1186,7 +1228,7 @@ fn delete_group_plan_image(
     state: tauri::State<'_, AppState>,
     group_id: i64,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::delete_group_plan_image(&conn, group_id)
 }
 
@@ -1196,7 +1238,7 @@ fn delete_group_plan_image(
 fn list_manual_buildings(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<building::ManualBuilding>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::list_manual_buildings(&conn)
 }
 
@@ -1213,7 +1255,7 @@ fn add_manual_building(
     geometry_json: Option<String>,
     group_id: Option<i64>,
 ) -> Result<i64, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     let gt = geometry_type.as_deref().unwrap_or("polygon");
     let gj = geometry_json.as_deref();
     building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
@@ -1233,7 +1275,7 @@ fn update_manual_building(
     geometry_json: Option<String>,
     group_id: Option<i64>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     let gt = geometry_type.as_deref().unwrap_or("polygon");
     let gj = geometry_json.as_deref();
     building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
@@ -1244,7 +1286,7 @@ fn delete_manual_building(
     state: tauri::State<'_, AppState>,
     id: i64,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     building::delete_manual_building(&conn, id)
 }
 
@@ -1268,7 +1310,7 @@ fn save_los_result(
     map_screenshot: Option<String>,
     chart_screenshot: Option<String>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::save_los_result(
         &conn, &id, &radar_site_name, radar_lat, radar_lon, radar_height,
         target_lat, target_lon, bearing, total_distance,
@@ -1281,7 +1323,7 @@ fn save_los_result(
 fn load_los_results(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     let rows = db::load_all_los_results(&conn).map_err(|e| format!("DB error: {}", e))?;
 
     #[derive(serde::Serialize)]
@@ -1318,7 +1360,7 @@ fn delete_los_result(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::delete_los_result(&conn, &id).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1326,7 +1368,7 @@ fn delete_los_result(
 fn clear_los_results(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::clear_all_los_results(&conn).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1338,7 +1380,7 @@ fn save_manual_merge(
     source_flight_ids_json: String,
     mode_s: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::save_manual_merge(&conn, &source_flight_ids_json, &mode_s)
         .map_err(|e| format!("DB error: {}", e))
 }
@@ -1347,7 +1389,7 @@ fn save_manual_merge(
 fn load_manual_merges(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<(String, String)>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::load_manual_merges(&conn).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1355,7 +1397,7 @@ fn load_manual_merges(
 fn clear_manual_merges(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::clear_manual_merges(&conn).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1371,7 +1413,7 @@ fn save_coverage_cache(
     max_elev_deg: f64,
     layers_json: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::save_coverage_cache(&conn, &radar_name, radar_lat, radar_lon, radar_height, max_elev_deg, &layers_json)
         .map_err(|e| format!("DB error: {}", e))
 }
@@ -1381,7 +1423,7 @@ fn load_coverage_cache(
     state: tauri::State<'_, AppState>,
     radar_name: String,
 ) -> Result<Option<String>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::load_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1390,7 +1432,7 @@ fn has_coverage_cache(
     state: tauri::State<'_, AppState>,
     radar_name: String,
 ) -> Result<bool, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::has_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1399,7 +1441,7 @@ fn clear_coverage_cache(
     state: tauri::State<'_, AppState>,
     radar_name: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::clear_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1416,8 +1458,13 @@ fn save_report(
     pdf_base64: Option<String>,
     metadata_json: Option<String>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
-    db::save_report(&conn, &id, &title, &template, &radar_name, &report_config_json, pdf_base64.as_deref(), metadata_json.as_deref())
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let pdf_bytes = pdf_base64
+        .as_deref()
+        .map(|b64| STANDARD.decode(b64).map_err(|e| format!("base64 decode: {}", e)))
+        .transpose()?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+    db::save_report(&conn, &id, &title, &template, &radar_name, &report_config_json, pdf_bytes.as_deref(), metadata_json.as_deref())
         .map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1425,7 +1472,7 @@ fn save_report(
 fn list_saved_reports(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<db::SavedReportSummary>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::list_saved_reports(&conn).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1434,7 +1481,7 @@ fn load_report_detail(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<Option<String>, String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     let row = db::load_report_detail(&conn, &id).map_err(|e| format!("DB error: {}", e))?;
     match row {
         Some(r) => {
@@ -1464,7 +1511,7 @@ fn delete_saved_report(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     db::delete_report(&conn, &id).map_err(|e| format!("DB error: {}", e))
 }
 
@@ -1483,7 +1530,7 @@ async fn resolve_declination(app_handle: &tauri::AppHandle, file_path: &str, rad
     // 1단계: 캐시 확인 (lock → 조회 → unlock)
     let cached = {
         let state = app_handle.state::<AppState>();
-        let guard = state.db.lock().ok();
+        let guard = state.db.lock().ok().and_then(|pool| pool.get().ok());
         guard.and_then(|conn| declination::get_cached(&conn, radar_lat, radar_lon, &date))
     };
     if let Some((dec, ref source)) = cached {
@@ -1503,7 +1550,7 @@ async fn resolve_declination(app_handle: &tauri::AppHandle, file_path: &str, rad
             info!("Magnetic declination (NOAA): {:.2}° for ({},{}) on {}", dec, radar_lat, radar_lon, date);
             // 3단계: 결과 저장 (lock → 저장 → unlock)
             let state = app_handle.state::<AppState>();
-            let _ = state.db.lock().ok().map(|conn| {
+            let _ = state.db.lock().ok().and_then(|pool| pool.get().ok()).map(|conn| {
                 declination::save_cache(&conn, radar_lat, radar_lon, &date, dec, "noaa")
             });
             return dec;
@@ -1516,11 +1563,17 @@ async fn resolve_declination(app_handle: &tauri::AppHandle, file_path: &str, rad
     }
 
     let state = app_handle.state::<AppState>();
-    let guard = state.db.lock().ok();
+    let guard = state.db.lock().ok().and_then(|pool| pool.get().ok());
     match guard {
         Some(conn) => declination::get_declination_sync(&conn, radar_lat, radar_lon, &date),
         None => -8.5,
     }
+}
+
+/// 분석 취소
+#[tauri::command]
+fn cancel_analysis(state: tauri::State<'_, AppState>) {
+    state.analysis_cancel.store(true, Ordering::Relaxed);
 }
 
 /// 장애물 월간 분석 IPC 커맨드
@@ -1549,28 +1602,53 @@ async fn analyze_obstacle_monthly(
         -8.5
     };
 
+    // 취소 토큰 초기화
+    let cancel = {
+        let state = app_handle.state::<AppState>();
+        state.analysis_cancel.store(false, Ordering::Relaxed);
+        Arc::clone(&state.analysis_cancel)
+    };
+
     let handle = app_handle.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut radar_results = Vec::new();
 
         for radar in &radar_file_sets {
+            // 취소 체크
+            if cancel.load(Ordering::Relaxed) {
+                return Err("분석이 취소되었습니다".to_string());
+            }
+
             let h = handle.clone();
             let progress_fn = move |p: ObstacleMonthlyProgress| {
                 let _ = h.emit("obstacle-monthly-progress", p);
             };
 
-            match om::analyze_radar_monthly(radar, &exclude_mode_s, mag_dec, &progress_fn) {
+            match om::analyze_radar_monthly(radar, &exclude_mode_s, mag_dec, &cancel, &progress_fn) {
                 Ok(result) => radar_results.push(result),
+                Err(e) if e.contains("취소") => {
+                    return Err(e);
+                }
                 Err(e) => {
                     info!("[ObstacleMonthly] 레이더 '{}' 분석 실패: {}", radar.radar_name, e);
+                    let h2 = handle.clone();
+                    let radar_name = radar.radar_name.clone();
+                    let err_msg = format!("레이더 '{}' 분석 실패: {}", radar_name, e);
+                    let _ = h2.emit("obstacle-monthly-progress", ObstacleMonthlyProgress {
+                        radar_name,
+                        stage: "error".to_string(),
+                        message: err_msg,
+                        current: 0,
+                        total: 0,
+                    });
                 }
             }
         }
 
-        om::ObstacleMonthlyResult { radar_results }
+        Ok(om::ObstacleMonthlyResult { radar_results })
     })
     .await
-    .map_err(|e| format!("분석 스레드 오류: {}", e))?;
+    .map_err(|e| format!("분석 스레드 오류: {}", e))??;
 
     Ok(result)
 }
@@ -1601,6 +1679,13 @@ async fn analyze_pre_screening(
         -8.5
     };
 
+    // 취소 토큰 초기화
+    let cancel = {
+        let state = app_handle.state::<AppState>();
+        state.analysis_cancel.store(false, Ordering::Relaxed);
+        Arc::clone(&state.analysis_cancel)
+    };
+
     let handle = app_handle.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1608,25 +1693,32 @@ async fn analyze_pre_screening(
         let mut radar_results = Vec::new();
 
         for radar in &radar_file_sets {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("분석이 취소되었습니다".to_string());
+            }
+
             let h = handle.clone();
             let progress_fn = move |p: ObstacleMonthlyProgress| {
                 let _ = h.emit("pre-screening-progress", p);
             };
 
             match ps::analyze_pre_screening(
-                radar, &proposed_buildings, &exclude_mode_s, mag_dec, &state.srtm, &progress_fn,
+                radar, &proposed_buildings, &exclude_mode_s, mag_dec, &state.srtm, &cancel, &progress_fn,
             ) {
                 Ok(result) => radar_results.push(result),
+                Err(e) if e.contains("취소") => {
+                    return Err(e);
+                }
                 Err(e) => {
                     info!("[PreScreening] 레이더 '{}' 분석 실패: {}", radar.radar_name, e);
                 }
             }
         }
 
-        ps::PreScreeningResult { radar_results }
+        Ok(ps::PreScreeningResult { radar_results })
     })
     .await
-    .map_err(|e| format!("분석 스레드 오류: {}", e))?;
+    .map_err(|e| format!("분석 스레드 오류: {}", e))??;
 
     Ok(result)
 }
@@ -1645,7 +1737,7 @@ fn compute_coverage_terrain_profile_excluding(
     bearing_step_deg: Option<f64>,
 ) -> Result<analysis::coverage::ProfileMeta, String> {
     let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     Ok(analysis::coverage::compute_terrain_profile_excluding(
         &mut srtm, &conn,
         &radar_name, radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
@@ -1684,7 +1776,7 @@ fn presample_coverage_elevations(
     let count = batch_ray_count.unwrap_or(total_rays);
 
     let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
 
     Ok(analysis::coverage::presample_elevations_batch(
         &mut srtm,
@@ -1708,7 +1800,7 @@ async fn get_magnetic_declination(
     // 1. 캐시 확인
     let cached = {
         let state = app_handle.state::<AppState>();
-        let guard = state.db.lock().ok();
+        let guard = state.db.lock().ok().and_then(|pool| pool.get().ok());
         guard.and_then(|conn| declination::get_cached(&conn, lat, lon, &date))
     };
     if let Some((dec, ref source)) = cached {
@@ -1726,7 +1818,7 @@ async fn get_magnetic_declination(
 
         if let Ok(dec) = declination::fetch_noaa(lat, lon, year, month, day).await {
             let state = app_handle.state::<AppState>();
-            let _ = state.db.lock().ok().map(|conn| {
+            let _ = state.db.lock().ok().and_then(|pool| pool.get().ok()).map(|conn| {
                 declination::save_cache(&conn, lat, lon, &date, dec, "noaa")
             });
             return Ok(dec);
@@ -1739,7 +1831,7 @@ async fn get_magnetic_declination(
     }
     let result = {
         let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
         declination::get_declination_sync(&conn, lat, lon, &date)
     };
     Ok(result)
@@ -1759,7 +1851,7 @@ async fn refresh_wmm_to_noaa(app_handle: &tauri::AppHandle) -> Result<usize, Str
     // 1. DB에서 WMM 엔트리 목록 조회 (sync)
     let entries = {
         let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
         declination::list_wmm_entries(&conn)
     };
 
@@ -1783,7 +1875,7 @@ async fn refresh_wmm_to_noaa(app_handle: &tauri::AppHandle) -> Result<usize, Str
             Ok(dec) => {
                 // 3. DB 저장 (sync)
                 let state = app_handle.state::<AppState>();
-                let saved = state.db.lock().ok().map(|conn| {
+                let saved = state.db.lock().ok().and_then(|pool| pool.get().ok()).map(|conn| {
                     declination::save_cache(&conn, lat, lon, date_key, dec, "noaa").is_ok()
                 }).unwrap_or(false);
                 if saved { refreshed += 1; }
@@ -1815,7 +1907,7 @@ fn compute_coverage_terrain_profile(
     bearing_step_deg: Option<f64>,
 ) -> Result<analysis::coverage::ProfileMeta, String> {
     let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-    let conn = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
     Ok(analysis::coverage::compute_terrain_profile(
         &mut srtm, &conn, &radar_name,
         radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
@@ -1933,7 +2025,7 @@ async fn vworld_download_buildings(
         );
         {
             let state = app_handle.state::<AppState>();
-            let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
             let region_key = vworld::region_code_to_key(&file.region_code);
             let handle_clone = app_handle.clone();
             let rk = region_key.to_string();
@@ -2003,7 +2095,7 @@ async fn download_landuse_tiles(
     // 기존 타일 삭제 후 새로 다운로드
     {
         let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
         conn.execute("DELETE FROM landuse_tiles", [])
             .map_err(|e| format!("기존 타일 삭제 실패: {e}"))?;
     }
@@ -2017,7 +2109,7 @@ async fn download_landuse_tiles(
         match vworld::download_landuse_tile(z, x, y).await {
             Ok(data) => {
                 let state = app_handle.state::<AppState>();
-                let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+                let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
                 conn.execute(
                     "INSERT OR REPLACE INTO landuse_tiles (z, x, y, data) VALUES (?1, ?2, ?3, ?4)",
                     params![z as i64, x as i64, y as i64, data],
@@ -2054,7 +2146,7 @@ async fn download_landuse_tiles(
 fn get_landuse_tile_count(
     state: tauri::State<'_, AppState>,
 ) -> Result<i64, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     conn.query_row("SELECT COUNT(*) FROM landuse_tiles", [], |row| row.get(0))
         .map_err(|e| format!("타일 카운트 실패: {e}"))
 }
@@ -2064,7 +2156,7 @@ fn get_landuse_tile_count(
 fn clear_landuse_tiles(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM landuse_tiles", [])
         .map_err(|e| format!("타일 삭제 실패: {e}"))?;
     Ok(())
@@ -2078,7 +2170,7 @@ fn get_landuse_tile(
     x: i64,
     y: i64,
 ) -> Result<Option<String>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
     match conn.query_row(
         "SELECT data FROM landuse_tiles WHERE z=?1 AND x=?2 AND y=?3",
         params![z, x, y],
@@ -2180,7 +2272,7 @@ async fn vworld_download_fac_buildings(
         );
         {
             let state = app_handle.state::<AppState>();
-            let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
             let handle_clone = app_handle.clone();
             let rk = region_key.clone();
             fac_building::import_from_zip(&conn, temp_path.to_str().unwrap(), &region_key, &|p| {
@@ -2284,7 +2376,7 @@ async fn vworld_download_landuse(
         );
         {
             let state = app_handle.state::<AppState>();
-            let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
             let region_key = vworld::region_code_to_key(&file.region_code);
             let handle_clone = app_handle.clone();
             let rk = region_key.to_string();
@@ -2378,7 +2470,7 @@ async fn vworld_download_n3p(
     emit("importing", "산 이름 데이터 임포트 중...", 1, 1);
     {
         let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
         let handle_clone = app_handle.clone();
         peak::import_from_zip(&conn, temp_path.to_str().unwrap(), &|progress| {
             let _ = handle_clone.emit("peak-import-progress", &progress);
@@ -2390,6 +2482,12 @@ async fn vworld_download_n3p(
 
     emit("done", "산 이름 데이터 다운로드 및 임포트 완료", 1, 1);
     Ok("산 이름 데이터(N3P) 다운로드 및 임포트 완료".to_string())
+}
+
+/// 호출자 윈도우의 DevTools 활성화
+#[tauri::command]
+fn open_devtools(window: tauri::WebviewWindow) {
+    window.open_devtools();
 }
 
 // ---------- App Entry Point ----------
@@ -2407,23 +2505,24 @@ pub fn run() {
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
             info!("App data dir: {:?}", app_data_dir);
 
-            // SQLite DB 초기화
+            // SQLite DB 초기화 (r2d2 연결 풀)
             let db_path = app_data_dir.join("adsb.db");
-            let db_conn = db::init_db(&db_path).map_err(|e| {
+            let db_pool = db::init_db_pool(&db_path).map_err(|e| {
                 Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("DB init error: {}", e),
+                    format!("DB pool init error: {}", e),
                 ))
             })?;
             info!("Database path: {:?}", db_path);
-
 
             // 기존 aircraft.json → DB 마이그레이션
             let aircraft_json_path = app_data_dir.join("aircraft.json");
             if aircraft_json_path.exists() {
                 info!("Migrating aircraft.json to SQLite...");
-                if let Err(e) = db::migrate_aircraft_json(&db_conn, &aircraft_json_path) {
-                    log::warn!("Aircraft migration failed: {}", e);
+                if let Ok(conn) = db_pool.get() {
+                    if let Err(e) = db::migrate_aircraft_json(&conn, &aircraft_json_path) {
+                        log::warn!("Aircraft migration failed: {}", e);
+                    }
                 }
             }
 
@@ -2436,13 +2535,14 @@ pub fn run() {
 
             app.manage(AppState {
                 app_data_dir: Mutex::new(app_data_dir.clone()),
-                db: Mutex::new(db_conn),
+                db: Mutex::new(db_pool),
                 srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir, db_path.clone())),
+                analysis_cancel: Arc::new(AtomicBool::new(false)),
             });
 
-            // 프로덕션 빌드에서도 DevTools 활성화 (F12)
+            // 프로덕션 빌드에서도 DevTools 활성화 — 모든 윈도우
             #[cfg(not(debug_assertions))]
-            if let Some(w) = app.get_webview_window("main") {
+            for (_label, w) in app.webview_windows() {
                 w.open_devtools();
             }
 
@@ -2540,6 +2640,7 @@ pub fn run() {
             refresh_declination_cache,
             // 장애물 월간 분석
             analyze_obstacle_monthly,
+            cancel_analysis,
             // 장애물 사전검토
             analyze_pre_screening,
             compute_coverage_terrain_profile_excluding,
@@ -2561,6 +2662,9 @@ pub fn run() {
             vworld_download_n3p,
             // WebView2 네이티브 PDF
             webview_print_to_pdf,
+            webview_print_and_save_report,
+            // DevTools
+            open_devtools,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

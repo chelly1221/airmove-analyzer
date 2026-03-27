@@ -1,11 +1,13 @@
 use std::path::Path;
 
+use base64::Engine as _;
 use rusqlite::{params, Connection, Result as SqlResult};
 
 use crate::models::Aircraft;
 
-/// DB 연결 타입 (lib.rs에서 사용)
-pub type Db = Connection;
+/// DB 연결 풀 타입 (lib.rs에서 사용)
+pub type DbPool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
+pub type PooledConn = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
 
 /// DB 초기화 (테이블 생성)
 pub fn init_db(path: &Path) -> SqlResult<Connection> {
@@ -281,7 +283,62 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 건물 그룹에 영역 바운드 컬럼 추가
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN area_bounds_json TEXT", []);
 
+    // pdf_blob BLOB 컬럼 추가 (마이그레이션)
+    let has_pdf_blob: bool = conn
+        .prepare("PRAGMA table_info(saved_reports)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|name| name.as_deref() == Ok("pdf_blob"));
+    if !has_pdf_blob {
+        let _ = conn.execute("ALTER TABLE saved_reports ADD COLUMN pdf_blob BLOB", []);
+    }
+
+    // 기존 pdf_base64 → pdf_blob 마이그레이션
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, pdf_base64 FROM saved_reports WHERE pdf_base64 IS NOT NULL AND pdf_blob IS NULL",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (id, b64) in &rows {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                let _ = conn.execute(
+                    "UPDATE saved_reports SET pdf_blob = ?1, pdf_base64 = NULL WHERE id = ?2",
+                    params![bytes, id],
+                );
+            }
+        }
+        if !rows.is_empty() {
+            log::info!("Migrated {} saved reports from pdf_base64 to pdf_blob", rows.len());
+        }
+    }
+
     Ok(conn)
+}
+
+/// r2d2 연결 풀 초기화
+pub fn init_db_pool(path: &Path) -> Result<DbPool, String> {
+    // 먼저 단일 연결로 마이그레이션 수행
+    init_db(path).map_err(|e| format!("DB migration: {}", e))?;
+
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(path)
+        .with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA cache_size=-32000;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA temp_store=MEMORY;",
+            )?;
+            Ok(())
+        });
+
+    r2d2::Pool::builder()
+        .max_size(8)
+        .build(manager)
+        .map_err(|e| format!("DB pool init: {}", e))
 }
 
 // ========== 비행검사기 (Aircraft) ==========
@@ -656,7 +713,7 @@ pub fn clear_coverage_cache(conn: &Connection, radar_name: &str) -> SqlResult<()
 
 // ========== 저장된 보고서 ==========
 
-/// 보고서 저장
+/// 보고서 저장 (BLOB)
 pub fn save_report(
     conn: &Connection,
     id: &str,
@@ -664,17 +721,26 @@ pub fn save_report(
     template: &str,
     radar_name: &str,
     report_config_json: &str,
-    pdf_base64: Option<&str>,
+    pdf_bytes: Option<&[u8]>,
     metadata_json: Option<&str>,
 ) -> SqlResult<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    // UPSERT: BLOB 저장, base64 NULL 처리
     conn.execute(
-        "INSERT OR REPLACE INTO saved_reports (id, title, template, radar_name, created_at, report_config_json, pdf_base64, metadata_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, title, template, radar_name, now, report_config_json, pdf_base64, metadata_json],
+        "INSERT INTO saved_reports (id, title, template, radar_name, created_at, report_config_json, pdf_blob, pdf_base64, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           template = excluded.template,
+           radar_name = excluded.radar_name,
+           report_config_json = excluded.report_config_json,
+           pdf_blob = excluded.pdf_blob,
+           pdf_base64 = NULL,
+           metadata_json = excluded.metadata_json",
+        params![id, title, template, radar_name, now, report_config_json, pdf_bytes, metadata_json],
     )?;
     Ok(())
 }
@@ -692,7 +758,7 @@ pub struct SavedReportSummary {
 
 pub fn list_saved_reports(conn: &Connection) -> SqlResult<Vec<SavedReportSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, template, radar_name, created_at, (pdf_base64 IS NOT NULL) FROM saved_reports ORDER BY created_at DESC",
+        "SELECT id, title, template, radar_name, created_at, (pdf_blob IS NOT NULL OR pdf_base64 IS NOT NULL) FROM saved_reports ORDER BY created_at DESC",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -709,12 +775,19 @@ pub fn list_saved_reports(conn: &Connection) -> SqlResult<Vec<SavedReportSummary
     Ok(rows)
 }
 
-/// 보고서 상세 (PDF 포함)
+/// 보고서 상세 (PDF BLOB 우선, base64 fallback)
+/// 반환: (id, title, template, radar_name, created_at, report_config_json, pdf_base64_string, metadata_json)
 pub fn load_report_detail(conn: &Connection, id: &str) -> SqlResult<Option<(String, String, String, String, i64, String, Option<String>, Option<String>)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, template, radar_name, created_at, report_config_json, pdf_base64, metadata_json FROM saved_reports WHERE id = ?1",
+        "SELECT id, title, template, radar_name, created_at, report_config_json, pdf_blob, pdf_base64, metadata_json FROM saved_reports WHERE id = ?1",
     )?;
     match stmt.query_row(params![id], |row| {
+        let pdf_blob: Option<Vec<u8>> = row.get(6)?;
+        let pdf_base64_legacy: Option<String> = row.get(7)?;
+        // BLOB → base64 encode for frontend, fallback to legacy base64
+        let pdf_b64 = pdf_blob
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(&bytes))
+            .or(pdf_base64_legacy);
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -722,8 +795,8 @@ pub fn load_report_detail(conn: &Connection, id: &str) -> SqlResult<Option<(Stri
             row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, String>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
+            pdf_b64,
+            row.get::<_, Option<String>>(8)?,
         ))
     }) {
         Ok(row) => Ok(Some(row)),

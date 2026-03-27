@@ -1,4 +1,4 @@
-import { format, startOfWeek, subWeeks, isWithinInterval } from "date-fns";
+import { format, startOfWeek, subWeeks } from "date-fns";
 import { ko } from "date-fns/locale";
 import type { Flight } from "../../types";
 import { flightLabel } from "../../utils/flightConsolidation";
@@ -28,7 +28,8 @@ function getWeekStats(flights: Flight[], weeksAgo: number): WeekStats {
 
   const weekFlights = flights.filter((f) => {
     const d = new Date(f.start_time * 1000);
-    return isWithinInterval(d, { start: weekStart, end: weekEnd });
+    // 시작 포함, 종료 미포함 (다음 주 시작과 겹치지 않도록)
+    return d >= weekStart && d < weekEnd;
   });
 
   const totalLoss = weekFlights.reduce((s, f) => s + f.loss_points.length, 0);

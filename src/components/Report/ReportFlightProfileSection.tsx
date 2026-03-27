@@ -9,6 +9,8 @@ interface Props {
   sectionNum: number;
   flight: Flight;
   radarSite: RadarSite;
+  /** 사전 로드된 포인트 — 보고서 윈도우에서 Worker가 없을 때 사용 */
+  preloadedPoints?: TrackPoint[];
 }
 
 function getGrade(lossPercent: number): { label: string; color: string; bg: string } {
@@ -18,21 +20,24 @@ function getGrade(lossPercent: number): { label: string; color: string; bg: stri
 }
 
 /** 단일비행 상세 보고서: 비행 프로파일 (기본정보 + KPI + 고도 차트) */
-export default function ReportFlightProfileSection({ sectionNum, flight, radarSite }: Props) {
+export default function ReportFlightProfileSection({ sectionNum, flight, radarSite, preloadedPoints }: Props) {
   const aircraft = useAppStore((s) => s.aircraft);
   const label = flightLabel(flight, aircraft);
   const grade = getGrade(flight.loss_percentage);
   const matchTypeLabel = flight.match_type === "manual" ? "수동 병합" : "Gap 분리";
 
-  // Worker에서 비행 포인트 비동기 로드
-  const [chartPoints, setChartPoints] = useState<TrackPoint[]>([]);
+  // Worker에서 비행 포인트 비동기 로드 (preloadedPoints가 있으면 스킵)
+  const [workerPoints, setWorkerPoints] = useState<TrackPoint[]>([]);
   useEffect(() => {
+    if (preloadedPoints && preloadedPoints.length > 0) return;
     let cancelled = false;
     queryFlightPoints(flight.id).then((pts) => {
-      if (!cancelled) setChartPoints(pts);
+      if (!cancelled) setWorkerPoints(pts);
     });
     return () => { cancelled = true; };
-  }, [flight.id]);
+  }, [flight.id, preloadedPoints]);
+
+  const chartPoints = (preloadedPoints && preloadedPoints.length > 0) ? preloadedPoints : workerPoints;
 
   // 고도/속도 범위 (로드된 포인트 기반)
   const { minAlt, maxAlt, minSpd, maxSpd } = useMemo(() => {

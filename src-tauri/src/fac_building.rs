@@ -16,6 +16,12 @@ use crate::coord::epsg5186_to_wgs84;
 /// 건물 높이 상한 (m)
 const MAX_HEIGHT_M: f64 = 650.0;
 
+/// 층당 최대 허용 높이 (m) — 용도별 차등 적용
+/// 공장/창고/산업시설: 층고가 높으므로 10m까지 허용
+/// 일반 건물(주거/사무/상업 등): 6m까지 허용
+const MAX_HEIGHT_PER_FLOOR_INDUSTRIAL: f64 = 10.0;
+const MAX_HEIGHT_PER_FLOOR_DEFAULT: f64 = 6.0;
+
 /// 임포트 진행률 이벤트
 #[derive(Clone, Serialize)]
 pub struct FacBuildingImportProgress {
@@ -131,6 +137,28 @@ pub fn import_from_zip(
                 }
             };
 
+            // 용도 (층수 검증에 필요하므로 먼저 추출)
+            let usability = get_field_as_string(&record, &["USABILITY"]);
+
+            // 층수 대비 높이 검증 — GRND_FLR(지상층수) + 용도별 차등
+            if let Some(floors) = get_field_as_f64(&record, &["GRND_FLR"]) {
+                if floors >= 1.0 {
+                    let h_per_floor = height / floors;
+                    let is_industrial = usability.as_deref().map_or(false, |u| {
+                        u.contains("공장") || u.contains("창고") || u.contains("산업")
+                            || u.contains("발전") || u.contains("저장")
+                    });
+                    let max_hpf = if is_industrial {
+                        MAX_HEIGHT_PER_FLOOR_INDUSTRIAL
+                    } else {
+                        MAX_HEIGHT_PER_FLOOR_DEFAULT
+                    };
+                    if h_per_floor > max_hpf {
+                        continue;
+                    }
+                }
+            }
+
             // 건물명 (EUC-KR 디코딩)
             let building_name = euckr_bld_names.as_ref()
                 .and_then(|names| names.get(count - 1).cloned().flatten())
@@ -141,8 +169,7 @@ pub fn import_from_zip(
                 .and_then(|names| names.get(count - 1).cloned().flatten())
                 .or_else(|| get_field_as_string(&record, &["DONG_NM"]));
 
-            // 용도, PNU, 도로명주소건물관리번호 (ASCII)
-            let usability = get_field_as_string(&record, &["USABILITY"]);
+            // PNU, 도로명주소건물관리번호 (ASCII) — usability는 위에서 이미 추출
             let pnu = get_field_as_string(&record, &["PNU"]);
             let bd_mgt_sn = get_field_as_string(&record, &["BD_MGT_SN"]);
 

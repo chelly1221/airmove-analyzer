@@ -36,6 +36,10 @@ export default function OMSectionImage({
     if (preCaptured) {
       setImageUrl(preCaptured);
       capturedRef.current = true;
+    } else {
+      // preCaptured가 undefined로 변경 시 재캡처 허용
+      capturedRef.current = false;
+      setImageUrl(null);
     }
   }, [preCaptured]);
 
@@ -56,7 +60,10 @@ export default function OMSectionImage({
           logging: false,
         });
         if (cancelled) return;
-        const dataUrl = canvas.toDataURL("image/webp", 0.88);
+        const dataUrl = canvas.toDataURL("image/png");
+        // 캔버스 리소스 명시적 해제
+        canvas.width = 0;
+        canvas.height = 0;
         capturedRef.current = true;
         setImageUrl(dataUrl);
         onCaptured?.(dataUrl);

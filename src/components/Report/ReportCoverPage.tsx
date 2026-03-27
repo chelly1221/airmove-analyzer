@@ -1,7 +1,7 @@
 import { format } from "date-fns";
 import EditableText from "./EditableText";
 import ReportPage from "./ReportPage";
-import { forwardRef } from "react";
+import { forwardRef, useMemo } from "react";
 import type { ReportMetadata } from "../../types";
 
 interface CoverPageProps {
@@ -26,7 +26,8 @@ const templateCodeMap: Record<string, string> = {
 
 const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(
   ({ template, radarName, metadata, editable, title, onTitleChange, subtitle, onSubtitleChange }, ref) => {
-    const now = new Date();
+    // 최초 마운트 시 고정 — 렌더마다 문서번호 변경 방지
+    const now = useMemo(() => new Date(), []);
     const tplCode = templateCodeMap[template] ?? "RPT";
     const docNum = `${metadata.docPrefix}-${tplCode}-${format(now, "yyMMdd")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
 
