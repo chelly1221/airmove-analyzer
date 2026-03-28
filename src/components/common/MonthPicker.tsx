@@ -120,14 +120,21 @@ export default function MonthPicker({ value, onChange, className = "" }: MonthPi
   }, [applyTransform, rerender]);
 
   // 휠 — 아래로 스크롤 = 미래(연도 증가)
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    cancelAnimationFrame(animId.current);
-    scrollY.current += e.deltaY * 0.35;
-    velocity.current = Math.max(-25, Math.min(25, velocity.current + e.deltaY * 0.1));
-    applyTransform();
-    runSnap();
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelAnimationFrame(animId.current);
+      scrollY.current += e.deltaY * 0.35;
+      velocity.current = Math.max(-25, Math.min(25, velocity.current + e.deltaY * 0.1));
+      applyTransform();
+      runSnap();
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
   }, [applyTransform, runSnap]);
 
   // 포인터 드래그
@@ -189,9 +196,9 @@ export default function MonthPicker({ value, onChange, className = "" }: MonthPi
 
   return (
     <div
+      ref={containerRef}
       className={`w-[260px] select-none cursor-grab active:cursor-grabbing ${className}`}
       style={{ height: CARD_H, overflow: "hidden", position: "relative" }}
-      onWheel={handleWheel}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}

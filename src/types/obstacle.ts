@@ -36,6 +36,8 @@ export interface DailyStats {
   total_loss_time_secs: number;
   loss_rate: number;
   loss_points_summary: LossPointGeo[];
+  /** 나머지 방위(분석 구간 제외) 베이스라인 Loss 포인트 좌표 */
+  baseline_loss_points: LossPointGeo[];
   /** 나머지 방위(분석 구간 제외) 베이스라인 Loss율 (%) */
   baseline_loss_rate: number;
   /** 나머지 방위 베이스라인 PSR율 (0~1) */

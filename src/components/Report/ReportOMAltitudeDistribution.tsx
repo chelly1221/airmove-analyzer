@@ -222,16 +222,8 @@ function ReportOMAltitudeDistribution({
         const panoWith = panoWithTargets?.get(radarName) ?? [];
         const panoWithout = panoWithoutTargets?.get(radarName) ?? [];
 
-        // Y축 범위: 파노라마 최대 양각 1° 올림 (상한), 차단 내 소실표적 최소 양각 1° 내림 (하한)
-        let panoMax = 0;
-        for (const p of panoWith) { if (p.elevation_angle_deg > panoMax) panoMax = p.elevation_angle_deg; }
-        const inShadowLosses = losses.filter((l) => l.inShadow);
-        let minElevDeg = 0;
-        for (const l of inShadowLosses) { if (l.elevAngleDeg < minElevDeg) minElevDeg = l.elevAngleDeg; }
-        const yTop = Math.max(1, Math.ceil(panoMax));
-        const yBottom = Math.min(0, Math.floor(minElevDeg));
-        const maxAngle = yTop;
-        const minAngle = yBottom;
+        // Y축 범위: 0°를 하한으로 고정, 표시 범위 내 파노라마 최대 양각 기준 상한
+        const minAngle = 0;
 
         // X축: 건물 또는 소실표적 방위 중심으로 포커싱
         const AZ_PAD = 20;
@@ -256,6 +248,22 @@ function ReportOMAltitudeDistribution({
           azHalfSpan = Math.min(maxDist + AZ_PAD, 180);
         }
         const azSpan = azHalfSpan * 2;
+
+        // 표시 범위 내 파노라마만으로 yTop 계산 (전체 360°가 아닌 현재 방위 범위)
+        const azInRange = (az: number) => {
+          let rel = az - azCenter;
+          if (rel > 180) rel -= 360;
+          if (rel < -180) rel += 360;
+          return Math.abs(rel) <= azHalfSpan;
+        };
+        let panoMax = 0;
+        for (const p of panoWith) {
+          if (azInRange(p.azimuth_deg) && p.elevation_angle_deg > panoMax) panoMax = p.elevation_angle_deg;
+        }
+        for (const p of panoWithout) {
+          if (azInRange(p.azimuth_deg) && p.elevation_angle_deg > panoMax) panoMax = p.elevation_angle_deg;
+        }
+        const maxAngle = Math.max(0.5, Math.ceil(panoMax * 2) / 2); // 0.5° 단위 올림, 최소 0.5°
 
         const xScale = (az: number) => {
           let rel = az - azCenter;
@@ -325,11 +333,9 @@ function ReportOMAltitudeDistribution({
                 </g>
               ))}
 
-              {/* 0° 수평선 */}
-              {minAngle <= 0 && maxAngle >= 0 && (
-                <line x1={MARGIN.left} y1={yScale(0)} x2={MARGIN.left + INNER_W} y2={yScale(0)}
-                  stroke="#374151" strokeWidth={0.8} />
-              )}
+              {/* 0° 수평선 (y축 하단) */}
+              <line x1={MARGIN.left} y1={yScale(0)} x2={MARGIN.left + INNER_W} y2={yScale(0)}
+                stroke="#374151" strokeWidth={0.8} />
 
               {/* 파노라마 차단 프로파일 (미포함=베이스라인 점선, 포함=실선) */}
               {(() => {
@@ -350,7 +356,7 @@ function ReportOMAltitudeDistribution({
                     });
                 const toPath = (pts: PanoramaPoint[]) =>
                   pts.map((p, i) =>
-                    `${i === 0 ? "M" : "L"}${xScale(p.azimuth_deg).toFixed(1)},${yScale(p.elevation_angle_deg).toFixed(1)}`
+                    `${i === 0 ? "M" : "L"}${xScale(p.azimuth_deg).toFixed(1)},${yScale(Math.max(0, p.elevation_angle_deg)).toFixed(1)}`
                   ).join(" ");
                 const withVis = filterSort(panoWith);
                 const withoutVis = filterSort(panoWithout);
@@ -358,23 +364,23 @@ function ReportOMAltitudeDistribution({
                   <g clipPath={`url(#az-elev-clip-${rIdx})`}>
                     {withoutVis.length > 1 && (
                       <path d={toPath(withoutVis)} fill="none"
-                        stroke="#84cc16" strokeWidth={1} />
+                        stroke="#84cc16" strokeWidth={1.5} />
                     )}
                     {withVis.length > 1 && (
                       <path d={toPath(withVis)} fill="none"
-                        stroke="#ef4444" strokeWidth={1} />
+                        stroke="#ef4444" strokeWidth={1.5} />
                     )}
                   </g>
                 );
               })()}
 
-              {/* 소실표적 (지형 차단 + 장애물 추가 기인만 표시) */}
+              {/* 소실표적 (0° 이상만 표시) */}
               <g clipPath={`url(#az-elev-clip-${rIdx})`}>
-                {losses.filter((l) => l.inShadow && !l.buildingCaused).map((l, i) => (
+                {losses.filter((l) => l.inShadow && !l.buildingCaused && l.elevAngleDeg >= 0).map((l, i) => (
                   <circle key={`terr-${i}`} cx={xScale(l.azDeg)} cy={yScale(l.elevAngleDeg)} r={2.5}
                     fill="#9ca3af" opacity={0.6} />
                 ))}
-                {losses.filter((l) => l.buildingCaused).map((l, i) => (
+                {losses.filter((l) => l.buildingCaused && l.elevAngleDeg >= 0).map((l, i) => (
                   <circle key={`bldg-${i}`} cx={xScale(l.azDeg)} cy={yScale(l.elevAngleDeg)} r={3}
                     fill="#ef4444" opacity={0.8} stroke="#b91c1c" strokeWidth={0.3} />
                 ))}

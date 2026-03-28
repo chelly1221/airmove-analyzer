@@ -1,8 +1,6 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useRef, useEffect, useState } from "react";
 import { Crosshair } from "lucide-react";
 import type { DailyStats, RadarSite, ManualBuilding, AzSector } from "../../types";
-import { azimuthAndDist } from "../../utils/geo";
-import KatexMath from "./KatexMath";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
@@ -23,8 +21,31 @@ function altToColor(altFt: number, minAlt: number, maxAlt: number): string {
   return `hsl(${hue}, 85%, 50%)`;
 }
 
+/** HSL 문자열 → rgba 문자열 (Canvas fillStyle용) */
+function hslToRgba(hsl: string, alpha: number): string {
+  const m = hsl.match(/hsl\((\d+\.?\d*),\s*(\d+\.?\d*)%,\s*(\d+\.?\d*)%\)/);
+  if (!m) return `rgba(128,128,128,${alpha})`;
+  const h = parseFloat(m[1]) / 360;
+  const s = parseFloat(m[2]) / 100;
+  const l = parseFloat(m[3]) / 100;
+  const hue2rgb = (p: number, q: number, t: number) => {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const r = Math.round(hue2rgb(p, q, h + 1 / 3) * 255);
+  const g = Math.round(hue2rgb(p, q, h) * 255);
+  const b = Math.round(hue2rgb(p, q, h - 1 / 3) * 255);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
 /** 방위 구간 내 포함 여부 */
-function inSector(azDeg: number, sectors: AzSector[]): boolean {
+export function _inSector(azDeg: number, sectors: AzSector[]): boolean {
   for (const s of sectors) {
     if (s.start_deg <= s.end_deg) {
       if (azDeg >= s.start_deg && azDeg <= s.end_deg) return true;
@@ -35,57 +56,378 @@ function inSector(azDeg: number, sectors: AzSector[]): boolean {
   return false;
 }
 
-const FIXED_ALTS = [1000, 2000, 3000, 5000, 10000, 15000, 20000];
-const DURATION_EXAMPLES = [5, 30, 120]; // 초
+// ─── 타일 유틸 ───────────────────────────────────────────────────
 
-/**
- * 시각화 산식 근거:
- * - 극좌표 변환: 평면 근사 azimuth/distance (latKm=dLat×111.32, lonKm=dLon×111.32×cos(lat))
- *   한국 위도(33–38°) 범위에서 200km 이내 오차 < 0.1%로 충분
- * - 점 크기: r = √(duration_s / 2), 범위 2–7px
- *   제곱근 스케일로 면적이 지속시간에 비례 (면적 ∝ πr² ∝ duration)
- * - 점 색상: HSL 스펙트럼 (hue = t×240°, t = (alt-1000)/(20000-1000))
- *   1000ft=빨강(0°) → 20000ft=파랑(240°) — 저고도(장애물 영향) 시인성 강조
- * - 차폐 영역: halfAngle = max(1°, min(5°, height/distance × 0.5))
- *   실제 전파 차폐각은 건물 폭/높이에 의존하나, 정확한 폭 데이터 없이
- *   높이/거리 비율로 시각적 근사. 정량 판정이 아닌 공간 패턴 확인 목적.
- */
+const DEG2RAD = Math.PI / 180;
+
+/** WGS84 → 슬리피맵 타일 좌표 */
+export function _latLonToTile(lat: number, lon: number, zoom: number) {
+  const n = Math.pow(2, zoom);
+  const x = Math.floor(((lon + 180) / 360) * n);
+  const yRaw = (1 - Math.log(Math.tan(lat * DEG2RAD) + 1 / Math.cos(lat * DEG2RAD)) / Math.PI) / 2;
+  const y = Math.floor(yRaw * n);
+  return { x, y };
+}
+
+/** 타일 좌표 → 타일 좌상단 WGS84 */
+export function _tileToLatLon(x: number, y: number, zoom: number) {
+  const n = Math.pow(2, zoom);
+  const lon = (x / n) * 360 - 180;
+  const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
+  const lat = (latRad * 180) / Math.PI;
+  return { lat, lon };
+}
+
+/** WGS84 → 해당 줌 레벨 전체 픽셀 좌표 */
+function latLonToPixel(lat: number, lon: number, zoom: number, tileSize: number) {
+  const n = Math.pow(2, zoom);
+  const px = ((lon + 180) / 360) * n * tileSize;
+  const yRaw = (1 - Math.log(Math.tan(lat * DEG2RAD) + 1 / Math.cos(lat * DEG2RAD)) / Math.PI) / 2;
+  const py = yRaw * n * tileSize;
+  return { px, py };
+}
+
+/** 레이더 범위 기준 적절한 줌 레벨 계산 */
+function computeZoom(lat: number, rangeKm: number, canvasSize: number): number {
+  // 위도에서 1px당 미터 = (지구둘레 × cos(lat)) / (2^zoom × 256)
+  for (let z = 14; z >= 4; z--) {
+    const metersPerPx = (40075016.686 * Math.cos(lat * DEG2RAD)) / (Math.pow(2, z) * 256);
+    const coveredKm = (metersPerPx * canvasSize) / 1000;
+    if (coveredKm >= rangeKm * 2.2) return z;
+  }
+  return 4;
+}
+
+const TILE_URL = "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png";
+const TILE_SIZE = 512; // @2x
+
+const FIXED_ALTS = [1000, 2000, 3000, 5000, 10000, 15000, 20000];
+const DOT_RADIUS = 2.5; // 고정 크기 작은 점
+const MIN_ALT = 1000;
+const MAX_ALT = 20000;
 
 function ReportOMAzDistScatter({
   sectionNum, radarSite, dailyStats, selectedBuildings, azSectors, analysisMonth, hideHeader,
 }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [, setReady] = useState(false);
+
   const monthLabel = analysisMonth
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
     : "";
 
-  // Loss 포인트 추출 + 극좌표 변환
-  const lossData = useMemo(() => {
-    const points: { azDeg: number; distKm: number; altFt: number; durationS: number; inSec: boolean }[] = [];
+  // 섹터 내 Loss 포인트
+  const sectorLoss = useMemo(() => {
+    const pts: { lat: number; lon: number; altFt: number; durationS: number; inSec: boolean }[] = [];
     for (const d of dailyStats) {
       for (const lp of d.loss_points_summary) {
         if (lp.lat === 0 && lp.lon === 0) continue;
-        const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, lp.lat, lp.lon);
-        points.push({
-          azDeg, distKm,
-          altFt: lp.alt_ft,
-          durationS: lp.duration_s,
-          inSec: inSector(azDeg, azSectors),
-        });
+        pts.push({ lat: lp.lat, lon: lp.lon, altFt: lp.alt_ft, durationS: lp.duration_s, inSec: true });
       }
     }
-    return points;
-  }, [dailyStats, radarSite, azSectors]);
+    return pts;
+  }, [dailyStats]);
 
-  // 건물 극좌표
-  const buildingPolar = useMemo(() =>
-    selectedBuildings.map((b) => ({
-      ...azimuthAndDist(radarSite.latitude, radarSite.longitude, b.latitude, b.longitude),
-      name: b.name || `B${b.id}`,
-      height: b.height,
-    })),
-  [selectedBuildings, radarSite]);
+  // 베이스라인(나머지 방위) Loss 포인트
+  const baselineLoss = useMemo(() => {
+    const pts: { lat: number; lon: number; altFt: number; durationS: number; inSec: boolean }[] = [];
+    for (const d of dailyStats) {
+      if (!d.baseline_loss_points) continue;
+      for (const lp of d.baseline_loss_points) {
+        if (lp.lat === 0 && lp.lon === 0) continue;
+        pts.push({ lat: lp.lat, lon: lp.lon, altFt: lp.alt_ft, durationS: lp.duration_s, inSec: false });
+      }
+    }
+    return pts;
+  }, [dailyStats]);
 
-  if (lossData.length === 0) {
+  // 전체 Loss 포인트 합산
+  const allLoss = useMemo(() => [...baselineLoss, ...sectorLoss], [sectorLoss, baselineLoss]);
+
+  // 캔버스 크기
+  const canvasW = 1400;
+  const canvasH = 1400;
+
+  // 줌 & 바운드 계산
+  const mapParams = useMemo(() => {
+    const rangeKm = radarSite.range_nm * 1.852;
+    const zoom = computeZoom(radarSite.latitude, rangeKm, canvasW / 2); // @2x이므로 논리 크기 기준
+    const center = latLonToPixel(radarSite.latitude, radarSite.longitude, zoom, TILE_SIZE);
+
+    // 캔버스 범위에 해당하는 타일 인덱스
+    const halfW = canvasW / 2;
+    const halfH = canvasH / 2;
+    const tileMinX = Math.floor((center.px - halfW) / TILE_SIZE);
+    const tileMaxX = Math.floor((center.px + halfW) / TILE_SIZE);
+    const tileMinY = Math.floor((center.py - halfH) / TILE_SIZE);
+    const tileMaxY = Math.floor((center.py + halfH) / TILE_SIZE);
+
+    // 캔버스 원점 (타일 그리드 좌상단)의 전역 픽셀 좌표
+    const originPx = center.px - halfW;
+    const originPy = center.py - halfH;
+
+    return { zoom, center, originPx, originPy, tileMinX, tileMaxX, tileMinY, tileMaxY, rangeKm };
+  }, [radarSite, canvasW, canvasH]);
+
+  // geo → canvas 좌표 변환
+  const geoToCanvas = useMemo(() => {
+    const { zoom, originPx, originPy } = mapParams;
+    return (lat: number, lon: number) => {
+      const { px, py } = latLonToPixel(lat, lon, zoom, TILE_SIZE);
+      return { x: px - originPx, y: py - originPy };
+    };
+  }, [mapParams]);
+
+  // 고정 크기 작은 점
+  const dotR = DOT_RADIUS;
+
+  // 캔버스 렌더링
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || allLoss.length === 0) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const { zoom, tileMinX, tileMaxX, tileMinY, tileMaxY, originPx, originPy, rangeKm } = mapParams;
+
+    // 타일 로드
+    const tiles: { img: HTMLImageElement; dx: number; dy: number }[] = [];
+    let loaded = 0;
+    const totalTiles = (tileMaxX - tileMinX + 1) * (tileMaxY - tileMinY + 1);
+
+    const drawAll = () => {
+      ctx.clearRect(0, 0, canvasW, canvasH);
+      // 배경
+      ctx.fillStyle = "#f0f0f0";
+      ctx.fillRect(0, 0, canvasW, canvasH);
+
+      // 타일
+      for (const t of tiles) {
+        ctx.drawImage(t.img, t.dx, t.dy, TILE_SIZE, TILE_SIZE);
+      }
+
+      // 레이더 범위 원 (NM 단위 링)
+      const radarCanvas = geoToCanvas(radarSite.latitude, radarSite.longitude);
+      const ringIntervalKm = 20 * 1.852;
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = "rgba(150,150,160,0.5)";
+      ctx.lineWidth = 1;
+      ctx.font = "18px sans-serif";
+      ctx.fillStyle = "rgba(120,120,130,0.7)";
+      for (let km = ringIntervalKm; km <= rangeKm * 1.3; km += ringIntervalKm) {
+        // km → 위도 차이 → 픽셀 차이로 반지름 계산
+        const edgeLat = radarSite.latitude + km / 111.32;
+        const edgeCanvas = geoToCanvas(edgeLat, radarSite.longitude);
+        const r = Math.abs(edgeCanvas.y - radarCanvas.y);
+        ctx.beginPath();
+        ctx.arc(radarCanvas.x, radarCanvas.y, r, 0, Math.PI * 2);
+        ctx.stroke();
+        // NM 라벨
+        const nm = km / 1.852;
+        ctx.fillText(`${nm.toFixed(0)}NM`, radarCanvas.x + r + 4, radarCanvas.y - 4);
+      }
+      ctx.setLineDash([]);
+
+      // 방위 섹터 경계선
+      if (azSectors.length > 0) {
+        const sectorR = rangeKm * 1.3; // km
+        ctx.strokeStyle = "rgba(239,68,68,0.7)";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([10, 5]);
+        for (const s of azSectors) {
+          for (const deg of [s.start_deg, s.end_deg]) {
+            const rad = (deg * Math.PI) / 180;
+            const endLat = radarSite.latitude + (sectorR / 111.32) * Math.cos(rad);
+            const endLon = radarSite.longitude + (sectorR / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(rad);
+            const end = geoToCanvas(endLat, endLon);
+            ctx.beginPath();
+            ctx.moveTo(radarCanvas.x, radarCanvas.y);
+            ctx.lineTo(end.x, end.y);
+            ctx.stroke();
+          }
+        }
+        ctx.setLineDash([]);
+
+        // 섹터 영역 반투명 채우기
+        for (const s of azSectors) {
+          ctx.beginPath();
+          ctx.moveTo(radarCanvas.x, radarCanvas.y);
+          const startDeg = s.start_deg;
+          const endDeg = s.start_deg <= s.end_deg ? s.end_deg : s.end_deg + 360;
+          for (let d = startDeg; d <= endDeg; d += 1) {
+            const dd = d % 360;
+            const rad = (dd * Math.PI) / 180;
+            const eLat = radarSite.latitude + (sectorR / 111.32) * Math.cos(rad);
+            const eLon = radarSite.longitude + (sectorR / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(rad);
+            const ep = geoToCanvas(eLat, eLon);
+            ctx.lineTo(ep.x, ep.y);
+          }
+          ctx.closePath();
+          ctx.fillStyle = "rgba(239,68,68,0.04)";
+          ctx.fill();
+        }
+      }
+
+      // 건물 차폐 영역 + 마커
+      for (const b of selectedBuildings) {
+        const bp = geoToCanvas(b.latitude, b.longitude);
+        const bDistKm = Math.sqrt(
+          Math.pow((b.latitude - radarSite.latitude) * 111.32, 2) +
+          Math.pow((b.longitude - radarSite.longitude) * 111.32 * Math.cos(radarSite.latitude * DEG2RAD), 2)
+        );
+        const bAzRad = Math.atan2(
+          (b.longitude - radarSite.longitude) * Math.cos(radarSite.latitude * DEG2RAD),
+          b.latitude - radarSite.latitude
+        );
+
+        // 차폐 삼각형
+        const halfAngle = Math.max(1, Math.min(5, (b.height / bDistKm) * 0.5)) * DEG2RAD;
+        const shadowR = rangeKm * 1.2;
+        const startAz = bAzRad - halfAngle;
+        const endAz = bAzRad + halfAngle;
+        ctx.beginPath();
+        // 건물 위치에서 시작
+        const bStartLat = radarSite.latitude + (bDistKm / 111.32) * Math.cos(startAz);
+        const bStartLon = radarSite.longitude + (bDistKm / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(startAz);
+        const bs = geoToCanvas(bStartLat, bStartLon);
+        ctx.moveTo(bs.x, bs.y);
+        // 먼 쪽 호
+        for (let a = startAz; a <= endAz; a += 0.01) {
+          const eLat = radarSite.latitude + (shadowR / 111.32) * Math.cos(a);
+          const eLon = radarSite.longitude + (shadowR / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(a);
+          const ep = geoToCanvas(eLat, eLon);
+          ctx.lineTo(ep.x, ep.y);
+        }
+        // 돌아오기
+        const bEndLat = radarSite.latitude + (bDistKm / 111.32) * Math.cos(endAz);
+        const bEndLon = radarSite.longitude + (bDistKm / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(endAz);
+        const be = geoToCanvas(bEndLat, bEndLon);
+        ctx.lineTo(be.x, be.y);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(245,158,11,0.08)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(245,158,11,0.3)";
+        ctx.lineWidth = 0.5;
+        ctx.setLineDash([4, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // 건물 마커
+        ctx.fillStyle = "#f59e0b";
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.fillRect(bp.x - 7, bp.y - 7, 14, 14);
+        ctx.strokeRect(bp.x - 7, bp.y - 7, 14, 14);
+        // 건물명
+        ctx.font = "bold 16px sans-serif";
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 4;
+        ctx.strokeText(b.name || `B${b.id}`, bp.x + 12, bp.y + 5);
+        ctx.fillStyle = "#92400e";
+        ctx.fillText(b.name || `B${b.id}`, bp.x + 12, bp.y + 5);
+      }
+
+      // 소실표적 — 베이스라인(섹터 외) 먼저 (반투명, 뒤에)
+      for (const pt of baselineLoss) {
+        const { x, y } = geoToCanvas(pt.lat, pt.lon);
+        if (x < 0 || x > canvasW || y < 0 || y > canvasH) continue;
+        const color = altToColor(pt.altFt, MIN_ALT, MAX_ALT);
+        ctx.beginPath();
+        ctx.arc(x, y, dotR, 0, Math.PI * 2);
+        ctx.fillStyle = hslToRgba(color, 0.35);
+        ctx.fill();
+      }
+
+      // 소실표적 — 섹터 내 (불투명, 위에)
+      for (const pt of sectorLoss) {
+        const { x, y } = geoToCanvas(pt.lat, pt.lon);
+        if (x < 0 || x > canvasW || y < 0 || y > canvasH) continue;
+        const color = altToColor(pt.altFt, MIN_ALT, MAX_ALT);
+        ctx.beginPath();
+        ctx.arc(x, y, dotR, 0, Math.PI * 2);
+        ctx.fillStyle = hslToRgba(color, 0.9);
+        ctx.fill();
+      }
+
+      // 레이더 중심
+      ctx.beginPath();
+      ctx.arc(radarCanvas.x, radarCanvas.y, 8, 0, Math.PI * 2);
+      ctx.fillStyle = "#a60739";
+      ctx.fill();
+      ctx.strokeStyle = "white";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // 레이더 이름
+      ctx.font = "bold 18px sans-serif";
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 4;
+      ctx.strokeText(radarSite.name, radarCanvas.x - ctx.measureText(radarSite.name).width / 2, radarCanvas.y + 24);
+      ctx.fillStyle = "#a60739";
+      ctx.fillText(radarSite.name, radarCanvas.x - ctx.measureText(radarSite.name).width / 2, radarCanvas.y + 24);
+
+      // 방위 라벨 (N, NE, E, ...)
+      const compassPts = [
+        { deg: 0, label: "N" }, { deg: 45, label: "NE" }, { deg: 90, label: "E" },
+        { deg: 135, label: "SE" }, { deg: 180, label: "S" }, { deg: 225, label: "SW" },
+        { deg: 270, label: "W" }, { deg: 315, label: "NW" },
+      ];
+      ctx.font = "bold 20px sans-serif";
+      ctx.fillStyle = "rgba(80,80,90,0.8)";
+      for (const cp of compassPts) {
+        const rad = (cp.deg * Math.PI) / 180;
+        const labelR = rangeKm * 1.2;
+        const eLat = radarSite.latitude + (labelR / 111.32) * Math.cos(rad);
+        const eLon = radarSite.longitude + (labelR / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(rad);
+        const ep = geoToCanvas(eLat, eLon);
+        if (ep.x >= 0 && ep.x <= canvasW && ep.y >= 0 && ep.y <= canvasH) {
+          const tw = ctx.measureText(cp.label).width;
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 3;
+          ctx.strokeText(cp.label, ep.x - tw / 2, ep.y + 7);
+          ctx.fillStyle = "rgba(80,80,90,0.8)";
+          ctx.fillText(cp.label, ep.x - tw / 2, ep.y + 7);
+        }
+      }
+
+      setReady(true);
+    };
+
+    // 타일 비동기 로드
+    const n = Math.pow(2, zoom);
+    for (let tx = tileMinX; tx <= tileMaxX; tx++) {
+      for (let ty = tileMinY; ty <= tileMaxY; ty++) {
+        // 타일 범위 클램프
+        const cx = ((tx % n) + n) % n;
+        const cy = ty;
+        if (cy < 0 || cy >= n) { loaded++; continue; }
+        const url = TILE_URL.replace("{z}", String(zoom)).replace("{x}", String(cx)).replace("{y}", String(cy));
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => {
+          const dx = tx * TILE_SIZE - originPx;
+          const dy = ty * TILE_SIZE - originPy;
+          tiles.push({ img, dx, dy });
+          loaded++;
+          if (loaded >= totalTiles) drawAll();
+        };
+        img.onerror = () => {
+          loaded++;
+          if (loaded >= totalTiles) drawAll();
+        };
+        img.src = url;
+      }
+    }
+
+    // 타일 0개인 경우
+    if (totalTiles === 0) drawAll();
+  }, [allLoss, sectorLoss, baselineLoss, mapParams, geoToCanvas, radarSite, azSectors, selectedBuildings, canvasW, canvasH]);
+
+  // 통계
+  const inSectorCount = sectorLoss.length;
+  const outSectorCount = baselineLoss.length;
+  const totalCount = allLoss.length;
+
+  if (totalCount === 0) {
     const hasDailyData = dailyStats.length > 0;
     return (
       <div className="mb-8">
@@ -104,54 +446,6 @@ function ReportOMAzDistScatter({
     );
   }
 
-  // SVG 레이아웃
-  const svgSize = 700;
-  const cx = svgSize / 2;
-  const cy = svgSize / 2;
-  const maxR = svgSize / 2 - 50;
-
-  // 최대 거리 결정
-  const maxDistKm = useMemo(() => {
-    let maxD = radarSite.range_nm * 1.852;
-    for (const lp of lossData) { if (lp.distKm > maxD) maxD = lp.distKm; }
-    for (const bp of buildingPolar) { if (bp.distKm > maxD) maxD = bp.distKm; }
-    return maxD * 1.1;
-  }, [lossData, buildingPolar, radarSite.range_nm]);
-
-  const scale = maxR / maxDistKm;
-
-  // 고도 범위
-  const minAlt = 1000;
-  const maxAlt = 20000;
-
-  // 거리 링 (20NM 간격)
-  const ringIntervalKm = 20 * 1.852;
-  const rings: { km: number; nm: number }[] = [];
-  for (let km = ringIntervalKm; km <= maxDistKm; km += ringIntervalKm) {
-    rings.push({ km, nm: km / 1.852 });
-  }
-
-  // 방위 라벨
-  const compassPoints = [
-    { deg: 0, label: "N" }, { deg: 45, label: "NE" }, { deg: 90, label: "E" },
-    { deg: 135, label: "SE" }, { deg: 180, label: "S" }, { deg: 225, label: "SW" },
-    { deg: 270, label: "W" }, { deg: 315, label: "NW" },
-  ];
-
-  // 점 크기: 지속시간 기반 (2~7px)
-  const dotR = (durationS: number) => Math.max(2, Math.min(7, Math.sqrt(durationS / 2)));
-
-  // 섹터 내/외 통계
-  const inSectorCount = lossData.filter((p) => p.inSec).length;
-  const outSectorCount = lossData.length - inSectorCount;
-
-  // 극좌표 → SVG 좌표
-  const polar2xy = (azDeg: number, distKm: number) => {
-    const rad = (azDeg * Math.PI) / 180;
-    const r = distKm * scale;
-    return { x: cx + r * Math.sin(rad), y: cy - r * Math.cos(rad) };
-  };
-
   return (
     <div className="mb-8">
       {!hideHeader && (
@@ -164,233 +458,63 @@ function ReportOMAzDistScatter({
 
       {/* 정보 요약 */}
       <div className="mb-2 flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] text-gray-500">
-        <span>소실 이벤트 총 {lossData.length}건 (섹터 내 {inSectorCount}건 / 섹터 외 {outSectorCount}건)</span>
+        <span>소실 이벤트 총 {totalCount}건 (섹터 내 {inSectorCount}건 / 섹터 외 {outSectorCount}건)</span>
         <span>
-          방위 구간: {azSectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ") || "—"}
+          방위 구간: {azSectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ") || "전방위"}
         </span>
       </div>
 
       <div className="rounded-md border border-gray-200 p-2">
-        <svg viewBox={`0 0 ${svgSize} ${svgSize}`} className="w-full" style={{ aspectRatio: "1/1" }}>
-          <rect x={0} y={0} width={svgSize} height={svgSize} fill="#fafafa" rx={4} />
-
-          {/* 거리 링 */}
-          {rings.map((ring, i) => {
-            const r = ring.km * scale;
-            return (
-              <g key={`ring-${i}`}>
-                <circle cx={cx} cy={cy} r={r} fill="none" stroke="#d1d5db" strokeWidth={0.4} strokeDasharray="3,3" />
-                <text x={cx + r + 3} y={cy - 3} fill="#9ca3af" fontSize={7} textAnchor="start">
-                  {ring.nm.toFixed(0)}NM
-                </text>
-              </g>
-            );
-          })}
-
-          {/* 방위선 + 라벨 */}
-          {compassPoints.map(({ deg, label }) => {
-            const rad = (deg * Math.PI) / 180;
-            return (
-              <g key={deg}>
-                <line x1={cx} y1={cy}
-                  x2={cx + (maxR + 10) * Math.sin(rad)}
-                  y2={cy - (maxR + 10) * Math.cos(rad)}
-                  stroke="#c0c0c8" strokeWidth={0.4} />
-                <text
-                  x={cx + (maxR + 22) * Math.sin(rad)}
-                  y={cy - (maxR + 22) * Math.cos(rad) + 3}
-                  textAnchor="middle" fill="#6b7280" fontSize={9} fontWeight={600}>{label}</text>
-              </g>
-            );
-          })}
-
-          {/* 방위 섹터 경계선 */}
-          {azSectors.flatMap((s) => [s.start_deg, s.end_deg]).map((deg, i) => {
-            const rad = (deg * Math.PI) / 180;
-            return (
-              <line key={`sec-${i}`} x1={cx} y1={cy}
-                x2={cx + (maxR + 15) * Math.sin(rad)}
-                y2={cy - (maxR + 15) * Math.cos(rad)}
-                stroke="#ef4444" strokeWidth={0.8} strokeDasharray="6,3" opacity={0.7} />
-            );
-          })}
-
-          {/* 섹터 영역 반투명 표시 */}
-          {azSectors.map((s, si) => {
-            const step = 1;
-            const pts: string[] = [`${cx},${cy}`];
-            let deg = s.start_deg;
-            const end = s.start_deg <= s.end_deg ? s.end_deg : s.end_deg + 360;
-            while (deg <= end) {
-              const d = deg % 360;
-              const rad = (d * Math.PI) / 180;
-              const r = maxR + 5;
-              pts.push(`${(cx + r * Math.sin(rad)).toFixed(1)},${(cy - r * Math.cos(rad)).toFixed(1)}`);
-              deg += step;
-            }
-            return (
-              <polygon key={`sector-fill-${si}`} points={pts.join(" ")}
-                fill="#ef4444" fillOpacity={0.04} stroke="none" />
-            );
-          })}
-
-          {/* 건물 그림자 영역 (이론적 차폐 삼각형) */}
-          {buildingPolar.map((bp, i) => {
-            // 건물 높이에 비례한 각도 폭 (최소 ±1°, 최대 ±5°)
-            const halfAngle = Math.max(1, Math.min(5, (bp.height / bp.distKm) * 0.5));
-            const startDeg = bp.azDeg - halfAngle;
-            const endDeg = bp.azDeg + halfAngle;
-            const pts: string[] = [];
-            // 건물 위치부터 최대 거리까지
-            const rStart = bp.distKm * scale;
-            const rEnd = maxR + 5;
-            for (let d = startDeg; d <= endDeg; d += 0.5) {
-              const rad = (d * Math.PI) / 180;
-              pts.push(`${(cx + rEnd * Math.sin(rad)).toFixed(1)},${(cy - rEnd * Math.cos(rad)).toFixed(1)}`);
-            }
-            for (let d = endDeg; d >= startDeg; d -= 0.5) {
-              const rad = (d * Math.PI) / 180;
-              pts.push(`${(cx + rStart * Math.sin(rad)).toFixed(1)},${(cy - rStart * Math.cos(rad)).toFixed(1)}`);
-            }
-            return (
-              <polygon key={`shadow-${i}`} points={pts.join(" ")}
-                fill="#f59e0b" fillOpacity={0.08} stroke="#f59e0b" strokeWidth={0.3}
-                strokeDasharray="3,3" strokeOpacity={0.3} />
-            );
-          })}
-
-          {/* 소실표적 산점 — 섹터 외 (먼저 그려서 뒤로) */}
-          {lossData.filter((p) => !p.inSec).map((pt, i) => {
-            const { x, y } = polar2xy(pt.azDeg, pt.distKm);
-            if (pt.distKm > maxDistKm) return null;
-            const r = dotR(pt.durationS);
-            const color = altToColor(pt.altFt, minAlt, maxAlt);
-            return (
-              <circle key={`out-${i}`} cx={x} cy={y} r={r}
-                fill={color} fillOpacity={0.3}
-                stroke={color} strokeWidth={0.3} strokeOpacity={0.4} />
-            );
-          })}
-
-          {/* 소실표적 산점 — 섹터 내 (위에 그려서 강조) */}
-          {lossData.filter((p) => p.inSec).map((pt, i) => {
-            const { x, y } = polar2xy(pt.azDeg, pt.distKm);
-            if (pt.distKm > maxDistKm) return null;
-            const r = dotR(pt.durationS);
-            const color = altToColor(pt.altFt, minAlt, maxAlt);
-            return (
-              <g key={`in-${i}`}>
-                <circle cx={x} cy={y} r={r + 1} fill="none" stroke="#ffffff" strokeWidth={0.8} />
-                <circle cx={x} cy={y} r={r}
-                  fill={color} fillOpacity={0.85}
-                  stroke={color} strokeWidth={0.5} />
-              </g>
-            );
-          })}
-
-          {/* 건물 위치 */}
-          {buildingPolar.map((bp, i) => {
-            const { x, y } = polar2xy(bp.azDeg, bp.distKm);
-            return (
-              <g key={`bld-${i}`}>
-                <rect x={x - 5} y={y - 5} width={10} height={10}
-                  fill="#f59e0b" stroke="#ffffff" strokeWidth={1} rx={2} />
-                <text x={x + 8} y={y + 3} fill="#92400e" fontSize={8} fontWeight={600}
-                  stroke="#ffffff" strokeWidth={2.5} paintOrder="stroke">
-                  {bp.name}
-                </text>
-              </g>
-            );
-          })}
-
-          {/* 레이더 중심 */}
-          <circle cx={cx} cy={cy} r={4} fill="#a60739" stroke="white" strokeWidth={1.2} />
-          <text x={cx} y={cy + 14} textAnchor="middle" fill="#a60739" fontSize={8} fontWeight={600}
-            stroke="#ffffff" strokeWidth={2} paintOrder="stroke">{radarSite.name}</text>
-
-          {/* 고도 스펙트럼 범례 */}
-          {(() => {
-            const legendW = FIXED_ALTS.length * 36;
-            const lx = svgSize / 2 - legendW / 2;
-            const ly = svgSize - 46;
-            return (
-              <g>
-                {FIXED_ALTS.map((alt, i) => {
-                  const x = lx + i * 36;
-                  const color = altToColor(alt, minAlt, maxAlt);
-                  return (
-                    <g key={alt}>
-                      <rect x={x} y={ly} width={12} height={8} fill={color} rx={1.5} />
-                      <text x={x + 6} y={ly + 17} textAnchor="middle" fill="#6b7280" fontSize={7}>
-                        {alt >= 1000 ? `${(alt / 1000).toFixed(0)}k` : alt}
-                      </text>
-                    </g>
-                  );
-                })}
-                <text x={lx + legendW / 2} y={ly - 4} textAnchor="middle" fill="#6b7280" fontSize={7}>
-                  고도 (ft)
-                </text>
-              </g>
-            );
-          })()}
-
-          {/* 크기 범례 (지속시간) */}
-          {(() => {
-            const baseX = svgSize - 100;
-            const baseY = svgSize - 46;
-            return (
-              <g>
-                <text x={baseX} y={baseY - 4} fill="#6b7280" fontSize={7}>지속시간(초)</text>
-                {DURATION_EXAMPLES.map((dur, i) => {
-                  const r = dotR(dur);
-                  const x = baseX + i * 28;
-                  return (
-                    <g key={dur}>
-                      <circle cx={x + 5} cy={baseY + 4} r={r} fill="#9ca3af" fillOpacity={0.5} stroke="#6b7280" strokeWidth={0.5} />
-                      <text x={x + 5} y={baseY + 18} textAnchor="middle" fill="#6b7280" fontSize={6.5}>{dur}s</text>
-                    </g>
-                  );
-                })}
-              </g>
-            );
-          })()}
-        </svg>
-      </div>
-
-      {/* 산식 근거 주석 */}
-      <div className="mt-1 rounded border border-gray-200 bg-gray-50/70 px-3 py-1.5 text-[9px] leading-relaxed text-gray-500">
-        <span className="font-semibold text-gray-600">산식 근거 · </span>
-        점 크기: <KatexMath math="r = \sqrt{\dfrac{t}{2}}" className="mx-0.5" />
-        <span className="text-gray-400 mx-0.5">—</span>
-        <KatexMath math="A \propto \pi r^2 \propto t" className="mx-0.5" /> (면적이 소실 지속시간 <KatexMath math="t" />에 비례)
-        {" · "}색상: <KatexMath math="\text{hue} = \frac{\text{alt} - 1000}{19000} \times 240°" className="mx-0.5" /> (1kft 빨강 → 20kft 파랑)
-        {" · "}차폐 반각: <KatexMath math="\theta = \max\!\bigl(1°,\;\min\!\bigl(5°,\;\frac{h}{d} \times 0.5\bigr)\bigr)" className="mx-0.5" /> (시각적 근사, 정량 판정 아님)
+        <canvas
+          ref={canvasRef}
+          width={canvasW}
+          height={canvasH}
+          className="w-full"
+          style={{ aspectRatio: "1/1", imageRendering: "auto" }}
+        />
       </div>
 
       {/* 하단 범례 */}
-      <div className="mt-2 flex flex-wrap justify-center gap-4 text-[10px] text-gray-600">
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-2.5 w-2.5 rounded-full" style={{
-            background: "linear-gradient(135deg, hsl(0,85%,50%), hsl(120,85%,50%), hsl(240,85%,50%))",
-          }} />
-          섹터 내 소실 ({inSectorCount}건, 불투명)
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-2.5 w-2.5 rounded-full bg-gray-300 opacity-50" />
-          섹터 외 소실 ({outSectorCount}건, 반투명)
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-2.5 w-2.5 rounded bg-amber-400 border border-white" />
-          분석 대상 장애물
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-2.5 w-4 bg-amber-400/10 border border-amber-400/30 border-dashed" />
-          이론적 차폐 영역
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-0 w-4 border-t border-dashed border-red-500" />
-          방위 구간 경계
-        </span>
+      <div className="mt-2 space-y-1.5">
+        {/* 고도 스펙트럼 */}
+        <div className="flex items-center justify-center gap-1 text-[10px] text-gray-500">
+          <span className="mr-1 font-medium text-gray-600">고도(ft):</span>
+          {FIXED_ALTS.map((alt) => {
+            const color = altToColor(alt, MIN_ALT, MAX_ALT);
+            return (
+              <span key={alt} className="flex items-center gap-0.5">
+                <span className="inline-block h-2.5 w-3 rounded-sm" style={{ background: color }} />
+                <span>{alt >= 1000 ? `${(alt / 1000).toFixed(0)}k` : alt}</span>
+              </span>
+            );
+          })}
+        </div>
+
+        {/* 크기 범례 + 기호 범례 */}
+        <div className="flex flex-wrap justify-center gap-4 text-[10px] text-gray-600">
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2.5 w-2.5 rounded-full" style={{
+              background: "linear-gradient(135deg, hsl(0,85%,50%), hsl(120,85%,50%), hsl(240,85%,50%))",
+            }} />
+            섹터 내 소실 ({inSectorCount}건, 불투명)
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2.5 w-2.5 rounded-full bg-gray-300 opacity-50" />
+            섹터 외 소실 ({outSectorCount}건, 반투명)
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2.5 w-2.5 rounded bg-amber-400 border border-white" />
+            장애물
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2.5 w-4 bg-amber-400/10 border border-amber-400/30 border-dashed" />
+            차폐 영역
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-0 w-4 border-t border-dashed border-red-500" />
+            방위 구간
+          </span>
+        </div>
       </div>
     </div>
   );

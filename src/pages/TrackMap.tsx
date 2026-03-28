@@ -206,6 +206,7 @@ export default function TrackMap() {
   const trailRef = useRef<HTMLDivElement>(null);
   const fittedRef = useRef(false);
   const prevPointsLen = useRef(0);
+  const allPointsRef = useRef<TrackPoint[]>([]);
 
   // 선택된 레이더용 비행만 필터 (radar_name이 없는 레거시 데이터는 항상 표시)
   const radarFilteredFlights = useMemo(() => {
@@ -366,6 +367,7 @@ export default function TrackMap() {
   }, [consolidating, radarFilteredFlights, radarSite.name, selectedModeS, selectedFlightId, validModeS, registeredModeS]);
 
   const { allPoints, allLoss, allLossPoints, paddedTimeRange, computedTimeRange } = allPointsState;
+  allPointsRef.current = allPoints;
 
   // 고유 Mode-S 목록
   const uniqueModeS = useMemo(() => {
@@ -825,7 +827,7 @@ export default function TrackMap() {
             ],
             "fill-extrusion-height": ["get", "height"],
             "fill-extrusion-base": 0,
-            "fill-extrusion-opacity": 0.85,
+            "fill-extrusion-opacity": 1.0,
           },
         });
       }
@@ -909,7 +911,47 @@ export default function TrackMap() {
     };
   }, [losTarget, buildings3dMode, showBuildings]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // LoS 단면도 건물 클릭/호버 → 3D 건물 주황색 하이라이트
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (!map || !map.isStyleLoaded()) return;
 
+    const hlSourceId = "buildings-3d-hl-src";
+    const hlLayerId = "buildings-3d-hl-fill";
+
+    // 기존 하이라이트 레이어 제거
+    if (map.getLayer(hlLayerId)) map.removeLayer(hlLayerId);
+    if (map.getSource(hlSourceId)) map.removeSource(hlSourceId);
+
+    if (!losBuildingHighlight || !buildings3dMode || buildings3dData.length === 0) return;
+
+    // lat/lon 근접 매칭으로 Building3D 찾기
+    const tgt = losBuildingHighlight;
+    const matched = buildings3dData.find(
+      (b) => Math.abs(b.lat - tgt.lat) < 0.0001 && Math.abs(b.lon - tgt.lon) < 0.0001
+    );
+    if (!matched || matched.polygon.length < 3) return;
+
+    const geoJSON = buildingsToGeoJSON([matched]);
+
+    map.addSource(hlSourceId, { type: "geojson", data: geoJSON });
+    map.addLayer({
+      id: hlLayerId,
+      type: "fill-extrusion",
+      source: hlSourceId,
+      paint: {
+        "fill-extrusion-color": "#f97316",  // 주황색
+        "fill-extrusion-height": ["get", "height"],
+        "fill-extrusion-base": 0,
+        "fill-extrusion-opacity": 0.9,
+      },
+    });
+
+    return () => {
+      if (map.getLayer(hlLayerId)) map.removeLayer(hlLayerId);
+      if (map.getSource(hlSourceId)) map.removeSource(hlSourceId);
+    };
+  }, [losBuildingHighlight, buildings3dMode, buildings3dData]);
 
   /** 커버리지 맵 계산 시작 — GPU 계산 + Worker 점진적 렌더링 */
   const startCoverageCompute = useCallback(async (force = false) => {
@@ -1176,20 +1218,25 @@ export default function TrackMap() {
 
   // ADS-B fetch는 FileUpload에서 관리 (store 공유)
 
-  // 재생 시 비행기 아이콘 위치 (mode_s별 보간, 데이터 gap에서는 숨김)
-  const airplaneMarkers = useMemo(() => {
-    if (sliderValue >= 100 || allPoints.length === 0) return [];
-    const currentTs = visibleMaxTs;
-    if (!isFinite(currentTs)) return [];
-    // mode_s별 포인트를 그룹핑
+  // mode_s별 사전 그룹핑 캐시 (airplaneMarkers, timelineBands 등에서 공유)
+  const allPointsByModeS = useMemo(() => {
     const groups = new Map<string, TrackPoint[]>();
     for (const p of allPoints) {
-      if (!groups.has(p.mode_s)) groups.set(p.mode_s, []);
-      groups.get(p.mode_s)!.push(p);
+      let arr = groups.get(p.mode_s);
+      if (!arr) { arr = []; groups.set(p.mode_s, arr); }
+      arr.push(p);
     }
+    return groups;
+  }, [allPoints]);
+
+  // 재생 시 비행기 아이콘 위치 (mode_s별 보간, 데이터 gap에서는 숨김)
+  const airplaneMarkers = useMemo(() => {
+    if (sliderValue >= 100 || allPointsByModeS.size === 0) return [];
+    const currentTs = visibleMaxTs;
+    if (!isFinite(currentTs)) return [];
     const result: TrackPoint[] = [];
     const GAP_THRESHOLD_SECS = 15; // 이 이상 gap이면 데이터 없는 구간으로 판단
-    for (const [, pts] of groups) {
+    for (const [, pts] of allPointsByModeS) {
       // 이진 탐색: currentTs 이하 최대 인덱스
       let lo = 0, hi = pts.length - 1, idx = -1;
       while (lo <= hi) {
@@ -1224,7 +1271,7 @@ export default function TrackMap() {
       }
     }
     return result;
-  }, [allPoints, visibleMinTs, visibleMaxTs, sliderValue]);
+  }, [allPointsByModeS, visibleMinTs, visibleMaxTs, sliderValue]);
 
   // Dot 모드용 색상 맵 (Mode-S → color)
 
@@ -1697,7 +1744,10 @@ export default function TrackMap() {
       const h = hex.replace("#", "");
       return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
     };
+    const isHighlighted = (d: Building3D) =>
+      losBuildingHighlight && Math.abs(d.lat - losBuildingHighlight.lat) < 0.0001 && Math.abs(d.lon - losBuildingHighlight.lon) < 0.0001;
     const fillColor = (d: Building3D): [number, number, number, number] => {
+      if (isHighlighted(d)) return [249, 115, 22, 255]; // 주황색 하이라이트
       if (d.group_color) { const c = hexToRgb(d.group_color); return [c[0], c[1], c[2], 200]; }
       return d.source === "fac" ? [229, 231, 235, 220]
         : d.source === "manual" ? [239, 68, 68, 220]
@@ -1723,15 +1773,16 @@ export default function TrackMap() {
         id: "buildings-dots",
         data: buildings3dData,
         getPosition: (d: Building3D) => [d.lon, d.lat],
-        getRadius: 3,
+        getRadius: (d: Building3D) => isHighlighted(d) ? 6 : 3,
         radiusUnits: "pixels" as const,
         getFillColor: fillColor,
+        updateTriggers: { getFillColor: [losBuildingHighlight], getRadius: [losBuildingHighlight] },
         pickable: true,
         onClick: () => { if (losTarget) losPointClickedRef.current = true; },
         onHover: buildingHover,
       }),
     ];
-  }, [showBuildings, buildings3dData, buildings3dMode]);
+  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
@@ -1767,6 +1818,20 @@ export default function TrackMap() {
     ];
   }, [panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite.latitude, radarSite.longitude]);
 
+  // 필터된 트랙/포인트 데이터 (deckLayers 밖에서 캐시 — inline filter 방지)
+  const filteredTrackPaths = useMemo(
+    () => trackPaths.filter((d) => !hiddenLegendItems.has(d.radarType)),
+    [trackPaths, hiddenLegendItems],
+  );
+  const filteredSinglePoints = useMemo(
+    () => singlePoints.filter((d) => !hiddenLegendItems.has(d.point.radar_type)),
+    [singlePoints, hiddenLegendItems],
+  );
+  const filteredDotPoints = useMemo(
+    () => dotPoints.filter((d) => !hiddenLegendItems.has(d.radar_type)),
+    [dotPoints, hiddenLegendItems],
+  );
+
   // deck.gl 레이어
   const deckLayers = useMemo(() => {
     const layers = [];
@@ -1777,7 +1842,6 @@ export default function TrackMap() {
 
     // 항적 경로 또는 Dot 모드
     if (dotMode) {
-      const filteredDotPoints = dotPoints.filter((d) => !hiddenLegendItems.has(d.radar_type));
       // 수직선 (지면 → 고도)
       layers.push(
         new LineLayer<TrackPoint>({
@@ -1839,7 +1903,6 @@ export default function TrackMap() {
         })
       );
     } else {
-      const filteredTrackPaths = trackPaths.filter((d) => !hiddenLegendItems.has(d.radarType));
       layers.push(
         new PathLayer<TrackPath>({
           id: "track-paths",
@@ -1861,10 +1924,10 @@ export default function TrackMap() {
             if (info.object && info.coordinate) {
               const d = info.object;
               const [hLon, hLat] = info.coordinate;
-              // 해당 세그먼트의 mode_s로 가장 가까운 실제 TrackPoint 찾기
+              // 해당 세그먼트의 mode_s로 가장 가까운 실제 TrackPoint 찾기 (ref 사용 — 레이어 재생성 방지)
               let bestPt: TrackPoint | null = null;
               let bestDist = Infinity;
-              for (const p of allPoints) {
+              for (const p of allPointsRef.current) {
                 if (p.mode_s !== d.modeS) continue;
                 const dl = p.latitude - hLat;
                 const dn = p.longitude - hLon;
@@ -1901,7 +1964,6 @@ export default function TrackMap() {
     }
 
     // 1포인트 항적 (ScatterplotLayer)
-    const filteredSinglePoints = singlePoints.filter((d) => !hiddenLegendItems.has(d.point.radar_type));
     if (filteredSinglePoints.length > 0) {
       layers.push(
         new ScatterplotLayer({
@@ -2066,7 +2128,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [trackPaths, singlePoints, altScale, radarInfo, losMode, dotMode, dotPoints, aircraft, allPoints, selectedModeS, losDeckLayers, coverageDeckLayers, coverage3DDeckLayers, coverageMode, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, losBuildingHighlight, airplaneMarkers, hiddenLegendItems]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, dotMode, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, coverage3DDeckLayers, coverageMode, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2186,22 +2248,16 @@ export default function TrackMap() {
 
   // 타임라인 띠 데이터: 각 Mode-S별 시간 구간 (dot 형태로 시각화)
   const timelineBands = useMemo(() => {
-    if (allPoints.length === 0 || timeRange.max <= timeRange.min) return [];
+    if (allPointsByModeS.size === 0 || timeRange.max <= timeRange.min) return [];
     const range = timeRange.max - timeRange.min;
-    // Mode-S별로 포인트 그룹핑
-    const byModeS = new Map<string, number[]>();
-    for (const p of allPoints) {
-      let arr = byModeS.get(p.mode_s);
-      if (!arr) { arr = []; byModeS.set(p.mode_s, arr); }
-      arr.push(p.timestamp);
-    }
     const bands: { modeS: string; color: [number, number, number]; segments: { start: number; end: number }[] }[] = [];
-    for (const [modeS, times] of byModeS) {
-      // 해당 mode_s의 가장 많은 탐지 유형 색상 사용
+    for (const [modeS, pts] of allPointsByModeS) {
+      // 단일 패스: 타임스탬프 수집 + 탐지 유형 카운트
+      const times: number[] = new Array(pts.length);
       const typeCounts = new Map<string, number>();
-      for (const p of allPoints) {
-        if (p.mode_s !== modeS) continue;
-        typeCounts.set(p.radar_type, (typeCounts.get(p.radar_type) ?? 0) + 1);
+      for (let i = 0; i < pts.length; i++) {
+        times[i] = pts[i].timestamp;
+        typeCounts.set(pts[i].radar_type, (typeCounts.get(pts[i].radar_type) ?? 0) + 1);
       }
       let dominantType = "mode_s_rollcall";
       let maxCount = 0;
@@ -2232,7 +2288,7 @@ export default function TrackMap() {
       bands.push({ modeS, color, segments });
     }
     return bands;
-  }, [allPoints, timeRange]);
+  }, [allPointsByModeS, timeRange]);
 
   // 타임라인 GPU 정리 (언마운트 시)
   useEffect(() => {

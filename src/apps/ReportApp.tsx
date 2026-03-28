@@ -540,7 +540,7 @@ export default function ReportApp() {
       }
     })();
     return () => { cancelled = true; };
-  }, [omData?.panoramaStatus, omData?.selectedRadarSites, omData?.selectedBuildings]);
+  }, [omData?.selectedRadarSites, omData?.selectedBuildings]);
 
   // ── 설정 모달 표시 ──
   if (configPayload && !state) {

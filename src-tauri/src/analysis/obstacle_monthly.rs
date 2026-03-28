@@ -75,6 +75,9 @@ pub struct DailyStats {
     pub total_loss_time_secs: f64,
     pub loss_rate: f64,
     pub loss_points_summary: Vec<LossPointGeo>,
+    /// 나머지 방위(분석 구간 제외) 베이스라인 Loss 포인트 좌표
+    #[serde(default)]
+    pub baseline_loss_points: Vec<LossPointGeo>,
     /// 나머지 방위(분석 구간 제외) 베이스라인 Loss율 (%)
     #[serde(default)]
     pub baseline_loss_rate: f64,
@@ -445,14 +448,19 @@ pub fn analyze_radar_monthly(
                         // signal_loss
                         day_loss_time += gap;
                         let avg_alt_ft = ((prev.altitude + next.altitude) / 2.0) * 3.28084;
-                        day_loss_points.push(LossPointGeo {
-                            lat: (prev.latitude + next.latitude) / 2.0,
-                            lon: (prev.longitude + next.longitude) / 2.0,
-                            alt_ft: avg_alt_ft,
-                            duration_s: gap,
-                        });
                         all_loss_alt_sum += avg_alt_ft;
                         all_loss_alt_count += 1;
+                        // 스캔별 보간 포인트 생성 (TrackMap Worker와 동일)
+                        let total_missed = ((gap / scan_interval).round() as u32).saturating_sub(1).max(1);
+                        for si in 1..=total_missed {
+                            let t = si as f64 / (total_missed as f64 + 1.0);
+                            day_loss_points.push(LossPointGeo {
+                                lat: prev.latitude + (next.latitude - prev.latitude) * t,
+                                lon: prev.longitude + (next.longitude - prev.longitude) * t,
+                                alt_ft: (prev.altitude + (next.altitude - prev.altitude) * t) * 3.28084,
+                                duration_s: gap,
+                            });
+                        }
                     }
                 }
             }
@@ -465,6 +473,7 @@ pub fn analyze_radar_monthly(
         };
 
         // ── 베이스라인 (나머지 방위) 일별 통계 계산 ──
+        let mut day_baseline_loss_points: Vec<LossPointGeo> = Vec::new();
         let (baseline_loss_rate, baseline_psr_rate) = if has_sectors {
             if let Some(bl_points) = daily_baseline_points.get(date) {
                 // PSR 베이스라인
@@ -520,6 +529,17 @@ pub fn analyze_radar_monthly(
                                 || speed_dev > 0.5;
                             if !is_oor {
                                 bl_loss_time += gap;
+                                // 스캔별 보간 포인트 생성
+                                let total_missed = ((gap / bl_scan).round() as u32).saturating_sub(1).max(1);
+                                for si in 1..=total_missed {
+                                    let t = si as f64 / (total_missed as f64 + 1.0);
+                                    day_baseline_loss_points.push(LossPointGeo {
+                                        lat: prev.latitude + (next.latitude - prev.latitude) * t,
+                                        lon: prev.longitude + (next.longitude - prev.longitude) * t,
+                                        alt_ft: (prev.altitude + (next.altitude - prev.altitude) * t) * 3.28084,
+                                        duration_s: gap,
+                                    });
+                                }
                             }
                         }
                     }
@@ -548,6 +568,7 @@ pub fn analyze_radar_monthly(
             total_loss_time_secs: day_loss_time,
             loss_rate,
             loss_points_summary: day_loss_points,
+            baseline_loss_points: day_baseline_loss_points,
             baseline_loss_rate,
             baseline_psr_rate,
         });
