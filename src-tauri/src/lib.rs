@@ -2093,6 +2093,37 @@ async fn presample_coverage_elevations(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// GPU용 2D heightmap 빌드 (SRTM + 건물 → base64 그리드)
+#[tauri::command]
+async fn build_heightmap(
+    app_handle: tauri::AppHandle,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_altitude: f64,
+    antenna_height: f64,
+    range_nm: f64,
+    pixel_size_m: Option<f64>,
+    exclude_manual_ids: Option<Vec<i64>>,
+) -> Result<analysis::heightmap::HeightmapResult, String> {
+    let pix = pixel_size_m.unwrap_or(100.0);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+
+        Ok(analysis::heightmap::build_heightmap(
+            &mut srtm,
+            &conn,
+            radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
+            pix,
+            exclude_manual_ids.as_deref(),
+        ))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// 자기편각 조회 IPC 커맨드
 #[tauri::command]
 async fn get_magnetic_declination(
@@ -2901,6 +2932,7 @@ pub fn run() {
             calculate_los_panorama,
             presample_panorama_elevations,
             presample_coverage_elevations,
+            build_heightmap,
             panorama_merge_buildings,
             save_panorama_cache,
             load_panorama_cache,

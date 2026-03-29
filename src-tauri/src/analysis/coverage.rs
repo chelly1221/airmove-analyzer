@@ -296,7 +296,7 @@ pub fn invalidate_cache() {
 
 /// Query buildings for coverage computation (returns (lat, lon, height) tuples)
 /// GIS 건물은 폴리곤 꼭짓점별로 확장, 수동 건물은 geometry별 샘플 포인트 확장
-fn query_buildings_for_coverage(
+pub(crate) fn query_buildings_for_coverage(
     conn: &rusqlite::Connection,
     radar_lat: f64,
     radar_lon: f64,
@@ -379,7 +379,7 @@ fn query_buildings_for_coverage(
 
 /// Query buildings excluding specific manual building IDs
 /// GIS 건물은 폴리곤 꼭짓점별 확장, 수동 건물은 geometry별 샘플 포인트 확장
-fn query_buildings_for_coverage_excluding(
+pub(crate) fn query_buildings_for_coverage_excluding(
     conn: &rusqlite::Connection,
     radar_lat: f64,
     radar_lon: f64,

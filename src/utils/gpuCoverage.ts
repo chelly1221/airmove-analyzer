@@ -1,16 +1,14 @@
 /**
  * WebGPU 커버리지 맵 가속 (0.01° 고해상도, 36,000 rays)
  *
- * 아키텍처:
- *   Phase 1: Rust rayon — SRTM + 건물 높이 프리샘플 → base64 IPC (배치)
- *   Phase 2a: GPU Pass 1 — 곡률 보정 + running max angle 누적
- *   Phase 2b: GPU Pass 2 — 고도별 이진 탐색 → max_range_km
+ * 아키텍처 (heightmap 3D 리팩토링):
+ *   Phase 1: Rust — SRTM + 건물 → 2D heightmap (ENU 그리드, 1회 IPC)
+ *   Phase 2: GPU — heightmap 텍스처에서 polar→ENU 샘플링 + 가시선 계산 (1회 디스패치)
  *   Phase 3: Worker — buildLayers + 폴리곤 구성 (UI 논블로킹)
  *
- * 최적화:
- *   - Web Worker: buildLayers (36K destinationPoint/alt) 오프로드
- *   - 점진적 렌더링: GPU 배치 완료마다 부분 폴리곤 즉시 표시
- *   - IndexedDB 캐시: 앱 재시작 시 재계산 없이 즉시 복원
+ * 기존 presample 방식(36K ray × 2400 샘플 base64 배치 IPC 12회) 대비:
+ *   - IPC 1회 (~20MB heightmap)로 대폭 감소
+ *   - GPU가 heightmap에서 직접 샘플링 → base64 인코딩/디코딩 제거
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -25,52 +23,92 @@ const MAX_ELEV_DEG = 40;
 const FT_TO_M = 0.3048;
 const IDB_NAME = "coverage-cache";
 const IDB_STORE = "ranges";
-const IDB_VERSION = 2; // v2: surfaceAngles 추가
+const IDB_VERSION = 2;
+const NUM_SAMPLES = 2400; // 레이당 거리 샘플 수
+const HEIGHTMAP_PIXEL_SIZE_M = 100; // heightmap 해상도 (m/pixel)
 
-// ─── Rust 결과 타입 ──────────────────────────────────
+// ─── Rust heightmap 결과 타입 ────────────────────────
 
-interface PreSampledCoverage {
-  elev_b64: string;
-  num_rays: number;
-  num_samples: number;
+interface HeightmapResult {
+  data_b64: string;
+  width: number;
+  height: number;
+  pixel_size_m: number;
+  center_lat: number;
+  center_lon: number;
   radar_height_m: number;
   max_range_km: number;
-  bearing_step_deg: number;
 }
 
-// ─── WGSL Compute Shader ─────────────────────────────
+// ─── WGSL Compute Shader (heightmap 기반) ───────────
 
-// Pass 1: 곡률 보정 지형 + running max angle → intermediate storage
-const PASS1_SHADER = /* wgsl */ `
+// Pass 1: heightmap에서 polar→ENU 샘플링 + 곡률 보정 + running max angle
+const HEIGHTMAP_PASS1_SHADER = /* wgsl */ `
 const R_EARTH_M: f32 = 6371000.0;
+const PI: f32 = 3.14159265358979;
 
 struct Params {
   radar_height_m: f32,
   max_range_km: f32,
   num_samples: u32,
+  bearing_step_deg: f32,
+  pixel_size_m: f32,
+  hm_width: u32,
+  hm_height: u32,
   _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> elevations: array<f32>;
+@group(0) @binding(1) var<storage, read> heightmap: array<f32>;
 @group(0) @binding(2) var<storage, read_write> max_angles: array<f32>;
+
+// 바이리니어 보간 heightmap 샘플링
+fn sample_hm(east_m: f32, north_m: f32) -> f32 {
+  let half_w = f32(params.hm_width) * 0.5;
+  let half_h = f32(params.hm_height) * 0.5;
+  let fx = east_m / params.pixel_size_m + half_w;
+  let fy = north_m / params.pixel_size_m + half_h;
+
+  let x0 = u32(max(floor(fx), 0.0));
+  let y0 = u32(max(floor(fy), 0.0));
+  if (x0 >= params.hm_width - 1u || y0 >= params.hm_height - 1u) { return 0.0; }
+
+  let dx = fx - f32(x0);
+  let dy = fy - f32(y0);
+  let w = params.hm_width;
+  let v00 = heightmap[y0 * w + x0];
+  let v10 = heightmap[y0 * w + x0 + 1u];
+  let v01 = heightmap[(y0 + 1u) * w + x0];
+  let v11 = heightmap[(y0 + 1u) * w + x0 + 1u];
+  return mix(mix(v00, v10, dx), mix(v01, v11, dx), dy);
+}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ray = gid.x;
-  if (ray * params.num_samples >= arrayLength(&max_angles)) { return; }
+  let total_rays = u32(360.0 / params.bearing_step_deg);
+  if (ray >= total_rays) { return; }
+
+  let bearing_rad = f32(ray) * params.bearing_step_deg * PI / 180.0;
+  let sin_b = sin(bearing_rad);
+  let cos_b = cos(bearing_rad);
   let base = ray * params.num_samples;
   var running_max: f32 = -1e10;
 
   for (var s = 0u; s < params.num_samples; s++) {
     let dist_m = (f32(s + 1u) / f32(params.num_samples)) * params.max_range_km * 1000.0;
-    let elev = elevations[base + s];
 
-    // 곡률 보정: adj = elev - d²/(2R)
+    // polar → ENU
+    let east_m = dist_m * sin_b;
+    let north_m = dist_m * cos_b;
+
+    let elev = sample_hm(east_m, north_m);
+
+    // 곡률 보정
     let curv_drop = dist_m * dist_m / (2.0 * R_EARTH_M);
     let adj = elev - curv_drop;
 
-    // running max angle (기울기)
+    // running max angle
     let angle = (adj - params.radar_height_m) / dist_m;
     if (angle > running_max) { running_max = angle; }
     max_angles[base + s] = running_max;
@@ -78,9 +116,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// Pass 2: 고도별 이진 탐색 → max_range_km
-const PASS2_SHADER = /* wgsl */ `
+// Pass 2: 고도별 이진 탐색 → max_range_km (heightmap에서 재샘플)
+const HEIGHTMAP_PASS2_SHADER = /* wgsl */ `
 const R_EARTH_M: f32 = 6371000.0;
+const PI: f32 = 3.14159265358979;
 const FT_TO_M: f32 = 0.3048;
 
 struct Params {
@@ -88,13 +127,37 @@ struct Params {
   max_range_km: f32,
   num_samples: u32,
   num_altitudes: u32,
+  bearing_step_deg: f32,
+  pixel_size_m: f32,
+  hm_width: u32,
+  hm_height: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> elevations: array<f32>;
+@group(0) @binding(1) var<storage, read> heightmap: array<f32>;
 @group(0) @binding(2) var<storage, read> max_angles: array<f32>;
 @group(0) @binding(3) var<storage, read> alt_fts: array<f32>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+fn sample_hm(east_m: f32, north_m: f32) -> f32 {
+  let half_w = f32(params.hm_width) * 0.5;
+  let half_h = f32(params.hm_height) * 0.5;
+  let fx = east_m / params.pixel_size_m + half_w;
+  let fy = north_m / params.pixel_size_m + half_h;
+
+  let x0 = u32(max(floor(fx), 0.0));
+  let y0 = u32(max(floor(fy), 0.0));
+  if (x0 >= params.hm_width - 1u || y0 >= params.hm_height - 1u) { return 0.0; }
+
+  let dx = fx - f32(x0);
+  let dy = fy - f32(y0);
+  let w = params.hm_width;
+  let v00 = heightmap[y0 * w + x0];
+  let v10 = heightmap[y0 * w + x0 + 1u];
+  let v01 = heightmap[(y0 + 1u) * w + x0];
+  let v11 = heightmap[(y0 + 1u) * w + x0 + 1u];
+  return mix(mix(v00, v10, dx), mix(v01, v11, dx), dy);
+}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -105,6 +168,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let base = ray * params.num_samples;
   let n = params.num_samples;
   let max_range = params.max_range_km;
+
+  let bearing_rad = f32(ray) * params.bearing_step_deg * PI / 180.0;
+  let sin_b = sin(bearing_rad);
+  let cos_b = cos(bearing_rad);
 
   // 이진 탐색: max_angles에서 LoS 차단점
   var los_block: u32 = n;
@@ -124,13 +191,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  // 선형 탐색: 지형 직접 차단점
+  // 선형 탐색: 지형 직접 차단점 (heightmap 재샘플)
   var terrain_block: u32 = n;
   for (var i = 0u; i < los_block; i++) {
     let dist = (f32(i + 1u) / f32(n)) * max_range * 1000.0;
+    let east_m = dist * sin_b;
+    let north_m = dist * cos_b;
+    let elev = sample_hm(east_m, north_m);
     let curv_drop = dist * dist / (2.0 * R_EARTH_M);
     let adj_alt = alt_m - curv_drop;
-    if (elevations[base + i] - curv_drop > adj_alt) {
+    if (elev - curv_drop > adj_alt) {
       terrain_block = i;
       break;
     }
@@ -142,7 +212,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// ─── destination_point (OM 보고서용 동기 레이어 생성) ───────
+// ─── destinationPoint (OM 보고서용 동기 레이어 생성) ───────
 
 function destinationPoint(
   latDeg: number, lonDeg: number, bearingDeg: number, distKm: number,
@@ -157,105 +227,118 @@ function destinationPoint(
   return [(lat2 * 180) / Math.PI, (lon2 * 180) / Math.PI];
 }
 
-// ─── base64 decode (async, 논블로킹) ────────────────
+// ─── Heightmap IPC ──────────────────────────────────
 
-async function decodeBase64F32(b64: string): Promise<Float32Array> {
-  const res = await fetch(`data:application/octet-stream;base64,${b64}`);
-  return new Float32Array(await res.arrayBuffer());
-}
-
-// ─── Rust 프리샘플 호출 ─────────────────────────────
-
-interface ProfileParams {
-  radarLat: number;
-  radarLon: number;
-  radarAltitude: number;
-  antennaHeight: number;
-  rangeNm: number;
-  bearingStepDeg: number;
-  excludeManualIds?: number[];
-}
-
-async function fetchPresample(
-  params: ProfileParams, startRay: number, rayCount: number,
-): Promise<PreSampledCoverage> {
-  return invoke<PreSampledCoverage>("presample_coverage_elevations", {
-    radarLat: params.radarLat,
-    radarLon: params.radarLon,
-    radarAltitude: params.radarAltitude,
-    antennaHeight: params.antennaHeight,
-    rangeNm: params.rangeNm,
-    bearingStepDeg: params.bearingStepDeg,
-    excludeManualIds: params.excludeManualIds,
-    batchStartRay: startRay,
-    batchRayCount: rayCount,
+async function fetchHeightmap(
+  radarLat: number, radarLon: number,
+  radarAltitude: number, antennaHeight: number,
+  rangeNm: number,
+  excludeManualIds?: number[],
+): Promise<{ heightmapF32: Float32Array; meta: HeightmapResult }> {
+  const meta = await invoke<HeightmapResult>("build_heightmap", {
+    radarLat, radarLon, radarAltitude, antennaHeight, rangeNm,
+    pixelSizeM: HEIGHTMAP_PIXEL_SIZE_M,
+    excludeManualIds,
   });
+
+  // base64 디코딩
+  const res = await fetch(`data:application/octet-stream;base64,${meta.data_b64}`);
+  const heightmapF32 = new Float32Array(await res.arrayBuffer());
+  meta.data_b64 = ""; // 메모리 해제
+  return { heightmapF32, meta };
 }
 
-// ─── GPU 배치 계산 ───────────────────────────────────
+// ─── GPU 계산 (heightmap 기반, 배치 없음) ────────────
 
-interface BatchGPUResult {
-  ranges: Float32Array;
+interface CoverageGPUResult {
+  ranges: Float32Array; // totalRays × numAlts
+  maxRangeKm: number;
 }
 
-async function computeBatchGPU(
+async function computeFromHeightmap(
   device: GPUDevice,
-  elevF32: Float32Array,
-  batchRays: number,
-  numSamples: number,
-  radarHeightM: number,
-  maxRangeKm: number,
+  heightmapF32: Float32Array,
+  meta: HeightmapResult,
+  bearingStepDeg: number,
   altFts: number[],
-): Promise<BatchGPUResult> {
-  // Pass 1 uniform
-  const p1Buf = new ArrayBuffer(16);
-  new Float32Array(p1Buf).set([radarHeightM, maxRangeKm]);
-  new Uint32Array(p1Buf, 8).set([numSamples, 0]);
+): Promise<CoverageGPUResult> {
+  const totalRays = Math.floor(360 / bearingStepDeg);
+  const numAlts = altFts.length;
 
+  // Heightmap 버퍼 (GPU에 1회 업로드)
+  const hmBuf = createBuffer(device, heightmapF32, GPUBufferUsage.STORAGE);
+
+  // ── Pass 1: running max angle ──
+  const p1Buf = new ArrayBuffer(32);
+  const p1F32 = new Float32Array(p1Buf);
+  const p1U32 = new Uint32Array(p1Buf);
+  p1F32[0] = meta.radar_height_m;
+  p1F32[1] = meta.max_range_km;
+  p1U32[2] = NUM_SAMPLES;
+  p1F32[3] = bearingStepDeg;
+  p1F32[4] = meta.pixel_size_m;
+  p1U32[5] = meta.width;
+  p1U32[6] = meta.height;
+  p1U32[7] = 0;
   const uniformBuf1 = createBuffer(device, new Float32Array(p1Buf), GPUBufferUsage.UNIFORM);
-  const elevBuf = createBuffer(device, elevF32, GPUBufferUsage.STORAGE);
+
+  const maxAnglesSize = totalRays * NUM_SAMPLES * 4;
   const maxAnglesBuf = device.createBuffer({
-    size: batchRays * numSamples * 4,
+    size: maxAnglesSize,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
 
-  await runComputeShader(device, PASS1_SHADER, [
+  const maxWorkgroups = device.limits.maxComputeWorkgroupsPerDimension;
+  const pass1Workgroups = Math.min(Math.ceil(totalRays / 64), maxWorkgroups);
+
+  await runComputeShader(device, HEIGHTMAP_PASS1_SHADER, [
     { buffer: uniformBuf1, type: "uniform" },
-    { buffer: elevBuf, type: "read-only-storage" },
+    { buffer: hmBuf, type: "read-only-storage" },
     { buffer: maxAnglesBuf, type: "storage" },
-  ], [Math.ceil(batchRays / 64), 1, 1]);
+  ], [pass1Workgroups, 1, 1]);
 
-  // Pass 2 uniform
-  const p2Buf = new ArrayBuffer(16);
-  new Float32Array(p2Buf).set([radarHeightM, maxRangeKm]);
-  new Uint32Array(p2Buf, 8).set([numSamples, altFts.length]);
-
+  // ── Pass 2: 고도별 이진 탐색 ──
+  const p2Buf = new ArrayBuffer(32);
+  const p2F32 = new Float32Array(p2Buf);
+  const p2U32 = new Uint32Array(p2Buf);
+  p2F32[0] = meta.radar_height_m;
+  p2F32[1] = meta.max_range_km;
+  p2U32[2] = NUM_SAMPLES;
+  p2U32[3] = numAlts;
+  p2F32[4] = bearingStepDeg;
+  p2F32[5] = meta.pixel_size_m;
+  p2U32[6] = meta.width;
+  p2U32[7] = meta.height;
   const uniformBuf2 = createBuffer(device, new Float32Array(p2Buf), GPUBufferUsage.UNIFORM);
+
   const altBuf = createBuffer(device, new Float32Array(altFts), GPUBufferUsage.STORAGE);
-  const outSize = batchRays * altFts.length * 4;
+  const outSize = totalRays * numAlts * 4;
   const outputBuf = device.createBuffer({
     size: outSize,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
 
-  await runComputeShader(device, PASS2_SHADER, [
+  const pass2Workgroups = Math.min(Math.ceil((totalRays * numAlts) / 64), maxWorkgroups);
+
+  await runComputeShader(device, HEIGHTMAP_PASS2_SHADER, [
     { buffer: uniformBuf2, type: "uniform" },
-    { buffer: elevBuf, type: "read-only-storage" },
+    { buffer: hmBuf, type: "read-only-storage" },
     { buffer: maxAnglesBuf, type: "read-only-storage" },
     { buffer: altBuf, type: "read-only-storage" },
     { buffer: outputBuf, type: "storage" },
-  ], [Math.ceil((batchRays * altFts.length) / 64), 1, 1]);
+  ], [pass2Workgroups, 1, 1]);
 
-  const result = await readBuffer(device, outputBuf, outSize);
+  const ranges = await readBuffer(device, outputBuf, outSize);
 
+  // 버퍼 정리
   uniformBuf1.destroy();
   uniformBuf2.destroy();
-  elevBuf.destroy();
+  hmBuf.destroy();
   maxAnglesBuf.destroy();
   altBuf.destroy();
   outputBuf.destroy();
 
-  return { ranges: result };
+  return { ranges, maxRangeKm: meta.max_range_km };
 }
 
 // ─── Worker 관리 ────────────────────────────────────
@@ -292,7 +375,6 @@ function getWorker(): Worker {
 function handleWorkerMessage(e: MessageEvent) {
   const { type, id } = e.data;
 
-  // 점진적 렌더링 콜백 (promise 없이 직접 콜백)
   if (type === "PROGRESSIVE_RESULT") {
     const cb = _progressiveCallbacks.get(e.data.computeId);
     cb?.(e.data.polygons);
@@ -365,7 +447,7 @@ export async function buildPolygonsAsync(
   return result.polygons;
 }
 
-// ─── GPU 배치 루프 + 점진적 렌더링 ─────────────────
+// ─── 점진적 렌더링 ─────────────────────────────────
 
 /** 점진적 렌더링 콜백을 받는 폴리곤 데이터 타입 */
 export interface CoveragePolygonData {
@@ -375,101 +457,6 @@ export interface CoveragePolygonData {
   fillColor: [number, number, number];
   altM: number;
   altFt: number;
-}
-
-interface ProgressiveResult {
-  ranges: Float32Array;
-  maxRangeKm?: number;
-}
-
-async function computeProfileRawWithProgressive(
-  device: GPUDevice,
-  params: ProfileParams,
-  altFts: number[],
-  onProgress?: (pct: number, msg: string) => void,
-  onProgressivePolygons?: (polygons: CoveragePolygonData[]) => void,
-): Promise<ProgressiveResult> {
-  if (altFts.length === 0) throw new Error("altFts must not be empty");
-  const totalRays = Math.floor(360 / params.bearingStepDeg);
-  const numSamples = 2400;
-  const bytesPerRay = numSamples * 4;
-
-  const maxBufBytes = device.limits.maxStorageBufferBindingSize;
-  const maxWorkgroups = device.limits.maxComputeWorkgroupsPerDimension;
-  const maxRaysForWorkgroups = Math.floor(maxWorkgroups * 64 / altFts.length);
-  const IPC_RAY_CAP = 3000;
-  const maxRaysPerBatch = Math.min(
-    Math.floor(maxBufBytes / bytesPerRay),
-    maxRaysForWorkgroups,
-    IPC_RAY_CAP,
-  );
-  const numBatches = Math.ceil(totalRays / maxRaysPerBatch);
-
-  // Worker 준비 (점진적 렌더링용)
-  const worker = getWorker();
-  const progressiveAlts = [500, 1000, 2000, 5000, 10000, 20000];
-
-  // 점진적 렌더링 콜백 설정
-  const computeId = _workerNextId; // Use first batch's ID as computation identifier
-  if (onProgressivePolygons) {
-    _progressiveCallbacks.set(computeId, onProgressivePolygons);
-  }
-
-  let lastMaxRangeKm = 0;
-
-  for (let b = 0; b < numBatches; b++) {
-    const startRay = b * maxRaysPerBatch;
-    const batchRays = Math.min(maxRaysPerBatch, totalRays - startRay);
-    const batchPct = Math.round(((b + 0.5) / numBatches) * 80) + 5;
-
-    onProgress?.(batchPct, `커버리지 GPU 계산 중... (배치 ${b + 1}/${numBatches}, ${batchRays} rays)`);
-
-    const ps = await fetchPresample(params, startRay, batchRays);
-    const elevF32 = await decodeBase64F32(ps.elev_b64);
-    ps.elev_b64 = "";
-    lastMaxRangeKm = ps.max_range_km;
-
-    const batchGPU = await computeBatchGPU(
-      device, elevF32, batchRays, numSamples, ps.radar_height_m, ps.max_range_km, altFts,
-    );
-
-    // GPU 결과를 Worker에 보내서 누적 + 점진적 폴리곤 생성 (논블로킹)
-    worker.postMessage({
-      type: "ACCUMULATE_BATCH",
-      id: _workerNextId++,
-      computeId,
-      startRay,
-      batchRays,
-      batchResult: batchGPU.ranges.buffer,
-      numAlts: altFts.length,
-      totalRays,
-      radarLat: params.radarLat,
-      radarLon: params.radarLon,
-      radarAltitude: params.radarAltitude,
-      antennaHeight: params.antennaHeight,
-      bearingStepDeg: params.bearingStepDeg,
-      altFts,
-      maxRangeKm: lastMaxRangeKm,
-      progressiveAlts: onProgressivePolygons ? progressiveAlts : null,
-      altScale: 0,
-      showCone: false,
-    }, [batchGPU.ranges.buffer]);
-  }
-
-  // 점진적 렌더링 콜백 해제
-  _progressiveCallbacks.delete(computeId);
-
-  // Worker 캐시에서 최종 ranges 추출 (EXPORT_CACHE)
-  const exported = await workerSend({ type: "EXPORT_CACHE" });
-  const allRanges = new Float32Array(exported.ranges);
-
-  // Worker는 이미 캐시를 가지고 있으므로 _workerReady = true
-  _workerReady = true;
-
-  return {
-    ranges: allRanges,
-    maxRangeKm: lastMaxRangeKm,
-  };
 }
 
 // ─── 세션 캐시 ──────────────────────────────────────
@@ -528,14 +515,13 @@ function buildLayers(
     .filter(Boolean) as CoverageLayer[];
 }
 
-// ─── IndexedDB 캐시 (Phase 4) ──────────────────────
+// ─── IndexedDB 캐시 ─────────────────────────────────
 
 function openIDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(IDB_NAME, IDB_VERSION);
     req.onupgradeneeded = (event) => {
       const db = req.result;
-      // v1→v2 마이그레이션: surfaceAngles 필드 추가 (기존 캐시 삭제)
       if ((event as IDBVersionChangeEvent).oldVersion < 2 && db.objectStoreNames.contains(IDB_STORE)) {
         db.deleteObjectStore(IDB_STORE);
       }
@@ -562,7 +548,7 @@ async function saveToIDB(cache: GPUCoverageCache): Promise<void> {
       bearingStepDeg: cache.bearingStepDeg,
       totalRays: cache.totalRays,
       altFts: cache.altFts,
-      ranges: cache.ranges.buffer, // ArrayBuffer 저장
+      ranges: cache.ranges.buffer,
       maxRangeKm: cache.maxRangeKm,
       savedAt: Date.now(),
     };
@@ -614,10 +600,9 @@ async function loadFromIDB(radarKey: string): Promise<GPUCoverageCache | null> {
 // ─── 공개 API: 메인 커버리지맵 ──────────────────────
 
 /**
- * 메인 커버리지맵 계산 (WebGPU, 0.01° 해상도, 36,000 rays)
- * - 전체 고도(100~30000ft, 100ft 단위) 사전 계산 → 세션 캐시 + IndexedDB
- * - Worker를 통한 논블로킹 레이어 생성
- * - 점진적 렌더링 콜백 지원
+ * 메인 커버리지맵 계산 (WebGPU + heightmap, 0.01° 해상도, 36,000 rays)
+ * - Rust에서 2D heightmap 1회 수신 → GPU에서 전체 가시선 1회 계산
+ * - 점진적 렌더링: GPU 완료 후 Worker에서 폴리곤 점진 생성
  */
 export async function computeMainCoverage(
   radar: RadarSite,
@@ -633,7 +618,6 @@ export async function computeMainCoverage(
     console.log("[Coverage] IndexedDB 캐시 복원");
     _cache = idbCache;
 
-    // Worker에 캐시 전달
     await initWorkerCache(_cache);
 
     onProgress?.(90, "레이어 변환 중...");
@@ -655,31 +639,29 @@ export async function computeMainCoverage(
     };
   }
 
-  // GPU 계산
+  // GPU 계산 (heightmap 방식)
   const device = await getGPUDevice();
 
-  onProgress?.(2, "GPU 커버리지 계산 준비...");
+  onProgress?.(2, "Heightmap 생성 중...");
 
   const altFts: number[] = [];
   for (let alt = 100; alt <= 30000; alt += 100) altFts.push(alt);
 
-  const params: ProfileParams = {
-    radarLat: radar.latitude,
-    radarLon: radar.longitude,
-    radarAltitude: radar.altitude,
-    antennaHeight: radar.antenna_height,
-    rangeNm: radar.range_nm,
-    bearingStepDeg: BEARING_STEP_DEG,
-  };
-
   const totalRays = Math.floor(360 / BEARING_STEP_DEG);
 
-  // GPU 계산 + 점진적 렌더링 (Worker에서 배치별 폴리곤 생성)
-  const progressive = await computeProfileRawWithProgressive(
-    device, params, altFts,
-    onProgress,
-    onProgressivePolygons,
+  // 1. Rust에서 heightmap 1회 수신
+  const { heightmapF32, meta } = await fetchHeightmap(
+    radar.latitude, radar.longitude,
+    radar.altitude, radar.antenna_height,
+    radar.range_nm,
   );
+
+  console.log(`[Coverage] Heightmap ${meta.width}×${meta.height} (${(heightmapF32.byteLength / 1024 / 1024).toFixed(1)} MB), range=${meta.max_range_km.toFixed(1)}km`);
+
+  onProgress?.(30, "GPU 커버리지 계산 중...");
+
+  // 2. GPU 1회 디스패치
+  const result = await computeFromHeightmap(device, heightmapF32, meta, BEARING_STEP_DEG, altFts);
 
   // 세션 캐시 저장
   _cache = {
@@ -691,17 +673,26 @@ export async function computeMainCoverage(
     bearingStepDeg: BEARING_STEP_DEG,
     totalRays,
     altFts,
-    ranges: progressive.ranges,
-    maxRangeKm: progressive.maxRangeKm,
+    ranges: result.ranges,
+    maxRangeKm: result.maxRangeKm,
   };
 
-  onProgress?.(88, "레이어 변환 중...");
+  // 3. Worker에 전체 결과 전달 → 점진적 폴리곤 생성
+  onProgress?.(70, "레이어 변환 중...");
+  await initWorkerCache(_cache);
 
-  // Worker에서 최종 레이어 생성 (논블로킹)
+  // 점진적 렌더링: Worker에서 주요 고도 폴리곤 즉시 생성
+  if (onProgressivePolygons) {
+    const progressiveAlts = [500, 1000, 2000, 5000, 10000, 20000];
+    const partialLayers = await computeLayersForAltitudesAsync(progressiveAlts, 10);
+    const partialPolygons = await buildPolygonsAsync(partialLayers, radar.latitude, radar.longitude, 0, false);
+    onProgressivePolygons(partialPolygons);
+  }
+
   const repAlts = [500, 1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
   const layers = await computeLayersForAltitudesAsync(repAlts, 1);
 
-  // IndexedDB에 비동기 저장 (fire-and-forget)
+  // IndexedDB에 비동기 저장
   onProgress?.(95, "캐시 저장 중...");
   saveToIDB(_cache).catch(() => {});
 
@@ -721,7 +712,6 @@ export async function computeMainCoverage(
 
 /**
  * 캐시에서 특정 고도 레이어 추출 (슬라이더용, 동기)
- * Worker가 준비되지 않았을 때만 사용
  */
 export function computeLayersForAltitudes(
   altFts: number[],
@@ -766,12 +756,11 @@ export const hasSurfaceAngles = hasCoverageCache;
 export interface Coverage3DQuad {
   polygon: [number, number, number][]; // 4개 꼭짓점 [lon, lat, altM]
   fillColor: [number, number, number];
-  altFt: number; // 셀 중심 고도 (ft)
+  altFt: number;
 }
 
 /**
  * 3D 커버리지 면 생성 (Worker 비동기)
- * Worker에서 캐시된 ranges를 사용하여 최저 탐지 가능 고도를 3D mesh로 시각화
  */
 export async function build3DSurfaceAsync(): Promise<Coverage3DQuad[]> {
   if (!_cache || !_workerReady || !_cache.maxRangeKm) return [];
@@ -796,61 +785,9 @@ export interface CoverageOMParams {
   bearingStepDeg: number;
 }
 
-// OM 보고서용 GPU 계산 (동기 buildLayers — Worker 불필요, 보고서 자체가 백그라운드)
-async function computeProfileRaw(
-  device: GPUDevice,
-  params: ProfileParams,
-  altFts: number[],
-  onProgress?: (msg: string) => void,
-): Promise<Float32Array> {
-  if (altFts.length === 0) throw new Error("altFts must not be empty");
-  const totalRays = Math.floor(360 / params.bearingStepDeg);
-  const numSamples = 2400;
-  const bytesPerRay = numSamples * 4;
-
-  const maxBufBytes = device.limits.maxStorageBufferBindingSize;
-  const maxWorkgroups = device.limits.maxComputeWorkgroupsPerDimension;
-  const maxRaysForWorkgroups = Math.floor(maxWorkgroups * 64 / altFts.length);
-  const IPC_RAY_CAP = 3000;
-  const maxRaysPerBatch = Math.min(
-    Math.floor(maxBufBytes / bytesPerRay),
-    maxRaysForWorkgroups,
-    IPC_RAY_CAP,
-  );
-  const numBatches = Math.ceil(totalRays / maxRaysPerBatch);
-
-  const allRanges = new Float32Array(totalRays * altFts.length);
-
-  for (let b = 0; b < numBatches; b++) {
-    const startRay = b * maxRaysPerBatch;
-    const batchRays = Math.min(maxRaysPerBatch, totalRays - startRay);
-
-    onProgress?.(`커버리지 GPU 계산 중... (배치 ${b + 1}/${numBatches}, ${batchRays} rays)`);
-
-    const ps = await fetchPresample(params, startRay, batchRays);
-    const elevF32 = await decodeBase64F32(ps.elev_b64);
-    ps.elev_b64 = "";
-
-    const batchGPU = await computeBatchGPU(
-      device, elevF32, batchRays, numSamples, ps.radar_height_m, ps.max_range_km, altFts,
-    );
-
-    const numAlts = altFts.length;
-    for (let r = 0; r < batchRays; r++) {
-      allRanges.set(
-        batchGPU.ranges.subarray(r * numAlts, (r + 1) * numAlts),
-        (startRay + r) * numAlts,
-      );
-    }
-  }
-
-  return allRanges;
-}
-
 /**
- * OM 보고서용 커버리지 레이어 계산
- * - WebGPU 필수
- * - 건물 포함/제외 2회 계산
+ * OM 보고서용 커버리지 레이어 계산 (heightmap 방식)
+ * - 건물 포함/제외 각각 heightmap 1회 + GPU 1회 = 총 2회 IPC
  */
 export async function computeCoverageLayersOM(
   params: CoverageOMParams,
@@ -861,10 +798,18 @@ export async function computeCoverageLayersOM(
   const device = await getGPUDevice();
 
   const totalRays = Math.floor(360 / params.bearingStepDeg);
-  console.log(`[Coverage] GPU 모드, ${params.bearingStepDeg}° (${totalRays} rays)`);
+  console.log(`[Coverage OM] Heightmap 모드, ${params.bearingStepDeg}° (${totalRays} rays)`);
 
-  onProgress?.(`커버리지 GPU 계산 중... ${params.radarName} (건물 포함)`);
-  const withRanges = await computeProfileRaw(device, params, altFts, onProgress);
+  // 건물 포함
+  onProgress?.(`Heightmap 생성 중... ${params.radarName} (건물 포함)`);
+  const { heightmapF32: hmWith, meta: metaWith } = await fetchHeightmap(
+    params.radarLat, params.radarLon,
+    params.radarAltitude, params.antennaHeight,
+    params.rangeNm,
+  );
+
+  onProgress?.(`GPU 커버리지 계산 중... ${params.radarName} (건물 포함)`);
+  const withResult = await computeFromHeightmap(device, hmWith, metaWith, params.bearingStepDeg, altFts);
   const withCache: GPUCoverageCache = {
     radarKey: "",
     radarLat: params.radarLat,
@@ -874,13 +819,22 @@ export async function computeCoverageLayersOM(
     bearingStepDeg: params.bearingStepDeg,
     totalRays,
     altFts,
-    ranges: withRanges,
+    ranges: withResult.ranges,
   };
   const layersWith = buildLayers(withCache, altFts, 1);
 
-  onProgress?.(`커버리지 GPU 계산 중... ${params.radarName} (건물 제외)`);
-  const withoutRanges = await computeProfileRaw(device, { ...params, excludeManualIds }, altFts, onProgress);
-  const withoutCache: GPUCoverageCache = { ...withCache, ranges: withoutRanges };
+  // 건물 제외
+  onProgress?.(`Heightmap 생성 중... ${params.radarName} (건물 제외)`);
+  const { heightmapF32: hmWithout, meta: metaWithout } = await fetchHeightmap(
+    params.radarLat, params.radarLon,
+    params.radarAltitude, params.antennaHeight,
+    params.rangeNm,
+    excludeManualIds,
+  );
+
+  onProgress?.(`GPU 커버리지 계산 중... ${params.radarName} (건물 제외)`);
+  const withoutResult = await computeFromHeightmap(device, hmWithout, metaWithout, params.bearingStepDeg, altFts);
+  const withoutCache: GPUCoverageCache = { ...withCache, ranges: withoutResult.ranges };
   const layersWithout = buildLayers(withoutCache, altFts, 1);
 
   return { layersWith, layersWithout };
