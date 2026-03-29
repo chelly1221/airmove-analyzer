@@ -125,3 +125,12 @@ export function gradeWithConfidence(
   if (avgLoss < 2.0) return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
   return { label: "경고", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
 }
+
+/**
+ * 편차 해석 임계값 — 이 범위 내이면 "유사 수준" 판정
+ *
+ * Loss율 (%p): 0.1%p — 통상적 배경 소실율 변동 폭 이내
+ * PSR율 (%p): 0.5%p — PSR율은 80–100% 범위로, Loss 대비 변동 스케일이 큼
+ */
+export const LOSS_DEV_THRESHOLD = 0.1;
+export const PSR_DEV_THRESHOLD = 0.5;

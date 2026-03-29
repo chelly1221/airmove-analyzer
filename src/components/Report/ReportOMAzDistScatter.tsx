@@ -93,7 +93,7 @@ function computeZoom(lat: number, rangeKm: number, canvasSize: number): number {
   for (let z = 14; z >= 4; z--) {
     const metersPerPx = (40075016.686 * Math.cos(lat * DEG2RAD)) / (Math.pow(2, z) * 256);
     const coveredKm = (metersPerPx * canvasSize) / 1000;
-    if (coveredKm >= rangeKm * 2.2) return z;
+    if (coveredKm >= rangeKm * 2.01) return z;
   }
   return 4;
 }
@@ -116,33 +116,23 @@ function ReportOMAzDistScatter({
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
     : "";
 
-  // 섹터 내 Loss 포인트
-  const sectorLoss = useMemo(() => {
-    const pts: { lat: number; lon: number; altFt: number; durationS: number; inSec: boolean }[] = [];
+  // 전체 Loss 포인트 (섹터 구분 없이 통합)
+  const allLoss = useMemo(() => {
+    const pts: { lat: number; lon: number; altFt: number; durationS: number }[] = [];
     for (const d of dailyStats) {
       for (const lp of d.loss_points_summary) {
         if (lp.lat === 0 && lp.lon === 0) continue;
-        pts.push({ lat: lp.lat, lon: lp.lon, altFt: lp.alt_ft, durationS: lp.duration_s, inSec: true });
+        pts.push({ lat: lp.lat, lon: lp.lon, altFt: lp.alt_ft, durationS: lp.duration_s });
+      }
+      if (d.baseline_loss_points) {
+        for (const lp of d.baseline_loss_points) {
+          if (lp.lat === 0 && lp.lon === 0) continue;
+          pts.push({ lat: lp.lat, lon: lp.lon, altFt: lp.alt_ft, durationS: lp.duration_s });
+        }
       }
     }
     return pts;
   }, [dailyStats]);
-
-  // 베이스라인(나머지 방위) Loss 포인트
-  const baselineLoss = useMemo(() => {
-    const pts: { lat: number; lon: number; altFt: number; durationS: number; inSec: boolean }[] = [];
-    for (const d of dailyStats) {
-      if (!d.baseline_loss_points) continue;
-      for (const lp of d.baseline_loss_points) {
-        if (lp.lat === 0 && lp.lon === 0) continue;
-        pts.push({ lat: lp.lat, lon: lp.lon, altFt: lp.alt_ft, durationS: lp.duration_s, inSec: false });
-      }
-    }
-    return pts;
-  }, [dailyStats]);
-
-  // 전체 Loss 포인트 합산
-  const allLoss = useMemo(() => [...baselineLoss, ...sectorLoss], [sectorLoss, baselineLoss]);
 
   // 캔버스 크기
   const canvasW = 1400;
@@ -231,24 +221,8 @@ function ReportOMAzDistScatter({
       // 방위 섹터 경계선
       if (azSectors.length > 0) {
         const sectorR = rangeKm * 1.3; // km
-        ctx.strokeStyle = "rgba(239,68,68,0.7)";
-        ctx.lineWidth = 2;
-        ctx.setLineDash([10, 5]);
-        for (const s of azSectors) {
-          for (const deg of [s.start_deg, s.end_deg]) {
-            const rad = (deg * Math.PI) / 180;
-            const endLat = radarSite.latitude + (sectorR / 111.32) * Math.cos(rad);
-            const endLon = radarSite.longitude + (sectorR / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(rad);
-            const end = geoToCanvas(endLat, endLon);
-            ctx.beginPath();
-            ctx.moveTo(radarCanvas.x, radarCanvas.y);
-            ctx.lineTo(end.x, end.y);
-            ctx.stroke();
-          }
-        }
-        ctx.setLineDash([]);
 
-        // 섹터 영역 반투명 채우기
+        // 섹터 영역 채우기
         for (const s of azSectors) {
           ctx.beginPath();
           ctx.moveTo(radarCanvas.x, radarCanvas.y);
@@ -263,9 +237,47 @@ function ReportOMAzDistScatter({
             ctx.lineTo(ep.x, ep.y);
           }
           ctx.closePath();
-          ctx.fillStyle = "rgba(239,68,68,0.04)";
+          ctx.fillStyle = "rgba(239,68,68,0.10)";
           ctx.fill();
         }
+
+        // 섹터 경계선
+        ctx.strokeStyle = "rgba(220,38,38,0.9)";
+        ctx.lineWidth = 3;
+        ctx.setLineDash([12, 6]);
+        for (const s of azSectors) {
+          for (const deg of [s.start_deg, s.end_deg]) {
+            const rad = (deg * Math.PI) / 180;
+            const endLat = radarSite.latitude + (sectorR / 111.32) * Math.cos(rad);
+            const endLon = radarSite.longitude + (sectorR / (111.32 * Math.cos(radarSite.latitude * DEG2RAD))) * Math.sin(rad);
+            const end = geoToCanvas(endLat, endLon);
+            ctx.beginPath();
+            ctx.moveTo(radarCanvas.x, radarCanvas.y);
+            ctx.lineTo(end.x, end.y);
+            ctx.stroke();
+            // 경계선 끝에 각도 라벨
+            const label = `${deg.toFixed(1)}°`;
+            ctx.font = "bold 18px sans-serif";
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 4;
+            ctx.setLineDash([]);
+            const dx = end.x - radarCanvas.x;
+            const dy = end.y - radarCanvas.y;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            const ox = len > 0 ? (dx / len) * 16 : 0;
+            const oy = len > 0 ? (dy / len) * 16 : 0;
+            const lx = end.x + ox;
+            const ly = end.y + oy;
+            ctx.strokeText(label, lx - ctx.measureText(label).width / 2, ly + 6);
+            ctx.fillStyle = "rgba(220,38,38,0.9)";
+            ctx.fillText(label, lx - ctx.measureText(label).width / 2, ly + 6);
+            // 경계선 스타일 복원
+            ctx.strokeStyle = "rgba(220,38,38,0.9)";
+            ctx.lineWidth = 3;
+            ctx.setLineDash([12, 6]);
+          }
+        }
+        ctx.setLineDash([]);
       }
 
       // 건물 차폐 영역 + 마커
@@ -304,11 +316,11 @@ function ReportOMAzDistScatter({
         const be = geoToCanvas(bEndLat, bEndLon);
         ctx.lineTo(be.x, be.y);
         ctx.closePath();
-        ctx.fillStyle = "rgba(245,158,11,0.08)";
+        ctx.fillStyle = "rgba(245,158,11,0.18)";
         ctx.fill();
-        ctx.strokeStyle = "rgba(245,158,11,0.3)";
-        ctx.lineWidth = 0.5;
-        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = "rgba(217,119,6,0.6)";
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
         ctx.stroke();
         ctx.setLineDash([]);
 
@@ -327,25 +339,14 @@ function ReportOMAzDistScatter({
         ctx.fillText(b.name || `B${b.id}`, bp.x + 12, bp.y + 5);
       }
 
-      // 소실표적 — 베이스라인(섹터 외) 먼저 (반투명, 뒤에)
-      for (const pt of baselineLoss) {
+      // 소실표적
+      for (const pt of allLoss) {
         const { x, y } = geoToCanvas(pt.lat, pt.lon);
         if (x < 0 || x > canvasW || y < 0 || y > canvasH) continue;
         const color = altToColor(pt.altFt, MIN_ALT, MAX_ALT);
         ctx.beginPath();
         ctx.arc(x, y, dotR, 0, Math.PI * 2);
-        ctx.fillStyle = hslToRgba(color, 0.35);
-        ctx.fill();
-      }
-
-      // 소실표적 — 섹터 내 (불투명, 위에)
-      for (const pt of sectorLoss) {
-        const { x, y } = geoToCanvas(pt.lat, pt.lon);
-        if (x < 0 || x > canvasW || y < 0 || y > canvasH) continue;
-        const color = altToColor(pt.altFt, MIN_ALT, MAX_ALT);
-        ctx.beginPath();
-        ctx.arc(x, y, dotR, 0, Math.PI * 2);
-        ctx.fillStyle = hslToRgba(color, 0.9);
+        ctx.fillStyle = hslToRgba(color, 0.85);
         ctx.fill();
       }
 
@@ -420,11 +421,8 @@ function ReportOMAzDistScatter({
 
     // 타일 0개인 경우
     if (totalTiles === 0) drawAll();
-  }, [allLoss, sectorLoss, baselineLoss, mapParams, geoToCanvas, radarSite, azSectors, selectedBuildings, canvasW, canvasH]);
+  }, [allLoss, mapParams, geoToCanvas, radarSite, azSectors, selectedBuildings, canvasW, canvasH]);
 
-  // 통계
-  const inSectorCount = sectorLoss.length;
-  const outSectorCount = baselineLoss.length;
   const totalCount = allLoss.length;
 
   if (totalCount === 0) {
@@ -458,7 +456,7 @@ function ReportOMAzDistScatter({
 
       {/* 정보 요약 */}
       <div className="mb-2 flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] text-gray-500">
-        <span>소실 이벤트 총 {totalCount}건 (섹터 내 {inSectorCount}건 / 섹터 외 {outSectorCount}건)</span>
+        <span>소실 이벤트 총 {totalCount}건</span>
         <span>
           방위 구간: {azSectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ") || "전방위"}
         </span>
@@ -496,22 +494,18 @@ function ReportOMAzDistScatter({
             <span className="inline-block h-2.5 w-2.5 rounded-full" style={{
               background: "linear-gradient(135deg, hsl(0,85%,50%), hsl(120,85%,50%), hsl(240,85%,50%))",
             }} />
-            섹터 내 소실 ({inSectorCount}건, 불투명)
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-full bg-gray-300 opacity-50" />
-            섹터 외 소실 ({outSectorCount}건, 반투명)
+            소실 표적 ({totalCount}건)
           </span>
           <span className="flex items-center gap-1">
             <span className="inline-block h-2.5 w-2.5 rounded bg-amber-400 border border-white" />
             장애물
           </span>
           <span className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-4 bg-amber-400/10 border border-amber-400/30 border-dashed" />
+            <span className="inline-block h-2.5 w-4 bg-amber-500/20 border border-amber-600/60 border-dashed" />
             차폐 영역
           </span>
           <span className="flex items-center gap-1">
-            <span className="inline-block h-0 w-4 border-t border-dashed border-red-500" />
+            <span className="inline-block h-0 w-4 border-t-2 border-dashed border-red-600" />
             방위 구간
           </span>
         </div>

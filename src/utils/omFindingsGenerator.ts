@@ -6,7 +6,7 @@ import type {
   RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData,
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
-import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg } from "./omStats";
+import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg, LOSS_DEV_THRESHOLD } from "./omStats";
 import { haversineKm } from "./geo";
 
 function gradeLabel(lossRate: number): string {
@@ -74,7 +74,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     lines.push(`  - 평균 PSR 탐지율: ${(avgPsr * 100).toFixed(1)}%, 소실 이벤트: ${totalLossEvents}건`);
 
     // 편차 해석
-    if (Math.abs(deviation) < 0.1) {
+    if (Math.abs(deviation) < LOSS_DEV_THRESHOLD) {
       lines.push(`  → 대상 방위 구간의 소실율이 기준선과 유사하여, 분석 대상 장애물에 의한 추가적인 표적소실 영향은 미미한 것으로 판단된다.`);
     } else if (deviation > 0) {
       lines.push(`  → 대상 방위 구간의 소실율이 기준선 대비 ${deviation.toFixed(2)}%p 높아, 분석 대상 장애물이 표적소실에 영향을 미치는 것으로 판단된다.`);
@@ -82,14 +82,15 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       lines.push(`  → 대상 방위 구간의 소실율이 기준선 대비 오히려 낮아, 분석 대상 장애물에 의한 표적소실 영향은 확인되지 않는다.`);
     }
 
-    // 일별 추이 분석 (선형 회귀 기울기)
+    // 일별 추이 분석 (선형 회귀 기울기, day_of_month 기반 — 실제 시간 간격 반영)
     if (stats.length >= 7) {
-      const xMean = (stats.length - 1) / 2;
+      const days = stats.map((d) => d.day_of_month);
+      const xMean = days.reduce((a, b) => a + b, 0) / days.length;
       const yMean = avgLoss;
       let num = 0, den = 0;
-      stats.forEach((d, i) => {
-        num += (i - xMean) * (d.loss_rate - yMean);
-        den += (i - xMean) ** 2;
+      stats.forEach((d) => {
+        num += (d.day_of_month - xMean) * (d.loss_rate - yMean);
+        den += (d.day_of_month - xMean) ** 2;
       });
       const slope = den > 0 ? num / den : 0;
       if (Math.abs(slope) > 0.02) {
@@ -158,7 +159,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       const diff = avgWithout - avgWith;
       if (diff > 0.5) {
         significantDiff = true;
-        lines.push(`  - FL${Math.round(alt / 100).toString().padStart(3, "0")} (${alt}ft): 건물 유 평균 ${avgWith.toFixed(1)}km → 건물 무 평균 ${avgWithout.toFixed(1)}km (${diff.toFixed(1)}km 감소)`);
+        lines.push(`  - FL${Math.round(alt / 100).toString().padStart(3, "0")} (${alt}ft): 건물에 의해 평균 커버리지 ${diff.toFixed(1)}km 감소 (${avgWithout.toFixed(1)}km → ${avgWith.toFixed(1)}km)`);
       }
     }
     if (significantDiff) {
@@ -177,6 +178,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     return { radar: rr.radar_name, avg, grade };
   });
 
+  const hasPending = allGrades.some((g) => g.grade === "판정 보류");
   const worstGrade = allGrades.some((g) => g.grade === "경고")
     ? "경고"
     : allGrades.some((g) => g.grade === "주의")
@@ -193,14 +195,10 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   } else {
     lines.push(`일부 레이더에서 표적소실율이 경고 수준으로, 분석 대상 장애물에 의한 탐지 성능 저하가 우려되며, 운용 관련 대책 검토가 필요하다.`);
   }
-
-  // ── 산식 근거 ──
-  lines.push("");
-  lines.push(`[산식 근거]`);
-  lines.push(`- 평균값: 관측량 가중 평균 x̄w = Σ(wi·xi)/Σwi (Loss: w=비행시간, PSR: w=SSR포인트수)`);
-  lines.push(`- ±σ: 가중 모표준편차 σw = √(Σ(wi·(xi-x̄w)²)/Σwi)`);
-  lines.push(`- 판정 기준: 양호(<0.5%) / 주의(0.5–2.0%) / 경고(≥2.0%) / 보류(관측<7일)`);
-  lines.push(`- Loss 탐지: 스캔 주기 자동 추정(중앙값), 임계값 = 주기 × 1.4`);
+  if (hasPending) {
+    const pendingRadars = allGrades.filter((g) => g.grade === "판정 보류").map((g) => g.radar).join(", ");
+    lines.push(`(${pendingRadars}: 관측일수 부족으로 판정 보류 — 추가 데이터 확보 후 재분석 필요)`);
+  }
 
   return lines.join("\n");
 }

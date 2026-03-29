@@ -1,7 +1,7 @@
 import React from "react";
 import { Calendar } from "lucide-react";
 import type { DailyStats } from "../../types";
-import { weightedAvg, weightedStdDev } from "../../utils/omStats";
+import { weightedAvg, weightedStdDev, LOSS_DEV_THRESHOLD, PSR_DEV_THRESHOLD } from "../../utils/omStats";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
@@ -50,9 +50,8 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
   const color = BAR_COLOR[mode];
 
   // 베이스라인 데이터 존재 여부
-  const hasBaseline = dailyStats.some((d) =>
-    mode === "loss" ? d.baseline_loss_rate > 0 : d.baseline_psr_rate > 0,
-  );
+  // 양쪽 모두 확인 — baseline_loss_rate가 정확히 0인 정상 데이터 누락 방지
+  const hasBaseline = dailyStats.some((d) => d.baseline_loss_rate > 0 || d.baseline_psr_rate > 0);
 
   // 데이터 준비
   const maxDay = Math.max(...dailyStats.map((d) => d.day_of_month), 28);
@@ -72,7 +71,7 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
     if (values[i] === 0 && baselineValues[i] === 0) return 0;
     return values[i] - baselineValues[i];
   });
-  const maxVal = Math.max(...values, ...baselineValues, mode === "psr" ? 100 : 1) * 1.1;
+  const maxVal = Math.max(...values, ...baselineValues, mode === "psr" ? 100 : 0.1) * 1.1;
   // 가중 평균 x̄_w = Σ(w·x) / Σ(w)
   // PSR: 가중치 = SSR포인트수 (분모가 클수록 안정적), Loss: 가중치 = 비행시간(초)
   const getVal = (d: DailyStats) => mode === "psr" ? d.psr_rate * 100 : d.loss_rate;
@@ -109,9 +108,14 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
     xTicks.push(Math.round(v * 1000) / 1000);
   }
 
-  // 편차 통계
-  const validDevs = deviations.filter((_, i) => dayDataMap.has(allDays[i]));
-  const avgDev = validDevs.length > 0 ? validDevs.reduce((a, b) => a + b, 0) / validDevs.length : 0;
+  // 편차 통계 (가중 평균 간 차이 — 일별 단순 평균 대신 가중 평균 사용)
+  const avgDev = avg - avgBaseline;
+  const devThreshold = mode === "psr" ? PSR_DEV_THRESHOLD : LOSS_DEV_THRESHOLD;
+  // Loss: 양(+)이면 나쁨, PSR: 음(-)이면 나쁨
+  const avgDevBad = mode === "loss" ? avgDev > devThreshold : avgDev < -devThreshold;
+  const avgDevSimilar = Math.abs(avgDev) <= devThreshold;
+  const avgDevLabel = avgDevBad ? "(장애물 영향 의심)" : avgDevSimilar ? "(유사 수준)" : "(분석구간 양호)";
+  const avgDevColor = avgDevBad ? DEV_POS_COLOR : avgDevSimilar ? "#9ca3af" : DEV_NEG_COLOR;
 
   return (
     <div className="mb-8">
@@ -288,7 +292,7 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
                     <text
                       x={svgW - margin.right + 6}
                       y={cy - 2}
-                      fill={dev > 0 ? DEV_POS_COLOR : dev < 0 ? DEV_NEG_COLOR : "#9ca3af"}
+                      fill={(mode === "loss" ? dev > 0 : dev < 0) ? DEV_POS_COLOR : (mode === "loss" ? dev < 0 : dev > 0) ? DEV_NEG_COLOR : "#9ca3af"}
                       fontSize={9}
                       fontWeight={600}
                     >
@@ -389,17 +393,14 @@ function ReportOMDailyChart({ sectionNum, mode, radarName, dailyStats, condition
             <text
               x={52}
               y={0}
-              fill={avgDev > 0 ? DEV_POS_COLOR : avgDev < 0 ? DEV_NEG_COLOR : "#9ca3af"}
+              fill={avgDevColor}
               fontSize={10}
               fontWeight={700}
             >
               {avgDev > 0 ? "+" : ""}{avgDev.toFixed(2)}%p
             </text>
             <text x={110} y={0} fill="#6b7280" fontSize={8.5}>
-              {mode === "loss"
-                ? avgDev > 0.05 ? "(장애물 영향 의심)" : avgDev > -0.05 ? "(유사 수준)" : "(분석구간 양호)"
-                : avgDev < -1 ? "(장애물 영향 의심)" : avgDev < 1 ? "(유사 수준)" : "(분석구간 양호)"
-              }
+              {avgDevLabel}
             </text>
           </g>
         )}

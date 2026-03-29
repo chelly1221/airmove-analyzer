@@ -1,5 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
+import maplibregl from "maplibre-gl";
 import { ScatterplotLayer, LineLayer } from "@deck.gl/layers";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { invoke } from "@tauri-apps/api/core";
@@ -213,6 +214,129 @@ export default function LoSObstacle() {
 
   const panoramaMapRef = useRef<MapRef>(null);
 
+  // 건물 3D GeoJSON 변환 (폴리곤 있는 건물만)
+  const bldg3dGeoJSON = useMemo((): GeoJSON.FeatureCollection | null => {
+    const withPoly = panoramaBuildingPoints.filter((p) => p.polygon && p.polygon.length >= 3);
+    if (withPoly.length === 0) return null;
+    const features: GeoJSON.Feature[] = [];
+    for (const p of withPoly) {
+      const coords = p.polygon!.map(([lat, lon]) => [lon, lat]);
+      const first = coords[0];
+      const last = coords[coords.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+      features.push({
+        type: "Feature",
+        properties: {
+          height: p.obstacle_height_m,
+          lat: p.lat,
+          lon: p.lon,
+          obstacle_type: p.obstacle_type,
+          name: p.name || "",
+        },
+        geometry: { type: "Polygon", coordinates: [coords] },
+      });
+    }
+    return { type: "FeatureCollection", features };
+  }, [panoramaBuildingPoints]);
+
+  // 폴리곤 없는 건물 (ScatterplotLayer 폴백)
+  const bldgNoPoly = useMemo(
+    () => panoramaBuildingPoints.filter((p) => !p.polygon || p.polygon.length < 3),
+    [panoramaBuildingPoints],
+  );
+
+  // MapLibre fill-extrusion 레이어 동기화
+  useEffect(() => {
+    const map = panoramaMapRef.current?.getMap();
+    if (!map || !map.isStyleLoaded()) return;
+
+    const sourceId = "panorama-bldg-3d-src";
+    const layerId = "panorama-bldg-3d-fill";
+
+    if (bldg3dGeoJSON) {
+      const source = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
+      if (source) {
+        source.setData(bldg3dGeoJSON);
+      } else {
+        map.addSource(sourceId, { type: "geojson", data: bldg3dGeoJSON });
+        map.addLayer({
+          id: layerId,
+          type: "fill-extrusion",
+          source: sourceId,
+          paint: {
+            "fill-extrusion-color": [
+              "case",
+              ["==", ["get", "obstacle_type"], "manual_building"],
+              "#ef4444",
+              "#f97316",
+            ],
+            "fill-extrusion-height": ["get", "height"],
+            "fill-extrusion-base": 0,
+            "fill-extrusion-opacity": 0.85,
+          },
+        });
+      }
+    } else {
+      if (map.getLayer(layerId)) map.removeLayer(layerId);
+      if (map.getSource(sourceId)) map.removeSource(sourceId);
+    }
+  }, [bldg3dGeoJSON]);
+
+  // fill-extrusion 호버/클릭 이벤트
+  useEffect(() => {
+    const map = panoramaMapRef.current?.getMap();
+    if (!map) return;
+    const layerId = "panorama-bldg-3d-fill";
+
+    const findPanoramaIdx = (lat: number, lon: number): number => {
+      let bestIdx = -1;
+      let bestDist = Infinity;
+      for (let i = 0; i < panoramaData.length; i++) {
+        const pt = panoramaData[i];
+        if (pt.obstacle_type === "terrain") continue;
+        const dlat = pt.lat - lat;
+        const dlon = pt.lon - lon;
+        const dist = dlat * dlat + dlon * dlon;
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+      }
+      return bestIdx;
+    };
+
+    const onMouseMove = (e: maplibregl.MapMouseEvent) => {
+      if (!map.getLayer(layerId)) return;
+      if (panoramaPinnedIdx !== null) return;
+      const features = map.queryRenderedFeatures(e.point, { layers: [layerId] });
+      if (features.length === 0) {
+        map.getCanvas().style.cursor = "";
+        setPanoramaHoverIdx(null);
+        return;
+      }
+      map.getCanvas().style.cursor = "pointer";
+      const props = features[0].properties;
+      const idx = findPanoramaIdx(props.lat, props.lon);
+      if (idx >= 0) setPanoramaHoverIdx(idx);
+    };
+
+    const onClick = (e: maplibregl.MapMouseEvent) => {
+      if (!map.getLayer(layerId)) return;
+      const features = map.queryRenderedFeatures(e.point, { layers: [layerId] });
+      if (features.length === 0) return;
+      const props = features[0].properties;
+      const idx = findPanoramaIdx(props.lat, props.lon);
+      if (idx >= 0) {
+        setPanoramaPinnedIdx((prev) => (prev === idx ? null : idx));
+        setPanoramaHoverIdx(idx);
+      }
+    };
+
+    map.on("mousemove", onMouseMove);
+    map.on("click", onClick);
+    return () => {
+      map.off("mousemove", onMouseMove);
+      map.off("click", onClick);
+    };
+  }, [panoramaData, panoramaPinnedIdx]);
+
   // 파노라마 SVG 치수
   const panoramaSvgW = 1200;
   const panoramaSvgH = 200;
@@ -246,6 +370,49 @@ export default function LoSObstacle() {
 
   const panoramaActiveIdx = panoramaPinnedIdx ?? panoramaHoverIdx;
   const panoramaActivePoint = panoramaActiveIdx !== null ? panoramaData[panoramaActiveIdx] : null;
+
+  // 활성 건물 하이라이트 fill-extrusion
+  useEffect(() => {
+    const map = panoramaMapRef.current?.getMap();
+    if (!map || !map.isStyleLoaded()) return;
+
+    const hlSourceId = "panorama-bldg-hl-src";
+    const hlLayerId = "panorama-bldg-hl-fill";
+
+    // 기존 하이라이트 제거
+    if (map.getLayer(hlLayerId)) map.removeLayer(hlLayerId);
+    if (map.getSource(hlSourceId)) map.removeSource(hlSourceId);
+
+    if (!panoramaActivePoint || panoramaActivePoint.obstacle_type === "terrain") return;
+    if (!panoramaActivePoint.polygon || panoramaActivePoint.polygon.length < 3) return;
+
+    const coords = panoramaActivePoint.polygon.map(([lat, lon]) => [lon, lat]);
+    const first = coords[0];
+    const last = coords[coords.length - 1];
+    if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+
+    const geojson: GeoJSON.FeatureCollection = {
+      type: "FeatureCollection",
+      features: [{
+        type: "Feature",
+        properties: { height: panoramaActivePoint.obstacle_height_m },
+        geometry: { type: "Polygon", coordinates: [coords] },
+      }],
+    };
+
+    map.addSource(hlSourceId, { type: "geojson", data: geojson });
+    map.addLayer({
+      id: hlLayerId,
+      type: "fill-extrusion",
+      source: hlSourceId,
+      paint: {
+        "fill-extrusion-color": panoramaActivePoint.obstacle_type === "manual_building" ? "#ef4444" : "#f97316",
+        "fill-extrusion-height": ["get", "height"],
+        "fill-extrusion-base": 0,
+        "fill-extrusion-opacity": 1.0,
+      },
+    });
+  }, [panoramaActivePoint]);
 
   // 활성 포인트를 스토어에 동기화 (사이드바 표시용)
   useEffect(() => {
@@ -698,14 +865,15 @@ export default function LoSObstacle() {
               </svg>
             </div>
 
-            {/* 건물 위치 지도 */}
+            {/* 건물 위치 지도 (3D fill-extrusion) */}
             <div className="min-h-0 flex-1 border-t border-gray-200">
               <MapGL
                 ref={panoramaMapRef}
                 initialViewState={{
                   latitude: radarSite.latitude,
                   longitude: radarSite.longitude,
-                  zoom: 10,
+                  zoom: 12,
+                  pitch: 45,
                 }}
                 style={{ width: "100%", height: "100%" }}
                 mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
@@ -721,9 +889,10 @@ export default function LoSObstacle() {
                       getColor: [100, 100, 100, 40],
                       getWidth: 1,
                     }),
+                    // 폴리곤 없는 건물만 점으로 표시 (폴백)
                     new ScatterplotLayer({
                       id: "panorama-bldg-dots",
-                      data: panoramaBuildingPoints,
+                      data: bldgNoPoly,
                       getPosition: (d: PanoramaPoint) => [d.lon, d.lat],
                       getRadius: 5,
                       radiusUnits: "pixels" as const,
@@ -735,10 +904,7 @@ export default function LoSObstacle() {
                       pickable: true,
                       onHover: (info: { object?: PanoramaPoint }) => {
                         if (panoramaPinnedIdx !== null) return;
-                        if (!info.object) {
-                          setPanoramaHoverIdx(null);
-                          return;
-                        }
+                        if (!info.object) { setPanoramaHoverIdx(null); return; }
                         const hovered = info.object;
                         let bestIdx = -1;
                         let bestDist = Infinity;
@@ -748,14 +914,9 @@ export default function LoSObstacle() {
                           const dlat = pt.lat - hovered.lat;
                           const dlon = pt.lon - hovered.lon;
                           const dist = dlat * dlat + dlon * dlon;
-                          if (dist < bestDist) {
-                            bestDist = dist;
-                            bestIdx = i;
-                          }
+                          if (dist < bestDist) { bestDist = dist; bestIdx = i; }
                         }
-                        if (bestIdx >= 0) {
-                          setPanoramaHoverIdx(bestIdx);
-                        }
+                        if (bestIdx >= 0) setPanoramaHoverIdx(bestIdx);
                       },
                       onClick: (info: { object?: PanoramaPoint }) => {
                         if (!info.object) return;
@@ -768,10 +929,7 @@ export default function LoSObstacle() {
                           const dlat = pt.lat - clicked.lat;
                           const dlon = pt.lon - clicked.lon;
                           const dist = dlat * dlat + dlon * dlon;
-                          if (dist < bestDist) {
-                            bestDist = dist;
-                            bestIdx = i;
-                          }
+                          if (dist < bestDist) { bestDist = dist; bestIdx = i; }
                         }
                         if (bestIdx >= 0) {
                           setPanoramaPinnedIdx((prev) => (prev === bestIdx ? null : bestIdx));
@@ -779,7 +937,8 @@ export default function LoSObstacle() {
                         }
                       },
                     }),
-                    ...(panoramaActivePoint
+                    // 활성 건물/지형 하이라이트 (terrain 또는 폴리곤 없는 건물)
+                    ...(panoramaActivePoint && (panoramaActivePoint.obstacle_type === "terrain" || !panoramaActivePoint.polygon || panoramaActivePoint.polygon.length < 3)
                       ? [
                           new ScatterplotLayer({
                             id: "panorama-bldg-highlight",
@@ -793,18 +952,18 @@ export default function LoSObstacle() {
                             stroked: true,
                             lineWidthMinPixels: 2,
                           }),
-                          ...(panoramaActivePoint.obstacle_type === "terrain"
-                            ? [
-                                new LineLayer({
-                                  id: "panorama-terrain-line",
-                                  data: [panoramaActivePoint],
-                                  getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
-                                  getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
-                                  getColor: [34, 197, 94, 120],
-                                  getWidth: 2,
-                                }),
-                              ]
-                            : []),
+                        ]
+                      : []),
+                    ...(panoramaActivePoint?.obstacle_type === "terrain"
+                      ? [
+                          new LineLayer({
+                            id: "panorama-terrain-line",
+                            data: [panoramaActivePoint],
+                            getSourcePosition: () => [radarSite.longitude, radarSite.latitude],
+                            getTargetPosition: (d: PanoramaPoint) => [d.lon, d.lat],
+                            getColor: [34, 197, 94, 120],
+                            getWidth: 2,
+                          }),
                         ]
                       : []),
                     // 레이더 위치

@@ -27,10 +27,6 @@ const IDB_NAME = "coverage-cache";
 const IDB_STORE = "ranges";
 const IDB_VERSION = 2; // v2: surfaceAngles 추가
 
-// 3D 커버리지 면 다운샘플 상수
-const SURFACE_RAY_STRIDE = 100;   // 36,000/100 = 360 rays (1° 간격)
-const SURFACE_SAMPLE_STRIDE = 10; // 2,400/10 = 240 samples (~1km 간격)
-
 // ─── Rust 결과 타입 ──────────────────────────────────
 
 interface PreSampledCoverage {
@@ -62,6 +58,7 @@ struct Params {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ray = gid.x;
+  if (ray * params.num_samples >= arrayLength(&max_angles)) { return; }
   let base = ray * params.num_samples;
   var running_max: f32 = -1e10;
 
@@ -101,6 +98,7 @@ struct Params {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= arrayLength(&output)) { return; }
   let ray = gid.x / params.num_altitudes;
   let alt_idx = gid.x % params.num_altitudes;
   let alt_m = alt_fts[alt_idx] * FT_TO_M;
@@ -198,9 +196,6 @@ async function fetchPresample(
 
 interface BatchGPUResult {
   ranges: Float32Array;
-  surfaceAngles?: Float32Array;
-  surfaceRays?: number;
-  surfaceSamples?: number;
 }
 
 async function computeBatchGPU(
@@ -211,7 +206,6 @@ async function computeBatchGPU(
   radarHeightM: number,
   maxRangeKm: number,
   altFts: number[],
-  returnSurfaceAngles = false,
 ): Promise<BatchGPUResult> {
   // Pass 1 uniform
   const p1Buf = new ArrayBuffer(16);
@@ -254,23 +248,6 @@ async function computeBatchGPU(
 
   const result = await readBuffer(device, outputBuf, outSize);
 
-  // 3D 면용 max_angles 다운샘플 readback
-  let surfaceAngles: Float32Array | undefined;
-  let surfaceRays: number | undefined;
-  let surfaceSamples: number | undefined;
-  if (returnSurfaceAngles) {
-    const fullAngles = await readBuffer(device, maxAnglesBuf, batchRays * numSamples * 4);
-    surfaceRays = Math.ceil(batchRays / SURFACE_RAY_STRIDE);
-    surfaceSamples = Math.ceil(numSamples / SURFACE_SAMPLE_STRIDE);
-    surfaceAngles = new Float32Array(surfaceRays * surfaceSamples);
-    for (let r = 0; r < surfaceRays; r++) {
-      for (let s = 0; s < surfaceSamples; s++) {
-        surfaceAngles[r * surfaceSamples + s] =
-          fullAngles[(r * SURFACE_RAY_STRIDE) * numSamples + (s * SURFACE_SAMPLE_STRIDE)];
-      }
-    }
-  }
-
   uniformBuf1.destroy();
   uniformBuf2.destroy();
   elevBuf.destroy();
@@ -278,7 +255,7 @@ async function computeBatchGPU(
   altBuf.destroy();
   outputBuf.destroy();
 
-  return { ranges: result, surfaceAngles, surfaceRays, surfaceSamples };
+  return { ranges: result };
 }
 
 // ─── Worker 관리 ────────────────────────────────────
@@ -292,7 +269,7 @@ let _worker: Worker | null = null;
 let _workerReady = false;
 const _workerPending = new Map<number, WorkerRequest>();
 let _workerNextId = 0;
-let _progressiveCallback: ((polygons: any[]) => void) | null = null;
+const _progressiveCallbacks = new Map<number, (polygons: any[]) => void>();
 
 function getWorker(): Worker {
   if (_worker) return _worker;
@@ -301,7 +278,14 @@ function getWorker(): Worker {
     { type: "module" },
   );
   _worker.onmessage = handleWorkerMessage;
-  _worker.onerror = (err) => console.error("[CoverageWorker] error:", err);
+  _worker.onerror = (err) => {
+    console.error("[CoverageWorker] error:", err);
+    for (const [, req] of _workerPending) {
+      req.reject(new Error("Worker crashed"));
+    }
+    _workerPending.clear();
+    _workerReady = false;
+  };
   return _worker;
 }
 
@@ -310,7 +294,8 @@ function handleWorkerMessage(e: MessageEvent) {
 
   // 점진적 렌더링 콜백 (promise 없이 직접 콜백)
   if (type === "PROGRESSIVE_RESULT") {
-    _progressiveCallback?.(e.data.polygons);
+    const cb = _progressiveCallbacks.get(e.data.computeId);
+    cb?.(e.data.polygons);
     return;
   }
 
@@ -346,6 +331,7 @@ async function initWorkerCache(cache: GPUCoverageCache): Promise<void> {
     totalRays: cache.totalRays,
     altFts: cache.altFts,
     ranges: copy.buffer,
+    maxRangeKm: cache.maxRangeKm,
   }, [copy.buffer]);
   _workerReady = true;
 }
@@ -393,9 +379,6 @@ export interface CoveragePolygonData {
 
 interface ProgressiveResult {
   ranges: Float32Array;
-  surfaceAngles?: Float32Array;
-  surfaceRays?: number;
-  surfaceSamples?: number;
   maxRangeKm?: number;
 }
 
@@ -406,6 +389,7 @@ async function computeProfileRawWithProgressive(
   onProgress?: (pct: number, msg: string) => void,
   onProgressivePolygons?: (polygons: CoveragePolygonData[]) => void,
 ): Promise<ProgressiveResult> {
+  if (altFts.length === 0) throw new Error("altFts must not be empty");
   const totalRays = Math.floor(360 / params.bearingStepDeg);
   const numSamples = 2400;
   const bytesPerRay = numSamples * 4;
@@ -424,14 +408,11 @@ async function computeProfileRawWithProgressive(
   const progressiveAlts = [500, 1000, 2000, 5000, 10000, 20000];
 
   // 점진적 렌더링 콜백 설정
+  const computeId = _workerNextId; // Use first batch's ID as computation identifier
   if (onProgressivePolygons) {
-    _progressiveCallback = onProgressivePolygons;
+    _progressiveCallbacks.set(computeId, onProgressivePolygons);
   }
 
-  // 3D 면용 surfaceAngles 누적 버퍼
-  const totalSurfaceRays = Math.ceil(totalRays / SURFACE_RAY_STRIDE);
-  const totalSurfaceSamples = Math.ceil(numSamples / SURFACE_SAMPLE_STRIDE);
-  const allSurfaceAngles = new Float32Array(totalSurfaceRays * totalSurfaceSamples);
   let lastMaxRangeKm = 0;
 
   for (let b = 0; b < numBatches; b++) {
@@ -448,30 +429,16 @@ async function computeProfileRawWithProgressive(
 
     const batchGPU = await computeBatchGPU(
       device, elevF32, batchRays, numSamples, ps.radar_height_m, ps.max_range_km, altFts,
-      true, // 3D 면용 surfaceAngles 반환
     );
 
-    // 배치별 surfaceAngles 누적
-    if (batchGPU.surfaceAngles && batchGPU.surfaceRays && batchGPU.surfaceSamples) {
-      const dstStartRow = Math.floor(startRay / SURFACE_RAY_STRIDE);
-      for (let r = 0; r < batchGPU.surfaceRays; r++) {
-        const dstRow = dstStartRow + r;
-        if (dstRow >= totalSurfaceRays) break;
-        for (let s = 0; s < batchGPU.surfaceSamples; s++) {
-          allSurfaceAngles[dstRow * totalSurfaceSamples + s] =
-            batchGPU.surfaceAngles[r * batchGPU.surfaceSamples + s];
-        }
-      }
-    }
-
     // GPU 결과를 Worker에 보내서 누적 + 점진적 폴리곤 생성 (논블로킹)
-    const batchCopy = new Float32Array(batchGPU.ranges);
     worker.postMessage({
       type: "ACCUMULATE_BATCH",
-      id: _workerNextId++, // PROGRESSIVE_RESULT는 promise 없이 콜백
+      id: _workerNextId++,
+      computeId,
       startRay,
       batchRays,
-      batchResult: batchCopy.buffer,
+      batchResult: batchGPU.ranges.buffer,
       numAlts: altFts.length,
       totalRays,
       radarLat: params.radarLat,
@@ -480,14 +447,15 @@ async function computeProfileRawWithProgressive(
       antennaHeight: params.antennaHeight,
       bearingStepDeg: params.bearingStepDeg,
       altFts,
+      maxRangeKm: lastMaxRangeKm,
       progressiveAlts: onProgressivePolygons ? progressiveAlts : null,
       altScale: 0,
       showCone: false,
-    }, [batchCopy.buffer]);
+    }, [batchGPU.ranges.buffer]);
   }
 
   // 점진적 렌더링 콜백 해제
-  _progressiveCallback = null;
+  _progressiveCallbacks.delete(computeId);
 
   // Worker 캐시에서 최종 ranges 추출 (EXPORT_CACHE)
   const exported = await workerSend({ type: "EXPORT_CACHE" });
@@ -498,9 +466,6 @@ async function computeProfileRawWithProgressive(
 
   return {
     ranges: allRanges,
-    surfaceAngles: allSurfaceAngles,
-    surfaceRays: totalSurfaceRays,
-    surfaceSamples: totalSurfaceSamples,
     maxRangeKm: lastMaxRangeKm,
   };
 }
@@ -517,9 +482,6 @@ interface GPUCoverageCache {
   totalRays: number;
   altFts: number[];
   ranges: Float32Array; // totalRays × numAlts
-  surfaceAngles?: Float32Array; // 다운샘플된 max_angles (360 × 240)
-  surfaceRays?: number;
-  surfaceSamples?: number;
   maxRangeKm?: number;
 }
 
@@ -599,23 +561,16 @@ async function saveToIDB(cache: GPUCoverageCache): Promise<void> {
       totalRays: cache.totalRays,
       altFts: cache.altFts,
       ranges: cache.ranges.buffer, // ArrayBuffer 저장
+      maxRangeKm: cache.maxRangeKm,
       savedAt: Date.now(),
     };
-    // 3D 커버리지 면 데이터 (있으면 저장)
-    if (cache.surfaceAngles) {
-      record.surfaceAngles = cache.surfaceAngles.buffer;
-      record.surfaceRays = cache.surfaceRays;
-      record.surfaceSamples = cache.surfaceSamples;
-      record.maxRangeKm = cache.maxRangeKm;
-    }
     store.put(record);
     await new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
     db.close();
-    const totalBytes = cache.ranges.byteLength + (cache.surfaceAngles?.byteLength ?? 0);
-    console.log(`[Coverage IDB] 캐시 저장 완료 (${(totalBytes / 1024 / 1024).toFixed(1)} MB)`);
+    console.log(`[Coverage IDB] 캐시 저장 완료 (${(cache.ranges.byteLength / 1024 / 1024).toFixed(1)} MB)`);
   } catch (e) {
     console.warn("[Coverage IDB] 저장 실패:", e);
   }
@@ -646,13 +601,7 @@ async function loadFromIDB(radarKey: string): Promise<GPUCoverageCache | null> {
       altFts: result.altFts,
       ranges: new Float32Array(result.ranges),
     };
-    // 3D 커버리지 면 데이터 복원
-    if (result.surfaceAngles) {
-      cache.surfaceAngles = new Float32Array(result.surfaceAngles);
-      cache.surfaceRays = result.surfaceRays;
-      cache.surfaceSamples = result.surfaceSamples;
-      cache.maxRangeKm = result.maxRangeKm;
-    }
+    cache.maxRangeKm = result.maxRangeKm;
     return cache;
   } catch (e) {
     console.warn("[Coverage IDB] 로드 실패:", e);
@@ -741,9 +690,6 @@ export async function computeMainCoverage(
     totalRays,
     altFts,
     ranges: progressive.ranges,
-    surfaceAngles: progressive.surfaceAngles,
-    surfaceRays: progressive.surfaceRays,
-    surfaceSamples: progressive.surfaceSamples,
     maxRangeKm: progressive.maxRangeKm,
   };
 
@@ -804,10 +750,13 @@ export function isWorkerReady(): boolean {
   return _workerReady;
 }
 
-/** 3D 커버리지 면 데이터 보유 여부 */
-export function hasSurfaceAngles(): boolean {
-  return !!_cache?.surfaceAngles;
+/** 커버리지 캐시 보유 여부 */
+export function hasCoverageCache(): boolean {
+  return !!_cache?.ranges;
 }
+
+/** @deprecated Use hasCoverageCache instead */
+export const hasSurfaceAngles = hasCoverageCache;
 
 // ─── 공개 API: 3D 커버리지 면 ──────────────────────
 
@@ -819,26 +768,17 @@ export interface Coverage3DQuad {
 }
 
 /**
- * 캐시된 surfaceAngles로 3D 커버리지 면 생성 (Worker 비동기)
- * - surfaceAngles: 다운샘플된 max_angles (360 rays × 240 samples)
- * - 각 (방위, 거리) 지점에서 최저 탐지 가능 고도를 3D mesh로 시각화
+ * 3D 커버리지 면 생성 (Worker 비동기)
+ * Worker에서 캐시된 ranges를 사용하여 최저 탐지 가능 고도를 3D mesh로 시각화
  */
 export async function build3DSurfaceAsync(): Promise<Coverage3DQuad[]> {
-  if (!_cache?.surfaceAngles || !_cache.surfaceRays || !_cache.surfaceSamples || !_cache.maxRangeKm) {
-    return [];
-  }
-  const copy = new Float32Array(_cache.surfaceAngles);
+  if (!_cache || !_workerReady || !_cache.maxRangeKm) return [];
   const result = await workerSend({
     type: "BUILD_3D_SURFACE",
-    surfaceAngles: copy.buffer,
-    surfaceRays: _cache.surfaceRays,
-    surfaceSamples: _cache.surfaceSamples,
-    radarLat: _cache.radarLat,
-    radarLon: _cache.radarLon,
-    radarHeightM: _cache.radarAltitude + _cache.antennaHeight,
     maxRangeKm: _cache.maxRangeKm,
-    bearingStepDeg: SURFACE_RAY_STRIDE * _cache.bearingStepDeg, // 다운샘플 후 간격 (1°)
-  }, [copy.buffer]);
+    surfaceRayStride: 100,
+    surfaceDistSteps: 240,
+  });
   return result.quads;
 }
 
@@ -861,6 +801,7 @@ async function computeProfileRaw(
   altFts: number[],
   onProgress?: (msg: string) => void,
 ): Promise<Float32Array> {
+  if (altFts.length === 0) throw new Error("altFts must not be empty");
   const totalRays = Math.floor(360 / params.bearingStepDeg);
   const numSamples = 2400;
   const bytesPerRay = numSamples * 4;
@@ -890,10 +831,12 @@ async function computeProfileRaw(
       device, elevF32, batchRays, numSamples, ps.radar_height_m, ps.max_range_km, altFts,
     );
 
+    const numAlts = altFts.length;
     for (let r = 0; r < batchRays; r++) {
-      for (let a = 0; a < altFts.length; a++) {
-        allRanges[(startRay + r) * altFts.length + a] = batchGPU.ranges[r * altFts.length + a];
-      }
+      allRanges.set(
+        batchGPU.ranges.subarray(r * numAlts, (r + 1) * numAlts),
+        (startRay + r) * numAlts,
+      );
     }
   }
 

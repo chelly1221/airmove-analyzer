@@ -1,7 +1,7 @@
 import React from "react";
 import { Calendar } from "lucide-react";
 import type { DailyStats } from "../../types";
-import { weightedAvg } from "../../utils/omStats";
+import { weightedAvg, LOSS_DEV_THRESHOLD, PSR_DEV_THRESHOLD } from "../../utils/omStats";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 
 interface Props {
@@ -74,7 +74,7 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
   const plotW = svgW - margin.left - margin.right;
   const plotH = svgH - margin.top - margin.bottom;
 
-  const maxPsr = Math.max(...weeks.map((w) => w.avgPsr), 1) * 1.15;
+  const maxPsr = Math.max(...weeks.map((w) => w.avgPsr), ...weeks.map((w) => w.baselinePsr), 1) * 1.15;
   const maxLoss = Math.max(...weeks.map((w) => w.avgLoss), ...weeks.map((w) => w.baselineLoss), 0.1) * 1.15;
 
   const groupW = plotW / (weeks.length + 1);
@@ -101,16 +101,23 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
         {[0, 0.25, 0.5, 0.75, 1.0].map((t) => {
           const y = margin.top + plotH * (1 - t);
           return (
-            <line
-              key={`grid-${t}`}
-              x1={margin.left}
-              y1={y}
-              x2={svgW - margin.right}
-              y2={y}
-              stroke="#e5e7eb"
-              strokeWidth={0.5}
-              strokeDasharray="3,3"
-            />
+            <g key={`grid-${t}`}>
+              <line
+                x1={margin.left}
+                y1={y}
+                x2={svgW - margin.right}
+                y2={y}
+                stroke="#e5e7eb"
+                strokeWidth={0.5}
+                strokeDasharray="3,3"
+              />
+              <text x={margin.left - 4} y={y + 3} textAnchor="end" fill="#3b82f6" fontSize={8}>
+                {(t * maxPsr).toFixed(0)}
+              </text>
+              <text x={svgW - margin.right + 4} y={y + 3} textAnchor="start" fill="#ef4444" fontSize={8}>
+                {(t * maxLoss).toFixed(maxLoss < 1 ? 2 : 1)}
+              </text>
+            </g>
           );
         })}
 
@@ -143,6 +150,19 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
               >
                 {w.avgPsr.toFixed(1)}%
               </text>
+
+              {/* 베이스라인 PSR 표시 */}
+              {hasBaseline && w.baselinePsr > 0 && (
+                <line
+                  x1={cx - barW - 1}
+                  y1={yPsr(w.baselinePsr)}
+                  x2={cx - 1}
+                  y2={yPsr(w.baselinePsr)}
+                  stroke="#9ca3af"
+                  strokeWidth={1.2}
+                  strokeDasharray="3,2"
+                />
+              )}
 
               {/* Loss 막대 (우) */}
               <rect
@@ -201,7 +221,7 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
                   x={cx}
                   y={svgH - margin.bottom + 44}
                   textAnchor="middle"
-                  fill={lossDev > 0.05 ? "#dc2626" : lossDev < -0.05 ? "#22c55e" : "#9ca3af"}
+                  fill={lossDev > LOSS_DEV_THRESHOLD ? "#dc2626" : lossDev < -LOSS_DEV_THRESHOLD ? "#22c55e" : "#9ca3af"}
                   fontSize={8.5}
                   fontWeight={600}
                 >
@@ -242,6 +262,12 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
             <th className="border border-gray-300 px-2 py-1 font-medium">주차</th>
             <th className="border border-gray-300 px-2 py-1 text-right font-medium">분석일수</th>
             <th className="border border-gray-300 px-2 py-1 text-right font-medium">평균 PSR율(%)</th>
+            {hasBaseline && (
+              <>
+                <th className="border border-gray-300 px-2 py-1 text-right font-medium">기준 PSR율(%)</th>
+                <th className="border border-gray-300 px-2 py-1 text-right font-medium">PSR 편차(%p)</th>
+              </>
+            )}
             <th className="border border-gray-300 px-2 py-1 text-right font-medium">평균 표적소실율(%)</th>
             {hasBaseline && (
               <>
@@ -253,7 +279,8 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
         </thead>
         <tbody>
           {weeks.map((w, i) => {
-            const dev = w.avgLoss - w.baselineLoss;
+            const lossDev = w.avgLoss - w.baselineLoss;
+            const psrDev = w.avgPsr - w.baselinePsr;
             return (
               <tr key={w.week} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
                 <td className="border border-gray-200 px-2 py-1 text-center font-semibold text-gray-700">
@@ -261,14 +288,24 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
                 </td>
                 <td className="border border-gray-200 px-2 py-1 text-right">{w.days}일</td>
                 <td className="border border-gray-200 px-2 py-1 text-right font-mono text-blue-600">{w.avgPsr.toFixed(2)}</td>
+                {hasBaseline && (
+                  <>
+                    <td className="border border-gray-200 px-2 py-1 text-right font-mono text-gray-500">{w.baselinePsr.toFixed(2)}</td>
+                    <td className={`border border-gray-200 px-2 py-1 text-right font-mono font-semibold ${
+                      psrDev < -PSR_DEV_THRESHOLD ? "text-red-600" : psrDev > PSR_DEV_THRESHOLD ? "text-green-600" : "text-gray-500"
+                    }`}>
+                      {psrDev > 0 ? "+" : ""}{psrDev.toFixed(2)}
+                    </td>
+                  </>
+                )}
                 <td className="border border-gray-200 px-2 py-1 text-right font-mono text-red-600">{w.avgLoss.toFixed(3)}</td>
                 {hasBaseline && (
                   <>
                     <td className="border border-gray-200 px-2 py-1 text-right font-mono text-gray-500">{w.baselineLoss.toFixed(3)}</td>
                     <td className={`border border-gray-200 px-2 py-1 text-right font-mono font-semibold ${
-                      dev > 0.05 ? "text-red-600" : dev < -0.05 ? "text-green-600" : "text-gray-500"
+                      lossDev > LOSS_DEV_THRESHOLD ? "text-red-600" : lossDev < -LOSS_DEV_THRESHOLD ? "text-green-600" : "text-gray-500"
                     }`}>
-                      {dev > 0 ? "+" : ""}{dev.toFixed(3)}
+                      {lossDev > 0 ? "+" : ""}{lossDev.toFixed(3)}
                     </td>
                   </>
                 )}

@@ -42,7 +42,7 @@ export {
   isGPUCacheValidFor,
   isWorkerReady,
   invalidateGPUCache,
-  hasSurfaceAngles,
+  hasCoverageCache,
   build3DSurfaceAsync,
 } from "./gpuCoverage";
 
@@ -133,7 +133,7 @@ export function coneOfSilenceToGeoJSON(
   const features: GeoJSON.Feature<GeoJSON.LineString>[] = [];
 
   for (const layer of coverage.layers) {
-    if (layer.coneRadiusKm < 0.5) continue;
+    if (layer.coneRadiusKm <= 0.5) continue;
     const coords = coneCircle(coverage.radarLat, coverage.radarLon, layer.coneRadiusKm, true);
     features.push({
       type: "Feature",

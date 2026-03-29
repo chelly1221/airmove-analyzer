@@ -23,6 +23,14 @@ export interface LossPointGeo {
   duration_s: number;
 }
 
+/** 항적 포인트 좌표 (LoS 단면도 오버레이용) */
+export interface TrackPointGeo {
+  lat: number;
+  lon: number;
+  alt_ft: number;
+  radar_type: string;
+}
+
 /** 일별 통계 */
 export interface DailyStats {
   date: string;
@@ -42,6 +50,8 @@ export interface DailyStats {
   baseline_loss_rate: number;
   /** 나머지 방위 베이스라인 PSR율 (0~1) */
   baseline_psr_rate: number;
+  /** 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용) */
+  track_points_geo?: TrackPointGeo[];
 }
 
 /** 레이더별 월간 결과 */

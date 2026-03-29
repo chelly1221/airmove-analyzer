@@ -61,6 +61,15 @@ pub struct LossPointGeo {
     pub duration_s: f64,
 }
 
+/// 항적 포인트 좌표 (LoS 단면도 오버레이용)
+#[derive(Serialize, Clone, Debug)]
+pub struct TrackPointGeo {
+    pub lat: f64,
+    pub lon: f64,
+    pub alt_ft: f64,
+    pub radar_type: String,
+}
+
 /// 일별 통계
 #[derive(Serialize, Clone, Debug)]
 pub struct DailyStats {
@@ -84,6 +93,9 @@ pub struct DailyStats {
     /// 나머지 방위 베이스라인 PSR율 (0~1)
     #[serde(default)]
     pub baseline_psr_rate: f64,
+    /// 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용)
+    #[serde(default)]
+    pub track_points_geo: Vec<TrackPointGeo>,
 }
 
 /// 레이더별 월간 분석 결과
@@ -138,6 +150,25 @@ impl LightPoint {
         }
     }
 }
+
+fn radar_type_str(rt: &RadarDetectionType) -> &'static str {
+    match rt {
+        RadarDetectionType::ModeAC => "mode_ac",
+        RadarDetectionType::ModeACPsr => "mode_ac_psr",
+        RadarDetectionType::ModeSAllCall => "mode_s_allcall",
+        RadarDetectionType::ModeSRollCall => "mode_s_rollcall",
+        RadarDetectionType::ModeSAllCallPsr => "mode_s_allcall_psr",
+        RadarDetectionType::ModeSRollCallPsr => "mode_s_rollcall_psr",
+    }
+}
+
+// ─── OM 전용 상수 ───
+
+/// OM 분석용 최대 Loss 지속시간 (초): 5분 초과 gap은 오탐 가능성 높아 제외
+const MAX_OM_LOSS_DURATION_SECS: f64 = 300.0;
+
+/// gap 전후 실제 보고 속도 변화율 임계값: 이 비율 초과 시 오탐(트랙 스왑 등)으로 제외
+const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
 
 // ─── 핵심 로직 ───
 
@@ -357,6 +388,16 @@ pub fn analyze_radar_monthly(
 
         let points = daily_points.get(date).expect("date exists in daily_points keys");
 
+        // 항적 포인트 좌표 수집 (LoS 단면도 오버레이용)
+        let day_track_geo: Vec<TrackPointGeo> = points.iter().map(|p| {
+            TrackPointGeo {
+                lat: p.latitude,
+                lon: p.longitude,
+                alt_ft: p.altitude * 3.28084,
+                radar_type: radar_type_str(&p.radar_type).to_string(),
+            }
+        }).collect();
+
         // PSR 통계 (60NM 이내만)
         const PSR_RANGE_KM: f64 = 60.0 * 1.852; // 60NM
         let total_pts = points.len() as u32;
@@ -423,7 +464,7 @@ pub fn analyze_radar_monthly(
                 let next = window[1];
                 let gap = next.timestamp - prev.timestamp;
 
-                if gap > threshold && gap <= 14400.0 {
+                if gap > threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
                     let start_dist = calculate_haversine_distance(
                         radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude,
                     );
@@ -440,9 +481,18 @@ pub fn analyze_radar_monthly(
                         0.0
                     };
 
+                    // gap 전후 실제 보고 속도 변화율 (트랙 스왑/그룹핑 오류 탐지)
+                    let speed_change = if prev.speed > 10.0 && next.speed > 10.0 {
+                        let avg_spd = (prev.speed + next.speed) / 2.0;
+                        (next.speed - prev.speed).abs() / avg_spd
+                    } else {
+                        0.0
+                    };
+
                     let is_oor = (start_dist >= boundary && end_dist >= boundary)
                         || (missed >= 15.0 && (start_dist >= boundary || end_dist >= boundary))
-                        || speed_dev > 0.5;
+                        || speed_dev > 0.5
+                        || speed_change > OM_SPEED_CHANGE_RATIO;
 
                     if !is_oor {
                         // signal_loss
@@ -517,16 +567,21 @@ pub fn analyze_radar_monthly(
                         let prev = window[0];
                         let next = window[1];
                         let gap = next.timestamp - prev.timestamp;
-                        if gap > bl_threshold && gap <= 14400.0 {
+                        if gap > bl_threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
                             let sd = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
                             let ed = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, next.latitude, next.longitude);
                             let missed = gap / bl_scan;
                             let dist = calculate_haversine_distance(prev.latitude, prev.longitude, next.latitude, next.longitude);
                             let implied_speed = (dist / gap) * 3600.0 / 1.852;
                             let speed_dev = if prev.speed > 10.0 { (implied_speed - prev.speed).abs() / prev.speed } else { 0.0 };
+                            let speed_change = if prev.speed > 10.0 && next.speed > 10.0 {
+                                let avg_spd = (prev.speed + next.speed) / 2.0;
+                                (next.speed - prev.speed).abs() / avg_spd
+                            } else { 0.0 };
                             let is_oor = (sd >= bl_boundary && ed >= bl_boundary)
                                 || (missed >= 15.0 && (sd >= bl_boundary || ed >= bl_boundary))
-                                || speed_dev > 0.5;
+                                || speed_dev > 0.5
+                                || speed_change > OM_SPEED_CHANGE_RATIO;
                             if !is_oor {
                                 bl_loss_time += gap;
                                 // 스캔별 보간 포인트 생성
@@ -571,6 +626,7 @@ pub fn analyze_radar_monthly(
             baseline_loss_points: day_baseline_loss_points,
             baseline_loss_rate,
             baseline_psr_rate,
+            track_points_geo: day_track_geo,
         });
     }
 

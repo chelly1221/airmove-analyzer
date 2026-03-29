@@ -39,6 +39,9 @@ pub struct PanoramaPoint {
     /// 장애물 위치 WGS84
     pub lat: f64,
     pub lon: f64,
+    /// 건물 폴리곤 [[lat, lon], ...] (건물 장애물만, 지형은 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polygon: Option<Vec<[f64; 2]>>,
 }
 
 /// 건물 후보 (DB 조회 결과) — point-only 폴백용
@@ -303,6 +306,7 @@ pub fn calculate_panorama(
                 obstacle_type: "terrain".to_string(),
                 name: None, address: None, usage: None,
                 lat: radar_lat, lon: radar_lon,
+                polygon: None,
             };
 
             let mut d = range_step_m;
@@ -357,6 +361,7 @@ pub fn merge_buildings_into_panorama(
         obstacle_type: "terrain".to_string(),
         name: None, address: None, usage: None,
         lat: t.lat, lon: t.lon,
+        polygon: None,
     }).collect();
 
     apply_buildings(&mut panorama, srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, azimuth_step_deg, &[]);
@@ -487,6 +492,7 @@ fn apply_buildings(
                         // centroid 좌표 → 프론트엔드 dedup 시 1건물=1마커
                         lat: bld.centroid_lat,
                         lon: bld.centroid_lon,
+                        polygon: Some(bld.polygon.clone()),
                     };
                 }
             }
@@ -524,6 +530,7 @@ fn apply_buildings(
                     usage: bld.usage.clone(),
                     lat: bld.lat,
                     lon: bld.lon,
+                    polygon: None,
                 };
             }
         }

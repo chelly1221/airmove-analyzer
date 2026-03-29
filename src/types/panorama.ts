@@ -21,4 +21,6 @@ export interface PanoramaPoint {
   /** 장애물 위치 WGS84 */
   lat: number;
   lon: number;
+  /** 건물 폴리곤 [[lat, lon], ...] (건물 장애물만) */
+  polygon?: [number, number][];
 }

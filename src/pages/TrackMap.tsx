@@ -36,7 +36,7 @@ import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, Building3D } from "../types";
 import { queryViewportPoints } from "../utils/flightConsolidationWorker";
 import LoSProfilePanel from "../components/Map/LoSProfilePanel";
-import { computeMainCoverage, computeLayersForAltitudesAsync, isGPUCacheValidFor, isWorkerReady, invalidateGPUCache, buildPolygonsAsync, hasSurfaceAngles, build3DSurfaceAsync, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer, type CoveragePolygonData, type Coverage3DQuad } from "../utils/radarCoverage";
+import { computeMainCoverage, computeLayersForAltitudesAsync, isGPUCacheValidFor, isWorkerReady, invalidateGPUCache, buildPolygonsAsync, hasCoverageCache, build3DSurfaceAsync, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer, type CoveragePolygonData, type Coverage3DQuad } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
 import { addPlanOverlay, removePlanOverlay, updatePlanOpacity, updatePlanBounds, rotateBounds } from "../utils/planOverlay";
 import { fetchBuildingsForViewport, invalidateBuildingCache, buildingsToGeoJSON } from "../utils/buildingTileCache";
@@ -179,6 +179,7 @@ export default function TrackMap() {
   const [coverageModalOpen, setCoverageModalOpen] = useState(false);
   const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageAltMinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const coverageComputeAbortRef = useRef(0);
 
   // 파노라마 장애물 맵 하이라이트 (전역 스토어)
   const panoramaViewActive = useAppStore((s) => s.panoramaViewActive);
@@ -955,6 +956,7 @@ export default function TrackMap() {
 
   /** 커버리지 맵 계산 시작 — GPU 계산 + Worker 점진적 렌더링 */
   const startCoverageCompute = useCallback(async (force = false) => {
+    const computeSeq = ++coverageComputeAbortRef.current;
     setCoverageLoading(true);
     setCoverageError("");
     setCoverageProgressPct(0);
@@ -965,28 +967,32 @@ export default function TrackMap() {
       const result = await computeMainCoverage(
         radarSite,
         (pct, msg) => {
+          if (coverageComputeAbortRef.current !== computeSeq) return;
           setCoverageProgressPct(pct);
           setCoverageProgress(msg);
         },
-        // 점진적 렌더링: GPU 배치 완료마다 부분 폴리곤 표시
         (progressivePolygons) => {
+          if (coverageComputeAbortRef.current !== computeSeq) return;
           setCoveragePolygonsList(progressivePolygons as CoveragePolygonData[]);
-          if (!coverageVisible) setCoverageVisible(true);
         },
       );
+      if (coverageComputeAbortRef.current !== computeSeq) return;
       setGpuCacheReady(true);
       setCoverageVisible(true);
       setCoverageData(result);
     } catch (err) {
+      if (coverageComputeAbortRef.current !== computeSeq) return;
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error("커버리지 계산 실패:", err);
       setCoverageError(`계산 실패: ${errMsg}`);
     } finally {
-      setCoverageLoading(false);
-      setCoverageProgress("");
-      setCoverageProgressPct(0);
+      if (coverageComputeAbortRef.current === computeSeq) {
+        setCoverageLoading(false);
+        setCoverageProgress("");
+        setCoverageProgressPct(0);
+      }
     }
-  }, [radarSite, coverageVisible, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
+  }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
 
   // 슬라이더 디바운스: 입력값 변경 → 150ms 후 실제 고도 반영
   const handleCoverageAltChange = useCallback((val: number) => {
@@ -1497,7 +1503,7 @@ export default function TrackMap() {
         id: "coverage-fill",
         data: coveragePolygonsList,
         getPolygon: (d: any) => d.polygon,
-        getFillColor: (d: any) => [...d.fillColor, fillAlpha] as [number, number, number, number],
+        getFillColor: (d: any) => [d.fillColor[0], d.fillColor[1], d.fillColor[2], fillAlpha] as [number, number, number, number],
         getLineColor: [0, 0, 0, 0],
         filled: true,
         stroked: false,
@@ -1550,13 +1556,14 @@ export default function TrackMap() {
         id: "coverage-3d-surface",
         data: coverage3DQuads,
         getPolygon: (d: Coverage3DQuad) => d.polygon,
-        getFillColor: (d: Coverage3DQuad) => [...d.fillColor, surfaceOpacity] as [number, number, number, number],
+        getFillColor: (d: Coverage3DQuad) => [d.fillColor[0], d.fillColor[1], d.fillColor[2], surfaceOpacity] as [number, number, number, number],
         getLineColor: [0, 0, 0, 0],
         filled: true,
         stroked: false,
         extruded: false,
         _full3d: true,
         parameters: { depthWriteEnabled: true },
+        updateTriggers: { getFillColor: [surfaceOpacity] },
       }),
     ];
   }, [coverage3DQuads, surfaceOpacity]);
@@ -1789,10 +1796,12 @@ export default function TrackMap() {
     if (!panoramaViewActive || !panoramaActivePoint) return [];
     const pt = panoramaActivePoint;
     const isBuilding = pt.obstacle_type !== "terrain";
+    const hasPolygon = isBuilding && pt.polygon && pt.polygon.length >= 3;
     const color: [number, number, number, number] = isBuilding
       ? [239, 68, 68, 230]
       : [34, 197, 94, 230];
-    return [
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const layers: any[] = [
       new LineLayer({
         id: "panorama-direction-line",
         data: [pt],
@@ -1803,20 +1812,82 @@ export default function TrackMap() {
         widthMinPixels: 1.5,
         widthUnits: "pixels" as const,
       }),
-      new ScatterplotLayer({
-        id: "panorama-highlight-point",
-        data: [pt],
-        getPosition: (d) => [d.lon, d.lat],
-        getFillColor: color,
-        getLineColor: [255, 255, 255, 200] as [number, number, number, number],
-        getRadius: panoramaPinned ? 8 : 6,
-        radiusUnits: "pixels" as const,
-        lineWidthMinPixels: panoramaPinned ? 2.5 : 1.5,
-        stroked: true,
-        pickable: false,
-      }),
     ];
+    // 폴리곤 없는 장애물(지형, point-only 건물)은 기존 점 마커
+    if (!hasPolygon) {
+      layers.push(
+        new ScatterplotLayer({
+          id: "panorama-highlight-point",
+          data: [pt],
+          getPosition: (d) => [d.lon, d.lat],
+          getFillColor: color,
+          getLineColor: [255, 255, 255, 200] as [number, number, number, number],
+          getRadius: panoramaPinned ? 8 : 6,
+          radiusUnits: "pixels" as const,
+          lineWidthMinPixels: panoramaPinned ? 2.5 : 1.5,
+          stroked: true,
+          pickable: false,
+        }),
+      );
+    }
+    return layers;
   }, [panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite.latitude, radarSite.longitude]);
+
+  // 파노라마 장애물 건물 3D fill-extrusion (폴리곤이 있는 건물만)
+  const panoramaObstacleGeoJSON = useMemo(() => {
+    if (!panoramaViewActive || !panoramaActivePoint) return null;
+    const pt = panoramaActivePoint;
+    if (pt.obstacle_type === "terrain" || !pt.polygon || pt.polygon.length < 3) return null;
+    // polygon: [[lat,lon], ...] → GeoJSON coordinates [[lon,lat], ...]
+    const coords = pt.polygon.map(([lat, lon]) => [lon, lat]);
+    const first = coords[0];
+    const last = coords[coords.length - 1];
+    if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+    const totalHeight = pt.ground_elev_m + pt.obstacle_height_m;
+    return {
+      type: "FeatureCollection" as const,
+      features: [{
+        type: "Feature" as const,
+        properties: { height: totalHeight, base: pt.ground_elev_m },
+        geometry: { type: "Polygon" as const, coordinates: [coords] },
+      }],
+    };
+  }, [panoramaViewActive, panoramaActivePoint]);
+
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (!map || !map.isStyleLoaded()) return;
+    const sourceId = "panorama-obstacle-3d-src";
+    const layerId = "panorama-obstacle-3d-fill";
+
+    if (panoramaObstacleGeoJSON) {
+      const source = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
+      if (source) {
+        source.setData(panoramaObstacleGeoJSON);
+      } else {
+        map.addSource(sourceId, { type: "geojson", data: panoramaObstacleGeoJSON });
+        map.addLayer({
+          id: layerId,
+          type: "fill-extrusion",
+          source: sourceId,
+          paint: {
+            "fill-extrusion-color": panoramaPinned ? "#dc2626" : "#ef4444",
+            "fill-extrusion-height": ["get", "height"],
+            "fill-extrusion-base": 0,
+            "fill-extrusion-opacity": panoramaPinned ? 0.95 : 0.8,
+          },
+        });
+      }
+      // 색상/투명도 업데이트
+      if (map.getLayer(layerId)) {
+        map.setPaintProperty(layerId, "fill-extrusion-color", panoramaPinned ? "#dc2626" : "#ef4444");
+        map.setPaintProperty(layerId, "fill-extrusion-opacity", panoramaPinned ? 0.95 : 0.8);
+        map.setLayoutProperty(layerId, "visibility", "visible");
+      }
+    } else {
+      if (map.getLayer(layerId)) map.setLayoutProperty(layerId, "visibility", "none");
+    }
+  }, [panoramaObstacleGeoJSON, panoramaPinned]);
 
   // 필터된 트랙/포인트 데이터 (deckLayers 밖에서 캐시 — inline filter 방지)
   const filteredTrackPaths = useMemo(
@@ -2733,7 +2804,7 @@ export default function TrackMap() {
                           onClick={async () => {
                             setCoverageMode("3d");
                             setTerrainEnabled(true);
-                            if (!coverage3DQuads && hasSurfaceAngles()) {
+                            if (!coverage3DQuads && hasCoverageCache()) {
                               setCoverage3DLoading(true);
                               try {
                                 const quads = await build3DSurfaceAsync();
@@ -2746,8 +2817,8 @@ export default function TrackMap() {
                             }
                           }}
                           className={`px-3 py-1 transition-colors ${coverageMode === "3d" ? "bg-[#a60739] text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
-                          disabled={!hasSurfaceAngles()}
-                          title={!hasSurfaceAngles() ? "커버리지 계산 후 사용 가능" : "3D 최저 탐지고도 면"}
+                          disabled={!hasCoverageCache()}
+                          title={!hasCoverageCache() ? "커버리지 계산 후 사용 가능" : "3D 최저 탐지고도 면"}
                         >
                           3D
                         </button>

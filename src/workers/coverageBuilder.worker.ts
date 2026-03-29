@@ -41,6 +41,7 @@ interface WorkerCache {
   bearingStepDeg: number;
   totalRays: number;
   altFts: number[];
+  maxRangeKm: number;
   ranges: Float32Array;
 }
 
@@ -171,25 +172,20 @@ function buildPolygons(
 
     // Cone of Silence
     if (showCone && layer.coneRadiusKm > 0.5 && (isSingle || idx === 0)) {
-      const hole: [number, number, number][] = [];
-      for (let i = CONE_PTS; i >= 0; i--) {
-        const deg = (i / CONE_PTS) * 360;
-        const rad = (deg * Math.PI) / 180;
-        const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
-        const lat = radarLat + dLat * Math.cos(rad);
-        const lon = radarLon + (dLat / Math.cos((radarLat * Math.PI) / 180)) * Math.sin(rad);
-        hole.push([lon, lat, zVal]);
-      }
-      polygon.push(hole);
-      coneRing = [];
+      const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
+      const cosRadarLat = Math.cos((radarLat * Math.PI) / 180);
+      const pts: [number, number, number][] = [];
       for (let i = 0; i <= CONE_PTS; i++) {
         const deg = (i / CONE_PTS) * 360;
         const rad = (deg * Math.PI) / 180;
-        const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
         const lat = radarLat + dLat * Math.cos(rad);
-        const lon = radarLon + (dLat / Math.cos((radarLat * Math.PI) / 180)) * Math.sin(rad);
-        coneRing.push([lon, lat, zVal]);
+        const lon = radarLon + (dLat / cosRadarLat) * Math.sin(rad);
+        pts.push([lon, lat, zVal]);
       }
+      // hole: reverse copy
+      const hole = [...pts].reverse();
+      polygon.push(hole);
+      coneRing = pts;
     }
 
     const fillColor = altToColor(layer.altitudeFt);
@@ -205,10 +201,10 @@ self.onmessage = (e: MessageEvent) => {
     // 캐시 초기화 (ranges Transfer로 수신)
     case "INIT_CACHE": {
       const { radarLat, radarLon, radarAltitude, antennaHeight,
-              bearingStepDeg, totalRays, altFts, ranges } = e.data;
+              bearingStepDeg, totalRays, altFts, ranges, maxRangeKm } = e.data;
       _cache = {
         radarLat, radarLon, radarAltitude, antennaHeight,
-        bearingStepDeg, totalRays, altFts,
+        bearingStepDeg, totalRays, altFts, maxRangeKm: maxRangeKm ?? 0,
         ranges: new Float32Array(ranges),
       };
       self.postMessage({ type: "CACHE_READY", id });
@@ -217,12 +213,16 @@ self.onmessage = (e: MessageEvent) => {
 
     // 슬라이더 변경 시 레이어 재생성
     case "BUILD_LAYERS": {
-      if (!_cache) {
-        self.postMessage({ type: "ERROR", id, error: "No cache" });
-        return;
+      try {
+        if (!_cache) {
+          self.postMessage({ type: "ERROR", id, error: "No cache" });
+          return;
+        }
+        const layers = buildLayers(_cache, e.data.altFts, e.data.bearingStep);
+        self.postMessage({ type: "LAYERS_RESULT", id, layers });
+      } catch (err) {
+        self.postMessage({ type: "ERROR", id, error: String(err) });
       }
-      const layers = buildLayers(_cache, e.data.altFts, e.data.bearingStep);
-      self.postMessage({ type: "LAYERS_RESULT", id, layers });
       break;
     }
 
@@ -230,24 +230,33 @@ self.onmessage = (e: MessageEvent) => {
     case "ACCUMULATE_BATCH": {
       const { startRay, batchRays, batchResult, numAlts, totalRays,
               radarLat, radarLon, radarAltitude, antennaHeight,
-              bearingStepDeg, altFts, progressiveAlts, altScale, showCone } = e.data;
+              bearingStepDeg, altFts, progressiveAlts, altScale, showCone,
+              maxRangeKm } = e.data;
 
       if (!_cache) {
         _cache = {
           radarLat, radarLon, radarAltitude, antennaHeight,
-          bearingStepDeg, totalRays, altFts,
+          bearingStepDeg, totalRays, altFts, maxRangeKm: maxRangeKm ?? 0,
+          ranges: new Float32Array(totalRays * numAlts),
+        };
+      } else if (_cache.radarLat !== radarLat || _cache.radarLon !== radarLon) {
+        // 레이더 변경 감지 — 캐시 재생성
+        _cache = {
+          radarLat, radarLon, radarAltitude, antennaHeight,
+          bearingStepDeg, totalRays, altFts, maxRangeKm: maxRangeKm ?? 0,
           ranges: new Float32Array(totalRays * numAlts),
         };
       }
 
+      if (maxRangeKm && _cache.maxRangeKm < maxRangeKm) _cache.maxRangeKm = maxRangeKm;
+
       // 배치 결과 누적
       const batchF32 = new Float32Array(batchResult);
       for (let r = 0; r < batchRays; r++) {
-        const srcBase = r * numAlts;
-        const dstBase = (startRay + r) * numAlts;
-        for (let a = 0; a < numAlts; a++) {
-          _cache.ranges[dstBase + a] = batchF32[srcBase + a];
-        }
+        _cache.ranges.set(
+          batchF32.subarray(r * numAlts, (r + 1) * numAlts),
+          (startRay + r) * numAlts,
+        );
       }
 
       // 점진적 레이어 생성 (완료된 레이 범위만, 다운샘플)
@@ -259,6 +268,7 @@ self.onmessage = (e: MessageEvent) => {
         const partialPolygons = buildPolygons(partialLayers, radarLat, radarLon, altScale ?? 0, showCone ?? false);
         self.postMessage({
           type: "PROGRESSIVE_RESULT", id,
+          computeId: e.data.computeId,
           polygons: partialPolygons,
           completedRays,
           totalRays,
@@ -272,66 +282,82 @@ self.onmessage = (e: MessageEvent) => {
 
     // 폴리곤 데이터 구성
     case "BUILD_POLYGONS": {
-      const { layers, radarLat, radarLon, altScale, showCone } = e.data;
-      const polygons = buildPolygons(layers, radarLat, radarLon, altScale, showCone);
-      self.postMessage({ type: "POLYGONS_RESULT", id, polygons });
+      try {
+        const { layers, radarLat, radarLon, altScale, showCone } = e.data;
+        const polygons = buildPolygons(layers, radarLat, radarLon, altScale, showCone);
+        self.postMessage({ type: "POLYGONS_RESULT", id, polygons });
+      } catch (err) {
+        self.postMessage({ type: "ERROR", id, error: String(err) });
+      }
       break;
     }
 
-    // 3D 커버리지 면 생성 (surfaceAngles → quad mesh)
     case "BUILD_3D_SURFACE": {
-      const { surfaceAngles: saBuffer, surfaceRays, surfaceSamples,
-              radarLat, radarLon, radarHeightM, maxRangeKm, bearingStepDeg } = e.data;
-      const angles = new Float32Array(saBuffer);
-      const R_EARTH_M = 6371000.0;
+      if (!_cache) {
+        self.postMessage({ type: "ERROR", id, error: "No cache" });
+        break;
+      }
+      const { maxRangeKm: msgMaxRange, surfaceRayStride, surfaceDistSteps } = e.data;
+      const effectiveMaxRange = msgMaxRange || _cache.maxRangeKm || 0;
+      if (effectiveMaxRange <= 0) {
+        self.postMessage({ type: "3D_SURFACE_RESULT", id, quads: [] });
+        break;
+      }
+      const numAlts = _cache.altFts.length;
       const M_TO_FT = 3.28084;
       const MAX_ALT_FT = 30000;
 
+      const surfaceRays = Math.ceil(_cache.totalRays / surfaceRayStride);
+
+      // 주어진 레이와 거리에서 최저 탐지 가능 고도(m) 계산
+      // altFts는 오름차순(100,200,...,30000), 고도가 높을수록 range가 크거나 같음
+      function minDetectAltM(rayIdx: number, distKm: number): number {
+        const base = rayIdx * numAlts;
+        for (let a = 0; a < numAlts; a++) {
+          if (_cache!.ranges[base + a] >= distKm) {
+            return _cache!.altFts[a] * FT_TO_M;
+          }
+        }
+        return -1; // 커버리지 없음
+      }
+
       const quads: any[] = [];
-      for (let r = 0; r < surfaceRays - 1; r++) {
-        const az0 = r * bearingStepDeg;
-        const az1 = (r + 1) * bearingStepDeg;
-        for (let s = 0; s < surfaceSamples - 1; s++) {
-          // 각 꼭짓점의 거리 (km)
-          const distFrac0 = (s + 1) / surfaceSamples;
-          const distFrac1 = (s + 2) / surfaceSamples;
-          const d0km = distFrac0 * maxRangeKm;
-          const d1km = distFrac1 * maxRangeKm;
-          const d0m = d0km * 1000;
-          const d1m = d1km * 1000;
+      for (let ri = 0; ri < surfaceRays - 1; ri++) {
+        const r0 = ri * surfaceRayStride;
+        const r1 = Math.min((ri + 1) * surfaceRayStride, _cache.totalRays - 1);
+        const az0 = r0 * _cache.bearingStepDeg;
+        const az1 = r1 * _cache.bearingStepDeg;
 
-          // 4개 꼭짓점의 max_angle
-          const a00 = angles[r * surfaceSamples + s];
-          const a10 = angles[(r + 1) * surfaceSamples + s];
-          const a01 = angles[r * surfaceSamples + s + 1];
-          const a11 = angles[(r + 1) * surfaceSamples + s + 1];
+        for (let si = 0; si < surfaceDistSteps - 1; si++) {
+          const d0km = ((si + 1) / surfaceDistSteps) * effectiveMaxRange;
+          const d1km = ((si + 2) / surfaceDistSteps) * effectiveMaxRange;
 
-          // 최저 탐지 고도 계산: min_alt = max_angle × dist + radar_height + dist²/(2R)
-          const alt00m = a00 * d0m + radarHeightM + (d0m * d0m) / (2 * R_EARTH_M);
-          const alt10m = a10 * d0m + radarHeightM + (d0m * d0m) / (2 * R_EARTH_M);
-          const alt01m = a01 * d1m + radarHeightM + (d1m * d1m) / (2 * R_EARTH_M);
-          const alt11m = a11 * d1m + radarHeightM + (d1m * d1m) / (2 * R_EARTH_M);
+          const alt00m = minDetectAltM(r0, d0km);
+          const alt10m = minDetectAltM(r1, d0km);
+          const alt01m = minDetectAltM(r0, d1km);
+          const alt11m = minDetectAltM(r1, d1km);
 
-          // 중심 고도 (ft) — 고도 클램핑
-          const centerAltFt = ((alt00m + alt10m + alt01m + alt11m) / 4) * M_TO_FT;
+          // 커버리지 없는 셀 제외
+          if (alt00m < 0 && alt10m < 0 && alt01m < 0 && alt11m < 0) continue;
+
+          const centerAltFt = (((alt00m < 0 ? 0 : alt00m) + (alt10m < 0 ? 0 : alt10m) +
+                                (alt01m < 0 ? 0 : alt01m) + (alt11m < 0 ? 0 : alt11m)) / 4) * M_TO_FT;
           if (centerAltFt > MAX_ALT_FT || centerAltFt < 0) continue;
 
-          // 좌표 계산 (4개 꼭짓점)
-          const [lat00, lon00] = destinationPoint(radarLat, radarLon, az0, d0km);
-          const [lat10, lon10] = destinationPoint(radarLat, radarLon, az1, d0km);
-          const [lat01, lon01] = destinationPoint(radarLat, radarLon, az0, d1km);
-          const [lat11, lon11] = destinationPoint(radarLat, radarLon, az1, d1km);
+          const [lat00, lon00] = destinationPoint(_cache.radarLat, _cache.radarLon, az0, d0km);
+          const [lat10, lon10] = destinationPoint(_cache.radarLat, _cache.radarLon, az1, d0km);
+          const [lat01, lon01] = destinationPoint(_cache.radarLat, _cache.radarLon, az0, d1km);
+          const [lat11, lon11] = destinationPoint(_cache.radarLat, _cache.radarLon, az1, d1km);
 
-          // 고도 색상 매핑
           const fillColor = altToColor(centerAltFt);
 
           quads.push({
             polygon: [
-              [lon00, lat00, alt00m],
-              [lon10, lat10, alt10m],
-              [lon11, lat11, alt11m],
-              [lon01, lat01, alt01m],
-              [lon00, lat00, alt00m], // 닫기
+              [lon00, lat00, alt00m < 0 ? 0 : alt00m],
+              [lon10, lat10, alt10m < 0 ? 0 : alt10m],
+              [lon11, lat11, alt11m < 0 ? 0 : alt11m],
+              [lon01, lat01, alt01m < 0 ? 0 : alt01m],
+              [lon00, lat00, alt00m < 0 ? 0 : alt00m],
             ] as [number, number, number][],
             fillColor,
             altFt: Math.round(centerAltFt),
@@ -360,6 +386,7 @@ self.onmessage = (e: MessageEvent) => {
         bearingStepDeg: _cache.bearingStepDeg,
         totalRays: _cache.totalRays,
         altFts: _cache.altFts,
+        maxRangeKm: _cache.maxRangeKm,
       };
       (postMessage as any)(msg, [copy.buffer]);
       break;

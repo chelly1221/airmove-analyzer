@@ -1,5 +1,6 @@
 import React, { useMemo } from "react";
 import EditableText from "./EditableText";
+import KatexMath from "./KatexMath";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
 import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedPsrStdDev, weightedBaselineLossAvg, weightedBaselineLossStdDev, gradeWithConfidence } from "../../utils/omStats";
 import { haversineKm } from "../../utils/geo";
@@ -106,7 +107,7 @@ function ReportOMFindings({
                 </tr>
                 <tr>
                   <td className="py-0.5 text-gray-500">편차</td>
-                  <td className="py-0.5 text-right font-mono font-bold" style={{ color: rs.deviation > 0 ? "#dc2626" : "#16a34a" }}>
+                  <td className="py-0.5 text-right font-mono font-bold" style={{ color: rs.deviation > 0 ? "#dc2626" : rs.deviation < 0 ? "#16a34a" : "#6b7280" }}>
                     {rs.deviation > 0 ? "+" : ""}{rs.deviation.toFixed(2)}%p
                   </td>
                 </tr>
@@ -148,6 +149,36 @@ function ReportOMFindings({
             tag="p"
             className="text-[13px] leading-relaxed text-gray-800 whitespace-pre-wrap"
           />
+        </div>
+      </div>
+
+      {/* 산식 근거 */}
+      <div className="rounded-lg border border-gray-200 bg-gray-50/70 px-4 py-3">
+        <p className="mb-2 text-[11px] font-semibold text-gray-600 tracking-wide">산식 근거</p>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-[10px] text-gray-500">
+          <div>
+            <p className="mb-0.5 font-medium text-gray-600">관측량 가중 평균</p>
+            <KatexMath math="\bar{x}_w = \dfrac{\displaystyle\sum_{i} w_i \cdot x_i}{\displaystyle\sum_{i} w_i}" display className="text-gray-700" />
+            <p className="mt-1">Loss: <KatexMath math="w_i" /> = 비행시간 · PSR: <KatexMath math="w_i" /> = SSR 포인트수</p>
+          </div>
+          <div>
+            <p className="mb-0.5 font-medium text-gray-600">가중 모표준편차</p>
+            <KatexMath math="\sigma_w = \sqrt{\dfrac{\displaystyle\sum_{i} w_i \left( x_i - \bar{x}_w \right)^2}{\displaystyle\sum_{i} w_i}}" display className="text-gray-700" />
+          </div>
+          <div>
+            <p className="mb-0.5 font-medium text-gray-600">Loss 탐지</p>
+            <p>스캔 주기 자동 추정 (중앙값)</p>
+            <KatexMath math="\text{임계값} = \text{주기} \times 1.4" display className="text-gray-700" />
+          </div>
+          <div>
+            <p className="mb-0.5 font-medium text-gray-600">판정 기준</p>
+            <p>
+              <span className="inline-block rounded bg-green-100 px-1 text-green-700">양호</span>{" < 0.5% · "}
+              <span className="inline-block rounded bg-yellow-100 px-1 text-yellow-700">주의</span>{" 0.5–2% · "}
+              <span className="inline-block rounded bg-red-100 px-1 text-red-700">경고</span>{" ≥ 2% · "}
+              <span className="inline-block rounded bg-gray-200 px-1 text-gray-600">보류</span>{" < 7일"}
+            </p>
+          </div>
         </div>
       </div>
 

@@ -146,6 +146,7 @@ function BuildingModal({
   initial,
   groups,
   allBuildings,
+  defaultGroupId,
 }: {
   open: boolean;
   onClose: () => void;
@@ -153,6 +154,7 @@ function BuildingModal({
   initial?: ManualBuilding | null;
   groups: BuildingGroup[];
   allBuildings: ManualBuilding[];
+  defaultGroupId?: number | null;
 }) {
   const [form, setForm] = useState<BuildingFormData>(emptyForm);
   const miniMapRef = useRef<MapRef>(null);
@@ -243,7 +245,7 @@ function BuildingModal({
         setConfirmedShapes([]);
       }
     } else {
-      setForm(emptyForm);
+      setForm(defaultGroupId != null ? { ...emptyForm, group_id: defaultGroupId } : emptyForm);
       setConfirmedShapes([]);
     }
     setClickPts([]);
@@ -251,7 +253,7 @@ function BuildingModal({
     setHoveredShapeIdx(null);
     setNoGeomWarning(false);
     setMiniMapReady(false);
-  }, [initial, isOpen]);
+  }, [initial, isOpen, defaultGroupId]);
 
   const handleSubmit = () => {
     if (!form.name.trim() || !form.latitude || !form.longitude || !form.height) return;
@@ -395,12 +397,6 @@ function BuildingModal({
     }
     const group = groups.find((g) => g.id === form.group_id);
     const areaBounds = group?.area_bounds_json ?? null;
-    // 첫 렌더(undefined→group_id)에서는 스킵, 이후 변경 시에만 작동
-    if (prevGroupIdRef.current === undefined) {
-      prevGroupIdRef.current = form.group_id;
-      prevAreaBoundsRef.current = areaBounds;
-      return;
-    }
     const groupChanged = form.group_id !== prevGroupIdRef.current;
     const areaChanged = areaBounds !== prevAreaBoundsRef.current;
     prevGroupIdRef.current = form.group_id;
@@ -427,8 +423,8 @@ function BuildingModal({
   // 새 건물 추가 시 그룹에 영역이 설정되어 있으면 맵 로드 후 줌
   const handleMiniMapLoad = useCallback(() => {
     setMiniMapReady(true);
-    // 기존 좌표가 없고 그룹에 영역이 있으면 자동 줌
-    if (!initial && form.group_id != null) {
+    // 그룹에 영역이 있으면 자동 줌 (신규/수정 모두)
+    if (form.group_id != null) {
       const group = groups.find((g) => g.id === form.group_id);
       if (group?.area_bounds_json) {
         try {
@@ -442,7 +438,7 @@ function BuildingModal({
         } catch { /* ignore */ }
       }
     }
-  }, [initial, form.group_id, groups]);
+  }, [form.group_id, groups]);
 
   // 미니맵 클릭
   const handleMapClick = useCallback((evt: any) => {
@@ -1062,6 +1058,7 @@ function ManualBuildingPanel() {
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<ManualBuilding | null>(null);
+  const [addGroupId, setAddGroupId] = useState<number | null>(null);
   // 그룹 관리
   const [groupModalOpen, setGroupModalOpen] = useState(false);
   const [editGroup, setEditGroup] = useState<BuildingGroup | null>(null);
@@ -1141,11 +1138,19 @@ function ManualBuildingPanel() {
 
   const openAdd = () => {
     setEditTarget(null);
+    setAddGroupId(null);
+    setModalOpen(true);
+  };
+
+  const openAddInGroup = (groupId: number) => {
+    setEditTarget(null);
+    setAddGroupId(groupId);
     setModalOpen(true);
   };
 
   const openEdit = (b: ManualBuilding) => {
     setEditTarget(b);
+    setAddGroupId(null);
     setModalOpen(true);
   };
 
@@ -1374,6 +1379,13 @@ function ManualBuildingPanel() {
                     {group && (
                       <div className="ml-auto flex items-center gap-1 opacity-0 group-hover/hdr:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
                         <button
+                          onClick={(e) => { e.stopPropagation(); openAddInGroup(group.id); }}
+                          className="rounded p-1 text-gray-400 hover:bg-[#a60739]/10 hover:text-[#a60739] transition-colors"
+                          title="이 그룹에 건물 추가"
+                        >
+                          <Plus size={10} />
+                        </button>
+                        <button
                           onClick={(e) => { e.stopPropagation(); openGroupEdit(group); }}
                           className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700 transition-colors"
                           title="그룹 수정"
@@ -1407,11 +1419,12 @@ function ManualBuildingPanel() {
 
       <BuildingModal
         open={modalOpen}
-        onClose={() => { setModalOpen(false); setEditTarget(null); }}
+        onClose={() => { setModalOpen(false); setEditTarget(null); setAddGroupId(null); }}
         onSave={handleSave}
         initial={editTarget}
         groups={groups}
         allBuildings={buildings}
+        defaultGroupId={addGroupId}
       />
 
       {/* 그룹 관리 모달 */}

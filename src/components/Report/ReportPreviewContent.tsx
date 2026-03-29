@@ -21,6 +21,7 @@ import ReportOMDailyChart from "./ReportOMDailyChart";
 import ReportOMWeeklyChart from "./ReportOMWeeklyChart";
 import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import ReportOMBuildingLoS from "./ReportOMBuildingLoS";
+import ReportOMLosCrossSection from "./ReportOMLosCrossSection";
 import ReportOMAltitudeDistribution from "./ReportOMAltitudeDistribution";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
@@ -149,6 +150,7 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
       { key: "omCoverageDiff", label: "커버리지" },
       { key: "omAzDistScatter", label: "산점도" },
       { key: "omBuildingLos", label: "LoS" },
+      { key: "omLosCrossSection", label: "LoS단면" },
       { key: "omAltitude", label: "고도분포" },
       { key: "omLossEvents", label: "표적소실상세" },
       { key: "omFindings", label: "소견" },
@@ -218,6 +220,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.omCoverageDiff) nums.omCoverageDiff = n++;
       if (sections.omAzDistScatter) nums.omAzDistScatter = n++;
       if (sections.omBuildingLos) nums.omBuildingLos = n++;
+      if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
       if (sections.omAltitude) nums.omAltitude = n++;
       if (sections.omLossEvents) nums.omLossEvents = n++;
       if (sections.omFindings) nums.omFindings = n++;
@@ -563,6 +566,16 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
               selectedBuildings={omData.selectedBuildings}
               radarSites={omData.selectedRadarSites}
               losMap={omData.losMap}
+            />
+          )}
+
+          {sections.omLosCrossSection && omData.losMap.size > 0 && (
+            <ReportOMLosCrossSection
+              sectionNum={sectionNumbers.omLosCrossSection ?? 8}
+              selectedBuildings={omData.selectedBuildings}
+              radarSites={omData.selectedRadarSites}
+              losMap={omData.losMap}
+              omResult={omResultTrimmed}
             />
           )}
 

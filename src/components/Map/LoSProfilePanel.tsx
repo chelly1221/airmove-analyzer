@@ -1073,24 +1073,34 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const dist = zoomStart + ((hoverX - PAD_LEFT) / cw) * zoomRange;
     if (dist < zoomStart || dist > zoomEnd) return null;
 
+    // 거리 기반 선형 보간 헬퍼 (각 배열이 자체 distance를 가지므로 독립 보간)
+    const lerpAt = (arr: { distance: number; height: number }[], d: number): number => {
+      if (arr.length === 0) return 0;
+      if (d <= arr[0].distance) return arr[0].height;
+      for (let j = 1; j < arr.length; j++) {
+        if (arr[j].distance >= d) {
+          const denom = arr[j].distance - arr[j - 1].distance;
+          const t = denom > 1e-9 ? (d - arr[j - 1].distance) / denom : 0;
+          return arr[j - 1].height + t * (arr[j].height - arr[j - 1].height);
+        }
+      }
+      return arr[arr.length - 1].height;
+    };
+
     // 프로파일에서 보간하여 값 계산
-    let terrainH = 0;
+    const terrainH = lerpAt(adjTerrain, dist);
     let realElev = 0;
-    let refractedH = 0;
-    let straightH = 0;
-    let fresnelH = 0;
-    for (let i = 1; i < adjTerrain.length; i++) {
-      if (adjTerrain[i].distance >= dist) {
-        const denom = adjTerrain[i].distance - adjTerrain[i - 1].distance;
-        const t = denom > 1e-9 ? (dist - adjTerrain[i - 1].distance) / denom : 0;
-        terrainH = adjTerrain[i - 1].height + t * (adjTerrain[i].height - adjTerrain[i - 1].height);
+    for (let i = 1; i < profile.length; i++) {
+      if (profile[i].distance >= dist) {
+        const denom = profile[i].distance - profile[i - 1].distance;
+        const t = denom > 1e-9 ? (dist - profile[i - 1].distance) / denom : 0;
         realElev = profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
-        refractedH = minDetRefracted[i - 1].height + t * (minDetRefracted[i].height - minDetRefracted[i - 1].height);
-        straightH = minDetStraight[i - 1].height + t * (minDetStraight[i].height - minDetStraight[i - 1].height);
-        fresnelH = minDetFresnel[i - 1].height + t * (minDetFresnel[i].height - minDetFresnel[i - 1].height);
         break;
       }
     }
+    const refractedH = lerpAt(minDetRefracted, dist);
+    const straightH = lerpAt(minDetStraight, dist);
+    const fresnelH = lerpAt(minDetFresnel, dist);
 
     // AGL (Above Ground Level): 실제 지표면 기준 최저탐지 높이
     const refractedAGL = refractedH - terrainH;

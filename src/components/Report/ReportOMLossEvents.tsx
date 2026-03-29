@@ -111,14 +111,14 @@ function ReportOMLossEvents({
         }
       }
 
-      // 지속시간 내림차순 정렬
-      events.sort((a, b) => b.durationS - a.durationS);
-      const obstacleCausedCount = events.filter((e) => e.obstacleCaused).length;
+      // 장애물 기인 이벤트만 필터링 후 지속시간 내림차순 정렬
+      const obstacleEvents = events.filter((e) => e.obstacleCaused);
+      obstacleEvents.sort((a, b) => b.durationS - a.durationS);
 
       result.push({
         radarName: rr.radar_name,
-        events: events.slice(0, MAX_EVENTS),
-        obstacleCausedCount,
+        events: obstacleEvents.slice(0, MAX_EVENTS),
+        obstacleCausedCount: obstacleEvents.length,
         totalCount: events.length,
       });
     }
@@ -148,7 +148,7 @@ function ReportOMLossEvents({
           return (
             <div key={radarName} className="mb-5">
               <h3 className="mb-2 text-[15px] font-semibold text-gray-700">{radarName}</h3>
-              <p className="text-[12px] text-gray-400">표적소실 이벤트 없음</p>
+              <p className="text-[12px] text-gray-400">장애물 기인 표적소실 없음 (전체 {totalCount}건 중 해당 없음)</p>
             </div>
           );
         }
@@ -180,9 +180,6 @@ function ReportOMLossEvents({
                   <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">고도(ft)</th>
                   <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">지속(초)</th>
                   <th className="border border-gray-300 px-1.5 py-1 text-center font-medium">좌표</th>
-                  {hasCovData && (
-                    <th className="border border-gray-300 px-1.5 py-1 text-center font-medium">판정</th>
-                  )}
                 </tr>
               </thead>
               <tbody>
@@ -198,23 +195,14 @@ function ReportOMLossEvents({
                     <td className="border border-gray-200 px-1.5 py-0.5 text-center font-mono text-gray-500">
                       {ev.lat.toFixed(4)}, {ev.lon.toFixed(4)}
                     </td>
-                    {hasCovData && (
-                      <td className="border border-gray-200 px-1.5 py-0.5 text-center">
-                        {ev.obstacleCaused ? (
-                          <span className="px-1.5 py-0.5 rounded text-[11px] font-bold bg-red-100 text-red-700">장애물</span>
-                        ) : (
-                          <span className="px-1.5 py-0.5 rounded text-[11px] font-bold bg-gray-100 text-gray-500">기타</span>
-                        )}
-                      </td>
-                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
 
-            {totalCount > MAX_EVENTS && (
+            {obstacleCausedCount > MAX_EVENTS && (
               <p className="mt-1 text-[11px] text-gray-400 text-right">
-                상위 {MAX_EVENTS}건 표시 (전체 {totalCount}건, 지속시간 내림차순)
+                상위 {MAX_EVENTS}건 표시 (장애물 기인 {obstacleCausedCount}건, 지속시간 내림차순)
               </p>
             )}
 

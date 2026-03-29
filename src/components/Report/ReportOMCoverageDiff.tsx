@@ -72,10 +72,15 @@ function buildDiffPath(
   let innerPts: string[] = [];
   let inDiff = false;
 
+  // withBearings를 방위각 기준 Map으로 변환 (인덱스가 아닌 deg 기준 매칭)
+  const withByDeg = new Map<number, (typeof withBearings)[0]>();
+  for (const wb of withBearings) {
+    withByDeg.set(Math.round(wb.deg * 100), wb);
+  }
+
   for (let i = 0; i < withoutBearings.length; i += every) {
     const b = withoutBearings[i];
-    // 동일 인덱스 기반 매칭 (두 레이어 모두 같은 bearing_step으로 계산되므로 인덱스 일치)
-    const matchWith = i < withBearings.length ? withBearings[i] : null;
+    const matchWith = withByDeg.get(Math.round(b.deg * 100)) ?? null;
     const rWithout = b.maxRangeKm * scale;
     const rWith = (matchWith?.maxRangeKm ?? b.maxRangeKm) * scale;
     const rad = (b.deg * Math.PI) / 180;
@@ -422,42 +427,6 @@ function ReportOMCoverageDiff({
             );
           })()}
 
-          {/* 거리 링 */}
-          {rings.map((ring, i) => {
-            const r = ring.km * scale;
-            const labelDeg = hasSector ? (sectorStart + sectorSpan / 2) % 360 : 45;
-            const labelRad = (labelDeg * Math.PI) / 180;
-            return (
-              <g key={`ring-${i}`}>
-                <circle cx={cx} cy={cy} r={r} fill="none" stroke="#d1d5db" strokeWidth={0.4} strokeDasharray="3,3" />
-                <text
-                  x={cx + (r + 3) * Math.sin(labelRad)}
-                  y={cy - (r + 3) * Math.cos(labelRad)}
-                  fill="#9ca3af" fontSize={hasSector ? 8 : 7} textAnchor="start"
-                >{ring.nm.toFixed(0)}NM</text>
-              </g>
-            );
-          })}
-
-          {/* 방위선 + 라벨 */}
-          {compassPoints.map(({ deg, label }) => {
-            const rad = (deg * Math.PI) / 180;
-            return (
-              <g key={deg}>
-                <line x1={cx} y1={cy} x2={cx + (maxR + 10) * Math.sin(rad)} y2={cy - (maxR + 10) * Math.cos(rad)}
-                  stroke="#c0c0c8" strokeWidth={0.4} />
-                <text x={cx + (maxR + 20) * Math.sin(rad)} y={cy - (maxR + 20) * Math.cos(rad) + 3}
-                  textAnchor="middle" fill="#6b7280" fontSize={9} fontWeight={600}>{label}</text>
-              </g>
-            );
-          })}
-
-          {/* 섹터 경계선 */}
-          {sectorLines.map((sl, i) => (
-            <line key={`sec-${i}`} x1={cx} y1={cy} x2={sl.x2} y2={sl.y2}
-              stroke="#a60739" strokeWidth={0.6} strokeDasharray="4,3" strokeOpacity={0.5} />
-          ))}
-
           {/* Cone of Silence */}
           {lowestWith && lowestWith.coneRadiusKm > 0.5 && (
             <circle cx={cx} cy={cy} r={lowestWith.coneRadiusKm * scale}
@@ -492,6 +461,43 @@ function ReportOMCoverageDiff({
           {diffPaths.map((dp, i) => (
             <path key={`diffF-${i}`} d={dp.path}
               fill="#ef4444" fillOpacity={0.5} stroke="#ef4444" strokeWidth={0.4} />
+          ))}
+
+          {/* 거리 링 (커버리지 위에 표시) */}
+          {rings.map((ring, i) => {
+            const r = ring.km * scale;
+            const labelDeg = hasSector ? (sectorStart + sectorSpan / 2) % 360 : 45;
+            const labelRad = (labelDeg * Math.PI) / 180;
+            return (
+              <g key={`ring-${i}`}>
+                <circle cx={cx} cy={cy} r={r} fill="none" stroke="#d1d5db" strokeWidth={0.4} strokeDasharray="3,3" />
+                <text
+                  x={cx + (r + 3) * Math.sin(labelRad)}
+                  y={cy - (r + 3) * Math.cos(labelRad)}
+                  fill="#9ca3af" fontSize={hasSector ? 8 : 7} textAnchor="start"
+                  stroke="#ffffff" strokeWidth={2} paintOrder="stroke"
+                >{ring.nm.toFixed(0)}NM</text>
+              </g>
+            );
+          })}
+
+          {/* 방위선 + 라벨 (커버리지 위에 표시) */}
+          {compassPoints.map(({ deg, label }) => {
+            const rad = (deg * Math.PI) / 180;
+            return (
+              <g key={deg}>
+                <line x1={cx} y1={cy} x2={cx + (maxR + 10) * Math.sin(rad)} y2={cy - (maxR + 10) * Math.cos(rad)}
+                  stroke="#c0c0c8" strokeWidth={0.4} />
+                <text x={cx + (maxR + 20) * Math.sin(rad)} y={cy - (maxR + 20) * Math.cos(rad) + 3}
+                  textAnchor="middle" fill="#6b7280" fontSize={9} fontWeight={600}>{label}</text>
+              </g>
+            );
+          })}
+
+          {/* 섹터 경계선 */}
+          {sectorLines.map((sl, i) => (
+            <line key={`sec-${i}`} x1={cx} y1={cy} x2={sl.x2} y2={sl.y2}
+              stroke="#a60739" strokeWidth={0.6} strokeDasharray="4,3" strokeOpacity={0.5} />
           ))}
 
           {/* Loss 포인트 (장애물 기인 Loss만) */}

@@ -134,6 +134,23 @@ function useAssFilePicker() {
       }
     }
 
+    // 파싱 필터에 맞게 기본 필터 자동 설정
+    const hasInclude = filter.modeSInclude.length > 0 || filter.mode3aInclude.length > 0;
+    if (hasInclude) {
+      const state = useAppStore.getState();
+      const registeredCodes = new Set(state.aircraft.filter((a) => a.active).map((a) => a.mode_s_code.toUpperCase()));
+      if (filter.modeSInclude.length === 1) {
+        // 단일 Mode-S → 해당 기체 선택
+        useAppStore.setState({ selectedModeS: filter.modeSInclude[0], selectedFlightId: null });
+      } else if (filter.modeSInclude.length > 0 && filter.modeSInclude.every((c) => registeredCodes.has(c))) {
+        // 포함된 Mode-S가 모두 등록 기체 → "등록 기체" 필터
+        useAppStore.setState({ selectedModeS: null, selectedFlightId: null });
+      } else {
+        // 기타(비등록 포함 혼합) → 전체 항적
+        useAppStore.setState({ selectedModeS: "__ALL__", selectedFlightId: null });
+      }
+    }
+
     setParsing(false);
     setPendingPaths([]);
   }, [pendingPaths]);
