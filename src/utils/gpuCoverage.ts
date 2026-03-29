@@ -397,9 +397,11 @@ async function computeProfileRawWithProgressive(
   const maxBufBytes = device.limits.maxStorageBufferBindingSize;
   const maxWorkgroups = device.limits.maxComputeWorkgroupsPerDimension;
   const maxRaysForWorkgroups = Math.floor(maxWorkgroups * 64 / altFts.length);
+  const IPC_RAY_CAP = 3000;
   const maxRaysPerBatch = Math.min(
     Math.floor(maxBufBytes / bytesPerRay),
     maxRaysForWorkgroups,
+    IPC_RAY_CAP,
   );
   const numBatches = Math.ceil(totalRays / maxRaysPerBatch);
 
@@ -809,9 +811,11 @@ async function computeProfileRaw(
   const maxBufBytes = device.limits.maxStorageBufferBindingSize;
   const maxWorkgroups = device.limits.maxComputeWorkgroupsPerDimension;
   const maxRaysForWorkgroups = Math.floor(maxWorkgroups * 64 / altFts.length);
+  const IPC_RAY_CAP = 3000;
   const maxRaysPerBatch = Math.min(
     Math.floor(maxBufBytes / bytesPerRay),
     maxRaysForWorkgroups,
+    IPC_RAY_CAP,
   );
   const numBatches = Math.ceil(totalRays / maxRaysPerBatch);
 

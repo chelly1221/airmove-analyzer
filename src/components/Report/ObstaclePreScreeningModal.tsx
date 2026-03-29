@@ -115,33 +115,51 @@ export default function ObstaclePreScreeningModal({
       }
       const losMap = await computeLosBatch(losJobs, "ps", losJobs.length, (done) => {
         setProgress(`LoS 분석 중... (${done}/${losJobs.length})`);
+        setProgressPct(Math.round((done / losJobs.length) * 80));
       });
 
-      onGenerate(result, selectedBuildings, selectedRadars, losMap, [], [], analysisMonth);
+      setProgress("커버리지 계산 중...");
+      setProgressPct(85);
 
+      let covWith: CoverageLayer[] = [];
+      let covWithout: CoverageLayer[] = [];
       if (selectedRadars.length > 0) {
         const r = selectedRadars[0];
         const altFts = [1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
         const excludeIds = selectedBuildings.map((b) => b.id);
-        import("../../utils/gpuCoverage").then(({ computeCoverageLayersOM }) =>
-          computeCoverageLayersOM(
-            { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm, bearingStepDeg: 0.01 },
-            altFts, excludeIds,
-          ).then(({ layersWith, layersWithout }) => {
-            onCoverageReady(layersWith, layersWithout);
-          }).catch((err) => {
-            console.warn("커버리지 계산 실패:", err);
-            onCoverageError?.();
-          }),
-        );
+        try {
+          const { computeCoverageLayersOM } = await import("../../utils/gpuCoverage");
+          if (!psCancelledRef.current) {
+            const covResult = await computeCoverageLayersOM(
+              { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm, bearingStepDeg: 0.01 },
+              altFts, excludeIds,
+              (msg) => { if (!psCancelledRef.current) { setProgress(msg); setProgressPct(msg.includes("제외") ? 90 : 85); } },
+            );
+            covWith = covResult.layersWith;
+            covWithout = covResult.layersWithout;
+          }
+        } catch (err) {
+          console.warn("커버리지 계산 실패:", err);
+          onCoverageError?.();
+        }
       }
+
+      if (psCancelledRef.current) return;
+
+      setProgress("보고서 생성 중...");
+      setProgressPct(95);
+      onGenerate(result, selectedBuildings, selectedRadars, losMap, covWith, covWithout, analysisMonth);
+
+      if (covWith.length > 0) onCoverageReady(covWith, covWithout);
+
+      setProgressPct(100);
     } catch (err) {
       setProgress(`분석 중 오류가 발생했습니다. 데이터 파일과 레이더 설정을 확인 후 다시 시도해주세요. (${err instanceof Error ? err.message : String(err)})`);
     } finally {
       unlistenFn?.();
       setAnalyzing(false);
     }
-  }, [analyzing, selectedRadars, selectedBuildings, radarFiles, aircraft, onGenerate, onCoverageError, analysisMonth]);
+  }, [analyzing, selectedRadars, selectedBuildings, radarFiles, aircraft, onGenerate, onCoverageReady, onCoverageError, analysisMonth]);
 
   const allFilesSelected = selectedRadars.every((r) => (radarFiles.get(r.name)?.length ?? 0) > 0);
   const canAnalyze = selectedRadars.length > 0 && selectedBuildings.length > 0 && allFilesSelected && !analyzing;

@@ -1216,13 +1216,15 @@ function ManualBuildingPanel() {
   // 그룹별로 건물 분류
   const groupedBuildings = useMemo(() => {
     const map = new Map<number | null, ManualBuilding[]>();
+    // 모든 그룹을 빈 배열로 먼저 등록 (건물이 없는 그룹도 표시)
+    for (const g of groups) map.set(g.id, []);
     for (const b of buildings) {
       const key = b.group_id;
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(b);
     }
     return map;
-  }, [buildings]);
+  }, [buildings, groups]);
 
   const getGroupName = (id: number | null) => {
     if (!id) return "미분류";

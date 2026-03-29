@@ -30,9 +30,6 @@
     "active": true,
     "targets": ["nsis"],
     "windows": {
-      "certificateThumbprint": "68181B896D10674C1F4E662E290B1B3296F4369D",
-      "digestAlgorithm": "sha256",
-      "timestampUrl": "http://timestamp.digicert.com",
       "nsis": {
         "installMode": "currentUser"
       }

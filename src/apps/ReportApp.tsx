@@ -125,6 +125,19 @@ export default function ReportApp() {
   // 닫기 확인 모달
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
+  // OM/PS 데이터 캐시 — IDB 왕복 시 커버리지 등 대용량 데이터 제외하고,
+  // 보고서 창 메모리에 직접 보관하여 IDB 병목 방지
+  const omDataCacheRef = useRef<OMReportData | null>(null);
+  const psDataCacheRef = useRef<{
+    result: PreScreeningResult;
+    buildings: ManualBuilding[];
+    radars: RadarSite[];
+    losMap: Map<string, LoSProfileData>;
+    covWith: CoverageLayer[];
+    covWithout: CoverageLayer[];
+    monthStr: string;
+  } | null>(null);
+
   // PDF 내보내기
   const [generating, setGenerating] = useState(false);
   const generatingRef = useRef(false);
@@ -152,6 +165,24 @@ export default function ReportApp() {
       }
       const s = payloadToState(payload);
       await clearReportPayload();
+
+      // 캐시된 대용량 데이터가 있으면 IDB에서 받은 경량 버전 대신 원본 사용
+      const cachedOm = omDataCacheRef.current;
+      if (cachedOm && s.template === "obstacle_monthly") {
+        s.omData = cachedOm;
+        omDataCacheRef.current = null;
+      }
+      const cachedPs = psDataCacheRef.current;
+      if (cachedPs && s.template === "obstacle") {
+        s.psResult = cachedPs.result;
+        s.psSelectedBuildings = cachedPs.buildings;
+        s.psSelectedRadarSites = cachedPs.radars;
+        s.psLosMap = cachedPs.losMap;
+        s.psCovLayersWith = cachedPs.covWith;
+        s.psCovLayersWithout = cachedPs.covWithout;
+        s.psAnalysisMonth = cachedPs.monthStr;
+        psDataCacheRef.current = null;
+      }
 
       startTransition(() => {
         setState(s);
@@ -208,6 +239,8 @@ export default function ReportApp() {
     // report:reload-config → 기존 창 재사용 시 모달 다시 표시
     const unlistenReloadConfig = listen("report:reload-config", async () => {
       loadingRef.current = false;
+      omDataCacheRef.current = null;
+      psDataCacheRef.current = null;
       setState(null);
       setLoading(true);
       setPrepPhase("waiting");
@@ -218,6 +251,8 @@ export default function ReportApp() {
     // report:reload-data → 기존 창 재사용 시 (편집 모드) 오버레이 표시
     const unlistenReload = listen("report:reload-data", () => {
       loadingRef.current = false;
+      omDataCacheRef.current = null;
+      psDataCacheRef.current = null;
       setConfigPayload(null); // 모달 닫기
       setPrepPhase("waiting");
       setLoading(true);
@@ -433,13 +468,34 @@ export default function ReportApp() {
       panoWithoutTargets: new Map(),
     };
 
+    // 대용량 데이터(커버리지 레이어 + track_points_geo)는 메모리에 캐시하고
+    // IDB에는 경량 버전만 전송하여 직렬화/역직렬화 병목 방지
+    omDataCacheRef.current = newOmData;
+
+    const lightResult: ObstacleMonthlyResult = {
+      radar_results: result.radar_results.map((rr) => ({
+        ...rr,
+        daily_stats: rr.daily_stats.map((d) => ({
+          ...d,
+          track_points_geo: [],
+        })),
+      })),
+    };
+    const lightOmData: OMReportData = {
+      ...newOmData,
+      result: lightResult,
+      covLayersWithBuildings: [],
+      covLayersWithout: [],
+      coverageStatus: covWith.length > 0 ? "done" : "idle",
+    };
+
     setConfigPayload(null);
     setLoading(true);
     setPrepPhase("waiting");
     await writeGenerateRequest({
       template: "obstacle_monthly",
       sections: { ...DEFAULT_SECTIONS },
-      omData: serializeOMData(newOmData),
+      omData: serializeOMData(lightOmData),
     });
     await emit("report:generate");
   }, []);
@@ -454,6 +510,12 @@ export default function ReportApp() {
     covWithout: CoverageLayer[],
     monthStr?: string,
   ) => {
+    // 대용량 데이터(커버리지 레이어 + LoS)는 메모리에 캐시하고
+    // IDB에는 경량 버전만 전송하여 직렬화/역직렬화 병목 방지
+    psDataCacheRef.current = {
+      result, buildings, radars, losMap,
+      covWith, covWithout, monthStr: monthStr ?? "",
+    };
 
     setConfigPayload(null);
     setLoading(true);
@@ -465,8 +527,8 @@ export default function ReportApp() {
       psSelectedBuildings: buildings,
       psSelectedRadarSites: radars,
       psLosMap: [...losMap],
-      psCovLayersWith: covWith,
-      psCovLayersWithout: covWithout,
+      psCovLayersWith: [],
+      psCovLayersWithout: [],
       psAnalysisMonth: monthStr,
     });
     await emit("report:generate");

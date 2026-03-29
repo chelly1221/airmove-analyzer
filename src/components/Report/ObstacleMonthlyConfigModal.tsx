@@ -271,6 +271,7 @@ export default function ObstacleMonthlyConfigModal({
             const covResult = await computeCoverageLayersOM(
               { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm, bearingStepDeg: 0.01 },
               altFts, excludeIds,
+              (msg) => { if (!cancelledRef.current) { setProgress(msg); setProgressPct(msg.includes("제외") ? 90 : 85); } },
             );
             covWith = covResult.layersWith;
             covWithout = covResult.layersWithout;

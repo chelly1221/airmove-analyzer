@@ -289,6 +289,8 @@ function BackgroundTasksPanel() {
   const n3pProgress = useAppStore((s) => s.n3pProgress);
   const landuseDownloading = useAppStore((s) => s.landuseDownloading);
   const landuseProgress = useAppStore((s) => s.landuseProgress);
+  const facBuildingDownloading = useAppStore((s) => s.facBuildingDownloading);
+  const facBuildingProgress = useAppStore((s) => s.facBuildingProgress);
   const peakImporting = useAppStore((s) => s.peakImporting);
   const peakImportProgress = useAppStore((s) => s.peakImportProgress);
 
@@ -307,6 +309,10 @@ function BackgroundTasksPanel() {
   if (landuseDownloading) {
     const pct = landuseProgress && landuseProgress.total > 0 ? Math.round((landuseProgress.current / landuseProgress.total) * 100) : 0;
     tasks.push({ label: "토지이용 다운로드", pct });
+  }
+  if (facBuildingDownloading) {
+    const pct = facBuildingProgress && facBuildingProgress.total > 0 ? Math.round((facBuildingProgress.current / facBuildingProgress.total) * 100) : 0;
+    tasks.push({ label: "건물통합정보 다운로드", pct });
   }
   if (peakImporting) {
     const pct = peakImportProgress && peakImportProgress.total > 0 ? Math.round((peakImportProgress.processed / peakImportProgress.total) * 100) : 0;
