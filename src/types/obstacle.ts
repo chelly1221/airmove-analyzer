@@ -90,8 +90,8 @@ export interface OMReportData {
   analysisMonth: string;
   findingsText: string;
   recommendText: string;
-  panoWithTargets: Map<string, import("./panorama").PanoramaPoint[]>;
-  panoWithoutTargets: Map<string, import("./panorama").PanoramaPoint[]>;
+  panoWithTargets: Map<string, import("./panorama").PanoramaMergeResult>;
+  panoWithoutTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   coverageStatus: "idle" | "loading" | "done" | "error";
   panoramaStatus: "idle" | "loading" | "done" | "error";
   /** 차트 섹션 사전 캡처 이미지 (key: sectionId, value: WebP data URL) */

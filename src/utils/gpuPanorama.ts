@@ -3,7 +3,7 @@
  *
  * 아키텍처 (heightmap 3D 리팩토링):
  *   Phase 1: Rust — SRTM + 건물 → 2D heightmap (ENU 그리드, 1회 IPC)
- *   Phase 2: GPU — heightmap에서 polar→ENU 샘플링 + 4/3 유효지구 앙각 계산
+ *   Phase 2: GPU — heightmap에서 polar→ENU 샘플링 + 실제 지구 기하학적 앙각 계산
  *   Phase 3: Rust — 건물 병합 (기존 panorama_merge_buildings IPC)
  *
  * 기존: presample_panorama_elevations (18M 샘플 ~96MB base64 IPC)
@@ -41,7 +41,7 @@ export interface TerrainResult {
 
 // ─── WGSL Compute Shader (heightmap 기반 파노라마) ───
 const PANORAMA_HEIGHTMAP_SHADER = /* wgsl */ `
-const R_EFF: f32 = 6371000.0 * 4.0 / 3.0;
+const R_EARTH: f32 = 6371000.0;
 const RAD2DEG: f32 = 180.0 / 3.14159265358979;
 const PI: f32 = 3.14159265358979;
 
@@ -102,9 +102,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let north_m = d * cos_b;
     let elev = sample_hm(east_m, north_m);
 
-    // 4/3 유효지구 앙각 계산
+    // 실제 지구 기하학적 앙각 계산
     let dh = elev - params.radar_height_m;
-    let curv_drop = d * d / (2.0 * R_EFF);
+    let curv_drop = d * d / (2.0 * R_EARTH);
     let angle = atan((dh - curv_drop) / d) * RAD2DEG;
 
     if (angle > best_angle) {
@@ -156,6 +156,7 @@ export async function computePanoramaTerrainGPU(
   maxRangeKm: number,
   azimuthStepDeg: number,
   rangeStepM: number,
+  onProgress?: (phase: "heightmap_done" | "gpu_done") => void,
 ): Promise<TerrainResult[]> {
   const device = await getGPUDevice();
 
@@ -173,6 +174,7 @@ export async function computePanoramaTerrainGPU(
     antennaHeight: 0, // radarHeightM에 이미 포함
     rangeNm,
     pixelSizeM: 100,
+    skipBuildings: true, // 파노라마: 순수 지형만 — 건물은 Rust apply_buildings에서 정밀 처리
   });
 
   // base64 디코딩
@@ -180,6 +182,7 @@ export async function computePanoramaTerrainGPU(
   const heightmapF32 = new Float32Array(await res.arrayBuffer());
   meta.data_b64 = "";
   console.timeEnd("[GPU Panorama] Heightmap fetch");
+  onProgress?.("heightmap_done");
 
   console.log(`[GPU Panorama] Heightmap ${meta.width}×${meta.height}, ${numAzimuths} azimuths × ${numSteps} steps`);
 
@@ -215,6 +218,7 @@ export async function computePanoramaTerrainGPU(
     { buffer: outputBuf, type: "storage" },
   ], [workgroups, 1, 1]);
   console.timeEnd("[GPU Panorama] compute");
+  onProgress?.("gpu_done");
 
   // 4. 결과 읽기
   const resultF32 = await readBuffer(device, outputBuf, outputSize);

@@ -24,7 +24,7 @@ import {
 } from "../utils/reportTransfer";
 import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
-  PanoramaPoint, ManualBuilding, RadarSite, TrackPoint, AzSector,
+  PanoramaPoint, PanoramaMergeResult, ManualBuilding, RadarSite, TrackPoint, AzSector,
   ObstacleMonthlyResult, PreScreeningResult, OMReportData, SavedReportSummary,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
@@ -572,19 +572,19 @@ export default function ReportApp() {
       rangeStepM: 200,
     });
     (async () => {
-      const withMap = new Map<string, PanoramaPoint[]>();
-      const withoutMap = new Map<string, PanoramaPoint[]>();
+      const withMap = new Map<string, PanoramaMergeResult>();
+      const withoutMap = new Map<string, PanoramaMergeResult>();
       for (const radar of omData.selectedRadarSites) {
         if (cancelled) break;
         try {
-          const withPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", panoArgs(radar));
-          if (!cancelled) withMap.set(radar.name, withPts);
+          const withResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", panoArgs(radar));
+          if (!cancelled) withMap.set(radar.name, withResult);
           if (excludeIds.length > 0) {
-            const withoutPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", {
+            const withoutResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", {
               ...panoArgs(radar),
               excludeManualIds: excludeIds,
             });
-            if (!cancelled) withoutMap.set(radar.name, withoutPts);
+            if (!cancelled) withoutMap.set(radar.name, withoutResult);
           }
         } catch (err) {
           console.warn(`Panorama failed for ${radar.name}:`, err);

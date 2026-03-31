@@ -9,8 +9,8 @@ use serde::Serialize;
 
 use crate::srtm::{self, SrtmReader};
 
-/// 4/3 유효지구반경 (m)
-const R_EFF: f64 = 6_371_000.0 * 4.0 / 3.0;
+/// 실제 지구반경 (m)
+const R_EARTH: f64 = 6_371_000.0;
 
 /// 건물 높이 상한 (m) — 한국 최고층 롯데월드타워 ~555m, 여유 포함 650m
 const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
@@ -20,7 +20,7 @@ const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
 pub struct PanoramaPoint {
     /// 방위 (°, 정북=0, 시계방향)
     pub azimuth_deg: f64,
-    /// 앙각 (°, 4/3 유효지구 모델)
+    /// 앙각 (°, 실제 지구 기하학적)
     pub elevation_angle_deg: f64,
     /// 장애물까지 지표 거리 (km)
     pub distance_km: f64,
@@ -42,6 +42,43 @@ pub struct PanoramaPoint {
     /// 건물 폴리곤 [[lat, lon], ...] (건물 장애물만, 지형은 None)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub polygon: Option<Vec<[f64; 2]>>,
+}
+
+/// 건물 장애물 (빈 양자화 없이 정확한 방위 범위)
+#[derive(Serialize, Clone, Debug)]
+pub struct BuildingObstacle {
+    /// 방위 시작각 (°)
+    pub azimuth_start_deg: f64,
+    /// 방위 끝각 (°)
+    pub azimuth_end_deg: f64,
+    /// 최대 앙각 (°)
+    pub elevation_angle_deg: f64,
+    /// 최대 앙각 지점까지의 거리 (km)
+    pub distance_km: f64,
+    /// 건물 높이 (m)
+    pub height_m: f64,
+    /// 지면 표고 (m ASL)
+    pub ground_elev_m: f64,
+    /// 지반고 출처: "srtm" | "manual"
+    pub ground_source: String,
+    /// "gis_building" | "manual_building"
+    pub obstacle_type: String,
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub usage: Option<String>,
+    /// 건물 대표 위치 (centroid)
+    pub lat: f64,
+    pub lon: f64,
+    /// 건물 폴리곤 [[lat, lon], ...]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polygon: Option<Vec<[f64; 2]>>,
+}
+
+/// 파노라마 병합 결과 (지형 + 건물 분리)
+#[derive(Serialize, Clone, Debug)]
+pub struct PanoramaMergeResult {
+    pub terrain: Vec<PanoramaPoint>,
+    pub buildings: Vec<BuildingObstacle>,
 }
 
 /// 건물 후보 (DB 조회 결과) — point-only 폴백용
@@ -111,14 +148,14 @@ fn ray_segment_intersection(
     if t > 0.0 { Some(t) } else { None }
 }
 
-/// 4/3 유효지구 모델 앙각 계산
+/// 실제 지구 기하학적 앙각 계산
 /// d: 지표 거리 (m), h_obs: 장애물 해발고 (m), h_radar: 레이더 안테나 해발고 (m)
 fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
     if d < 1.0 || !d.is_finite() || !h_obs.is_finite() || !h_radar.is_finite() {
         return 0.0;
     }
     let dh = h_obs - h_radar;
-    let curv_drop = d * d / (2.0 * R_EFF);
+    let curv_drop = d * d / (2.0 * R_EARTH);
     ((dh - curv_drop) / d).atan().to_degrees()
 }
 
@@ -279,7 +316,7 @@ pub fn calculate_panorama(
     azimuth_step_deg: f64,
     range_step_m: f64,
     exclude_manual_ids: &[i64],
-) -> Vec<PanoramaPoint> {
+) -> PanoramaMergeResult {
     let max_range_m = max_range_km * 1000.0;
     let num_azimuths = (360.0 / azimuth_step_deg).round() as usize;
 
@@ -332,15 +369,16 @@ pub fn calculate_panorama(
         })
         .collect();
 
-    let mut panorama = terrain_results;
+    let all_buildings = collect_building_obstacles(srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, exclude_manual_ids);
+    let buildings = filter_visible_buildings(all_buildings, &terrain_results);
 
-    // Phase 2: 건물 조회 + 병합
-    apply_buildings(&mut panorama, srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, azimuth_step_deg, exclude_manual_ids);
-
-    panorama
+    PanoramaMergeResult {
+        terrain: terrain_results,
+        buildings,
+    }
 }
 
-/// GPU 지형 결과에 건물 데이터를 병합하여 최종 PanoramaPoint 배열 반환
+/// GPU 지형 결과 + 건물 장애물 수집 → PanoramaMergeResult 반환
 pub fn merge_buildings_into_panorama(
     srtm: &mut SrtmReader,
     conn: &Connection,
@@ -349,10 +387,9 @@ pub fn merge_buildings_into_panorama(
     radar_lon: f64,
     radar_height_m: f64,
     max_range_m: f64,
-    azimuth_step_deg: f64,
-) -> Vec<PanoramaPoint> {
-    // TerrainResult → PanoramaPoint 변환
-    let mut panorama: Vec<PanoramaPoint> = terrain_results.iter().map(|t| PanoramaPoint {
+    _azimuth_step_deg: f64,
+) -> PanoramaMergeResult {
+    let terrain: Vec<PanoramaPoint> = terrain_results.iter().map(|t| PanoramaPoint {
         azimuth_deg: t.azimuth_deg,
         elevation_angle_deg: t.elevation_angle_deg,
         distance_km: t.distance_km,
@@ -364,26 +401,104 @@ pub fn merge_buildings_into_panorama(
         polygon: None,
     }).collect();
 
-    apply_buildings(&mut panorama, srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, azimuth_step_deg, &[]);
+    let all_buildings = collect_building_obstacles(srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, &[]);
+    let buildings = filter_visible_buildings(all_buildings, &terrain);
 
-    panorama
+    PanoramaMergeResult { terrain, buildings }
 }
 
-/// Phase 2: 건물 3D 실루엣 — ray-polygon 교차 기반 정밀 병합
-fn apply_buildings(
-    panorama: &mut Vec<PanoramaPoint>,
+/// LoS에 실질적으로 영향 주는 건물만 필터:
+/// 1) 건물 앙각 > 해당 방위 지형 앙각 (지형에 가려지면 제외)
+/// 2) 같은 방위 범위에 더 높은 앙각의 건물이 있으면 가려짐 → 제외
+fn filter_visible_buildings(all: Vec<BuildingObstacle>, terrain: &[PanoramaPoint]) -> Vec<BuildingObstacle> {
+    let n = terrain.len();
+    if n == 0 { return all; }
+
+    // 1단계: 지형 가림 필터
+    let above_terrain: Vec<BuildingObstacle> = all.into_iter().filter(|b| {
+        let mid_az = ((b.azimuth_start_deg + b.azimuth_end_deg) / 2.0).rem_euclid(360.0);
+        let idx = ((mid_az / 360.0 * n as f64).round() as usize).min(n - 1);
+        b.elevation_angle_deg > terrain[idx].elevation_angle_deg
+    }).collect();
+
+    // 2단계: 건물 간 가림 필터 — 방위 겹침 + 더 높은 앙각 건물에 완전히 가려지면 제외
+    // 앙각 내림차순 정렬 → 높은 건물부터 방위 트랙에 등록
+    let mut sorted: Vec<(usize, &BuildingObstacle)> = above_terrain.iter().enumerate().collect();
+    sorted.sort_by(|a, b| b.1.elevation_angle_deg.partial_cmp(&a.1.elevation_angle_deg).unwrap());
+
+    // 0.01° 해상도 방위 트랙: 각 빈의 최대 앙각
+    let track_bins = 36000usize;
+    let mut max_angle = vec![f64::NEG_INFINITY; track_bins];
+
+    // 지형 앙각으로 트랙 초기화
+    for (i, t) in terrain.iter().enumerate() {
+        let bin = ((t.azimuth_deg / 360.0 * track_bins as f64).round() as usize).min(track_bins - 1);
+        if t.elevation_angle_deg > max_angle[bin] {
+            max_angle[bin] = t.elevation_angle_deg;
+        }
+        // 이웃 빈 보정 (terrain 해상도 갭 방지)
+        if i > 0 {
+            let prev_bin = ((terrain[i-1].azimuth_deg / 360.0 * track_bins as f64).round() as usize).min(track_bins - 1);
+            for bi in prev_bin.min(bin)..=prev_bin.max(bin) {
+                if t.elevation_angle_deg > max_angle[bi] {
+                    max_angle[bi] = t.elevation_angle_deg;
+                }
+            }
+        }
+    }
+
+    let mut visible = vec![false; above_terrain.len()];
+
+    for &(orig_idx, b) in &sorted {
+        let mut start = b.azimuth_start_deg;
+        let mut end = b.azimuth_end_deg;
+        if start == end { start -= 0.01; end += 0.01; }
+        if end < start { end += 360.0; }
+
+        let bin_start = ((start / 360.0 * track_bins as f64).floor() as i64).rem_euclid(track_bins as i64) as usize;
+        let bin_end = ((end / 360.0 * track_bins as f64).ceil() as i64).rem_euclid(track_bins as i64) as usize;
+        let bin_count = if bin_end >= bin_start { bin_end - bin_start + 1 } else { track_bins - bin_start + bin_end + 1 };
+
+        // 이 건물이 어떤 빈에서라도 현재 최대보다 높으면 보임
+        let mut dominated = true;
+        for di in 0..bin_count {
+            let bi = (bin_start + di) % track_bins;
+            if b.elevation_angle_deg > max_angle[bi] {
+                dominated = false;
+                break;
+            }
+        }
+
+        if !dominated {
+            visible[orig_idx] = true;
+            // 이 건물의 방위 범위를 트랙에 등록
+            for di in 0..bin_count {
+                let bi = (bin_start + di) % track_bins;
+                if b.elevation_angle_deg > max_angle[bi] {
+                    max_angle[bi] = b.elevation_angle_deg;
+                }
+            }
+        }
+    }
+
+    above_terrain.into_iter().enumerate()
+        .filter(|(i, _)| visible[*i])
+        .map(|(_, b)| b)
+        .collect()
+}
+
+/// Phase 2: 건물 장애물 수집 — ray-polygon 교차 기반 (빈 양자화 없음)
+fn collect_building_obstacles(
     srtm: &mut SrtmReader,
     conn: &Connection,
     radar_lat: f64,
     radar_lon: f64,
     radar_height_m: f64,
     max_range_m: f64,
-    azimuth_step_deg: f64,
     exclude_manual_ids: &[i64],
-) {
-    let num_azimuths = panorama.len();
+) -> Vec<BuildingObstacle> {
     let cos_lat = radar_lat.to_radians().cos().max(0.5);
-    let az_step_rad = azimuth_step_deg.to_radians();
+    let mut results: Vec<BuildingObstacle> = Vec::new();
 
     let tiers: [(f64, f64, f64); 3] = [
         (0.0, 10_000.0, 10.0),
@@ -404,16 +519,13 @@ fn apply_buildings(
             conn, bb_min_lat, bb_max_lat, bb_min_lon, bb_max_lon, min_h, exclude_manual_ids,
         );
 
-        // ── 폴리곤 건물: ray-edge 교차로 정밀 실루엣 ──
+        // ── 폴리곤 건물: 정확한 방위 범위 + 최대 앙각 ──
         for bld in &poly_buildings {
-            // centroid 거리로 quick reject (여유 버퍼 포함)
             let centroid_dist = crate::geo::haversine_m(radar_lat, radar_lon, bld.centroid_lat, bld.centroid_lon);
-            // 건물 최대 반경 ~500m 여유
             if centroid_dist < min_d.max(1.0) - 500.0 || centroid_dist > max_d + 500.0 {
                 continue;
             }
 
-            // 지면 표고 (centroid 기준 1회 조회)
             let ground = if bld.is_manual {
                 bld.ground_elev
             } else {
@@ -421,7 +533,7 @@ fn apply_buildings(
             };
             let total_h = ground + bld.height_m;
 
-            // 꼭짓점 → ENU 변환 + 방위각 계산
+            // 꼭짓점 → ENU + 방위각
             let n = bld.polygon.len();
             let mut enu: Vec<(f64, f64)> = Vec::with_capacity(n);
             let mut vertex_az_deg: Vec<f64> = Vec::with_capacity(n);
@@ -433,108 +545,106 @@ fn apply_buildings(
                 vertex_az_deg.push(az);
             }
 
-            // 방위각 범위 결정 (0/360 wrap 처리)
             let (az_start, az_span) = azimuth_span(&vertex_az_deg);
+            if az_span > 180.0 { continue; }
 
-            // 안전장치: 건물이 180° 이상 차지하면 데이터 이상 → skip
-            if az_span > 180.0 {
-                continue;
+            // 꼭짓점별 거리로 최소 거리(nearest edge) 근사 → 앙각 계산
+            let mut best_angle = f64::NEG_INFINITY;
+            let mut best_dist = f64::INFINITY;
+
+            // 방위 중앙에서 레이 쏘아 정확한 nearest edge 거리 구함
+            let mid_az_deg = (az_start + az_span / 2.0) % 360.0;
+            let mid_az_rad = mid_az_deg.to_radians();
+            let ray_dx = mid_az_rad.sin();
+            let ray_dy = mid_az_rad.cos();
+            let mut nearest_mid = f64::INFINITY;
+            for i in 0..n {
+                let j = (i + 1) % n;
+                if let Some(d) = ray_segment_intersection(ray_dx, ray_dy, enu[i].0, enu[i].1, enu[j].0, enu[j].1) {
+                    if d < nearest_mid { nearest_mid = d; }
+                }
+            }
+            if nearest_mid < f64::INFINITY && nearest_mid >= 1.0 && nearest_mid >= min_d && nearest_mid <= max_d {
+                let angle = elevation_angle_deg(nearest_mid, total_h, radar_height_m);
+                if angle > best_angle { best_angle = angle; best_dist = nearest_mid; }
             }
 
-            // 빈 범위 계산
-            let bin_start = (az_start / azimuth_step_deg).floor() as i64;
-            let bin_count = ((az_span / azimuth_step_deg).ceil() as i64 + 1).min(num_azimuths as i64);
-
-            let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
-
-            for bi in 0..bin_count {
-                let bin_idx = ((bin_start + bi) as i64).rem_euclid(num_azimuths as i64) as usize;
-                let az_rad = (bin_start + bi) as f64 * az_step_rad;
-                let ray_dx = az_rad.sin();
-                let ray_dy = az_rad.cos();
-
-                // 모든 edge와 교차 테스트 → 최소 거리
-                let mut nearest_dist = f64::INFINITY;
+            // 양 끝 방위에서도 레이 쏴서 체크
+            for edge_az in [az_start, (az_start + az_span) % 360.0] {
+                let az_rad = edge_az.to_radians();
+                let rdx = az_rad.sin();
+                let rdy = az_rad.cos();
+                let mut nd = f64::INFINITY;
                 for i in 0..n {
                     let j = (i + 1) % n;
-                    if let Some(d) = ray_segment_intersection(
-                        ray_dx, ray_dy,
-                        enu[i].0, enu[i].1,
-                        enu[j].0, enu[j].1,
-                    ) {
-                        if d < nearest_dist {
-                            nearest_dist = d;
-                        }
+                    if let Some(d) = ray_segment_intersection(rdx, rdy, enu[i].0, enu[i].1, enu[j].0, enu[j].1) {
+                        if d < nd { nd = d; }
                     }
                 }
-
-                if nearest_dist == f64::INFINITY || nearest_dist < 1.0 {
-                    continue;
-                }
-
-                // 거리 범위 확인
-                if nearest_dist < min_d || nearest_dist > max_d {
-                    continue;
-                }
-
-                let angle = elevation_angle_deg(nearest_dist, total_h, radar_height_m);
-                if angle > panorama[bin_idx].elevation_angle_deg {
-                    panorama[bin_idx] = PanoramaPoint {
-                        azimuth_deg: bin_idx as f64 * azimuth_step_deg,
-                        elevation_angle_deg: angle,
-                        distance_km: nearest_dist / 1000.0,
-                        obstacle_height_m: bld.height_m,
-                        ground_elev_m: ground,
-                        obstacle_type: obs_type.to_string(),
-                        name: bld.name.clone(),
-                        address: bld.address.clone(),
-                        usage: bld.usage.clone(),
-                        // centroid 좌표 → 프론트엔드 dedup 시 1건물=1마커
-                        lat: bld.centroid_lat,
-                        lon: bld.centroid_lon,
-                        polygon: Some(bld.polygon.clone()),
-                    };
+                if nd < f64::INFINITY && nd >= 1.0 && nd >= min_d && nd <= max_d {
+                    let angle = elevation_angle_deg(nd, total_h, radar_height_m);
+                    if angle > best_angle { best_angle = angle; best_dist = nd; }
                 }
             }
+
+            if best_angle <= f64::NEG_INFINITY { continue; }
+
+            let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
+            let az_end = (az_start + az_span) % 360.0;
+
+            let ground_src = if bld.is_manual { "manual" } else { "srtm" };
+            results.push(BuildingObstacle {
+                azimuth_start_deg: az_start,
+                azimuth_end_deg: az_end,
+                elevation_angle_deg: best_angle,
+                distance_km: best_dist / 1000.0,
+                height_m: bld.height_m,
+                ground_elev_m: ground,
+                ground_source: ground_src.to_string(),
+                obstacle_type: obs_type.to_string(),
+                name: bld.name.clone(),
+                address: bld.address.clone(),
+                usage: bld.usage.clone(),
+                lat: bld.centroid_lat,
+                lon: bld.centroid_lon,
+                polygon: Some(bld.polygon.clone()),
+            });
         }
 
-        // ── point-only 건물 폴백 (폴리곤 없는 수동 건물) ──
+        // ── point-only 건물 (폴리곤 없는 수동 건물) ──
         for bld in &point_buildings {
             let dist_m = crate::geo::haversine_m(radar_lat, radar_lon, bld.lat, bld.lon);
-            if dist_m < min_d || dist_m > max_d {
-                continue;
-            }
+            if dist_m < min_d || dist_m > max_d { continue; }
 
-            let ground = if bld.is_manual {
-                bld.ground_elev
-            } else {
+            let ground = if bld.is_manual { bld.ground_elev } else {
                 srtm.get_elevation(bld.lat, bld.lon).unwrap_or(0.0)
             };
             let total_h = ground + bld.height_m;
             let angle = elevation_angle_deg(dist_m, total_h, radar_height_m);
-
             let az = crate::geo::bearing_deg(radar_lat, radar_lon, bld.lat, bld.lon);
-            let bin = ((az / azimuth_step_deg).round() as usize) % num_azimuths;
+            let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
 
-            if angle > panorama[bin].elevation_angle_deg {
-                let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
-                panorama[bin] = PanoramaPoint {
-                    azimuth_deg: bin as f64 * azimuth_step_deg,
-                    elevation_angle_deg: angle,
-                    distance_km: dist_m / 1000.0,
-                    obstacle_height_m: bld.height_m,
-                    ground_elev_m: ground,
-                    obstacle_type: obs_type.to_string(),
-                    name: bld.name.clone(),
-                    address: bld.address.clone(),
-                    usage: bld.usage.clone(),
-                    lat: bld.lat,
-                    lon: bld.lon,
-                    polygon: None,
-                };
-            }
+            let ground_src = if bld.is_manual { "manual" } else { "srtm" };
+            results.push(BuildingObstacle {
+                azimuth_start_deg: az,
+                azimuth_end_deg: az,
+                elevation_angle_deg: angle,
+                distance_km: dist_m / 1000.0,
+                height_m: bld.height_m,
+                ground_elev_m: ground,
+                ground_source: ground_src.to_string(),
+                obstacle_type: obs_type.to_string(),
+                name: bld.name.clone(),
+                address: bld.address.clone(),
+                usage: bld.usage.clone(),
+                lat: bld.lat,
+                lon: bld.lon,
+                polygon: None,
+            });
         }
     }
+
+    results
 }
 
 /// 방위각 목록에서 실제 건물이 차지하는 (시작각, 각도폭) 계산

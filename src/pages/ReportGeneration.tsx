@@ -31,7 +31,7 @@ import {
   type ReportTemplate, type ReportSections,
 } from "../utils/reportTransfer";
 import type {
-  Flight, LoSProfileData, PanoramaPoint, NearbyPeak,
+  Flight, LoSProfileData, PanoramaPoint, PanoramaMergeResult, NearbyPeak,
   ManualBuilding, RadarSite, SavedReportSummary,
   PreScreeningResult, OMReportData,
 } from "../types";
@@ -95,8 +95,12 @@ export default function ReportGeneration() {
       .then((json) => {
         if (cancelled) return;
         if (json) {
-          const data = JSON.parse(json) as PanoramaPoint[];
-          setPanoramaData(data);
+          const parsed = JSON.parse(json);
+          if (parsed && !Array.isArray(parsed) && Array.isArray(parsed.terrain)) {
+            setPanoramaData(parsed.terrain);
+          } else if (Array.isArray(parsed)) {
+            setPanoramaData(parsed as PanoramaPoint[]);
+          }
         }
       })
       .catch(() => {});
@@ -202,24 +206,24 @@ export default function ReportGeneration() {
       rangeStepM: 200,
     });
     (async () => {
-      const withMap = new Map<string, PanoramaPoint[]>();
-      const withoutMap = new Map<string, PanoramaPoint[]>();
+      const withMap = new Map<string, PanoramaMergeResult>();
+      const withoutMap = new Map<string, PanoramaMergeResult>();
       for (const radar of omData.selectedRadarSites) {
         if (cancelled) break;
         try {
-          const withPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", panoArgs(radar));
-          if (!cancelled) withMap.set(radar.name, withPts);
+          const withResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", panoArgs(radar));
+          if (!cancelled) withMap.set(radar.name, withResult);
           await invoke("save_panorama_cache", {
             radarLat: radar.latitude, radarLon: radar.longitude,
             radarHeightM: radar.altitude + radar.antenna_height,
-            dataJson: JSON.stringify(withPts),
+            dataJson: JSON.stringify(withResult),
           }).catch(() => {});
           if (excludeIds.length > 0) {
-            const withoutPts = await invoke<PanoramaPoint[]>("calculate_los_panorama", {
+            const withoutResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", {
               ...panoArgs(radar),
               excludeManualIds: excludeIds,
             });
-            if (!cancelled) withoutMap.set(radar.name, withoutPts);
+            if (!cancelled) withoutMap.set(radar.name, withoutResult);
           }
         } catch (err) {
           console.warn(`Panorama failed for ${radar.name}:`, err);

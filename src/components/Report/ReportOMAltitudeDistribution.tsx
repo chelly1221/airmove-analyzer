@@ -10,8 +10,8 @@ interface Props {
   selectedBuildings: ManualBuilding[];
   radarSites: RadarSite[];
   losMap: Map<string, LoSProfileData>;
-  panoWithTargets?: Map<string, PanoramaPoint[]>;
-  panoWithoutTargets?: Map<string, PanoramaPoint[]>;
+  panoWithTargets?: Map<string, import("../../types/panorama").PanoramaMergeResult>;
+  panoWithoutTargets?: Map<string, import("../../types/panorama").PanoramaMergeResult>;
   /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
   hideHeader?: boolean;
 }
@@ -681,8 +681,8 @@ function ReportOMAltitudeDistribution({
             losses={losses}
             buildings={buildings}
             radarSite={rs}
-            panoWith={panoWithTargets?.get(radarName) ?? []}
-            panoWithout={panoWithoutTargets?.get(radarName) ?? []}
+            panoWith={panoWithTargets?.get(radarName)?.terrain ?? []}
+            panoWithout={panoWithoutTargets?.get(radarName)?.terrain ?? []}
           />
         );
       })}

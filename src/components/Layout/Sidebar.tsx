@@ -191,8 +191,9 @@ function PanoramaObstaclePanel() {
     pt.obstacle_type === "terrain" ? "bg-green-100 text-green-700"
     : pt.obstacle_type === "gis_building" ? "bg-orange-100 text-orange-700"
     : "bg-red-100 text-red-700";
+  const bldgHeight = isBuilding && "height_m" in pt ? pt.height_m : ("obstacle_height_m" in pt ? pt.obstacle_height_m : 0);
   const elevASL = isBuilding
-    ? pt.ground_elev_m + pt.obstacle_height_m
+    ? pt.ground_elev_m + bldgHeight
     : pt.ground_elev_m;
 
   return (
@@ -218,7 +219,7 @@ function PanoramaObstaclePanel() {
       <div className="grid grid-cols-3 gap-x-2 gap-y-1">
         <div>
           <span className="text-[9px] text-gray-400">방위</span>
-          <p className="font-mono text-[11px] font-medium text-gray-700">{pt.azimuth_deg.toFixed(1)}°</p>
+          <p className="font-mono text-[11px] font-medium text-gray-700">{"azimuth_deg" in pt ? pt.azimuth_deg.toFixed(1) : ((pt.azimuth_start_deg + pt.azimuth_end_deg) / 2).toFixed(1)}°</p>
         </div>
         <div>
           <span className="text-[9px] text-gray-400">앙각</span>
@@ -243,7 +244,7 @@ function PanoramaObstaclePanel() {
         {isBuilding ? (
           <div>
             <span className="text-[9px] text-gray-400">건물높이</span>
-            <p className="font-mono text-[11px] font-medium text-gray-700">{pt.obstacle_height_m.toFixed(1)} m</p>
+            <p className="font-mono text-[11px] font-medium text-gray-700">{bldgHeight.toFixed(1)} m</p>
           </div>
         ) : (
           <div />

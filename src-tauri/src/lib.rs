@@ -633,7 +633,7 @@ async fn calculate_los_panorama(
     azimuth_step_deg: Option<f64>,
     range_step_m: Option<f64>,
     exclude_manual_ids: Option<Vec<i64>>,
-) -> Result<Vec<analysis::panorama::PanoramaPoint>, String> {
+) -> Result<analysis::panorama::PanoramaMergeResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let max_range = max_range_km.unwrap_or(100.0);
         let az_step = azimuth_step_deg.unwrap_or(0.5);
@@ -745,7 +745,7 @@ async fn panorama_merge_buildings(
     max_range_km: Option<f64>,
     azimuth_step_deg: Option<f64>,
     terrain_results: Vec<analysis::panorama::TerrainResult>,
-) -> Result<Vec<analysis::panorama::PanoramaPoint>, String> {
+) -> Result<analysis::panorama::PanoramaMergeResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let max_range = max_range_km.unwrap_or(100.0);
         let az_step = azimuth_step_deg.unwrap_or(0.01);
@@ -2104,8 +2104,10 @@ async fn build_heightmap(
     range_nm: f64,
     pixel_size_m: Option<f64>,
     exclude_manual_ids: Option<Vec<i64>>,
+    skip_buildings: Option<bool>,
 ) -> Result<analysis::heightmap::HeightmapResult, String> {
     let pix = pixel_size_m.unwrap_or(100.0);
+    let skip_bldg = skip_buildings.unwrap_or(false);
 
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
@@ -2118,6 +2120,7 @@ async fn build_heightmap(
             radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
             pix,
             exclude_manual_ids.as_deref(),
+            skip_bldg,
         ))
     })
     .await

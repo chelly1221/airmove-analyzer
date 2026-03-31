@@ -1843,7 +1843,8 @@ export default function TrackMap() {
     const first = coords[0];
     const last = coords[coords.length - 1];
     if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
-    const totalHeight = pt.ground_elev_m + pt.obstacle_height_m;
+    const bldgH = "height_m" in pt ? pt.height_m : (pt as any).obstacle_height_m ?? 0;
+    const totalHeight = pt.ground_elev_m + bldgH;
     return {
       type: "FeatureCollection" as const,
       features: [{

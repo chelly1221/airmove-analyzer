@@ -75,7 +75,7 @@ export default function ReportPSAngleHeight({ sectionNum, result }: Props) {
         <span>* 지형 앙각: 레이더→건물 경로 상 기존 지형의 최대 앙각 (최소 0.25° 적용)</span>
       </div>
       <div className="mt-1 flex gap-4 text-[10px] text-gray-400">
-        <span>* 최대 건축가능 높이: 기존 지형 앙각을 초과하지 않는 건물 최대 높이 (4/3 유효지구 모델)</span>
+        <span>* 최대 건축가능 높이: 기존 지형 앙각을 초과하지 않는 건물 최대 높이 (실제 지구 곡률 기준)</span>
       </div>
     </div>
   );

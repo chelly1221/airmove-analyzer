@@ -5,7 +5,7 @@
  */
 import type {
   Flight, LoSProfileData, Aircraft, RadarSite, ReportMetadata,
-  PanoramaPoint, ManualBuilding, AzSector, ObstacleMonthlyResult,
+  PanoramaPoint, PanoramaMergeResult, ManualBuilding, AzSector, ObstacleMonthlyResult,
   PreScreeningResult, OMReportData, TrackPoint,
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
@@ -56,8 +56,8 @@ export interface SerializedOMData {
   analysisMonth: string;
   findingsText: string;
   recommendText: string;
-  panoWithTargets: [string, PanoramaPoint[]][];
-  panoWithoutTargets: [string, PanoramaPoint[]][];
+  panoWithTargets: [string, PanoramaMergeResult][];
+  panoWithoutTargets: [string, PanoramaMergeResult][];
   coverageStatus: "idle" | "loading" | "done" | "error";
   panoramaStatus: "idle" | "loading" | "done" | "error";
   sectionImages: [string, string][];

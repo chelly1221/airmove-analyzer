@@ -1,11 +1,12 @@
 import { useId } from "react";
-import type { PanoramaPoint, RadarSite } from "../../types";
+import type { PanoramaPoint, BuildingObstacle, RadarSite } from "../../types";
 import ReportPage from "./ReportPage";
 import { PAGE_CONTENT_MM, SECTION_HEADER_MM, TABLE_HEADER_MM, ROW_HEIGHT_SM } from "./reportPageConstants";
 
 interface PanoramaSectionProps {
   sectionNum: number;
   panoramaData: PanoramaPoint[];
+  buildingObstacles?: BuildingObstacle[];
   radarSite: RadarSite;
   peakNames?: Map<number, string>;
 }
@@ -37,11 +38,11 @@ const SECTOR_TITLE_MM = 8;
 const SECTOR_TABLE_MM = 64; // 8행 × 8mm
 const BUILDING_TITLE_MM = 10;
 
-export default function ReportPanoramaSection({ sectionNum, panoramaData, radarSite, peakNames }: PanoramaSectionProps) {
+export default function ReportPanoramaSection({ sectionNum, panoramaData, buildingObstacles = [], radarSite, peakNames }: PanoramaSectionProps) {
   if (panoramaData.length < 2) return null;
 
   // 통계 계산
-  const buildings = panoramaData.filter((p) => p.obstacle_type !== "terrain");
+  const buildings = buildingObstacles;
   const gisBuildings = buildings.filter((p) => p.obstacle_type === "gis_building");
   const manualBuildings = buildings.filter((p) => p.obstacle_type === "manual_building");
   const maxAnglePt = panoramaData.reduce((a, b) => a.elevation_angle_deg > b.elevation_angle_deg ? a : b, panoramaData[0]);
@@ -291,35 +292,38 @@ export default function ReportPanoramaSection({ sectionNum, panoramaData, radarS
     </thead>
   );
 
-  const renderBuildingRow = (pt: PanoramaPoint, idx: number) => (
-    <tr key={idx} className={idx % 2 === 0 ? "bg-white" : "bg-gray-50"}>
-      <td className="border border-gray-200 px-1.5 py-1 text-center">{idx + 1}</td>
-      <td className="border border-gray-200 px-1.5 py-1 text-center">
-        <span className={`rounded px-1 py-0.5 text-[11px] font-medium ${
-          pt.obstacle_type === "gis_building" ? "bg-orange-50 text-orange-600" : "bg-red-50 text-red-600"
-        }`}>
-          {pt.obstacle_type === "gis_building" ? "GIS" : "수동"}
-        </span>
-      </td>
-      <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">
-        {pt.azimuth_deg.toFixed(1)} <span className="text-[10px] text-gray-400">{azLabel(pt.azimuth_deg)}</span>
-      </td>
-      <td className="border border-gray-200 px-1.5 py-1 text-right font-mono font-medium text-[#a60739]">
-        {pt.elevation_angle_deg.toFixed(3)}
-      </td>
-      <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">{pt.distance_km.toFixed(2)}</td>
-      <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">{pt.obstacle_height_m.toFixed(1)}</td>
-      <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">
-        {(pt.ground_elev_m + pt.obstacle_height_m).toFixed(0)}
-      </td>
-      <td className="border border-gray-200 px-1.5 py-1 truncate max-w-[120px]" title={pt.address ?? pt.name ?? ""}>
-        {pt.address || pt.name || "—"}
-      </td>
-      <td className="border border-gray-200 px-1.5 py-1 truncate max-w-[80px]" title={pt.usage ?? ""}>
-        {pt.usage || "—"}
-      </td>
-    </tr>
-  );
+  const renderBuildingRow = (pt: BuildingObstacle, idx: number) => {
+    const midAz = (pt.azimuth_start_deg + pt.azimuth_end_deg) / 2;
+    return (
+      <tr key={idx} className={idx % 2 === 0 ? "bg-white" : "bg-gray-50"}>
+        <td className="border border-gray-200 px-1.5 py-1 text-center">{idx + 1}</td>
+        <td className="border border-gray-200 px-1.5 py-1 text-center">
+          <span className={`rounded px-1 py-0.5 text-[11px] font-medium ${
+            pt.obstacle_type === "gis_building" ? "bg-orange-50 text-orange-600" : "bg-red-50 text-red-600"
+          }`}>
+            {pt.obstacle_type === "gis_building" ? "GIS" : "수동"}
+          </span>
+        </td>
+        <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">
+          {midAz.toFixed(1)} <span className="text-[10px] text-gray-400">{azLabel(midAz)}</span>
+        </td>
+        <td className="border border-gray-200 px-1.5 py-1 text-right font-mono font-medium text-[#a60739]">
+          {pt.elevation_angle_deg.toFixed(3)}
+        </td>
+        <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">{pt.distance_km.toFixed(2)}</td>
+        <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">{pt.height_m.toFixed(1)}</td>
+        <td className="border border-gray-200 px-1.5 py-1 text-right font-mono">
+          {(pt.ground_elev_m + pt.height_m).toFixed(0)}
+        </td>
+        <td className="border border-gray-200 px-1.5 py-1 truncate max-w-[120px]" title={pt.address ?? pt.name ?? ""}>
+          {pt.address || pt.name || "—"}
+        </td>
+        <td className="border border-gray-200 px-1.5 py-1 truncate max-w-[80px]" title={pt.usage ?? ""}>
+          {pt.usage || "—"}
+        </td>
+      </tr>
+    );
+  };
 
   // 첫 페이지 잔여 공간: 헤더 + KPI + SVG + 방위테이블
   const firstPageUsedMM = SECTION_HEADER_MM + KPI_MM + SVG_CHART_MM + SECTOR_TITLE_MM + SECTOR_TABLE_MM;

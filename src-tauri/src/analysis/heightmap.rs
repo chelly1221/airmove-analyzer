@@ -40,6 +40,7 @@ pub fn build_heightmap(
     range_nm: f64,
     pixel_size_m: f64,
     exclude_manual_ids: Option<&[i64]>,
+    skip_buildings: bool,
 ) -> HeightmapResult {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -91,8 +92,23 @@ pub fn build_heightmap(
         })
         .collect();
 
-    // 2. 건물 래스터화 (max semantics)
+    // 2. 건물 래스터화 (max semantics) — skip_buildings 시 생략
     let mut data = data;
+    if skip_buildings {
+        // f32 LE → base64 (건물 없는 순수 지형)
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data_b64 = STANDARD.encode(&bytes);
+        return HeightmapResult {
+            data_b64,
+            width: width as u32,
+            height: height as u32,
+            pixel_size_m: pixel_size_m as f32,
+            center_lat: radar_lat,
+            center_lon: radar_lon,
+            radar_height_m: radar_height,
+            max_range_km,
+        };
+    }
     let cos_lat = radar_lat.to_radians().cos();
     for &(blat, blon, bheight) in &buildings {
         // 건물 위치 → ENU 그리드 좌표

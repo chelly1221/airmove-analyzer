@@ -1,26 +1,40 @@
-/** LoS 파노라마 포인트 (방위별 최대 앙각 장애물) */
+/** LoS 파노라마 포인트 — 지형 (방위별 최대 앙각) */
 export interface PanoramaPoint {
-  /** 방위 (°, 정북=0, 시계방향) */
   azimuth_deg: number;
-  /** 앙각 (°, 4/3 유효지구 모델) */
   elevation_angle_deg: number;
-  /** 장애물까지 지표 거리 (km) */
   distance_km: number;
-  /** 장애물 높이 (m) */
   obstacle_height_m: number;
-  /** 지면 표고 (m ASL) */
   ground_elev_m: number;
-  /** 장애물 유형 */
-  obstacle_type: "terrain" | "gis_building" | "manual_building";
-  /** 장애물 이름 */
+  obstacle_type: "terrain";
   name: string | null;
-  /** 주소 (건물) */
   address: string | null;
-  /** 용도 (건물) */
   usage: string | null;
-  /** 장애물 위치 WGS84 */
   lat: number;
   lon: number;
-  /** 건물 폴리곤 [[lat, lon], ...] (건물 장애물만) */
   polygon?: [number, number][];
+}
+
+/** 건물 장애물 — 정확한 방위 범위, 빈 양자화 없음 */
+export interface BuildingObstacle {
+  azimuth_start_deg: number;
+  azimuth_end_deg: number;
+  elevation_angle_deg: number;
+  distance_km: number;
+  height_m: number;
+  ground_elev_m: number;
+  /** 지반고 출처: "srtm" (NASA) | "manual" (수동 등록) */
+  ground_source: "srtm" | "manual";
+  obstacle_type: "gis_building" | "manual_building";
+  name: string | null;
+  address: string | null;
+  usage: string | null;
+  lat: number;
+  lon: number;
+  polygon?: [number, number][];
+}
+
+/** 파노라마 병합 결과 (지형 + 건물 분리) */
+export interface PanoramaMergeResult {
+  terrain: PanoramaPoint[];
+  buildings: BuildingObstacle[];
 }

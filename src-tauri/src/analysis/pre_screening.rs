@@ -17,8 +17,8 @@ use crate::parser;
 use std::sync::Mutex;
 use crate::srtm::SrtmReader;
 
-/// 4/3 유효지구반경 (m)
-const R_EFF: f64 = 6_371_000.0 * 4.0 / 3.0;
+/// 실제 지구반경 (m) — 지형/건물 기하학적 앙각 계산용
+const R_EARTH: f64 = 6_371_000.0;
 
 /// 최소 지형 앙각 (도) — 기준 하한
 const MIN_TERRAIN_ANGLE_DEG: f64 = 0.25;
@@ -102,13 +102,13 @@ pub struct PreScreeningResult {
 
 // ─── 핵심 로직 ───
 
-/// 4/3 유효지구 모델 앙각 계산 (도)
+/// 실제 지구 기하학적 앙각 계산 (도) — 지형/건물 표시용
 fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
     if d < 1.0 || !d.is_finite() || !h_obs.is_finite() || !h_radar.is_finite() {
         return 0.0;
     }
     let dh = h_obs - h_radar;
-    let curv_drop = d * d / (2.0 * R_EFF);
+    let curv_drop = d * d / (2.0 * R_EARTH);
     ((dh - curv_drop) / d).atan().to_degrees()
 }
 
@@ -156,7 +156,7 @@ impl LightPoint {
 /// 항공기의 특정 위치에서 건물에 의한 LoS 차단 여부 판정
 ///
 /// 레이더 → 항공기 직선 경로 상에서 건물 위치를 통과할 때
-/// 건물 꼭대기가 LoS 선보다 높으면 차단 (4/3 유효지구 모델)
+/// 건물 꼭대기가 LoS 선보다 높으면 차단 (직선 LoS 기하학)
 fn is_blocked_by_building(
     radar_lat: f64, radar_lon: f64, radar_height: f64,
     ac_lat: f64, ac_lon: f64, ac_alt: f64,   // 항공기 (해발고 m)
@@ -169,12 +169,12 @@ fn is_blocked_by_building(
 
     let t = d_bldg / d_total;  // 건물이 LoS 선 상의 비율 위치
 
-    // 4/3 유효지구 모델: LoS 선 높이 at building distance
+    // 직선 LoS: 실제 지구 곡률 기준 LoS 선 높이 at building distance
     // curvature drop at building location
-    let curv_drop_bldg = d_bldg * d_bldg / (2.0 * R_EFF);
-    let curv_drop_total = d_total * d_total / (2.0 * R_EFF);
+    let curv_drop_bldg = d_bldg * d_bldg / (2.0 * R_EARTH);
+    let curv_drop_total = d_total * d_total / (2.0 * R_EARTH);
 
-    // 직선 보간 높이 (4/3 유효지구 프레임)
+    // 직선 보간 높이 (실제 지구 프레임)
     let los_height_at_bldg = radar_height * (1.0 - t) + (ac_alt + curv_drop_total) * t - curv_drop_bldg;
 
     // 건물 꼭대기가 LOS보다 높으면 차단
@@ -191,7 +191,7 @@ fn is_blocked_by_terrain(
 ) -> bool {
     let d_total = crate::geo::haversine_m(radar_lat, radar_lon, ac_lat, ac_lon);
     if d_total < 200.0 { return false; }
-    let curv_drop_total = d_total * d_total / (2.0 * R_EFF);
+    let curv_drop_total = d_total * d_total / (2.0 * R_EARTH);
 
     for i in 1..num_samples {
         let t = i as f64 / num_samples as f64;
@@ -202,7 +202,7 @@ fn is_blocked_by_terrain(
         let terrain_elev = srtm.lock().ok()
             .and_then(|mut s| s.get_elevation(lat, lon))
             .unwrap_or(0.0);
-        let curv_drop = d * d / (2.0 * R_EFF);
+        let curv_drop = d * d / (2.0 * R_EARTH);
         let los_height = radar_height * (1.0 - t) + (ac_alt + curv_drop_total) * t - curv_drop;
 
         if terrain_elev > los_height {
@@ -273,7 +273,7 @@ pub fn analyze_pre_screening(
 
         // 최대 건축가능 높이: terrain_angle 기준으로 역산
         let terrain_angle_rad = terrain_angle.to_radians();
-        let curv_drop = dist * dist / (2.0 * R_EFF);
+        let curv_drop = dist * dist / (2.0 * R_EARTH);
         let max_top = radar_height + dist * terrain_angle_rad.tan() + curv_drop;
         let max_buildable = (max_top - b.ground_elev_m).max(0.0);
 

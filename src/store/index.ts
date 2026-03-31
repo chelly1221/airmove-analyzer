@@ -8,7 +8,7 @@ import type {
   LoSProfileData,
   ManualBuilding,
   PageId,
-  PanoramaPoint,
+  PanoramaPoint, BuildingObstacle,
   ParseStatistics,
   PlanImageBounds,
   RadarSite,
@@ -93,8 +93,8 @@ interface AppState {
   // 파노라마 (전파 장애물) 뷰
   panoramaViewActive: boolean;
   setPanoramaViewActive: (v: boolean) => void;
-  panoramaActivePoint: PanoramaPoint | null;
-  setPanoramaActivePoint: (pt: PanoramaPoint | null) => void;
+  panoramaActivePoint: PanoramaPoint | BuildingObstacle | null;
+  setPanoramaActivePoint: (pt: PanoramaPoint | BuildingObstacle | null) => void;
   panoramaPinned: boolean;
   setPanoramaPinned: (v: boolean) => void;
   // 파노라마 맵 오버레이 (장애물 경계 폴리곤)
