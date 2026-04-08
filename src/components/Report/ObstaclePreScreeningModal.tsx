@@ -35,11 +35,11 @@ export default function ObstaclePreScreeningModal({
     buildings: ManualBuilding[],
     radars: RadarSite[],
     losMap: Map<string, LoSProfileData>,
-    covWith: CoverageLayer[],
-    covWithout: CoverageLayer[],
+    covWith: Map<string, CoverageLayer[]>,
+    covWithout: Map<string, CoverageLayer[]>,
     analysisMonth?: string,
   ) => void;
-  onCoverageReady: (covWith: CoverageLayer[], covWithout: CoverageLayer[]) => void;
+  onCoverageReady: (covWith: Map<string, CoverageLayer[]>, covWithout: Map<string, CoverageLayer[]>) => void;
   onCoverageError?: () => void;
 }) {
   const [step, setStep] = useState(0);
@@ -121,22 +121,25 @@ export default function ObstaclePreScreeningModal({
       setProgress("커버리지 계산 중...");
       setProgressPct(85);
 
-      let covWith: CoverageLayer[] = [];
-      let covWithout: CoverageLayer[] = [];
+      const covWithMap = new Map<string, CoverageLayer[]>();
+      const covWithoutMap = new Map<string, CoverageLayer[]>();
       if (selectedRadars.length > 0) {
-        const r = selectedRadars[0];
         const altFts = [1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
         const excludeIds = selectedBuildings.map((b) => b.id);
         try {
           const { computeCoverageLayersOM } = await import("../../utils/gpuCoverage");
-          if (!psCancelledRef.current) {
+          for (let ri = 0; ri < selectedRadars.length; ri++) {
+            if (psCancelledRef.current) break;
+            const r = selectedRadars[ri];
+            setProgress(`커버리지 계산 중... (${r.name}, ${ri + 1}/${selectedRadars.length})`);
+            setProgressPct(85 + Math.floor((ri / selectedRadars.length) * 8));
             const covResult = await computeCoverageLayersOM(
               { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm, bearingStepDeg: 0.01 },
               altFts, excludeIds,
-              (msg) => { if (!psCancelledRef.current) { setProgress(msg); setProgressPct(msg.includes("제외") ? 90 : 85); } },
+              (msg) => { if (!psCancelledRef.current) { setProgress(`[${r.name}] ${msg}`); } },
             );
-            covWith = covResult.layersWith;
-            covWithout = covResult.layersWithout;
+            covWithMap.set(r.name, covResult.layersWith);
+            covWithoutMap.set(r.name, covResult.layersWithout);
           }
         } catch (err) {
           console.warn("커버리지 계산 실패:", err);
@@ -148,9 +151,9 @@ export default function ObstaclePreScreeningModal({
 
       setProgress("보고서 생성 중...");
       setProgressPct(95);
-      onGenerate(result, selectedBuildings, selectedRadars, losMap, covWith, covWithout, analysisMonth);
+      onGenerate(result, selectedBuildings, selectedRadars, losMap, covWithMap, covWithoutMap, analysisMonth);
 
-      if (covWith.length > 0) onCoverageReady(covWith, covWithout);
+      if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap);
 
       setProgressPct(100);
     } catch (err) {

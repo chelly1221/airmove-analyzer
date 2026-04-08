@@ -109,7 +109,9 @@ const MAX_ALT = 20000;
 function ReportOMAzDistScatter({
   sectionNum, radarSite, dailyStats, selectedBuildings, azSectors, analysisMonth, hideHeader,
 }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const genRef = useRef(0);
   const [, setReady] = useState(false);
 
   const monthLabel = analysisMonth
@@ -178,6 +180,8 @@ function ReportOMAzDistScatter({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const gen = ++genRef.current;
+
     const { zoom, tileMinX, tileMaxX, tileMinY, tileMaxY, originPx, originPy, rangeKm } = mapParams;
 
     // 타일 로드
@@ -186,6 +190,7 @@ function ReportOMAzDistScatter({
     const totalTiles = (tileMaxX - tileMinX + 1) * (tileMaxY - tileMinY + 1);
 
     const drawAll = () => {
+      if (gen !== genRef.current) return; // stale — 이전 타일 로드 무시
       ctx.clearRect(0, 0, canvasW, canvasH);
       // 배경
       ctx.fillStyle = "#f0f0f0";
@@ -391,6 +396,8 @@ function ReportOMAzDistScatter({
       }
 
       setReady(true);
+      // OMSectionImage에 캡처 준비 알림 (bubbles로 상위 div까지 전파)
+      canvasRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
     };
 
     // 타일 비동기 로드
@@ -405,6 +412,7 @@ function ReportOMAzDistScatter({
         const img = new Image();
         img.crossOrigin = "anonymous";
         img.onload = () => {
+          if (gen !== genRef.current) return;
           const dx = tx * TILE_SIZE - originPx;
           const dy = ty * TILE_SIZE - originPy;
           tiles.push({ img, dx, dy });
@@ -412,6 +420,7 @@ function ReportOMAzDistScatter({
           if (loaded >= totalTiles) drawAll();
         };
         img.onerror = () => {
+          if (gen !== genRef.current) return;
           loaded++;
           if (loaded >= totalTiles) drawAll();
         };
@@ -421,14 +430,23 @@ function ReportOMAzDistScatter({
 
     // 타일 0개인 경우
     if (totalTiles === 0) drawAll();
+
+    return () => { genRef.current++; };
   }, [allLoss, mapParams, geoToCanvas, radarSite, azSectors, selectedBuildings, canvasW, canvasH]);
 
   const totalCount = allLoss.length;
 
+  // 빈 상태 즉시 captureReady 전파
+  useEffect(() => {
+    if (totalCount === 0) {
+      containerRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
+    }
+  }, [totalCount]);
+
   if (totalCount === 0) {
     const hasDailyData = dailyStats.length > 0;
     return (
-      <div className="mb-8">
+      <div ref={containerRef} className="mb-8">
         {!hideHeader && (
           <ReportOMSectionHeader
             sectionNum={sectionNum}

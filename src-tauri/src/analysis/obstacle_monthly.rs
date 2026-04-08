@@ -12,6 +12,9 @@ use crate::analysis::loss::calculate_haversine_distance;
 use crate::models::{RadarDetectionType, TrackPoint};
 use crate::parser;
 
+/// 일별 track_points_geo 최대 수집 건수 — LoS 단면도 시각화에 충분한 양
+const MAX_TRACK_POINTS_GEO_PER_DAY: usize = 5_000;
+
 // ─── 입력 타입 ───
 
 /// 방위 구간 (레이더 기준, 건물 노출면의 시작~끝 방위)
@@ -297,7 +300,12 @@ pub fn analyze_radar_monthly(
         let point_count = parsed.track_points.len();
 
         // 필터링: mode_s 제외 + 방위 구간 + 장애물 후방
+        let mut inner_count = 0u32;
         for tp in &parsed.track_points {
+            inner_count += 1;
+            if inner_count % 10_000 == 0 && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("분석이 취소되었습니다".to_string());
+            }
             // 비행검사기 제외
             if exclude_mode_s.iter().any(|ex| ex.eq_ignore_ascii_case(&tp.mode_s)) {
                 continue;
@@ -378,6 +386,11 @@ pub fn analyze_radar_monthly(
     }
 
     for (di, date) in sorted_dates.iter().enumerate() {
+        // 취소 체크
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("분석이 취소되었습니다".to_string());
+        }
+
         progress_fn(ObstacleMonthlyProgress {
             radar_name: radar.radar_name.clone(),
             stage: "analyzing".to_string(),
@@ -397,6 +410,16 @@ pub fn analyze_radar_monthly(
                 radar_type: radar_type_str(&p.radar_type).to_string(),
             }
         }).collect();
+
+        // track_points_geo 크기 제한 — 균등 샘플링으로 분포 보존
+        let day_track_geo = if day_track_geo.len() > MAX_TRACK_POINTS_GEO_PER_DAY {
+            let step = day_track_geo.len() as f64 / MAX_TRACK_POINTS_GEO_PER_DAY as f64;
+            (0..MAX_TRACK_POINTS_GEO_PER_DAY)
+                .map(|i| day_track_geo[(i as f64 * step) as usize].clone())
+                .collect()
+        } else {
+            day_track_geo
+        };
 
         // PSR 통계 (60NM 이내만)
         const PSR_RANGE_KM: f64 = 60.0 * 1.852; // 60NM

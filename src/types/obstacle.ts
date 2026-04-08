@@ -85,8 +85,9 @@ export interface OMReportData {
   selectedRadarSites: import("./radar").RadarSite[];
   azSectorsByRadar: Map<string, AzSector[]>;
   losMap: Map<string, import("./los").LoSProfileData>;
-  covLayersWithBuildings: import("../utils/radarCoverage").CoverageLayer[];
-  covLayersWithout: import("../utils/radarCoverage").CoverageLayer[];
+  /** 레이더별 커버리지 레이어 (key: radarName) */
+  covLayersWithBuildings: Map<string, import("../utils/radarCoverage").CoverageLayer[]>;
+  covLayersWithout: Map<string, import("../utils/radarCoverage").CoverageLayer[]>;
   analysisMonth: string;
   findingsText: string;
   recommendText: string;

@@ -132,25 +132,35 @@ async function exportViaNative(
   window.addEventListener("beforeunload", onBeforeUnload);
 
   try {
+    // 60초 타임아웃 — GPU 교착 또는 IPC 버퍼 포화 방지
+    const PRINT_TIMEOUT_MS = 60_000;
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("PDF 생성 시간 초과 (60초)")), PRINT_TIMEOUT_MS),
+    );
+
     if (reportMeta) {
-      // 통합 커맨드: PDF 생성 + 파일 저장 + DB BLOB 저장을 Rust에서 일괄 처리
-      await invoke<boolean>("webview_print_and_save_report", {
-        savePath,
-        windowLabel: getCurrentWindow().label,
-        reportId: reportMeta.reportId,
-        title: reportMeta.title,
-        template: reportMeta.template,
-        radarName: reportMeta.radarName,
-        reportConfigJson: reportMeta.reportConfigJson,
-        metadataJson: reportMeta.metadataJson ?? null,
-      });
+      await Promise.race([
+        invoke<boolean>("webview_print_and_save_report", {
+          savePath,
+          windowLabel: getCurrentWindow().label,
+          reportId: reportMeta.reportId,
+          title: reportMeta.title,
+          template: reportMeta.template,
+          radarName: reportMeta.radarName,
+          reportConfigJson: reportMeta.reportConfigJson,
+          metadataJson: reportMeta.metadataJson ?? null,
+        }),
+        timeoutPromise,
+      ]);
       return { success: true };
     } else {
-      // 기존 경로: base64 반환
-      const pdfBase64 = await invoke<string>("webview_print_to_pdf", {
-        path: savePath,
-        windowLabel: getCurrentWindow().label,
-      });
+      const pdfBase64 = await Promise.race([
+        invoke<string>("webview_print_to_pdf", {
+          path: savePath,
+          windowLabel: getCurrentWindow().label,
+        }),
+        timeoutPromise,
+      ]);
       return { success: true, pdfBase64 };
     }
   } catch (err) {

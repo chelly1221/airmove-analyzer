@@ -20,8 +20,8 @@ interface GenerateOMFindingsParams {
   selectedBuildings: ManualBuilding[];
   radarSites: RadarSite[];
   losMap: Map<string, LoSProfileData>;
-  covLayersWithBuildings: CoverageLayer[];
-  covLayersWithout: CoverageLayer[];
+  covLayersWithBuildings: Map<string, CoverageLayer[]>;
+  covLayersWithout: Map<string, CoverageLayer[]>;
   analysisMonth: string;
 }
 
@@ -82,22 +82,27 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       lines.push(`  → 대상 방위 구간의 소실율이 기준선 대비 오히려 낮아, 분석 대상 장애물에 의한 표적소실 영향은 확인되지 않는다.`);
     }
 
-    // 일별 추이 분석 (선형 회귀 기울기, day_of_month 기반 — 실제 시간 간격 반영)
+    // 일별 추이 분석 (가중 최소자승 회귀, day_of_month 기반 — 비행시간 가중치로 소수 관측일 편향 방지)
     if (stats.length >= 7) {
-      const days = stats.map((d) => d.day_of_month);
-      const xMean = days.reduce((a, b) => a + b, 0) / days.length;
-      const yMean = avgLoss;
-      let num = 0, den = 0;
-      stats.forEach((d) => {
-        num += (d.day_of_month - xMean) * (d.loss_rate - yMean);
-        den += (d.day_of_month - xMean) ** 2;
-      });
-      const slope = den > 0 ? num / den : 0;
-      if (Math.abs(slope) > 0.02) {
-        const trend = slope > 0 ? "증가" : "감소";
-        lines.push(`  → 분석 기간 중 일별 소실율 ${trend} 추세가 관찰된다 (일당 ${slope > 0 ? "+" : ""}${slope.toFixed(3)}%p).`);
-      } else {
-        lines.push(`  → 분석 기간 중 일별 소실율은 비교적 안정적인 추세를 보인다.`);
+      // 가중 최소자승 회귀 — 비행시간 가중치로 소수 관측일 편향 방지
+      const weights = stats.map((d) => d.total_track_time_secs);
+      const sumW = weights.reduce((a, b) => a + b, 0);
+      if (sumW > 0) {
+        const xMeanW = stats.reduce((s, d, i) => s + d.day_of_month * weights[i], 0) / sumW;
+        const yMeanW = stats.reduce((s, d, i) => s + d.loss_rate * weights[i], 0) / sumW;
+        let num = 0, den = 0;
+        stats.forEach((d, i) => {
+          const w = weights[i];
+          num += w * (d.day_of_month - xMeanW) * (d.loss_rate - yMeanW);
+          den += w * (d.day_of_month - xMeanW) ** 2;
+        });
+        const slope = den > 0 ? num / den : 0;
+        if (Math.abs(slope) > 0.02) {
+          const trend = slope > 0 ? "증가" : "감소";
+          lines.push(`  → 분석 기간 중 일별 소실율 ${trend} 추세가 관찰된다 (일당 ${slope > 0 ? "+" : ""}${slope.toFixed(3)}%p).`);
+        } else {
+          lines.push(`  → 분석 기간 중 일별 소실율은 비교적 안정적인 추세를 보인다.`);
+        }
       }
     }
 
@@ -143,26 +148,35 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   }
 
   // ── 4. 커버리지 비교 분석 ──
-  if (covLayersWithBuildings.length > 0 && covLayersWithout.length > 0) {
+  if (covLayersWithBuildings.size > 0 && covLayersWithout.size > 0) {
     lines.push(`■ 커버리지 비교 분석 (건물 유/무)`);
-    // 각 고도별로 커버리지 범위 비교
-    const altFts = [...new Set(covLayersWithBuildings.map((l) => l.altitudeFt))].sort((a, b) => a - b);
-    let significantDiff = false;
-    for (const alt of altFts) {
-      const withLayer = covLayersWithBuildings.find((l) => l.altitudeFt === alt);
-      const withoutLayer = covLayersWithout.find((l) => l.altitudeFt === alt);
-      if (!withLayer || !withoutLayer) continue;
+    let anySignificantDiff = false;
+    for (const rr of radarResults) {
+      const rsLayersWith = covLayersWithBuildings.get(rr.radar_name) ?? [];
+      const rsLayersWithout = covLayersWithout.get(rr.radar_name) ?? [];
+      if (rsLayersWith.length === 0 || rsLayersWithout.length === 0) continue;
+      lines.push(`  [${rr.radar_name}]`);
+      const altFts = [...new Set(rsLayersWith.map((l) => l.altitudeFt))].sort((a, b) => a - b);
+      let significantDiff = false;
+      for (const alt of altFts) {
+        const withLayer = rsLayersWith.find((l) => l.altitudeFt === alt);
+        const withoutLayer = rsLayersWithout.find((l) => l.altitudeFt === alt);
+        if (!withLayer || !withoutLayer) continue;
 
-      // 평균 커버리지 거리 비교
-      const avgWith = withLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withLayer.bearings.length, 1);
-      const avgWithout = withoutLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withoutLayer.bearings.length, 1);
-      const diff = avgWithout - avgWith;
-      if (diff > 0.5) {
-        significantDiff = true;
-        lines.push(`  - FL${Math.round(alt / 100).toString().padStart(3, "0")} (${alt}ft): 건물에 의해 평균 커버리지 ${diff.toFixed(1)}km 감소 (${avgWithout.toFixed(1)}km → ${avgWith.toFixed(1)}km)`);
+        const avgWith = withLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withLayer.bearings.length, 1);
+        const avgWithout = withoutLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withoutLayer.bearings.length, 1);
+        const diff = avgWithout - avgWith;
+        if (diff > 0.5) {
+          significantDiff = true;
+          anySignificantDiff = true;
+          lines.push(`  - FL${Math.round(alt / 100).toString().padStart(3, "0")} (${alt}ft): 건물에 의해 평균 커버리지 ${diff.toFixed(1)}km 감소 (${avgWithout.toFixed(1)}km → ${avgWith.toFixed(1)}km)`);
+        }
+      }
+      if (!significantDiff) {
+        lines.push(`  - 커버리지 차이 유의미하지 않음`);
       }
     }
-    if (significantDiff) {
+    if (anySignificantDiff) {
       lines.push(`  → 분석 대상 건물에 의한 커버리지 감소가 확인되며, 해당 고도/방위에서 탐지 범위가 축소된다.`);
     } else {
       lines.push(`  → 분석 대상 건물에 의한 커버리지 차이는 유의미하지 않다.`);

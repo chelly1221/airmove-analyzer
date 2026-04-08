@@ -51,8 +51,8 @@ export interface SerializedOMData {
   selectedRadarSites: RadarSite[];
   azSectorsByRadar: [string, AzSector[]][];
   losMap: [string, LoSProfileData][];
-  covLayersWithBuildings: CoverageLayer[];
-  covLayersWithout: CoverageLayer[];
+  covLayersWithBuildings: [string, CoverageLayer[]][];
+  covLayersWithout: [string, CoverageLayer[]][];
   analysisMonth: string;
   findingsText: string;
   recommendText: string;
@@ -98,8 +98,8 @@ export interface ReportWindowPayload {
   psSelectedBuildings: ManualBuilding[];
   psSelectedRadarSites: RadarSite[];
   psLosMap: [string, LoSProfileData][];
-  psCovLayersWith: CoverageLayer[];
-  psCovLayersWithout: CoverageLayer[];
+  psCovLayersWith: [string, CoverageLayer[]][];
+  psCovLayersWithout: [string, CoverageLayer[]][];
   psAnalysisMonth: string;
 
   // 단일비행 차트 포인트 (보고서 윈도우에서 Worker가 없으므로 사전 전달)
@@ -115,8 +115,8 @@ export function serializeOMData(om: OMReportData): SerializedOMData {
     selectedRadarSites: om.selectedRadarSites,
     azSectorsByRadar: [...om.azSectorsByRadar],
     losMap: [...om.losMap],
-    covLayersWithBuildings: om.covLayersWithBuildings,
-    covLayersWithout: om.covLayersWithout,
+    covLayersWithBuildings: [...om.covLayersWithBuildings],
+    covLayersWithout: [...om.covLayersWithout],
     analysisMonth: om.analysisMonth,
     findingsText: om.findingsText,
     recommendText: om.recommendText,
@@ -136,8 +136,8 @@ export function deserializeOMData(s: SerializedOMData): OMReportData {
     selectedRadarSites: s.selectedRadarSites,
     azSectorsByRadar: new Map(s.azSectorsByRadar),
     losMap: new Map(s.losMap),
-    covLayersWithBuildings: s.covLayersWithBuildings,
-    covLayersWithout: s.covLayersWithout,
+    covLayersWithBuildings: new Map(s.covLayersWithBuildings),
+    covLayersWithout: new Map(s.covLayersWithout),
     analysisMonth: s.analysisMonth,
     findingsText: s.findingsText,
     recommendText: s.recommendText,
@@ -220,8 +220,8 @@ export interface ReportGenerateRequest {
   psSelectedBuildings?: ManualBuilding[];
   psSelectedRadarSites?: RadarSite[];
   psLosMap?: [string, LoSProfileData][];
-  psCovLayersWith?: CoverageLayer[];
-  psCovLayersWithout?: CoverageLayer[];
+  psCovLayersWith?: [string, CoverageLayer[]][];
+  psCovLayersWithout?: [string, CoverageLayer[]][];
   psAnalysisMonth?: string;
 }
 

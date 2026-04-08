@@ -57,8 +57,8 @@ interface LoadedState {
   psSelectedBuildings: ManualBuilding[];
   psSelectedRadarSites: RadarSite[];
   psLosMap: Map<string, LoSProfileData>;
-  psCovLayersWith: CoverageLayer[];
-  psCovLayersWithout: CoverageLayer[];
+  psCovLayersWith: Map<string, CoverageLayer[]>;
+  psCovLayersWithout: Map<string, CoverageLayer[]>;
   psAnalysisMonth: string;
   selectedFlightIds: string[];
   singleFlightId: string | null;
@@ -88,8 +88,8 @@ function payloadToState(p: ReportWindowPayload): LoadedState {
     psSelectedBuildings: p.psSelectedBuildings,
     psSelectedRadarSites: p.psSelectedRadarSites,
     psLosMap: new Map(p.psLosMap),
-    psCovLayersWith: p.psCovLayersWith,
-    psCovLayersWithout: p.psCovLayersWithout,
+    psCovLayersWith: new Map(p.psCovLayersWith),
+    psCovLayersWithout: new Map(p.psCovLayersWithout),
     psAnalysisMonth: p.psAnalysisMonth,
     selectedFlightIds: p.selectedFlightIds,
     singleFlightId: p.singleFlightId,
@@ -133,8 +133,8 @@ export default function ReportApp() {
     buildings: ManualBuilding[];
     radars: RadarSite[];
     losMap: Map<string, LoSProfileData>;
-    covWith: CoverageLayer[];
-    covWithout: CoverageLayer[];
+    covWith: Map<string, CoverageLayer[]>;
+    covWithout: Map<string, CoverageLayer[]>;
     monthStr: string;
   } | null>(null);
 
@@ -146,6 +146,7 @@ export default function ReportApp() {
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportElapsed, setExportElapsed] = useState(0);
   const exportTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pendingCapturesRef = useRef(0);
   const previewRef = useRef<HTMLDivElement>(null);
   const { exportPDF } = useReportExport();
 
@@ -170,7 +171,8 @@ export default function ReportApp() {
       const cachedOm = omDataCacheRef.current;
       if (cachedOm && s.template === "obstacle_monthly") {
         s.omData = cachedOm;
-        omDataCacheRef.current = null;
+        // 캐시 즉시 삭제 대신 지연 삭제 — 비동기 로드 타이밍 보호
+        setTimeout(() => { omDataCacheRef.current = null; }, 5000);
       }
       const cachedPs = psDataCacheRef.current;
       if (cachedPs && s.template === "obstacle") {
@@ -181,7 +183,8 @@ export default function ReportApp() {
         s.psCovLayersWith = cachedPs.covWith;
         s.psCovLayersWithout = cachedPs.covWithout;
         s.psAnalysisMonth = cachedPs.monthStr;
-        psDataCacheRef.current = null;
+        // 캐시 즉시 삭제 대신 지연 삭제 — 비동기 로드 타이밍 보호
+        setTimeout(() => { psDataCacheRef.current = null; }, 5000);
       }
 
       startTransition(() => {
@@ -267,7 +270,7 @@ export default function ReportApp() {
     });
 
     // 비동기 커버리지 업데이트 수신 — PDF 생성 중이면 큐에 저장
-    const unlistenCov = listen<{ covLayersWithBuildings: CoverageLayer[]; covLayersWithout: CoverageLayer[]; coverageStatus: string }>(
+    const unlistenCov = listen<{ covLayersWithBuildings: [string, CoverageLayer[]][]; covLayersWithout: [string, CoverageLayer[]][]; coverageStatus: string }>(
       "report:coverage-update",
       (event) => {
         const apply = () => {
@@ -279,8 +282,8 @@ export default function ReportApp() {
             }
             return {
               ...prev,
-              covLayersWithBuildings: event.payload.covLayersWithBuildings,
-              covLayersWithout: event.payload.covLayersWithout,
+              covLayersWithBuildings: new Map(event.payload.covLayersWithBuildings),
+              covLayersWithout: new Map(event.payload.covLayersWithout),
               coverageStatus: event.payload.coverageStatus as OMReportData["coverageStatus"],
               sectionImages: nextImages,
             };
@@ -343,8 +346,19 @@ export default function ReportApp() {
     setExportError(null);
     setExportElapsed(0);
     exportTimerRef.current = setInterval(() => setExportElapsed((p) => p + 1), 1000);
-    // OMSectionImage 캡처 완료 대기 (500ms delay + html2canvas) — 충분한 대기
-    await new Promise((r) => setTimeout(r, 1200));
+    // OMSectionImage 캡처 완료 대기 (최대 15초, 100ms 간격 폴링)
+    const captureStart = Date.now();
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        if (pendingCapturesRef.current <= 0 || Date.now() - captureStart > 15000) {
+          resolve();
+        } else {
+          setTimeout(check, 100);
+        }
+      };
+      // 최소 1200ms 대기 후 체크 시작 (컴포넌트 마운트 + 캡처 시작 대기)
+      setTimeout(check, 1200);
+    });
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     try {
       const dateStr = format(new Date(), "yyyyMMdd_HHmmss");
@@ -438,8 +452,8 @@ export default function ReportApp() {
     radars: RadarSite[],
     azMap: Map<string, AzSector[]>,
     losMap: Map<string, LoSProfileData>,
-    covWith: CoverageLayer[],
-    covWithout: CoverageLayer[],
+    covWith: Map<string, CoverageLayer[]>,
+    covWithout: Map<string, CoverageLayer[]>,
     monthStr?: string,
   ) => {
     const newOmData: OMReportData = {
@@ -461,7 +475,7 @@ export default function ReportApp() {
         analysisMonth: monthStr ?? "",
       }),
       recommendText: "",
-      coverageStatus: covWith.length > 0 ? "done" : "loading",
+      coverageStatus: covWith.size > 0 ? "done" : "loading",
       panoramaStatus: "idle",
       sectionImages: new Map(),
       panoWithTargets: new Map(),
@@ -484,9 +498,10 @@ export default function ReportApp() {
     const lightOmData: OMReportData = {
       ...newOmData,
       result: lightResult,
-      covLayersWithBuildings: [],
-      covLayersWithout: [],
-      coverageStatus: covWith.length > 0 ? "done" : "idle",
+      // 커버리지 레이어는 IDB에 저장하여 새로고침 시에도 복원
+      covLayersWithBuildings: covWith,
+      covLayersWithout: covWithout,
+      coverageStatus: covWith.size > 0 ? "done" : "idle",
     };
 
     setConfigPayload(null);
@@ -506,8 +521,8 @@ export default function ReportApp() {
     buildings: ManualBuilding[],
     radars: RadarSite[],
     losMap: Map<string, LoSProfileData>,
-    covWith: CoverageLayer[],
-    covWithout: CoverageLayer[],
+    covWith: Map<string, CoverageLayer[]>,
+    covWithout: Map<string, CoverageLayer[]>,
     monthStr?: string,
   ) => {
     // 대용량 데이터(커버리지 레이어 + LoS)는 메모리에 캐시하고
@@ -535,7 +550,7 @@ export default function ReportApp() {
   }, []);
 
   // ── 커버리지 콜백 (모달 언마운트 후에도 동작) ──
-  const handleCoverageReady = useCallback((covWith: CoverageLayer[], covWithout: CoverageLayer[]) => {
+  const handleCoverageReady = useCallback((covWith: Map<string, CoverageLayer[]>, covWithout: Map<string, CoverageLayer[]>) => {
     // 보고서 창 내부에서 직접 omData 업데이트
     setOmData((prev) => {
       if (!prev) return prev;
@@ -796,6 +811,7 @@ export default function ReportApp() {
         forceAllVisible={forceAllVisible}
         onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
         singleFlightChartPoints={state.singleFlightChartPoints}
+        pendingCapturesRef={pendingCapturesRef}
         previewRef={previewRef}
       />
     </div>

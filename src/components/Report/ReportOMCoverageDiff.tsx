@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState, useEffect, useRef } from "react";
 import type { RadarSite, LossPointGeo, ManualBuilding } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
@@ -209,6 +209,7 @@ function ReportOMCoverageDiff({
   selectedBuildings,
   hideHeader,
 }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const MIN_ALT = 1000;
   const MAX_ALT = 20000;
 
@@ -287,8 +288,15 @@ function ReportOMCoverageDiff({
   // 지도 배경 타일 이미지
   const mapImage = useStaticMapImage(radarSite.latitude, radarSite.longitude, globalMaxRange);
 
+  // 맵 타일 로드 완료 시 OMSectionImage에 캡처 준비 알림
+  useEffect(() => {
+    if (mapImage || (fixedWith.length === 0 && fixedWithout.length === 0)) {
+      containerRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
+    }
+  }, [mapImage, fixedWith.length, fixedWithout.length]);
+
   if (fixedWith.length === 0 && fixedWithout.length === 0) return (
-    <div className="flex flex-col items-center py-16 text-gray-400">
+    <div ref={containerRef} className="flex flex-col items-center py-16 text-gray-400">
       <p className="text-sm">커버리지 비교 데이터 없음</p>
     </div>
   );
@@ -384,7 +392,7 @@ function ReportOMCoverageDiff({
   const drawOrderWithout = useMemo(() => [...fixedWithout].sort((a, b) => b.altitudeFt - a.altitudeFt), [fixedWithout]);
 
   return (
-    <div className="mb-8">
+    <div ref={containerRef} className="mb-8">
       {!hideHeader && <ReportOMSectionHeader sectionNum={sectionNum} title="커버리지 비교맵" />}
 
       {/* 정보 요약 바 */}

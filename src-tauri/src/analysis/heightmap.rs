@@ -109,9 +109,12 @@ pub fn build_heightmap(
             max_range_km,
         };
     }
+    // 건물 높이 그리드 — 픽셀별 최대 건물 높이(AGL)만 기록
+    // data(SRTM 지형)에 직접 더하면 같은 픽셀에 여러 꼭짓점이 겹칠 때 높이가 누적되므로,
+    // 별도 그리드에서 max를 구한 뒤 한 번만 합산
+    let mut bldg_heights = vec![0.0f32; width * height];
     let cos_lat = radar_lat.to_radians().cos();
     for &(blat, blon, bheight) in &buildings {
-        // 건물 위치 → ENU 그리드 좌표
         let east_m = (blon - radar_lon) * 111_000.0 * cos_lat;
         let north_m = (blat - radar_lat) * 111_000.0;
         let col_f = east_m / pixel_size_m + half_dim;
@@ -123,10 +126,14 @@ pub fn build_heightmap(
             continue;
         }
         let idx = row as usize * width + col as usize;
-        let terrain = data[idx];
-        let with_building = terrain + bheight as f32;
-        if with_building > data[idx] {
-            data[idx] = with_building;
+        if bheight as f32 > bldg_heights[idx] {
+            bldg_heights[idx] = bheight as f32;
+        }
+    }
+    // SRTM 지형 + 건물 최대 높이 합산
+    for i in 0..data.len() {
+        if bldg_heights[i] > 0.0 {
+            data[i] += bldg_heights[i];
         }
     }
 

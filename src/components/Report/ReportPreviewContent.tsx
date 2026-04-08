@@ -2,7 +2,7 @@
  * 보고서 프리뷰 콘텐츠 — ReportGeneration과 ReportApp 양쪽에서 공유.
  * 툴바는 포함하지 않음. 호출 측에서 previewRef와 상태를 관리.
  */
-import { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import { useMemo, useCallback } from "react";
 import { Loader2 } from "lucide-react";
 import ReportPage from "./ReportPage";
 import ReportCoverPage from "./ReportCoverPage";
@@ -39,32 +39,6 @@ import type {
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import type { ReportTemplate, ReportSections } from "../../utils/reportTransfer";
 
-// ── LazySection ──
-
-function LazySection({ children, fallbackHeight = "297mm", forceVisible = false }: {
-  children: React.ReactNode;
-  fallbackHeight?: string;
-  forceVisible?: boolean;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(false);
-
-  useEffect(() => {
-    if (forceVisible) return;
-    const el = ref.current;
-    if (!el) return;
-    const obs = new IntersectionObserver(
-      ([entry]) => { if (entry.isIntersecting) { setVisible(true); obs.disconnect(); } },
-      { rootMargin: "200px" },
-    );
-    obs.observe(el);
-    return () => obs.disconnect();
-  }, [forceVisible]);
-
-  if (forceVisible || visible) return <>{children}</>;
-  return <div ref={ref} style={{ minHeight: fallbackHeight }} />;
-}
-
 // ── Props ──
 
 export interface ReportPreviewContentProps {
@@ -92,8 +66,8 @@ export interface ReportPreviewContentProps {
   psSelectedBuildings: ManualBuilding[];
   psSelectedRadarSites: RadarSite[];
   psLosMap: Map<string, LoSProfileData>;
-  psCovLayersWith: CoverageLayer[];
-  psCovLayersWithout: CoverageLayer[];
+  psCovLayersWith: Map<string, CoverageLayer[]>;
+  psCovLayersWithout: Map<string, CoverageLayer[]>;
   psAnalysisMonth: string;
 
   // 편집 가능 텍스트
@@ -115,6 +89,8 @@ export interface ReportPreviewContentProps {
 
   // ref
   previewRef: React.RefObject<HTMLDivElement | null>;
+  /** 대기 중인 OMSectionImage 캡처 수 추적 — PDF 내보내기 동기화용 */
+  pendingCapturesRef?: React.MutableRefObject<number>;
 }
 
 // ── 섹션 토글 정의 ──
@@ -188,10 +164,11 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap, psCovLayersWith, psCovLayersWithout, psAnalysisMonth,
     coverTitle, onCoverTitleChange, coverSubtitle, onCoverSubtitleChange,
     commentary, onCommentaryChange,
-    forceAllVisible,
+    forceAllVisible: _forceAllVisible,
     onOmDataChange,
     singleFlightChartPoints,
     previewRef,
+    pendingCapturesRef,
   } = props;
 
   const singleFlight = template === "single" ? reportFlights[0] : null;
@@ -210,7 +187,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.obstacleSummary) nums.obstacleSummary = n++;
       if (sections.psAngleHeight && psResult) nums.psAngleHeight = n++;
       if (sections.psAdditionalLoss && psResult) nums.psAdditionalLoss = n++;
-      if (sections.coverageMap && (psCovLayersWith.length > 0 || psCovLayersWithout.length > 0)) nums.coverageMap = n++;
+      if (sections.coverageMap && (psCovLayersWith.size > 0 || psCovLayersWithout.size > 0)) nums.coverageMap = n++;
       if (sections.los && psLosMap.size > 0) nums.los = n++;
     } else if (template === "obstacle_monthly") {
       if (sections.omSummary) nums.omSummary = n++;
@@ -239,7 +216,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.aircraft && aircraft.length > 0) nums.aircraft = n++;
     }
     return nums;
-  }, [template, sections, losResults, flights, aircraft, panoramaData, psResult, psCovLayersWith, psCovLayersWithout, psLosMap]);
+  }, [template, sections, losResults, flights, aircraft, panoramaData, psResult, psCovLayersWith, psCovLayersWithout, psLosMap, omData?.losMap]);
 
   // OM 레이더별 조건 텍스트
   const omRadarConditions = useMemo(() => {
@@ -394,19 +371,24 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             </ReportPage>
           )}
 
-          {sections.coverageMap && (psCovLayersWith.length > 0 || psCovLayersWithout.length > 0) && psSelectedRadarSites[0] && (
-            <ReportPage>
-              <ReportOMCoverageDiff
-                sectionNum={sectionNumbers.coverageMap ?? 4}
-                layersWithTargets={psCovLayersWith}
-                layersWithoutTargets={psCovLayersWithout}
-                radarSite={psSelectedRadarSites[0]}
-                lossPoints={[]}
-                defaultAltFt={5000}
-                selectedBuildings={psSelectedBuildings}
-              />
-            </ReportPage>
-          )}
+          {sections.coverageMap && (psCovLayersWith.size > 0 || psCovLayersWithout.size > 0) && psSelectedRadarSites.map((rs) => {
+            const rsLayers = psCovLayersWith.get(rs.name) ?? [];
+            const rsLayersWithout = psCovLayersWithout.get(rs.name) ?? [];
+            if (rsLayers.length === 0 && rsLayersWithout.length === 0) return null;
+            return (
+              <ReportPage key={`ps-cov-${rs.name}`}>
+                <ReportOMCoverageDiff
+                  sectionNum={sectionNumbers.coverageMap ?? 4}
+                  layersWithTargets={rsLayers}
+                  layersWithoutTargets={rsLayersWithout}
+                  radarSite={rs}
+                  lossPoints={[]}
+                  defaultAltFt={5000}
+                  selectedBuildings={psSelectedBuildings}
+                />
+              </ReportPage>
+            );
+          })}
 
           {sections.los && psLosMap.size > 0 && (
             <ReportLoSSection
@@ -489,32 +471,33 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             );
           })}
 
-          {sections.omCoverageDiff && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.length > 0 ? omData.selectedRadarSites.map((rs) => {
+          {sections.omCoverageDiff && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? omData.selectedRadarSites.map((rs) => {
+            const rsLayersWith = omData.covLayersWithBuildings.get(rs.name) ?? [];
+            const rsLayersWithout = omData.covLayersWithout.get(rs.name) ?? [];
+            if (rsLayersWith.length === 0 && rsLayersWithout.length === 0) return null;
             const rr = omResultTrimmed.radar_results.find((r) => r.radar_name === rs.name);
             const allLoss = rr?.daily_stats.flatMap((d) => d.loss_points_summary) ?? [];
             const covImgKey = `cov-${rs.name}`;
             return (
-              <LazySection key={covImgKey} forceVisible={forceAllVisible}>
-                <ReportPage>
-                  <ReportOMSectionHeader sectionNum={sectionNumbers.omCoverageDiff ?? 5} title="커버리지 비교맵" radarName={rs.name} />
-                  <OMSectionImage
-                    preCaptured={omData.sectionImages.get(covImgKey)}
-                    onCaptured={(url) => handleOMSectionCaptured(covImgKey, url)}
-                    delay={800}
-                  >
-                    <ReportOMCoverageDiff
-                      sectionNum={sectionNumbers.omCoverageDiff ?? 5}
-                      radarSite={rs}
-                      layersWithTargets={omData.covLayersWithBuildings}
-                      layersWithoutTargets={omData.covLayersWithout}
-                      lossPoints={allLoss}
-                      defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
-                      selectedBuildings={omData.selectedBuildings}
-                      hideHeader
-                    />
-                  </OMSectionImage>
-                </ReportPage>
-              </LazySection>
+              <ReportPage key={covImgKey}>
+                <ReportOMSectionHeader sectionNum={sectionNumbers.omCoverageDiff ?? 5} title="커버리지 비교맵" radarName={rs.name} />
+                <OMSectionImage
+                  preCaptured={omData.sectionImages.get(covImgKey)}
+                  onCaptured={(url) => handleOMSectionCaptured(covImgKey, url)}
+                  pendingCapturesRef={pendingCapturesRef}
+                >
+                  <ReportOMCoverageDiff
+                    sectionNum={sectionNumbers.omCoverageDiff ?? 5}
+                    radarSite={rs}
+                    layersWithTargets={rsLayersWith}
+                    layersWithoutTargets={rsLayersWithout}
+                    lossPoints={allLoss}
+                    defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
+                    selectedBuildings={omData.selectedBuildings}
+                    hideHeader
+                  />
+                </OMSectionImage>
+              </ReportPage>
             );
           }) : omData.coverageStatus === "error" ? (
             <ReportPage>
@@ -538,25 +521,24 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             if (!rs) return null;
             const azImgKey = `azdist-${rr.radar_name}`;
             return (
-              <LazySection key={azImgKey} forceVisible={forceAllVisible}>
-                <ReportPage>
-                  <ReportOMSectionHeader sectionNum={sectionNumbers.omAzDistScatter ?? 6} title={`방위-거리 소실표적 산점도${omData.analysisMonth ? ` (${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월)` : ""}`} radarName={rs.name} />
-                  <OMSectionImage
-                    preCaptured={omData.sectionImages.get(azImgKey)}
-                    onCaptured={(url) => handleOMSectionCaptured(azImgKey, url)}
-                  >
-                    <ReportOMAzDistScatter
-                      sectionNum={sectionNumbers.omAzDistScatter ?? 6}
-                      radarSite={rs}
-                      dailyStats={rr.daily_stats}
-                      selectedBuildings={omData.selectedBuildings}
-                      azSectors={sectors}
-                      analysisMonth={omData.analysisMonth}
-                      hideHeader
-                    />
-                  </OMSectionImage>
-                </ReportPage>
-              </LazySection>
+              <ReportPage key={azImgKey}>
+                <ReportOMSectionHeader sectionNum={sectionNumbers.omAzDistScatter ?? 6} title={`방위-거리 소실표적 산점도${omData.analysisMonth ? ` (${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월)` : ""}`} radarName={rs.name} />
+                <OMSectionImage
+                  preCaptured={omData.sectionImages.get(azImgKey)}
+                  onCaptured={(url) => handleOMSectionCaptured(azImgKey, url)}
+                  pendingCapturesRef={pendingCapturesRef}
+                >
+                  <ReportOMAzDistScatter
+                    sectionNum={sectionNumbers.omAzDistScatter ?? 6}
+                    radarSite={rs}
+                    dailyStats={rr.daily_stats}
+                    selectedBuildings={omData.selectedBuildings}
+                    azSectors={sectors}
+                    analysisMonth={omData.analysisMonth}
+                    hideHeader
+                  />
+                </OMSectionImage>
+              </ReportPage>
             );
           })}
 
@@ -580,34 +562,30 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
 
           {sections.omAltitude && (
-            <LazySection forceVisible={forceAllVisible}>
-              <ReportPage>
-                <ReportOMAltitudeDistribution
-                  sectionNum={sectionNumbers.omAltitude ?? 7}
-                  radarResults={omResultTrimmed.radar_results}
-                  selectedBuildings={omData.selectedBuildings}
-                  radarSites={omData.selectedRadarSites}
-                  losMap={omData.losMap}
-                  panoWithTargets={omData.panoWithTargets}
-                  panoWithoutTargets={omData.panoWithoutTargets}
-                />
-              </ReportPage>
-            </LazySection>
+            <ReportPage>
+              <ReportOMAltitudeDistribution
+                sectionNum={sectionNumbers.omAltitude ?? 9}
+                radarResults={omResultTrimmed.radar_results}
+                selectedBuildings={omData.selectedBuildings}
+                radarSites={omData.selectedRadarSites}
+                losMap={omData.losMap}
+                panoWithTargets={omData.panoWithTargets}
+                panoWithoutTargets={omData.panoWithoutTargets}
+              />
+            </ReportPage>
           )}
 
-          {sections.omLossEvents && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.length > 0 ? (
-            <LazySection forceVisible={forceAllVisible}>
-              <ReportPage>
-                <ReportOMLossEvents
-                  sectionNum={sectionNumbers.omLossEvents ?? 8}
-                  radarResults={omResultTrimmed.radar_results}
-                  selectedBuildings={omData.selectedBuildings}
-                  radarSites={omData.selectedRadarSites}
-                  layersWithTargets={omData.covLayersWithBuildings}
-                  layersWithoutTargets={omData.covLayersWithout}
-                />
-              </ReportPage>
-            </LazySection>
+          {sections.omLossEvents && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? (
+            <ReportPage>
+              <ReportOMLossEvents
+                sectionNum={sectionNumbers.omLossEvents ?? 10}
+                radarResults={omResultTrimmed.radar_results}
+                selectedBuildings={omData.selectedBuildings}
+                radarSites={omData.selectedRadarSites}
+                layersWithTargets={omData.covLayersWithBuildings}
+                layersWithoutTargets={omData.covLayersWithout}
+              />
+            </ReportPage>
           ) : omData.coverageStatus === "error" ? (
             <ReportPage>
               <div className="flex flex-col items-center justify-center py-20 text-gray-400">
@@ -626,7 +604,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           {sections.omFindings && (
             <ReportPage>
               <ReportOMFindings
-                sectionNum={sectionNumbers.omFindings ?? 9}
+                sectionNum={sectionNumbers.omFindings ?? 11}
                 radarResults={omResultTrimmed.radar_results}
                 selectedBuildings={omData.selectedBuildings}
                 radarSites={omData.selectedRadarSites}

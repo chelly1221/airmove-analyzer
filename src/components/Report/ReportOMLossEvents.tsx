@@ -10,10 +10,10 @@ interface Props {
   radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
   radarSites: RadarSite[];
-  /** 건물 포함 커버리지 레이어 */
-  layersWithTargets: CoverageLayer[];
-  /** 건물 제외 커버리지 레이어 */
-  layersWithoutTargets: CoverageLayer[];
+  /** 레이더별 건물 포함 커버리지 레이어 */
+  layersWithTargets: Map<string, CoverageLayer[]>;
+  /** 레이더별 건물 제외 커버리지 레이어 */
+  layersWithoutTargets: Map<string, CoverageLayer[]>;
 }
 
 /** 방위별 커버리지 범위(km) lookup — O(1) 인덱스 기반 */
@@ -88,6 +88,8 @@ function ReportOMLossEvents({
     for (const rr of radarResults) {
       const rs = radarSites.find((r) => r.name === rr.radar_name);
       if (!rs) continue;
+      const rsLayersWith = layersWithTargets.get(rr.radar_name) ?? [];
+      const rsLayersWithout = layersWithoutTargets.get(rr.radar_name) ?? [];
 
       const events: LossEvent[] = [];
       for (const day of rr.daily_stats) {
@@ -96,7 +98,7 @@ function ReportOMLossEvents({
           const obstacleCaused = isInCoverageDiffArea(
             lp.lat, lp.lon, lp.alt_ft,
             rs.latitude, rs.longitude,
-            layersWithTargets, layersWithoutTargets,
+            rsLayersWith, rsLayersWithout,
           );
           events.push({
             date: day.date,
@@ -153,7 +155,7 @@ function ReportOMLossEvents({
           );
         }
 
-        const hasCovData = layersWithTargets.length > 0 && layersWithoutTargets.length > 0;
+        const hasCovData = layersWithTargets.size > 0 && layersWithoutTargets.size > 0;
         const obstaclePct = totalCount > 0 ? (obstacleCausedCount / totalCount) * 100 : 0;
 
         return (
@@ -227,7 +229,9 @@ function ReportOMLossEvents({
                     <tbody>
                       {selectedBuildings.map((b, bi) => {
                         const { azDeg: bAz, distKm: bDist } = azimuthAndDist(rs.latitude, rs.longitude, b.latitude, b.longitude);
-                        // 방위 ±5° 이내 + 건물 후방(거리 ≥ 건물거리) Loss 필터
+                        // 방위 ±5° 이내 + 건물 후방(거리 ≥ 건물거리×0.8) Loss 필터
+                        // 비대칭 거리 조건: 장애물에 의한 전파 차단은 건물 후방(레이더로부터 더 먼 쪽)에서 발생하므로
+                        // 건물 거리의 80% 이상인 Loss만 포함. 전방(레이더~건물) 구간은 장애물 영향 범위 외.
                         const nearby = events.filter((ev) => {
                           let azDiff = Math.abs(ev.azDeg - bAz);
                           if (azDiff > 180) azDiff = 360 - azDiff;

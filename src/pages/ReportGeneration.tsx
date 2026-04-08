@@ -59,8 +59,8 @@ export default function ReportGeneration() {
     selectedRadarSites: [],
     azSectorsByRadar: new Map(),
     losMap: new Map(),
-    covLayersWithBuildings: [],
-    covLayersWithout: [],
+    covLayersWithBuildings: new Map(),
+    covLayersWithout: new Map(),
     analysisMonth: "",
     findingsText: "",
     recommendText: "",
@@ -77,8 +77,8 @@ export default function ReportGeneration() {
   const [psSelectedBuildings] = useState<ManualBuilding[]>([]);
   const [psSelectedRadarSites] = useState<RadarSite[]>([]);
   const [psLosMap] = useState<Map<string, LoSProfileData>>(new Map());
-  const [psCovLayersWith] = useState<CoverageLayer[]>([]);
-  const [psCovLayersWithout] = useState<CoverageLayer[]>([]);
+  const [psCovLayersWith] = useState<Map<string, CoverageLayer[]>>(new Map());
+  const [psCovLayersWithout] = useState<Map<string, CoverageLayer[]>>(new Map());
   const [psAnalysisMonth] = useState<string>("");
 
   // 파노라마 데이터 (캐시에서 로드)
@@ -359,8 +359,8 @@ export default function ReportGeneration() {
     psSelectedBuildings?: ManualBuilding[];
     psSelectedRadarSites?: RadarSite[];
     psLosMap?: Map<string, LoSProfileData>;
-    psCovLayersWith?: CoverageLayer[];
-    psCovLayersWithout?: CoverageLayer[];
+    psCovLayersWith?: Map<string, CoverageLayer[]>;
+    psCovLayersWithout?: Map<string, CoverageLayer[]>;
     psAnalysisMonth?: string;
   }
 
@@ -483,8 +483,8 @@ export default function ReportGeneration() {
         psSelectedBuildings: needsPs ? curPsBuildings : [],
         psSelectedRadarSites: needsPs ? curPsRadars : [],
         psLosMap: needsPs ? [...curPsLosMap] : [],
-        psCovLayersWith: needsPs ? curPsCovWith : [],
-        psCovLayersWithout: needsPs ? curPsCovWithout : [],
+        psCovLayersWith: needsPs ? [...curPsCovWith] : [],
+        psCovLayersWithout: needsPs ? [...curPsCovWithout] : [],
         psAnalysisMonth: needsPs ? curPsMonth : "",
         singleFlightChartPoints,
       });
@@ -544,8 +544,8 @@ export default function ReportGeneration() {
           dataOverride.psSelectedBuildings = req.psSelectedBuildings;
           dataOverride.psSelectedRadarSites = req.psSelectedRadarSites;
           dataOverride.psLosMap = req.psLosMap ? new Map(req.psLosMap) : new Map();
-          dataOverride.psCovLayersWith = req.psCovLayersWith;
-          dataOverride.psCovLayersWithout = req.psCovLayersWithout;
+          dataOverride.psCovLayersWith = req.psCovLayersWith ? new Map(req.psCovLayersWith) : new Map();
+          dataOverride.psCovLayersWithout = req.psCovLayersWithout ? new Map(req.psCovLayersWithout) : new Map();
           dataOverride.psAnalysisMonth = req.psAnalysisMonth;
         }
         await handleGenerateRef.current(
@@ -655,8 +655,8 @@ export default function ReportGeneration() {
         psSelectedBuildings: needsPs ? psSelectedBuildings : [],
         psSelectedRadarSites: needsPs ? psSelectedRadarSites : [],
         psLosMap: needsPs ? [...psLosMap] : [],
-        psCovLayersWith: needsPs ? psCovLayersWith : [],
-        psCovLayersWithout: needsPs ? psCovLayersWithout : [],
+        psCovLayersWith: needsPs ? [...psCovLayersWith] : [],
+        psCovLayersWithout: needsPs ? [...psCovLayersWithout] : [],
         psAnalysisMonth: needsPs ? psAnalysisMonth : "",
         singleFlightChartPoints: editChartPoints,
       });

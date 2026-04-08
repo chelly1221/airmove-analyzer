@@ -37,11 +37,11 @@ export default function ObstacleMonthlyConfigModal({
     radars: RadarSite[],
     azMap: Map<string, AzSector[]>,
     losMap: Map<string, LoSProfileData>,
-    covWith: CoverageLayer[],
-    covWithout: CoverageLayer[],
+    covWith: Map<string, CoverageLayer[]>,
+    covWithout: Map<string, CoverageLayer[]>,
     analysisMonth?: string,
   ) => void;
-  onCoverageReady: (covWith: CoverageLayer[], covWithout: CoverageLayer[]) => void;
+  onCoverageReady: (covWith: Map<string, CoverageLayer[]>, covWithout: Map<string, CoverageLayer[]>) => void;
   onCoverageError?: () => void;
 }) {
   const [step, setStep] = useState(0);
@@ -216,6 +216,14 @@ export default function ObstacleMonthlyConfigModal({
       });
       if (cancelledRef.current) return;
 
+      // LoS 계산 실패 건수 확인
+      const expectedLosCount = selectedRadars.length * selectedBuildings.length;
+      const actualLosCount = losMap.size;
+      if (actualLosCount < expectedLosCount) {
+        const failedCount = expectedLosCount - actualLosCount;
+        setProgress(`LoS 분석 완료 (${failedCount}건 계산 실패 — 해당 건물 단면도 생략)`);
+      }
+
       // 백엔드 결과에서 실제 데이터 월 자동 감지
       let effectiveMonth = analysisMonth;
       const allDates = result.radar_results.flatMap((rr) => rr.daily_stats.map((d) => d.date)).sort();
@@ -231,7 +239,8 @@ export default function ObstacleMonthlyConfigModal({
           if (c > maxCount) { detectedMonth = m; maxCount = c; }
         }
         if (detectedMonth && !allDates.some((d) => d.startsWith(analysisMonth))) {
-          console.warn(`[OM 진단] 선택 월 "${analysisMonth}"에 데이터 없음. 실제 데이터 월 "${detectedMonth}"로 자동 보정.`);
+          console.warn(`[OM 진단] 선택 월 "${analysisMonth}"에 데이터 없음, 감지 월: "${detectedMonth}"`);
+          setProgress(`⚠ 선택 월(${analysisMonth})에 데이터 없음 → ${detectedMonth}로 자동 변경`);
           effectiveMonth = detectedMonth;
           setAnalysisMonth(detectedMonth);
         }
@@ -249,6 +258,7 @@ export default function ObstacleMonthlyConfigModal({
             : rr.daily_stats;
           if (before > 0 && after.length === 0) {
             console.warn(`[OM 진단] ⚠ "${rr.radar_name}" 월 필터링으로 ${before}일 → 0일! effectiveMonth="${effectiveMonth}", 원본 날짜: ${rr.daily_stats.map((d) => d.date).join(", ")}`);
+            setProgress(`⚠ ${rr.radar_name}: 분석월 필터링 후 데이터 0일 — 해당 레이더 섹션 비어있을 수 있음`);
           }
           return { ...rr, daily_stats: after };
         }),
@@ -256,29 +266,37 @@ export default function ObstacleMonthlyConfigModal({
 
       if (cancelledRef.current) return;
 
-      // 커버리지 계산 (보고서 생성 전에 시작, 실패해도 보고서는 생성)
-      let covWith: CoverageLayer[] = [];
-      let covWithout: CoverageLayer[] = [];
+      // 커버리지 계산 — 전체 레이더 순회 (실패해도 보고서는 생성)
+      const covWithMap = new Map<string, CoverageLayer[]>();
+      const covWithoutMap = new Map<string, CoverageLayer[]>();
       if (selectedRadars.length > 0) {
-        const r = selectedRadars[0];
         const altFts = [1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
         const excludeIds = selectedBuildings.map((b) => b.id);
-        setProgress("커버리지 계산 중...");
-        setProgressPct(85);
         try {
           const { computeCoverageLayersOM } = await import("../../utils/gpuCoverage");
-          if (!cancelledRef.current) {
+          for (let ri = 0; ri < selectedRadars.length; ri++) {
+            if (cancelledRef.current) break;
+            const r = selectedRadars[ri];
+            setProgress(`커버리지 계산 중... (${r.name}, ${ri + 1}/${selectedRadars.length})`);
+            setProgressPct(85 + Math.floor((ri / selectedRadars.length) * 8));
             const covResult = await computeCoverageLayersOM(
               { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm, bearingStepDeg: 0.01 },
               altFts, excludeIds,
-              (msg) => { if (!cancelledRef.current) { setProgress(msg); setProgressPct(msg.includes("제외") ? 90 : 85); } },
+              (msg) => { if (!cancelledRef.current) { setProgress(`[${r.name}] ${msg}`); } },
             );
-            covWith = covResult.layersWith;
-            covWithout = covResult.layersWithout;
+            covWithMap.set(r.name, covResult.layersWith);
+            covWithoutMap.set(r.name, covResult.layersWithout);
           }
         } catch (err) {
-          console.warn("커버리지 계산 실패:", err);
+          console.warn("GPU 커버리지 계산 실패:", err);
           onCoverageError?.();
+          try {
+            const { message } = await import("@tauri-apps/plugin-dialog");
+            message("커버리지 계산에 실패했습니다. 커버리지 비교 없이 보고서가 생성됩니다.", {
+              title: "커버리지 계산 실패",
+              kind: "warning",
+            });
+          } catch { /* ignore */ }
         }
       }
 
@@ -287,9 +305,9 @@ export default function ObstacleMonthlyConfigModal({
       // 보고서 생성
       setProgress("보고서 생성 중...");
       setProgressPct(95);
-      await onGenerate(filteredResult, selectedBuildings, selectedRadars, azSectorsByRadar, losMap, covWith, covWithout, effectiveMonth);
+      await onGenerate(filteredResult, selectedBuildings, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, effectiveMonth);
 
-      if (covWith.length > 0) onCoverageReady(covWith, covWithout);
+      if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap);
 
       setProgress("보고서 로딩 완료");
       setProgressPct(100);

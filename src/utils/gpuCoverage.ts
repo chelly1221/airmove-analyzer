@@ -44,7 +44,7 @@ interface HeightmapResult {
 
 // Pass 1: heightmap에서 polar→ENU 샘플링 + 곡률 보정 + running max angle
 const HEIGHTMAP_PASS1_SHADER = /* wgsl */ `
-const R_EARTH_M: f32 = 6371000.0;
+const R_EFF_M: f32 = 8494666.7; // 4/3 유효지구 반경 (6371000 * 4/3)
 const PI: f32 = 3.14159265358979;
 
 struct Params {
@@ -105,7 +105,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let elev = sample_hm(east_m, north_m);
 
     // 곡률 보정
-    let curv_drop = dist_m * dist_m / (2.0 * R_EARTH_M);
+    let curv_drop = dist_m * dist_m / (2.0 * R_EFF_M);
     let adj = elev - curv_drop;
 
     // running max angle
@@ -118,7 +118,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Pass 2: 고도별 이진 탐색 → max_range_km (heightmap에서 재샘플)
 const HEIGHTMAP_PASS2_SHADER = /* wgsl */ `
-const R_EARTH_M: f32 = 6371000.0;
+const R_EFF_M: f32 = 8494666.7; // 4/3 유효지구 반경 (6371000 * 4/3)
 const PI: f32 = 3.14159265358979;
 const FT_TO_M: f32 = 0.3048;
 
@@ -180,7 +180,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   while (lo <= hi) {
     let mid = (lo + hi) / 2u;
     let dist = (f32(mid + 1u) / f32(n)) * max_range * 1000.0;
-    let curv_drop = dist * dist / (2.0 * R_EARTH_M);
+    let curv_drop = dist * dist / (2.0 * R_EFF_M);
     let adj_alt = alt_m - curv_drop;
     let target_angle = (adj_alt - params.radar_height_m) / dist;
     if (max_angles[base + mid] > target_angle) {
@@ -198,7 +198,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let east_m = dist * sin_b;
     let north_m = dist * cos_b;
     let elev = sample_hm(east_m, north_m);
-    let curv_drop = dist * dist / (2.0 * R_EARTH_M);
+    let curv_drop = dist * dist / (2.0 * R_EFF_M);
     let adj_alt = alt_m - curv_drop;
     if (elev - curv_drop > adj_alt) {
       terrain_block = i;
