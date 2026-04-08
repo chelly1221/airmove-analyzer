@@ -476,7 +476,7 @@ export default function ReportApp() {
       }),
       recommendText: "",
       coverageStatus: covWith.size > 0 ? "done" : "loading",
-      panoramaStatus: "idle",
+      panoramaStatus: "deferred",
       sectionImages: new Map(),
       panoWithTargets: new Map(),
       panoWithoutTargets: new Map(),
@@ -571,6 +571,15 @@ export default function ReportApp() {
   const handleCoverageError = useCallback(() => {
     setOmData((prev) => prev ? { ...prev, coverageStatus: "error" } : prev);
   }, []);
+
+  // ── 파노라마 지연 트리거: 분석 후 5초 대기하여 GC + 메모리 안정화 ──
+  useEffect(() => {
+    if (!omData || omData.panoramaStatus !== "deferred") return;
+    const timer = setTimeout(() => {
+      setOmData((prev) => prev ? { ...prev, panoramaStatus: "idle" } : prev);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [omData?.panoramaStatus]);
 
   // ── 파노라마 자동 계산 (보고서 창 내부) ──
   useEffect(() => {

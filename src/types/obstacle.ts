@@ -13,6 +13,8 @@ export interface RadarFileSet {
   antenna_height: number;
   file_paths: string[];
   azimuth_sectors: AzSector[];
+  /** LoS 단면도 표시용 건물 방위각 목록 (±5° 이내만 track_points_geo에 포함) */
+  building_bearings_deg?: number[];
 }
 
 /** Loss 발생 좌표 요약 */
@@ -94,7 +96,7 @@ export interface OMReportData {
   panoWithTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   panoWithoutTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   coverageStatus: "idle" | "loading" | "done" | "error";
-  panoramaStatus: "idle" | "loading" | "done" | "error";
+  panoramaStatus: "idle" | "deferred" | "loading" | "done" | "error";
   /** 차트 섹션 사전 캡처 이미지 (key: sectionId, value: WebP data URL) */
   sectionImages: Map<string, string>;
 }

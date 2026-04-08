@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect, useRef, startTransition } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import {
   FileText,
   Download,
@@ -31,7 +31,7 @@ import {
   type ReportTemplate, type ReportSections,
 } from "../utils/reportTransfer";
 import type {
-  Flight, LoSProfileData, PanoramaPoint, PanoramaMergeResult, NearbyPeak,
+  Flight, LoSProfileData, PanoramaPoint, NearbyPeak,
   ManualBuilding, RadarSite, SavedReportSummary,
   PreScreeningResult, OMReportData,
 } from "../types";
@@ -70,7 +70,7 @@ export default function ReportGeneration() {
     panoramaStatus: "idle",
     sectionImages: new Map(),
   };
-  const [omData, setOmData] = useState<OMReportData>(initialOMData);
+  const [omData] = useState<OMReportData>(initialOMData);
 
   // 사전검토 분석 상태
   const [psResult] = useState<PreScreeningResult | null>(null);
@@ -191,57 +191,7 @@ export default function ReportGeneration() {
     setCoverageLayers(computeLayersForAltitudes(altFts));
   }, [radarSite]);
 
-  // OM 분석 완료 시 파노라마 자동 계산 (0.01° 해상도, 포함/미포함 2회)
-  useEffect(() => {
-    if (omData.selectedRadarSites.length === 0) return;
-    let cancelled = false;
-    setOmData((prev) => ({ ...prev, panoramaStatus: "loading" }));
-    const excludeIds = omData.selectedBuildings.map((b) => b.id);
-    const panoArgs = (radar: RadarSite) => ({
-      radarLat: radar.latitude,
-      radarLon: radar.longitude,
-      radarHeightM: radar.altitude + radar.antenna_height,
-      maxRangeKm: 100,
-      azimuthStepDeg: 0.01,
-      rangeStepM: 200,
-    });
-    (async () => {
-      const withMap = new Map<string, PanoramaMergeResult>();
-      const withoutMap = new Map<string, PanoramaMergeResult>();
-      for (const radar of omData.selectedRadarSites) {
-        if (cancelled) break;
-        try {
-          const withResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", panoArgs(radar));
-          if (!cancelled) withMap.set(radar.name, withResult);
-          await invoke("save_panorama_cache", {
-            radarLat: radar.latitude, radarLon: radar.longitude,
-            radarHeightM: radar.altitude + radar.antenna_height,
-            dataJson: JSON.stringify(withResult),
-          }).catch(() => {});
-          if (excludeIds.length > 0) {
-            const withoutResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", {
-              ...panoArgs(radar),
-              excludeManualIds: excludeIds,
-            });
-            if (!cancelled) withoutMap.set(radar.name, withoutResult);
-          }
-        } catch (err) {
-          console.warn(`Panorama failed for ${radar.name}:`, err);
-        }
-      }
-      if (!cancelled) {
-        startTransition(() => {
-          setOmData((prev) => ({
-            ...prev,
-            panoWithTargets: withMap,
-            panoWithoutTargets: withoutMap,
-            panoramaStatus: "done",
-          }));
-        });
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [omData.selectedRadarSites, omData.selectedBuildings]);
+  // 파노라마 자동 계산은 보고서 창(ReportApp)에서만 수행 — 메인 창 부하 방지
 
   // 비행 선택 (건별/단일 상세용)
   const [selectedFlightIds, setSelectedFlightIds] = useState<Set<string>>(new Set());

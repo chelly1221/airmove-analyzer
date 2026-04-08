@@ -659,7 +659,7 @@ export default function LoSObstacle() {
     };
     svg.addEventListener("wheel", handler, { passive: false });
     return () => svg.removeEventListener("wheel", handler);
-  }, [panoramaData.length, panoramaChartW, panoramaMargin.left, panoramaAzRange]);
+  }, [panoramaData.length, panoramaLoading, panoramaChartW, panoramaMargin.left, panoramaAzRange]);
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-hidden">

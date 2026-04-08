@@ -59,7 +59,7 @@ export interface SerializedOMData {
   panoWithTargets: [string, PanoramaMergeResult][];
   panoWithoutTargets: [string, PanoramaMergeResult][];
   coverageStatus: "idle" | "loading" | "done" | "error";
-  panoramaStatus: "idle" | "loading" | "done" | "error";
+  panoramaStatus: "idle" | "deferred" | "loading" | "done" | "error";
   sectionImages: [string, string][];
 }
 

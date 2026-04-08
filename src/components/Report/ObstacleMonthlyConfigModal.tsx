@@ -10,7 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import Modal from "../common/Modal";
 import MonthPicker from "../common/MonthPicker";
-import { haversineKm } from "../../utils/geo";
+import { haversineKm, bearingDeg } from "../../utils/geo";
 import { computeLosBatch, calcBuildingAzExtent, mergeAzSectors } from "../../utils/obstacleAnalysisHelpers";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import type {
@@ -171,12 +171,18 @@ export default function ObstacleMonthlyConfigModal({
         console.log(`건물: ${selectedBuildings.map((b) => `${b.name}(${b.id})`).join(", ")}`);
         console.groupEnd();
 
+        // 건물 방위각 (LoS 단면도 track_points_geo 필터용)
+        const buildingBearings = selectedBuildings.map((b) =>
+          bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude),
+        );
+
         return {
           radar_name: r.name, radar_lat: r.latitude, radar_lon: r.longitude,
           radar_altitude: r.altitude, antenna_height: r.antenna_height,
           file_paths: monthFiles,
           azimuth_sectors: sectors,
           min_obstacle_distance_km: minObstacleDist,
+          building_bearings_deg: buildingBearings,
         };
       });
 

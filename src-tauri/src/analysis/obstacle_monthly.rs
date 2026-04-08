@@ -51,6 +51,9 @@ pub struct RadarFileSet {
     /// 장애물 최소 거리(km) — 이보다 먼 항적만 분석 대상
     #[serde(default)]
     pub min_obstacle_distance_km: f64,
+    /// LoS 단면도 표시용 건물 방위각 목록 (±5° 이내만 track_points_geo에 포함)
+    #[serde(default)]
+    pub building_bearings_deg: Vec<f64>,
 }
 
 // ─── 출력 타입 ───
@@ -154,6 +157,116 @@ impl LightPoint {
     }
 }
 
+// ─── 베이스라인 일 단위 플러시 (메모리 최적화) ───
+// 기존 알고리즘을 그대로 유지하면서, 파싱 중 완료된 날짜의 베이스라인을
+// 즉시 처리+해제하여 메모리를 최대 2~3일치로 제한한다.
+// (기존: 전체 누적 → 51M × 80B ≈ 4GB OOM → 개선: ~300MB)
+
+/// 일별 베이스라인 처리 결과 (경량)
+struct BaselineDayResult {
+    psr_rate: f64,
+    loss_rate: f64,
+    loss_points: Vec<LossPointGeo>,
+}
+
+/// 기존 알고리즘 그대로: 하루치 베이스라인 포인트를 mode_s별 그룹핑하여
+/// PSR율/Loss율/Loss좌표를 계산한다.
+fn process_baseline_day(
+    bl_points: &[LightPoint],
+    radar_lat: f64,
+    radar_lon: f64,
+) -> BaselineDayResult {
+    if bl_points.is_empty() {
+        return BaselineDayResult { psr_rate: 0.0, loss_rate: 0.0, loss_points: Vec::new() };
+    }
+
+    // PSR 베이스라인
+    let bl_ssr = bl_points.iter().filter(|p| {
+        let dist = calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude);
+        dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
+    }).count() as u32;
+    let bl_psr = bl_points.iter().filter(|p| {
+        let dist = calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude);
+        dist <= PSR_RANGE_KM && is_psr_combined(&p.radar_type)
+    }).count() as u32;
+    let psr_rate = if bl_ssr > 0 { bl_psr as f64 / bl_ssr as f64 } else { 0.0 };
+
+    // Loss 베이스라인: mode_s별 그룹핑 → 기존 알고리즘
+    let mut bl_ms_groups: HashMap<&str, Vec<&LightPoint>> = HashMap::new();
+    for p in bl_points {
+        bl_ms_groups.entry(&p.mode_s).or_default().push(p);
+    }
+    let mut bl_track_time = 0.0f64;
+    let mut bl_loss_time = 0.0f64;
+    let mut loss_points: Vec<LossPointGeo> = Vec::new();
+
+    for (_ms, mut pts) in bl_ms_groups {
+        if pts.len() < 2 { continue; }
+        pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+        bl_track_time += pts.last().unwrap().timestamp - pts.first().unwrap().timestamp;
+        let mut bl_gaps: Vec<f64> = pts.windows(2)
+            .map(|w| w[1].timestamp - w[0].timestamp)
+            .filter(|&g| g > 0.5 && g < 30.0)
+            .collect();
+        if bl_gaps.len() < 3 { continue; }
+        bl_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let bl_scan = bl_gaps[bl_gaps.len() / 2];
+        let mut bl_dists: Vec<f64> = pts.iter()
+            .map(|p| calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude))
+            .collect();
+        bl_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let bl_range_idx = ((bl_dists.len() as f64 * 0.95) as usize).min(bl_dists.len() - 1);
+        let bl_max_range = bl_dists[bl_range_idx].max(50.0);
+        let bl_threshold = bl_scan * 1.4;
+        let bl_boundary = bl_max_range * 1.0;
+        for window in pts.windows(2) {
+            let prev = window[0];
+            let next = window[1];
+            let gap = next.timestamp - prev.timestamp;
+            if gap > bl_threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
+                let sd = calculate_haversine_distance(radar_lat, radar_lon, prev.latitude, prev.longitude);
+                let ed = calculate_haversine_distance(radar_lat, radar_lon, next.latitude, next.longitude);
+                let missed = gap / bl_scan;
+                let dist = calculate_haversine_distance(prev.latitude, prev.longitude, next.latitude, next.longitude);
+                let implied_speed = (dist / gap) * 3600.0 / 1.852;
+                let speed_dev = if prev.speed > 10.0 { (implied_speed - prev.speed).abs() / prev.speed } else { 0.0 };
+                let speed_change = if prev.speed > 10.0 && next.speed > 10.0 {
+                    let avg_spd = (prev.speed + next.speed) / 2.0;
+                    (next.speed - prev.speed).abs() / avg_spd
+                } else { 0.0 };
+                let is_oor = (sd >= bl_boundary && ed >= bl_boundary)
+                    || (missed >= 15.0 && (sd >= bl_boundary || ed >= bl_boundary))
+                    || speed_dev > 0.5
+                    || speed_change > OM_SPEED_CHANGE_RATIO;
+                if !is_oor {
+                    bl_loss_time += gap;
+                    let total_missed = ((gap / bl_scan).round() as u32).saturating_sub(1).max(1);
+                    for si in 1..=total_missed {
+                        let t = si as f64 / (total_missed as f64 + 1.0);
+                        loss_points.push(LossPointGeo {
+                            lat: prev.latitude + (next.latitude - prev.latitude) * t,
+                            lon: prev.longitude + (next.longitude - prev.longitude) * t,
+                            alt_ft: (prev.altitude + (next.altitude - prev.altitude) * t) * 3.28084,
+                            duration_s: gap,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let loss_rate = if bl_track_time > 0.0 { (bl_loss_time / bl_track_time) * 100.0 } else { 0.0 };
+    BaselineDayResult { psr_rate, loss_rate, loss_points }
+}
+
+/// track_points_geo 포함 여부: 건물 방위 ±5° 이내인지 확인
+fn in_any_building_bearing(az: f64, bearings: &[f64]) -> bool {
+    bearings.iter().any(|&b| {
+        let mut diff = (az - b).abs();
+        if diff > 180.0 { diff = 360.0 - diff; }
+        diff <= 5.0
+    })
+}
+
 fn radar_type_str(rt: &RadarDetectionType) -> &'static str {
     match rt {
         RadarDetectionType::ModeAC => "mode_ac",
@@ -172,6 +285,9 @@ const MAX_OM_LOSS_DURATION_SECS: f64 = 300.0;
 
 /// gap 전후 실제 보고 속도 변화율 임계값: 이 비율 초과 시 오탐(트랙 스왑 등)으로 제외
 const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
+
+/// PSR 통계 계산 범위: 60NM
+const PSR_RANGE_KM: f64 = 60.0 * 1.852;
 
 // ─── 핵심 로직 ───
 
@@ -252,13 +368,21 @@ pub fn analyze_radar_monthly(
 
     // 1단계: 파일별 순차 파싱 → 필터링 → 일별 버킷 누적
     let mut daily_points: HashMap<String, Vec<LightPoint>> = HashMap::with_capacity(31);
-    // 베이스라인용: 분석 구간 제외 나머지 방위 포인트
+    // 베이스라인: 일 단위 플러시 — 기존 알고리즘 유지, 완료 날짜 즉시 처리+해제
+    // (기존: 전체 포인트 누적 → 51M × 80B ≈ 4GB OOM → 개선: 2~3일치 ≈ 300MB)
     let mut daily_baseline_points: HashMap<String, Vec<LightPoint>> = HashMap::with_capacity(31);
+    let mut baseline_results: HashMap<String, BaselineDayResult> = HashMap::with_capacity(31);
+    let mut latest_date_seen = String::new(); // 파싱 중 가장 최근 날짜 추적
     let mut total_filtered = 0u32;
     let mut failed_files: Vec<String> = Vec::new();
     let has_sectors = !radar.azimuth_sectors.is_empty();
+    let has_building_bearings = !radar.building_bearings_deg.is_empty();
 
-    for (i, path) in radar.file_paths.iter().enumerate() {
+    // 파일 정렬 (파일명 기준 시간순 보장 — 일 단위 플러시 정확도)
+    let mut sorted_paths = radar.file_paths.clone();
+    sorted_paths.sort();
+
+    for (i, path) in sorted_paths.iter().enumerate() {
         // 취소 체크
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("분석이 취소되었습니다".to_string());
@@ -344,6 +468,9 @@ pub fn analyze_radar_monthly(
                 }
 
                 let date = timestamp_to_date(tp.timestamp);
+                if date > latest_date_seen {
+                    latest_date_seen = date.clone();
+                }
                 daily_baseline_points
                     .entry(date)
                     .or_default()
@@ -359,7 +486,47 @@ pub fn analyze_radar_monthly(
             daily_points.values().map(|v| v.len()).sum::<usize>()
         );
 
+        // ── 베이스라인 일 단위 플러시: 최신 날짜보다 2일 이상 이전 데이터 즉시 처리+해제 ──
+        // 자정 전후 포인트가 2개 파일에 걸칠 수 있으므로 2일 버퍼 유지
+        if has_sectors && !latest_date_seen.is_empty() {
+            let flush_dates: Vec<String> = daily_baseline_points.keys()
+                .filter(|d| {
+                    // latest_date_seen과 2일 이상 차이나는 날짜 플러시
+                    if d.len() != 10 || latest_date_seen.len() != 10 { return false; }
+                    // 간단한 문자열 비교: "YYYY-MM-DD" 형식이므로 사전순 비교 유효
+                    // 2일 차이 판정: 날짜 차이 직접 계산 대신 보수적으로 월이 다르면 플러시
+                    let d_prefix = &d[..7]; // "YYYY-MM"
+                    let latest_prefix = &latest_date_seen[..7];
+                    if d_prefix < latest_prefix {
+                        return true; // 이전 달 → 플러시
+                    }
+                    if d_prefix == latest_prefix {
+                        // 같은 달: day 비교
+                        let d_day: i32 = d[8..10].parse().unwrap_or(0);
+                        let latest_day: i32 = latest_date_seen[8..10].parse().unwrap_or(0);
+                        return latest_day - d_day >= 2;
+                    }
+                    false
+                })
+                .cloned()
+                .collect();
+
+            for flush_date in flush_dates {
+                if let Some(bl_points) = daily_baseline_points.remove(&flush_date) {
+                    let result = process_baseline_day(&bl_points, radar.radar_lat, radar.radar_lon);
+                    baseline_results.insert(flush_date, result);
+                    // bl_points는 여기서 drop → 메모리 해제
+                }
+            }
+        }
+
         // ParsedFile 메모리 즉시 해제 (drop)
+    }
+
+    // 잔여 베이스라인 일괄 처리 (마지막 2일치)
+    for (date, bl_points) in daily_baseline_points.drain() {
+        let result = process_baseline_day(&bl_points, radar.radar_lat, radar.radar_lon);
+        baseline_results.insert(date, result);
     }
 
     // 2단계: 일별 집계
@@ -402,14 +569,21 @@ pub fn analyze_radar_monthly(
         let points = daily_points.get(date).expect("date exists in daily_points keys");
 
         // 항적 포인트 좌표 수집 (LoS 단면도 오버레이용)
-        let day_track_geo: Vec<TrackPointGeo> = points.iter().map(|p| {
-            TrackPointGeo {
+        // 건물 방위 ±5° 이내만 필터링하여 IPC 전송량 대폭 감소
+        // (기존: 전체 포인트 ~270만개 → 수만 개로 99% 감소)
+        let day_track_geo: Vec<TrackPointGeo> = if has_building_bearings {
+            points.iter().filter(|p| {
+                let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
+                in_any_building_bearing(az, &radar.building_bearings_deg)
+            }).map(|p| TrackPointGeo {
                 lat: p.latitude,
                 lon: p.longitude,
                 alt_ft: p.altitude * 3.28084,
                 radar_type: radar_type_str(&p.radar_type).to_string(),
-            }
-        }).collect();
+            }).collect()
+        } else {
+            Vec::new()
+        };
 
         // track_points_geo 크기 제한 — 균등 샘플링으로 분포 보존
         let day_track_geo = if day_track_geo.len() > MAX_TRACK_POINTS_GEO_PER_DAY {
@@ -422,7 +596,6 @@ pub fn analyze_radar_monthly(
         };
 
         // PSR 통계 (60NM 이내만)
-        const PSR_RANGE_KM: f64 = 60.0 * 1.852; // 60NM
         let total_pts = points.len() as u32;
         let ssr_combined = points.iter().filter(|p| {
             let dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
@@ -545,90 +718,15 @@ pub fn analyze_radar_monthly(
             0.0
         };
 
-        // ── 베이스라인 (나머지 방위) 일별 통계 계산 ──
-        let mut day_baseline_loss_points: Vec<LossPointGeo> = Vec::new();
-        let (baseline_loss_rate, baseline_psr_rate) = if has_sectors {
-            if let Some(bl_points) = daily_baseline_points.get(date) {
-                // PSR 베이스라인
-                let bl_ssr = bl_points.iter().filter(|p| {
-                    let dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
-                    dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
-                }).count() as u32;
-                let bl_psr = bl_points.iter().filter(|p| {
-                    let dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
-                    dist <= PSR_RANGE_KM && is_psr_combined(&p.radar_type)
-                }).count() as u32;
-                let bl_psr_rate = if bl_ssr > 0 { bl_psr as f64 / bl_ssr as f64 } else { 0.0 };
-
-                // Loss 베이스라인
-                let mut bl_ms_groups: HashMap<&str, Vec<&LightPoint>> = HashMap::new();
-                for p in bl_points {
-                    bl_ms_groups.entry(&p.mode_s).or_default().push(p);
-                }
-                let mut bl_track_time = 0.0f64;
-                let mut bl_loss_time = 0.0f64;
-                for (_ms, mut pts) in bl_ms_groups {
-                    if pts.len() < 2 { continue; }
-                    pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
-                    bl_track_time += pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
-                    let mut bl_gaps: Vec<f64> = pts.windows(2)
-                        .map(|w| w[1].timestamp - w[0].timestamp)
-                        .filter(|&g| g > 0.5 && g < 30.0)
-                        .collect();
-                    if bl_gaps.len() < 3 { continue; }
-                    bl_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let bl_scan = bl_gaps[bl_gaps.len() / 2];
-                    let mut bl_dists: Vec<f64> = pts.iter()
-                        .map(|p| calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude))
-                        .collect();
-                    bl_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let bl_range_idx = ((bl_dists.len() as f64 * 0.95) as usize).min(bl_dists.len() - 1);
-                    let bl_max_range = bl_dists[bl_range_idx].max(50.0);
-                    let bl_threshold = bl_scan * 1.4;
-                    let bl_boundary = bl_max_range * 1.0;
-                    for window in pts.windows(2) {
-                        let prev = window[0];
-                        let next = window[1];
-                        let gap = next.timestamp - prev.timestamp;
-                        if gap > bl_threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
-                            let sd = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
-                            let ed = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, next.latitude, next.longitude);
-                            let missed = gap / bl_scan;
-                            let dist = calculate_haversine_distance(prev.latitude, prev.longitude, next.latitude, next.longitude);
-                            let implied_speed = (dist / gap) * 3600.0 / 1.852;
-                            let speed_dev = if prev.speed > 10.0 { (implied_speed - prev.speed).abs() / prev.speed } else { 0.0 };
-                            let speed_change = if prev.speed > 10.0 && next.speed > 10.0 {
-                                let avg_spd = (prev.speed + next.speed) / 2.0;
-                                (next.speed - prev.speed).abs() / avg_spd
-                            } else { 0.0 };
-                            let is_oor = (sd >= bl_boundary && ed >= bl_boundary)
-                                || (missed >= 15.0 && (sd >= bl_boundary || ed >= bl_boundary))
-                                || speed_dev > 0.5
-                                || speed_change > OM_SPEED_CHANGE_RATIO;
-                            if !is_oor {
-                                bl_loss_time += gap;
-                                // 스캔별 보간 포인트 생성
-                                let total_missed = ((gap / bl_scan).round() as u32).saturating_sub(1).max(1);
-                                for si in 1..=total_missed {
-                                    let t = si as f64 / (total_missed as f64 + 1.0);
-                                    day_baseline_loss_points.push(LossPointGeo {
-                                        lat: prev.latitude + (next.latitude - prev.latitude) * t,
-                                        lon: prev.longitude + (next.longitude - prev.longitude) * t,
-                                        alt_ft: (prev.altitude + (next.altitude - prev.altitude) * t) * 3.28084,
-                                        duration_s: gap,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                let bl_lr = if bl_track_time > 0.0 { (bl_loss_time / bl_track_time) * 100.0 } else { 0.0 };
-                (bl_lr, bl_psr_rate)
+        // ── 베이스라인 (나머지 방위) 일별 통계 — 플러시 결과 사용 ──
+        let (baseline_loss_rate, baseline_psr_rate, day_baseline_loss_points) = if has_sectors {
+            if let Some(bl) = baseline_results.remove(date) {
+                (bl.loss_rate, bl.psr_rate, bl.loss_points)
             } else {
-                (0.0, 0.0)
+                (0.0, 0.0, Vec::new())
             }
         } else {
-            (0.0, 0.0)
+            (0.0, 0.0, Vec::new())
         };
 
         // 날짜에서 day_of_month 추출
