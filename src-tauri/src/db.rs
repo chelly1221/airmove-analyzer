@@ -233,6 +233,34 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             record_count INTEGER NOT NULL
         );
 
+        -- 도로명주소 (오프라인 주소 검색)
+        CREATE TABLE IF NOT EXISTS juso_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT NOT NULL,
+            full_addr TEXT NOT NULL,
+            jibun_addr TEXT,
+            sido TEXT,
+            sigungu TEXT,
+            eupmyeondong TEXT,
+            road_name TEXT,
+            building_num TEXT,
+            building_name TEXT,
+            zip_code TEXT,
+            bd_mgt_sn TEXT,
+            latitude REAL,
+            longitude REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_juso_latlon ON juso_addresses(latitude, longitude);
+        CREATE INDEX IF NOT EXISTS idx_juso_region ON juso_addresses(region);
+        CREATE INDEX IF NOT EXISTS idx_juso_bd_mgt_sn ON juso_addresses(bd_mgt_sn);
+
+        CREATE TABLE IF NOT EXISTS juso_import_log (
+            region TEXT PRIMARY KEY,
+            file_date TEXT NOT NULL,
+            imported_at INTEGER NOT NULL,
+            record_count INTEGER NOT NULL
+        );
+
         -- 자기편각 캐시 (NOAA API 결과 + WMM fallback)
         CREATE TABLE IF NOT EXISTS declination_cache (
             lat_key TEXT NOT NULL,
@@ -245,6 +273,15 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         );
         ",
     )?;
+
+    // 도로명주소 FTS5 가상 테이블 (별도 실행 — execute_batch 내에서 가상 테이블 생성 불가)
+    let _ = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS juso_fts USING fts5(
+            full_addr, jibun_addr, sido, sigungu, road_name, building_name,
+            content=juso_addresses,
+            content_rowid=id
+        );"
+    );
 
     // 구 GIS buildings/building_import_log/weather_cache/cloud_grid_cache 테이블 삭제 (fac_buildings로 대체)
     let _ = conn.execute("DROP TABLE IF EXISTS buildings", []);

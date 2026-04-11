@@ -174,7 +174,7 @@ export default function TrackMapApp() {
 
   return (
     <div className="flex h-full flex-col bg-white">
-      {/* 타이틀바 + ASS 파일 열기 버튼 */}
+      {/* 상단바 — ASS 파일 열기 + 통계 */}
       <div className="flex h-8 shrink-0 items-center bg-white">
         <div data-tauri-drag-region className="flex flex-1 h-full items-center pl-4 gap-2">
           <button
@@ -190,19 +190,20 @@ export default function TrackMapApp() {
               {flights.length}개 비행
             </span>
           )}
-          {/* TrackMap 툴바 포탈: 왼쪽 (드롭다운+토글) */}
-          <div id="trackmap-toolbar-left" className="pointer-events-auto flex items-center gap-2" />
           <div className="flex-1" />
-          {/* TrackMap 툴바 포탈: 오른쪽 (통계) */}
+          {/* TrackMap 툴바 포탈: 통계 */}
           <div id="trackmap-toolbar-right" className="pointer-events-auto flex items-center gap-2" />
         </div>
         <Titlebar controlsOnly />
       </div>
 
-      {/* TrackMap 전체 화면 */}
-      <main className="relative flex-1 overflow-hidden">
-        <TrackMap />
-      </main>
+      {/* 메인: 사이드바 + 지도 */}
+      <div className="flex flex-1 min-h-0">
+        <aside id="trackmap-sidebar" className="w-[232px] shrink-0 border-r border-gray-200 overflow-y-auto" />
+        <main className="relative flex-1 overflow-hidden">
+          <TrackMap />
+        </main>
+      </div>
 
       <SourceOverlay />
       <ToastContainer />

@@ -3,15 +3,16 @@
  * Web Worker — 커버리지 맵 CPU 집약 연산 오프로드
  *
  * 담당:
- *  1. buildLayers: 36K destinationPoint (삼각함수) 호출 → CoverageLayer[]
- *  2. 배치별 GPU 결과 누적 + 점진적 레이어 생성 (progressive rendering)
- *  3. 폴리곤 데이터 구성 (deck.gl PolygonLayer 용)
+ *  1. buildLayers: destinationPoint (삼각함수) 호출 → CoverageLayer[]
+ *  2. 래스터 이미지 렌더링 (OffscreenCanvas → ImageBitmap)
+ *  3. 3D 커버리지 면 생성
  *
  * Main thread 와 통신:
- *  - INIT_CACHE      : ranges Float32Array 캐시 초기화
- *  - BUILD_LAYERS    : 슬라이더 고도 변경 시 레이어 재생성
- *  - ACCUMULATE_BATCH: GPU 배치 결과 누적 + 점진적 레이어 반환
- *  - BUILD_POLYGONS  : CoverageLayer[] → 폴리곤 데이터
+ *  - INIT_CACHE            : ranges Float32Array 캐시 초기화
+ *  - BUILD_LAYERS          : 고도별 레이어 생성
+ *  - BUILD_3D_SURFACE      : 3D 커버리지 면 quad 생성
+ *  - RENDER_COVERAGE_IMAGE : 래스터 이미지 렌더링
+ *  - EXPORT_CACHE          : IndexedDB 저장용 캐시 반환
  */
 
 // ─── 상수 ──────────────────────────────────────────
@@ -130,69 +131,6 @@ function altToColor(altFt: number): [number, number, number] {
   return [Math.round((r1 + m) * 255), Math.round((g1 + m) * 255), Math.round((b1 + m) * 255)];
 }
 
-// ─── buildPolygons ─────────────────────────────────
-interface PolygonData {
-  polygon: [number, number, number][][];
-  outerRing: [number, number, number][];
-  coneRing: [number, number, number][] | null;
-  fillColor: [number, number, number];
-  altM: number;
-  altFt: number;
-}
-
-function buildPolygons(
-  layers: CoverageLayer[],
-  radarLat: number,
-  radarLon: number,
-  altScale: number,
-  showCone: boolean,
-): PolygonData[] {
-  if (layers.length === 0) return [];
-
-  const CONE_PTS = 72;
-  const isSingle = layers.length === 1;
-  const sorted = [...layers].sort((a, b) => a.altitudeFt - b.altitudeFt);
-
-  return sorted.map((layer, idx) => {
-    const zVal = isSingle ? layer.altitudeM * altScale : 0;
-    const outerRing: [number, number, number][] = layer.bearings.map((b) => [b.lon, b.lat, zVal]);
-    if (outerRing.length > 0) outerRing.push(outerRing[0]);
-
-    const polygon: [number, number, number][][] = [outerRing];
-    let coneRing: [number, number, number][] | null = null;
-
-    // 범위 모드: 안쪽 레이어를 구멍으로
-    const innerLayer = !isSingle && idx > 0 ? sorted[idx - 1] : null;
-    if (innerLayer) {
-      const innerHole: [number, number, number][] = innerLayer.bearings.map((b) => [b.lon, b.lat, zVal]);
-      if (innerHole.length > 0) innerHole.push(innerHole[0]);
-      innerHole.reverse();
-      polygon.push(innerHole);
-    }
-
-    // Cone of Silence
-    if (showCone && layer.coneRadiusKm > 0.5 && (isSingle || idx === 0)) {
-      const dLat = (layer.coneRadiusKm / 6371) * (180 / Math.PI);
-      const cosRadarLat = Math.cos((radarLat * Math.PI) / 180);
-      const pts: [number, number, number][] = [];
-      for (let i = 0; i <= CONE_PTS; i++) {
-        const deg = (i / CONE_PTS) * 360;
-        const rad = (deg * Math.PI) / 180;
-        const lat = radarLat + dLat * Math.cos(rad);
-        const lon = radarLon + (dLat / cosRadarLat) * Math.sin(rad);
-        pts.push([lon, lat, zVal]);
-      }
-      // hole: reverse copy
-      const hole = [...pts].reverse();
-      polygon.push(hole);
-      coneRing = pts;
-    }
-
-    const fillColor = altToColor(layer.altitudeFt);
-    return { polygon, outerRing, coneRing, fillColor, altM: layer.altitudeM, altFt: layer.altitudeFt };
-  });
-}
-
 // ─── 메시지 핸들러 ─────────────────────────────────
 self.onmessage = (e: MessageEvent) => {
   const { type, id } = e.data;
@@ -220,72 +158,6 @@ self.onmessage = (e: MessageEvent) => {
         }
         const layers = buildLayers(_cache, e.data.altFts, e.data.bearingStep);
         self.postMessage({ type: "LAYERS_RESULT", id, layers });
-      } catch (err) {
-        self.postMessage({ type: "ERROR", id, error: String(err) });
-      }
-      break;
-    }
-
-    // GPU 배치 결과 누적 + 점진적 레이어 반환
-    case "ACCUMULATE_BATCH": {
-      const { startRay, batchRays, batchResult, numAlts, totalRays,
-              radarLat, radarLon, radarAltitude, antennaHeight,
-              bearingStepDeg, altFts, progressiveAlts, altScale, showCone,
-              maxRangeKm } = e.data;
-
-      if (!_cache) {
-        _cache = {
-          radarLat, radarLon, radarAltitude, antennaHeight,
-          bearingStepDeg, totalRays, altFts, maxRangeKm: maxRangeKm ?? 0,
-          ranges: new Float32Array(totalRays * numAlts),
-        };
-      } else if (_cache.radarLat !== radarLat || _cache.radarLon !== radarLon) {
-        // 레이더 변경 감지 — 캐시 재생성
-        _cache = {
-          radarLat, radarLon, radarAltitude, antennaHeight,
-          bearingStepDeg, totalRays, altFts, maxRangeKm: maxRangeKm ?? 0,
-          ranges: new Float32Array(totalRays * numAlts),
-        };
-      }
-
-      if (maxRangeKm && _cache.maxRangeKm < maxRangeKm) _cache.maxRangeKm = maxRangeKm;
-
-      // 배치 결과 누적
-      const batchF32 = new Float32Array(batchResult);
-      for (let r = 0; r < batchRays; r++) {
-        _cache.ranges.set(
-          batchF32.subarray(r * numAlts, (r + 1) * numAlts),
-          (startRay + r) * numAlts,
-        );
-      }
-
-      // 점진적 레이어 생성 (완료된 레이 범위만, 다운샘플)
-      const completedRays = startRay + batchRays;
-      const pct = Math.round((completedRays / totalRays) * 100);
-      if (progressiveAlts && progressiveAlts.length > 0) {
-        // 점진적 렌더링: 낮은 해상도로 빠르게 (bearingStep=10 → 3600 rays)
-        const partialLayers = buildLayers(_cache, progressiveAlts, 10, completedRays);
-        const partialPolygons = buildPolygons(partialLayers, radarLat, radarLon, altScale ?? 0, showCone ?? false);
-        self.postMessage({
-          type: "PROGRESSIVE_RESULT", id,
-          computeId: e.data.computeId,
-          polygons: partialPolygons,
-          completedRays,
-          totalRays,
-          pct,
-        });
-      } else {
-        self.postMessage({ type: "BATCH_ACCUMULATED", id, pct });
-      }
-      break;
-    }
-
-    // 폴리곤 데이터 구성
-    case "BUILD_POLYGONS": {
-      try {
-        const { layers, radarLat, radarLon, altScale, showCone } = e.data;
-        const polygons = buildPolygons(layers, radarLat, radarLon, altScale, showCone);
-        self.postMessage({ type: "POLYGONS_RESULT", id, polygons });
       } catch (err) {
         self.postMessage({ type: "ERROR", id, error: String(err) });
       }
@@ -366,6 +238,135 @@ self.onmessage = (e: MessageEvent) => {
       }
 
       self.postMessage({ type: "3D_SURFACE_RESULT", id, quads });
+      break;
+    }
+
+    // 커버리지 이미지 래스터화 — 픽셀 직접 계산 (ranges 캐시 기반, anti-aliasing 블렌딩 없음)
+    case "RENDER_COVERAGE_IMAGE": {
+      if (!_cache) {
+        self.postMessage({ type: "ERROR", id, error: "No cache" });
+        break;
+      }
+      const { altFts: imgAltFts, showCone: imgShowCone, viewport: vp } = e.data;
+      const ranges = _cache.ranges;
+      const numAlts = _cache.altFts.length;
+      const totalRays = _cache.totalRays;
+      const bearingStep = _cache.bearingStepDeg;
+      const radarLat = _cache.radarLat;
+      const radarLon = _cache.radarLon;
+      const radarHeight = _cache.radarAltitude + _cache.antennaHeight;
+
+      const maxRange = _cache.maxRangeKm || 200;
+      const cosRadLat = Math.cos(radarLat * Math.PI / 180);
+
+      // 뷰포트 기반: 현재 화면 영역만 화면 해상도로 렌더링
+      // 뷰포트 없으면 전체 커버리지 영역 폴백
+      let imgW: number, imgH: number;
+      let bWest: number, bEast: number, bSouth: number, bNorth: number;
+      if (vp) {
+        imgW = Math.min(vp.width, 4096);
+        imgH = Math.min(vp.height, 4096);
+        bWest = vp.west; bEast = vp.east;
+        bSouth = vp.south; bNorth = vp.north;
+      } else {
+        imgW = 2000; imgH = 2000;
+        const MARGIN = 1.05;
+        const latOff = (maxRange * MARGIN) / 111.32;
+        const lonOff = (maxRange * MARGIN) / (111.32 * cosRadLat);
+        bWest = radarLon - lonOff; bEast = radarLon + lonOff;
+        bSouth = radarLat - latOff; bNorth = radarLat + latOff;
+      }
+
+      // 선택 고도 인덱스 매핑 (낮은→높은 순, 낮은 고도 우선 탐색)
+      const sortedAlts = [...imgAltFts].sort((a, b) => a - b);
+      const altIndices: number[] = [];
+      const altColors: [number, number, number][] = [];
+      const altIdxMap = new Map<number, number>();
+      for (let i = 0; i < _cache.altFts.length; i++) altIdxMap.set(_cache.altFts[i], i);
+      for (const alt of sortedAlts) {
+        const idx = altIdxMap.get(alt);
+        if (idx !== undefined) {
+          altIndices.push(idx);
+          altColors.push(altToColor(alt));
+        }
+      }
+      const nSelAlts = altIndices.length;
+      if (nSelAlts === 0) {
+        // 선택된 고도 없음 — 빈 이미지
+        const emptyCanvas = new OffscreenCanvas(imgW, imgH);
+        const bmp = emptyCanvas.transferToImageBitmap();
+        (self.postMessage as any)(
+          { type: "COVERAGE_IMAGE_RESULT", id, image: bmp, bounds: [bWest, bSouth, bEast, bNorth] },
+          [bmp],
+        );
+        break;
+      }
+
+      // Cone of Silence 반경 (최저 고도 기준)
+      const lowestAltFt = sortedAlts[0];
+      const lowestAltM = lowestAltFt * FT_TO_M;
+      const heightAbove = lowestAltM - radarHeight;
+      const maxElevRad = (MAX_ELEV_DEG * Math.PI) / 180;
+      const coneRadiusKm = imgShowCone && heightAbove > 0
+        ? (heightAbove / Math.tan(maxElevRad)) / 1000
+        : 0;
+      const coneRadiusSq = coneRadiusKm * coneRadiusKm;
+
+      // 픽셀 직접 계산 — 각 픽셀의 방위/거리 → ranges 캐시 조회
+      // 불투명 렌더링 (BitmapLayer.opacity로 투명도 실시간 조절)
+      const canvas = new OffscreenCanvas(imgW, imgH);
+      const ctx = canvas.getContext("2d")!;
+      const imageData = ctx.createImageData(imgW, imgH);
+      const pixels = imageData.data; // Uint8ClampedArray [R,G,B,A, ...]
+
+      const RAD2DEG = 180 / Math.PI;
+      const latStep = (bNorth - bSouth) / imgH;
+      const lonStep = (bEast - bWest) / imgW;
+      const maxRangeSq = maxRange * maxRange;
+
+      for (let py = 0; py < imgH; py++) {
+        const lat = bNorth - py * latStep;
+        const dNorthKm = (lat - radarLat) * 111.32;
+
+        for (let px = 0; px < imgW; px++) {
+          const lon = bWest + px * lonStep;
+          const dEastKm = (lon - radarLon) * 111.32 * cosRadLat;
+
+          const distSq = dNorthKm * dNorthKm + dEastKm * dEastKm;
+          if (distSq > maxRangeSq) continue;
+          if (coneRadiusKm > 0.5 && distSq < coneRadiusSq) continue;
+
+          const distKm = Math.sqrt(distSq);
+
+          let bearing = Math.atan2(dEastKm, dNorthKm) * RAD2DEG;
+          if (bearing < 0) bearing += 360;
+          let ray = Math.round(bearing / bearingStep);
+          if (ray >= totalRays) ray = 0;
+
+          const base = ray * numAlts;
+          for (let a = 0; a < nSelAlts; a++) {
+            if (ranges[base + altIndices[a]] >= distKm) {
+              const c = altColors[a];
+              const off = (py * imgW + px) * 4;
+              pixels[off]     = c[0];
+              pixels[off + 1] = c[1];
+              pixels[off + 2] = c[2];
+              pixels[off + 3] = 255;
+              break;
+            }
+          }
+        }
+      }
+
+      ctx.putImageData(imageData, 0, 0);
+
+      // ImageBitmap Transfer (zero-copy)
+      const bmp = canvas.transferToImageBitmap();
+      (self.postMessage as any)(
+        { type: "COVERAGE_IMAGE_RESULT", id, image: bmp,
+          bounds: [bWest, bSouth, bEast, bNorth] },
+        [bmp],
+      );
       break;
     }
 

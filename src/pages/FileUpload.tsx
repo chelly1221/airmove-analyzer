@@ -27,7 +27,7 @@ import { sendPointsToWorker, startConsolidate, clearWorkerPoints, getPointSummar
 import maplibregl from "maplibre-gl";
 import Modal from "../components/common/Modal";
 import { Dropdown } from "../components/common/Dropdown";
-import { SrtmDownloadSection, FacBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
+import { SrtmDownloadSection, FacBuildingDataSection, LandUseDataSection, PeakDataSection, JusoDataSection } from "./Settings";
 import type { AnalysisResult, BuildingGroup, Flight, GeometryType, ManualBuilding, UploadedFile } from "../types";
 
 // ─── landuse 타일 프로토콜 ──────────────────────────────────────
@@ -2214,6 +2214,9 @@ export default function FileUpload() {
       </div>
       <div className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
         <SrtmDownloadSection />
+      </div>
+      <div className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
+        <JusoDataSection />
       </div>
     </div>
     </div>

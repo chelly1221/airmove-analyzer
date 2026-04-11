@@ -1,9 +1,9 @@
 import { useState, useMemo, useEffect, useRef, useCallback, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
-import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
+import MapGL, { Marker, NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
-import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, PolygonLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer } from "@deck.gl/layers";
 import {
   Play,
   Pause,
@@ -15,6 +15,8 @@ import {
   Loader2,
   Building2,
   X,
+  Search,
+  MapPin,
 } from "lucide-react";
 
 /** Dot 모드 핀 아이콘 (가느다란 선 위에 원) */
@@ -25,18 +27,14 @@ const DotPinIcon = ({ size = 16 }: { size?: number }) => (
   </svg>
 );
 
-/** 커버리지 맵 아이콘 (날카로운 별 형태 — 레이더 커버리지 불규칙 경계 느낌) */
-const CoverageIcon = ({ size = 16 }: { size?: number }) => (
-  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" strokeLinecap="round">
-    <polygon points="8,0.2 9,3.5 11.5,0.8 10.5,4.2 14.5,2 11.5,5 15.8,5.5 12,6.8 15.5,9 11.5,8.5 14,12 10.5,9.5 10,13.5 8.5,10 7,15 7,10.5 4,13.5 5.5,9.5 1.5,11.5 4.5,8.2 0.2,8.5 4,6.5 0.5,4.5 4.2,5 2,1.8 5.5,4 6,0.8 7,4" />
-  </svg>
-);
+
+import { invoke } from "@tauri-apps/api/core";
 import { format } from "date-fns";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, Building3D } from "../types";
 import { queryViewportPoints } from "../utils/flightConsolidationWorker";
 import LoSProfilePanel from "../components/Map/LoSProfilePanel";
-import { computeMainCoverage, computeLayersForAltitudesAsync, isGPUCacheValidFor, isWorkerReady, invalidateGPUCache, buildPolygonsAsync, hasCoverageCache, build3DSurfaceAsync, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT, type CoverageLayer, type CoveragePolygonData, type Coverage3DQuad } from "../utils/radarCoverage";
+import { computeMainCoverage, isGPUCacheValidFor, invalidateGPUCache, renderCoverageImageAsync, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
 import { addPlanOverlay, removePlanOverlay, updatePlanOpacity, updatePlanBounds, rotateBounds } from "../utils/planOverlay";
 import { fetchBuildingsForViewport, invalidateBuildingCache, buildingsToGeoJSON } from "../utils/buildingTileCache";
@@ -107,9 +105,9 @@ export default function TrackMap() {
   const [portalReady, setPortalReady] = useState(false);
   useEffect(() => {
     // 포탈 타겟이 DOM에 마운트된 후 렌더링
-    if (document.getElementById("trackmap-toolbar-left")) setPortalReady(true);
+    if (document.getElementById("trackmap-sidebar")) setPortalReady(true);
     else {
-      const id = requestAnimationFrame(() => setPortalReady(!!document.getElementById("trackmap-toolbar-left")));
+      const id = requestAnimationFrame(() => setPortalReady(!!document.getElementById("trackmap-sidebar")));
       return () => cancelAnimationFrame(id);
     }
   }, []);
@@ -152,13 +150,13 @@ export default function TrackMap() {
   const [trailDropOpen, setTrailDropOpen] = useState(false);
 
   // 레이더 커버리지 (범위 슬라이더: min~max)
-  const [coverageAlt, setCoverageAlt] = useState(10000); // 커버리지 최대 고도 (ft)
+  const [coverageAlt, setCoverageAlt] = useState(COVERAGE_MAX_ALT_FT); // 커버리지 최대 고도 (ft)
   const [coverageAltMin, setCoverageAltMin] = useState(COVERAGE_MIN_ALT_FT); // 커버리지 최소 고도 (ft)
-  const [coverageAltInput, setCoverageAltInput] = useState(10000); // 디바운스용 최대 입력값
+  const [coverageAltInput, setCoverageAltInput] = useState(COVERAGE_MAX_ALT_FT); // 디바운스용 최대 입력값
   const [coverageAltMinInput, setCoverageAltMinInput] = useState(COVERAGE_MIN_ALT_FT); // 디바운스용 최소 입력값
   const [gpuCacheReady, setGpuCacheReady] = useState(false);
-  const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
-  const [coveragePolygonsList, setCoveragePolygonsList] = useState<CoveragePolygonData[] | null>(null);
+  const [coverageImage, setCoverageImage] = useState<ImageBitmap | null>(null);
+  const [coverageBounds, setCoverageBounds] = useState<[number, number, number, number] | null>(null);
   const coverageVisible = useAppStore((s) => s.coverageVisible);
   const setCoverageVisible = useAppStore((s) => s.setCoverageVisible);
   const coverageLoading = useAppStore((s) => s.coverageLoading);
@@ -170,16 +168,14 @@ export default function TrackMap() {
   const coverageError = useAppStore((s) => s.coverageError);
   const setCoverageError = useAppStore((s) => s.setCoverageError);
   const setCoverageData = useAppStore((s) => s.setCoverageData);
-  const [showConeOfSilence, setShowConeOfSilence] = useState(true);
-  const [coverageMode, setCoverageMode] = useState<"2d" | "3d">("2d");
-  const [coverage3DQuads, setCoverage3DQuads] = useState<Coverage3DQuad[] | null>(null);
-  const [surfaceOpacity, setSurfaceOpacity] = useState(120);
-  const [coverage3DLoading, setCoverage3DLoading] = useState(false);
+  const [showConeOfSilence, _setShowConeOfSilence] = useState(true);
+  const [coverageOpacity, setCoverageOpacity] = useState(0.55); // 커버리지 투명도 (0~1)
   const coverageAltRef = useRef<HTMLDivElement>(null);
   const [coverageModalOpen, setCoverageModalOpen] = useState(false);
   const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageAltMinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageComputeAbortRef = useRef(0);
+
 
   // 파노라마 장애물 맵 하이라이트 (전역 스토어)
   const panoramaViewActive = useAppStore((s) => s.panoramaViewActive);
@@ -208,6 +204,61 @@ export default function TrackMap() {
   const fittedRef = useRef(false);
   const prevPointsLen = useRef(0);
   const allPointsRef = useRef<TrackPoint[]>([]);
+
+  // 주소 검색 (오프라인 SQLite FTS5)
+  const [addressQuery, setAddressQuery] = useState("");
+  const [addressResults, setAddressResults] = useState<{ display_name: string; jibun_addr?: string; lat: number; lon: number }[]>([]);
+  const [addressSearching, setAddressSearching] = useState(false);
+  const [addressOpen, setAddressOpen] = useState(false);
+  const [addressMarker, setAddressMarker] = useState<{ lat: number; lon: number; label: string } | null>(null);
+  const addressRef = useRef<HTMLDivElement>(null);
+  const addressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const searchAddress = useCallback(async (q: string) => {
+    if (!q.trim()) { setAddressResults([]); return; }
+    setAddressSearching(true);
+    try {
+      const local = await invoke<{ full_addr: string; jibun_addr: string; latitude: number; longitude: number }[]>(
+        "search_juso_address", { query: q, limit: 8 },
+      );
+      setAddressResults(local.map((r) => ({
+        display_name: r.full_addr,
+        jibun_addr: r.jibun_addr || "",
+        lat: r.latitude,
+        lon: r.longitude,
+      })));
+    } catch {
+      setAddressResults([]);
+    } finally {
+      setAddressSearching(false);
+    }
+  }, []);
+
+  const handleAddressInput = useCallback((value: string) => {
+    setAddressQuery(value);
+    if (addressTimerRef.current) clearTimeout(addressTimerRef.current);
+    addressTimerRef.current = setTimeout(() => searchAddress(value), 400);
+  }, [searchAddress]);
+
+  const selectAddress = useCallback((lat: number, lon: number, label: string) => {
+    if (lat !== 0 && lon !== 0) {
+      setViewState((v) => ({ ...v, latitude: lat, longitude: lon, zoom: 15 }));
+      setAddressMarker({ lat, lon, label });
+    }
+    setAddressResults([]);
+    setAddressOpen(false);
+  }, []);
+
+  // 주소 검색 외부 클릭 닫기
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (addressRef.current && !addressRef.current.contains(e.target as Node)) {
+        setAddressOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
 
   // 선택된 레이더용 비행만 필터 (radar_name이 없는 레거시 데이터는 항상 표시)
   const radarFilteredFlights = useMemo(() => {
@@ -639,7 +690,8 @@ export default function TrackMap() {
   useEffect(() => {
     if (!isGPUCacheValidFor(radarSite)) {
       setGpuCacheReady(false);
-      setCoverageLayers([]);
+      setCoverageImage(null);
+      setCoverageBounds(null);
       setCoverageVisible(false);
       setCoverageError("");
     }
@@ -688,24 +740,10 @@ export default function TrackMap() {
     return [Math.round((r1 + m) * 255), Math.round((g1 + m) * 255), Math.round((b1 + m) * 255)];
   }, []);
 
-  // 커버리지 deck.gl 데이터 — Worker에서 비동기 폴리곤 구성 (UI 논블로킹)
+  // 커버리지 비표시 시 이미지 클리어
   useEffect(() => {
-    if (!coverageVisible || coverageLayers.length === 0) {
-      setCoveragePolygonsList(null);
-      return;
-    }
-    let stale = false;
-    buildPolygonsAsync(
-      coverageLayers,
-      radarSite.latitude,
-      radarSite.longitude,
-      coverageLayers.length === 1 ? altScale : 0,
-      showConeOfSilence,
-    ).then((polygons) => {
-      if (!stale) setCoveragePolygonsList(polygons as CoveragePolygonData[]);
-    }).catch(() => {});
-    return () => { stale = true; };
-  }, [coverageLayers, coverageVisible, altScale, radarSite.latitude, radarSite.longitude, showConeOfSilence]);
+    if (!coverageVisible) { setCoverageImage(null); setCoverageBounds(null); }
+  }, [coverageVisible]);
 
 
   // ── 타일 기반 건물 캐시 로딩 ──────────────────────────────────
@@ -954,7 +992,7 @@ export default function TrackMap() {
     };
   }, [losBuildingHighlight, buildings3dMode, buildings3dData]);
 
-  /** 커버리지 맵 계산 시작 — GPU 계산 + Worker 점진적 렌더링 */
+  /** 커버리지 맵 계산 시작 — GPU 계산 */
   const startCoverageCompute = useCallback(async (force = false) => {
     const computeSeq = ++coverageComputeAbortRef.current;
     setCoverageLoading(true);
@@ -968,18 +1006,28 @@ export default function TrackMap() {
         radarSite,
         (pct, msg) => {
           if (coverageComputeAbortRef.current !== computeSeq) return;
-          setCoverageProgressPct(pct);
+          setCoverageProgressPct(Math.round(pct));
           setCoverageProgress(msg);
-        },
-        (progressivePolygons) => {
-          if (coverageComputeAbortRef.current !== computeSeq) return;
-          setCoveragePolygonsList(progressivePolygons as CoveragePolygonData[]);
         },
       );
       if (coverageComputeAbortRef.current !== computeSeq) return;
       setGpuCacheReady(true);
       setCoverageVisible(true);
       setCoverageData(result);
+
+      // 커버리지 전체 범위로 맵 자동 이동
+      const map = mapRef.current?.getMap();
+      if (map) {
+        const rangeKm = radarSite.range_nm * 1.852;
+        const latOff = (rangeKm * 1.05) / 111.32;
+        const lonOff = (rangeKm * 1.05) / (111.32 * Math.cos(radarSite.latitude * Math.PI / 180));
+        map.fitBounds(
+          [[radarSite.longitude - lonOff, radarSite.latitude - latOff],
+           [radarSite.longitude + lonOff, radarSite.latitude + latOff]],
+          { padding: 40, duration: 800 },
+        );
+      }
+
     } catch (err) {
       if (coverageComputeAbortRef.current !== computeSeq) return;
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -994,16 +1042,16 @@ export default function TrackMap() {
     }
   }, [radarSite, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
 
-  // 슬라이더 디바운스: 입력값 변경 → 150ms 후 실제 고도 반영
+  // 슬라이더 디바운스 150ms
   const handleCoverageAltChange = useCallback((val: number) => {
     setCoverageAltInput(val);
     if (coverageAltTimerRef.current) clearTimeout(coverageAltTimerRef.current);
-    coverageAltTimerRef.current = setTimeout(() => setCoverageAlt(val), 300);
+    coverageAltTimerRef.current = setTimeout(() => setCoverageAlt(val), 150);
   }, []);
   const handleCoverageAltMinChange = useCallback((val: number) => {
     setCoverageAltMinInput(val);
     if (coverageAltMinTimerRef.current) clearTimeout(coverageAltMinTimerRef.current);
-    coverageAltMinTimerRef.current = setTimeout(() => setCoverageAltMin(val), 300);
+    coverageAltMinTimerRef.current = setTimeout(() => setCoverageAltMin(val), 150);
   }, []);
 
   // 커버리지 슬라이더 타이머 정리 (언마운트 시)
@@ -1040,9 +1088,12 @@ export default function TrackMap() {
     return () => window.removeEventListener("keydown", handleWASD);
   }, []);
 
-  // 고도 슬라이더 변경 시 레이어들 재계산 (Worker 비동기, UI 논블로킹)
-  useEffect(() => {
-    if (!gpuCacheReady || !coverageVisible) return;
+  // 뷰포트 정보를 포함한 커버리지 이미지 렌더링 (화면 해상도에 맞춤)
+  const coverageRenderSeqRef = useRef(0);
+  const coverageRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const renderCoverageForViewport = useCallback(() => {
+    if (!gpuCacheReady || !coverageVisible || coverageLoading) return;
 
     const effMin = Math.min(coverageAltMin, coverageAlt);
     const effMax = Math.max(coverageAltMin, coverageAlt);
@@ -1053,21 +1104,52 @@ export default function TrackMap() {
     else step = 1000;
 
     const altFts: number[] = [];
-    for (let alt = effMin; alt <= effMax; alt += step) {
-      altFts.push(alt);
-    }
-    if (altFts.length === 0 || altFts[altFts.length - 1] !== effMax) {
-      altFts.push(effMax);
+    for (let alt = effMin; alt <= effMax; alt += step) altFts.push(alt);
+    if (altFts.length === 0 || altFts[altFts.length - 1] !== effMax) altFts.push(effMax);
+
+    // 현재 맵 뷰포트 → 화면 해상도로 렌더링
+    const map = mapRef.current?.getMap();
+    let viewport: { width: number; height: number; west: number; south: number; east: number; north: number } | undefined;
+    if (map) {
+      const bounds = map.getBounds();
+      const container = map.getContainer();
+      viewport = {
+        width: Math.round(container.clientWidth * devicePixelRatio),
+        height: Math.round(container.clientHeight * devicePixelRatio),
+        west: bounds.getWest(), east: bounds.getEast(),
+        south: bounds.getSouth(), north: bounds.getNorth(),
+      };
     }
 
-    let stale = false;
-    if (isWorkerReady()) {
-      computeLayersForAltitudesAsync(altFts).then((layers) => {
-        if (!stale) setCoverageLayers(layers);
-      });
-    }
-    return () => { stale = true; };
-  }, [coverageAlt, coverageAltMin, gpuCacheReady, coverageVisible]);
+    const seq = ++coverageRenderSeqRef.current;
+    renderCoverageImageAsync(altFts, showConeOfSilence, viewport)
+      .then((result) => {
+        if (coverageRenderSeqRef.current !== seq || !result) return;
+        setCoverageImage(result.image);
+        setCoverageBounds(result.bounds);
+      }).catch(() => {});
+  }, [gpuCacheReady, coverageVisible, coverageLoading, coverageAlt, coverageAltMin, showConeOfSilence]);
+
+  // 고도 슬라이더/설정 변경 시 렌더링
+  useEffect(() => {
+    renderCoverageForViewport();
+  }, [renderCoverageForViewport]);
+
+  // 맵 이동/줌 후 커버리지 재렌더링 (300ms 디바운스)
+  useEffect(() => {
+    if (!coverageVisible || !gpuCacheReady) return;
+    const map = mapRef.current?.getMap();
+    if (!map) return;
+    const onMoveEnd = () => {
+      if (coverageRenderTimerRef.current) clearTimeout(coverageRenderTimerRef.current);
+      coverageRenderTimerRef.current = setTimeout(renderCoverageForViewport, 300);
+    };
+    map.on("moveend", onMoveEnd);
+    return () => {
+      map.off("moveend", onMoveEnd);
+      if (coverageRenderTimerRef.current) clearTimeout(coverageRenderTimerRef.current);
+    };
+  }, [coverageVisible, gpuCacheReady, renderCoverageForViewport]);
 
   // Mode-S별 트랙 패스 데이터 (gap + radar_type 변경 시 분할)
   /** 1포인트 항적용 데이터 */
@@ -1489,84 +1571,20 @@ export default function TrackMap() {
     return pts;
   }, [losTarget, radarSite, allPoints, signalLossPoints, visibleMinTs, visibleMaxTs]);
 
-  // 커버리지 전용 deck.gl 레이어 (coveragePolygonsList 변경 시에만 재생성)
+  // 커버리지 전용 deck.gl 레이어 — BitmapLayer (이미지 텍스처 1장, tessellation 없음)
   const coverageDeckLayers = useMemo(() => {
-    if (!coveragePolygonsList || coveragePolygonsList.length === 0) return [];
-    const covLayers: any[] = [];
-    const n = coveragePolygonsList.length;
-    const isSingle = n === 1;
-    const fillAlpha = isSingle ? 40 : 100;
-
-    // 단일 PolygonLayer로 모든 커버리지 폴리곤 통합
-    covLayers.push(
-      new PolygonLayer({
-        id: "coverage-fill",
-        data: coveragePolygonsList,
-        getPolygon: (d: any) => d.polygon,
-        getFillColor: (d: any) => [d.fillColor[0], d.fillColor[1], d.fillColor[2], fillAlpha] as [number, number, number, number],
-        getLineColor: [0, 0, 0, 0],
-        filled: true,
-        stroked: false,
-        extruded: false,
-        _full3d: true,
-        parameters: { depthWriteEnabled: false },
-      })
-    );
-
-    // 최외곽 경계선
-    const outermost = coveragePolygonsList[n - 1];
-    covLayers.push(
-      new PathLayer({
-        id: "coverage-outline",
-        data: [{ path: outermost.outerRing }],
-        getPath: (d: any) => d.path,
-        getColor: [...outermost.fillColor, isSingle ? 255 : 180],
-        getWidth: isSingle ? 2.5 : 1.5,
-        widthMinPixels: isSingle ? 2 : 1,
-        widthMaxPixels: isSingle ? 4 : 3,
-        widthUnits: "pixels" as const,
-      })
-    );
-
-    // Cone of Silence 경계선 (최내곽 레이어)
-    const innermost = coveragePolygonsList[0];
-    if (innermost.coneRing) {
-      covLayers.push(
-        new PathLayer({
-          id: "cone-outline",
-          data: [{ path: innermost.coneRing }],
-          getPath: (d: any) => d.path,
-          getColor: [...innermost.fillColor, 100],
-          getWidth: 1,
-          widthMinPixels: 1,
-          widthMaxPixels: 2,
-          widthUnits: "pixels" as const,
-        })
-      );
-    }
-
-    return covLayers;
-  }, [coveragePolygonsList]);
-
-  // 3D 커버리지 면 deck.gl 레이어
-  const coverage3DDeckLayers = useMemo(() => {
-    if (!coverage3DQuads || coverage3DQuads.length === 0) return [];
+    if (!coverageImage || !coverageBounds) return [];
     return [
-      new PolygonLayer({
-        id: "coverage-3d-surface",
-        data: coverage3DQuads,
-        getPolygon: (d: Coverage3DQuad) => d.polygon,
-        getFillColor: (d: Coverage3DQuad) => [d.fillColor[0], d.fillColor[1], d.fillColor[2], surfaceOpacity] as [number, number, number, number],
-        getLineColor: [0, 0, 0, 0],
-        filled: true,
-        stroked: false,
-        extruded: false,
-        _full3d: true,
-        parameters: { depthWriteEnabled: true },
-        updateTriggers: { getFillColor: [surfaceOpacity] },
+      new BitmapLayer({
+        id: "coverage-bitmap",
+        image: coverageImage,
+        bounds: coverageBounds,
+        opacity: coverageOpacity,
+        parameters: { depthWriteEnabled: false },
       }),
     ];
-  }, [coverage3DQuads, surfaceOpacity]);
+  }, [coverageImage, coverageBounds, coverageOpacity]);
+
 
   // LoS 전용 deck.gl 레이어 (LoS 모드 상태 변경 시에만 재생성)
   const losDeckLayers = useMemo(() => {
@@ -2123,7 +2141,7 @@ export default function TrackMap() {
     layers.push(...losDeckLayers);
 
     // 커버리지 맵 합성 (2D/3D 모드에 따라 선택)
-    layers.push(...(coverageMode === "3d" ? coverage3DDeckLayers : coverageDeckLayers));
+    layers.push(...coverageDeckLayers);
 
     // 건물 2D 오버레이 합성 (별도 useMemo)
     layers.push(...buildingDeckLayers);
@@ -2200,7 +2218,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, dotMode, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, coverage3DDeckLayers, coverageMode, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, dotMode, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2440,25 +2458,27 @@ export default function TrackMap() {
     <div className="flex h-full flex-col">
       {/* 타이틀바 포탈: 왼쪽 (드롭다운+토글+재생) */}
       {portalReady && createPortal(
-        <>
-        {/* 비행검사기 선택 드롭다운 */}
-        <div ref={aircraftDropRef} className="relative flex items-center">
+        <div className="p-3 space-y-4">
+        {/* 항공기 선택 */}
+        <div>
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">항공기</div>
+          <div ref={aircraftDropRef} className="relative">
           <button
             onClick={() => { setAircraftDropOpen(!aircraftDropOpen); setRadarDropOpen(false); setModeSSearch(""); }}
-            className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+            className={`flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors ${
               aircraftDropOpen
-                ? "border-[#a60739] bg-[#a60739]/10 text-[#a60739]"
-                : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300"
+                ? "border-[#a60739] bg-[#a60739]/5 text-[#a60739]"
+                : "border-gray-200 bg-white text-gray-700 hover:border-gray-300"
             }`}
           >
-            <Plane size={13} fill="white" />
-            <span className="max-w-[120px] truncate font-medium">
+            <Plane size={14} fill="white" className="shrink-0" />
+            <span className="flex-1 truncate text-left font-medium">
               {!selectedModeS ? "등록 기체" : selectedModeS === "__ALL__" ? "전체 항적" : getAircraftName(selectedModeS)}
             </span>
-            <ChevronDown size={12} className={`transition-transform ${aircraftDropOpen ? "rotate-180" : ""}`} />
+            <ChevronDown size={12} className={`shrink-0 transition-transform ${aircraftDropOpen ? "rotate-180" : ""}`} />
           </button>
           {aircraftDropOpen && (
-            <div className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+            <div className="absolute left-0 right-0 top-full z-[2000] mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
               <div className="px-2 pt-2 pb-1">
                 <input
                   type="text"
@@ -2510,24 +2530,27 @@ export default function TrackMap() {
               </div>
             </div>
           )}
+          </div>
         </div>
 
-        {/* 레이더 사이트 선택 드롭다운 */}
-        <div ref={radarDropRef} className="relative flex items-center">
+        {/* 레이더 선택 */}
+        <div>
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">레이더</div>
+          <div ref={radarDropRef} className="relative">
           <button
             onClick={() => { setRadarDropOpen(!radarDropOpen); setAircraftDropOpen(false); }}
-            className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+            className={`flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors ${
               radarDropOpen
-                ? "border-[#a60739] bg-[#a60739]/10 text-[#a60739]"
-                : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300"
+                ? "border-[#a60739] bg-[#a60739]/5 text-[#a60739]"
+                : "border-gray-200 bg-white text-gray-700 hover:border-gray-300"
             }`}
           >
-            <Radar size={13} />
-            <span className="max-w-[120px] truncate font-medium">{radarSite.name}</span>
-            <ChevronDown size={12} className={`transition-transform ${radarDropOpen ? "rotate-180" : ""}`} />
+            <Radar size={14} className="shrink-0" />
+            <span className="flex-1 truncate text-left font-medium">{radarSite.name}</span>
+            <ChevronDown size={12} className={`shrink-0 transition-transform ${radarDropOpen ? "rotate-180" : ""}`} />
           </button>
           {radarDropOpen && (
-            <div className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+            <div className="absolute left-0 right-0 top-full z-[2000] mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
               <div className="max-h-56 overflow-y-auto py-1 px-1">
                 {allRadarSites.map((site) => (
                   <button
@@ -2548,11 +2571,14 @@ export default function TrackMap() {
               </div>
             </div>
           )}
+          </div>
         </div>
 
-        {/* Playback controls */}
+        {/* 재생 */}
         {allPoints.length > 0 && (
-          <div className="flex items-center gap-1.5">
+          <div>
+            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">재생</div>
+            <div className="flex items-center gap-2">
             <button
               onClick={() => {
                 if (!playing && sliderValue >= 99.9) {
@@ -2560,10 +2586,10 @@ export default function TrackMap() {
                 }
                 setPlaying(!playing);
               }}
-              className="flex h-6 w-6 items-center justify-center rounded-full bg-[#a60739] text-white hover:bg-[#85062e] transition-colors"
+              className="flex h-7 w-7 items-center justify-center rounded-full bg-[#a60739] text-white hover:bg-[#85062e] transition-colors"
               title={playing ? "일시정지" : "재생"}
             >
-              {playing ? <Pause size={10} fill="white" /> : <Play size={10} fill="white" className="ml-0.5" />}
+              {playing ? <Pause size={12} fill="white" /> : <Play size={12} fill="white" className="ml-0.5" />}
             </button>
 
             {/* 배속 뱃지 */}
@@ -2615,280 +2641,209 @@ export default function TrackMap() {
                 </div>
               )}
             </div>
+            </div>
           </div>
         )}
 
-        {/* LoS Analysis toggle */}
-        <button
-          onClick={() => {
-            const entering = !losMode;
-            setLosMode(entering);
-            if (entering) {
-              savedPitchRef.current = viewState.pitch ?? 45;
-              savedBearingRef.current = viewState.bearing ?? 0;
-              savedTerrainRef.current = terrainEnabled;
-              if (terrainEnabled) setTerrainEnabled(false);
-              const map = mapRef.current?.getMap();
-              if (map) {
-                map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
-              }
-            } else {
-              setLosTarget(null);
-              setLosCursor(null);
-              setLosHighlightIdx(null);
-              if (savedTerrainRef.current) setTerrainEnabled(true);
-              const map = mapRef.current?.getMap();
-              if (map) {
-                map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
-              }
-            }
-          }}
-          className={`rounded-lg border p-1 transition-colors ${
-            losMode
-              ? "border-[#a60739] bg-[#a60739] text-white shadow-sm"
-              : "border-transparent text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-          }`}
-          title="LoS 분석 (단면도)"
-        >
-          <Mountain size={16} />
-        </button>
+        {/* 표시 토글 */}
+        <div>
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">표시</div>
+          <div className="space-y-2.5">
 
-        {/* Dot mode toggle */}
-        <button
-          onClick={() => setDotMode(!dotMode)}
-          className={`rounded-lg border p-1 transition-colors ${
-            dotMode
-              ? "border-[#a60739] bg-[#a60739] text-white shadow-sm"
-              : "border-transparent text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-          }`}
-          title="Dot 모드"
-        >
-          <DotPinIcon size={16} />
-        </button>
-
-        {/* 건물 오버레이 토글 */}
-        {buildingsLoading ? (
-          <div className="flex items-center gap-1 rounded-lg border border-transparent bg-violet-50 px-2 py-1 text-[10px] text-violet-600">
-            <Loader2 size={14} className="animate-spin" />
-            <span>건물...</span>
+        {/* Dot 모드 */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className={dotMode ? "text-[#a60739]" : "text-gray-400"}><DotPinIcon size={14} /></span>
+            <span className="text-xs text-gray-600">Dot 모드</span>
           </div>
-        ) : (
           <button
-            onClick={() => {
-              if (buildings3dData.length > 0) {
-                setShowBuildings(!showBuildings);
-              } else {
-                fetchBuildingOverlay();
-              }
-            }}
-            className={`relative rounded-lg border p-1 transition-colors ${
-              showBuildings && (buildings3dData.length > 0)
-                ? "border-[#a60739] bg-[#a60739] text-white shadow-sm"
-                : "border-transparent text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-            }`}
-            title={buildings3dData.length > 0 ? "3D 건물 토글" : "건물 표시"}
+            onClick={() => setDotMode(!dotMode)}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${dotMode ? "bg-[#a60739]" : "bg-gray-300"}`}
+            role="switch"
+            aria-checked={dotMode}
           >
-            <Building2 size={16} />
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${dotMode ? "translate-x-4.5" : "translate-x-0.5"}`} />
           </button>
-        )}
+        </div>
 
-        {/* 레이더 커버리지 맵 */}
-        <div ref={coverageAltRef} className="relative">
+        {/* 건물 */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Building2 size={14} className={showBuildings && buildings3dData.length > 0 ? "text-[#a60739]" : "text-gray-400"} />
+            <span className="text-xs text-gray-600">건물</span>
+          </div>
+          {buildingsLoading ? (
+            <Loader2 size={16} className="animate-spin text-[#a60739]" />
+          ) : (
+            <button
+              onClick={() => {
+                if (buildings3dData.length > 0) {
+                  setShowBuildings(!showBuildings);
+                } else {
+                  fetchBuildingOverlay();
+                }
+              }}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showBuildings && buildings3dData.length > 0 ? "bg-[#a60739]" : "bg-gray-300"}`}
+              role="switch"
+              aria-checked={showBuildings && buildings3dData.length > 0}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${showBuildings && buildings3dData.length > 0 ? "translate-x-4.5" : "translate-x-0.5"}`} />
+            </button>
+          )}
+        </div>
+
+        {/* 3D 지형 */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className={`flex h-3.5 w-3.5 items-center justify-center text-[9px] font-bold ${terrainEnabled ? "text-[#a60739]" : "text-gray-400"}`}>3D</span>
+            <span className="text-xs text-gray-600">3D 지형</span>
+          </div>
           <button
-            onClick={() => setCoverageModalOpen(true)}
-            className={`rounded-lg border p-1 transition-colors relative ${
-              coverageVisible && coverageLayers.length > 0
-                ? "border-[#a60739] bg-[#a60739] text-white shadow-sm"
-                : "border-transparent text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-            }`}
-            title="레이더 커버리지 맵"
+            onClick={() => setTerrainEnabled(!terrainEnabled)}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${terrainEnabled ? "bg-[#a60739]" : "bg-gray-300"}`}
+            role="switch"
+            aria-checked={terrainEnabled}
           >
-            <CoverageIcon size={16} />
-            {coverageLoading && (
-              <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#a60739] opacity-60" />
-                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[#a60739]" />
-              </span>
-            )}
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${terrainEnabled ? "translate-x-4.5" : "translate-x-0.5"}`} />
           </button>
+        </div>
 
-        {/* 커버리지 모달 */}
-        {coverageModalOpen && (
-          <>
-          <div
-            className="fixed inset-0 z-[9998]"
-            onClick={() => setCoverageModalOpen(false)}
-          />
-          <div
-            className="absolute top-full right-0 mt-1 z-[9999] w-80 rounded-xl bg-white shadow-2xl border border-gray-200"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="coverage-modal-title"
-            onClick={(e) => e.stopPropagation()}
-          >
-              {/* 헤더 */}
-              <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3">
-                <h3 id="coverage-modal-title" className="text-sm font-semibold text-gray-800">레이더 커버리지 맵</h3>
-                <button
-                  onClick={() => setCoverageModalOpen(false)}
-                  className="text-gray-400 hover:text-gray-600 text-lg leading-none focus:outline-2 focus:outline-[#a60739] rounded"
-                  aria-label="커버리지 모달 닫기"
-                >
-                  &times;
-                </button>
+          </div>
+        </div>
+
+        {/* ── 도구 ────────────────── */}
+        <div>
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-gray-400">도구</div>
+          <div className="space-y-2">
+
+          {/* LoS 분석 카드 */}
+          <div className={`rounded-lg border transition-colors ${losMode ? "border-[#a60739]/30 bg-[#a60739]/5" : "border-gray-200 bg-gray-50"}`}>
+            <div className="flex items-center justify-between px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Mountain size={14} className={losMode ? "text-[#a60739]" : "text-gray-400"} />
+                <span className={`text-xs font-medium ${losMode ? "text-[#a60739]" : "text-gray-600"}`}>LoS 분석</span>
               </div>
-              {/* 본문 */}
-              <div className="space-y-4 px-5 py-4">
+              <button
+                onClick={() => {
+                  const entering = !losMode;
+                  setLosMode(entering);
+                  if (entering) {
+                    savedPitchRef.current = viewState.pitch ?? 45;
+                    savedBearingRef.current = viewState.bearing ?? 0;
+                    savedTerrainRef.current = terrainEnabled;
+                    if (terrainEnabled) setTerrainEnabled(false);
+                    const map = mapRef.current?.getMap();
+                    if (map) map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
+                  } else {
+                    setLosTarget(null);
+                    setLosCursor(null);
+                    setLosHighlightIdx(null);
+                    if (savedTerrainRef.current) setTerrainEnabled(true);
+                    const map = mapRef.current?.getMap();
+                    if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
+                  }
+                }}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${losMode ? "bg-[#a60739]" : "bg-gray-300"}`}
+                role="switch"
+                aria-checked={losMode}
+              >
+                <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${losMode ? "translate-x-4.5" : "translate-x-0.5"}`} />
+              </button>
+            </div>
+            {losMode && (
+              <div className="border-t border-[#a60739]/10 px-3 py-2 text-[10px] text-[#a60739]/70">
+                지도에서 분석할 지점을 클릭하세요
+              </div>
+            )}
+          </div>
 
-                {/* 계산 버튼 + 프로그레스 */}
-                {coverageLoading ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-xs text-[#a60739]">
-                      <Loader2 size={14} className="animate-spin flex-shrink-0" />
-                      <span className="truncate">{coverageProgress || "계산 중..."}</span>
-                    </div>
-                    <div className="h-2 w-full rounded-full bg-gray-200 overflow-hidden">
-                      <div
-                        className="h-full rounded-full bg-[#a60739] transition-all duration-300"
-                        style={{ width: `${Math.max(2, coverageProgressPct)}%` }}
-                      />
-                    </div>
-                    <div className="text-right text-[10px] text-gray-400">{coverageProgressPct}%</div>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {!gpuCacheReady || !isGPUCacheValidFor(radarSite) ? (
-                      <button
-                        onClick={() => startCoverageCompute(false)}
-                        className="w-full rounded-lg bg-[#a60739] py-2.5 text-xs font-medium text-white hover:bg-[#8a0630] transition-colors"
-                      >
-                        커버리지 계산 시작
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => startCoverageCompute(true)}
-                        className="w-full rounded-lg border border-gray-200 py-2 text-xs text-gray-600 hover:bg-gray-50 transition-colors"
-                      >
-                        커버리지 재계산
-                      </button>
-                    )}
-                  </div>
+          {/* 레이더 커버리지 카드 */}
+          <div className={`rounded-lg border transition-colors ${coverageVisible && gpuCacheReady ? "border-[#a60739]/30 bg-[#a60739]/5" : "border-gray-200 bg-gray-50"}`}>
+            <div className="flex items-center justify-between px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Radar size={14} className={coverageVisible && gpuCacheReady ? "text-[#a60739]" : "text-gray-400"} />
+                <span className={`text-xs font-medium ${coverageVisible && gpuCacheReady ? "text-[#a60739]" : "text-gray-600"}`}>커버리지 맵</span>
+                {coverageLoading && (
+                  <Loader2 size={12} className="animate-spin text-[#a60739]" />
                 )}
+              </div>
+              {gpuCacheReady && isGPUCacheValidFor(radarSite) && (
+                <button
+                  onClick={() => setCoverageVisible(!coverageVisible)}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${coverageVisible ? "bg-[#a60739]" : "bg-gray-300"}`}
+                  role="switch"
+                  aria-checked={coverageVisible}
+                >
+                  <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${coverageVisible ? "translate-x-4.5" : "translate-x-0.5"}`} />
+                </button>
+              )}
+            </div>
 
-                {/* 에러 메시지 */}
-                {coverageError && (
-                  <div className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600">
-                    {coverageError}
+            {/* 커버리지 본문 */}
+            <div ref={coverageAltRef} className="border-t border-gray-100 px-3 py-2.5 space-y-3">
+              {/* 계산 버튼 + 프로그레스 */}
+              {coverageLoading ? (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-[11px] text-[#a60739]">
+                    <span className="truncate">{coverageProgress || "계산 중..."}</span>
                   </div>
-                )}
+                  <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                      style={{ width: `${Math.max(2, coverageProgressPct)}%` }}
+                    />
+                  </div>
+                  <div className="text-right text-[10px] text-gray-400">{coverageProgressPct}%</div>
+                </div>
+              ) : !gpuCacheReady || !isGPUCacheValidFor(radarSite) ? (
+                <button
+                  onClick={() => startCoverageCompute(false)}
+                  className="w-full rounded-lg bg-[#a60739] py-2 text-xs font-medium text-white hover:bg-[#8a0630] transition-colors"
+                >
+                  커버리지 계산 시작
+                </button>
+              ) : (
+                <button
+                  onClick={() => startCoverageCompute(true)}
+                  className="w-full rounded-md border border-gray-200 py-1.5 text-[11px] text-gray-500 hover:bg-gray-50 transition-colors"
+                >
+                  재계산
+                </button>
+              )}
 
-                {/* 아래 컨트롤은 프로파일 계산 완료 후 활성화 */}
-                {gpuCacheReady && isGPUCacheValidFor(radarSite) && (
-                  <>
-                    {/* 구분선 */}
-                    <div className="border-t border-gray-100" />
+              {/* 에러 */}
+              {coverageError && (
+                <div className="rounded-md bg-red-50 px-2.5 py-1.5 text-[11px] text-red-600">
+                  {coverageError}
+                </div>
+              )}
 
-                    {/* 2D/3D 모드 세그먼트 토글 */}
+              {/* 계산 완료 후 상세 설정 */}
+              {gpuCacheReady && isGPUCacheValidFor(radarSite) && (
+                <div className="space-y-2.5">
+                  {/* 투명도 */}
+                  <div className="space-y-1">
                     <div className="flex items-center justify-between">
-                      <label className="text-xs text-gray-600">표시 모드</label>
-                      <div className="flex rounded-lg border border-gray-200 overflow-hidden text-xs">
-                        <button
-                          onClick={() => {
-                            setCoverageMode("2d");
-                            setCoverage3DQuads(null);
-                          }}
-                          className={`px-3 py-1 transition-colors ${coverageMode === "2d" ? "bg-[#a60739] text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
-                        >
-                          2D
-                        </button>
-                        <button
-                          onClick={async () => {
-                            setCoverageMode("3d");
-                            setTerrainEnabled(true);
-                            if (!coverage3DQuads && hasCoverageCache()) {
-                              setCoverage3DLoading(true);
-                              try {
-                                const quads = await build3DSurfaceAsync();
-                                setCoverage3DQuads(quads);
-                              } catch (err) {
-                                console.error("3D 면 생성 실패:", err);
-                              } finally {
-                                setCoverage3DLoading(false);
-                              }
-                            }
-                          }}
-                          className={`px-3 py-1 transition-colors ${coverageMode === "3d" ? "bg-[#a60739] text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
-                          disabled={!hasCoverageCache()}
-                          title={!hasCoverageCache() ? "커버리지 계산 후 사용 가능" : "3D 최저 탐지고도 면"}
-                        >
-                          3D
-                        </button>
-                      </div>
+                      <span className="text-[11px] text-gray-500">투명도</span>
+                      <span className="text-[10px] font-medium text-[#a60739]">
+                        {Math.round((1 - coverageOpacity) * 100)}%
+                      </span>
                     </div>
+                    <input
+                      type="range" min={0.1} max={1} step={0.05}
+                      value={1.1 - coverageOpacity}
+                      onChange={(e) => setCoverageOpacity(1.1 - Number(e.target.value))}
+                      className="w-full accent-[#a60739]"
+                    />
+                  </div>
 
-                    {/* 3D 로딩 표시 */}
-                    {coverage3DLoading && (
-                      <div className="flex items-center gap-2 text-xs text-[#a60739]">
-                        <Loader2 size={12} className="animate-spin" />
-                        <span>3D 면 생성 중...</span>
-                      </div>
-                    )}
-
-                    {/* 3D 투명도 슬라이더 (3D 모드에서만 표시) */}
-                    {coverageMode === "3d" && (
-                      <div className="space-y-1">
-                        <div className="flex items-center justify-between">
-                          <label className="text-xs text-gray-600">투명도</label>
-                          <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-[10px] font-semibold text-[#a60739]">
-                            {Math.round((surfaceOpacity / 255) * 100)}%
-                          </span>
-                        </div>
-                        <input
-                          type="range"
-                          min={20}
-                          max={255}
-                          step={5}
-                          value={surfaceOpacity}
-                          onChange={(e) => setSurfaceOpacity(Number(e.target.value))}
-                          className="w-full accent-[#a60739]"
-                        />
-                      </div>
-                    )}
-
-                    {/* 표시/숨기기 토글 */}
-                    <div className="flex items-center justify-between">
-                      <label htmlFor="coverage-toggle" className="text-xs text-gray-600">커버리지 표시</label>
-                      <button
-                        id="coverage-toggle"
-                        onClick={() => setCoverageVisible(!coverageVisible)}
-                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${coverageVisible ? "bg-[#a60739]" : "bg-gray-300"}`}
-                        role="switch"
-                        aria-checked={coverageVisible}
-                      >
-                        <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${coverageVisible ? "translate-x-4.5" : "translate-x-0.5"}`} />
-                      </button>
-                    </div>
-
-                    {/* Cone of Silence 토글 */}
-                    <div className="flex items-center justify-between">
-                      <label htmlFor="cone-toggle" className="text-xs text-gray-600">Cone of Silence 표시</label>
-                      <button
-                        id="cone-toggle"
-                        onClick={() => setShowConeOfSilence(!showConeOfSilence)}
-                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showConeOfSilence ? "bg-[#a60739]" : "bg-gray-300"}`}
-                        role="switch"
-                        aria-checked={showConeOfSilence}
-                      >
-                        <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${showConeOfSilence ? "translate-x-4.5" : "translate-x-0.5"}`} />
-                      </button>
-                    </div>
-
-                    {/* 고도 범위 슬라이더 (2D 모드에서만 표시) */}
-                    {coverageMode === "2d" && <div className="space-y-2">
+                  {/* 고도 범위 */}
+                  {(
+                    <div className="space-y-1.5">
                       <div className="flex items-center justify-between">
-                        <label className="text-xs text-gray-600">표시 고도 범위</label>
-                        <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-xs font-semibold text-[#a60739]">
-                          {coverageAltMinInput.toLocaleString()}ft ~ {coverageAltInput.toLocaleString()}ft
+                        <span className="text-[11px] text-gray-500">고도</span>
+                        <span className="text-[10px] font-medium text-[#a60739]">
+                          {coverageAltMinInput.toLocaleString()}~{coverageAltInput.toLocaleString()}ft
                         </span>
                       </div>
                       {(() => {
@@ -2897,39 +2852,23 @@ export default function TrackMap() {
                         const pctMax = ((Math.max(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
                         return (
                           <div className="relative h-6">
-                            {/* 트랙 배경 — 썸 반지름(8px)만큼 좌우 여백 */}
                             <div className="absolute top-1/2 left-[8px] right-[8px] h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
-                            {/* 활성 범위 — 썸 위치와 동기화 */}
                             <div
                               className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
                               style={{ left: `calc(8px + (100% - 16px) * ${pctMin / 100})`, right: `calc(8px + (100% - 16px) * ${(100 - pctMax) / 100})` }}
                             />
-                            {/* 최소 핸들 */}
                             <input
-                              type="range"
-                              min={COVERAGE_MIN_ALT_FT}
-                              max={COVERAGE_MAX_ALT_FT}
-                              step={COVERAGE_ALT_STEP_FT}
+                              type="range" min={COVERAGE_MIN_ALT_FT} max={COVERAGE_MAX_ALT_FT} step={COVERAGE_ALT_STEP_FT}
                               value={coverageAltMinInput}
-                              onChange={(e) => {
-                                const v = Number(e.target.value);
-                                handleCoverageAltMinChange(Math.min(v, coverageAltInput));
-                              }}
+                              onChange={(e) => { const v = Number(e.target.value); handleCoverageAltMinChange(Math.min(v, coverageAltInput)); }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 30 : 20 }}
                               className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
                               aria-label="최소 고도"
                             />
-                            {/* 최대 핸들 */}
                             <input
-                              type="range"
-                              min={COVERAGE_MIN_ALT_FT}
-                              max={COVERAGE_MAX_ALT_FT}
-                              step={COVERAGE_ALT_STEP_FT}
+                              type="range" min={COVERAGE_MIN_ALT_FT} max={COVERAGE_MAX_ALT_FT} step={COVERAGE_ALT_STEP_FT}
                               value={coverageAltInput}
-                              onChange={(e) => {
-                                const v = Number(e.target.value);
-                                handleCoverageAltChange(Math.max(v, coverageAltMinInput));
-                              }}
+                              onChange={(e) => { const v = Number(e.target.value); handleCoverageAltChange(Math.max(v, coverageAltMinInput)); }}
                               style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 20 : 30 }}
                               className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
                               aria-label="최대 고도"
@@ -2941,29 +2880,17 @@ export default function TrackMap() {
                         <span>{COVERAGE_MIN_ALT_FT.toLocaleString()}ft</span>
                         <span>{COVERAGE_MAX_ALT_FT.toLocaleString()}ft</span>
                       </div>
-                    </div>}
-                  </>
-                )}
-              </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
-          </>
-        )}
-        </div>
+          </div>
 
-        {/* Terrain toggle */}
-        <button
-          onClick={() => setTerrainEnabled(!terrainEnabled)}
-          className={`rounded-lg border p-1 transition-colors ${
-            terrainEnabled
-              ? "border-[#a60739] bg-[#a60739] text-white shadow-sm"
-              : "border-transparent text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-          }`}
-          title="3D 지형"
-        >
-          <span className="flex h-4 w-4 items-center justify-center text-[11px] font-bold leading-none">3D</span>
-        </button>
-        </>,
-        document.getElementById("trackmap-toolbar-left")!,
+          </div>
+        </div>
+        </div>,
+        document.getElementById("trackmap-sidebar")!,
       )}
 
       {/* 타이틀바 포탈: 오른쪽 (통계) */}
@@ -3019,7 +2946,66 @@ export default function TrackMap() {
         >
           <DeckGLOverlay layers={deckLayers} />
           <NavigationControl position="top-right" showZoom={false} />
+          {addressMarker && (
+            <Marker longitude={addressMarker.lon} latitude={addressMarker.lat} anchor="bottom">
+              <div className="flex flex-col items-center">
+                <div className="relative mb-1 max-w-[200px] rounded-md bg-white/95 px-2 py-1 text-[10px] leading-tight text-gray-700 shadow-lg backdrop-blur-sm border border-gray-200">
+                  <div className="line-clamp-2">{addressMarker.label}</div>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setAddressMarker(null); }}
+                    className="absolute -top-1.5 -right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-gray-500 text-white shadow hover:bg-gray-700 transition-colors"
+                  >
+                    <X size={8} />
+                  </button>
+                  <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 h-2 w-2 rotate-45 bg-white/95 border-b border-r border-gray-200" />
+                </div>
+                <MapPin size={24} className="text-[#a60739] drop-shadow-md" fill="#a60739" strokeWidth={1} stroke="#fff" />
+              </div>
+            </Marker>
+          )}
         </MapGL>
+
+        {/* 주소 검색 오버레이 */}
+        <div ref={addressRef} className="absolute top-2 left-2 z-[800]" style={{ width: 280 }}>
+          <div className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white/95 px-2.5 py-1.5 shadow-lg backdrop-blur-sm">
+            <Search size={14} className="shrink-0 text-gray-400" />
+            <input
+              type="text"
+              value={addressQuery}
+              onChange={(e) => { handleAddressInput(e.target.value); setAddressOpen(true); }}
+              onFocus={() => { if (addressResults.length > 0) setAddressOpen(true); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); searchAddress(addressQuery); setAddressOpen(true); }
+                if (e.key === "Escape") setAddressOpen(false);
+              }}
+              placeholder="주소 검색..."
+              className="flex-1 bg-transparent text-xs text-gray-700 outline-none placeholder:text-gray-400"
+            />
+            {addressSearching && <Loader2 size={12} className="animate-spin text-gray-400" />}
+            {addressQuery && !addressSearching && (
+              <button onClick={() => { setAddressQuery(""); setAddressResults([]); setAddressOpen(false); setAddressMarker(null); }} className="text-gray-400 hover:text-gray-600">
+                <X size={12} />
+              </button>
+            )}
+          </div>
+          {addressOpen && addressResults.length > 0 && (
+            <div className="mt-1 max-h-[200px] overflow-y-auto rounded-lg border border-gray-200 bg-white/95 shadow-lg backdrop-blur-sm">
+              {addressResults.map((r, i) => (
+                <button
+                  key={i}
+                  onClick={() => selectAddress(r.lat, r.lon, r.display_name)}
+                  className="flex w-full items-start gap-2 px-2.5 py-2 text-left text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+                >
+                  <MapPin size={12} className="mt-0.5 shrink-0 text-[#a60739]" />
+                  <div className="min-w-0">
+                    <div className="line-clamp-2">{r.display_name}</div>
+                    {r.jibun_addr && <div className="text-[10px] text-gray-400 mt-0.5 line-clamp-1">{r.jibun_addr}</div>}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* Hover tooltip */}
         {hoverInfo && (
@@ -3130,17 +3116,18 @@ export default function TrackMap() {
                     </label>
                   </>
                 )}
-                {coverageVisible && coverageLayers.length > 0 && (() => {
+                {coverageVisible && gpuCacheReady && (() => {
                   const fmtAlt = (ft: number) => `${ft.toLocaleString()}ft`;
-                  const sorted = [...coverageLayers].sort((a, b) => a.altitudeFt - b.altitudeFt);
-                  // 밴드가 너무 많으면 대표 밴드만 표시 (최대 5개)
+                  // 슬라이더 값에서 레전드 밴드 직접 계산
+                  const effMin = Math.min(coverageAltMin, coverageAlt);
+                  const effMax = Math.max(coverageAltMin, coverageAlt);
                   const maxBands = 5;
-                  const bands = sorted.length <= maxBands
-                    ? sorted
-                    : (() => {
-                        const step = (sorted.length - 1) / (maxBands - 1);
-                        return Array.from({ length: maxBands }, (_, i) => sorted[Math.round(i * step)]);
-                      })();
+                  const bandStep = maxBands > 1 ? (effMax - effMin) / (maxBands - 1) : 0;
+                  const bands = maxBands > 1
+                    ? Array.from({ length: maxBands }, (_, i) => ({
+                        altitudeFt: Math.round((effMin + bandStep * i) / COVERAGE_ALT_STEP_FT) * COVERAGE_ALT_STEP_FT,
+                      }))
+                    : [{ altitudeFt: effMin }];
                   return (
                     <div className="flex flex-col gap-0.5">
                       <span className="text-gray-500 text-[8px] font-medium">커버리지</span>
