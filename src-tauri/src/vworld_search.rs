@@ -1,7 +1,8 @@
-//! vworld 통합검색 스크래핑 기반 주소/장소 검색
+//! vworld 통합검색 스크래핑 기반 주소/장소 검색 + 건물 상세정보
 //!
 //! map.vworld.kr 지도의 통합검색 엔드포인트(unifiedSearch2.do)를 사용하여
 //! 도로명주소 + 장소/건물명 검색 + 좌표(WGS84) 반환. API 키 불필요.
+//! 건물 상세정보는 po_buildMetaInfoGIS.do 엔드포인트에서 HTML 파싱.
 
 use serde::{Deserialize, Serialize};
 
@@ -169,4 +170,165 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<VWorldSearchResult>
     // limit 적용
     results.truncate(limit);
     Ok(results)
+}
+
+// ─── 건물 상세정보 (po_buildMetaInfoGIS.do) ───
+
+const BUILDING_INFO_URL: &str = "https://map.vworld.kr/dtkmap/po_buildMetaInfoGIS.do";
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct VWorldBuildingInfo {
+    /// 건물명칭
+    pub name: String,
+    /// 건물동명칭
+    pub dong_name: String,
+    /// 도로명주소
+    pub road_addr: String,
+    /// 지번주소
+    pub jibun_addr: String,
+    /// 건물용도
+    pub usage: String,
+    /// 구조
+    pub structure: String,
+    /// 지상층수
+    pub floors_above: String,
+    /// 지하층수
+    pub floors_below: String,
+    /// 건물높이 (m)
+    pub height: String,
+    /// 건물면적 (m²)
+    pub area: String,
+    /// 연면적 (m²)
+    pub total_area: String,
+    /// 대지면적 (m²)
+    pub site_area: String,
+    /// 용적률 (%)
+    pub floor_area_ratio: String,
+    /// 건폐율 (%)
+    pub building_coverage: String,
+    /// 사용승인일자
+    pub approval_date: String,
+}
+
+/// WGS84 → EPSG:3857 (Web Mercator) 변환
+fn wgs84_to_epsg3857(lat: f64, lon: f64) -> (f64, f64) {
+    let x = lon * 20037508.34 / 180.0;
+    let y = ((90.0 + lat) * std::f64::consts::PI / 360.0).tan().ln() * 20037508.34
+        / std::f64::consts::PI;
+    (x, y)
+}
+
+/// HTML 테이블에서 <th>text</th><td>value</td> 쌍 추출
+fn extract_th_td_pairs(html: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut pos = 0;
+    while let Some(th_start) = html[pos..].find("<th") {
+        let th_start = pos + th_start;
+        // <th ...> 닫는 > 찾기
+        let Some(th_open_end) = html[th_start..].find('>') else { break };
+        let th_content_start = th_start + th_open_end + 1;
+        let Some(th_end) = html[th_content_start..].find("</th>") else { break };
+        let th_text = html[th_content_start..th_content_start + th_end].trim().to_string();
+
+        // 바로 뒤 <td> 찾기
+        let after_th = th_content_start + th_end + 5;
+        if let Some(td_start) = html[after_th..].find("<td") {
+            let td_start = after_th + td_start;
+            if let Some(td_open_end) = html[td_start..].find('>') {
+                let td_content_start = td_start + td_open_end + 1;
+                if let Some(td_end) = html[td_content_start..].find("</td>") {
+                    let td_text = html[td_content_start..td_content_start + td_end]
+                        .trim()
+                        .to_string();
+                    // HTML 태그 제거
+                    let clean = strip_html_tags(&td_text);
+                    pairs.push((th_text, clean));
+                    pos = td_content_start + td_end + 5;
+                    continue;
+                }
+            }
+        }
+        pos = after_th;
+    }
+    pairs
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 좌표(WGS84)로 건물 상세정보 조회
+pub async fn fetch_building_info(lat: f64, lon: f64) -> Result<Option<VWorldBuildingInfo>, String> {
+    let client = build_client()?;
+    let (x, y) = wgs84_to_epsg3857(lat, lon);
+
+    let url = format!(
+        "{}?SRSNAME=EPSG:900913&BLDGPOS=POINT({}%20{})&MAPMODE=2D",
+        BUILDING_INFO_URL, x, y,
+    );
+
+    let resp = client
+        .get(&url)
+        .header("Referer", REFERER)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .send()
+        .await
+        .map_err(|e| format!("건물정보 요청 실패: {e}"))?;
+
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| format!("건물정보 응답 읽기 실패: {e}"))?;
+
+    // 건물 데이터가 없는 경우
+    if html.contains("데이터가 없습니다") || html.contains("정보가 없습니다") || html.len() < 100 {
+        return Ok(None);
+    }
+
+    let pairs = extract_th_td_pairs(&html);
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+
+    let mut info = VWorldBuildingInfo::default();
+    for (key, val) in &pairs {
+        let v = val.trim().to_string();
+        if v.is_empty() || v == "-" {
+            continue;
+        }
+        match key.as_str() {
+            "건물명칭" => info.name = v,
+            "건물동명칭" => info.dong_name = v,
+            "도로명" | "도로명주소" => info.road_addr = v,
+            "지번" | "지번주소" => info.jibun_addr = v,
+            "건물용도" => info.usage = v,
+            "구조" => info.structure = v,
+            "지상층수" => info.floors_above = v,
+            "지하층수" => info.floors_below = v,
+            "건물높이" => info.height = v,
+            "건물면적" => info.area = v,
+            "연면적" => info.total_area = v,
+            "대지면적" => info.site_area = v,
+            "용적률" => info.floor_area_ratio = v,
+            "건폐율" => info.building_coverage = v,
+            "사용승인일자" => info.approval_date = v,
+            _ => {}
+        }
+    }
+
+    Ok(Some(info))
 }

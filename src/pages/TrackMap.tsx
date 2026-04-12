@@ -233,9 +233,31 @@ export default function TrackMap() {
   const [hiddenBuildingSources, setHiddenBuildingSources] = useState<Set<string>>(new Set());
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
   const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
+  // 건물 클릭 시 VWorld 건축물정보 팝업
+  const [bldgPopup, setBldgPopup] = useState<{
+    x: number; y: number; lat: number; lon: number;
+    loading: boolean;
+    info: {
+      name: string; dong_name: string; road_addr: string; jibun_addr: string;
+      usage: string; structure: string; floors_above: string; floors_below: string;
+      height: string; area: string; total_area: string; site_area: string;
+      floor_area_ratio: string; building_coverage: string; approval_date: string;
+    } | null;
+    localName?: string; localHeight?: number; localUsage?: string;
+  } | null>(null);
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
   const [trailDuration, setTrailDuration] = useState(0);
+
+  // bldgPopup 좌표 설정 시 VWorld 건물정보 조회
+  useEffect(() => {
+    if (!bldgPopup || !bldgPopup.loading) return;
+    let cancelled = false;
+    invoke<typeof bldgPopup.info>("get_vworld_building_info", { lat: bldgPopup.lat, lon: bldgPopup.lon })
+      .then((res) => { if (!cancelled) setBldgPopup((prev) => prev ? { ...prev, loading: false, info: res ?? null } : null); })
+      .catch(() => { if (!cancelled) setBldgPopup((prev) => prev ? { ...prev, loading: false, info: null } : null); });
+    return () => { cancelled = true; };
+  }, [bldgPopup?.lat, bldgPopup?.lon]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 비행 선택 시 시간 바 리셋 (전체 범위 표시)
   useEffect(() => {
@@ -945,10 +967,24 @@ export default function TrackMap() {
     };
 
     const onClick = (e: maplibregl.MapMouseEvent) => {
-      if (!map.getLayer(layerId)) return;
+      if (!map.getLayer(layerId)) { setBldgPopup(null); return; }
       const features = map.queryRenderedFeatures(e.point, { layers: [layerId] });
-      if (features.length > 0 && losTarget) {
-        losPointClickedRef.current = true;
+      if (features.length > 0) {
+        if (losTarget) losPointClickedRef.current = true;
+        const p = features[0].properties;
+        if (p) {
+          const lat = Number(p.lat);
+          const lon = Number(p.lon);
+          setBldgPopup({
+            x: e.point.x, y: e.point.y, lat, lon,
+            loading: true, info: null,
+            localName: p.name || undefined,
+            localHeight: p.height ? Number(p.height) : undefined,
+            localUsage: p.usage || undefined,
+          });
+        }
+      } else {
+        setBldgPopup(null);
       }
     };
 
@@ -1834,7 +1870,19 @@ export default function TrackMap() {
         getFillColor: fillColor,
         updateTriggers: { getFillColor: [losBuildingHighlight], getRadius: [losBuildingHighlight] },
         pickable: true,
-        onClick: () => { if (losTarget) losPointClickedRef.current = true; },
+        onClick: (info: { object?: Building3D; x: number; y: number }) => {
+          if (losTarget) losPointClickedRef.current = true;
+          if (info.object) {
+            const d = info.object;
+            setBldgPopup({
+              x: info.x, y: info.y, lat: d.lat, lon: d.lon,
+              loading: true, info: null,
+              localName: d.name || undefined,
+              localHeight: d.height_m,
+              localUsage: d.usage || undefined,
+            });
+          }
+        },
         onHover: buildingHover,
       }),
     ];
@@ -2907,6 +2955,82 @@ export default function TrackMap() {
         )}
 
 
+
+        {/* 건축물정보 팝업 (건물 클릭 시) */}
+        {bldgPopup && (
+          <div
+            className="absolute z-[1100] rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm"
+            style={{
+              left: Math.min(bldgPopup.x + 14, window.innerWidth - 310),
+              top: Math.max(bldgPopup.y - 14, 8),
+              width: 280,
+            }}
+          >
+            {/* 헤더 */}
+            <div className="flex items-center justify-between border-b border-gray-100 px-3 py-2">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <Building2 size={12} className="shrink-0 text-[#a60739]" />
+                <span className="text-[11px] font-semibold text-gray-800 truncate">
+                  {bldgPopup.info?.name || bldgPopup.localName || "건축물정보"}
+                </span>
+              </div>
+              <button
+                onClick={() => setBldgPopup(null)}
+                className="rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors ml-1.5"
+              >
+                <X size={12} />
+              </button>
+            </div>
+            {/* 내용 */}
+            <div className="max-h-[320px] overflow-y-auto">
+              {bldgPopup.loading ? (
+                <div className="flex items-center justify-center gap-2 px-3 py-4 text-[10px] text-gray-400">
+                  <Loader2 size={12} className="animate-spin" />
+                  조회 중...
+                </div>
+              ) : (() => {
+                const bi = bldgPopup.info;
+                const rows: [string, string][] = [];
+                if (bi) {
+                  if (bi.road_addr) rows.push(["도로명", bi.road_addr]);
+                  if (bi.jibun_addr) rows.push(["지번", bi.jibun_addr]);
+                  if (bi.usage) rows.push(["용도", bi.usage]);
+                  if (bi.structure) rows.push(["구조", bi.structure]);
+                  if (bi.floors_above || bi.floors_below) rows.push(["층수", `지상 ${bi.floors_above || "-"} / 지하 ${bi.floors_below || "-"}`]);
+                  if (bi.height) rows.push(["높이", bi.height]);
+                  if (bi.area) rows.push(["건물면적", bi.area]);
+                  if (bi.total_area) rows.push(["연면적", bi.total_area]);
+                  if (bi.site_area) rows.push(["대지면적", bi.site_area]);
+                  if (bi.floor_area_ratio || bi.building_coverage) rows.push(["용적률/건폐율", `${bi.floor_area_ratio || "-"} / ${bi.building_coverage || "-"}`]);
+                  if (bi.approval_date) rows.push(["사용승인", bi.approval_date]);
+                }
+                if (rows.length === 0) {
+                  // VWorld 정보 없으면 로컬 정보라도 표시
+                  if (bldgPopup.localHeight) rows.push(["높이", `${bldgPopup.localHeight.toFixed(1)}m`]);
+                  if (bldgPopup.localUsage) rows.push(["용도", bldgPopup.localUsage]);
+                  rows.push(["좌표", `${bldgPopup.lat.toFixed(6)}°N, ${bldgPopup.lon.toFixed(6)}°E`]);
+                  if (rows.length <= 1) return <div className="px-3 py-3 text-[10px] text-gray-400 text-center">건축물정보 없음</div>;
+                }
+                return (
+                  <table className="w-full text-[10px]">
+                    <tbody>
+                      {rows.map(([k, v], i) => (
+                        <tr key={i} className={i % 2 === 0 ? "bg-white" : "bg-gray-50/50"}>
+                          <td className="px-2.5 py-1.5 text-gray-400 whitespace-nowrap w-[76px] align-top font-medium">{k}</td>
+                          <td className="px-2 py-1.5 text-gray-700 break-all">{v}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                );
+              })()}
+            </div>
+            {/* 좌표 푸터 */}
+            <div className="border-t border-gray-100 px-3 py-1.5 text-[9px] text-gray-400">
+              {bldgPopup.lat.toFixed(6)}°N, {bldgPopup.lon.toFixed(6)}°E
+            </div>
+          </div>
+        )}
 
         {/* 범례 (왼쪽 하단) — 항적/건물/커버리지 중 하나라도 활성이면 표시 */}
         {(allPoints.length > 0 || showBuildings || coverageVisible) && (

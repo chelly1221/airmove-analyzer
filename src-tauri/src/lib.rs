@@ -2919,6 +2919,14 @@ async fn search_vworld_address(
     vworld_search::search(&query, lim).await
 }
 
+#[tauri::command]
+async fn get_vworld_building_info(
+    lat: f64,
+    lon: f64,
+) -> Result<Option<vworld_search::VWorldBuildingInfo>, String> {
+    vworld_search::fetch_building_info(lat, lon).await
+}
+
 /// 호출자 윈도우의 DevTools 활성화
 #[tauri::command]
 fn open_devtools(window: tauri::WebviewWindow) {
@@ -3094,8 +3102,9 @@ pub fn run() {
             get_landuse_tile_count,
             clear_landuse_tiles,
             get_landuse_tile,
-            // 주소 검색 (vworld)
+            // 주소 검색 + 건물 상세정보 (vworld)
             search_vworld_address,
+            get_vworld_building_info,
             // vworld 자동 다운로드
             vworld_download_buildings,
             vworld_download_fac_buildings,
