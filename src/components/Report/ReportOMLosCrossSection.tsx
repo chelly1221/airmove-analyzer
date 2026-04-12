@@ -3,6 +3,8 @@ import type { ManualBuilding, RadarSite, LoSProfileData, ElevationPoint } from "
 import type { ObstacleMonthlyResult, LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportPage from "./ReportPage";
+import { haversineKm, bearingDeg } from "../../utils/geo";
+import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 
 interface Props {
   sectionNum: number;
@@ -33,43 +35,7 @@ const NM_TO_KM = 1.852;
 const MAX_RANGE_NM = 200;
 const MAX_RANGE_KM = MAX_RANGE_NM * NM_TO_KM; // 370.4km
 
-/** 탐지 유형별 색상 (TrackMap/LoSProfilePanel과 동일) */
-const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
-  mode_ac:              [234, 179, 8],
-  mode_ac_psr:          [234, 179, 8],
-  mode_s_allcall:       [34, 197, 94],
-  mode_s_allcall_psr:   [34, 197, 94],
-  mode_s_rollcall:      [16, 185, 129],
-  mode_s_rollcall_psr:  [16, 185, 129],
-};
-const PSR_TYPES = new Set(["mode_ac_psr", "mode_s_allcall_psr", "mode_s_rollcall_psr"]);
 const LOSS_COLOR: [number, number, number] = [255, 23, 69]; // #ff1745
-function detectionColor(rt: string): [number, number, number] {
-  return DETECTION_TYPE_COLORS[rt] ?? [128, 128, 128];
-}
-
-function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const y = Math.sin(dLon) * Math.cos((lat2 * Math.PI) / 180);
-  const x =
-    Math.cos((lat1 * Math.PI) / 180) * Math.sin((lat2 * Math.PI) / 180) -
-    Math.sin((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.cos(dLon);
-  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
-}
 
 /** 프로파일 보간 */
 function interpTerrainElev(profile: ElevationPoint[], d: number): number {
@@ -164,7 +130,7 @@ function LosCrossSection({
     }));
 
     // 건물 정보
-    const bDistKm = haversine(
+    const bDistKm = haversineKm(
       los.radarLat, los.radarLon,
       building.latitude, building.longitude,
     );
@@ -372,7 +338,7 @@ function LosCrossSection({
             const adjAlt = tp.altM - curvDrop(tp.distKm);
             const px = xScale(tp.distKm);
             const py = yScale(adjAlt);
-            const col = detectionColor(tp.radarType);
+            const col = detectionTypeColor(tp.radarType);
             const hasPsr = PSR_TYPES.has(tp.radarType);
             return (
               <circle
@@ -496,7 +462,7 @@ function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, lo
         const projectedTrack: ChartTrackPoint[] = [];
         for (const tp of allTrack) {
           if (!isInBearing(tp.lat, tp.lon)) continue;
-          const distKm = haversine(radarLat, radarLon, tp.lat, tp.lon);
+          const distKm = haversineKm(radarLat, radarLon, tp.lat, tp.lon);
           if (distKm > MAX_RANGE_KM) continue;
           projectedTrack.push({ distKm, altM: tp.alt_ft / M_TO_FT, radarType: tp.radar_type, isLoss: false });
         }
@@ -506,7 +472,7 @@ function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, lo
         const projectedLoss: ChartTrackPoint[] = [];
         for (const lp of allLoss) {
           if (!isInBearing(lp.lat, lp.lon)) continue;
-          const distKm = haversine(radarLat, radarLon, lp.lat, lp.lon);
+          const distKm = haversineKm(radarLat, radarLon, lp.lat, lp.lon);
           if (distKm > MAX_RANGE_KM) continue;
           projectedLoss.push({ distKm, altM: lp.alt_ft / M_TO_FT, radarType: "", isLoss: true });
         }

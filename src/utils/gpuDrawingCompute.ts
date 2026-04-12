@@ -1,71 +1,40 @@
 /**
- * Drawing 탭 전용 WebGPU Compute Shader
+ * Drawing 탭 전용 WebGPU Compute — GPU Worker에 위임
  *
  * (1) haversine 최대 거리 병렬 리덕션
- * (2) ewDists 좌표 변환 (lon/lat/alt → screenX/screenY)
+ * (2) ewDists 좌표 변환
  * (3) density histogram 버킷 계산
  *
- * GPU 필수 — 미지원 시 에러 throw
+ * 모든 GPU 연산은 gpuCoverage Worker에서 실행 (메인 스레드 블로킹 0)
  */
 
-import { getGPUDevice, createBuffer, readBuffer, runComputeShader } from "./gpuCompute";
+import { getGPUWorkerInstance } from "./gpuCoverage";
 
-// ─── (1) Haversine 최대 거리 ──────────────────────────
+/** Worker에 메시지 전송 후 결과 대기 (seq 기반) */
+async function workerRPC<T>(
+  msgType: string,
+  resultType: string,
+  payload: Record<string, unknown>,
+  transfer?: Transferable[],
+): Promise<T> {
+  const worker = await getGPUWorkerInstance();
+  const seq = Date.now() + Math.random();
 
-const MAX_DISTANCE_SHADER = /* wgsl */ `
-const R: f32 = 6371.0;
-const DEG2RAD: f32 = 3.14159265358979 / 180.0;
-
-struct Params {
-  radar_lat: f32,
-  radar_lon: f32,
-  count: u32,
-  _pad: u32,
+  return new Promise<T>((resolve, reject) => {
+    const handler = (e: MessageEvent) => {
+      if (e.data.seq !== seq) return;
+      if (e.data.type === resultType) {
+        worker.removeEventListener("message", handler);
+        resolve(e.data as T);
+      } else if (e.data.type === "ERROR") {
+        worker.removeEventListener("message", handler);
+        reject(new Error(e.data.error));
+      }
+    };
+    worker.addEventListener("message", handler);
+    worker.postMessage({ type: msgType, seq, ...payload }, transfer ?? []);
+  });
 }
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> points: array<f32>;    // [lat0,lon0, lat1,lon1, ...]
-@group(0) @binding(2) var<storage, read_write> results: array<f32>; // 워크그룹당 1개 max
-
-var<workgroup> sdata: array<f32, 256>;
-
-@compute @workgroup_size(256)
-fn main(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_id) lid: vec3<u32>,
-  @builtin(workgroup_id) wid: vec3<u32>,
-) {
-  var dist: f32 = 0.0;
-  let idx = gid.x;
-  if (idx < params.count) {
-    let lat1 = params.radar_lat * DEG2RAD;
-    let lon1 = params.radar_lon * DEG2RAD;
-    let lat2 = points[idx * 2u] * DEG2RAD;
-    let lon2 = points[idx * 2u + 1u] * DEG2RAD;
-    let dLat = lat2 - lat1;
-    let dLon = lon2 - lon1;
-    let a = sin(dLat * 0.5) * sin(dLat * 0.5)
-          + cos(lat1) * cos(lat2) * sin(dLon * 0.5) * sin(dLon * 0.5);
-    dist = R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
-  }
-
-  // workgroup 내 shared memory 리덕션
-  sdata[lid.x] = dist;
-  workgroupBarrier();
-
-  // 트리 리덕션
-  for (var s = 128u; s > 0u; s >>= 1u) {
-    if (lid.x < s) {
-      sdata[lid.x] = max(sdata[lid.x], sdata[lid.x + s]);
-    }
-    workgroupBarrier();
-  }
-
-  if (lid.x == 0u) {
-    results[wid.x] = sdata[0];
-  }
-}
-`;
 
 /**
  * GPU로 전체 포인트 중 레이더로부터 최대 거리(km) 계산
@@ -73,75 +42,17 @@ fn main(
 export async function computeMaxDistanceGPU(
   radarLat: number,
   radarLon: number,
-  latLonPairs: Float32Array, // [lat0,lon0, lat1,lon1, ...]
+  latLonPairs: Float32Array,
 ): Promise<number> {
-  const device = await getGPUDevice();
-
-  const count = latLonPairs.length / 2;
-  if (count === 0) return 0;
-
-  // Params uniform
-  const paramsBuf = new ArrayBuffer(16);
-  const pf = new Float32Array(paramsBuf);
-  const pu = new Uint32Array(paramsBuf);
-  pf[0] = radarLat;
-  pf[1] = radarLon;
-  pu[2] = count;
-  pu[3] = 0;
-
-  const uniformBuf = createBuffer(device, new Float32Array(paramsBuf),
-    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-  const pointsBuf = createBuffer(device, latLonPairs,
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-
-  const numWorkgroups = Math.ceil(count / 256);
-  const resultSize = numWorkgroups * 4;
-  const resultBuf = device.createBuffer({
-    size: resultSize,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-
-  await runComputeShader(device, MAX_DISTANCE_SHADER, [
-    { buffer: uniformBuf, type: "uniform" },
-    { buffer: pointsBuf, type: "read-only-storage" },
-    { buffer: resultBuf, type: "storage" },
-  ], [numWorkgroups, 1, 1]);
-
-  const results = await readBuffer(device, resultBuf, resultSize);
-
-  uniformBuf.destroy();
-  pointsBuf.destroy();
-  resultBuf.destroy();
-
-  // CPU에서 워크그룹별 max를 최종 리듀스
-  let maxDist = 0;
-  for (let i = 0; i < numWorkgroups; i++) {
-    if (results[i] > maxDist) maxDist = results[i];
-  }
-  return maxDist;
+  if (latLonPairs.length === 0) return 0;
+  const copy = new Float32Array(latLonPairs);
+  const result = await workerRPC<{ maxDistKm: number }>(
+    "MAX_DISTANCE", "MAX_DISTANCE_RESULT",
+    { radarLat, radarLon, latLonPairs: copy.buffer },
+    [copy.buffer],
+  );
+  return result.maxDistKm;
 }
-
-// ─── (2) EW 거리 변환 ─────────────────────────────────
-
-const EWDIST_SHADER = /* wgsl */ `
-struct Params {
-  radar_lon: f32,
-  cos_lat: f32,
-  count: u32,
-  _pad: u32,
-}
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> lons: array<f32>;
-@group(0) @binding(2) var<storage, read_write> ew_dists: array<f32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
-  if (idx >= params.count) { return; }
-  ew_dists[idx] = (lons[idx] - params.radar_lon) * 111.32 * params.cos_lat;
-}
-`;
 
 export interface EwDistResult {
   ewDists: Float32Array;
@@ -157,80 +68,15 @@ export async function computeEwDistsGPU(
   cosLat: number,
   lons: Float32Array,
 ): Promise<EwDistResult> {
-  const device = await getGPUDevice();
-
-  const count = lons.length;
-  if (count === 0) return { ewDists: new Float32Array(0), minEW: 0, maxEW: 0 };
-
-  const paramsBuf = new ArrayBuffer(16);
-  const pf = new Float32Array(paramsBuf);
-  const pu = new Uint32Array(paramsBuf);
-  pf[0] = radarLon;
-  pf[1] = cosLat;
-  pu[2] = count;
-  pu[3] = 0;
-
-  const uniformBuf = createBuffer(device, new Float32Array(paramsBuf),
-    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-  const lonsBuf = createBuffer(device, lons,
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-  const outputSize = count * 4;
-  const outputBuf = device.createBuffer({
-    size: outputSize,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-
-  const numWorkgroups = Math.ceil(count / 256);
-  await runComputeShader(device, EWDIST_SHADER, [
-    { buffer: uniformBuf, type: "uniform" },
-    { buffer: lonsBuf, type: "read-only-storage" },
-    { buffer: outputBuf, type: "storage" },
-  ], [numWorkgroups, 1, 1]);
-
-  const ewDists = await readBuffer(device, outputBuf, outputSize);
-
-  uniformBuf.destroy();
-  lonsBuf.destroy();
-  outputBuf.destroy();
-
-  // min/max는 CPU에서 (결과 배열이 이미 GPU에서 돌아옴)
-  let minEW = 0, maxEW = 0;
-  for (let i = 0; i < count; i++) {
-    const v = ewDists[i];
-    if (v < minEW) minEW = v;
-    if (v > maxEW) maxEW = v;
-  }
-
-  return { ewDists, minEW, maxEW };
+  if (lons.length === 0) return { ewDists: new Float32Array(0), minEW: 0, maxEW: 0 };
+  const copy = new Float32Array(lons);
+  const result = await workerRPC<{ ewDists: ArrayBuffer; minEW: number; maxEW: number }>(
+    "EW_DISTS", "EW_DISTS_RESULT",
+    { radarLon, cosLat, lons: copy.buffer },
+    [copy.buffer],
+  );
+  return { ewDists: new Float32Array(result.ewDists), minEW: result.minEW, maxEW: result.maxEW };
 }
-
-// ─── (3) Density Histogram ────────────────────────────
-
-const HISTOGRAM_SHADER = /* wgsl */ `
-struct Params {
-  view_min_ts: f32,
-  view_max_ts: f32,
-  num_buckets: u32,
-  count: u32,
-}
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> timestamps: array<f32>;
-@group(0) @binding(2) var<storage, read_write> buckets: array<atomic<u32>>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
-  if (idx >= params.count) { return; }
-  let ts = timestamps[idx];
-  if (ts < params.view_min_ts || ts > params.view_max_ts) { return; }
-  let span = params.view_max_ts - params.view_min_ts;
-  if (span <= 0.0) { return; }
-  let bucket_f = ((ts - params.view_min_ts) / span) * f32(params.num_buckets);
-  let bucket_idx = min(u32(bucket_f), params.num_buckets - 1u);
-  atomicAdd(&buckets[bucket_idx], 1u);
-}
-`;
 
 /**
  * GPU로 밀도 히스토그램 계산
@@ -241,52 +87,12 @@ export async function computeDensityHistogramGPU(
   viewMaxTs: number,
   numBuckets: number = 200,
 ): Promise<number[]> {
-  const device = await getGPUDevice();
-
-  const count = timestamps.length;
-  if (count === 0 || viewMaxTs <= viewMinTs) return new Array(numBuckets).fill(0);
-
-  const paramsBuf = new ArrayBuffer(16);
-  const pf = new Float32Array(paramsBuf);
-  const pu = new Uint32Array(paramsBuf);
-  pf[0] = viewMinTs;
-  pf[1] = viewMaxTs;
-  pu[2] = numBuckets;
-  pu[3] = count;
-
-  const uniformBuf = createBuffer(device, new Float32Array(paramsBuf),
-    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-  const tsBuf = createBuffer(device, timestamps,
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-
-  // 버킷 초기화 (0으로)
-  const bucketSize = numBuckets * 4;
-  const bucketBuf = createBuffer(device, new Uint32Array(numBuckets),
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-
-  const numWorkgroups = Math.ceil(count / 256);
-  await runComputeShader(device, HISTOGRAM_SHADER, [
-    { buffer: uniformBuf, type: "uniform" },
-    { buffer: tsBuf, type: "read-only-storage" },
-    { buffer: bucketBuf, type: "storage" },
-  ], [numWorkgroups, 1, 1]);
-
-  const resultF32 = await readBuffer(device, bucketBuf, bucketSize);
-  const resultU32 = new Uint32Array(resultF32.buffer);
-
-  uniformBuf.destroy();
-  tsBuf.destroy();
-  bucketBuf.destroy();
-
-  // 정규화
-  let maxCount = 1;
-  for (let i = 0; i < numBuckets; i++) {
-    if (resultU32[i] > maxCount) maxCount = resultU32[i];
-  }
-  const normalized: number[] = new Array(numBuckets);
-  for (let i = 0; i < numBuckets; i++) {
-    normalized[i] = resultU32[i] / maxCount;
-  }
-  return normalized;
+  if (timestamps.length === 0 || viewMaxTs <= viewMinTs) return new Array(numBuckets).fill(0);
+  const copy = new Float32Array(timestamps);
+  const result = await workerRPC<{ buckets: number[] }>(
+    "DENSITY_HISTOGRAM", "DENSITY_HISTOGRAM_RESULT",
+    { timestamps: copy.buffer, viewMinTs, viewMaxTs, numBuckets },
+    [copy.buffer],
+  );
+  return result.buckets;
 }
-

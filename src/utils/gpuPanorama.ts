@@ -1,19 +1,14 @@
 /**
- * WebGPU Compute Shader로 360° 파노라마 앙각 계산 가속
+ * WebGPU 파노라마 앙각 계산 — GPU Worker에 위임
  *
- * 아키텍처 (heightmap 3D 리팩토링):
- *   Phase 1: Rust — SRTM + 건물 → 2D heightmap (ENU 그리드, 1회 IPC)
- *   Phase 2: GPU — heightmap에서 polar→ENU 샘플링 + 실제 지구 기하학적 앙각 계산
- *   Phase 3: Rust — 건물 병합 (기존 panorama_merge_buildings IPC)
- *
- * 기존: presample_panorama_elevations (18M 샘플 ~96MB base64 IPC)
- * 변경: build_heightmap (~20MB heightmap, 1회 IPC) + GPU 직접 샘플링
- *
- * GPU 필수 — 미지원 시 에러 throw
+ * 아키텍처:
+ *   Phase 1: 메인 스레드 — Rust IPC로 heightmap 수신 + base64 decode
+ *   Phase 2: GPU Worker — heightmap에서 polar→ENU 샘플링 + 앙각 계산
+ *   Phase 3: 메인 스레드 — TerrainResult 배열로 변환
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { getGPUDevice, createBuffer, readBuffer, runComputeShader } from "./gpuCompute";
+import { getGPUWorkerInstance } from "./gpuCoverage";
 
 // ─── Rust heightmap 결과 타입 ────────────────────────
 
@@ -39,93 +34,27 @@ export interface TerrainResult {
   lon: number;
 }
 
-// ─── WGSL Compute Shader (heightmap 기반 파노라마) ───
-const PANORAMA_HEIGHTMAP_SHADER = /* wgsl */ `
-const R_EARTH: f32 = 6371000.0;
-const RAD2DEG: f32 = 180.0 / 3.14159265358979;
-const PI: f32 = 3.14159265358979;
+// ─── base64 decode (인라인 Worker) ──────────────────
 
-struct Params {
-  radar_height_m: f32,
-  range_step_m: f32,
-  num_steps: u32,
-  num_azimuths: u32,
-  azimuth_step_deg: f32,
-  pixel_size_m: f32,
-  hm_width: u32,
-  hm_height: u32,
+function decodeBase64OffThread(base64: string): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const code = `self.onmessage=function(e){try{var b=atob(e.data),n=b.length,u=new Uint8Array(n);for(var i=0;i<n;i++)u[i]=b.charCodeAt(i);postMessage(u.buffer,[u.buffer])}catch(err){postMessage({error:String(err)})}}`;
+    const blob = new Blob([code], { type: "text/javascript" });
+    const url = URL.createObjectURL(blob);
+    const w = new Worker(url);
+    w.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) resolve(e.data);
+      else reject(new Error(e.data?.error ?? "Base64 decode failed"));
+      w.terminate();
+      URL.revokeObjectURL(url);
+    };
+    w.onerror = (err) => { reject(err); w.terminate(); URL.revokeObjectURL(url); };
+    w.postMessage(base64);
+  });
 }
 
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> heightmap: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+// ─── destination_point (좌표 복원용) ────────────────
 
-// 바이리니어 보간 heightmap 샘플링
-fn sample_hm(east_m: f32, north_m: f32) -> f32 {
-  let half_w = f32(params.hm_width) * 0.5;
-  let half_h = f32(params.hm_height) * 0.5;
-  let fx = east_m / params.pixel_size_m + half_w;
-  let fy = north_m / params.pixel_size_m + half_h;
-
-  let x0 = u32(max(floor(fx), 0.0));
-  let y0 = u32(max(floor(fy), 0.0));
-  if (x0 >= params.hm_width - 1u || y0 >= params.hm_height - 1u) { return 0.0; }
-
-  let dx = fx - f32(x0);
-  let dy = fy - f32(y0);
-  let w = params.hm_width;
-  let v00 = heightmap[y0 * w + x0];
-  let v10 = heightmap[y0 * w + x0 + 1u];
-  let v01 = heightmap[(y0 + 1u) * w + x0];
-  let v11 = heightmap[(y0 + 1u) * w + x0 + 1u];
-  return mix(mix(v00, v10, dx), mix(v01, v11, dx), dy);
-}
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let az_idx = gid.x;
-  if (az_idx >= params.num_azimuths) { return; }
-
-  let bearing_rad = f32(az_idx) * params.azimuth_step_deg * PI / 180.0;
-  let sin_b = sin(bearing_rad);
-  let cos_b = cos(bearing_rad);
-
-  var best_angle: f32 = -90.0;
-  var best_step: u32 = 0u;
-  var best_elev: f32 = 0.0;
-
-  for (var s = 0u; s < params.num_steps; s++) {
-    let d = f32(s + 1u) * params.range_step_m;
-
-    // polar → ENU → heightmap 샘플링
-    let east_m = d * sin_b;
-    let north_m = d * cos_b;
-    let elev = sample_hm(east_m, north_m);
-
-    // 실제 지구 기하학적 앙각 계산
-    let dh = elev - params.radar_height_m;
-    let curv_drop = d * d / (2.0 * R_EARTH);
-    let angle = atan((dh - curv_drop) / d) * RAD2DEG;
-
-    if (angle > best_angle) {
-      best_angle = angle;
-      best_step = s + 1u;
-      best_elev = elev;
-    }
-  }
-
-  if (best_angle < -89.0) { best_angle = 0.0; }
-
-  // 출력: [best_angle, best_step_as_f32, best_elev, pad]
-  let out_base = az_idx * 4u;
-  output[out_base] = best_angle;
-  output[out_base + 1u] = f32(best_step);
-  output[out_base + 2u] = best_elev;
-  output[out_base + 3u] = 0.0;
-}
-`;
-
-// ─── destination_point (JS 구현, GPU 결과에서 좌표 복원용) ───
 function destinationPoint(
   latDeg: number, lonDeg: number, bearingDeg: number, distM: number,
 ): [number, number] {
@@ -134,7 +63,6 @@ function destinationPoint(
   const lon1 = lonDeg * Math.PI / 180;
   const brg = bearingDeg * Math.PI / 180;
   const dR = distM / R;
-
   const lat2 = Math.asin(
     Math.sin(lat1) * Math.cos(dR) + Math.cos(lat1) * Math.sin(dR) * Math.cos(brg),
   );
@@ -146,8 +74,7 @@ function destinationPoint(
 }
 
 /**
- * WebGPU + heightmap으로 파노라마 앙각 계산 실행
- * GPU 필수 — 미지원 시 에러 throw
+ * 파노라마 앙각 계산 — GPU Worker에 위임
  */
 export async function computePanoramaTerrainGPU(
   radarLat: number,
@@ -158,77 +85,51 @@ export async function computePanoramaTerrainGPU(
   rangeStepM: number,
   onProgress?: (phase: "heightmap_done" | "gpu_done") => void,
 ): Promise<TerrainResult[]> {
-  const device = await getGPUDevice();
-
   const numAzimuths = Math.round(360 / azimuthStepDeg);
-  const maxRangeM = maxRangeKm * 1000;
-  const numSteps = Math.floor(maxRangeM / rangeStepM);
 
-  // 1. Rust에서 heightmap 1회 수신
-  // rangeNm 계산: maxRangeKm → NM (파노라마는 rangeNm이 아닌 maxRangeKm으로 호출됨)
+  // 1. Rust에서 heightmap 수신
   const rangeNm = maxRangeKm / 1.852;
   console.time("[GPU Panorama] Heightmap fetch");
   const meta = await invoke<HeightmapResult>("build_heightmap", {
     radarLat, radarLon,
-    radarAltitude: radarHeightM, // panorama는 radarHeightM = altitude + antenna
-    antennaHeight: 0, // radarHeightM에 이미 포함
+    radarAltitude: radarHeightM,
+    antennaHeight: 0,
     rangeNm,
     pixelSizeM: 100,
-    skipBuildings: true, // 파노라마: 순수 지형만 — 건물은 Rust apply_buildings에서 정밀 처리
+    skipBuildings: true,
   });
-
-  // base64 디코딩
-  const res = await fetch(`data:application/octet-stream;base64,${meta.data_b64}`);
-  const heightmapF32 = new Float32Array(await res.arrayBuffer());
+  const ab = await decodeBase64OffThread(meta.data_b64);
   meta.data_b64 = "";
   console.timeEnd("[GPU Panorama] Heightmap fetch");
   onProgress?.("heightmap_done");
 
-  console.log(`[GPU Panorama] Heightmap ${meta.width}×${meta.height}, ${numAzimuths} azimuths × ${numSteps} steps`);
+  // 2. GPU Worker에 위임
+  console.time("[GPU Panorama] Worker compute");
+  const worker = await getGPUWorkerInstance();
+  const seq = Date.now();
+  const { data_b64: _, ...metaClean } = meta;
 
-  // 2. GPU 버퍼 생성
-  console.time("[GPU Panorama] compute");
-  const hmBuf = createBuffer(device, heightmapF32, GPUBufferUsage.STORAGE);
-
-  const paramsData = new ArrayBuffer(32);
-  const paramsF32 = new Float32Array(paramsData);
-  const paramsU32 = new Uint32Array(paramsData);
-  paramsF32[0] = radarHeightM;
-  paramsF32[1] = rangeStepM;
-  paramsU32[2] = numSteps;
-  paramsU32[3] = numAzimuths;
-  paramsF32[4] = azimuthStepDeg;
-  paramsF32[5] = meta.pixel_size_m;
-  paramsU32[6] = meta.width;
-  paramsU32[7] = meta.height;
-
-  const uniformBuf = createBuffer(device, new Float32Array(paramsData), GPUBufferUsage.UNIFORM);
-
-  const outputSize = numAzimuths * 4 * 4;
-  const outputBuf = device.createBuffer({
-    size: outputSize,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  const resultF32 = await new Promise<Float32Array>((resolve, reject) => {
+    const handler = (e: MessageEvent) => {
+      if (e.data.seq !== seq) return;
+      if (e.data.type === "PANORAMA_RESULT") {
+        worker.removeEventListener("message", handler);
+        resolve(new Float32Array(e.data.terrain));
+      } else if (e.data.type === "ERROR") {
+        worker.removeEventListener("message", handler);
+        reject(new Error(e.data.error));
+      }
+    };
+    worker.addEventListener("message", handler);
+    worker.postMessage(
+      { type: "PANORAMA_COMPUTE", seq, radarHeightM, rangeStepM, azimuthStepDeg, heightmapBuffer: ab, meta: metaClean },
+      [ab],
+    );
   });
-
-  // 3. Compute shader 실행
-  const workgroups = Math.ceil(numAzimuths / 64);
-  await runComputeShader(device, PANORAMA_HEIGHTMAP_SHADER, [
-    { buffer: uniformBuf, type: "uniform" },
-    { buffer: hmBuf, type: "read-only-storage" },
-    { buffer: outputBuf, type: "storage" },
-  ], [workgroups, 1, 1]);
-  console.timeEnd("[GPU Panorama] compute");
+  console.timeEnd("[GPU Panorama] Worker compute");
   onProgress?.("gpu_done");
 
-  // 4. 결과 읽기
-  const resultF32 = await readBuffer(device, outputBuf, outputSize);
-
-  // 5. 버퍼 정리
-  uniformBuf.destroy();
-  hmBuf.destroy();
-  outputBuf.destroy();
-
-  // 6. TerrainResult 배열로 변환
+  // 3. TerrainResult 배열로 변환
   const results: TerrainResult[] = new Array(numAzimuths);
   for (let i = 0; i < numAzimuths; i++) {
     const base = i * 4;
@@ -236,7 +137,6 @@ export async function computePanoramaTerrainGPU(
     const bestStep = resultF32[base + 1];
     const bestElev = resultF32[base + 2];
     const distKm = bestStep * rangeStepM / 1000;
-
     const azDeg = i * azimuthStepDeg;
     const [lat, lon] = bestStep > 0
       ? destinationPoint(radarLat, radarLon, azDeg, bestStep * rangeStepM)

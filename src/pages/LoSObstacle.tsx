@@ -9,24 +9,7 @@ import { SimpleCard } from "../components/common/Card";
 import { useToastStore } from "../components/common/Toast";
 import { useAppStore } from "../store";
 import type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult, NearbyPeak, RadarSite } from "../types";
-
-/** Haversine 거리 (km) */
-function haversineKm(
-  lat1: number,
-  lon1: number,
-  lat2: number,
-  lon2: number
-): number {
-  const R = 6371.0;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.asin(Math.sqrt(a));
-}
+import { haversineKm } from "../utils/geo";
 
 export default function LoSObstacle() {
   const radarSite = useAppStore((s) => s.radarSite);

@@ -49,8 +49,20 @@ pub fn build_heightmap(
     let max_range_m = max_range_km * 1000.0;
     let half_extent_m = max_range_m;
 
-    // 그리드 크기
-    let dim = (2.0 * half_extent_m / pixel_size_m).ceil() as usize;
+    // 그리드 크기 — dim^2 * 17바이트(data+bldg+bytes+b64) 메모리 사용,
+    // dim 10000 → ~1.7GB peak. 안전 한도 10000으로 제한, 초과 시 pixel_size 자동 조정
+    const MAX_DIM: usize = 10_000;
+    let raw_dim = (2.0 * half_extent_m / pixel_size_m).ceil() as usize;
+    let (dim, pixel_size_m) = if raw_dim > MAX_DIM {
+        let adjusted = (2.0 * half_extent_m / MAX_DIM as f64).ceil();
+        log::info!(
+            "[Heightmap] dim {} 초과 → {}×{} (pixel {:.1}m→{:.1}m)",
+            raw_dim, MAX_DIM, MAX_DIM, pixel_size_m, adjusted
+        );
+        (MAX_DIM, adjusted)
+    } else {
+        (raw_dim, pixel_size_m)
+    };
     let width = dim;
     let height = dim;
     let half_dim = dim as f64 / 2.0;
@@ -130,12 +142,13 @@ pub fn build_heightmap(
             bldg_heights[idx] = bheight as f32;
         }
     }
-    // SRTM 지형 + 건물 최대 높이 합산
+    // SRTM 지형 + 건물 최대 높이 합산 후 bldg_heights 즉시 해제 (메모리 절약)
     for i in 0..data.len() {
         if bldg_heights[i] > 0.0 {
             data[i] += bldg_heights[i];
         }
     }
+    drop(bldg_heights);
 
     // f32 LE → base64
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();

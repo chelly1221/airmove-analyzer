@@ -14,34 +14,11 @@ import {
   type EwDistResult,
 } from "../utils/gpuDrawingCompute";
 import { useToastStore } from "../components/common/Toast";
-
-/** 탐지 유형별 색상 (항적지도와 동일) */
-const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
-  mode_ac:              [234, 179, 8],
-  mode_ac_psr:          [234, 179, 8],
-  mode_s_allcall:       [56, 189, 248],
-  mode_s_allcall_psr:   [132, 204, 22],
-  mode_s_rollcall:      [59, 130, 246],
-  mode_s_rollcall_psr:  [34, 197, 94],
-};
-
-/** 탐지 유형 라벨 */
-function radarTypeLabel(rt: string): string {
-  switch (rt) {
-    case "mode_ac":              return "Mode A/C";
-    case "mode_ac_psr":          return "Mode A/C + PSR";
-    case "mode_s_allcall":       return "Mode S All-Call";
-    case "mode_s_allcall_psr":   return "Mode S All-Call + PSR";
-    case "mode_s_rollcall":      return "Mode S Roll-Call";
-    case "mode_s_rollcall_psr":  return "Mode S Roll-Call + PSR";
-    default:                     return rt.toUpperCase();
-  }
-}
+import { DETECTION_TYPE_COLORS, radarTypeLabel, MAP_STYLE_URL } from "../utils/radarConstants";
 
 const KM_TO_NM = 0.539957;
 const NM_TO_KM = 1.852;
 const M_TO_FT = 3.28084;
-const MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
 
 /** 동심원 좌표 생성 */
 function circleCoords(lat: number, lon: number, radiusKm: number, steps = 64): [number, number][] {
@@ -759,7 +736,7 @@ export default function Drawing() {
               <MapGL
                 key={mapKey}
                 initialViewState={planViewState}
-                mapStyle={MAP_STYLE}
+                mapStyle={MAP_STYLE_URL}
                 style={{ width: "100%", height: "100%" }}
                 attributionControl={false}
               >

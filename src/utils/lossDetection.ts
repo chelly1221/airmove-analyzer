@@ -1,4 +1,5 @@
 import type { TrackPoint, LossPoint, LossSegment } from "../types";
+import { haversineKm } from "./geo";
 
 /** 기본 임계값 (초): 이 시간 이상 gap이면 Loss */
 const DEFAULT_THRESHOLD_SECS = 7.0;
@@ -14,18 +15,6 @@ const MAX_LOSS_DURATION_SECS = 14400.0;
 
 /** 보간 속도 vs 직전 속도 차이 비율이 이 값을 초과하면 범위이탈로 판정 (예: 0.5 = 50% 차이) */
 const SPEED_DEVIATION_RATIO = 0.5;
-
-/** Haversine 거리 계산 (km) */
-export function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371.0;
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.asin(Math.sqrt(Math.min(a, 1)));
-}
 
 /** 트랙의 중앙값 스캔 간격 추정 */
 function estimateScanInterval(points: TrackPoint[]): number | null {
@@ -47,7 +36,7 @@ export function estimateMaxRadarRange(
   radarLon: number,
 ): number {
   if (points.length === 0) return 150.0;
-  const distances = points.map((p) => haversine(radarLat, radarLon, p.latitude, p.longitude));
+  const distances = points.map((p) => haversineKm(radarLat, radarLon, p.latitude, p.longitude));
   distances.sort((a, b) => a - b);
   const idx = Math.min(Math.floor(distances.length * 0.95), distances.length - 1);
   return Math.max(distances[idx], 50.0);
@@ -76,12 +65,12 @@ function detectLossForTrack(
 
     if (gap > thresholdSecs && gap <= MAX_LOSS_DURATION_SECS) {
       if (gap <= 0) continue; // 0 나누기 방지
-      const startRadarDist = haversine(radarLat, radarLon, prev.latitude, prev.longitude);
-      const endRadarDist = haversine(radarLat, radarLon, next.latitude, next.longitude);
+      const startRadarDist = haversineKm(radarLat, radarLon, prev.latitude, prev.longitude);
+      const endRadarDist = haversineKm(radarLat, radarLon, next.latitude, next.longitude);
       const missedScans = gap / scanIntervalSecs;
 
       // 보간 속도 계산 (knots): gap 구간의 직선거리 / 시간
-      const gapDistKm = haversine(prev.latitude, prev.longitude, next.latitude, next.longitude);
+      const gapDistKm = haversineKm(prev.latitude, prev.longitude, next.latitude, next.longitude);
       const impliedSpeedKts = (gapDistKm / gap) * 3600 / 1.852; // km/s -> knots
 
       // 직전 속도 대비 보간 속도 편차가 크면 범위이탈로 판정
@@ -118,7 +107,7 @@ function detectLossForTrack(
         const lat = prev.latitude + (next.latitude - prev.latitude) * t;
         const lon = prev.longitude + (next.longitude - prev.longitude) * t;
         const alt = prev.altitude + (next.altitude - prev.altitude) * t;
-        const radDist = haversine(radarLat, radarLon, lat, lon);
+        const radDist = haversineKm(radarLat, radarLon, lat, lon);
 
         lossPoints.push({
           mode_s: modeS,
@@ -188,7 +177,7 @@ function deriveSegments(points: LossPoint[], trackPoints: TrackPoint[]): LossSeg
 
     if (!prevPt || !nextPt) continue;
 
-    const distanceKm = haversine(prevPt.latitude, prevPt.longitude, nextPt.latitude, nextPt.longitude);
+    const distanceKm = haversineKm(prevPt.latitude, prevPt.longitude, nextPt.latitude, nextPt.longitude);
 
     segments.push({
       mode_s: modeS,

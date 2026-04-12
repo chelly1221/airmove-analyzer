@@ -13,6 +13,11 @@ export function haversineKm(lat1: number, lon1: number, lat2: number, lon2: numb
   return R_EARTH * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+/** Haversine 대원 거리 (m) */
+export function haversineM(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  return haversineKm(lat1, lon1, lat2, lon2) * 1000;
+}
+
 /** 초기 방위각 (°, 0=N, CW) */
 export function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const dLon = (lon2 - lon1) * DEG2RAD;

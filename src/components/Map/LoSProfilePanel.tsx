@@ -4,24 +4,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../../store";
 import type { ElevationPoint, LoSProfileData, RadarSite, BuildingOnPath, NearbyPeak } from "../../types";
 import { GPU2D, type CircleData } from "../../utils/gpu2d";
+import { haversineKm, bearingDeg } from "../../utils/geo";
+import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 
 const R_EARTH_M = 6_371_000;
 const R_EFF_M = R_EARTH_M * (4 / 3); // 4/3 유효 지구 반경
 const LAMBDA_M = 0.1071; // S-band 2.8GHz 파장 (m)
-
-/** 탐지 유형별 색상 (TrackMap과 동일) */
-const DETECTION_TYPE_COLORS: Record<string, [number, number, number]> = {
-  mode_ac:              [234, 179, 8],
-  mode_ac_psr:          [234, 179, 8],
-  mode_s_allcall:       [34, 197, 94],
-  mode_s_allcall_psr:   [34, 197, 94],
-  mode_s_rollcall:      [16, 185, 129],
-  mode_s_rollcall_psr:  [16, 185, 129],
-};
-const PSR_TYPES = new Set(["mode_ac_psr", "mode_s_allcall_psr", "mode_s_rollcall_psr"]);
-function detectionTypeColor(rt: string): [number, number, number] {
-  return DETECTION_TYPE_COLORS[rt] ?? [128, 128, 128];
-}
 
 interface LoSTrackPoint {
   distRatio: number;
@@ -57,28 +45,6 @@ interface Props {
   onBuildingDetail?: (building: BuildingOnPath & { isBlocking?: boolean }) => void;
 }
 
-function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const y = Math.sin(dLon) * Math.cos((lat2 * Math.PI) / 180);
-  const x =
-    Math.cos((lat1 * Math.PI) / 180) * Math.sin((lat2 * Math.PI) / 180) -
-    Math.sin((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.cos(dLon);
-  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
-}
 
 function interpolate(
   lat1: number, lon1: number, lat2: number, lon2: number, t: number
@@ -166,7 +132,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const dragStartX = useRef(0);
   const dragStartZoom = useRef<[number, number]>([0, 100]);
 
-  const totalDist = haversine(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
+  const totalDist = haversineKm(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
   const bearing = bearingDeg(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
   const radarHeight = radarSite.altitude + radarSite.antenna_height;
 
@@ -213,7 +179,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         if (cancelled) return;
 
         const points: ElevationPoint[] = lats.map((lat, i) => ({
-          distance: haversine(radarSite.latitude, radarSite.longitude, lat, lons[i]),
+          distance: haversineKm(radarSite.latitude, radarSite.longitude, lat, lons[i]),
           elevation: Math.max(0, allElevations[i] ?? 0),
           latitude: lat,
           longitude: lons[i],
@@ -309,7 +275,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         console.error("Elevation fetch failed:", err);
         if (!cancelled) {
           const points: ElevationPoint[] = lats.map((lat, i) => ({
-            distance: haversine(radarSite.latitude, radarSite.longitude, lat, lons[i]),
+            distance: haversineKm(radarSite.latitude, radarSite.longitude, lat, lons[i]),
             elevation: 0,
             latitude: lat,
             longitude: lons[i],

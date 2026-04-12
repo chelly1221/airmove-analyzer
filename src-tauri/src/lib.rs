@@ -5,7 +5,7 @@ pub mod db;
 pub mod declination;
 pub mod fac_building;
 pub mod geo;
-pub mod juso;
+pub mod vworld_search;
 pub mod landuse;
 pub mod models;
 pub mod parser;
@@ -2290,6 +2290,71 @@ async fn invalidate_coverage_profile() {
     analysis::coverage::invalidate_cache();
 }
 
+/// Per-pixel 커버리지 캐시 초기화 (SRTM + 건물 프리로드)
+#[tauri::command]
+async fn init_pixel_coverage(
+    app_handle: tauri::AppHandle,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_altitude: f64,
+    antenna_height: f64,
+    range_nm: f64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+        analysis::coverage::init_pixel_coverage(
+            &mut srtm, &conn,
+            radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// 특정 좌표의 최저 탐지고도 조회
+#[tauri::command]
+async fn query_min_detection_alt(
+    app_handle: tauri::AppHandle,
+    lat: f64,
+    lon: f64,
+) -> Result<Option<f64>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        Ok(analysis::coverage::query_min_detection_alt(&mut srtm, lat, lon))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// Per-pixel 커버리지 비트맵 렌더링 (무한해상도)
+#[tauri::command]
+async fn render_coverage_bitmap(
+    app_handle: tauri::AppHandle,
+    alt_fts: Vec<f64>,
+    show_cone: bool,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    width: u32,
+    height: u32,
+) -> Result<analysis::coverage::CoverageBitmapResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        analysis::coverage::render_coverage_bitmap(
+            &mut srtm, &alt_fts, show_cone,
+            west, south, east, north, width, height,
+        ).ok_or_else(|| "커버리지 캐시 미초기화".to_string())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 // ---------- vworld 건물 데이터 자동 다운로드 ----------
 
 #[tauri::command]
@@ -2843,209 +2908,15 @@ async fn vworld_download_n3p(
     Ok("산 이름 데이터(N3P) 다운로드 및 임포트 완료".to_string())
 }
 
-// ── 도로명주소 ──────────────────────────────────────────────
+// ── vworld 주소 검색 ──────────────────────────────────────────
 
 #[tauri::command]
-async fn import_juso_address_data(
-    app_handle: tauri::AppHandle,
-    zip_path: String,
-    region: String,
-) -> Result<String, String> {
-    let handle = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
-        let h2 = handle.clone();
-        let count = juso::import_address_zip(&conn, &zip_path, &region, &|p| {
-            let _ = h2.emit("juso-import-progress", &p);
-        })?;
-        Ok(format!("{} 주소 {}건 임포트 완료", region, count))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
-}
-
-#[tauri::command]
-async fn import_juso_coord_data(
-    app_handle: tauri::AppHandle,
-    zip_path: String,
-) -> Result<String, String> {
-    let handle = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
-        let h2 = handle.clone();
-        let count = juso::import_coord_zip(&conn, &zip_path, &|p| {
-            let _ = h2.emit("juso-import-progress", &p);
-        })?;
-        Ok(format!("좌표 {}건 매칭 완료", count))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
-}
-
-#[tauri::command]
-async fn search_juso_address(
-    app_handle: tauri::AppHandle,
+async fn search_vworld_address(
     query: String,
     limit: Option<usize>,
-) -> Result<Vec<juso::JusoSearchResult>, String> {
-    let handle = app_handle.clone();
+) -> Result<Vec<vworld_search::VWorldSearchResult>, String> {
     let lim = limit.unwrap_or(8);
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
-        juso::search_address(&conn, &query, lim)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
-}
-
-#[tauri::command]
-async fn get_juso_import_status(
-    app_handle: tauri::AppHandle,
-) -> Result<Vec<juso::JusoImportStatus>, String> {
-    let handle = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
-        juso::get_import_status(&conn)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
-}
-
-#[tauri::command]
-async fn get_juso_total_count(
-    app_handle: tauri::AppHandle,
-) -> Result<(i64, i64), String> {
-    let handle = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
-        let total = juso::get_total_count(&conn)?;
-        let geocoded = juso::get_geocoded_count(&conn)?;
-        Ok((total, geocoded))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
-}
-
-#[tauri::command]
-async fn clear_juso_data(
-    app_handle: tauri::AppHandle,
-    region: Option<String>,
-) -> Result<(), String> {
-    let handle = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
-        juso::clear_data(&conn, region.as_deref())
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
-}
-
-#[tauri::command]
-async fn juso_download(
-    app_handle: tauri::AppHandle,
-) -> Result<String, String> {
-    let emit = |stage: &str, msg: &str, cur: usize, total: usize| {
-        let _ = app_handle.emit(
-            "juso-download-progress",
-            serde_json::json!({
-                "stage": stage, "message": msg, "current": cur, "total": total,
-            }),
-        );
-    };
-
-    // 1. HTTP 클라이언트 (로그인 불필요)
-    let client = juso::build_client()?;
-
-    // 2. 주소DB 파일 목록
-    emit("listing", "주소DB 파일 목록 수집 중...", 0, 0);
-    let addr_files = juso::list_address_files(&client).await?;
-
-    if addr_files.is_empty() {
-        return Err("주소DB 다운로드 파일을 찾을 수 없습니다. business.juso.go.kr에서 주소DB 접근 권한을 확인해 주세요.".into());
-    }
-
-    let total = addr_files.len();
-    let mut imported = 0;
-
-    // 3. 각 파일 다운로드 + 임포트
-    for (i, file) in addr_files.iter().enumerate() {
-        emit(
-            "downloading",
-            &format!("{} 다운로드 중... ({}/{})", file.region, i + 1, total),
-            i + 1,
-            total,
-        );
-
-        let data = juso::download_file(&client, &file.url).await?;
-
-        let temp_path = std::env::temp_dir().join(format!("juso_addr_{}.zip", i));
-        std::fs::write(&temp_path, &data)
-            .map_err(|e| format!("임시 파일 저장 실패: {e}"))?;
-        drop(data);
-
-        emit(
-            "importing",
-            &format!("{} 임포트 중... ({}/{})", file.region, i + 1, total),
-            i + 1,
-            total,
-        );
-
-        // 중첩 ZIP 구조 감지 (전체분 ZIP → 지역별 ZIP → TXT)
-        if juso::is_nested_zip(temp_path.to_str().unwrap()) {
-            let inner_zips = juso::extract_inner_zips(temp_path.to_str().unwrap())?;
-            let inner_total = inner_zips.len();
-            for (j, (inner_path, region)) in inner_zips.iter().enumerate() {
-                emit(
-                    "importing",
-                    &format!("{} 임포트 중... ({}/{})", region, j + 1, inner_total),
-                    j + 1,
-                    inner_total,
-                );
-                let state = app_handle.state::<AppState>();
-                let conn = state
-                    .db
-                    .lock()
-                    .unwrap()
-                    .get()
-                    .map_err(|e| format!("DB pool: {e}"))?;
-                let h2 = app_handle.clone();
-                juso::import_address_zip(&conn, inner_path.to_str().unwrap(), region, &|p| {
-                    let _ = h2.emit("juso-import-progress", &p);
-                })
-                .map_err(|e| format!("{} 임포트 실패: {e}", region))?;
-                let _ = std::fs::remove_file(inner_path);
-            }
-            // 임시 디렉토리 정리
-            let _ = std::fs::remove_dir(std::env::temp_dir().join("juso_inner"));
-        } else {
-            let state = app_handle.state::<AppState>();
-            let conn = state
-                .db
-                .lock()
-                .unwrap()
-                .get()
-                .map_err(|e| format!("DB pool: {e}"))?;
-            let h2 = app_handle.clone();
-            juso::import_address_zip(&conn, temp_path.to_str().unwrap(), &file.region, &|p| {
-                let _ = h2.emit("juso-import-progress", &p);
-            })
-            .map_err(|e| format!("{} 임포트 실패: {e}", file.region))?;
-        }
-
-        let _ = std::fs::remove_file(&temp_path);
-        imported += 1;
-    }
-
-    // 좌표DB는 juso.go.kr API에서 제공되지 않음 — 수동 "좌표DB ZIP" 임포트로만 지원
-
-    emit("done", &format!("주소DB {imported}개 지역 임포트 완료"), imported, total);
-    Ok(format!("도로명주소 {imported}개 지역 다운로드 및 임포트 완료 (좌표 매칭은 좌표DB ZIP 수동 임포트 필요)"))
+    vworld_search::search(&query, lim).await
 }
 
 /// 호출자 윈도우의 DevTools 활성화
@@ -3195,6 +3066,9 @@ pub fn run() {
             compute_coverage_layers_batch,
             is_coverage_profile_valid,
             invalidate_coverage_profile,
+            init_pixel_coverage,
+            render_coverage_bitmap,
+            query_min_detection_alt,
             // 보고서
             save_report,
             list_saved_reports,
@@ -3220,14 +3094,8 @@ pub fn run() {
             get_landuse_tile_count,
             clear_landuse_tiles,
             get_landuse_tile,
-            // 도로명주소
-            import_juso_address_data,
-            import_juso_coord_data,
-            search_juso_address,
-            get_juso_import_status,
-            get_juso_total_count,
-            clear_juso_data,
-            juso_download,
+            // 주소 검색 (vworld)
+            search_vworld_address,
             // vworld 자동 다운로드
             vworld_download_buildings,
             vworld_download_fac_buildings,

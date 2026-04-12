@@ -44,6 +44,7 @@ export {
   hasCoverageCache,
   build3DSurfaceAsync,
   renderCoverageImageAsync,
+  queryMinDetectionAlt,
 } from "./gpuCoverage";
 
 export type { Coverage3DQuad, CoverageImageResult } from "./gpuCoverage";

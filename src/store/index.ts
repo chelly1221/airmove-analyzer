@@ -180,11 +180,6 @@ interface AppState {
   peakImportResult: { type: "success" | "error"; message: string } | null;
   startPeakImport: (zipPath: string) => Promise<void>;
 
-  // 도로명주소 자동 다운로드 (백그라운드 지속)
-  jusoDownloading: boolean;
-  jusoProgress: { stage: string; message: string; current: number; total: number } | null;
-  jusoResult: { type: "success" | "error"; message: string } | null;
-  startJusoDownload: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -787,31 +782,4 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  // 도로명주소 자동 다운로드
-  jusoDownloading: false,
-  jusoProgress: null,
-  jusoResult: null,
-  startJusoDownload: async () => {
-    if (get().jusoDownloading) return;
-    set({ jusoDownloading: true, jusoResult: null, jusoProgress: null });
-
-    let unlisten: (() => void) | null = null;
-    try {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ stage: string; message: string; current: number; total: number }>(
-        "juso-download-progress",
-        (e) => set({ jusoProgress: e.payload }),
-      );
-    } catch { /* 리스너 실패 시 진행률 없이 진행 */ }
-
-    try {
-      const msg = await invoke<string>("juso_download", {});
-      set({ jusoResult: { type: "success", message: msg } });
-    } catch (e) {
-      set({ jusoResult: { type: "error", message: String(e) } });
-    } finally {
-      set({ jusoDownloading: false, jusoProgress: null });
-      unlisten?.();
-    }
-  },
 }));

@@ -36,40 +36,47 @@ interface Buildings3DBinaryResult {
   count: number;
 }
 
-/** base64 → Float64Array 디코딩 */
-function decodeBase64Float64(b64: string): Float64Array {
-  const raw = atob(b64);
-  const buf = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
-  return new Float64Array(buf.buffer);
-}
+/**
+ * base64 decode + 건물 unpack을 별도 Worker에서 수행 (메인 스레드 블로킹 방지)
+ * atob()가 대량 데이터(~1-3MB)에서 100-400ms 블로킹 유발하므로 인라인 Worker 사용
+ */
+function unpackBuildingsOffThread(
+  coordsB64: string,
+  meta: Buildings3DBinaryResult["meta"],
+  count: number,
+): Promise<Building3D[]> {
+  if (count === 0) return Promise.resolve([]);
 
-/** Binary 결과 → Building3D[] 변환 */
-function unpackBuildings(result: Buildings3DBinaryResult): Building3D[] {
-  if (result.count === 0) return [];
-  const floats = decodeBase64Float64(result.coords);
-  const buildings: Building3D[] = [];
-  let offset = 0;
-
-  for (let i = 0; i < result.count; i++) {
-    const lon = floats[offset++];
-    const lat = floats[offset++];
-    const height_m = floats[offset++];
-    const vertexCount = floats[offset++];
-    const polygon: [number, number][] = [];
-    for (let v = 0; v < vertexCount; v++) {
-      const vlon = floats[offset++];
-      const vlat = floats[offset++];
-      polygon.push([vlat, vlon]); // [lat, lon] 형식 유지
-    }
-    const m = result.meta[i];
-    buildings.push({
-      lat, lon, height_m, polygon,
-      name: m.name, usage: m.usage, source: m.source,
-      group_color: m.group_color,
-    });
+  return new Promise((resolve, reject) => {
+    const code = `self.onmessage=function(e){
+try{
+  var b64=e.data.coords,meta=e.data.meta,count=e.data.count;
+  var raw=atob(b64),buf=new Uint8Array(raw.length);
+  for(var i=0;i<raw.length;i++)buf[i]=raw.charCodeAt(i);
+  var floats=new Float64Array(buf.buffer);
+  var buildings=[],offset=0;
+  for(var i=0;i<count;i++){
+    var lon=floats[offset++],lat=floats[offset++],h=floats[offset++],vc=floats[offset++];
+    var poly=[];
+    for(var v=0;v<vc;v++){var vlon=floats[offset++];var vlat=floats[offset++];poly.push([vlat,vlon]);}
+    var m=meta[i];
+    buildings.push({lat:lat,lon:lon,height_m:h,polygon:poly,name:m.name,usage:m.usage,source:m.source,group_color:m.group_color});
   }
-  return buildings;
+  postMessage(buildings);
+}catch(err){postMessage({error:String(err)})}
+}`;
+    const blob = new Blob([code], { type: "text/javascript" });
+    const url = URL.createObjectURL(blob);
+    const w = new Worker(url);
+    w.onmessage = (e) => {
+      if (Array.isArray(e.data)) resolve(e.data as Building3D[]);
+      else reject(new Error(e.data?.error ?? "Building unpack failed"));
+      w.terminate();
+      URL.revokeObjectURL(url);
+    };
+    w.onerror = (err) => { reject(err); w.terminate(); URL.revokeObjectURL(url); };
+    w.postMessage({ coords: coordsB64, meta, count });
+  });
 }
 
 // ── 타일 캐시 ──────────────────────────────────────────────────
@@ -235,7 +242,7 @@ export async function fetchBuildingsForViewport(
             excludeSources,
           });
 
-          const buildings = unpackBuildings(result);
+          const buildings = await unpackBuildingsOffThread(result.coords, result.meta, result.count);
           _cache.set(key, {
             buildings,
             minHeight: stage.minH,

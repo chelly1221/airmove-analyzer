@@ -294,8 +294,6 @@ function BackgroundTasksPanel() {
   const facBuildingProgress = useAppStore((s) => s.facBuildingProgress);
   const peakImporting = useAppStore((s) => s.peakImporting);
   const peakImportProgress = useAppStore((s) => s.peakImportProgress);
-  const jusoDownloading = useAppStore((s) => s.jusoDownloading);
-  const jusoProgress = useAppStore((s) => s.jusoProgress);
 
   // 진행 중인 작업 목록 빌드
   const tasks: { label: string; pct: number }[] = [];
@@ -320,10 +318,6 @@ function BackgroundTasksPanel() {
   if (peakImporting) {
     const pct = peakImportProgress && peakImportProgress.total > 0 ? Math.round((peakImportProgress.processed / peakImportProgress.total) * 100) : 0;
     tasks.push({ label: "산 데이터 임포트", pct });
-  }
-  if (jusoDownloading) {
-    const pct = jusoProgress && jusoProgress.total > 0 ? Math.round((jusoProgress.current / jusoProgress.total) * 100) : 0;
-    tasks.push({ label: "주소 다운로드", pct });
   }
 
   if (tasks.length === 0) return null;

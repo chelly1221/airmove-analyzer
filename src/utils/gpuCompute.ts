@@ -9,6 +9,9 @@ let _initPromise: Promise<GPUDevice> | null = null;
 let _available: boolean | null = null;
 let _lastError: string | null = null;
 
+/** 파이프라인 캐시 — 동일 셰이더+바인딩 레이아웃은 1회만 컴파일 */
+const _pipelineCache = new Map<string, { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout }>();
+
 /** GPU 에러 메시지 (초기화 실패 시) */
 export function getGPUError(): string | null {
   return _lastError;
@@ -57,6 +60,7 @@ export async function getGPUDevice(): Promise<GPUDevice> {
 
     _device.lost.then((lostInfo) => {
       console.warn(`[GPU] Device lost: ${lostInfo.message}`);
+      _pipelineCache.clear();
       // _lastError를 설정하지 않음 — 다음 getGPUDevice() 호출 시 재초기화 시도 허용
       _device = null;
       _initPromise = null;
@@ -118,7 +122,40 @@ export async function readBuffer(
 }
 
 /**
- * Generic compute shader execution helper
+ * 셰이더 코드 + 바인딩 타입 조합으로 파이프라인 캐시 조회/생성.
+ * 동일 셰이더를 반복 호출하는 커버리지 계산에서 ~80회 컴파일을 2회로 감소.
+ */
+function getOrCreatePipeline(
+  device: GPUDevice,
+  shaderCode: string,
+  bindingTypes: ("read-only-storage" | "storage" | "uniform")[],
+): { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout } {
+  // 셰이더 길이 + 처음 64자 + 바인딩 타입으로 충돌 방지
+  const key = shaderCode.length + ":" + shaderCode.slice(0, 64) + "|" + bindingTypes.join(",");
+  const cached = _pipelineCache.get(key);
+  if (cached) return cached;
+
+  const module = device.createShaderModule({ code: shaderCode });
+  const entries: GPUBindGroupLayoutEntry[] = bindingTypes.map((type, i) => ({
+    binding: i,
+    visibility: GPUShaderStage.COMPUTE,
+    buffer: { type },
+  }));
+  const layout = device.createBindGroupLayout({ entries });
+  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+  const pipeline = device.createComputePipeline({
+    layout: pipelineLayout,
+    compute: { module, entryPoint: "main" },
+  });
+
+  const result = { pipeline, layout };
+  _pipelineCache.set(key, result);
+  console.log(`[GPU] Pipeline cached (bindings: ${bindingTypes.join(",")})`);
+  return result;
+}
+
+/**
+ * Generic compute shader execution helper (파이프라인 자동 캐시)
  */
 export async function runComputeShader(
   device: GPUDevice,
@@ -126,26 +163,12 @@ export async function runComputeShader(
   bindings: { buffer: GPUBuffer; type: "read-only-storage" | "storage" | "uniform" }[],
   workgroupCount: [number, number, number],
 ): Promise<void> {
-  const module = device.createShaderModule({ code: shaderCode });
-
-  const entries: GPUBindGroupLayoutEntry[] = bindings.map((b, i) => ({
-    binding: i,
-    visibility: GPUShaderStage.COMPUTE,
-    buffer: { type: b.type },
-  }));
-
-  const bindGroupLayout = device.createBindGroupLayout({ entries });
-  const pipelineLayout = device.createPipelineLayout({
-    bindGroupLayouts: [bindGroupLayout],
-  });
-
-  const pipeline = device.createComputePipeline({
-    layout: pipelineLayout,
-    compute: { module, entryPoint: "main" },
-  });
+  const { pipeline, layout } = getOrCreatePipeline(
+    device, shaderCode, bindings.map(b => b.type),
+  );
 
   const bindGroup = device.createBindGroup({
-    layout: bindGroupLayout,
+    layout,
     entries: bindings.map((b, i) => ({
       binding: i,
       resource: { buffer: b.buffer },
