@@ -622,21 +622,28 @@ export default function ReportApp() {
     setOmData((prev) => prev ? { ...prev, coverageStatus: "error" } : prev);
   }, []);
 
-  // ── 파노라마 지연 트리거: 분석 후 5초 대기하여 GC + 메모리 안정화 ──
+  // ── 파노라마 자동 계산 (단일 effect 상태머신) ──
+  // Why: 기존 2-effect 분리 구조(deferred→idle→loading→done)는 effect deps 누락으로
+  // "idle→loading" 전환이 트리거되지 않는 race가 있었음. 단일 effect + omData?.result
+  // 레퍼런스만 dep으로 사용해 "새 omData 로드 시 1회 실행" 을 보장한다.
+  // 재진입 방지는 effect 스코프 내 cancelled 플래그로 처리.
   useEffect(() => {
-    if (!omData || omData.panoramaStatus !== "deferred") return;
-    const timer = setTimeout(() => {
-      setOmData((prev) => prev ? { ...prev, panoramaStatus: "idle" } : prev);
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, [omData?.panoramaStatus]);
+    if (!omData) return;
+    const radars = omData.selectedRadarSites;
+    // 레이더 없음 → 바로 done (overlay 통과)
+    if (radars.length === 0) {
+      if (omData.panoramaStatus !== "done") {
+        setOmData((prev) => prev ? { ...prev, panoramaStatus: "done" } : prev);
+      }
+      return;
+    }
+    // 이미 완료된 경우 (edit 모드 리로드 등) 스킵
+    if (omData.panoramaStatus === "done") return;
 
-  // ── 파노라마 자동 계산 (보고서 창 내부) ──
-  useEffect(() => {
-    if (!omData || omData.panoramaStatus !== "idle" || omData.selectedRadarSites.length === 0) return;
     let cancelled = false;
-    setOmData((prev) => prev ? { ...prev, panoramaStatus: "loading" } : prev);
     const excludeIds = omData.selectedBuildings.map((b) => b.id);
+    const shouldDefer = omData.panoramaStatus === "deferred";
+
     const panoArgs = (radar: RadarSite) => ({
       radarLat: radar.latitude,
       radarLon: radar.longitude,
@@ -645,38 +652,59 @@ export default function ReportApp() {
       azimuthStepDeg: 0.01,
       rangeStepM: 200,
     });
+
     (async () => {
+      // 분석 직후 5초 대기 (GC + GPU 버퍼 정리) — edit 모드나 재실행 시에는 생략
+      if (shouldDefer) {
+        for (let i = 0; i < 50; i++) {
+          if (cancelled) return;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (cancelled) return;
+
+      // loading 진입
+      setOmData((prev) => prev ? { ...prev, panoramaStatus: "loading" } : prev);
+
       const withMap = new Map<string, PanoramaMergeResult>();
       const withoutMap = new Map<string, PanoramaMergeResult>();
-      for (const radar of omData.selectedRadarSites) {
-        if (cancelled) break;
+      for (const radar of radars) {
+        if (cancelled) return;
         try {
           const withResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", panoArgs(radar));
-          if (!cancelled) withMap.set(radar.name, withResult);
+          if (cancelled) return;
+          withMap.set(radar.name, withResult);
+          // 진행 상황 오버레이 실시간 갱신
+          setOmData((prev) => prev ? { ...prev, panoWithTargets: new Map(withMap) } : prev);
+
           if (excludeIds.length > 0) {
             const withoutResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", {
               ...panoArgs(radar),
               excludeManualIds: excludeIds,
             });
-            if (!cancelled) withoutMap.set(radar.name, withoutResult);
+            if (cancelled) return;
+            withoutMap.set(radar.name, withoutResult);
           }
         } catch (err) {
           console.warn(`Panorama failed for ${radar.name}:`, err);
         }
       }
-      if (!cancelled) {
-        startTransition(() => {
-          setOmData((prev) => prev ? {
-            ...prev,
-            panoWithTargets: withMap,
-            panoWithoutTargets: withoutMap,
-            panoramaStatus: "done",
-          } : prev);
-        });
-      }
+
+      if (cancelled) return;
+      startTransition(() => {
+        setOmData((prev) => prev ? {
+          ...prev,
+          panoWithTargets: withMap,
+          panoWithoutTargets: withoutMap,
+          panoramaStatus: "done",
+        } : prev);
+      });
     })();
+
     return () => { cancelled = true; };
-  }, [omData?.panoramaStatus, omData?.selectedRadarSites, omData?.selectedBuildings]);
+    // deps: 새 omData(result 레퍼런스 변경)에만 반응. 내부 setOmData는 result를 교체하지
+    // 않으므로 effect 재진입 없음.
+  }, [omData?.result]);
 
   // ── 설정 모달 표시 ──
   if (configPayload && !state) {
