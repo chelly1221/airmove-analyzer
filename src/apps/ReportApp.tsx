@@ -622,28 +622,39 @@ export default function ReportApp() {
     setOmData((prev) => prev ? { ...prev, coverageStatus: "error" } : prev);
   }, []);
 
-  // ── 파노라마 자동 계산 (단일 effect 상태머신) ──
-  // Why: 기존 2-effect 분리 구조(deferred→idle→loading→done)는 effect deps 누락으로
-  // "idle→loading" 전환이 트리거되지 않는 race가 있었음. 단일 effect + omData?.result
-  // 레퍼런스만 dep으로 사용해 "새 omData 로드 시 1회 실행" 을 보장한다.
-  // 재진입 방지는 effect 스코프 내 cancelled 플래그로 처리.
+  // ── 파노라마 자동 계산 ──
+  // 구조: omData가 로드되면 result 레퍼런스를 ref에 저장하고, 같은 result에
+  // 대해서는 재실행 안 함. deps=[omData]로 모든 state 변화에 반응하되 ref로 guard.
+  // 실행 방식: 전 레이더 × (with/without) 완전 병렬(Promise.all), 5초 대기 제거.
+  const panoramaStartedRef = useRef<unknown>(null);
   useEffect(() => {
     if (!omData) return;
-    const radars = omData.selectedRadarSites;
-    // 레이더 없음 → 바로 done (overlay 통과)
-    if (radars.length === 0) {
+    // 동일 result 에 대해 중복 실행 방지
+    if (panoramaStartedRef.current === omData.result) return;
+
+    // 레이더 없음 → 즉시 done 처리
+    if (omData.selectedRadarSites.length === 0) {
+      panoramaStartedRef.current = omData.result;
       if (omData.panoramaStatus !== "done") {
         setOmData((prev) => prev ? { ...prev, panoramaStatus: "done" } : prev);
       }
       return;
     }
-    // 이미 완료된 경우 (edit 모드 리로드 등) 스킵
-    if (omData.panoramaStatus === "done") return;
+
+    // 이미 완료된 omData (edit 모드 리로드 등)
+    if (omData.panoramaStatus === "done") {
+      panoramaStartedRef.current = omData.result;
+      return;
+    }
+
+    // 실행 플래그 설정 — 이 result 에 대해 이제 책임짐
+    panoramaStartedRef.current = omData.result;
+
+    const radars = omData.selectedRadarSites;
+    const excludeIds = omData.selectedBuildings.map((b) => b.id);
+    console.log(`[Panorama] 시작 (${radars.length}개 레이더, 병렬)`, radars.map((r) => r.name));
 
     let cancelled = false;
-    const excludeIds = omData.selectedBuildings.map((b) => b.id);
-    const shouldDefer = omData.panoramaStatus === "deferred";
-
     const panoArgs = (radar: RadarSite) => ({
       radarLat: radar.latitude,
       radarLon: radar.longitude,
@@ -654,41 +665,39 @@ export default function ReportApp() {
     });
 
     (async () => {
-      // 분석 직후 5초 대기 (GC + GPU 버퍼 정리) — edit 모드나 재실행 시에는 생략
-      if (shouldDefer) {
-        for (let i = 0; i < 50; i++) {
-          if (cancelled) return;
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      }
-      if (cancelled) return;
-
       // loading 진입
       setOmData((prev) => prev ? { ...prev, panoramaStatus: "loading" } : prev);
 
       const withMap = new Map<string, PanoramaMergeResult>();
       const withoutMap = new Map<string, PanoramaMergeResult>();
-      for (const radar of radars) {
-        if (cancelled) return;
-        try {
-          const withResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", panoArgs(radar));
-          if (cancelled) return;
-          withMap.set(radar.name, withResult);
-          // 진행 상황 오버레이 실시간 갱신
-          setOmData((prev) => prev ? { ...prev, panoWithTargets: new Map(withMap) } : prev);
 
-          if (excludeIds.length > 0) {
-            const withoutResult = await invoke<PanoramaMergeResult>("calculate_los_panorama", {
-              ...panoArgs(radar),
-              excludeManualIds: excludeIds,
-            });
+      // 전 레이더 병렬 실행 — 각 레이더 내에서도 with/without 동시 호출
+      await Promise.all(
+        radars.map(async (radar) => {
+          try {
+            const withPromise = invoke<PanoramaMergeResult>("calculate_los_panorama", panoArgs(radar));
+            const withoutPromise = excludeIds.length > 0
+              ? invoke<PanoramaMergeResult>("calculate_los_panorama", {
+                  ...panoArgs(radar),
+                  excludeManualIds: excludeIds,
+                })
+              : Promise.resolve(null);
+            const [withResult, withoutResult] = await Promise.all([withPromise, withoutPromise]);
             if (cancelled) return;
-            withoutMap.set(radar.name, withoutResult);
+            withMap.set(radar.name, withResult);
+            if (withoutResult) withoutMap.set(radar.name, withoutResult);
+            // 진행 상황 오버레이 실시간 갱신 — 레이더가 완료될 때마다
+            setOmData((prev) => prev ? {
+              ...prev,
+              panoWithTargets: new Map(withMap),
+              panoWithoutTargets: new Map(withoutMap),
+            } : prev);
+            console.log(`[Panorama] ${radar.name} 완료`);
+          } catch (err) {
+            console.warn(`[Panorama] ${radar.name} 실패:`, err);
           }
-        } catch (err) {
-          console.warn(`Panorama failed for ${radar.name}:`, err);
-        }
-      }
+        }),
+      );
 
       if (cancelled) return;
       startTransition(() => {
@@ -699,12 +708,11 @@ export default function ReportApp() {
           panoramaStatus: "done",
         } : prev);
       });
+      console.log("[Panorama] 전체 완료");
     })();
 
     return () => { cancelled = true; };
-    // deps: 새 omData(result 레퍼런스 변경)에만 반응. 내부 setOmData는 result를 교체하지
-    // 않으므로 effect 재진입 없음.
-  }, [omData?.result]);
+  }, [omData]);
 
   // ── 설정 모달 표시 ──
   if (configPayload && !state) {
@@ -878,8 +886,7 @@ export default function ReportApp() {
         const panoramaStage: StageStatus =
           omData.panoramaStatus === "done" ? "done"
           : omData.panoramaStatus === "loading" ? "active"
-          : omData.panoramaStatus === "deferred" ? "waiting"
-          : "active";
+          : "waiting";
         const captureStage: StageStatus =
           coverageStage !== "done" && coverageStage !== "error" ? "waiting"
           : omMountGrace ? "active"
@@ -912,10 +919,9 @@ export default function ReportApp() {
           : omData.coverageStatus === "error" ? "계산 실패 — 커버리지 없이 진행"
           : "대기 중";
         const panoramaDetail =
-          omData.panoramaStatus === "deferred" ? "5초 후 자동 시작 (메모리 안정화)"
-          : omData.panoramaStatus === "loading" ? `${omData.panoWithTargets.size}/${omData.selectedRadarSites.length} 레이더 LoS 파노라마 계산 중`
-          : omData.panoramaStatus === "done" ? `${omData.panoWithTargets.size}개 레이더 완료`
-          : "대기 중";
+          omData.panoramaStatus === "done" ? `${omData.panoWithTargets.size}개 레이더 완료`
+          : omData.panoramaStatus === "loading" ? `${omData.panoWithTargets.size}/${omData.selectedRadarSites.length} 레이더 계산 중 (병렬)`
+          : "초기화 중";
         const captureDetail =
           captureStage === "waiting" ? "커버리지 대기 중"
           : omMountGrace ? "섹션 컴포넌트 마운트 중"
