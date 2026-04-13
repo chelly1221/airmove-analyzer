@@ -134,7 +134,7 @@ export default function ObstaclePreScreeningModal({
             setProgress(`커버리지 계산 중... (${r.name}, ${ri + 1}/${selectedRadars.length})`);
             setProgressPct(85 + Math.floor((ri / selectedRadars.length) * 8));
             const covResult = await computeCoverageLayersOM(
-              { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm, bearingStepDeg: 0.01 },
+              { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm },
               altFts, excludeIds,
               (msg) => { if (!psCancelledRef.current) { setProgress(`[${r.name}] ${msg}`); } },
             );

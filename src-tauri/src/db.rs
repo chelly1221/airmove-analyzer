@@ -288,6 +288,13 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 건물 그룹에 영역 바운드 컬럼 추가
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN area_bounds_json TEXT", []);
 
+    // 건물 그룹 활성화 플래그 (비활성 그룹의 수동 건물은 LoS/커버리지/3D 렌더링에서 제외)
+    let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1", []);
+
+    // fac_buildings 지반고 컬럼 (SRTM centroid 표고 캐시)
+    // NULL = 아직 백필되지 않음, 0 이상 = SRTM 값 계산 완료
+    let _ = conn.execute("ALTER TABLE fac_buildings ADD COLUMN ground_elev REAL", []);
+
     // pdf_blob BLOB 컬럼 추가 (마이그레이션)
     let has_pdf_blob: bool = conn
         .prepare("PRAGMA table_info(saved_reports)")?

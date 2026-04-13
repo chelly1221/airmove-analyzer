@@ -12,6 +12,7 @@ use crate::building::{
     parse_dbf_euckr_field, today_yyyymm, Building3D,
 };
 use crate::coord::epsg5186_to_wgs84;
+use crate::srtm::SrtmReader;
 
 /// 건물 높이 상한 (m)
 const MAX_HEIGHT_M: f64 = 650.0;
@@ -44,6 +45,7 @@ pub struct FacBuildingImportStatus {
 /// HEIGHT > 0 인 건물만 저장, 폴리곤 풋프린트를 WGS84 JSON으로 변환하여 저장
 pub fn import_from_zip(
     conn: &Connection,
+    srtm: &mut SrtmReader,
     zip_path: &str,
     region: &str,
     progress_fn: &dyn Fn(FacBuildingImportProgress),
@@ -108,8 +110,8 @@ pub fn import_from_zip(
     conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
 
     let mut stmt = conn.prepare(
-        "INSERT INTO fac_buildings (region, centroid_lat, centroid_lon, bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon, height, building_name, dong_name, usability, pnu, bd_mgt_sn, polygon_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+        "INSERT INTO fac_buildings (region, centroid_lat, centroid_lon, bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon, height, building_name, dong_name, usability, pnu, bd_mgt_sn, polygon_json, ground_elev)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
     ).map_err(|e| format!("INSERT 준비 실패: {}", e))?;
 
     let loop_result: Result<(), String> = (|| {
@@ -208,9 +210,13 @@ pub fn import_from_zip(
                 continue;
             }
 
+            // centroid 지반고 (SRTM) — 3D 렌더링 및 LoS 단면도 base로 사용
+            let ground_elev = srtm.get_elevation(clat, clon).unwrap_or(0.0);
+
             stmt.execute(params![
                 region, clat, clon, min_lat, min_lon, max_lat, max_lon,
                 height, building_name, dong_name, usability, pnu, bd_mgt_sn, polygon_json,
+                ground_elev,
             ]).map_err(|e| format!("INSERT 실패: {}", e))?;
 
             inserted += 1;
@@ -272,7 +278,7 @@ pub fn query_fac_buildings_3d(
     max_count: usize,
 ) -> Result<Vec<Building3D>, String> {
     let mut stmt = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, building_name, usability, polygon_json
+        "SELECT centroid_lat, centroid_lon, height, building_name, usability, polygon_json, COALESCE(ground_elev, 0)
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
@@ -292,13 +298,14 @@ pub fn query_fac_buildings_3d(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, f64>(6)?,
             ))
         },
     ).map_err(|e| format!("건물통합정보 3D 쿼리 실행 실패: {}", e))?;
 
     let mut result = Vec::new();
     for row in rows {
-        let (lat, lon, height, name, usage, poly_json) =
+        let (lat, lon, height, name, usage, poly_json, ground_elev) =
             row.map_err(|e| format!("건물통합정보 3D 행 읽기 실패: {}", e))?;
 
         let polygon: Vec<[f64; 2]> = match serde_json::from_str(&poly_json) {
@@ -314,6 +321,7 @@ pub fn query_fac_buildings_3d(
             lat,
             lon,
             height_m: height,
+            ground_elev_m: ground_elev,
             polygon,
             name,
             usage,
@@ -323,6 +331,50 @@ pub fn query_fac_buildings_3d(
     }
 
     Ok(result)
+}
+
+/// 기존 fac_buildings 중 ground_elev가 NULL인 행에 SRTM 표고 일괄 채우기
+/// 앱 시작 시 1회만 수행 (settings 플래그로 중복 실행 방지)
+pub fn backfill_ground_elev(
+    conn: &Connection,
+    srtm: &mut SrtmReader,
+) -> Result<usize, String> {
+    // NULL 상태 행의 좌표 수집
+    let mut stmt = conn
+        .prepare("SELECT id, centroid_lat, centroid_lon FROM fac_buildings WHERE ground_elev IS NULL")
+        .map_err(|e| format!("백필 SELECT 준비 실패: {}", e))?;
+    let rows: Vec<(i64, f64, f64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(|e| format!("백필 쿼리 실패: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    log::info!("[fac_building] ground_elev 백필 시작: {} 행", rows.len());
+
+    // SRTM 타일 미리 로드 (한국 전역)
+    srtm.preload_tiles(33, 43, 124, 132);
+
+    conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+    let updated = {
+        let mut upd = conn
+            .prepare("UPDATE fac_buildings SET ground_elev = ?1 WHERE id = ?2")
+            .map_err(|e| format!("백필 UPDATE 준비 실패: {}", e))?;
+        let mut n = 0usize;
+        for (id, lat, lon) in &rows {
+            let g = srtm.get_elevation(*lat, *lon).unwrap_or(0.0);
+            if upd.execute(params![g, id]).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    };
+    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+
+    log::info!("[fac_building] ground_elev 백필 완료: {} 행", updated);
+    Ok(updated)
 }
 
 /// 임포트 현황 조회

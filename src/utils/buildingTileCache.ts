@@ -48,6 +48,7 @@ function unpackBuildingsOffThread(
   if (count === 0) return Promise.resolve([]);
 
   return new Promise((resolve, reject) => {
+    // 포맷: [lon, lat, ground_elev, height, vertexCount, v0_lon, v0_lat, ...]
     const code = `self.onmessage=function(e){
 try{
   var b64=e.data.coords,meta=e.data.meta,count=e.data.count;
@@ -56,11 +57,11 @@ try{
   var floats=new Float64Array(buf.buffer);
   var buildings=[],offset=0;
   for(var i=0;i<count;i++){
-    var lon=floats[offset++],lat=floats[offset++],h=floats[offset++],vc=floats[offset++];
+    var lon=floats[offset++],lat=floats[offset++],g=floats[offset++],h=floats[offset++],vc=floats[offset++];
     var poly=[];
     for(var v=0;v<vc;v++){var vlon=floats[offset++];var vlat=floats[offset++];poly.push([vlat,vlon]);}
     var m=meta[i];
-    buildings.push({lat:lat,lon:lon,height_m:h,polygon:poly,name:m.name,usage:m.usage,source:m.source,group_color:m.group_color});
+    buildings.push({lat:lat,lon:lon,height_m:h,ground_elev_m:g,polygon:poly,name:m.name,usage:m.usage,source:m.source,group_color:m.group_color});
   }
   postMessage(buildings);
 }catch(err){postMessage({error:String(err)})}
@@ -294,6 +295,7 @@ export function buildingsToGeoJSON(buildings: Building3D[]): GeoJSON.FeatureColl
       type: "Feature",
       properties: {
         height: b.height_m,
+        base: b.ground_elev_m,
         name: b.name || "",
         usage: b.usage || "",
         source: b.source,

@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { Marker } from "react-map-gl/maplibre";
 import { Search, Loader2, X, MapPin } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import Fuse from "fuse.js";
 
 interface AddressResult {
   display_name: string;
@@ -45,18 +46,37 @@ export default function AddressSearch({ onSelect }: Props) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const search = useCallback(async (q: string) => {
-    if (!q.trim()) { setResults([]); return; }
+    const query = q.trim();
+    if (!query) { setResults([]); return; }
     setSearching(true);
     try {
+      // VWorld는 prefix 기반이라 후보를 넉넉히(20) 받아 fuse.js로 재정렬
       const res = await invoke<{ address: string; building_name: string; zip_code: string; latitude: number; longitude: number; result_type: string }[]>(
-        "search_vworld_address", { query: q, limit: 8 },
+        "search_vworld_address", { query, limit: 20 },
       );
-      setResults(res.map((r) => ({
+      const mapped: AddressResult[] = res.map((r) => ({
         display_name: r.result_type === "place" && r.building_name ? r.building_name : r.address,
         jibun_addr: r.result_type === "place" ? r.address : (r.building_name || ""),
         lat: r.latitude,
         lon: r.longitude,
-      })));
+      }));
+
+      // 한글 오타/부분 일치 허용 fuzzy 재정렬. display_name에 가중치, 보조로 jibun_addr.
+      // threshold 0.4: 너무 관대하면 noise, 너무 빡빡하면 오타 보정 실패. 한글 2~3글자 기준 경험값.
+      const fuse = new Fuse(mapped, {
+        keys: [
+          { name: "display_name", weight: 0.7 },
+          { name: "jibun_addr", weight: 0.3 },
+        ],
+        threshold: 0.4,
+        ignoreLocation: true,
+        includeScore: true,
+        minMatchCharLength: 1,
+      });
+      const ranked = fuse.search(query);
+      // fuse 매칭이 있으면 그 순서대로, 없으면 VWorld 원순서 유지 (완전 미스보다 prefix 결과가 나음)
+      const final = ranked.length > 0 ? ranked.map((x) => x.item) : mapped;
+      setResults(final.slice(0, 8));
     } catch {
       setResults([]);
     } finally {

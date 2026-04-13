@@ -288,11 +288,31 @@ function ReportOMCoverageDiff({
   // 지도 배경 타일 이미지
   const mapImage = useStaticMapImage(radarSite.latitude, radarSite.longitude, globalMaxRange);
 
-  // 맵 타일 로드 완료 시 OMSectionImage에 캡처 준비 알림
+  // captureReady 1회 발사 — 맵 타일 준비(또는 빈 상태 확정) + 2× RAF(paint) 이후
+  // Why: 과거에는 mapImage=null 초기 상태에서도 fixedWith/without 배열이 비어있으면
+  // 즉시 dispatch 됐고, 또 multi-radar 환경에서 재-dispatch 문제가 있었다.
+  // 1회 가드 + 2× RAF로 paint 완료를 보장.
+  const readyFiredRef = useRef(false);
   useEffect(() => {
-    if (mapImage || (fixedWith.length === 0 && fixedWithout.length === 0)) {
-      containerRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
-    }
+    if (readyFiredRef.current) return;
+    const hasData = fixedWith.length > 0 || fixedWithout.length > 0;
+    // 데이터가 있는 경우 맵 타일 로드까지 대기 (빈 데이터는 즉시 준비 인정)
+    if (hasData && mapImage === null) return;
+
+    let cancelled = false;
+    let raf2Id = 0;
+    const raf1Id = requestAnimationFrame(() => {
+      raf2Id = requestAnimationFrame(() => {
+        if (cancelled || readyFiredRef.current) return;
+        readyFiredRef.current = true;
+        containerRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1Id);
+      if (raf2Id) cancelAnimationFrame(raf2Id);
+    };
   }, [mapImage, fixedWith.length, fixedWithout.length]);
 
   if (fixedWith.length === 0 && fixedWithout.length === 0) return (

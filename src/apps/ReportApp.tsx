@@ -7,7 +7,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { format } from "date-fns";
-import { Download, Loader2, TriangleAlert } from "lucide-react";
+import { Download, Loader2, TriangleAlert, Check, Circle } from "lucide-react";
 import Titlebar from "../components/Layout/Titlebar";
 import ReportPreviewContent, { getSectionToggles } from "../components/Report/ReportPreviewContent";
 import { useReportExport, type ReportSaveMeta } from "../components/Report/useReportExport";
@@ -146,9 +146,33 @@ export default function ReportApp() {
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportElapsed, setExportElapsed] = useState(0);
   const exportTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const pendingCapturesRef = useRef(0);
   const previewRef = useRef<HTMLDivElement>(null);
   const { exportPDF } = useReportExport();
+
+  // ── OM 프리뷰 staging 동기화 ──
+  // OM 템플릿은 다수의 OMSectionImage가 각자 비동기로 html2canvas 캡처하므로
+  // 전체가 준비될 때까지 프리뷰를 숨기고 상세 진행 오버레이를 표시한다.
+  type CaptureEntry = { label: string; status: "pending" | "done" };
+  const [captureMap, setCaptureMap] = useState<Map<string, CaptureEntry>>(new Map());
+  const [omMountGrace, setOmMountGrace] = useState(false);
+  const captureTracker = useMemo(() => ({
+    register: (key: string, label: string) => {
+      setCaptureMap((m) => {
+        const next = new Map(m);
+        next.set(key, { label, status: "pending" });
+        return next;
+      });
+    },
+    complete: (key: string) => {
+      setCaptureMap((m) => {
+        const entry = m.get(key);
+        if (!entry || entry.status === "done") return m;
+        const next = new Map(m);
+        next.set(key, { ...entry, status: "done" });
+        return next;
+      });
+    },
+  }), []);
 
   /** IDB에서 페이로드 읽기 → state 적용 */
   const loadingRef = useRef(false);
@@ -328,6 +352,41 @@ export default function ReportApp() {
     return getSectionToggles(activeTemplate, activeSections);
   }, [activeTemplate, activeSections]);
 
+  // ── OM staging: omData가 새로 로드되면 captureMap 리셋 + mount grace 활성화 ──
+  // Why: OMSectionImage 들이 mount하여 captureTracker.register() 호출할 시간을 확보.
+  // grace 기간 동안에는 pending===0 이어도 ready로 인정하지 않음.
+  useEffect(() => {
+    if (activeTemplate !== "obstacle_monthly" || !omData) {
+      setOmMountGrace(false);
+      return;
+    }
+    setCaptureMap(new Map());
+    setOmMountGrace(true);
+    const t = setTimeout(() => setOmMountGrace(false), 800);
+    return () => clearTimeout(t);
+  }, [activeTemplate, omData?.result]);
+
+  // captureMap 기반 카운트 파생
+  const { captureTotal, captureDone, capturePending } = useMemo(() => {
+    let total = 0, done = 0;
+    for (const v of captureMap.values()) {
+      total++;
+      if (v.status === "done") done++;
+    }
+    return { captureTotal: total, captureDone: done, capturePending: total - done };
+  }, [captureMap]);
+
+  // ── OM 준비 완료 여부 ──
+  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료 (3) mount grace 해제 (4) 진행 중 캡처 0
+  const omReady = useMemo(() => {
+    if (activeTemplate !== "obstacle_monthly") return true;
+    if (!omData) return false;
+    const covReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
+    const panoReady = omData.panoramaStatus === "done";
+    return covReady && panoReady && !omMountGrace && capturePending === 0;
+  }, [activeTemplate, omData, omMountGrace, capturePending]);
+  const omPreparing = activeTemplate === "obstacle_monthly" && !omReady;
+
   // PDF 내보내기 + DB 저장
   const handleExportPDF = useCallback(async () => {
     if (!state || !activeSections) return;
@@ -346,19 +405,10 @@ export default function ReportApp() {
     setExportError(null);
     setExportElapsed(0);
     exportTimerRef.current = setInterval(() => setExportElapsed((p) => p + 1), 1000);
-    // OMSectionImage 캡처 완료 대기 (최대 15초, 100ms 간격 폴링)
-    const captureStart = Date.now();
-    await new Promise<void>((resolve) => {
-      const check = () => {
-        if (pendingCapturesRef.current <= 0 || Date.now() - captureStart > 15000) {
-          resolve();
-        } else {
-          setTimeout(check, 100);
-        }
-      };
-      // 최소 1200ms 대기 후 체크 시작 (컴포넌트 마운트 + 캡처 시작 대기)
-      setTimeout(check, 1200);
-    });
+
+    // 프리뷰가 이미 ready 상태일 때만 이 함수에 도달 (버튼 disabled 가드).
+    // 모든 OMSectionImage가 <img>로 치환된 정적 DOM을 PrintToPdf가 스냅샷한다.
+    // 마지막 paint 동기화로 overlay 해제 직후 레이아웃 확정.
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     try {
       const dateStr = format(new Date(), "yyyyMMdd_HHmmss");
@@ -626,7 +676,7 @@ export default function ReportApp() {
       }
     })();
     return () => { cancelled = true; };
-  }, [omData?.selectedRadarSites, omData?.selectedBuildings]);
+  }, [omData?.panoramaStatus, omData?.selectedRadarSites, omData?.selectedBuildings]);
 
   // ── 설정 모달 표시 ──
   if (configPayload && !state) {
@@ -708,7 +758,7 @@ export default function ReportApp() {
   }
 
   return (
-    <div className="flex h-screen flex-col bg-white">
+    <div className="relative flex h-screen flex-col bg-white">
       <SourceOverlay />
       <Titlebar controlsOnly>
         {/* 섹션 토글 (컴팩트) */}
@@ -748,11 +798,12 @@ export default function ReportApp() {
 
         <button
           onClick={handleExportPDF}
-          disabled={generating}
+          disabled={generating || omPreparing}
+          title={omPreparing ? "섹션 준비 중..." : undefined}
           className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40"
         >
           {generating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-          {generating ? `생성 중... ${exportElapsed}초` : editingReportId ? "PDF 재저장" : "PDF"}
+          {generating ? `생성 중... ${exportElapsed}초` : omPreparing ? "섹션 준비 중..." : editingReportId ? "PDF 재저장" : "PDF"}
         </button>
       </Titlebar>
 
@@ -788,41 +839,170 @@ export default function ReportApp() {
         </div>
       )}
 
-      {/* 보고서 프리뷰 */}
-      <ReportPreviewContent
-        template={activeTemplate}
-        sections={activeSections}
-        flights={state.flights}
-        reportFlights={state.reportFlights}
-        losResults={state.losResults}
-        aircraft={state.aircraft}
-        radarSite={state.radarSite}
-        reportMetadata={state.reportMetadata}
-        panoramaData={state.panoramaData}
-        panoramaPeakNames={state.panoramaPeakNames}
-        coverageLayers={state.coverageLayers}
-        mapImage={state.mapImage}
-        omData={omData}
-        omResultTrimmed={omData?.result ?? null}
-        psResult={state.psResult}
-        psSelectedBuildings={state.psSelectedBuildings}
-        psSelectedRadarSites={state.psSelectedRadarSites}
-        psLosMap={state.psLosMap}
-        psCovLayersWith={state.psCovLayersWith}
-        psCovLayersWithout={state.psCovLayersWithout}
-        psAnalysisMonth={state.psAnalysisMonth}
-        coverTitle={coverTitle}
-        onCoverTitleChange={setCoverTitle}
-        coverSubtitle={coverSubtitle}
-        onCoverSubtitleChange={setCoverSubtitle}
-        commentary={commentary}
-        onCommentaryChange={setCommentary}
-        forceAllVisible={forceAllVisible}
-        onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
-        singleFlightChartPoints={state.singleFlightChartPoints}
-        pendingCapturesRef={pendingCapturesRef}
-        previewRef={previewRef}
-      />
+      {/* OM 섹션 준비 중 상세 진행 오버레이 — 프리뷰 위에 덮어 표시 */}
+      {omPreparing && omData && (() => {
+        type StageStatus = "waiting" | "active" | "done" | "error";
+        const coverageStage: StageStatus =
+          omData.coverageStatus === "done" ? "done"
+          : omData.coverageStatus === "error" ? "error"
+          : omData.coverageStatus === "loading" ? "active"
+          : "waiting";
+        const panoramaStage: StageStatus =
+          omData.panoramaStatus === "done" ? "done"
+          : omData.panoramaStatus === "loading" ? "active"
+          : omData.panoramaStatus === "deferred" ? "waiting"
+          : "active";
+        const captureStage: StageStatus =
+          coverageStage !== "done" && coverageStage !== "error" ? "waiting"
+          : omMountGrace ? "active"
+          : captureTotal === 0 ? "waiting"
+          : captureDone === captureTotal ? "done"
+          : "active";
+
+        const totalSteps = 2 + Math.max(1, captureTotal);
+        const doneSteps =
+          (coverageStage === "done" || coverageStage === "error" ? 1 : 0)
+          + (panoramaStage === "done" ? 1 : 0)
+          + captureDone;
+        const percent = Math.round((doneSteps / totalSteps) * 100);
+
+        const StageIcon = ({ status }: { status: StageStatus }) => {
+          if (status === "done") return <Check size={16} className="text-emerald-500" strokeWidth={3} />;
+          if (status === "active") return <Loader2 size={16} className="animate-spin text-[#a60739]" />;
+          if (status === "error") return <TriangleAlert size={16} className="text-red-500" />;
+          return <Circle size={14} className="text-gray-300" />;
+        };
+        const stageTextClass = (status: StageStatus) =>
+          status === "done" ? "text-gray-400"
+          : status === "active" ? "text-gray-800 font-medium"
+          : status === "error" ? "text-red-500 font-medium"
+          : "text-gray-400";
+
+        const coverageDetail =
+          omData.coverageStatus === "loading" ? "레이더별 SRTM+건물 프로파일 계산 중"
+          : omData.coverageStatus === "done" ? `${omData.covLayersWithBuildings.size}개 레이더 완료`
+          : omData.coverageStatus === "error" ? "계산 실패 — 커버리지 없이 진행"
+          : "대기 중";
+        const panoramaDetail =
+          omData.panoramaStatus === "deferred" ? "5초 후 자동 시작 (메모리 안정화)"
+          : omData.panoramaStatus === "loading" ? `${omData.panoWithTargets.size}/${omData.selectedRadarSites.length} 레이더 LoS 파노라마 계산 중`
+          : omData.panoramaStatus === "done" ? `${omData.panoWithTargets.size}개 레이더 완료`
+          : "대기 중";
+        const captureDetail =
+          captureStage === "waiting" ? "커버리지 대기 중"
+          : omMountGrace ? "섹션 컴포넌트 마운트 중"
+          : captureTotal === 0 ? "섹션 등록 대기 중"
+          : `${captureDone}/${captureTotal} 섹션 html2canvas 캡처`;
+
+        return (
+          <div className="absolute inset-0 top-[44px] z-30 flex items-center justify-center bg-white/95 backdrop-blur-sm">
+            <div className="mx-4 flex w-full max-w-md flex-col gap-5 rounded-xl border border-gray-200 bg-white p-6 shadow-lg">
+              <div className="flex items-center gap-2">
+                <Loader2 size={20} className="animate-spin text-[#a60739]" />
+                <h3 className="text-base font-semibold text-gray-800">보고서 준비 중</h3>
+                <div className="flex-1" />
+                <span className="text-xs font-medium text-gray-500">{percent}%</span>
+              </div>
+
+              <div className="h-1 w-full overflow-hidden rounded-full bg-gray-100">
+                <div
+                  className="h-full bg-[#a60739] transition-all duration-300"
+                  style={{ width: `${percent}%` }}
+                />
+              </div>
+
+              <div className="flex flex-col gap-3">
+                {/* Stage 1: 커버리지 */}
+                <div className="flex items-start gap-2.5">
+                  <div className="mt-0.5"><StageIcon status={coverageStage} /></div>
+                  <div className="flex-1">
+                    <p className={`text-sm ${stageTextClass(coverageStage)}`}>커버리지 계산</p>
+                    <p className="text-xs text-gray-400">{coverageDetail}</p>
+                  </div>
+                </div>
+
+                {/* Stage 2: 파노라마 */}
+                <div className="flex items-start gap-2.5">
+                  <div className="mt-0.5"><StageIcon status={panoramaStage} /></div>
+                  <div className="flex-1">
+                    <p className={`text-sm ${stageTextClass(panoramaStage)}`}>파노라마 LoS 계산</p>
+                    <p className="text-xs text-gray-400">{panoramaDetail}</p>
+                  </div>
+                </div>
+
+                {/* Stage 3: 섹션 캡처 */}
+                <div className="flex items-start gap-2.5">
+                  <div className="mt-0.5"><StageIcon status={captureStage} /></div>
+                  <div className="flex-1">
+                    <p className={`text-sm ${stageTextClass(captureStage)}`}>섹션 이미지 캡처</p>
+                    <p className="text-xs text-gray-400">{captureDetail}</p>
+                    {captureTotal > 0 && (
+                      <div className="mt-2 flex flex-col gap-1">
+                        {[...captureMap.entries()].map(([key, entry]) => (
+                          <div key={key} className="flex items-center gap-2 text-[11px]">
+                            {entry.status === "done"
+                              ? <Check size={11} className="text-emerald-500" strokeWidth={3} />
+                              : <Loader2 size={11} className="animate-spin text-[#a60739]" />}
+                            <span className={entry.status === "done" ? "text-gray-400" : "text-gray-700"}>
+                              {entry.label}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <p className="text-center text-[11px] text-gray-400">
+                모든 섹션이 준비되면 자동으로 보고서가 표시됩니다
+              </p>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* 보고서 프리뷰 — staging 중에는 visibility hidden 으로 레이아웃만 유지 */}
+      <div
+        className="flex flex-1 min-h-0"
+        style={{ visibility: omPreparing ? "hidden" : "visible" }}
+        aria-hidden={omPreparing}
+      >
+        <ReportPreviewContent
+          template={activeTemplate}
+          sections={activeSections}
+          flights={state.flights}
+          reportFlights={state.reportFlights}
+          losResults={state.losResults}
+          aircraft={state.aircraft}
+          radarSite={state.radarSite}
+          reportMetadata={state.reportMetadata}
+          panoramaData={state.panoramaData}
+          panoramaPeakNames={state.panoramaPeakNames}
+          coverageLayers={state.coverageLayers}
+          mapImage={state.mapImage}
+          omData={omData}
+          omResultTrimmed={omData?.result ?? null}
+          psResult={state.psResult}
+          psSelectedBuildings={state.psSelectedBuildings}
+          psSelectedRadarSites={state.psSelectedRadarSites}
+          psLosMap={state.psLosMap}
+          psCovLayersWith={state.psCovLayersWith}
+          psCovLayersWithout={state.psCovLayersWithout}
+          psAnalysisMonth={state.psAnalysisMonth}
+          coverTitle={coverTitle}
+          onCoverTitleChange={setCoverTitle}
+          coverSubtitle={coverSubtitle}
+          onCoverSubtitleChange={setCoverSubtitle}
+          commentary={commentary}
+          onCommentaryChange={setCommentary}
+          forceAllVisible={forceAllVisible}
+          onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
+          singleFlightChartPoints={state.singleFlightChartPoints}
+          captureTracker={captureTracker}
+          previewRef={previewRef}
+        />
+      </div>
     </div>
   );
 }

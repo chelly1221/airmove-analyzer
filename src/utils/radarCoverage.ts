@@ -36,18 +36,14 @@ export const COVERAGE_ALT_STEP_FT = 100;
 
 export {
   computeMainCoverage,
-  computeLayersForAltitudes,
-  computeLayersForAltitudesAsync,
   isGPUCacheValidFor,
-  isWorkerReady,
   invalidateGPUCache,
   hasCoverageCache,
-  build3DSurfaceAsync,
   renderCoverageImageAsync,
   queryMinDetectionAlt,
 } from "./gpuCoverage";
 
-export type { Coverage3DQuad, CoverageImageResult } from "./gpuCoverage";
+export type { CoverageImageResult } from "./gpuCoverage";
 
 /** DB storage key (per-radar) */
 export function coverageMapKey(radarName: string): string {

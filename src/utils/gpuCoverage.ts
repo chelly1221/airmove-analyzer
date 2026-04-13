@@ -3,48 +3,20 @@
  *
  * 아키텍처:
  *   1. init: Rust에서 SRTM + 건물 데이터 프리로드 + 캐시
- *   2. 레이어: Rust compute_coverage_terrain_profile + compute_coverage_layers_batch (3600 rays)
- *   3. 비트맵: Rust render_coverage_bitmap — 뷰포트 per-pixel ray tracing (무한해상도)
+ *   2. 비트맵: Rust render_coverage_bitmap — 뷰포트 per-pixel ray tracing (무한해상도)
+ *   3. OM 보고서 polar 레이어: Rust compute_coverage_terrain_profile[_excluding]
+ *      + compute_coverage_layers_batch[_excluded] (픽셀 기반 bearing step)
  *
  * GPU Worker는 파노라마/도면 계산에만 사용 (커버리지에서 완전 제거)
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { CoverageLayer, CoverageBearing, MultiCoverageResult } from "./radarCoverage";
+import type { CoverageLayer, MultiCoverageResult } from "./radarCoverage";
 import type { RadarSite } from "../types";
 
 // ─── 상수 ───────────────────────────────────────────
 
 const MAX_ELEV_DEG = 40;
-const FT_TO_M = 0.3048;
-
-// ─── Rust heightmap 결과 타입 (OM 보고서용) ─────────
-
-interface HeightmapResult {
-  data_b64: string;
-  width: number;
-  height: number;
-  pixel_size_m: number;
-  center_lat: number;
-  center_lon: number;
-  radar_height_m: number;
-  max_range_km: number;
-}
-
-// ─── destinationPoint (OM buildLayers용) ────────────
-
-function destinationPoint(
-  latDeg: number, lonDeg: number, bearingDeg: number, distKm: number,
-): [number, number] {
-  const R = 6371.0;
-  const d = distKm / R;
-  const brg = (bearingDeg * Math.PI) / 180;
-  const lat1 = (latDeg * Math.PI) / 180;
-  const lon1 = (lonDeg * Math.PI) / 180;
-  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(brg));
-  const lon2 = lon1 + Math.atan2(Math.sin(brg) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
-  return [(lat2 * 180) / Math.PI, (lon2 * 180) / Math.PI];
-}
 
 // ─── Base64 디코딩 (별도 Worker) ────────────────────
 
@@ -65,31 +37,12 @@ function decodeBase64OffThread(base64: string): Promise<ArrayBuffer> {
   });
 }
 
-/** Rust IPC → base64 decode → ArrayBuffer (OM 보고서용) */
-async function fetchHeightmapBuffer(
-  radarLat: number, radarLon: number,
-  radarAltitude: number, antennaHeight: number,
-  outerKm: number, pixelSizeM: number,
-  excludeManualIds?: number[],
-): Promise<{ buffer: ArrayBuffer; meta: Omit<HeightmapResult, "data_b64"> }> {
-  const rangeNm = outerKm / 1.852;
-  const meta = await invoke<HeightmapResult>("build_heightmap", {
-    radarLat, radarLon, radarAltitude, antennaHeight, rangeNm,
-    pixelSizeM, excludeManualIds,
-  });
-  const ab = await decodeBase64OffThread(meta.data_b64);
-  meta.data_b64 = "";
-  const { data_b64: _, ...metaWithout } = meta;
-  return { buffer: ab, meta: metaWithout };
-}
-
 // ═══════════════════════════════════════════════════
 // GPU Worker 관리 — 파노라마/도면 계산에만 사용
 // ═══════════════════════════════════════════════════
 
 let _gpuWorker: Worker | null = null;
 let _gpuWorkerReady = false;
-let _gpuWorkerLimits: { maxStorageBufferBindingSize: number; maxBufferSize: number } | null = null;
 let _gpuWorkerInitPromise: Promise<void> | null = null;
 
 function ensureGPUWorker(): Promise<void> {
@@ -104,10 +57,6 @@ function ensureGPUWorker(): Promise<void> {
     const onMessage = (e: MessageEvent) => {
       if (e.data.type === "GPU_READY") {
         _gpuWorker!.removeEventListener("message", onMessage);
-        _gpuWorkerLimits = {
-          maxStorageBufferBindingSize: e.data.maxStorageBufferBindingSize,
-          maxBufferSize: e.data.maxBufferSize,
-        };
         _gpuWorkerReady = true;
         resolve();
       } else if (e.data.type === "ERROR") {
@@ -122,51 +71,10 @@ function ensureGPUWorker(): Promise<void> {
   return _gpuWorkerInitPromise;
 }
 
-/** GPU Worker용 OM 보고서 계산 */
-async function runGPUComputationOM(
-  heightmapBuffer: ArrayBuffer,
-  meta: Omit<HeightmapResult, "data_b64">,
-  bearingStepDeg: number,
-  altFts: number[],
-): Promise<Float32Array> {
-  await ensureGPUWorker();
-  const worker = _gpuWorker!;
-  const seq = Date.now();
-  return new Promise<Float32Array>((resolve, reject) => {
-    const handler = (e: MessageEvent) => {
-      const msg = e.data;
-      if (msg.seq !== undefined && msg.seq !== seq) return;
-      if (msg.type === "OM_RESULT") {
-        worker.removeEventListener("message", handler);
-        resolve(new Float32Array(msg.ranges));
-      } else if (msg.type === "ERROR") {
-        worker.removeEventListener("message", handler);
-        reject(new Error(msg.error));
-      }
-    };
-    worker.addEventListener("message", handler);
-    worker.postMessage(
-      { type: "COMPUTE_OM", seq, bearingStepDeg, altFts, heightmapBuffer, meta },
-      [heightmapBuffer],
-    );
-  });
-}
-
-function abortGPUWorker(): void {
-  if (_gpuWorker) {
-    _gpuWorker.postMessage({ type: "ABORT", seq: -1 });
-  }
-}
-
 /** GPU Worker 인스턴스 공유 — gpuPanorama, gpuDrawingCompute 등에서 사용 */
 export async function getGPUWorkerInstance(): Promise<Worker> {
   await ensureGPUWorker();
   return _gpuWorker!;
-}
-
-/** GPU Worker limits 조회 */
-export function getGPUWorkerLimits(): { maxStorageBufferBindingSize: number; maxBufferSize: number } | null {
-  return _gpuWorkerLimits;
 }
 
 // ═══════════════════════════════════════════════════
@@ -254,22 +162,6 @@ export async function renderCoverageImageAsync(
   return { image, bounds: result.bounds, usedAltFts: result.used_alt_fts };
 }
 
-/** @deprecated per-pixel 방식에서는 비트맵이 직접 렌더링되므로 불필요 */
-export async function computeLayersForAltitudesAsync(
-  _altFts: number[],
-  _bearingStep = 1,
-): Promise<CoverageLayer[]> {
-  return [];
-}
-
-/** @deprecated per-pixel 방식에서는 비트맵이 직접 렌더링되므로 불필요 */
-export function computeLayersForAltitudes(
-  _altFts: number[],
-  _bearingStep = 1,
-): CoverageLayer[] {
-  return [];
-}
-
 export function isGPUCacheValidFor(radar: RadarSite): boolean {
   return _pixelCacheReady && _currentRadarKey === radarKey(radar);
 }
@@ -277,19 +169,11 @@ export function isGPUCacheValidFor(radar: RadarSite): boolean {
 export function invalidateGPUCache(): void {
   _pixelCacheReady = false;
   _currentRadarKey = "";
-  abortGPUWorker();
-}
-
-export function isWorkerReady(): boolean {
-  return _pixelCacheReady;
 }
 
 export function hasCoverageCache(): boolean {
   return _pixelCacheReady;
 }
-
-/** @deprecated */
-export const hasSurfaceAngles = hasCoverageCache;
 
 /** 특정 좌표의 최저 탐지고도(ft) 조회 — Rust PIXEL_STATE 캐시 사용 */
 export async function queryMinDetectionAlt(lat: number, lon: number): Promise<number | null> {
@@ -297,19 +181,9 @@ export async function queryMinDetectionAlt(lat: number, lon: number): Promise<nu
   return invoke<number | null>("query_min_detection_alt", { lat, lon });
 }
 
-// ─── 3D 커버리지 면 (미구현, 빈 배열) ──────────────
-
-export interface Coverage3DQuad {
-  polygon: [number, number, number][];
-  fillColor: [number, number, number];
-  altFt: number;
-}
-
-export async function build3DSurfaceAsync(): Promise<Coverage3DQuad[]> {
-  return [];
-}
-
-// ─── OM 보고서용 (GPU Worker 경로 유지) ─────────────
+// ─── OM 보고서용 polar 레이어 ───────────────────────
+// TrackMap per-pixel 방식과 동일한 Rust 지형 프로파일 엔진 사용.
+// 외곽 원 둘레를 100m 단위로 쪼개는 "지형 픽셀" bearing step로 가는 장애물도 포착.
 
 export interface CoverageOMParams {
   radarName: string;
@@ -318,54 +192,20 @@ export interface CoverageOMParams {
   radarAltitude: number;
   antennaHeight: number;
   rangeNm: number;
-  bearingStepDeg: number;
 }
 
-interface OMCoverageCache {
-  radarKey: string;
-  radarLat: number;
-  radarLon: number;
-  radarAltitude: number;
-  antennaHeight: number;
-  bearingStepDeg: number;
-  totalRays: number;
-  altFts: number[];
-  ranges: Float32Array;
-}
-
-function buildLayersOM(
-  cache: OMCoverageCache,
-  altFts: number[],
-): CoverageLayer[] {
-  const radarHeight = cache.radarAltitude + cache.antennaHeight;
-  const maxElevRad = (MAX_ELEV_DEG * Math.PI) / 180;
-  const numAlts = cache.altFts.length;
-  const altIdxMap = new Map<number, number>();
-  for (let i = 0; i < cache.altFts.length; i++) altIdxMap.set(cache.altFts[i], i);
-
-  return altFts
-    .map((altFt) => {
-      const altIdx = altIdxMap.get(altFt);
-      if (altIdx === undefined) return null;
-      const altM = altFt * FT_TO_M;
-      const heightAbove = altM - radarHeight;
-      const coneRadiusKm = heightAbove > 0 ? (heightAbove / Math.tan(maxElevRad)) / 1000 : 0;
-      const bearings: CoverageBearing[] = [];
-      for (let r = 0; r < cache.totalRays; r++) {
-        const deg = r * cache.bearingStepDeg;
-        const range = cache.ranges[r * numAlts + altIdx];
-        const [lat, lon] = range > 0
-          ? destinationPoint(cache.radarLat, cache.radarLon, deg, range)
-          : [cache.radarLat, cache.radarLon];
-        bearings.push({ deg, maxRangeKm: range, lat, lon });
-      }
-      return { altitudeFt: altFt, altitudeM: altM, bearings, coneRadiusKm } as CoverageLayer;
-    })
-    .filter(Boolean) as CoverageLayer[];
+/** 외곽 둘레 100m = ray 1개 기준 bearing step (deg). 최소 0.005° 클램프. */
+function pixelBearingStepDeg(rangeNm: number): number {
+  const maxRangeKm = rangeNm * 1.852;
+  if (maxRangeKm <= 0) return 0.1;
+  const stepRad = 100 / (maxRangeKm * 1000);
+  const stepDeg = (stepRad * 180) / Math.PI;
+  return Math.max(stepDeg, 0.005);
 }
 
 /**
- * OM 보고서용 커버리지 레이어 계산 — GPU Worker 경로 유지
+ * OM 보고서용 커버리지 레이어 계산
+ * — compute_coverage_terrain_profile[_excluding] + compute_coverage_layers_batch[_excluded]
  */
 export async function computeCoverageLayersOM(
   params: CoverageOMParams,
@@ -373,36 +213,38 @@ export async function computeCoverageLayersOM(
   excludeManualIds: number[],
   onProgress?: (msg: string) => void,
 ): Promise<{ layersWith: CoverageLayer[]; layersWithout: CoverageLayer[] }> {
-  const totalRays = Math.floor(360 / params.bearingStepDeg);
+  const bearingStepDeg = pixelBearingStepDeg(params.rangeNm);
 
-  // 건물 포함
-  onProgress?.(`Heightmap 생성 중... ${params.radarName} (건물 포함)`);
-  const { buffer: bufWith, meta: metaWith } = await fetchHeightmapBuffer(
-    params.radarLat, params.radarLon,
-    params.radarAltitude, params.antennaHeight,
-    params.rangeNm * 1.852, 100,
-  );
-  onProgress?.(`GPU 커버리지 계산 중... ${params.radarName} (건물 포함)`);
-  const rangesWith = await runGPUComputationOM(bufWith, metaWith, params.bearingStepDeg, altFts);
-  const withCache: OMCoverageCache = {
-    radarKey: "", radarLat: params.radarLat, radarLon: params.radarLon,
-    radarAltitude: params.radarAltitude, antennaHeight: params.antennaHeight,
-    bearingStepDeg: params.bearingStepDeg, totalRays, altFts, ranges: rangesWith,
-  };
-  const layersWith = buildLayersOM(withCache, altFts);
+  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (건물 포함)`);
+  await invoke("compute_coverage_terrain_profile", {
+    radarName: params.radarName,
+    radarLat: params.radarLat,
+    radarLon: params.radarLon,
+    radarAltitude: params.radarAltitude,
+    antennaHeight: params.antennaHeight,
+    rangeNm: params.rangeNm,
+    bearingStepDeg,
+  });
+  const layersWith = await invoke<CoverageLayer[]>("compute_coverage_layers_batch", {
+    altFts,
+    bearingStep: 1,
+  });
 
-  // 건물 제외
-  onProgress?.(`Heightmap 생성 중... ${params.radarName} (건물 제외)`);
-  const { buffer: bufWithout, meta: metaWithout } = await fetchHeightmapBuffer(
-    params.radarLat, params.radarLon,
-    params.radarAltitude, params.antennaHeight,
-    params.rangeNm * 1.852, 100,
+  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (건물 제외)`);
+  await invoke("compute_coverage_terrain_profile_excluding", {
+    radarName: params.radarName,
+    radarLat: params.radarLat,
+    radarLon: params.radarLon,
+    radarAltitude: params.radarAltitude,
+    antennaHeight: params.antennaHeight,
+    rangeNm: params.rangeNm,
     excludeManualIds,
-  );
-  onProgress?.(`GPU 커버리지 계산 중... ${params.radarName} (건물 제외)`);
-  const rangesWithout = await runGPUComputationOM(bufWithout, metaWithout, params.bearingStepDeg, altFts);
-  const withoutCache: OMCoverageCache = { ...withCache, ranges: rangesWithout };
-  const layersWithout = buildLayersOM(withoutCache, altFts);
+    bearingStepDeg,
+  });
+  const layersWithout = await invoke<CoverageLayer[]>("compute_coverage_layers_batch_excluded", {
+    altFts,
+    bearingStep: 1,
+  });
 
   return { layersWith, layersWithout };
 }

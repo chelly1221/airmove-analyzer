@@ -209,6 +209,16 @@ function ManualBuildingPanel() {
       loadData();
     } catch (e) { console.error("그룹 삭제 실패:", e); }
   };
+  const toggleGroupEnabled = async (g: BuildingGroup) => {
+    const next = !g.enabled;
+    setGroups((prev) => prev.map((x) => (x.id === g.id ? { ...x, enabled: next } : x)));
+    try {
+      await invoke("set_building_group_enabled", { id: g.id, enabled: next });
+    } catch (e) {
+      console.error("그룹 활성화 변경 실패:", e);
+      setGroups((prev) => prev.map((x) => (x.id === g.id ? { ...x, enabled: g.enabled } : x)));
+    }
+  };
   const toggleCollapse = (groupId: number) => {
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
@@ -381,8 +391,19 @@ function ManualBuildingPanel() {
                       className="inline-block h-2.5 w-2.5 rounded-full shrink-0"
                       style={{ backgroundColor: getGroupColor(gId) }}
                     />
-                    <span className="text-sm font-medium text-gray-700">{getGroupName(gId)}</span>
+                    <span className={`text-sm font-medium ${group && !group.enabled ? "text-gray-400 line-through" : "text-gray-700"}`}>{getGroupName(gId)}</span>
                     <span className="text-[10px] text-gray-400">({items.length})</span>
+                    {group && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); toggleGroupEnabled(group); }}
+                        className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${group.enabled ? "bg-[#a60739]" : "bg-gray-300"}`}
+                        role="switch"
+                        aria-checked={group.enabled}
+                        title={group.enabled ? "그룹 비활성화 (LoS/커버리지/3D에서 제외)" : "그룹 활성화"}
+                      >
+                        <span className={`inline-block h-3 w-3 rounded-full bg-white shadow transition-transform ${group.enabled ? "translate-x-3.5" : "translate-x-0.5"}`} />
+                      </button>
+                    )}
                     {group && (
                       <div className="ml-auto flex items-center gap-1 opacity-0 group-hover/hdr:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
                         <button

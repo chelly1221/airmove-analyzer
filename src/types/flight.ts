@@ -1,4 +1,3 @@
-import type { TrackPoint } from "./track";
 import type { LossPoint, LossSegment } from "./loss";
 
 /** 비행 (분석 기본 단위) */
@@ -14,8 +13,6 @@ export interface Flight {
   arrival_airport?: string;
   start_time: number;
   end_time: number;
-  /** @deprecated Worker 소유 — queryViewportPoints/queryFlightPoints로 접근. 빈 배열. */
-  track_points: TrackPoint[];
   loss_points: LossPoint[];
   loss_segments: LossSegment[];
   total_loss_time: number;

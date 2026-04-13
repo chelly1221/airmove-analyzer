@@ -38,6 +38,7 @@ struct CoverageProfile {
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct CoverageBearing {
     pub deg: f64,
     pub max_range_km: f64,
@@ -46,6 +47,7 @@ pub struct CoverageBearing {
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct CoverageLayer {
     pub altitude_ft: f64,
     pub altitude_m: f64,

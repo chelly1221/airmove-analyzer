@@ -43,6 +43,8 @@ interface Props {
   onBuildingHover?: (building: { lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null) => void;
   /** 건물 상세보기 요청 콜백 */
   onBuildingDetail?: (building: BuildingOnPath & { isBlocking?: boolean }) => void;
+  /** 주소 검색으로 LoS 분석 시작한 경우, 해당 좌표에 해당하는 건물을 단면도에서 자동 선택 */
+  searchedAddress?: { lat: number; lon: number } | null;
 }
 
 
@@ -67,7 +69,7 @@ function curvDrop43(dKm: number): number {
 
 
 
-export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail }: Props) {
+export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail, searchedAddress }: Props) {
   const addLoSResult = useAppStore((s) => s.addLoSResult);
   const manualBuildings = useAppStore((s) => s.manualBuildings);
   const buildingGroups = useAppStore((s) => s.buildingGroups);
@@ -196,25 +198,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
             corridorWidthM: 100.0,
           });
           if (!cancelled && bldgs.length > 0) {
-            // 각 건물의 지형 고도를 프로파일에서 보간
-            const enriched = bldgs.map((b) => {
-              // 수동 건물은 사용자 입력 지반고 유지
-              if (b.is_manual) {
-                return b;
-              }
-              // GIS 건물은 SRTM 지형 프로파일에서 지반고 보간
-              let groundElev = 0;
-              for (let i = 1; i < points.length; i++) {
-                if (points[i].distance >= b.distance_km) {
-                  const denom = points[i].distance - points[i - 1].distance;
-                  const t = denom > 1e-9 ? (b.distance_km - points[i - 1].distance) / denom : 0;
-                  groundElev = points[i - 1].elevation + t * (points[i].elevation - points[i - 1].elevation);
-                  break;
-                }
-              }
-              return { ...b, ground_elev_m: groundElev, total_height_m: groundElev + b.height_m };
-            });
-            setBuildings(enriched);
+            // 백엔드가 fac_buildings.ground_elev (SRTM centroid 캐시) 및 수동 건물 사용자 입력값을 이미 제공함
+            setBuildings(bldgs);
           }
         } catch {
           // 건물 데이터 없으면 무시
@@ -562,6 +547,21 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     // 차폐에 영향을 주는 건물만 필터링:
     // 건물 꼭대기가 지형만으로 생성된 shadow보다 높으면 = 실질 차폐 기여
     const significantBuildings: (BuildingOnPath & { isBlocking: boolean })[] = [];
+    // 주소 검색으로 지정된 건물 찾기 (검색 좌표에 가장 가까운 건물, 150m 이내)
+    let searchedBldg: BuildingOnPath | null = null;
+    if (searchedAddress && buildings.length > 0) {
+      let bestD2 = Infinity;
+      const cosLat = Math.cos(searchedAddress.lat * Math.PI / 180);
+      for (const b of buildings) {
+        const dLat = (b.lat - searchedAddress.lat) * 111.32;
+        const dLon = (b.lon - searchedAddress.lon) * 111.32 * cosLat;
+        const d2 = dLat * dLat + dLon * dLon;
+        if (d2 < bestD2) { bestD2 = d2; searchedBldg = b; }
+      }
+      // 150m 이내에 건물이 없으면 무시
+      if (Math.sqrt(bestD2) > 0.15) searchedBldg = null;
+    }
+    let searchedBldgIdx: number | null = null;
     if (showBuildings && buildings.length > 0) {
       for (const b of buildings) {
         const bDist = b.distance_km;
@@ -577,11 +577,13 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
           if (shadow > terrainShadow) terrainShadow = shadow;
         }
-        if (bAdj > terrainShadow) {
+        const isSearched = searchedBldg !== null && b === searchedBldg;
+        if (bAdj > terrainShadow || isSearched) {
           // 이 건물이 최대 차단점 근처인지 판정
           const isBlk = !!(maxBlockPoint &&
             Math.abs(bDist - maxBlockPoint.distance) < 0.1 &&
             bAdj > maxBlockPoint.adjHeight - 5);
+          if (isSearched) searchedBldgIdx = significantBuildings.length;
           significantBuildings.push({ ...b, isBlocking: isBlk });
         }
       }
@@ -598,13 +600,29 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       maxBlockPoint,
       namedPeaks,
       significantBuildings,
+      searchedBldgIdx,
       minY,
       maxY,
       maxDistance: D,
       adjTarget,
       targetElev,
     };
-  }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings]);
+  }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings, searchedAddress]);
+
+  // 주소 검색 결과 건물을 단면도에서 자동 선택
+  const autoSelectedSearchedRef = useRef<number | null>(null);
+  useEffect(() => {
+    const idx = chartData?.searchedBldgIdx ?? null;
+    if (idx === autoSelectedSearchedRef.current) return;
+    autoSelectedSearchedRef.current = idx;
+    if (idx !== null && chartData) {
+      const b = chartData.significantBuildings[idx];
+      if (b) {
+        setClickedBldgIdx(idx);
+        onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
+      }
+    }
+  }, [chartData, onBuildingHover]);
 
   // ── Y축 가시 범위 자동조정 (줌인 시 보이는 구간의 데이터만 기준) ──
   const visibleYRange = useMemo(() => {

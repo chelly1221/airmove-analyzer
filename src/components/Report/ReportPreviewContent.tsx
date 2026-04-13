@@ -27,7 +27,7 @@ import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
 import ReportOMAzDistScatter from "./ReportOMAzDistScatter";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
-import OMSectionImage from "./OMSectionImage";
+import OMSectionImage, { type CaptureTracker } from "./OMSectionImage";
 import ReportPSSummarySection from "./ReportPSSummarySection";
 import ReportPSAngleHeight from "./ReportPSAngleHeight";
 import ReportPSAdditionalLoss from "./ReportPSAdditionalLoss";
@@ -89,8 +89,8 @@ export interface ReportPreviewContentProps {
 
   // ref
   previewRef: React.RefObject<HTMLDivElement | null>;
-  /** 대기 중인 OMSectionImage 캡처 수 추적 — PDF 내보내기 동기화용 */
-  pendingCapturesRef?: React.MutableRefObject<number>;
+  /** OMSectionImage 준비 상태 추적 — staging/ready 동기화용 */
+  captureTracker?: CaptureTracker;
 }
 
 // ── 섹션 토글 정의 ──
@@ -168,7 +168,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     onOmDataChange,
     singleFlightChartPoints,
     previewRef,
-    pendingCapturesRef,
+    captureTracker,
   } = props;
 
   const singleFlight = template === "single" ? reportFlights[0] : null;
@@ -482,9 +482,11 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
               <ReportPage key={covImgKey}>
                 <ReportOMSectionHeader sectionNum={sectionNumbers.omCoverageDiff ?? 5} title="커버리지 비교맵" radarName={rs.name} />
                 <OMSectionImage
+                  sectionKey={covImgKey}
+                  sectionLabel={`커버리지 비교맵 (${rs.name})`}
                   preCaptured={omData.sectionImages.get(covImgKey)}
                   onCaptured={(url) => handleOMSectionCaptured(covImgKey, url)}
-                  pendingCapturesRef={pendingCapturesRef}
+                  captureTracker={captureTracker}
                 >
                   <ReportOMCoverageDiff
                     sectionNum={sectionNumbers.omCoverageDiff ?? 5}
@@ -524,9 +526,11 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
               <ReportPage key={azImgKey}>
                 <ReportOMSectionHeader sectionNum={sectionNumbers.omAzDistScatter ?? 6} title={`방위-거리 소실표적 산점도${omData.analysisMonth ? ` (${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월)` : ""}`} radarName={rs.name} />
                 <OMSectionImage
+                  sectionKey={azImgKey}
+                  sectionLabel={`방위-거리 산점도 (${rs.name})`}
                   preCaptured={omData.sectionImages.get(azImgKey)}
                   onCaptured={(url) => handleOMSectionCaptured(azImgKey, url)}
-                  pendingCapturesRef={pendingCapturesRef}
+                  captureTracker={captureTracker}
                 >
                   <ReportOMAzDistScatter
                     sectionNum={sectionNumbers.omAzDistScatter ?? 6}

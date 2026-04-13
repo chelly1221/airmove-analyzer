@@ -23,7 +23,10 @@ export interface BuildingOnPath {
 export interface Building3D {
   lat: number;
   lon: number;
+  /** 건물 자체 높이 (m) */
   height_m: number;
+  /** 지반 표고 (m, AMSL) — fill-extrusion base */
+  ground_elev_m: number;
   /** 건물 폴리곤 좌표 [[lat,lon],...] (WGS84) */
   polygon: [number, number][];
   name: string | null;
@@ -69,6 +72,8 @@ export interface BuildingGroup {
   plan_rotation: number;
   /** 그룹 영역 바운드 JSON: [[minLat, minLon], [maxLat, maxLon]] */
   area_bounds_json: string | null;
+  /** 활성화 여부 (false이면 LoS/커버리지/3D 렌더링에서 제외) */
+  enabled: boolean;
 }
 
 /** 토지이용계획도 오버레이 경계 (4코너 좌표) */

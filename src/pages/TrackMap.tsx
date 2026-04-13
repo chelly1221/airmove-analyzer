@@ -244,7 +244,40 @@ export default function TrackMap() {
       floor_area_ratio: string; building_coverage: string; approval_date: string;
     } | null;
     localName?: string; localHeight?: number; localUsage?: string;
+    /** true: 클릭으로 고정됨 (호버로 닫히지 않음) */
+    pinned: boolean;
   } | null>(null);
+  /** 호버 디바운스 타이머 — 250ms 머무르면 팝업 표시 */
+  const bldgHoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showBldgPopupForHover = useCallback((args: {
+    x: number; y: number; lat: number; lon: number;
+    name?: string; height?: number; usage?: string;
+  }) => {
+    setBldgPopup((prev) => {
+      if (prev?.pinned) return prev;
+      // 같은 좌표면 위치만 갱신
+      if (prev && Math.abs(prev.lat - args.lat) < 1e-6 && Math.abs(prev.lon - args.lon) < 1e-6) {
+        return { ...prev, x: args.x, y: args.y };
+      }
+      return {
+        x: args.x, y: args.y, lat: args.lat, lon: args.lon,
+        loading: true, info: null,
+        localName: args.name, localHeight: args.height, localUsage: args.usage,
+        pinned: false,
+      };
+    });
+  }, []);
+  const scheduleBldgHover = useCallback((args: {
+    x: number; y: number; lat: number; lon: number;
+    name?: string; height?: number; usage?: string;
+  }) => {
+    if (bldgHoverTimerRef.current) clearTimeout(bldgHoverTimerRef.current);
+    bldgHoverTimerRef.current = setTimeout(() => showBldgPopupForHover(args), 220);
+  }, [showBldgPopupForHover]);
+  const clearBldgHover = useCallback(() => {
+    if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
+    setBldgPopup((prev) => (prev && !prev.pinned ? null : prev));
+  }, []);
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
   const [trailDuration, setTrailDuration] = useState(0);
@@ -304,6 +337,8 @@ export default function TrackMap() {
   const [losHoverRatio, setLosHoverRatio] = useState<number | null>(null);
   const [losHighlightIdx, setLosHighlightIdx] = useState<number | null>(null);
   const [losHoverIdx, setLosHoverIdx] = useState<number | null>(null);
+  // 주소 검색으로 LoS 분석 시작한 경우, 해당 좌표를 단면도에 전달해 건물 선택 표시
+  const [losSearchedAddress, setLosSearchedAddress] = useState<{ lat: number; lon: number } | null>(null);
   const savedPitchRef = useRef(45);
   const savedBearingRef = useRef(0);
   const losPointClickedRef = useRef(false); // deck.gl LoS 포인트 클릭 여부 (빈 영역 클릭 구분용)
@@ -901,8 +936,9 @@ export default function TrackMap() {
               "#e5e7eb",
               "#ef4444",
             ],
-            "fill-extrusion-height": ["get", "height"],
-            "fill-extrusion-base": 0,
+            // AMSL 옥상 높이 = 지반 표고 + 건물 높이
+            "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
+            "fill-extrusion-base": ["get", "base"],
             "fill-extrusion-opacity": 1.0,
           },
         });
@@ -939,7 +975,7 @@ export default function TrackMap() {
       if (!map.getLayer(layerId)) {
         if (buildingHoverActiveRef.current) {
           buildingHoverActiveRef.current = false;
-          setHoverInfo(null);
+          clearBldgHover();
         }
         return;
       }
@@ -949,20 +985,17 @@ export default function TrackMap() {
         map.getCanvas().style.cursor = "pointer";
         const p = features[0].properties;
         if (!p) return;
-        const srcLabel = p.source === "fac" ? "건물통합정보" : "수동 등록";
-        const srcColor = p.group_color || (p.source === "fac" ? "#3b82f6" : "#f97316");
-        const lines: { label: string; value: string; color?: string }[] = [
-          { label: "건물", value: p.name || "(이름 없음)", color: srcColor },
-          { label: "높이", value: `${Number(p.height).toFixed(1)}m` },
-        ];
-        if (p.usage) lines.push({ label: "용도", value: p.usage });
-        lines.push({ label: "출처", value: srcLabel });
-        lines.push({ label: "좌표", value: `${Number(p.lat).toFixed(5)}°N ${Number(p.lon).toFixed(5)}°E` });
-        setHoverInfo({ x: e.point.x, y: e.point.y, lines });
+        scheduleBldgHover({
+          x: e.point.x, y: e.point.y,
+          lat: Number(p.lat), lon: Number(p.lon),
+          name: p.name || undefined,
+          height: p.height != null ? Number(p.height) : undefined,
+          usage: p.usage || undefined,
+        });
       } else if (buildingHoverActiveRef.current) {
         buildingHoverActiveRef.current = false;
         map.getCanvas().style.cursor = "";
-        setHoverInfo(null);
+        clearBldgHover();
       }
     };
 
@@ -975,12 +1008,20 @@ export default function TrackMap() {
         if (p) {
           const lat = Number(p.lat);
           const lon = Number(p.lon);
-          setBldgPopup({
-            x: e.point.x, y: e.point.y, lat, lon,
-            loading: true, info: null,
-            localName: p.name || undefined,
-            localHeight: p.height ? Number(p.height) : undefined,
-            localUsage: p.usage || undefined,
+          if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
+          setBldgPopup((prev) => {
+            // 같은 건물이면 기존 정보 유지하고 pinned만 켠다
+            if (prev && Math.abs(prev.lat - lat) < 1e-6 && Math.abs(prev.lon - lon) < 1e-6) {
+              return { ...prev, x: e.point.x, y: e.point.y, pinned: true };
+            }
+            return {
+              x: e.point.x, y: e.point.y, lat, lon,
+              loading: true, info: null,
+              localName: p.name || undefined,
+              localHeight: p.height ? Number(p.height) : undefined,
+              localUsage: p.usage || undefined,
+              pinned: true,
+            };
           });
         }
       } else {
@@ -1081,8 +1122,8 @@ export default function TrackMap() {
       source: hlSourceId,
       paint: {
         "fill-extrusion-color": "#f97316",  // 주황색
-        "fill-extrusion-height": ["get", "height"],
-        "fill-extrusion-base": 0,
+        "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
+        "fill-extrusion-base": ["get", "base"],
         "fill-extrusion-opacity": 0.9,
       },
     });
@@ -1522,6 +1563,7 @@ export default function TrackMap() {
         setDetailBuilding(null);
       }
       setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
+      setLosSearchedAddress(null);
       setLosCursorPicking(false);
     },
     [losMode, losCursorPicking, losTarget]
@@ -1577,6 +1619,14 @@ export default function TrackMap() {
     const dLon = (losTarget.lon - radarSite.longitude) * 111.32 * cosLat;
     return Math.sqrt(dLat * dLat + dLon * dLon);
   }, [losTarget, radarSite.latitude, radarSite.longitude, radarSite.range_nm]);
+
+  // 초정밀 방위 슬라이더의 중심 (휠/주소검색/지도클릭 등 큰 변경 시에만 재중심)
+  const [losAzFineCenter, setLosAzFineCenter] = useState(0);
+  useEffect(() => {
+    if (Math.abs(losAzimuth - losAzFineCenter) > 1.99) {
+      setLosAzFineCenter(Math.round(losAzimuth));
+    }
+  }, [losAzimuth, losAzFineCenter]);
 
   const setLosFromAzDist = useCallback((az: number, distKm: number) => {
     if (!losMode) {
@@ -1830,8 +1880,6 @@ export default function TrackMap() {
   // 건물 2D 오버레이 전용 deck.gl 레이어
   const buildingDeckLayers = useMemo(() => {
     if (!showBuildings || buildings3dData.length === 0 || buildings3dMode) return [];
-    const srcLabel = (s: string) => s === "fac" ? "건물통합정보" : "수동 등록";
-    const srcColor = (d: Building3D) => d.group_color ? d.group_color : d.source === "fac" ? "#e5e7eb" : d.source === "manual" ? "#ef4444" : "#d1d5db";
     const hexToRgb = (hex: string): [number, number, number] => {
       const h = hex.replace("#", "");
       return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
@@ -1848,16 +1896,12 @@ export default function TrackMap() {
     const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
       if (info.object) {
         const d = info.object;
-        const lines: { label: string; value: string; color?: string }[] = [
-          { label: "건물", value: d.name || "(이름 없음)", color: srcColor(d) },
-          { label: "높이", value: `${d.height_m.toFixed(1)}m` },
-        ];
-        if (d.usage) lines.push({ label: "용도", value: d.usage });
-        lines.push({ label: "출처", value: srcLabel(d.source) });
-        lines.push({ label: "좌표", value: `${d.lat.toFixed(5)}°N ${d.lon.toFixed(5)}°E` });
-        setHoverInfo({ x: info.x, y: info.y, lines });
+        scheduleBldgHover({
+          x: info.x, y: info.y, lat: d.lat, lon: d.lon,
+          name: d.name || undefined, height: d.height_m, usage: d.usage || undefined,
+        });
       } else {
-        setHoverInfo(null);
+        clearBldgHover();
       }
     };
     return [
@@ -1874,12 +1918,19 @@ export default function TrackMap() {
           if (losTarget) losPointClickedRef.current = true;
           if (info.object) {
             const d = info.object;
-            setBldgPopup({
-              x: info.x, y: info.y, lat: d.lat, lon: d.lon,
-              loading: true, info: null,
-              localName: d.name || undefined,
-              localHeight: d.height_m,
-              localUsage: d.usage || undefined,
+            if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
+            setBldgPopup((prev) => {
+              if (prev && Math.abs(prev.lat - d.lat) < 1e-6 && Math.abs(prev.lon - d.lon) < 1e-6) {
+                return { ...prev, x: info.x, y: info.y, pinned: true };
+              }
+              return {
+                x: info.x, y: info.y, lat: d.lat, lon: d.lon,
+                loading: true, info: null,
+                localName: d.name || undefined,
+                localHeight: d.height_m,
+                localUsage: d.usage || undefined,
+                pinned: true,
+              };
             });
           }
         },
@@ -1941,12 +1992,11 @@ export default function TrackMap() {
     const last = coords[coords.length - 1];
     if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
     const bldgH = "height_m" in pt ? pt.height_m : (pt as any).obstacle_height_m ?? 0;
-    const totalHeight = pt.ground_elev_m + bldgH;
     return {
       type: "FeatureCollection" as const,
       features: [{
         type: "Feature" as const,
-        properties: { height: totalHeight, base: pt.ground_elev_m },
+        properties: { height: bldgH, base: pt.ground_elev_m },
         geometry: { type: "Polygon" as const, coordinates: [coords] },
       }],
     };
@@ -1970,8 +2020,8 @@ export default function TrackMap() {
           source: sourceId,
           paint: {
             "fill-extrusion-color": panoramaPinned ? "#dc2626" : "#ef4444",
-            "fill-extrusion-height": ["get", "height"],
-            "fill-extrusion-base": 0,
+            "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
+            "fill-extrusion-base": ["get", "base"],
             "fill-extrusion-opacity": panoramaPinned ? 0.95 : 0.8,
           },
         });
@@ -2794,6 +2844,7 @@ export default function TrackMap() {
                       const az = ((Math.atan2(dLon * cosLat, dLat) * 180 / Math.PI) + 360) % 360;
                       const defaultDistKm = 30 * 1.852; // 30NM
                       setLosFromAzDist(az, defaultDistKm);
+                      setLosSearchedAddress({ lat, lon });
                       setLosCursorPicking(false);
                     }
                   }} />
@@ -2804,12 +2855,12 @@ export default function TrackMap() {
                   <AzimuthCircle
                     azimuth={losAzimuth}
                     disabled={false}
-                    onChange={(az) => setLosFromAzDist(az, losDistanceKm)}
+                    onChange={(az) => { setLosFromAzDist(az, losDistanceKm); setLosSearchedAddress(null); setLosAzFineCenter(az); }}
                   />
                   <div className="flex-1 space-y-1.5">
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] text-gray-500">방위</span>
-                      <span className="text-[10px] font-medium text-[#a60739]">{Math.round(losAzimuth)}°</span>
+                      <span className="text-[10px] font-medium text-[#a60739]">{losAzimuth.toFixed(3)}°</span>
                     </div>
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] text-gray-500">거리</span>
@@ -2818,12 +2869,28 @@ export default function TrackMap() {
                   </div>
                 </div>
 
+                {/* 초정밀 방위 슬라이더 (±2°, 0.001° step) */}
+                <div className="space-y-1">
+                  <input
+                    type="range"
+                    min={losAzFineCenter - 2} max={losAzFineCenter + 2} step={0.001}
+                    value={Math.min(losAzFineCenter + 2, Math.max(losAzFineCenter - 2, losAzimuth))}
+                    onChange={(e) => { setLosFromAzDist(Number(e.target.value), losDistanceKm); setLosSearchedAddress(null); }}
+                    className="w-full accent-[#a60739]"
+                  />
+                  <div className="flex justify-between text-[9px] text-gray-400">
+                    <span>{(losAzFineCenter - 2).toFixed(3)}°</span>
+                    <span className="text-[#a60739]/60">초정밀 ±2° (0.001°)</span>
+                    <span>{(losAzFineCenter + 2).toFixed(3)}°</span>
+                  </div>
+                </div>
+
                 {/* 거리 슬라이더 (NM) */}
                 <div className="space-y-1">
                   <input
                     type="range" min={1} max={Math.round(radarSite.range_nm)} step={1}
                     value={Math.min(Math.round(losDistanceKm / 1.852), Math.round(radarSite.range_nm))}
-                    onChange={(e) => setLosFromAzDist(losAzimuth, Number(e.target.value) * 1.852)}
+                    onChange={(e) => { setLosFromAzDist(losAzimuth, Number(e.target.value) * 1.852); setLosSearchedAddress(null); }}
                     disabled={false}
                     className="w-full accent-[#a60739] disabled:opacity-40"
                   />
@@ -2923,7 +2990,7 @@ export default function TrackMap() {
         {/* Hover tooltip */}
         {hoverInfo && (
           <div
-            className="pointer-events-none absolute z-[1000] rounded-lg border border-gray-200 bg-white/95 px-3 py-2.5 text-xs shadow-xl backdrop-blur-sm"
+            className="pointer-events-none absolute z-[9999] rounded-lg border border-gray-200 bg-white/95 px-3 py-2.5 text-xs shadow-xl backdrop-blur-sm"
             style={{ left: hoverInfo.x + 14, top: hoverInfo.y - 14 }}
           >
             {hoverInfo.lines.map((line, i) => (
@@ -2943,7 +3010,7 @@ export default function TrackMap() {
         {/* 커버리지 최저 탐지고도 tooltip */}
         {!hoverInfo && coverageTooltip && !coverageTooltip.loading && coverageTooltip.altFt !== null && (
           <div
-            className="pointer-events-none absolute z-[1000] rounded-md border border-[#a60739]/20 bg-white/95 px-2.5 py-1.5 text-xs shadow-lg backdrop-blur-sm"
+            className="pointer-events-none absolute z-[9999] rounded-md border border-[#a60739]/20 bg-white/95 px-2.5 py-1.5 text-xs shadow-lg backdrop-blur-sm"
             style={{ left: coverageTooltip.x + 14, top: coverageTooltip.y - 14 }}
           >
             <div className="flex items-center gap-1.5">
@@ -2956,77 +3023,137 @@ export default function TrackMap() {
 
 
 
-        {/* 건축물정보 팝업 (건물 클릭 시) */}
+        {/* 건축물정보 팝업 (건물 클릭 시) — VWorld 스타일 */}
         {bldgPopup && (
           <div
-            className="absolute z-[1100] rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm"
+            className="absolute z-[1100] rounded-lg border border-gray-300 bg-white shadow-xl"
             style={{
-              left: Math.min(bldgPopup.x + 14, window.innerWidth - 310),
+              left: Math.min(bldgPopup.x + 14, window.innerWidth - 380),
               top: Math.max(bldgPopup.y - 14, 8),
-              width: 280,
+              width: 360,
             }}
           >
             {/* 헤더 */}
-            <div className="flex items-center justify-between border-b border-gray-100 px-3 py-2">
-              <div className="flex items-center gap-1.5 min-w-0">
-                <Building2 size={12} className="shrink-0 text-[#a60739]" />
-                <span className="text-[11px] font-semibold text-gray-800 truncate">
-                  {bldgPopup.info?.name || bldgPopup.localName || "건축물정보"}
-                </span>
-              </div>
+            <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
+              <span className="text-[12px] font-bold text-gray-800">건축물정보</span>
               <button
                 onClick={() => setBldgPopup(null)}
-                className="rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors ml-1.5"
+                className="rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors"
               >
-                <X size={12} />
+                <X size={13} />
               </button>
             </div>
-            {/* 내용 */}
-            <div className="max-h-[320px] overflow-y-auto">
+            {/* 본문 */}
+            <div className="max-h-[420px] overflow-y-auto">
               {bldgPopup.loading ? (
-                <div className="flex items-center justify-center gap-2 px-3 py-4 text-[10px] text-gray-400">
-                  <Loader2 size={12} className="animate-spin" />
+                <div className="flex items-center justify-center gap-2 px-3 py-5 text-[11px] text-gray-400">
+                  <Loader2 size={13} className="animate-spin" />
                   조회 중...
                 </div>
               ) : (() => {
                 const bi = bldgPopup.info;
-                const rows: [string, string][] = [];
-                if (bi) {
-                  if (bi.road_addr) rows.push(["도로명", bi.road_addr]);
-                  if (bi.jibun_addr) rows.push(["지번", bi.jibun_addr]);
-                  if (bi.usage) rows.push(["용도", bi.usage]);
-                  if (bi.structure) rows.push(["구조", bi.structure]);
-                  if (bi.floors_above || bi.floors_below) rows.push(["층수", `지상 ${bi.floors_above || "-"} / 지하 ${bi.floors_below || "-"}`]);
-                  if (bi.height) rows.push(["높이", bi.height]);
-                  if (bi.area) rows.push(["건물면적", bi.area]);
-                  if (bi.total_area) rows.push(["연면적", bi.total_area]);
-                  if (bi.site_area) rows.push(["대지면적", bi.site_area]);
-                  if (bi.floor_area_ratio || bi.building_coverage) rows.push(["용적률/건폐율", `${bi.floor_area_ratio || "-"} / ${bi.building_coverage || "-"}`]);
-                  if (bi.approval_date) rows.push(["사용승인", bi.approval_date]);
-                }
-                if (rows.length === 0) {
-                  // VWorld 정보 없으면 로컬 정보라도 표시
-                  if (bldgPopup.localHeight) rows.push(["높이", `${bldgPopup.localHeight.toFixed(1)}m`]);
-                  if (bldgPopup.localUsage) rows.push(["용도", bldgPopup.localUsage]);
-                  rows.push(["좌표", `${bldgPopup.lat.toFixed(6)}°N, ${bldgPopup.lon.toFixed(6)}°E`]);
-                  if (rows.length <= 1) return <div className="px-3 py-3 text-[10px] text-gray-400 text-center">건축물정보 없음</div>;
+                const displayName = bi?.name || bldgPopup.localName || "";
+                const hasInfo = bi && (bi.name || bi.road_addr || bi.jibun_addr || bi.usage || bi.structure || bi.height);
+                if (!hasInfo) {
+                  return (
+                    <div className="px-3 py-4">
+                      <div className="text-[11px] text-gray-400 text-center mb-2">건축물정보 없음</div>
+                      {(bldgPopup.localHeight || bldgPopup.localUsage) && (
+                        <table className="w-full text-[11px] border-t border-gray-200">
+                          <tbody>
+                            {bldgPopup.localHeight != null && (
+                              <tr className="border-b border-gray-100">
+                                <td className="px-2 py-1.5 bg-gray-50 text-gray-500 w-[80px]">건물높이</td>
+                                <td className="px-2 py-1.5 text-gray-700">{bldgPopup.localHeight.toFixed(1)} m</td>
+                              </tr>
+                            )}
+                            {bldgPopup.localUsage && (
+                              <tr>
+                                <td className="px-2 py-1.5 bg-gray-50 text-gray-500">건물용도</td>
+                                <td className="px-2 py-1.5 text-gray-700">{bldgPopup.localUsage}</td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  );
                 }
                 return (
-                  <table className="w-full text-[10px]">
-                    <tbody>
-                      {rows.map(([k, v], i) => (
-                        <tr key={i} className={i % 2 === 0 ? "bg-white" : "bg-gray-50/50"}>
-                          <td className="px-2.5 py-1.5 text-gray-400 whitespace-nowrap w-[76px] align-top font-medium">{k}</td>
-                          <td className="px-2 py-1.5 text-gray-700 break-all">{v}</td>
+                  <>
+                    {/* 건물명/주소 배너 */}
+                    <div className="mx-3 mt-3 mb-2 rounded border border-gray-200 bg-gray-50 px-2.5 py-2 space-y-1">
+                      {displayName && (
+                        <div className="text-[12px] font-semibold text-gray-800">{displayName}</div>
+                      )}
+                      {bi?.road_addr && (
+                        <div className="flex items-start gap-1.5 text-[10.5px]">
+                          <span className="shrink-0 rounded-sm bg-[#a60739] px-1.5 py-[1px] text-[9px] font-semibold text-white">도로명</span>
+                          <span className="text-gray-700 leading-[14px]">{bi.road_addr}</span>
+                        </div>
+                      )}
+                      {bi?.jibun_addr && (
+                        <div className="flex items-start gap-1.5 text-[10.5px]">
+                          <span className="shrink-0 rounded-sm bg-gray-500 px-1.5 py-[1px] text-[9px] font-semibold text-white">지번</span>
+                          <span className="text-gray-700 leading-[14px]">{bi.jibun_addr}</span>
+                        </div>
+                      )}
+                    </div>
+                    {/* 상세 테이블 */}
+                    <table className="w-full border-t border-gray-200 text-[10.5px]">
+                      <tbody>
+                        <tr className="border-b border-gray-100">
+                          <td className="w-[68px] bg-gray-50 px-2 py-1.5 text-gray-500">건물명칭</td>
+                          <td className="px-2 py-1.5 text-gray-700" colSpan={3}>{bi?.name || "-"}</td>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                        <tr className="border-b border-gray-100">
+                          <td className="w-[68px] bg-gray-50 px-2 py-1.5 text-gray-500">건물동명칭</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.dong_name || "-"}</td>
+                          <td className="w-[68px] bg-gray-50 px-2 py-1.5 text-gray-500">건물용도</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.usage || "-"}</td>
+                        </tr>
+                        <tr className="border-b border-gray-100">
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">구조</td>
+                          <td className="px-2 py-1.5 text-gray-700" colSpan={3}>{bi?.structure || "-"}</td>
+                        </tr>
+                        <tr className="border-b border-gray-100">
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">지상층수</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.floors_above ? `${bi.floors_above} 층` : "-"}</td>
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">지하층수</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.floors_below ? `${bi.floors_below} 층` : "-"}</td>
+                        </tr>
+                        <tr className="border-b border-gray-100">
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">건물면적</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.area ? `${bi.area} ㎡` : "-"}</td>
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">건물높이</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.height ? `${bi.height} m` : "-"}</td>
+                        </tr>
+                        <tr className="border-b border-gray-100">
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">용적률</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.floor_area_ratio ? `${bi.floor_area_ratio} %` : "-"}</td>
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">건폐율</td>
+                          <td className="px-2 py-1.5 text-gray-700">{bi?.building_coverage ? `${bi.building_coverage} %` : "-"}</td>
+                        </tr>
+                        <tr className="border-b border-gray-100">
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">연면적</td>
+                          <td className="px-2 py-1.5 text-gray-700" colSpan={3}>{bi?.total_area ? `${bi.total_area} ㎡` : "-"}</td>
+                        </tr>
+                        <tr className="border-b border-gray-100">
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">대지면적</td>
+                          <td className="px-2 py-1.5 text-gray-700" colSpan={3}>{bi?.site_area ? `${bi.site_area} ㎡` : "-"}</td>
+                        </tr>
+                        <tr>
+                          <td className="bg-gray-50 px-2 py-1.5 text-gray-500">사용승인일자</td>
+                          <td className="px-2 py-1.5 text-gray-700" colSpan={3}>{bi?.approval_date || "-"}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </>
                 );
               })()}
             </div>
             {/* 좌표 푸터 */}
-            <div className="border-t border-gray-100 px-3 py-1.5 text-[9px] text-gray-400">
+            <div className="border-t border-gray-200 px-3 py-1.5 text-[9px] text-gray-400">
               {bldgPopup.lat.toFixed(6)}°N, {bldgPopup.lon.toFixed(6)}°E
             </div>
           </div>
@@ -3215,7 +3342,8 @@ export default function TrackMap() {
           radarSite={radarSite}
           targetLat={losTarget.lat}
           targetLon={losTarget.lon}
-          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosCursorPicking(true); }}
+          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosCursorPicking(true); }}
+          searchedAddress={losSearchedAddress}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
           onLoaded={handleLosLoaded}

@@ -4,8 +4,8 @@ import { ChevronDown, Trash2, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import Modal from "./common/Modal";
 import { Dropdown } from "./common/Dropdown";
+import AddressSearch, { AddressMarker } from "./Map/AddressSearch";
 import type { BuildingGroup, GeometryType, ManualBuilding } from "../types";
-import { haversineM } from "../utils/geo";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
 
 // ─── landuse 프로토콜 (BuildingModal 전용) ──────────────────────
@@ -355,13 +355,12 @@ export default function BuildingModal({
     setClickPts((prev) => {
       if (prev.length >= 3) {
         const first = prev[0];
-        const snapDistM = 50;
         const map = miniMapRef.current?.getMap();
-        let isSnap = haversineM(first[0], first[1], lat, lon) < snapDistM;
-        if (!isSnap && map) {
+        let isSnap = false;
+        if (map) {
           const firstPx = map.project([first[1], first[0]]);
           const clickPx = map.project([lon, lat]);
-          isSnap = Math.hypot(firstPx.x - clickPx.x, firstPx.y - clickPx.y) < 12;
+          isSnap = Math.hypot(firstPx.x - clickPx.x, firstPx.y - clickPx.y) <= 9;
         }
         if (isSnap) {
           const closed = [...prev, prev[0]];
@@ -438,14 +437,12 @@ export default function BuildingModal({
     if (pts.length < 2) return null;
     if (clickPts.length >= 3 && mousePt) {
       const first = clickPts[0];
-      let isNearFirst = haversineM(first[0], first[1], mousePt[0], mousePt[1]) < 50;
-      if (!isNearFirst) {
-        const map = miniMapRef.current?.getMap();
-        if (map) {
-          const firstPx = map.project([first[1], first[0]]);
-          const mousePx = map.project([mousePt[1], mousePt[0]]);
-          isNearFirst = Math.hypot(firstPx.x - mousePx.x, firstPx.y - mousePx.y) < 12;
-        }
+      let isNearFirst = false;
+      const map = miniMapRef.current?.getMap();
+      if (map) {
+        const firstPx = map.project([first[1], first[0]]);
+        const mousePx = map.project([mousePt[1], mousePt[0]]);
+        isNearFirst = Math.hypot(firstPx.x - mousePx.x, firstPx.y - mousePx.y) <= 9;
       }
       if (isNearFirst) {
         const closed = [...clickPts, clickPts[0]];
@@ -477,6 +474,18 @@ export default function BuildingModal({
   const markerLon = parseFloat(form.longitude);
   const hasMarker = !isNaN(markerLat) && !isNaN(markerLon);
   const mapCenter = hasMarker ? { latitude: markerLat, longitude: markerLon } : { latitude: 37.55, longitude: 126.99 };
+
+  const [addressMarker, setAddressMarker] = useState<{ lat: number; lon: number; label: string } | null>(null);
+  const handleAddressSelect = useCallback((lat: number, lon: number, label: string) => {
+    if (lat !== 0 && lon !== 0) {
+      miniMapRef.current?.flyTo({ center: [lon, lat], zoom: 17, duration: 600 });
+      setAddressMarker({ lat, lon, label });
+    } else {
+      setAddressMarker(null);
+    }
+  }, []);
+
+  useEffect(() => { if (!isOpen) setAddressMarker(null); }, [isOpen]);
 
   const [elevMode, setElevMode] = useState<"auto" | "manual">("auto");
   const [elevLoading, setElevLoading] = useState(false);
@@ -666,7 +675,11 @@ export default function BuildingModal({
                   </button>
                 </Marker>
               )}
+              {addressMarker && (
+                <AddressMarker marker={addressMarker} onClose={() => setAddressMarker(null)} />
+              )}
             </MapGL>
+            <AddressSearch onSelect={handleAddressSelect} />
           </div>
         </div>
       </div>

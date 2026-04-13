@@ -22,7 +22,7 @@ import { useAppStore } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { queryFlightPoints } from "../utils/flightConsolidationWorker";
-import { computeLayersForAltitudes, isGPUCacheValidFor, type CoverageLayer } from "../utils/radarCoverage";
+import { type CoverageLayer } from "../utils/radarCoverage";
 import { haversineKm } from "../utils/geo";
 import {
   writeReportPayload, writeReportConfig, readGenerateRequest, clearGenerateRequest,
@@ -174,22 +174,9 @@ export default function ReportGeneration() {
     return () => { cancelled = true; };
   }, [panoramaData]);
 
-  // 커버리지 레이어 (GPU 캐시에서 동기 추출)
-  const [coverageLayers, setCoverageLayers] = useState<CoverageLayer[]>([]);
-  useEffect(() => {
-    if (!isGPUCacheValidFor(radarSite)) { setCoverageLayers([]); return; }
-    // 100ft ~ 30000ft, 적절 간격으로 레이어 생성
-    const maxAlt = 30000;
-    const step = 1000;
-    const altFts: number[] = [];
-    for (let alt = 100; alt <= maxAlt; alt += (alt < 2000 ? 500 : step)) {
-      altFts.push(alt);
-    }
-    if (altFts.length > 0 && altFts[altFts.length - 1] !== maxAlt) {
-      altFts.push(maxAlt);
-    }
-    setCoverageLayers(computeLayersForAltitudes(altFts));
-  }, [radarSite]);
+  // 커버리지 레이어는 보고서 창(ReportApp)에서 OM 경로로 계산됨.
+  // 이 페이지에서는 빈 배열 유지 (프리뷰 props 호환용).
+  const coverageLayers: CoverageLayer[] = [];
 
   // 파노라마 자동 계산은 보고서 창(ReportApp)에서만 수행 — 메인 창 부하 방지
 

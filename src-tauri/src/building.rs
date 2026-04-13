@@ -166,7 +166,7 @@ pub fn query_buildings_along_path(
     let max_lon = radar_lon.max(target_lon) + buffer_deg;
 
     let mut stmt = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json
+        "SELECT centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json, COALESCE(ground_elev, 0)
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
@@ -185,6 +185,7 @@ pub fn query_buildings_along_path(
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, f64>(7)?,
             ))
         },
     ).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
@@ -201,7 +202,7 @@ pub fn query_buildings_along_path(
     let mut buildings = Vec::new();
 
     for row in rows {
-        let (_blat, _blon, height, name, address, usage, polygon_json_str) = row.map_err(|e| format!("행 읽기 실패: {}", e))?;
+        let (_blat, _blon, height, name, address, usage, polygon_json_str, ground_elev) = row.map_err(|e| format!("행 읽기 실패: {}", e))?;
 
         // 폴리곤 좌표 파싱 시도
         let polygon_coords: Option<Vec<[f64; 2]>> = polygon_json_str.as_deref()
@@ -243,8 +244,8 @@ pub fn query_buildings_along_path(
                 near_dist_km: near_dist,
                 far_dist_km: far_dist,
                 height_m: height,
-                ground_elev_m: 0.0,
-                total_height_m: height,
+                ground_elev_m: ground_elev,
+                total_height_m: height + ground_elev,
                 name,
                 address,
                 usage,
@@ -265,7 +266,8 @@ pub fn query_buildings_along_path(
         "SELECT latitude, longitude, height, ground_elev, name, memo, geometry_type, geometry_json
          FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2
-           AND longitude BETWEEN ?3 AND ?4"
+           AND longitude BETWEEN ?3 AND ?4
+           AND (group_id IS NULL OR group_id IN (SELECT id FROM building_groups WHERE enabled = 1))"
     ).map_err(|e| format!("수동 건물 쿼리 준비 실패: {}", e))?;
 
     let manual_rows = stmt2.query_map(
@@ -435,7 +437,8 @@ pub fn query_buildings_in_bbox(
          FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2
            AND longitude BETWEEN ?3 AND ?4
-           AND (height + ground_elev) >= ?5"
+           AND (height + ground_elev) >= ?5
+           AND (group_id IS NULL OR group_id IN (SELECT id FROM building_groups WHERE enabled = 1))"
     ).map_err(|e| format!("수동 건물 쿼리 준비 실패: {}", e))?;
 
     let rows2 = stmt2.query_map(
@@ -480,6 +483,8 @@ pub struct Building3D {
     pub lat: f64,
     pub lon: f64,
     pub height_m: f64,
+    /// 지반 표고 (m, AMSL) — SRTM 기반
+    pub ground_elev_m: f64,
     /// 건물 폴리곤 [[lat,lon],...] (WGS84)
     pub polygon: Vec<[f64; 2]>,
     pub name: Option<String>,
@@ -517,7 +522,8 @@ pub fn query_buildings_3d(
              LEFT JOIN building_groups bg ON mb.group_id = bg.id
              WHERE mb.latitude BETWEEN ?1 AND ?2
                AND mb.longitude BETWEEN ?3 AND ?4
-               AND (mb.height + mb.ground_elev) >= ?5"
+               AND (mb.height + mb.ground_elev) >= ?5
+               AND (mb.group_id IS NULL OR bg.enabled = 1)"
         ).map_err(|e| format!("수동 건물 3D 쿼리 준비 실패: {}", e))?;
 
         let rows2 = stmt2.query_map(
@@ -539,28 +545,19 @@ pub fn query_buildings_3d(
         for row in rows2 {
             let (lat, lon, height, ground_elev, name, geo_type, geo_json, group_color) =
                 row.map_err(|e| format!("수동 건물 3D 행 읽기 실패: {}", e))?;
-            let total_h = height + ground_elev;
 
             // 수동 건물 geometry → 폴리곤 좌표 변환
             let sample_pts = expand_manual_building_geometry(lat, lon, geo_type.as_deref(), geo_json.as_deref());
-            if sample_pts.len() < 3 {
-                // 점/선 → 작은 사각형 생성 (±5m)
+            let polygon: Vec<[f64; 2]> = if sample_pts.len() < 3 {
                 let d = 0.000045; // ~5m
-                let polygon = vec![
-                    [lat - d, lon - d],
-                    [lat - d, lon + d],
-                    [lat + d, lon + d],
-                    [lat + d, lon - d],
-                ];
-                result.push(Building3D {
-                    lat, lon, height_m: total_h, polygon, name, usage: None, source: "manual".to_string(), group_color,
-                });
+                vec![[lat - d, lon - d], [lat - d, lon + d], [lat + d, lon + d], [lat + d, lon - d]]
             } else {
-                let polygon: Vec<[f64; 2]> = sample_pts.iter().map(|(la, lo)| [*la, *lo]).collect();
-                result.push(Building3D {
-                    lat, lon, height_m: total_h, polygon, name, usage: None, source: "manual".to_string(), group_color,
-                });
-            }
+                sample_pts.iter().map(|(la, lo)| [*la, *lo]).collect()
+            };
+            result.push(Building3D {
+                lat, lon, height_m: height, ground_elev_m: ground_elev, polygon,
+                name, usage: None, source: "manual".to_string(), group_color,
+            });
         }
     }
 
@@ -619,7 +616,8 @@ pub fn query_buildings_3d_binary(
              LEFT JOIN building_groups bg ON mb.group_id = bg.id
              WHERE mb.latitude BETWEEN ?1 AND ?2
                AND mb.longitude BETWEEN ?3 AND ?4
-               AND (mb.height + mb.ground_elev) >= ?5"
+               AND (mb.height + mb.ground_elev) >= ?5
+               AND (mb.group_id IS NULL OR bg.enabled = 1)"
         ).map_err(|e| format!("수동 건물 binary 쿼리 준비 실패: {}", e))?;
 
         let rows = stmt.query_map(
@@ -642,7 +640,6 @@ pub fn query_buildings_3d_binary(
             if metas.len() >= max_count { break; }
             let (lat, lon, height, ground_elev, name, geo_type, geo_json, group_color) =
                 row.map_err(|e| format!("수동 건물 binary 행 읽기 실패: {}", e))?;
-            let total_h = height + ground_elev;
 
             let sample_pts = expand_manual_building_geometry(lat, lon, geo_type.as_deref(), geo_json.as_deref());
             let polygon: Vec<[f64; 2]> = if sample_pts.len() < 3 {
@@ -652,10 +649,11 @@ pub fn query_buildings_3d_binary(
                 sample_pts.iter().map(|(la, lo)| [*la, *lo]).collect()
             };
 
-            // 패킹: [lon, lat, height, vertexCount, v0_lon, v0_lat, ...]
+            // 패킹: [lon, lat, ground_elev, height, vertexCount, v0_lon, v0_lat, ...]
             floats.push(lon);
             floats.push(lat);
-            floats.push(total_h);
+            floats.push(ground_elev);
+            floats.push(height);
             floats.push(polygon.len() as f64);
             for [vlat, vlon] in &polygon {
                 floats.push(*vlon);
@@ -671,7 +669,7 @@ pub fn query_buildings_3d_binary(
     // FAC 건물 (fac_buildings 테이블 없을 수 있음 — 실패 시 무시)
     if !skip_fac {
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT centroid_lat, centroid_lon, height, building_name, usability, polygon_json
+            "SELECT centroid_lat, centroid_lon, height, building_name, usability, polygon_json, COALESCE(ground_elev, 0)
              FROM fac_buildings
              WHERE centroid_lat BETWEEN ?1 AND ?2
                AND centroid_lon BETWEEN ?3 AND ?4
@@ -691,11 +689,12 @@ pub fn query_buildings_3d_binary(
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, f64>(6)?,
                     ))
                 },
             ) {
                 for row in rows {
-                    let (lat, lon, height, name, usage, poly_json) = match row {
+                    let (lat, lon, height, name, usage, poly_json, ground_elev) = match row {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
@@ -708,6 +707,7 @@ pub fn query_buildings_3d_binary(
 
                     floats.push(lon);
                     floats.push(lat);
+                    floats.push(ground_elev);
                     floats.push(height);
                     floats.push(polygon.len() as f64);
                     for [vlat, vlon] in &polygon {
@@ -750,12 +750,14 @@ pub struct BuildingGroup {
     pub plan_rotation: f64,
     /// 그룹 영역 바운드 JSON: [[minLat, minLon], [maxLat, maxLon]]
     pub area_bounds_json: Option<String>,
+    /// 활성화 여부 (false이면 LoS/커버리지/3D 렌더링에서 제외)
+    pub enabled: bool,
 }
 
 /// 건물 그룹 전체 조회
 pub fn list_building_groups(conn: &Connection) -> Result<Vec<BuildingGroup>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, color, memo, (plan_image IS NOT NULL) AS has_plan_image, plan_bounds_json, plan_opacity, plan_rotation, area_bounds_json FROM building_groups ORDER BY id"
+        "SELECT id, name, color, memo, (plan_image IS NOT NULL) AS has_plan_image, plan_bounds_json, plan_opacity, plan_rotation, area_bounds_json, enabled FROM building_groups ORDER BY id"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -769,6 +771,7 @@ pub fn list_building_groups(conn: &Connection) -> Result<Vec<BuildingGroup>, Str
             plan_opacity: row.get::<_, f64>(6).unwrap_or(0.5),
             plan_rotation: row.get::<_, f64>(7).unwrap_or(0.0),
             area_bounds_json: row.get(8)?,
+            enabled: row.get::<_, i32>(9).unwrap_or(1) != 0,
         })
     }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
@@ -818,6 +821,19 @@ pub fn update_building_group(
             params![rotation, id],
         ).map_err(|e| format!("UPDATE rotation 실패: {}", e))?;
     }
+    Ok(())
+}
+
+/// 건물 그룹 활성화 플래그 변경
+pub fn set_building_group_enabled(
+    conn: &Connection,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE building_groups SET enabled = ?1 WHERE id = ?2",
+        params![enabled as i32, id],
+    ).map_err(|e| format!("UPDATE enabled 실패: {}", e))?;
     Ok(())
 }
 
