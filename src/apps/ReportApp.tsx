@@ -623,8 +623,9 @@ export default function ReportApp() {
   }, []);
 
   // ── 파노라마 자동 계산 ──
-  // 구조: omData가 로드되면 result 레퍼런스를 ref에 저장하고, 같은 result에
-  // 대해서는 재실행 안 함. deps=[omData]로 모든 state 변화에 반응하되 ref로 guard.
+  // 구조: omData.result 레퍼런스 변경 시에만 effect 진입. ref로 동일 result 중복 실행 차단.
+  // deps에 omData 전체를 넣으면 내부 setOmData(loading 진입/진행 갱신) 시 effect가 재실행되며
+  // cleanup이 먼저 돌아 cancelled=true가 되고 진행 중인 invoke 결과가 전부 폐기됨 → 0/N에서 멈춤.
   // 실행 방식: 전 레이더 × (with/without) 완전 병렬(Promise.all), 5초 대기 제거.
   const panoramaStartedRef = useRef<unknown>(null);
   useEffect(() => {
@@ -652,17 +653,12 @@ export default function ReportApp() {
 
     const radars = omData.selectedRadarSites;
     const excludeIds = omData.selectedBuildings.map((b) => b.id);
-    console.log(`[Panorama] 시작 (${radars.length}개 레이더, 병렬)`, radars.map((r) => r.name));
+    console.log(`[Panorama] 시작 (${radars.length}개 레이더, GPU terrain)`, radars.map((r) => r.name));
 
     let cancelled = false;
-    const panoArgs = (radar: RadarSite) => ({
-      radarLat: radar.latitude,
-      radarLon: radar.longitude,
-      radarHeightM: radar.altitude + radar.antenna_height,
-      maxRangeKm: 100,
-      azimuthStepDeg: 0.01,
-      rangeStepM: 200,
-    });
+    const MAX_RANGE_KM = 100;
+    const AZ_STEP_DEG = 0.01;
+    const RANGE_STEP_M = 200;
 
     (async () => {
       // loading 진입
@@ -671,33 +667,49 @@ export default function ReportApp() {
       const withMap = new Map<string, PanoramaMergeResult>();
       const withoutMap = new Map<string, PanoramaMergeResult>();
 
-      // 전 레이더 병렬 실행 — 각 레이더 내에서도 with/without 동시 호출
-      await Promise.all(
-        radars.map(async (radar) => {
-          try {
-            const withPromise = invoke<PanoramaMergeResult>("calculate_los_panorama", panoArgs(radar));
-            const withoutPromise = excludeIds.length > 0
-              ? invoke<PanoramaMergeResult>("calculate_los_panorama", {
-                  ...panoArgs(radar),
-                  excludeManualIds: excludeIds,
-                })
-              : Promise.resolve(null);
-            const [withResult, withoutResult] = await Promise.all([withPromise, withoutPromise]);
-            if (cancelled) return;
-            withMap.set(radar.name, withResult);
-            if (withoutResult) withoutMap.set(radar.name, withoutResult);
-            // 진행 상황 오버레이 실시간 갱신 — 레이더가 완료될 때마다
-            setOmData((prev) => prev ? {
-              ...prev,
-              panoWithTargets: new Map(withMap),
-              panoWithoutTargets: new Map(withoutMap),
-            } : prev);
-            console.log(`[Panorama] ${radar.name} 완료`);
-          } catch (err) {
-            console.warn(`[Panorama] ${radar.name} 실패:`, err);
-          }
-        }),
-      );
+      // GPU(heightmap+terrain)는 단일 워커/디바이스 경합으로 레이더별 직렬 실행이 안전.
+      // 레이더 내에서는 terrain 결과를 공유하여 with/without merge_buildings 를 병렬 호출.
+      const { computePanoramaTerrainGPU } = await import("../utils/gpuPanorama");
+
+      for (const radar of radars) {
+        if (cancelled) return;
+        const radarH = radar.altitude + radar.antenna_height;
+        try {
+          const terrainResults = await computePanoramaTerrainGPU(
+            radar.latitude, radar.longitude, radarH,
+            MAX_RANGE_KM, AZ_STEP_DEG, RANGE_STEP_M,
+          );
+          if (cancelled) return;
+
+          const mergeArgs = {
+            radarLat: radar.latitude,
+            radarLon: radar.longitude,
+            radarHeightM: radarH,
+            maxRangeKm: MAX_RANGE_KM,
+            azimuthStepDeg: AZ_STEP_DEG,
+            terrainResults,
+          };
+          const withPromise = invoke<PanoramaMergeResult>("panorama_merge_buildings", mergeArgs);
+          const withoutPromise = excludeIds.length > 0
+            ? invoke<PanoramaMergeResult>("panorama_merge_buildings", {
+                ...mergeArgs,
+                excludeManualIds: excludeIds,
+              })
+            : Promise.resolve(null);
+          const [withResult, withoutResult] = await Promise.all([withPromise, withoutPromise]);
+          if (cancelled) return;
+          withMap.set(radar.name, withResult);
+          if (withoutResult) withoutMap.set(radar.name, withoutResult);
+          setOmData((prev) => prev ? {
+            ...prev,
+            panoWithTargets: new Map(withMap),
+            panoWithoutTargets: new Map(withoutMap),
+          } : prev);
+          console.log(`[Panorama] ${radar.name} 완료`);
+        } catch (err) {
+          console.warn(`[Panorama] ${radar.name} 실패:`, err);
+        }
+      }
 
       if (cancelled) return;
       startTransition(() => {
@@ -712,7 +724,7 @@ export default function ReportApp() {
     })();
 
     return () => { cancelled = true; };
-  }, [omData]);
+  }, [omData?.result]);
 
   // ── 설정 모달 표시 ──
   if (configPayload && !state) {

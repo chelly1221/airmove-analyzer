@@ -627,10 +627,12 @@ async fn panorama_merge_buildings(
     max_range_km: Option<f64>,
     azimuth_step_deg: Option<f64>,
     terrain_results: Vec<analysis::panorama::TerrainResult>,
+    exclude_manual_ids: Option<Vec<i64>>,
 ) -> Result<analysis::panorama::PanoramaMergeResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let max_range = max_range_km.unwrap_or(100.0);
         let az_step = azimuth_step_deg.unwrap_or(0.01);
+        let exclude_ids = exclude_manual_ids.unwrap_or_default();
 
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
@@ -640,7 +642,7 @@ async fn panorama_merge_buildings(
             &mut srtm, &conn,
             &terrain_results,
             radar_lat, radar_lon, radar_height_m,
-            max_range * 1000.0, az_step,
+            max_range * 1000.0, az_step, &exclude_ids,
         ))
     })
     .await

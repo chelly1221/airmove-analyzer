@@ -388,6 +388,7 @@ pub fn merge_buildings_into_panorama(
     radar_height_m: f64,
     max_range_m: f64,
     _azimuth_step_deg: f64,
+    exclude_manual_ids: &[i64],
 ) -> PanoramaMergeResult {
     let terrain: Vec<PanoramaPoint> = terrain_results.iter().map(|t| PanoramaPoint {
         azimuth_deg: t.azimuth_deg,
@@ -401,7 +402,7 @@ pub fn merge_buildings_into_panorama(
         polygon: None,
     }).collect();
 
-    let all_buildings = collect_building_obstacles(srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, &[]);
+    let all_buildings = collect_building_obstacles(srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, exclude_manual_ids);
     let buildings = filter_visible_buildings(all_buildings, &terrain);
 
     PanoramaMergeResult { terrain, buildings }
