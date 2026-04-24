@@ -6,9 +6,23 @@
  *    (이벤트 없으면 fallback delay 후 캡처)
  * 3. 캡처 성공 시 <img>로 교체 → 이후 리렌더 비용 0
  *
+ * 동시성: 전역 큐로 한 번에 하나의 섹션만 html2canvas 실행.
+ *         동시 실행 시 메인 스레드 경합으로 load 이벤트 핸들러가 수 초간 블로킹되어
+ *         React setState 반영이 지연되어 캡처 단계가 영구 교착되는 문제 회피.
+ *
  * 텍스트 편집이 필요한 섹션(소견 등)에는 사용하지 않음.
  */
 import { useState, useRef, useEffect } from "react";
+
+// 전역 캡처 큐 — html2canvas 동시 실행 금지
+let globalCaptureQueue: Promise<void> = Promise.resolve();
+function enqueueCaptureTask(task: () => Promise<void>): Promise<void> {
+  const next = globalCaptureQueue.then(() => task()).catch((e) => {
+    console.warn("[OMSectionImage] 캡처 큐 태스크 실패:", e);
+  });
+  globalCaptureQueue = next;
+  return next;
+}
 
 export interface CaptureTracker {
   /** 섹션 mount 시 등록 — 진행 오버레이에 "대기 중"으로 표출 */
@@ -80,44 +94,50 @@ export default function OMSectionImage({
       trackerRef.current?.complete(sectionKey);
     };
 
-    const doCapture = async () => {
-      if (cancelled) { reportDone(); return; }
-      try {
-        const { default: html2canvas } = await import("html2canvas-pro");
-        const canvas = await html2canvas(el, {
-          scale: 2,
-          useCORS: true,
-          backgroundColor: "#ffffff",
-          logging: false,
-        });
-        if (cancelled) {
+    // 실제 html2canvas 캡처 — 전역 큐로 직렬화
+    const runCapture = () => {
+      if (queued || cancelled) return;
+      queued = true;
+      enqueueCaptureTask(async () => {
+        if (cancelled) return;
+        console.log(`[OMSectionImage] 캡처 시작: ${sectionKey}`);
+        const t0 = performance.now();
+        try {
+          const { default: html2canvas } = await import("html2canvas-pro");
+          const canvas = await html2canvas(el, {
+            scale: 2,
+            useCORS: true,
+            backgroundColor: "#ffffff",
+            logging: false,
+          });
+          if (cancelled) {
+            canvas.width = 0;
+            canvas.height = 0;
+            return;
+          }
+          const dataUrl = canvas.toDataURL("image/png");
           canvas.width = 0;
           canvas.height = 0;
-          reportDone();
-          return;
+          capturedRef.current = true;
+          setImageUrl(dataUrl);
+          onCapturedRef.current?.(dataUrl);
+          console.log(`[OMSectionImage] 캡처 완료: ${sectionKey} (${(performance.now() - t0).toFixed(0)}ms)`);
+        } catch (err) {
+          console.warn(`[OMSectionImage] 캡처 실패: ${sectionKey}`, err);
         }
-        const dataUrl = canvas.toDataURL("image/png");
-        canvas.width = 0;
-        canvas.height = 0;
-        capturedRef.current = true;
-        setImageUrl(dataUrl);
-        onCapturedRef.current?.(dataUrl);
-        reportDone();
-      } catch (err) {
-        console.warn("[OMSectionImage] 캡처 실패, 원본 유지:", err);
-        reportDone();
-      }
+      }).finally(() => reportDone());
     };
 
     // captureReady 이벤트 수신 — 자식이 렌더링 완료를 알릴 때
     let eventFired = false;
+    let queued = false;
     const handleReady = () => {
       if (eventFired || cancelled) return;
       eventFired = true;
       // 2× RAF로 브라우저 paint 완료 보장
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          if (!cancelled) doCapture();
+          if (!cancelled) runCapture();
         });
       });
     };
@@ -125,7 +145,7 @@ export default function OMSectionImage({
 
     // 폴백 타이머 — captureReady 이벤트가 오지 않을 경우 delay 후 캡처
     const fallbackTimer = setTimeout(() => {
-      if (!eventFired && !cancelled) doCapture();
+      if (!eventFired && !cancelled) runCapture();
     }, delay);
 
     return () => {

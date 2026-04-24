@@ -649,6 +649,37 @@ async fn panorama_merge_buildings(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// GPU 파노라마 건물 병합 (dual) — with/without manual targets 를 단일 IPC로 반환.
+/// terrain 직렬화/송신을 1회만 수행하여 기존 대비 IPC 비용 절반 수준.
+#[tauri::command]
+async fn panorama_merge_buildings_dual(
+    app_handle: tauri::AppHandle,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    max_range_km: Option<f64>,
+    terrain_results: Vec<analysis::panorama::TerrainResult>,
+    exclude_manual_ids: Option<Vec<i64>>,
+) -> Result<analysis::panorama::PanoramaMergeDualResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let max_range = max_range_km.unwrap_or(100.0);
+        let exclude_ids = exclude_manual_ids.unwrap_or_default();
+
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+
+        Ok(analysis::panorama::merge_buildings_into_panorama_dual(
+            &mut srtm, &conn,
+            &terrain_results,
+            radar_lat, radar_lon, radar_height_m,
+            max_range * 1000.0, &exclude_ids,
+        ))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// 파노라마 캐시 저장
 #[tauri::command]
 async fn save_panorama_cache(
@@ -1782,19 +1813,41 @@ async fn build_heightmap(
     let pix = pixel_size_m.unwrap_or(100.0);
     let skip_bldg = skip_buildings.unwrap_or(false);
 
+    let handle = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+        let emit = |msg: String| { let _ = handle.emit("panorama-debug", msg); };
+        let state = handle.state::<AppState>();
 
-        Ok(analysis::heightmap::build_heightmap(
+        let t0 = std::time::Instant::now();
+        emit("build_heightmap: SRTM lock 시도".into());
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        emit(format!("build_heightmap: SRTM lock 획득 ({}ms 대기)", t0.elapsed().as_millis()));
+
+        let t1 = std::time::Instant::now();
+        emit("build_heightmap: DB pool 시도".into());
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+        emit(format!("build_heightmap: DB pool 획득 ({}ms)", t1.elapsed().as_millis()));
+
+        let t2 = std::time::Instant::now();
+        emit("build_heightmap: 내부 계산 시작".into());
+        let handle2 = handle.clone();
+        let progress_cb = move |msg: String| {
+            let _ = handle2.emit("panorama-debug", msg);
+        };
+        let result = analysis::heightmap::build_heightmap_with_progress(
             &mut srtm,
             &conn,
             radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
             pix,
             exclude_manual_ids.as_deref(),
             skip_bldg,
-        ))
+            Some(&progress_cb),
+        );
+        emit(format!("build_heightmap: 내부 계산 완료 ({}ms, {}×{}, b64 {:.1}MB)",
+            t2.elapsed().as_millis(), result.width, result.height,
+            result.data_b64.len() as f64 / 1024.0 / 1024.0));
+
+        Ok(result)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -2415,6 +2468,7 @@ pub fn run() {
             calculate_los_panorama,
             build_heightmap,
             panorama_merge_buildings,
+            panorama_merge_buildings_dual,
             save_panorama_cache,
             load_panorama_cache,
             clear_panorama_cache,

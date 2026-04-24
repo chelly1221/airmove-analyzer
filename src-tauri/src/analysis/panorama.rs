@@ -81,6 +81,15 @@ pub struct PanoramaMergeResult {
     pub buildings: Vec<BuildingObstacle>,
 }
 
+/// with/without manual targets 묶음 결과 — 단일 IPC로 두 변형을 반환.
+/// terrain 은 두 변형이 공유하므로 한 번만 직렬화 (IPC 절반).
+#[derive(Serialize, Clone, Debug)]
+pub struct PanoramaMergeDualResult {
+    pub terrain: Vec<PanoramaPoint>,
+    pub buildings_with_targets: Vec<BuildingObstacle>,
+    pub buildings_without_targets: Option<Vec<BuildingObstacle>>,
+}
+
 /// 건물 후보 (DB 조회 결과) — point-only 폴백용
 struct BuildingCandidate {
     lat: f64,
@@ -406,6 +415,49 @@ pub fn merge_buildings_into_panorama(
     let buildings = filter_visible_buildings(all_buildings, &terrain);
 
     PanoramaMergeResult { terrain, buildings }
+}
+
+/// with/without manual targets 동시 계산 — terrain 변환/건물 수집을 1회만 수행.
+/// exclude_manual_ids 가 비어 있으면 without_targets 는 None.
+pub fn merge_buildings_into_panorama_dual(
+    srtm: &mut SrtmReader,
+    conn: &Connection,
+    terrain_results: &[TerrainResult],
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    max_range_m: f64,
+    exclude_manual_ids: &[i64],
+) -> PanoramaMergeDualResult {
+    let terrain: Vec<PanoramaPoint> = terrain_results.iter().map(|t| PanoramaPoint {
+        azimuth_deg: t.azimuth_deg,
+        elevation_angle_deg: t.elevation_angle_deg,
+        distance_km: t.distance_km,
+        obstacle_height_m: t.obstacle_height_m,
+        ground_elev_m: t.ground_elev_m,
+        obstacle_type: "terrain".to_string(),
+        name: None, address: None, usage: None,
+        lat: t.lat, lon: t.lon,
+        polygon: None,
+    }).collect();
+
+    // with_targets: 전체 건물 수집 (수동 건물 제외 없이)
+    let all_buildings = collect_building_obstacles(
+        srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, &[],
+    );
+    let buildings_with_targets = filter_visible_buildings(all_buildings, &terrain);
+
+    let buildings_without_targets = if exclude_manual_ids.is_empty() {
+        None
+    } else {
+        // manual_buildings 쿼리만 exclude 적용 — fac_buildings 쿼리는 OS 캐시로 저렴
+        let filtered = collect_building_obstacles(
+            srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, exclude_manual_ids,
+        );
+        Some(filter_visible_buildings(filtered, &terrain))
+    };
+
+    PanoramaMergeDualResult { terrain, buildings_with_targets, buildings_without_targets }
 }
 
 /// LoS에 실질적으로 영향 주는 건물만 필터:

@@ -16,7 +16,7 @@ export type {
   PlanImageBounds,
   ManualBuilding,
 } from "./building";
-export type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult } from "./panorama";
+export type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult, PanoramaMergeDualResult } from "./panorama";
 export type { Flight, ManualMergeRecord } from "./flight";
 export type { ReportMetadata, SavedReportSummary, SavedReportDetail } from "./report";
 export type {

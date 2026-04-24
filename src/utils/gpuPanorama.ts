@@ -89,6 +89,7 @@ export async function computePanoramaTerrainGPU(
 
   // 1. Rust에서 heightmap 수신
   const rangeNm = maxRangeKm / 1.852;
+  console.log(`[GPU Panorama] build_heightmap invoke 시작 (lat=${radarLat.toFixed(4)}, lon=${radarLon.toFixed(4)}, rangeNm=${rangeNm.toFixed(1)})`);
   console.time("[GPU Panorama] Heightmap fetch");
   const meta = await invoke<HeightmapResult>("build_heightmap", {
     radarLat, radarLon,
@@ -98,14 +99,20 @@ export async function computePanoramaTerrainGPU(
     pixelSizeM: 100,
     skipBuildings: true,
   });
+  console.log(`[GPU Panorama] build_heightmap 응답: ${meta.width}×${meta.height}, pixel=${meta.pixel_size_m}m, b64=${(meta.data_b64.length / 1024 / 1024).toFixed(1)}MB`);
   const ab = await decodeBase64OffThread(meta.data_b64);
   meta.data_b64 = "";
   console.timeEnd("[GPU Panorama] Heightmap fetch");
+  console.log(`[GPU Panorama] ArrayBuffer decoded: ${(ab.byteLength / 1024 / 1024).toFixed(1)}MB`);
   onProgress?.("heightmap_done");
+  // React paint 기회 부여 — phase 전환 상태가 UI에 반영될 틈
+  await new Promise((r) => setTimeout(r, 0));
 
   // 2. GPU Worker에 위임
+  console.log(`[GPU Panorama] GPU Worker 확보 중`);
   console.time("[GPU Panorama] Worker compute");
   const worker = await getGPUWorkerInstance();
+  console.log(`[GPU Panorama] GPU Worker 준비 완료, PANORAMA_COMPUTE 전송`);
   const seq = Date.now();
   const { data_b64: _, ...metaClean } = meta;
 
@@ -128,6 +135,7 @@ export async function computePanoramaTerrainGPU(
   });
   console.timeEnd("[GPU Panorama] Worker compute");
   onProgress?.("gpu_done");
+  await new Promise((r) => setTimeout(r, 0));
 
   // 3. TerrainResult 배열로 변환
   const results: TerrainResult[] = new Array(numAzimuths);

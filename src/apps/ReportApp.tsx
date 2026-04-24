@@ -24,7 +24,7 @@ import {
 } from "../utils/reportTransfer";
 import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
-  PanoramaPoint, PanoramaMergeResult, ManualBuilding, RadarSite, TrackPoint, AzSector,
+  PanoramaPoint, PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, RadarSite, TrackPoint, AzSector,
   ObstacleMonthlyResult, PreScreeningResult, OMReportData, SavedReportSummary,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
@@ -155,8 +155,31 @@ export default function ReportApp() {
   type CaptureEntry = { label: string; status: "pending" | "done" };
   const [captureMap, setCaptureMap] = useState<Map<string, CaptureEntry>>(new Map());
   const [omMountGrace, setOmMountGrace] = useState(false);
+
+  // 파노라마 하위 단계 진행 상태 (레이더별 heightmap → GPU → merge)
+  type PanoramaPhase = "heightmap" | "gpu" | "merge";
+  type PanoramaProgress = {
+    currentIndex: number;   // 1-based, 처리 중 레이더
+    totalRadars: number;
+    currentRadarName: string;
+    phase: PanoramaPhase;
+  };
+  const [panoramaProgress, setPanoramaProgress] = useState<PanoramaProgress | null>(null);
+  const [panoramaElapsedMs, setPanoramaElapsedMs] = useState(0);
+  const [panoramaLastError, setPanoramaLastError] = useState<string | null>(null);
+  // phaseStartedAt 은 ref 로 보관 — phase 전환 시 interval 을 재생성하지 않음
+  const phaseStartedAtRef = useRef<number>(0);
+  const panoramaActive = panoramaProgress !== null;
+  useEffect(() => {
+    if (!panoramaActive) { setPanoramaElapsedMs(0); return; }
+    const id = setInterval(() => {
+      setPanoramaElapsedMs(performance.now() - phaseStartedAtRef.current);
+    }, 250);
+    return () => clearInterval(id);
+  }, [panoramaActive]);
   const captureTracker = useMemo(() => ({
     register: (key: string, label: string) => {
+      console.log(`[Capture] register: ${key} (${label})`);
       setCaptureMap((m) => {
         const next = new Map(m);
         next.set(key, { label, status: "pending" });
@@ -164,6 +187,7 @@ export default function ReportApp() {
       });
     },
     complete: (key: string) => {
+      console.log(`[Capture] complete: ${key}`);
       setCaptureMap((m) => {
         const entry = m.get(key);
         if (!entry || entry.status === "done") return m;
@@ -263,6 +287,11 @@ export default function ReportApp() {
       loadFromIDB();
     });
 
+    // Rust 파노라마/heightmap 단계별 진단 로그
+    const unlistenPanoramaDebug = listen<string>("panorama-debug", (e) => {
+      console.log(`[Rust] ${e.payload}`);
+    });
+
     // report:reload-config → 기존 창 재사용 시 모달 다시 표시
     const unlistenReloadConfig = listen("report:reload-config", async () => {
       loadingRef.current = false;
@@ -333,6 +362,7 @@ export default function ReportApp() {
 
     return () => {
       unlistenData.then((fn) => fn());
+      unlistenPanoramaDebug.then((fn) => fn());
       unlistenReloadConfig.then((fn) => fn());
       unlistenReload.then((fn) => fn());
       unlistenError.then((fn) => fn());
@@ -352,11 +382,22 @@ export default function ReportApp() {
     return getSectionToggles(activeTemplate, activeSections);
   }, [activeTemplate, activeSections]);
 
-  // ── OM staging: omData가 새로 로드되면 captureMap 리셋 + mount grace 활성화 ──
+  // ── 프리뷰 mount 게이트 ──
+  // 파노라마 IPC 응답(20MB+ base64)이 메인 스레드 block 된 프리뷰 렌더와 경합해 영구 대기됨.
+  // coverage+panorama 완료 전까지는 ReportPreviewContent 를 아예 mount 하지 않아 메인 스레드 확보.
+  const previewMountable = useMemo(() => {
+    if (activeTemplate !== "obstacle_monthly") return true;
+    if (!omData) return true;
+    const covReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
+    const panoReady = omData.panoramaStatus === "done";
+    return covReady && panoReady;
+  }, [activeTemplate, omData]);
+
+  // ── OM staging: preview 가 실제로 mount 되는 시점에 captureMap 리셋 + mount grace 활성화 ──
   // Why: OMSectionImage 들이 mount하여 captureTracker.register() 호출할 시간을 확보.
   // grace 기간 동안에는 pending===0 이어도 ready로 인정하지 않음.
   useEffect(() => {
-    if (activeTemplate !== "obstacle_monthly" || !omData) {
+    if (activeTemplate !== "obstacle_monthly" || !omData || !previewMountable) {
       setOmMountGrace(false);
       return;
     }
@@ -364,7 +405,7 @@ export default function ReportApp() {
     setOmMountGrace(true);
     const t = setTimeout(() => setOmMountGrace(false), 800);
     return () => clearTimeout(t);
-  }, [activeTemplate, omData?.result]);
+  }, [activeTemplate, omData?.result, previewMountable]);
 
   // captureMap 기반 카운트 파생
   const { captureTotal, captureDone, capturePending } = useMemo(() => {
@@ -377,14 +418,19 @@ export default function ReportApp() {
   }, [captureMap]);
 
   // ── OM 준비 완료 여부 ──
-  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료 (3) mount grace 해제 (4) 진행 중 캡처 0
+  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료 (3) mount grace 해제
+  //       (4) 섹션 등록 최소 1개 이상 (5) 진행 중 캡처 0
   const omReady = useMemo(() => {
     if (activeTemplate !== "obstacle_monthly") return true;
     if (!omData) return false;
     const covReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
     const panoReady = omData.panoramaStatus === "done";
-    return covReady && panoReady && !omMountGrace && capturePending === 0;
-  }, [activeTemplate, omData, omMountGrace, capturePending]);
+    if (!covReady || !panoReady) return false;
+    if (omMountGrace) return false;
+    // preview unmount 동안 captureMap 비어 있음 — total>0 보장으로 race 방지
+    if (captureTotal === 0) return false;
+    return capturePending === 0;
+  }, [activeTemplate, omData, omMountGrace, capturePending, captureTotal]);
   const omPreparing = activeTemplate === "obstacle_monthly" && !omReady;
 
   // PDF 내보내기 + DB 저장
@@ -623,15 +669,26 @@ export default function ReportApp() {
   }, []);
 
   // ── 파노라마 자동 계산 ──
-  // 구조: omData.result 레퍼런스 변경 시에만 effect 진입. ref로 동일 result 중복 실행 차단.
+  // 구조: omData.result 또는 coverageStatus 변경 시 effect 진입. ref로 동일 result 중복 실행 차단.
   // deps에 omData 전체를 넣으면 내부 setOmData(loading 진입/진행 갱신) 시 effect가 재실행되며
   // cleanup이 먼저 돌아 cancelled=true가 되고 진행 중인 invoke 결과가 전부 폐기됨 → 0/N에서 멈춤.
-  // 실행 방식: 전 레이더 × (with/without) 완전 병렬(Promise.all), 5초 대기 제거.
+  // 실행 방식: 레이더별 직렬 (GPU 워커/SRTM mutex 경합 회피).
+  //            레이더 내부에서는 with/without 을 단일 Rust 커맨드(dual)로 묶어 IPC 1회 처리.
+  // **커버리지 게이트**: SRTM 락 경합으로 build_heightmap 이 무한 대기하는 것을 방지.
+  //                    커버리지 계산(render_coverage_bitmap 등)이 SRTM mutex 를 자주 점유하므로,
+  //                    coverageStatus 가 done/error 로 확정된 뒤에 파노라마 시작.
   const panoramaStartedRef = useRef<unknown>(null);
   useEffect(() => {
     if (!omData) return;
     // 동일 result 에 대해 중복 실행 방지
     if (panoramaStartedRef.current === omData.result) return;
+
+    // 커버리지 완료 대기 — SRTM mutex 락 경합 회피
+    const coverageReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
+    if (!coverageReady) {
+      console.log(`[Panorama] 커버리지 완료 대기 중 (status=${omData.coverageStatus}) — 파노라마 보류`);
+      return;
+    }
 
     // 레이더 없음 → 즉시 done 처리
     if (omData.selectedRadarSites.length === 0) {
@@ -663,68 +720,103 @@ export default function ReportApp() {
     (async () => {
       // loading 진입
       setOmData((prev) => prev ? { ...prev, panoramaStatus: "loading" } : prev);
-
-      const withMap = new Map<string, PanoramaMergeResult>();
-      const withoutMap = new Map<string, PanoramaMergeResult>();
+      setPanoramaLastError(null);
 
       // GPU(heightmap+terrain)는 단일 워커/디바이스 경합으로 레이더별 직렬 실행이 안전.
-      // 레이더 내에서는 terrain 결과를 공유하여 with/without merge_buildings 를 병렬 호출.
+      // 레이더 내 with/without 은 Rust dual 커맨드로 묶어 IPC 1회 처리.
       const { computePanoramaTerrainGPU } = await import("../utils/gpuPanorama");
 
-      for (const radar of radars) {
-        if (cancelled) return;
+      const setPhase = (index: number, name: string, phase: PanoramaPhase) => {
+        phaseStartedAtRef.current = performance.now();
+        setPanoramaElapsedMs(0);
+        setPanoramaProgress({
+          currentIndex: index,
+          totalRadars: radars.length,
+          currentRadarName: name,
+          phase,
+        });
+      };
+
+      for (let i = 0; i < radars.length; i++) {
+        if (cancelled) { console.log(`[Panorama] 취소됨 — 레이더 루프 진입 전 (i=${i})`); return; }
+        const radar = radars[i];
         const radarH = radar.altitude + radar.antenna_height;
+        console.log(`[Panorama] === 레이더 ${i + 1}/${radars.length} 시작: ${radar.name} (h=${radarH}m, excludeIds=${excludeIds.length}) ===`);
+        setPhase(i + 1, radar.name, "heightmap");
+        const radarStart = performance.now();
         try {
+          console.log(`[Panorama] ${radar.name}: computePanoramaTerrainGPU 호출`);
           const terrainResults = await computePanoramaTerrainGPU(
             radar.latitude, radar.longitude, radarH,
             MAX_RANGE_KM, AZ_STEP_DEG, RANGE_STEP_M,
+            (phase) => {
+              if (cancelled) return;
+              console.log(`[Panorama] ${radar.name}: phase=${phase}`);
+              setPhase(i + 1, radar.name, phase === "heightmap_done" ? "gpu" : "merge");
+            },
           );
-          if (cancelled) return;
+          if (cancelled) { console.log(`[Panorama] ${radar.name}: 취소됨 (terrain 후)`); return; }
+          console.log(`[Panorama] ${radar.name}: terrainResults ${terrainResults.length}개, ${(performance.now() - radarStart).toFixed(0)}ms. invoke panorama_merge_buildings_dual`);
 
-          const mergeArgs = {
+          const mergeStart = performance.now();
+          const dual = await invoke<PanoramaMergeDualResult>("panorama_merge_buildings_dual", {
             radarLat: radar.latitude,
             radarLon: radar.longitude,
             radarHeightM: radarH,
             maxRangeKm: MAX_RANGE_KM,
-            azimuthStepDeg: AZ_STEP_DEG,
             terrainResults,
+            excludeManualIds: excludeIds.length > 0 ? excludeIds : null,
+          });
+          if (cancelled) { console.log(`[Panorama] ${radar.name}: 취소됨 (merge 후)`); return; }
+          console.log(`[Panorama] ${radar.name}: merge_dual 완료 ${(performance.now() - mergeStart).toFixed(0)}ms (terrain=${dual.terrain.length}, bldg_with=${dual.buildings_with_targets.length}, bldg_without=${dual.buildings_without_targets?.length ?? "null"})`);
+
+          const withResult: PanoramaMergeResult = {
+            terrain: dual.terrain,
+            buildings: dual.buildings_with_targets,
           };
-          const withPromise = invoke<PanoramaMergeResult>("panorama_merge_buildings", mergeArgs);
-          const withoutPromise = excludeIds.length > 0
-            ? invoke<PanoramaMergeResult>("panorama_merge_buildings", {
-                ...mergeArgs,
-                excludeManualIds: excludeIds,
-              })
-            : Promise.resolve(null);
-          const [withResult, withoutResult] = await Promise.all([withPromise, withoutPromise]);
-          if (cancelled) return;
-          withMap.set(radar.name, withResult);
-          if (withoutResult) withoutMap.set(radar.name, withoutResult);
-          setOmData((prev) => prev ? {
-            ...prev,
-            panoWithTargets: new Map(withMap),
-            panoWithoutTargets: new Map(withoutMap),
-          } : prev);
-          console.log(`[Panorama] ${radar.name} 완료`);
+          const withoutResult: PanoramaMergeResult | null = dual.buildings_without_targets
+            ? { terrain: dual.terrain, buildings: dual.buildings_without_targets }
+            : null;
+
+          // 점진 업데이트: prev Map 에 이번 레이더 결과만 추가 (O(N²) 복제 제거)
+          const radarName = radar.name;
+          setOmData((prev) => {
+            if (!prev) return prev;
+            const nextWith = new Map(prev.panoWithTargets);
+            nextWith.set(radarName, withResult);
+            let nextWithout = prev.panoWithoutTargets;
+            if (withoutResult) {
+              nextWithout = new Map(prev.panoWithoutTargets);
+              nextWithout.set(radarName, withoutResult);
+            }
+            return {
+              ...prev,
+              panoWithTargets: nextWith,
+              panoWithoutTargets: nextWithout,
+            };
+          });
+          console.log(`[Panorama] ${radar.name} 완료 (총 ${(performance.now() - radarStart).toFixed(0)}ms)`);
         } catch (err) {
-          console.warn(`[Panorama] ${radar.name} 실패:`, err);
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[Panorama] ${radar.name} 실패:`, err);
+          setPanoramaLastError(`${radar.name}: ${msg}`);
         }
       }
 
-      if (cancelled) return;
+      if (cancelled) { console.log("[Panorama] 취소됨 — 루프 종료 직후"); return; }
+      console.log("[Panorama] 전체 완료 — panoramaStatus done 전환");
+      setPanoramaProgress(null);
       startTransition(() => {
-        setOmData((prev) => prev ? {
-          ...prev,
-          panoWithTargets: withMap,
-          panoWithoutTargets: withoutMap,
-          panoramaStatus: "done",
-        } : prev);
+        setOmData((prev) => prev ? { ...prev, panoramaStatus: "done" } : prev);
       });
-      console.log("[Panorama] 전체 완료");
     })();
 
-    return () => { cancelled = true; };
-  }, [omData?.result]);
+    return () => {
+      console.log("[Panorama] effect cleanup — cancelled=true");
+      cancelled = true;
+      setPanoramaProgress(null);
+    };
+  }, [omData?.result, omData?.coverageStatus]);
 
   // ── 설정 모달 표시 ──
   if (configPayload && !state) {
@@ -897,6 +989,8 @@ export default function ReportApp() {
           : "waiting";
         const panoramaStage: StageStatus =
           omData.panoramaStatus === "done" ? "done"
+          // 커버리지 미완료 → 파노라마 대기 (SRTM 락 경합 방지 게이트)
+          : omData.coverageStatus !== "done" && omData.coverageStatus !== "error" ? "waiting"
           : omData.panoramaStatus === "loading" ? "active"
           : "waiting";
         const captureStage: StageStatus =
@@ -930,14 +1024,26 @@ export default function ReportApp() {
           : omData.coverageStatus === "done" ? `${omData.covLayersWithBuildings.size}개 레이더 완료`
           : omData.coverageStatus === "error" ? "계산 실패 — 커버리지 없이 진행"
           : "대기 중";
+        const phaseLabel = (p: PanoramaPhase) =>
+          p === "heightmap" ? "지형맵 수신"
+          : p === "gpu" ? "GPU 앙각 계산"
+          : "건물 병합";
+        const elapsedSec = (panoramaElapsedMs / 1000).toFixed(1);
+        const stalled = panoramaElapsedMs > 30_000;
+        const coverageBlocking = coverageStage !== "done" && coverageStage !== "error";
         const panoramaDetail =
           omData.panoramaStatus === "done" ? `${omData.panoWithTargets.size}개 레이더 완료`
-          : omData.panoramaStatus === "loading" ? `${omData.panoWithTargets.size}/${omData.selectedRadarSites.length} 레이더 계산 중 (병렬)`
+          : coverageBlocking ? "커버리지 완료 대기 중 (SRTM 락 경합 방지)"
+          : omData.panoramaStatus === "loading" && panoramaProgress
+            ? `레이더 ${panoramaProgress.currentIndex}/${panoramaProgress.totalRadars} · ${panoramaProgress.currentRadarName} — ${phaseLabel(panoramaProgress.phase)} (${elapsedSec}s)${stalled ? " ⚠ 지연" : ""}`
+          : omData.panoramaStatus === "loading"
+            ? `${omData.panoWithTargets.size}/${omData.selectedRadarSites.length} 레이더 계산 중 — 진행 상세 대기`
           : "초기화 중";
         const captureDetail =
-          captureStage === "waiting" ? "커버리지 대기 중"
+          coverageBlocking ? "커버리지 대기 중"
+          : omData.panoramaStatus !== "done" ? "파노라마 대기 중"
           : omMountGrace ? "섹션 컴포넌트 마운트 중"
-          : captureTotal === 0 ? "섹션 등록 대기 중"
+          : captureTotal === 0 ? "섹션 등록 대기 중 (프리뷰 mount 후 OMSectionImage useEffect 실행)"
           : `${captureDone}/${captureTotal} 섹션 html2canvas 캡처`;
 
         return (
@@ -972,7 +1078,10 @@ export default function ReportApp() {
                   <div className="mt-0.5"><StageIcon status={panoramaStage} /></div>
                   <div className="flex-1">
                     <p className={`text-sm ${stageTextClass(panoramaStage)}`}>파노라마 LoS 계산</p>
-                    <p className="text-xs text-gray-400">{panoramaDetail}</p>
+                    <p className={`text-xs ${stalled ? "text-amber-600" : "text-gray-400"}`}>{panoramaDetail}</p>
+                    {panoramaLastError && (
+                      <p className="mt-1 text-[11px] text-red-500">오류: {panoramaLastError}</p>
+                    )}
                   </div>
                 </div>
 
@@ -1008,7 +1117,10 @@ export default function ReportApp() {
         );
       })()}
 
-      {/* 보고서 프리뷰 — staging 중에는 visibility hidden 으로 레이아웃만 유지 */}
+      {/* 보고서 프리뷰 — coverage+panorama 완료 전에는 mount 자체를 안 함.
+          파노라마 IPC 응답(20MB+)이 프리뷰 렌더/이미지 로드와 경합해 영구 대기되는 문제 회피.
+          capture 중에는 visibility hidden 으로 레이아웃만 유지 (mount 상태) */}
+      {previewMountable && (
       <div
         className="flex flex-1 min-h-0"
         style={{ visibility: omPreparing ? "hidden" : "visible" }}
@@ -1049,6 +1161,7 @@ export default function ReportApp() {
           previewRef={previewRef}
         />
       </div>
+      )}
     </div>
   );
 }

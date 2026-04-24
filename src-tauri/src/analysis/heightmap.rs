@@ -42,7 +42,35 @@ pub fn build_heightmap(
     exclude_manual_ids: Option<&[i64]>,
     skip_buildings: bool,
 ) -> HeightmapResult {
+    build_heightmap_with_progress(
+        srtm, conn,
+        radar_lat, radar_lon, radar_altitude, antenna_height, range_nm, pixel_size_m,
+        exclude_manual_ids, skip_buildings, None,
+    )
+}
+
+/// 내부 단계별 진행 콜백을 받는 버전 — 진단/UI 용
+pub fn build_heightmap_with_progress(
+    srtm: &mut SrtmReader,
+    conn: &rusqlite::Connection,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_altitude: f64,
+    antenna_height: f64,
+    range_nm: f64,
+    pixel_size_m: f64,
+    exclude_manual_ids: Option<&[i64]>,
+    skip_buildings: bool,
+    progress_cb: Option<&(dyn Fn(String) + Send + Sync)>,
+) -> HeightmapResult {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let emit = |msg: String| {
+        log::info!("{}", &msg);
+        if let Some(cb) = progress_cb { cb(msg); }
+    };
+    emit(format!("[Heightmap] 시작: lat={:.4}, lon={:.4}, range_nm={:.1}, pix={:.0}m, skip_bldg={}",
+        radar_lat, radar_lon, range_nm, pixel_size_m, skip_buildings));
+    let t_total = std::time::Instant::now();
 
     let radar_height = radar_altitude + antenna_height;
     let max_range_km = range_nm * 1.852;
@@ -69,27 +97,43 @@ pub fn build_heightmap(
 
     // SRTM 타일 프리로드
     let range_deg = (max_range_km / 111.0).ceil() as i32 + 1;
+    let t_preload = std::time::Instant::now();
+    emit(format!("[Heightmap] preload_tiles 시작 (범위 {}°x{}°, dim={}×{})",
+        2 * range_deg + 1, 2 * range_deg + 1, width, height));
     srtm.preload_tiles(
         radar_lat.floor() as i32 - range_deg,
         radar_lat.floor() as i32 + range_deg,
         radar_lon.floor() as i32 - range_deg,
         radar_lon.floor() as i32 + range_deg,
     );
+    emit(format!("[Heightmap] preload_tiles 완료 ({}ms)", t_preload.elapsed().as_millis()));
     let tiles = srtm.tiles_ref();
 
-    // 건물 쿼리
+    // 건물 쿼리 — skip_buildings 시 완전히 생략 (이전 버그: 쿼리만 했다가 결과를 버렸음)
     let range_deg_f = max_range_km / 111.0;
-    let buildings = if let Some(exclude_ids) = exclude_manual_ids {
-        super::coverage::query_buildings_for_coverage_excluding(
+    let t_bldg = std::time::Instant::now();
+    let buildings = if skip_buildings {
+        emit("[Heightmap] 건물 쿼리 skip".into());
+        Vec::new()
+    } else if let Some(exclude_ids) = exclude_manual_ids {
+        emit(format!("[Heightmap] query_buildings_for_coverage_excluding 시작 (exclude={}개)", exclude_ids.len()));
+        let r = super::coverage::query_buildings_for_coverage_excluding(
             conn, radar_lat, radar_lon, range_deg_f, exclude_ids,
-        )
+        );
+        emit(format!("[Heightmap] 건물 쿼리 완료 ({}ms, {}개)", t_bldg.elapsed().as_millis(), r.len()));
+        r
     } else {
-        super::coverage::query_buildings_for_coverage(
+        emit("[Heightmap] query_buildings_for_coverage 시작".into());
+        let r = super::coverage::query_buildings_for_coverage(
             conn, radar_lat, radar_lon, range_deg_f,
-        )
+        );
+        emit(format!("[Heightmap] 건물 쿼리 완료 ({}ms, {}개)", t_bldg.elapsed().as_millis(), r.len()));
+        r
     };
 
     // 1. rayon 병렬 SRTM 샘플링 → 기본 지형 그리드
+    emit(format!("[Heightmap] rayon SRTM 샘플링 시작 ({} px)", width * height));
+    let t_sample = std::time::Instant::now();
     let cos_radar_lat = radar_lat.to_radians().cos();
     let data: Vec<f32> = (0..height)
         .into_par_iter()
@@ -103,13 +147,20 @@ pub fn build_heightmap(
             })
         })
         .collect();
+    emit(format!("[Heightmap] rayon SRTM 샘플링 완료 ({}ms)", t_sample.elapsed().as_millis()));
 
     // 2. 건물 래스터화 (max semantics) — skip_buildings 시 생략
     let mut data = data;
     if skip_buildings {
         // f32 LE → base64 (건물 없는 순수 지형)
+        emit("[Heightmap] base64 인코딩 시작".into());
+        let t_enc = std::time::Instant::now();
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let data_b64 = STANDARD.encode(&bytes);
+        emit(format!("[Heightmap] base64 인코딩 완료 ({}ms, {:.1}MB). 전체 {}ms",
+            t_enc.elapsed().as_millis(),
+            data_b64.len() as f64 / 1024.0 / 1024.0,
+            t_total.elapsed().as_millis()));
         return HeightmapResult {
             data_b64,
             width: width as u32,

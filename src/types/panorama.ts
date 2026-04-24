@@ -38,3 +38,10 @@ export interface PanoramaMergeResult {
   terrain: PanoramaPoint[];
   buildings: BuildingObstacle[];
 }
+
+/** with/without manual targets 동시 반환 — terrain 은 한 번만 직렬화 */
+export interface PanoramaMergeDualResult {
+  terrain: PanoramaPoint[];
+  buildings_with_targets: BuildingObstacle[];
+  buildings_without_targets: BuildingObstacle[] | null;
+}
