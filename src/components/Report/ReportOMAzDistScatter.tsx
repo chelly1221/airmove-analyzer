@@ -1,7 +1,8 @@
-import React, { useMemo, useRef, useEffect, useState } from "react";
+import React, { useMemo, useRef, useEffect, forwardRef, useImperativeHandle } from "react";
 import { Crosshair } from "lucide-react";
 import type { DailyStats, RadarSite, ManualBuilding, AzSector } from "../../types";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import { type OMSectionCaptureHandle, createDeferred } from "./omCapture";
 
 interface Props {
   sectionNum: number;
@@ -10,8 +11,10 @@ interface Props {
   selectedBuildings: ManualBuilding[];
   azSectors: AzSector[];
   analysisMonth?: string;
-  /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
+  /** true면 헤더 생략 (외부에서 헤더 렌더) */
   hideHeader?: boolean;
+  /** 사전 캡처된 캔버스 dataUrl. 있으면 라이브 캔버스 대신 <img> 표시 (캡처 진행 후 보고서 재방문 등) */
+  preCapturedImage?: string;
 }
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
@@ -106,13 +109,15 @@ const DOT_RADIUS = 2.5; // 고정 크기 작은 점
 const MIN_ALT = 1000;
 const MAX_ALT = 20000;
 
-function ReportOMAzDistScatter({
-  sectionNum, radarSite, dailyStats, selectedBuildings, azSectors, analysisMonth, hideHeader,
-}: Props) {
+const ReportOMAzDistScatter = forwardRef<OMSectionCaptureHandle, Props>(function ReportOMAzDistScatter({
+  sectionNum, radarSite, dailyStats, selectedBuildings, azSectors, analysisMonth, hideHeader, preCapturedImage,
+}: Props, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const genRef = useRef(0);
-  const [, setReady] = useState(false);
+  // 캡처 readiness deferred — drawAll() 완료 시 resolve. capture() 가 await.
+  const readyDeferredRef = useRef(createDeferred<void>());
+  const readyFiredRef = useRef(false);
 
   const monthLabel = analysisMonth
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
@@ -395,9 +400,11 @@ function ReportOMAzDistScatter({
         }
       }
 
-      setReady(true);
-      // OMSectionImage에 캡처 준비 알림 (bubbles로 상위 div까지 전파)
-      canvasRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
+      // 캡처 readiness 신호 — capture() 가 await 중인 deferred 를 resolve.
+      if (!readyFiredRef.current) {
+        readyFiredRef.current = true;
+        readyDeferredRef.current.resolve();
+      }
     };
 
     // 타일 비동기 로드
@@ -436,12 +443,34 @@ function ReportOMAzDistScatter({
 
   const totalCount = allLoss.length;
 
-  // 빈 상태 즉시 captureReady 전파
+  // 빈 상태 즉시 readiness 신호 (캡처 대상 없음 — capture() 는 null 반환)
   useEffect(() => {
-    if (totalCount === 0) {
-      containerRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
+    if (totalCount === 0 && !readyFiredRef.current) {
+      readyFiredRef.current = true;
+      readyDeferredRef.current.resolve();
     }
   }, [totalCount]);
+
+  // 명령형 capture 핸들 — 외부 오케스트레이터가 await 시퀀스로 호출
+  useImperativeHandle(ref, () => ({
+    async capture(): Promise<string | null> {
+      // 데이터 없으면 캡처 대신 null (라이브 빈 상태 메시지를 PDF 에 그대로 인쇄)
+      if (totalCount === 0) return null;
+      // 타일 로드 + drawAll 완료까지 대기
+      await readyDeferredRef.current.promise;
+      const canvas = canvasRef.current;
+      if (!canvas) throw new Error("ReportOMAzDistScatter: canvas not mounted");
+      return canvas.toDataURL("image/png");
+    },
+  }), [totalCount]);
+
+  // unmount 시 readiness 가 미해결이면 reject — 외부 await 가 영구 hang 되지 않도록.
+  useEffect(() => {
+    const deferred = readyDeferredRef.current;
+    return () => {
+      deferred.reject(new Error("ReportOMAzDistScatter unmounted before ready"));
+    };
+  }, []);
 
   if (totalCount === 0) {
     const hasDailyData = dailyStats.length > 0;
@@ -481,13 +510,22 @@ function ReportOMAzDistScatter({
       </div>
 
       <div className="rounded-md border border-gray-200 p-2">
-        <canvas
-          ref={canvasRef}
-          width={canvasW}
-          height={canvasH}
-          className="w-full"
-          style={{ aspectRatio: "1/1", imageRendering: "auto" }}
-        />
+        {preCapturedImage ? (
+          <img
+            src={preCapturedImage}
+            alt=""
+            className="w-full"
+            style={{ aspectRatio: "1/1", imageRendering: "auto" }}
+          />
+        ) : (
+          <canvas
+            ref={canvasRef}
+            width={canvasW}
+            height={canvasH}
+            className="w-full"
+            style={{ aspectRatio: "1/1", imageRendering: "auto" }}
+          />
+        )}
       </div>
 
       {/* 하단 범례 */}
@@ -530,6 +568,6 @@ function ReportOMAzDistScatter({
       </div>
     </div>
   );
-}
+});
 
 export default React.memo(ReportOMAzDistScatter);

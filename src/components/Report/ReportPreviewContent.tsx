@@ -2,7 +2,7 @@
  * 보고서 프리뷰 콘텐츠 — ReportGeneration과 ReportApp 양쪽에서 공유.
  * 툴바는 포함하지 않음. 호출 측에서 previewRef와 상태를 관리.
  */
-import { useMemo, useCallback } from "react";
+import { useMemo, useCallback, useRef } from "react";
 import { Loader2 } from "lucide-react";
 import ReportPage from "./ReportPage";
 import ReportCoverPage from "./ReportCoverPage";
@@ -27,7 +27,7 @@ import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
 import ReportOMAzDistScatter from "./ReportOMAzDistScatter";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
-import OMSectionImage, { type CaptureTracker } from "./OMSectionImage";
+import type { OMSectionCaptureHandle } from "./omCapture";
 import ReportPSSummarySection from "./ReportPSSummarySection";
 import ReportPSAngleHeight from "./ReportPSAngleHeight";
 import ReportPSAdditionalLoss from "./ReportPSAdditionalLoss";
@@ -89,8 +89,8 @@ export interface ReportPreviewContentProps {
 
   // ref
   previewRef: React.RefObject<HTMLDivElement | null>;
-  /** OMSectionImage 준비 상태 추적 — staging/ready 동기화용 */
-  captureTracker?: CaptureTracker;
+  /** OM 캡처 가능 섹션의 ref 등록 콜백. 마운트 시 handle 전달, unmount 시 null. */
+  setCaptureRef?: (key: string, handle: OMSectionCaptureHandle | null) => void;
 }
 
 // ── 섹션 토글 정의 ──
@@ -168,7 +168,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     onOmDataChange,
     singleFlightChartPoints,
     previewRef,
-    captureTracker,
+    setCaptureRef,
   } = props;
 
   const singleFlight = template === "single" ? reportFlights[0] : null;
@@ -244,14 +244,18 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     return map;
   }, [omResultTrimmed, omData.azSectorsByRadar, omData.selectedRadarSites, omData.selectedBuildings]);
 
-  // OM 섹션 이미지 캡처 콜백
-  const handleOMSectionCaptured = useCallback((key: string, dataUrl: string) => {
-    onOmDataChange((prev) => {
-      const next = new Map(prev.sectionImages);
-      next.set(key, dataUrl);
-      return { ...prev, sectionImages: next };
-    });
-  }, [onOmDataChange]);
+  // OM 섹션 capture ref 콜백 — 안정성 보장 (매 렌더 새 콜백 생성 시 React가
+  // ref(null) → ref(new) churn 을 일으켜 오케스트레이터가 잠시 ref 미등록 상태를 봄).
+  // 키별로 메모이즈한 콜백을 재사용.
+  const refCallbackCache = useRef(new Map<string, (h: OMSectionCaptureHandle | null) => void>());
+  const setRef = useCallback((key: string) => {
+    let cb = refCallbackCache.current.get(key);
+    if (!cb) {
+      cb = (h: OMSectionCaptureHandle | null) => setCaptureRef?.(key, h);
+      refCallbackCache.current.set(key, cb);
+    }
+    return cb;
+  }, [setCaptureRef]);
 
   return (
     <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">
@@ -481,24 +485,18 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             return (
               <ReportPage key={covImgKey}>
                 <ReportOMSectionHeader sectionNum={sectionNumbers.omCoverageDiff ?? 5} title="커버리지 비교맵" radarName={rs.name} />
-                <OMSectionImage
-                  sectionKey={covImgKey}
-                  sectionLabel={`커버리지 비교맵 (${rs.name})`}
-                  preCaptured={omData.sectionImages.get(covImgKey)}
-                  onCaptured={(url) => handleOMSectionCaptured(covImgKey, url)}
-                  captureTracker={captureTracker}
-                >
-                  <ReportOMCoverageDiff
-                    sectionNum={sectionNumbers.omCoverageDiff ?? 5}
-                    radarSite={rs}
-                    layersWithTargets={rsLayersWith}
-                    layersWithoutTargets={rsLayersWithout}
-                    lossPoints={allLoss}
-                    defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
-                    selectedBuildings={omData.selectedBuildings}
-                    hideHeader
-                  />
-                </OMSectionImage>
+                <ReportOMCoverageDiff
+                  ref={setRef(covImgKey)}
+                  sectionNum={sectionNumbers.omCoverageDiff ?? 5}
+                  radarSite={rs}
+                  layersWithTargets={rsLayersWith}
+                  layersWithoutTargets={rsLayersWithout}
+                  lossPoints={allLoss}
+                  defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
+                  selectedBuildings={omData.selectedBuildings}
+                  preCapturedImage={omData.sectionImages.get(covImgKey)}
+                  hideHeader
+                />
               </ReportPage>
             );
           }) : omData.coverageStatus === "error" ? (
@@ -525,23 +523,17 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             return (
               <ReportPage key={azImgKey}>
                 <ReportOMSectionHeader sectionNum={sectionNumbers.omAzDistScatter ?? 6} title={`방위-거리 소실표적 산점도${omData.analysisMonth ? ` (${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월)` : ""}`} radarName={rs.name} />
-                <OMSectionImage
-                  sectionKey={azImgKey}
-                  sectionLabel={`방위-거리 산점도 (${rs.name})`}
-                  preCaptured={omData.sectionImages.get(azImgKey)}
-                  onCaptured={(url) => handleOMSectionCaptured(azImgKey, url)}
-                  captureTracker={captureTracker}
-                >
-                  <ReportOMAzDistScatter
-                    sectionNum={sectionNumbers.omAzDistScatter ?? 6}
-                    radarSite={rs}
-                    dailyStats={rr.daily_stats}
-                    selectedBuildings={omData.selectedBuildings}
-                    azSectors={sectors}
-                    analysisMonth={omData.analysisMonth}
-                    hideHeader
-                  />
-                </OMSectionImage>
+                <ReportOMAzDistScatter
+                  ref={setRef(azImgKey)}
+                  sectionNum={sectionNumbers.omAzDistScatter ?? 6}
+                  radarSite={rs}
+                  dailyStats={rr.daily_stats}
+                  selectedBuildings={omData.selectedBuildings}
+                  azSectors={sectors}
+                  analysisMonth={omData.analysisMonth}
+                  preCapturedImage={omData.sectionImages.get(azImgKey)}
+                  hideHeader
+                />
               </ReportPage>
             );
           })}
@@ -566,30 +558,26 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
 
           {sections.omAltitude && (
-            <ReportPage>
-              <ReportOMAltitudeDistribution
-                sectionNum={sectionNumbers.omAltitude ?? 9}
-                radarResults={omResultTrimmed.radar_results}
-                selectedBuildings={omData.selectedBuildings}
-                radarSites={omData.selectedRadarSites}
-                losMap={omData.losMap}
-                panoWithTargets={omData.panoWithTargets}
-                panoWithoutTargets={omData.panoWithoutTargets}
-              />
-            </ReportPage>
+            <ReportOMAltitudeDistribution
+              sectionNum={sectionNumbers.omAltitude ?? 9}
+              radarResults={omResultTrimmed.radar_results}
+              selectedBuildings={omData.selectedBuildings}
+              radarSites={omData.selectedRadarSites}
+              losMap={omData.losMap}
+              panoWithTargets={omData.panoWithTargets}
+              panoWithoutTargets={omData.panoWithoutTargets}
+            />
           )}
 
           {sections.omLossEvents && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? (
-            <ReportPage>
-              <ReportOMLossEvents
-                sectionNum={sectionNumbers.omLossEvents ?? 10}
-                radarResults={omResultTrimmed.radar_results}
-                selectedBuildings={omData.selectedBuildings}
-                radarSites={omData.selectedRadarSites}
-                layersWithTargets={omData.covLayersWithBuildings}
-                layersWithoutTargets={omData.covLayersWithout}
-              />
-            </ReportPage>
+            <ReportOMLossEvents
+              sectionNum={sectionNumbers.omLossEvents ?? 10}
+              radarResults={omResultTrimmed.radar_results}
+              selectedBuildings={omData.selectedBuildings}
+              radarSites={omData.selectedRadarSites}
+              layersWithTargets={omData.covLayersWithBuildings}
+              layersWithoutTargets={omData.covLayersWithout}
+            />
           ) : omData.coverageStatus === "error" ? (
             <ReportPage>
               <div className="flex flex-col items-center justify-center py-20 text-gray-400">
@@ -606,18 +594,16 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           ))}
 
           {sections.omFindings && (
-            <ReportPage>
-              <ReportOMFindings
-                sectionNum={sectionNumbers.omFindings ?? 11}
-                radarResults={omResultTrimmed.radar_results}
-                selectedBuildings={omData.selectedBuildings}
-                radarSites={omData.selectedRadarSites}
-                findingsText={omData.findingsText}
-                onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}
-                editable={true}
-                analysisMonth={omData.analysisMonth}
-              />
-            </ReportPage>
+            <ReportOMFindings
+              sectionNum={sectionNumbers.omFindings ?? 11}
+              radarResults={omResultTrimmed.radar_results}
+              selectedBuildings={omData.selectedBuildings}
+              radarSites={omData.selectedRadarSites}
+              findingsText={omData.findingsText}
+              onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}
+              editable={true}
+              analysisMonth={omData.analysisMonth}
+            />
           )}
         </>
       )}

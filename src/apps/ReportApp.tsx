@@ -11,6 +11,7 @@ import { Download, Loader2, TriangleAlert, Check, Circle } from "lucide-react";
 import Titlebar from "../components/Layout/Titlebar";
 import ReportPreviewContent, { getSectionToggles } from "../components/Report/ReportPreviewContent";
 import { useReportExport, type ReportSaveMeta } from "../components/Report/useReportExport";
+import type { OMSectionCaptureHandle } from "../components/Report/omCapture";
 import TemplateConfigModal from "../components/Report/TemplateConfigModal";
 import ObstacleMonthlyConfigModal from "../components/Report/ObstacleMonthlyConfigModal";
 import ObstaclePreScreeningModal from "../components/Report/ObstaclePreScreeningModal";
@@ -150,11 +151,15 @@ export default function ReportApp() {
   const { exportPDF } = useReportExport();
 
   // ── OM 프리뷰 staging 동기화 ──
-  // OM 템플릿은 다수의 OMSectionImage가 각자 비동기로 html2canvas 캡처하므로
-  // 전체가 준비될 때까지 프리뷰를 숨기고 상세 진행 오버레이를 표시한다.
+  // 명령형 ref 기반 캡처 오케스트레이터:
+  //   1) coverage+panorama 완료 후 자식들이 mount → 각 자식이 setCaptureRef 로 핸들 등록
+  //   2) 오케스트레이터가 sequential 하게 handle.capture() 호출 → dataUrl 을 sectionImages 에 저장
+  //   3) 모든 섹션 처리 완료 시 omReady=true → 프리뷰 표시 + PDF 버튼 활성화
+  // captureMap 은 진행률 표시용. 외부 라이브러리/이벤트 의존 없음.
   type CaptureEntry = { label: string; status: "pending" | "done" };
   const [captureMap, setCaptureMap] = useState<Map<string, CaptureEntry>>(new Map());
-  const [omMountGrace, setOmMountGrace] = useState(false);
+  const captureRefsRef = useRef<Map<string, OMSectionCaptureHandle>>(new Map());
+  const [orchestratorState, setOrchestratorState] = useState<"idle" | "running" | "done">("idle");
 
   // 파노라마 하위 단계 진행 상태 (레이더별 heightmap → GPU → merge)
   type PanoramaPhase = "heightmap" | "gpu" | "merge";
@@ -177,26 +182,32 @@ export default function ReportApp() {
     }, 250);
     return () => clearInterval(id);
   }, [panoramaActive]);
-  const captureTracker = useMemo(() => ({
-    register: (key: string, label: string) => {
-      console.log(`[Capture] register: ${key} (${label})`);
-      setCaptureMap((m) => {
-        const next = new Map(m);
-        next.set(key, { label, status: "pending" });
-        return next;
-      });
-    },
-    complete: (key: string) => {
-      console.log(`[Capture] complete: ${key}`);
-      setCaptureMap((m) => {
-        const entry = m.get(key);
-        if (!entry || entry.status === "done") return m;
-        const next = new Map(m);
-        next.set(key, { ...entry, status: "done" });
-        return next;
-      });
-    },
-  }), []);
+  // 자식 mount 시 capture handle 등록, unmount 시 해제
+  const setCaptureRef = useCallback((key: string, handle: OMSectionCaptureHandle | null) => {
+    if (handle) {
+      captureRefsRef.current.set(key, handle);
+    } else {
+      captureRefsRef.current.delete(key);
+    }
+  }, []);
+
+  // 진행률 표시용 — 오케스트레이터가 호출
+  const trackerRegister = useCallback((key: string, label: string) => {
+    setCaptureMap((m) => {
+      const next = new Map(m);
+      next.set(key, { label, status: "pending" });
+      return next;
+    });
+  }, []);
+  const trackerComplete = useCallback((key: string) => {
+    setCaptureMap((m) => {
+      const entry = m.get(key);
+      if (!entry || entry.status === "done") return m;
+      const next = new Map(m);
+      next.set(key, { ...entry, status: "done" });
+      return next;
+    });
+  }, []);
 
   /** IDB에서 페이로드 읽기 → state 적용 */
   const loadingRef = useRef(false);
@@ -273,8 +284,9 @@ export default function ReportApp() {
 
   // 이벤트 리스너: data-written, reload-config, reload-data, coverage-update
   useEffect(() => {
-    // 보고서 창 DevTools 활성화
-    invoke("open_devtools").catch(() => {});
+    // 보고서 창 DevTools 자동 활성화 비활성 — DevTools 가 열려 있으면 panorama-debug
+    // 콘솔 로그 부하로 메인 스레드 블로킹/setTimeout throttle 가능. 필요 시 F12 로 직접 열 것.
+    // invoke("open_devtools").catch(() => {});
 
     // 마운트 시: config 먼저 확인, 없으면 payload 확인
     (async () => {
@@ -393,44 +405,116 @@ export default function ReportApp() {
     return covReady && panoReady;
   }, [activeTemplate, omData]);
 
-  // ── OM staging: preview 가 실제로 mount 되는 시점에 captureMap 리셋 + mount grace 활성화 ──
-  // Why: OMSectionImage 들이 mount하여 captureTracker.register() 호출할 시간을 확보.
-  // grace 기간 동안에는 pending===0 이어도 ready로 인정하지 않음.
+  // ── 캡처 오케스트레이터 ──
+  // coverage + panorama 가 done 이고 preview 가 mount 가능한 시점에 시작.
+  // omData.result identity 가 변경되면 새 작업 사이클로 간주 (편집 reload 등).
+  const omDataRef = useRef(omData);
+  omDataRef.current = omData;
   useEffect(() => {
     if (activeTemplate !== "obstacle_monthly" || !omData || !previewMountable) {
-      setOmMountGrace(false);
+      setOrchestratorState("idle");
+      setCaptureMap(new Map());
       return;
     }
+    let cancelled = false;
+    setOrchestratorState("running");
     setCaptureMap(new Map());
-    setOmMountGrace(true);
-    const t = setTimeout(() => setOmMountGrace(false), 800);
-    return () => clearTimeout(t);
-  }, [activeTemplate, omData?.result, previewMountable]);
+
+    // 자식 mount 가 완료되어 ref 가 등록될 시간을 약간 확보.
+    // (자식 useEffect 실행 → setCaptureRef 호출은 mount cycle 직후 이루어짐)
+    const startTimer = setTimeout(async () => {
+      if (cancelled) return;
+      const data = omDataRef.current;
+      if (!data) { setOrchestratorState("done"); return; }
+
+      // 캡처 대상 섹션 목록 산출
+      const tasks: { key: string; label: string }[] = [];
+      if (data.coverageStatus === "done" && data.covLayersWithBuildings.size > 0) {
+        for (const rs of data.selectedRadarSites) {
+          const w = data.covLayersWithBuildings.get(rs.name) ?? [];
+          const wo = data.covLayersWithout.get(rs.name) ?? [];
+          if (w.length === 0 && wo.length === 0) continue;
+          tasks.push({ key: `cov-${rs.name}`, label: `커버리지 비교맵 (${rs.name})` });
+        }
+      }
+      if (data.result) {
+        for (const rr of data.result.radar_results) {
+          const rs = data.selectedRadarSites.find((r) => r.name === rr.radar_name);
+          if (!rs) continue;
+          tasks.push({ key: `azdist-${rr.radar_name}`, label: `방위-거리 산점도 (${rr.radar_name})` });
+        }
+      }
+
+      // 진행률 표시용 일괄 등록
+      for (const t of tasks) trackerRegister(t.key, t.label);
+      console.log(`[OMCapture] orchestrator 시작 (${tasks.length}개 섹션)`);
+
+      // 직렬 처리 — 동시 캡처가 메인 스레드 경합을 일으킬 수 있어 직렬이 안전
+      for (const t of tasks) {
+        if (cancelled) return;
+        // 이미 캡처된 항목은 건너뛰기
+        const cached = omDataRef.current?.sectionImages.get(t.key);
+        if (cached) {
+          trackerComplete(t.key);
+          continue;
+        }
+        const handle = captureRefsRef.current.get(t.key);
+        if (!handle) {
+          console.warn(`[OMCapture] ${t.key} ref 미등록 — skip`);
+          trackerComplete(t.key);
+          continue;
+        }
+        const t0 = performance.now();
+        try {
+          const url = await handle.capture();
+          if (cancelled) return;
+          if (url) {
+            setOmData((prev) => {
+              if (!prev) return prev;
+              const next = new Map(prev.sectionImages);
+              next.set(t.key, url);
+              return { ...prev, sectionImages: next };
+            });
+          }
+          console.log(`[OMCapture] ${t.key} 완료 (${(performance.now() - t0).toFixed(0)}ms${url ? "" : ", null"})`);
+        } catch (err) {
+          console.warn(`[OMCapture] ${t.key} 실패 (${(performance.now() - t0).toFixed(0)}ms):`, err);
+        }
+        trackerComplete(t.key);
+      }
+
+      if (!cancelled) {
+        console.log("[OMCapture] orchestrator 완료");
+        setOrchestratorState("done");
+      }
+    }, 100);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(startTimer);
+    };
+  }, [activeTemplate, omData?.result, omData?.coverageStatus, omData?.panoramaStatus, previewMountable, trackerRegister, trackerComplete]);
 
   // captureMap 기반 카운트 파생
-  const { captureTotal, captureDone, capturePending } = useMemo(() => {
+  const { captureTotal, captureDone } = useMemo(() => {
     let total = 0, done = 0;
     for (const v of captureMap.values()) {
       total++;
       if (v.status === "done") done++;
     }
-    return { captureTotal: total, captureDone: done, capturePending: total - done };
+    return { captureTotal: total, captureDone: done };
   }, [captureMap]);
 
   // ── OM 준비 완료 여부 ──
-  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료 (3) mount grace 해제
-  //       (4) 섹션 등록 최소 1개 이상 (5) 진행 중 캡처 0
+  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료 (3) 오케스트레이터 done
   const omReady = useMemo(() => {
     if (activeTemplate !== "obstacle_monthly") return true;
     if (!omData) return false;
     const covReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
     const panoReady = omData.panoramaStatus === "done";
     if (!covReady || !panoReady) return false;
-    if (omMountGrace) return false;
-    // preview unmount 동안 captureMap 비어 있음 — total>0 보장으로 race 방지
-    if (captureTotal === 0) return false;
-    return capturePending === 0;
-  }, [activeTemplate, omData, omMountGrace, capturePending, captureTotal]);
+    return orchestratorState === "done";
+  }, [activeTemplate, omData, orchestratorState]);
   const omPreparing = activeTemplate === "obstacle_monthly" && !omReady;
 
   // PDF 내보내기 + DB 저장
@@ -995,7 +1079,8 @@ export default function ReportApp() {
           : "waiting";
         const captureStage: StageStatus =
           coverageStage !== "done" && coverageStage !== "error" ? "waiting"
-          : omMountGrace ? "active"
+          : panoramaStage !== "done" ? "waiting"
+          : orchestratorState === "running" && captureTotal === 0 ? "active"
           : captureTotal === 0 ? "waiting"
           : captureDone === captureTotal ? "done"
           : "active";
@@ -1042,9 +1127,9 @@ export default function ReportApp() {
         const captureDetail =
           coverageBlocking ? "커버리지 대기 중"
           : omData.panoramaStatus !== "done" ? "파노라마 대기 중"
-          : omMountGrace ? "섹션 컴포넌트 마운트 중"
-          : captureTotal === 0 ? "섹션 등록 대기 중 (프리뷰 mount 후 OMSectionImage useEffect 실행)"
-          : `${captureDone}/${captureTotal} 섹션 html2canvas 캡처`;
+          : orchestratorState === "running" && captureTotal === 0 ? "섹션 컴포넌트 마운트 중"
+          : captureTotal === 0 ? "오케스트레이터 시작 대기"
+          : `${captureDone}/${captureTotal} 섹션 캡처 진행`;
 
         return (
           <div className="absolute inset-0 top-[44px] z-30 flex items-center justify-center bg-white/95 backdrop-blur-sm">
@@ -1119,11 +1204,13 @@ export default function ReportApp() {
 
       {/* 보고서 프리뷰 — coverage+panorama 완료 전에는 mount 자체를 안 함.
           파노라마 IPC 응답(20MB+)이 프리뷰 렌더/이미지 로드와 경합해 영구 대기되는 문제 회피.
-          capture 중에는 visibility hidden 으로 레이아웃만 유지 (mount 상태) */}
+          캡처 중에는 위 오버레이(bg-white/95, z-30)가 프리뷰를 시각적으로 가려줌.
+          주의: visibility:hidden 또는 display:none 사용 금지 — html2canvas-pro 가
+          hidden 컨테이너 안의 자식을 렌더하지 않아 캡처가 빈 캔버스 / 영구 hang 됨
+          (https://github.com/niklasvh/html2canvas/issues/2171) */}
       {previewMountable && (
       <div
         className="flex flex-1 min-h-0"
-        style={{ visibility: omPreparing ? "hidden" : "visible" }}
         aria-hidden={omPreparing}
       >
         <ReportPreviewContent
@@ -1157,7 +1244,7 @@ export default function ReportApp() {
           forceAllVisible={forceAllVisible}
           onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
           singleFlightChartPoints={state.singleFlightChartPoints}
-          captureTracker={captureTracker}
+          setCaptureRef={setCaptureRef}
           previewRef={previewRef}
         />
       </div>

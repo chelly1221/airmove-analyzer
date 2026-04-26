@@ -4,6 +4,7 @@ import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types"
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import AutoPaginate from "./AutoPaginate";
 
 interface Props {
   sectionNum: number;
@@ -128,24 +129,23 @@ function ReportOMLossEvents({
     return result;
   }, [radarResults, radarSites, layersWithTargets, layersWithoutTargets]);
 
+  const sectionHeader = (
+    <ReportOMSectionHeader sectionNum={sectionNum} title="장애물 기인 표적소실 상세" />
+  );
+
   if (eventsByRadar.length === 0) {
     const hasDailyData = radarResults.some((rr) => rr.daily_stats.length > 0);
     return (
-      <div className="mb-8">
-        <ReportOMSectionHeader sectionNum={sectionNum} title="장애물 기인 표적소실 상세" />
+      <AutoPaginate firstHeader={sectionHeader}>
         <div className="flex flex-col items-center py-12 text-gray-400">
           <AlertTriangle size={28} strokeWidth={1.2} className="mb-2" />
           <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
         </div>
-      </div>
+      </AutoPaginate>
     );
   }
 
-  return (
-    <div className="mb-8">
-      <ReportOMSectionHeader sectionNum={sectionNum} title="장애물 기인 표적소실 상세" />
-
-      {eventsByRadar.map(({ radarName, events, obstacleCausedCount, totalCount }) => {
+  const radarBlocks = eventsByRadar.map(({ radarName, events, obstacleCausedCount, totalCount }) => {
         if (events.length === 0) {
           return (
             <div key={radarName} className="mb-5">
@@ -261,8 +261,12 @@ function ReportOMLossEvents({
             })()}
           </div>
         );
-      })}
-    </div>
+      });
+
+  return (
+    <AutoPaginate firstHeader={sectionHeader}>
+      {radarBlocks}
+    </AutoPaginate>
   );
 }
 

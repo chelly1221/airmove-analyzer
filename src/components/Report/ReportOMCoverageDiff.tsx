@@ -1,8 +1,9 @@
-import React, { useMemo, useState, useEffect, useRef } from "react";
+import React, { useMemo, useState, useEffect, useRef, forwardRef, useImperativeHandle } from "react";
 import type { RadarSite, LossPointGeo, ManualBuilding } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import { type OMSectionCaptureHandle, createDeferred, svgToPngDataUrl } from "./omCapture";
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
 function altToColor(altFt: number, minAlt: number, maxAlt: number): string {
@@ -23,8 +24,10 @@ interface Props {
   /** 기본 고도 (ft) — 미사용, 호환성 유지 */
   defaultAltFt: number;
   selectedBuildings: ManualBuilding[];
-  /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
+  /** true면 헤더 생략 (외부에서 헤더 렌더) */
   hideHeader?: boolean;
+  /** 사전 캡처된 SVG dataUrl. 있으면 라이브 SVG 대신 <img> 표시 */
+  preCapturedImage?: string;
 }
 
 /** 방위별 커버리지 범위(km) lookup — O(1) 인덱스 기반 */
@@ -200,7 +203,7 @@ function useStaticMapImage(
 const SECTOR_PAD_DEG = 25;
 const FIXED_ALTS = [1000, 2000, 3000, 5000, 10000, 15000, 20000];
 
-function ReportOMCoverageDiff({
+const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function ReportOMCoverageDiff({
   sectionNum,
   radarSite,
   layersWithTargets,
@@ -208,8 +211,11 @@ function ReportOMCoverageDiff({
   lossPoints,
   selectedBuildings,
   hideHeader,
-}: Props) {
+  preCapturedImage,
+}: Props, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const readyDeferredRef = useRef(createDeferred<void>());
   const MIN_ALT = 1000;
   const MAX_ALT = 20000;
 
@@ -288,10 +294,8 @@ function ReportOMCoverageDiff({
   // 지도 배경 타일 이미지
   const mapImage = useStaticMapImage(radarSite.latitude, radarSite.longitude, globalMaxRange);
 
-  // captureReady 1회 발사 — 맵 타일 준비(또는 빈 상태 확정) + 2× RAF(paint) 이후
-  // Why: 과거에는 mapImage=null 초기 상태에서도 fixedWith/without 배열이 비어있으면
-  // 즉시 dispatch 됐고, 또 multi-radar 환경에서 재-dispatch 문제가 있었다.
-  // 1회 가드 + 2× RAF로 paint 완료를 보장.
+  // 캡처 readiness — 맵 타일 준비(또는 빈 상태 확정) + 2× RAF(paint) 이후 resolve.
+  // capture() 가 await 중인 deferred 를 신호.
   const readyFiredRef = useRef(false);
   useEffect(() => {
     if (readyFiredRef.current) return;
@@ -305,7 +309,7 @@ function ReportOMCoverageDiff({
       raf2Id = requestAnimationFrame(() => {
         if (cancelled || readyFiredRef.current) return;
         readyFiredRef.current = true;
-        containerRef.current?.dispatchEvent(new CustomEvent("captureReady", { bubbles: true }));
+        readyDeferredRef.current.resolve();
       });
     });
     return () => {
@@ -314,6 +318,27 @@ function ReportOMCoverageDiff({
       if (raf2Id) cancelAnimationFrame(raf2Id);
     };
   }, [mapImage, fixedWith.length, fixedWithout.length]);
+
+  // 명령형 capture 핸들 — SVG 직렬화 → PNG dataUrl
+  useImperativeHandle(ref, () => ({
+    async capture(): Promise<string | null> {
+      // 데이터 없으면 캡처 불필요 (라이브 빈 상태 메시지를 PDF 에 그대로 인쇄)
+      if (fixedWith.length === 0 && fixedWithout.length === 0) return null;
+      // 맵 타일 + paint 완료 대기
+      await readyDeferredRef.current.promise;
+      const svg = svgRef.current;
+      if (!svg) throw new Error("ReportOMCoverageDiff: svg not mounted");
+      return await svgToPngDataUrl(svg, 2, "#ffffff");
+    },
+  }), [fixedWith.length, fixedWithout.length]);
+
+  // unmount 시 readiness 미해결이면 reject
+  useEffect(() => {
+    const deferred = readyDeferredRef.current;
+    return () => {
+      deferred.reject(new Error("ReportOMCoverageDiff unmounted before ready"));
+    };
+  }, []);
 
   if (fixedWith.length === 0 && fixedWithout.length === 0) return (
     <div ref={containerRef} className="flex flex-col items-center py-16 text-gray-400">
@@ -424,9 +449,12 @@ function ReportOMCoverageDiff({
         </span>
       </div>
 
-      {/* 커버리지 비교맵 */}
+      {/* 커버리지 비교맵 — preCapturedImage 가 있으면 정적 이미지로 표시 */}
       <div className="rounded-md border border-gray-200 p-2">
-        <svg viewBox={`${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}`} className="w-full">
+        {preCapturedImage ? (
+          <img src={preCapturedImage} alt="" className="w-full" />
+        ) : (
+        <svg ref={svgRef} viewBox={`${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}`} className="w-full">
           <defs>
             <clipPath id="om-map-clip">
               <circle cx={cx} cy={cy} r={maxR + 2} />
@@ -592,6 +620,7 @@ function ReportOMCoverageDiff({
             );
           })()}
         </svg>
+        )}
       </div>
 
       {/* 장애물 영향 차이 없음 안내 */}
@@ -640,6 +669,6 @@ function ReportOMCoverageDiff({
       </div>
     </div>
   );
-}
+});
 
 export default React.memo(ReportOMCoverageDiff);

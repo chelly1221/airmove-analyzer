@@ -3,6 +3,7 @@ import { BarChart3 } from "lucide-react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import AutoPaginate from "./AutoPaginate";
 
 interface Props {
   sectionNum: number;
@@ -647,46 +648,48 @@ function ReportOMAltitudeDistribution({
     });
   }, [radarResults, radarSites, selectedBuildings, losMap]);
 
+  const sectionHeader = !hideHeader
+    ? <ReportOMSectionHeader sectionNum={sectionNum} title="LoS 차단 양각 대비 표적소실 분포" />
+    : null;
+
   if (radarAnalysis.every((r) => r.losses.length === 0)) {
     const hasDailyData = radarResults.some((rr) => rr.daily_stats.length > 0);
     return (
-      <div className="mb-8">
-        {!hideHeader && <ReportOMSectionHeader sectionNum={sectionNum} title="LoS 차단 양각 대비 표적소실 분포" />}
+      <AutoPaginate firstHeader={sectionHeader}>
         <div className="flex flex-col items-center py-12 text-gray-400">
           <BarChart3 size={28} strokeWidth={1.2} className="mb-2" />
           <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
         </div>
-      </div>
+      </AutoPaginate>
     );
   }
 
+  const radarBlocks = radarAnalysis.map(({ radarName, losses, buildings, radarSite: rs }) => {
+    if (losses.length === 0) {
+      return (
+        <div key={radarName} className="mb-5">
+          <h3 className="mb-2 text-[15px] font-semibold text-gray-700">{radarName}</h3>
+          <p className="text-[12px] text-gray-400">표적소실 데이터 없음</p>
+        </div>
+      );
+    }
+    return (
+      <AzElevChart
+        key={radarName}
+        radarName={radarName}
+        losses={losses}
+        buildings={buildings}
+        radarSite={rs}
+        panoWith={panoWithTargets?.get(radarName)?.terrain ?? []}
+        panoWithout={panoWithoutTargets?.get(radarName)?.terrain ?? []}
+      />
+    );
+  });
+
   return (
-    <div className="mb-8">
-      <ReportOMSectionHeader sectionNum={sectionNum} title="LoS 차단 양각 대비 표적소실 분포" />
-
-      {radarAnalysis.map(({ radarName, losses, buildings, radarSite: rs }) => {
-        if (losses.length === 0) {
-          return (
-            <div key={radarName} className="mb-5">
-              <h3 className="mb-2 text-[15px] font-semibold text-gray-700">{radarName}</h3>
-              <p className="text-[12px] text-gray-400">표적소실 데이터 없음</p>
-            </div>
-          );
-        }
-
-        return (
-          <AzElevChart
-            key={radarName}
-            radarName={radarName}
-            losses={losses}
-            buildings={buildings}
-            radarSite={rs}
-            panoWith={panoWithTargets?.get(radarName)?.terrain ?? []}
-            panoWithout={panoWithoutTargets?.get(radarName)?.terrain ?? []}
-          />
-        );
-      })}
-    </div>
+    <AutoPaginate firstHeader={sectionHeader}>
+      {radarBlocks}
+    </AutoPaginate>
   );
 }
 
