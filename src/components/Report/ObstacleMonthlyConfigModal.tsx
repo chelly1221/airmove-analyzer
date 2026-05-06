@@ -1,9 +1,11 @@
 /**
- * 장애물 월간 보고서 설정 모달 (스텝별 위자드)
- * 보고서 창에서 렌더링됨. 분석월 → 레이더 → 건물 → 파일 선택+분석.
+ * 장애물 월간 보고서 설정 + 준비 통합 모달
+ * 보고서 창에서 렌더링됨. 설정(분석월 → 레이더 → 건물 → 파일) → 분석(파싱→LoS→커버리지→파노라마→캡처)
+ * 까지 단일 모달로 처리한다. 부모(ReportApp)는 panorama/capture 상태를 props 로 전달하고,
+ * `omReady` 가 true 가 되면 모달이 자동으로 onComplete 를 호출해 닫힌다.
  */
 import { useState, useRef, useCallback, useMemo, useEffect } from "react";
-import { CheckSquare, Square, ChevronRight, ChevronDown, MinusSquare, Loader2, BarChart3, Radio, Building2, FolderOpen, ArrowRight, ArrowLeft } from "lucide-react";
+import { CheckSquare, Square, ChevronRight, ChevronDown, MinusSquare, Loader2, BarChart3, Radio, Building2, FolderOpen, ArrowRight, ArrowLeft, Check, Circle, TriangleAlert } from "lucide-react";
 import { format, lastDayOfMonth, subMonths } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -18,6 +20,19 @@ import type {
   AzSector, ObstacleMonthlyResult, ObstacleMonthlyProgress, LoSProfileData,
 } from "../../types";
 
+// ── 통합 진행 상태 모니터링용 타입 (ReportApp 측 정의와 미러) ──
+type CoverageStatus = "idle" | "loading" | "done" | "error";
+type PanoramaStatus = "idle" | "deferred" | "loading" | "done" | "error";
+type PanoramaPhase = "heightmap" | "gpu" | "merge";
+export type PanoramaProgress = {
+  currentIndex: number;
+  totalRadars: number;
+  currentRadarName: string;
+  phase: PanoramaPhase;
+};
+export type CaptureEntry = { label: string; status: "pending" | "done" };
+type OrchestratorState = "idle" | "running" | "done";
+
 export default function ObstacleMonthlyConfigModal({
   customRadarSites,
   aircraft,
@@ -26,6 +41,18 @@ export default function ObstacleMonthlyConfigModal({
   onGenerate,
   onCoverageReady,
   onCoverageError,
+  // ── 통합 모달용 부모 상태 ──
+  coverageStatus,
+  panoramaStatus,
+  panoramaProgress,
+  panoramaElapsedMs,
+  panoramaLastError,
+  captureMap,
+  captureDone,
+  captureTotal,
+  orchestratorState,
+  omReady,
+  onComplete,
 }: {
   customRadarSites: RadarSite[];
   aircraft: AircraftType[];
@@ -43,6 +70,17 @@ export default function ObstacleMonthlyConfigModal({
   ) => void;
   onCoverageReady: (covWith: Map<string, CoverageLayer[]>, covWithout: Map<string, CoverageLayer[]>) => void;
   onCoverageError?: () => void;
+  coverageStatus?: CoverageStatus;
+  panoramaStatus?: PanoramaStatus;
+  panoramaProgress?: PanoramaProgress | null;
+  panoramaElapsedMs?: number;
+  panoramaLastError?: string | null;
+  captureMap?: Map<string, CaptureEntry>;
+  captureDone?: number;
+  captureTotal?: number;
+  orchestratorState?: OrchestratorState;
+  omReady?: boolean;
+  onComplete?: () => void;
 }) {
   const [step, setStep] = useState(0);
   const [checkedRadars, setCheckedRadars] = useState<Set<string>>(new Set());
@@ -56,11 +94,43 @@ export default function ObstacleMonthlyConfigModal({
   const [progress, setProgress] = useState("");
   const [progressPct, setProgressPct] = useState(0);
   const [error, setError] = useState("");
+  // 통합 모달 — 6단계 스테이지로 진행 표시 (parsing → los → coverage → transfer → panorama → capture → done)
+  // parsing/los/coverage/transfer 는 모달 로컬 작업, panorama/capture 는 부모 props 로 모니터링
+  type AnalyzeStage = "parsing" | "los" | "coverage" | "transfer" | "panorama" | "capture" | "done";
+  const [stage, setStage] = useState<AnalyzeStage | null>(null);
+  const [stageDetail, setStageDetail] = useState<{ parsing: string; los: string; coverage: string; transfer: string }>({
+    parsing: "", los: "", coverage: "", transfer: "",
+  });
   const cancelledRef = useRef(false);
   useEffect(() => {
     cancelledRef.current = false;
     return () => { cancelledRef.current = true; };
   }, []);
+
+  // ── prop-driven 스테이지 전환 ──
+  // 로컬 작업(transfer 까지) 후 부모 상태에 따라 panorama → capture → done 자동 진행.
+  // panorama "deferred" 는 부모 effect 가 아직 안 돈 상태이므로 transfer 에 머무름.
+  useEffect(() => {
+    if (!stage || stage === "done") return;
+    if (stage === "transfer") {
+      if (panoramaStatus === "loading" || panoramaStatus === "error") setStage("panorama");
+      else if (panoramaStatus === "done") setStage("capture");
+    }
+    if (stage === "panorama" && panoramaStatus === "done") setStage("capture");
+    if ((stage === "panorama" || stage === "capture") && omReady) setStage("done");
+  }, [stage, panoramaStatus, omReady]);
+
+  // stage 가 "done" 이 되면 onComplete 호출.
+  // 별도 effect 로 분리한 이유: 스테이지 전환 effect 의 cleanup 이 setStage 재실행 시
+  // setTimeout 을 즉시 취소하던 버그 방지. onComplete 는 ref 로 안정화하여 매 렌더
+  // 새 함수가 와도 deps 변경으로 인한 재실행이 없도록 한다.
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
+  useEffect(() => {
+    if (stage !== "done") return;
+    const t = setTimeout(() => onCompleteRef.current?.(), 350);
+    return () => clearTimeout(t);
+  }, [stage]);
 
   useEffect(() => {
     invoke<ManualBuilding[]>("list_manual_buildings").then(setManualBuildings).catch((err) => console.warn("건물 목록 로드 실패:", err));
@@ -135,12 +205,15 @@ export default function ObstacleMonthlyConfigModal({
     setProgress("분석 준비 중...");
     setProgressPct(0);
     setError("");
+    setStage("parsing");
+    setStageDetail({ parsing: "ASS 파일 파싱 준비 중", los: "", coverage: "", transfer: "" });
 
     let unlistenFn: (() => void) | null = null;
     try {
       unlistenFn = await listen<ObstacleMonthlyProgress>("obstacle-monthly-progress", (e) => {
         if (cancelledRef.current) return;
         setProgress(e.payload.message);
+        setStageDetail((prev) => ({ ...prev, parsing: e.payload.message }));
         if (e.payload.total > 0) setProgressPct(Math.round((e.payload.current / e.payload.total) * 100));
       });
       const excludeMs = aircraft.map((a) => a.mode_s_code).filter(Boolean);
@@ -210,7 +283,13 @@ export default function ObstacleMonthlyConfigModal({
 
       setProgress("LoS 분석 중...");
       setProgressPct(0);
+      setStage("los");
       const totalLosJobs = selectedRadars.length * selectedBuildings.length;
+      setStageDetail((prev) => ({
+        ...prev,
+        parsing: `${result.radar_results.reduce((s, r) => s + r.total_files_parsed, 0)}개 파일 파싱 완료`,
+        los: `0/${totalLosJobs} 단면 계산 시작`,
+      }));
       const losJobs: { radar: RadarSite; bldg: ManualBuilding }[] = [];
       for (const radar of selectedRadars) {
         for (const bldg of selectedBuildings) losJobs.push({ radar, bldg });
@@ -219,6 +298,7 @@ export default function ObstacleMonthlyConfigModal({
         if (cancelledRef.current) return;
         setProgress(`LoS 분석 중... (${done}/${totalLosJobs})`);
         setProgressPct(Math.round((done / totalLosJobs) * 100));
+        setStageDetail((prev) => ({ ...prev, los: `${done}/${totalLosJobs} 단면 계산 중` }));
       });
       if (cancelledRef.current) return;
 
@@ -228,6 +308,9 @@ export default function ObstacleMonthlyConfigModal({
       if (actualLosCount < expectedLosCount) {
         const failedCount = expectedLosCount - actualLosCount;
         setProgress(`LoS 분석 완료 (${failedCount}건 계산 실패 — 해당 건물 단면도 생략)`);
+        setStageDetail((prev) => ({ ...prev, los: `${actualLosCount}/${expectedLosCount} 완료 (${failedCount}건 실패)` }));
+      } else {
+        setStageDetail((prev) => ({ ...prev, los: `${actualLosCount}개 단면 완료` }));
       }
 
       // 백엔드 결과에서 실제 데이터 월 자동 감지
@@ -276,6 +359,8 @@ export default function ObstacleMonthlyConfigModal({
       const covWithMap = new Map<string, CoverageLayer[]>();
       const covWithoutMap = new Map<string, CoverageLayer[]>();
       if (selectedRadars.length > 0) {
+        setStage("coverage");
+        setStageDetail((prev) => ({ ...prev, coverage: `0/${selectedRadars.length} 레이더 시작` }));
         const altFts = [1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
         const excludeIds = selectedBuildings.map((b) => b.id);
         try {
@@ -285,15 +370,22 @@ export default function ObstacleMonthlyConfigModal({
             const r = selectedRadars[ri];
             setProgress(`커버리지 계산 중... (${r.name}, ${ri + 1}/${selectedRadars.length})`);
             setProgressPct(85 + Math.floor((ri / selectedRadars.length) * 8));
+            setStageDetail((prev) => ({ ...prev, coverage: `${ri + 1}/${selectedRadars.length} · ${r.name}` }));
             const covResult = await computeCoverageLayersOM(
               { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm },
               altFts, excludeIds,
-              (msg) => { if (!cancelledRef.current) { setProgress(`[${r.name}] ${msg}`); } },
+              (msg) => {
+                if (cancelledRef.current) return;
+                setProgress(`[${r.name}] ${msg}`);
+                setStageDetail((prev) => ({ ...prev, coverage: `${ri + 1}/${selectedRadars.length} · ${r.name} — ${msg}` }));
+              },
             );
             covWithMap.set(r.name, covResult.layersWith);
             covWithoutMap.set(r.name, covResult.layersWithout);
           }
+          setStageDetail((prev) => ({ ...prev, coverage: `${covWithMap.size}개 레이더 완료` }));
         } catch (err) {
+          setStageDetail((prev) => ({ ...prev, coverage: "계산 실패 — 커버리지 없이 진행" }));
           console.warn("GPU 커버리지 계산 실패:", err);
           onCoverageError?.();
           try {
@@ -311,20 +403,28 @@ export default function ObstacleMonthlyConfigModal({
       // 보고서 생성
       setProgress("보고서 생성 중...");
       setProgressPct(95);
+      setStage("transfer");
+      setStageDetail((prev) => ({ ...prev, transfer: "보고서 창으로 데이터 전송 중" }));
       await onGenerate(filteredResult, selectedBuildings, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, effectiveMonth);
 
       if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap);
 
       setProgress("보고서 로딩 완료");
       setProgressPct(100);
+      setStageDetail((prev) => ({ ...prev, transfer: "전송 완료 — 파노라마 대기 중" }));
+      // 모달은 닫지 않고 stage 그대로 "transfer" 유지 → prop-driven useEffect 가 panorama/capture 로 진행
     } catch (err) {
       if (!cancelledRef.current) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(`분석 중 오류가 발생했습니다. 데이터 파일과 레이더 설정을 확인 후 다시 시도해주세요. (${msg})`);
       }
+      // 오류/취소 시에는 진행 카드 닫고 설정 화면 복귀
+      setAnalyzing(false);
+      setStage(null);
     } finally {
       unlistenFn?.();
-      setAnalyzing(false);
+      // 정상 완료 시 analyzing/stage 는 유지 — prop-driven 단계가 이어진다.
+      // 모달 unmount 는 omReady → onComplete 경로로만 발생.
     }
   }, [analyzing, selectedRadars, selectedBuildings, radarFiles, azSectorsByRadar, aircraft, onGenerate, onCoverageReady, onCoverageError, analysisMonth, filterFilesByMonth]);
 
@@ -532,21 +632,162 @@ export default function ObstacleMonthlyConfigModal({
                 })}
               </div>
 
-              {analyzing && (
-                <div className="mt-4 rounded-xl border border-[#a60739]/20 bg-[#a60739]/5 p-3.5">
-                  <div className="flex items-center justify-between gap-2">
+              {analyzing && (() => {
+                // 통합 진행 카드 — 6단계 (parsing → los → coverage → transfer → panorama → capture)
+                type StageStatus = "waiting" | "active" | "done" | "error";
+                const order: AnalyzeStage[] = ["parsing", "los", "coverage", "transfer", "panorama", "capture"];
+                const currentIdx = stage && stage !== "done" ? order.indexOf(stage) : (stage === "done" ? order.length : -1);
+                const statusOf = (key: AnalyzeStage): StageStatus => {
+                  const idx = order.indexOf(key);
+                  // panorama/coverage 오류 처리
+                  if (key === "coverage" && coverageStatus === "error" && currentIdx > idx) return "error";
+                  if (key === "panorama" && panoramaStatus === "error") return "error";
+                  if (currentIdx < 0) return "waiting";
+                  if (idx < currentIdx) return "done";
+                  if (idx === currentIdx) return "active";
+                  return "waiting";
+                };
+                const StageIcon = ({ status }: { status: StageStatus }) => {
+                  if (status === "done") return <Check size={14} className="text-emerald-500" strokeWidth={3} />;
+                  if (status === "active") return <Loader2 size={14} className="animate-spin text-[#a60739]" />;
+                  if (status === "error") return <TriangleAlert size={14} className="text-red-500" />;
+                  return <Circle size={12} className="text-gray-300" />;
+                };
+                const stageTextClass = (status: StageStatus) =>
+                  status === "done" ? "text-gray-400"
+                  : status === "active" ? "text-gray-800 font-medium"
+                  : status === "error" ? "text-red-500 font-medium"
+                  : "text-gray-400";
+
+                // 파노라마 디테일
+                const phaseLabel = (p: PanoramaPhase) =>
+                  p === "heightmap" ? "지형맵 수신" : p === "gpu" ? "GPU 앙각 계산" : "건물 병합";
+                const elapsedSec = ((panoramaElapsedMs ?? 0) / 1000).toFixed(1);
+                const stalled = (panoramaElapsedMs ?? 0) > 30_000;
+                const panoramaDetailText =
+                  panoramaStatus === "done" ? "완료"
+                  : panoramaStatus === "error" ? (panoramaLastError ?? "오류")
+                  : panoramaStatus === "loading" && panoramaProgress
+                    ? `레이더 ${panoramaProgress.currentIndex}/${panoramaProgress.totalRadars} · ${panoramaProgress.currentRadarName} — ${phaseLabel(panoramaProgress.phase)} (${elapsedSec}s)${stalled ? " ⚠ 지연" : ""}`
+                  : panoramaStatus === "loading" ? "진행 상세 대기"
+                  : "대기 중";
+
+                // 캡처 디테일
+                const cTotal = captureTotal ?? 0;
+                const cDone = captureDone ?? 0;
+                const captureDetailText =
+                  orchestratorState === "running" && cTotal === 0 ? "섹션 컴포넌트 마운트 중"
+                  : cTotal === 0 ? "준비 대기"
+                  : cDone === cTotal ? "완료"
+                  : `${cDone}/${cTotal} 섹션 캡처 진행`;
+
+                // 통합 진행률 — 단계별 가중치
+                const baseFor = (s: AnalyzeStage): number =>
+                  s === "parsing" ? 0
+                  : s === "los" ? 15
+                  : s === "coverage" ? 30
+                  : s === "transfer" ? 55
+                  : s === "panorama" ? 60
+                  : s === "capture" ? 85
+                  : 100;
+                const spanFor = (s: AnalyzeStage): number =>
+                  s === "parsing" ? 15
+                  : s === "los" ? 15
+                  : s === "coverage" ? 25
+                  : s === "transfer" ? 5
+                  : s === "panorama" ? 25
+                  : s === "capture" ? 15
+                  : 0;
+                const overallPct = (() => {
+                  if (!stage || stage === "done") return stage === "done" ? 100 : 0;
+                  const base = baseFor(stage);
+                  const span = spanFor(stage);
+                  let frac = 0;
+                  if (stage === "parsing" || stage === "los" || stage === "coverage") frac = progressPct / 100;
+                  else if (stage === "transfer") frac = 0.5;
+                  else if (stage === "panorama") {
+                    if (panoramaStatus === "done") frac = 1;
+                    else if (panoramaProgress && panoramaProgress.totalRadars > 0) {
+                      frac = (panoramaProgress.currentIndex - 1) / panoramaProgress.totalRadars;
+                    }
+                  } else if (stage === "capture") {
+                    frac = cTotal > 0 ? cDone / cTotal : 0;
+                  }
+                  return Math.min(100, Math.round(base + span * Math.max(0, Math.min(1, frac))));
+                })();
+
+                const stageList: { key: AnalyzeStage; label: string; detail: string }[] = [
+                  { key: "parsing", label: "ASS 파일 파싱", detail: stageDetail.parsing || "대기 중" },
+                  { key: "los", label: "LoS 분석", detail: stageDetail.los || "대기 중" },
+                  { key: "coverage", label: "커버리지 계산", detail: stageDetail.coverage || "대기 중" },
+                  { key: "transfer", label: "보고서 창 전송", detail: stageDetail.transfer || "대기 중" },
+                  { key: "panorama", label: "파노라마 LoS 계산", detail: panoramaDetailText },
+                  { key: "capture", label: "섹션 이미지 캡처", detail: captureDetailText },
+                ];
+
+                // 로컬 단계(취소 가능) vs 원격 단계(닫기로만)
+                const inLocalPhase = stage === "parsing" || stage === "los" || stage === "coverage";
+                const cancelButtonLabel = inLocalPhase ? "중단" : "닫기";
+                const onCancelClick = async () => {
+                  cancelledRef.current = true;
+                  try { await invoke("cancel_analysis"); } catch { /* ignore */ }
+                  if (inLocalPhase) {
+                    // 설정 화면 복귀
+                    setAnalyzing(false);
+                    setProgress("");
+                    setProgressPct(0);
+                    setStage(null);
+                  } else {
+                    // 원격 단계 — 윈도우 닫기 (부모가 destroy)
+                    onClose();
+                  }
+                };
+
+                return (
+                  <div className="mt-4 rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
                     <div className="flex items-center gap-2">
-                      <Loader2 size={14} className="animate-spin text-[#a60739]" />
-                      <span className="text-[12px] text-gray-700">{progress}</span>
+                      <Loader2 size={16} className="animate-spin text-[#a60739]" />
+                      <h3 className="text-[13px] font-semibold text-gray-800">보고서 준비 중</h3>
+                      <div className="flex-1" />
+                      <span className="text-[11px] font-medium text-gray-500">{overallPct}%</span>
+                      <button onClick={onCancelClick}
+                        className="rounded-lg border border-red-200 bg-white px-2.5 py-1 text-[11px] text-red-600 hover:bg-red-50 transition-colors">{cancelButtonLabel}</button>
                     </div>
-                    <button onClick={async () => { cancelledRef.current = true; try { await invoke("cancel_analysis"); } catch { /* ignore */ } setAnalyzing(false); setProgress(""); setProgressPct(0); }}
-                      className="rounded-lg border border-red-200 bg-white px-2.5 py-1 text-[11px] text-red-600 hover:bg-red-50 transition-colors">중단</button>
+                    <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-gray-100">
+                      <div className="h-full bg-[#a60739] transition-all duration-300" style={{ width: `${overallPct}%` }} />
+                    </div>
+                    <div className="mt-4 flex flex-col gap-2.5">
+                      {stageList.map(({ key, label, detail }) => {
+                        const status = statusOf(key);
+                        return (
+                          <div key={key} className="flex items-start gap-2.5">
+                            <div className="mt-0.5"><StageIcon status={status} /></div>
+                            <div className="flex-1">
+                              <p className={`text-[12px] ${stageTextClass(status)}`}>{label}</p>
+                              <p className={`text-[11px] ${stalled && key === "panorama" ? "text-amber-600" : "text-gray-400"}`}>{detail}</p>
+                              {key === "capture" && status === "active" && captureMap && captureMap.size > 0 && (
+                                <div className="mt-1.5 flex flex-col gap-0.5">
+                                  {[...captureMap.entries()].map(([k, v]) => (
+                                    <div key={k} className="flex items-center gap-1.5 text-[10px]">
+                                      {v.status === "done"
+                                        ? <Check size={10} className="text-emerald-500" strokeWidth={3} />
+                                        : <Loader2 size={10} className="animate-spin text-[#a60739]" />}
+                                      <span className={v.status === "done" ? "text-gray-400" : "text-gray-700"}>{v.label}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {progress && (
+                      <p className="mt-3 text-center text-[10px] text-gray-500">{progress}</p>
+                    )}
                   </div>
-                  <div className="mt-2.5 h-2 rounded-full bg-gray-200 overflow-hidden">
-                    <div className="h-full rounded-full bg-[#a60739] transition-all duration-300" style={{ width: `${progressPct}%` }} />
-                  </div>
-                </div>
-              )}
+                );
+              })()}
               {!analyzing && error && (
                 <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3.5">
                   <p className="text-[12px] text-red-700">{error}</p>

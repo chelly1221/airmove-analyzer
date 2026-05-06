@@ -48,13 +48,14 @@ async function exportViaNative(
   container.id = "__print-wrapper__";
 
   // 2. 컨테이너 내부에서 [data-page] 외 요소 숨김
+  // 자기 자신이 data-page 이거나 자손에 data-page 가 있으면 보존 (중간 wrapper 보호)
   const containerChildren = Array.from(container.children) as HTMLElement[];
   const hiddenContainerChildren: HTMLElement[] = [];
   containerChildren.forEach((el) => {
-    if (!el.hasAttribute("data-page")) {
-      hiddenContainerChildren.push(el);
-      el.style.setProperty("display", "none", "important");
-    }
+    if (el.hasAttribute("data-page")) return;
+    if (el.querySelector("[data-page]")) return;
+    hiddenContainerChildren.push(el);
+    el.style.setProperty("display", "none", "important");
   });
 
   // 3. body 자식 중 컨테이너 조상 경로 외 전부 숨김
@@ -67,8 +68,11 @@ async function exportViaNative(
     }
   });
 
-  // 4. 컨테이너~body 사이 조상 경로의 형제도 숨김
+  // 4. 컨테이너~body 사이 조상 경로의 형제 숨김 + 조상 자체 layout 제약 제거.
+  // h-screen / flex-1 / min-h-0 등이 print 시 문서 높이를 1 페이지(100vh=297mm)로
+  // 제한해 첫 페이지만 출력되는 문제를 막기 위함. 조상에 클래스를 부여해 CSS 로 일괄 정리.
   const hiddenAncestorSiblings: HTMLElement[] = [];
+  const overriddenAncestors: HTMLElement[] = [];
   let ancestor: HTMLElement | null = container.parentElement;
   while (ancestor && ancestor !== document.body) {
     Array.from(ancestor.parentElement?.children ?? []).forEach((sibling) => {
@@ -77,6 +81,8 @@ async function exportViaNative(
         sibling.style.setProperty("display", "none", "important");
       }
     });
+    ancestor.classList.add("__print-ancestor__");
+    overriddenAncestors.push(ancestor);
     ancestor = ancestor.parentElement;
   }
 
@@ -91,9 +97,31 @@ async function exportViaNative(
       margin: 0 !important;
       padding: 0 !important;
       overflow: visible !important;
+      height: auto !important;
+    }
+    /* 조상 체인 정리 — flex / 고정 높이 제약 제거하여 print 시 모든 페이지가 흐르도록 */
+    .__print-ancestor__ {
+      display: block !important;
+      height: auto !important;
+      min-height: 0 !important;
+      max-height: none !important;
+      overflow: visible !important;
+      flex: none !important;
     }
     #__print-wrapper__ {
       background: white;
+      display: block !important;
+      overflow: visible !important;
+      height: auto !important;
+      max-height: none !important;
+      flex: none !important;
+    }
+    /* container 직계 자식(inner wrapper) 정리 — 단, data-page 본체는 자체 스타일 유지 */
+    #__print-wrapper__ > div:not([data-page]) {
+      display: block !important;
+      overflow: visible !important;
+      max-height: none !important;
+      flex: none !important;
     }
     #__print-wrapper__ [data-page] {
       page-break-after: always;
@@ -102,7 +130,7 @@ async function exportViaNative(
       min-height: 297mm !important;
       margin: 0 !important;
       box-shadow: none !important;
-      overflow: hidden;
+      overflow: hidden !important;
     }
     #__print-wrapper__ [data-page]:last-child {
       page-break-after: auto;
@@ -125,6 +153,7 @@ async function exportViaNative(
     hiddenContainerChildren.forEach((el) => el.style.removeProperty("display"));
     hiddenBodyChildren.forEach((el) => el.style.removeProperty("display"));
     hiddenAncestorSiblings.forEach((el) => el.style.removeProperty("display"));
+    overriddenAncestors.forEach((el) => el.classList.remove("__print-ancestor__"));
   };
 
   // 비정상 종료 시 DOM 복원 보장

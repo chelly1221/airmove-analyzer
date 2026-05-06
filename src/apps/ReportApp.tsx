@@ -684,7 +684,8 @@ export default function ReportApp() {
       coverageStatus: covWith.size > 0 ? "done" : "idle",
     };
 
-    setConfigPayload(null);
+    // 통합 모달이 살아있는 동안에는 configPayload 를 유지 — 모달이 omReady 시점에
+    // onComplete 콜백으로 setConfigPayload(null) 호출하여 unmount 시킨다.
     setLoading(true);
     setPrepPhase("waiting");
     await writeGenerateRequest({
@@ -902,86 +903,115 @@ export default function ReportApp() {
     };
   }, [omData?.result, omData?.coverageStatus]);
 
-  // ── 설정 모달 표시 ──
-  if (configPayload && !state) {
+  // ── 통합 OM 모달 (전체 prep 라이프사이클을 가로지름) ──
+  // configPayload 가 obstacle_monthly 인 동안 항상 마운트되며, 모달이 omReady 시점에
+  // onComplete 콜백으로 configPayload 를 비워야 unmount 된다.
+  const omFlowActive = configPayload?.template === "obstacle_monthly";
+  const omModal = omFlowActive && configPayload ? (
+    <ObstacleMonthlyConfigModal
+      customRadarSites={configPayload.customRadarSites}
+      aircraft={configPayload.aircraft}
+      metadata={configPayload.metadata}
+      onClose={() => appWindow.destroy()}
+      onGenerate={handleOMGenerate}
+      onCoverageReady={handleCoverageReady}
+      onCoverageError={handleCoverageError}
+      coverageStatus={omData?.coverageStatus}
+      panoramaStatus={omData?.panoramaStatus}
+      panoramaProgress={panoramaProgress}
+      panoramaElapsedMs={panoramaElapsedMs}
+      panoramaLastError={panoramaLastError}
+      captureMap={captureMap}
+      captureDone={captureDone}
+      captureTotal={captureTotal}
+      orchestratorState={orchestratorState}
+      omReady={omReady}
+      onComplete={() => setConfigPayload(null)}
+    />
+  ) : null;
+
+  // ── 분기별 배경 컨텐츠 결정 ──
+  // 핵심 원칙: omModal 은 항상 같은 React 트리 위치(fragment 의 두 번째 자식)에 렌더되어야
+  // 분기 전환(설정→로딩→메인) 시에도 unmount/remount 되지 않고 step/analyzing 등 로컬
+  // state 가 보존된다. 따라서 모든 return 은 `<>{branchContent}{omModal}</>` 패턴.
+  const phaseMessage = prepPhase === "waiting"
+    ? "보고서 데이터 준비 중..."
+    : prepPhase === "loading"
+      ? "데이터 로딩 중..."
+      : "보고서 데이터 로딩 중...";
+
+  // 설정 모달 단계 (OM 외 — TemplateConfigModal/PreScreening)
+  if (configPayload && !state && !omFlowActive) {
     const { template: tpl } = configPayload;
     return (
-      <div className="flex h-screen flex-col bg-white">
-        <SourceOverlay />
-        <Titlebar controlsOnly />
-        <div className="flex flex-1 items-center justify-center">
-          {tpl === "obstacle_monthly" ? (
-            <ObstacleMonthlyConfigModal
-              customRadarSites={configPayload.customRadarSites}
-              aircraft={configPayload.aircraft}
-              metadata={configPayload.metadata}
-              onClose={() => appWindow.destroy()}
-              onGenerate={handleOMGenerate}
-              onCoverageReady={handleCoverageReady}
-              onCoverageError={handleCoverageError}
-            />
-          ) : tpl === "obstacle" ? (
-            <ObstaclePreScreeningModal
-              customRadarSites={configPayload.customRadarSites}
-              aircraft={configPayload.aircraft}
-              metadata={configPayload.metadata}
-              onClose={() => appWindow.destroy()}
-              onGenerate={handlePSGenerate}
-              onCoverageReady={handleCoverageReady}
-              onCoverageError={handleCoverageError}
-            />
-          ) : (
-            <TemplateConfigModal
-              template={tpl}
-              flights={configPayload.flights}
-              losResults={configPayload.losResults}
-              aircraft={configPayload.aircraft}
-              metadata={configPayload.metadata}
-              radarSite={configPayload.radarSite}
-              panoramaData={configPayload.panoramaData}
-              onClose={() => appWindow.destroy()}
-              onGenerate={handleModalGenerate}
-            />
-          )}
+      <>
+        <div className="flex h-screen flex-col bg-white">
+          <SourceOverlay />
+          <Titlebar controlsOnly />
+          <div className="flex flex-1 items-center justify-center">
+            {tpl === "obstacle" ? (
+              <ObstaclePreScreeningModal
+                customRadarSites={configPayload.customRadarSites}
+                aircraft={configPayload.aircraft}
+                metadata={configPayload.metadata}
+                onClose={() => appWindow.destroy()}
+                onGenerate={handlePSGenerate}
+                onCoverageReady={handleCoverageReady}
+                onCoverageError={handleCoverageError}
+              />
+            ) : (
+              <TemplateConfigModal
+                template={tpl}
+                flights={configPayload.flights}
+                losResults={configPayload.losResults}
+                aircraft={configPayload.aircraft}
+                metadata={configPayload.metadata}
+                radarSite={configPayload.radarSite}
+                panoramaData={configPayload.panoramaData}
+                onClose={() => appWindow.destroy()}
+                onGenerate={handleModalGenerate}
+              />
+            )}
+          </div>
         </div>
-      </div>
+        {omModal}
+      </>
     );
   }
 
-  // 로딩/에러 화면
+  // 로딩/에러 화면 — state/omData 가 아직 없을 때
   if (loading || error || !state || !activeSections || !omData) {
-    const phaseMessage = prepPhase === "waiting"
-      ? "보고서 데이터 준비 중..."
-      : prepPhase === "loading"
-        ? "데이터 로딩 중..."
-        : "보고서 데이터 로딩 중...";
     return (
-      <div className="flex h-screen flex-col bg-white">
-        <SourceOverlay />
-        <Titlebar controlsOnly />
-        <div className="flex flex-1 items-center justify-center">
-          {error ? (
-            <div className="flex flex-col items-center gap-3">
-              <p className="text-sm text-red-500">{error}</p>
-              <button
-                onClick={() => appWindow.close()}
-                className="rounded-lg border border-gray-200 px-4 py-1.5 text-sm text-gray-600 hover:bg-gray-100"
-              >
-                닫기
-              </button>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center gap-3">
-              <Loader2 size={24} className="animate-spin text-[#a60739]" />
-              <p className="text-sm text-gray-500">{phaseMessage}</p>
-            </div>
-          )}
+      <>
+        <div className="flex h-screen flex-col bg-white">
+          <SourceOverlay />
+          <Titlebar controlsOnly />
+          <div className="flex flex-1 items-center justify-center">
+            {error ? (
+              <div className="flex flex-col items-center gap-3">
+                <p className="text-sm text-red-500">{error}</p>
+                <button
+                  onClick={() => appWindow.close()}
+                  className="rounded-lg border border-gray-200 px-4 py-1.5 text-sm text-gray-600 hover:bg-gray-100"
+                >
+                  닫기
+                </button>
+              </div>
+            ) : !omFlowActive ? (
+              <div className="flex flex-col items-center gap-3">
+                <Loader2 size={24} className="animate-spin text-[#a60739]" />
+                <p className="text-sm text-gray-500">{phaseMessage}</p>
+              </div>
+            ) : null}
+          </div>
         </div>
-      </div>
+        {omModal}
+      </>
     );
   }
 
   return (
+    <>
     <div className="relative flex h-screen flex-col bg-white">
       <SourceOverlay />
       <Titlebar controlsOnly>
@@ -1063,8 +1093,11 @@ export default function ReportApp() {
         </div>
       )}
 
-      {/* OM 섹션 준비 중 상세 진행 오버레이 — 프리뷰 위에 덮어 표시 */}
-      {omPreparing && omData && (() => {
+      {/* OM 섹션 준비 중 상세 진행 오버레이 — 프리뷰 위에 덮어 표시.
+          통합 모달(omFlowActive)이 떠 있는 동안에는 모달이 동일 정보를 표시하므로 숨김.
+          이 오버레이는 모달이 없는 시나리오(저장 보고서 재로딩, 레이더 재선택으로 인한
+          파노라마 재계산 등)의 안전망으로만 사용됨. */}
+      {!omFlowActive && omPreparing && omData && (() => {
         type StageStatus = "waiting" | "active" | "done" | "error";
         const coverageStage: StageStatus =
           omData.coverageStatus === "done" ? "done"
@@ -1250,5 +1283,9 @@ export default function ReportApp() {
       </div>
       )}
     </div>
+    {/* 통합 OM 모달 — fragment 의 두 번째 자식 위치에 고정. 모든 분기에서 같은 트리
+        위치에 마운트되어 step/analyzing 등 로컬 state 가 분기 전환 시 보존된다. */}
+    {omModal}
+    </>
   );
 }
