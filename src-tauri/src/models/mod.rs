@@ -120,6 +120,9 @@ pub struct TrackPoint {
     /// Original bytes for debugging
     #[serde(with = "serde_bytes_base64")]
     pub raw_data: Vec<u8>,
+    /// TCAS RA 보고 페이로드 (BDS 3,0 7바이트) — I048/260 우선, 없으면 I048/250 BDS 3,0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcas_ra: Option<Vec<u8>>,
 }
 
 /// Loss 구간 (Loss Segment)

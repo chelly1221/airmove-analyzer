@@ -288,6 +288,7 @@ mod tests {
             heading: 90.0,
             radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
+            tcas_ra: None,
         }
     }
 
@@ -302,6 +303,7 @@ mod tests {
             heading: 90.0,
             radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
+            tcas_ra: None,
         }
     }
 

@@ -17,6 +17,7 @@ import type {
   UploadedFile,
 } from "../types";
 import type { MultiCoverageResult } from "../utils/radarCoverage";
+import type { TcasEvent } from "../utils/tcasEvents";
 import { manualMergeFlightsAsync, clearWorkerPoints } from "../utils/flightConsolidationWorker";
 
 /** 설정을 DB에 비동기 저장 (fire-and-forget) */
@@ -118,6 +119,16 @@ interface AppState {
   setCoverageProgressPct: (pct: number) => void;
   coverageError: string;
   setCoverageError: (msg: string) => void;
+
+  // TCAS RA 분석
+  tcasVisible: boolean;
+  setTcasVisible: (v: boolean) => void;
+  tcasEvents: TcasEvent[];
+  setTcasEvents: (evts: TcasEvent[]) => void;
+  tcasSelectedId: string | null;
+  setTcasSelectedId: (id: string | null) => void;
+  tcasLoading: boolean;
+  setTcasLoading: (v: boolean) => void;
 
 
   // 보고서 메타데이터
@@ -515,6 +526,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   setCoverageProgressPct: (pct) => set({ coverageProgressPct: pct }),
   coverageError: "",
   setCoverageError: (msg) => set({ coverageError: msg }),
+
+  // TCAS RA 분석
+  tcasVisible: false,
+  setTcasVisible: (v) => set({ tcasVisible: v }),
+  tcasEvents: [],
+  setTcasEvents: (evts) => set({ tcasEvents: evts }),
+  tcasSelectedId: null,
+  setTcasSelectedId: (id) => set({ tcasSelectedId: id }),
+  tcasLoading: false,
+  setTcasLoading: (v) => set({ tcasLoading: v }),
 
 
   // 보고서 메타데이터

@@ -20,4 +20,6 @@ export interface TrackPoint {
   raw_data: number[];
   /** 파싱 시 사용된 레이더 사이트 이름 (필터링용) */
   radar_name?: string;
+  /** TCAS RA 페이로드 7바이트 (BDS 3,0). 있을 때만. */
+  tcas_ra?: number[];
 }

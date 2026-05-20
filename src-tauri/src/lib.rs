@@ -32,8 +32,9 @@ struct TrackPointsChunk {
     points: Vec<TrackPoint>,
 }
 
-/// TrackPoints를 청크 단위로 이벤트 emit한 뒤, 원본에서 제거
-const CHUNK_SIZE: usize = 5000;
+/// TrackPoints를 청크 단위로 이벤트 emit한 뒤, 원본에서 제거.
+/// 50K = 메인 listener 호출 빈도 1/10로 감소 + 메인 메모리 통과 시간 짧음.
+const CHUNK_SIZE: usize = 50_000;
 
 fn emit_and_drain_track_points(
     handle: &tauri::AppHandle,

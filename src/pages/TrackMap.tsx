@@ -39,6 +39,7 @@ import { detectionTypeColor, radarTypeLabel, MAP_STYLE_URL } from "../utils/rada
 import AddressSearch, { AddressMarker } from "../components/Map/AddressSearch";
 import PlaybackControls from "../components/Map/PlaybackControls";
 import CoveragePanel from "../components/Map/CoveragePanel";
+import TcasPanel from "../components/Map/TcasPanel";
 
 /** 전체 항적 표시 시 최대 선택 가능 윈도우 (초) = 24시간 */
 const MAX_WINDOW_SECS = 86400;
@@ -207,6 +208,10 @@ export default function TrackMap() {
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
   const selectedFlightId = useAppStore((s) => s.selectedFlightId);
   const setSelectedFlightId = useAppStore((s) => s.setSelectedFlightId);
+  const tcasVisible = useAppStore((s) => s.tcasVisible);
+  const tcasEvents = useAppStore((s) => s.tcasEvents);
+  const tcasSelectedId = useAppStore((s) => s.tcasSelectedId);
+  const setTcasSelectedId = useAppStore((s) => s.setTcasSelectedId);
 
   const [portalReady, setPortalReady] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
@@ -345,6 +350,7 @@ export default function TrackMap() {
   const [losExpanded, setLosExpanded] = useState(false);
   const [losCursorPicking, setLosCursorPicking] = useState(false);
   const [coverageExpanded, setCoverageExpanded] = useState(false);
+  const [tcasExpanded, setTcasExpanded] = useState(false);
 
   const mapRef = useRef<MapRef>(null);
   const terrainAdded = useRef(false);
@@ -555,6 +561,19 @@ export default function TrackMap() {
       max: paddedTimeRange ? Math.max(paddedTimeRange.max, pointMax) : pointMax,
     };
   }, [allPoints, paddedTimeRange, computedTimeRange]);
+
+  // TcasPanel prop 안정화 — 매 렌더마다 새 배열/함수 생성 방지
+  const tcasTimeRange = useMemo<[number, number] | undefined>(
+    () => (timeRange.max > timeRange.min ? [timeRange.min, timeRange.max] : undefined),
+    [timeRange.min, timeRange.max],
+  );
+  const tcasRegisteredModeSArr = useMemo(() => Array.from(registeredModeS), [registeredModeS]);
+  const tcasOnJumpToTime = useCallback((ts: number) => {
+    if (timeRange.max > timeRange.min) {
+      const pct = ((ts - timeRange.min) / (timeRange.max - timeRange.min)) * 100;
+      setSliderValue(Math.max(0, Math.min(100, pct)));
+    }
+  }, [timeRange.min, timeRange.max]);
 
   // 퍼센트 → 타임스탬프
   const pctToTs = useCallback(
@@ -1981,6 +2000,47 @@ export default function TrackMap() {
     return layers;
   }, [panoramaViewActive, panoramaActivePoint, panoramaPinned, radarSite.latitude, radarSite.longitude]);
 
+  // TCAS RA 이벤트 오버레이 (CPA 마커 + 두 비행 연결선)
+  const tcasDeckLayers = useMemo(() => {
+    if (!tcasVisible || tcasEvents.length === 0) return [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const layers: any[] = [];
+
+    // RA 발생 지점 마커 (자기 위치 — RA 시작 점 좌표 데이터 그대로).
+    // 위협 위치는 데이터에 정확한 좌표가 없으므로 표시하지 않음 (TTI=2는 거리/방위만,
+    // TTI=1은 Mode-S만). 자체 계산은 하지 않음.
+    layers.push(
+      new ScatterplotLayer({
+        id: "tcas-ra-points",
+        data: tcasEvents,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        getPosition: (d: any) => [d.ownLon, d.ownLat],
+        // TTI에 따른 색상: Mode-S(빨강) / 거리·방위(주황) / 없음(회색)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        getFillColor: (d: any) =>
+          d.threatTti === 1 ? [233, 69, 96, 230] as [number, number, number, number] :
+          d.threatTti === 2 ? [245, 158, 11, 230] as [number, number, number, number] :
+                              [156, 163, 175, 220] as [number, number, number, number],
+        getLineColor: [255, 255, 255, 220],
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        getRadius: (d: any) => d.id === tcasSelectedId ? 12 : 6,
+        radiusUnits: "pixels",
+        radiusMinPixels: 4,
+        radiusMaxPixels: 16,
+        stroked: true,
+        lineWidthMinPixels: 2,
+        pickable: true,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        onClick: (info: any) => {
+          if (info.object) setTcasSelectedId(info.object.id === tcasSelectedId ? null : info.object.id);
+        },
+        updateTriggers: { getRadius: [tcasSelectedId], getFillColor: [tcasSelectedId] },
+      }),
+    );
+
+    return layers;
+  }, [tcasVisible, tcasEvents, tcasSelectedId, setTcasSelectedId]);
+
   // 파노라마 장애물 건물 3D fill-extrusion (폴리곤이 있는 건물만)
   const panoramaObstacleGeoJSON = useMemo(() => {
     if (!panoramaViewActive || !panoramaActivePoint) return null;
@@ -2272,6 +2332,9 @@ export default function TrackMap() {
     // 커버리지 맵 합성 (2D/3D 모드에 따라 선택)
     layers.push(...coverageDeckLayers);
 
+    // TCAS RA CPA 마커/연결선 (별도 useMemo)
+    layers.push(...tcasDeckLayers);
+
     // 건물 2D 오버레이 합성 (별도 useMemo)
     layers.push(...buildingDeckLayers);
 
@@ -2347,7 +2410,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackLine, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackLine, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, tcasDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2919,6 +2982,18 @@ export default function TrackMap() {
             coverageExpanded={coverageExpanded} setCoverageExpanded={setCoverageExpanded}
             coverageRendering={coverageRendering}
             mapRef={mapRef}
+          />
+
+          {/* TCAS RA 분석 — Collapsible */}
+          <TcasPanel
+            expanded={tcasExpanded} setExpanded={setTcasExpanded}
+            radarName={radarSite.name}
+            selectedModeS={selectedModeS}
+            registeredModeS={tcasRegisteredModeSArr}
+            timeRange={tcasTimeRange}
+            flights={flights}
+            mapRef={mapRef}
+            onJumpToTime={tcasOnJumpToTime}
           />
 
           </div>

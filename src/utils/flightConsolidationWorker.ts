@@ -131,9 +131,29 @@ function workerSend(msg: Record<string, unknown>): Promise<any> {
 /**
  * 포인트를 Worker에 직접 전송 (메인에 축적하지 않음).
  * DB에서 파일 로드 → 즉시 이 함수로 Worker에 전달 → 로컬 참조 해제.
+ *
+ * 구조화 복제 OOM 방지를 위해 100K 단위 청크로 분할 전송.
+ * Worker는 ADD_POINTS에 ACK를 보내지 않음 — fire-and-forget.
  */
+const ADD_POINTS_CHUNK_SIZE = 100_000;
 export async function sendPointsToWorker(points: TrackPoint[]): Promise<void> {
-  await workerSend({ type: "ADD_POINTS", points });
+  if (points.length <= ADD_POINTS_CHUNK_SIZE) {
+    getWorker().postMessage({ type: "ADD_POINTS", points });
+    return;
+  }
+  for (let i = 0; i < points.length; i += ADD_POINTS_CHUNK_SIZE) {
+    const end = Math.min(i + ADD_POINTS_CHUNK_SIZE, points.length);
+    const chunk = points.slice(i, end);
+    getWorker().postMessage({ type: "ADD_POINTS", points: chunk });
+  }
+}
+
+/**
+ * Fire-and-forget — listener에서 직접 호출. Promise chain capture 없이 즉시 반환.
+ * 메인 메모리에 청크 closure가 누적되지 않도록 한다.
+ */
+export function postPointsToWorker(points: TrackPoint[]): void {
+  getWorker().postMessage({ type: "ADD_POINTS", points });
 }
 
 /**
@@ -289,4 +309,22 @@ export async function queryFlightPoints(flightId: string): Promise<TrackPoint[]>
 export async function queryFlightPointsBatch(flightIds: string[]): Promise<TrackPoint[]> {
   const result = await workerSend({ type: "QUERY_FLIGHT_POINTS_BATCH", flightIds });
   return result.points;
+}
+
+// ─── TCAS RA Events ─────────────────────────────────
+
+export interface RaEventQueryParams {
+  radarName?: string;
+  selectedModeS?: string | null;
+  registeredModeS?: string[];
+  timeRange?: [number, number];
+}
+
+/**
+ * Worker에 RA 이벤트 쿼리. RA 점들을 모아 위협 매칭 + CPA 계산 → 이벤트 배열 반환.
+ * 결과 크기는 작아 청크 스트리밍 불필요(보통 < 수백 건).
+ */
+export async function queryRaEvents(params: RaEventQueryParams): Promise<{ events: import("./tcasEvents").TcasEvent[]; raPointCount: number }> {
+  const result = await workerSend({ type: "QUERY_RA_EVENTS", ...params });
+  return { events: result.events ?? [], raPointCount: result.raPointCount ?? 0 };
 }

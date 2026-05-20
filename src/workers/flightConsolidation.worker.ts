@@ -9,7 +9,16 @@
  *  - CONSOLIDATE   : 축적된 포인트로 consolidateFlights 실행, 결과를 비행 단위 청크로 반환
  *  - MANUAL_MERGE  : 선택 비행 수동 병합
  *  - BUILD_FLIGHT  : 단일 비행 구축 (소규모 데이터용)
+ *  - QUERY_RA_EVENTS: 비행 인덱스 내 RA 포인트 → TcasEvent[] 생성
  */
+
+import { decodeRaReport } from "../utils/tcasDecoder";
+import { buildTcasEvents, type RaPoint } from "../utils/tcasEvents";
+import {
+  type PointBatch, type FlightPointsSoA,
+  batchFromObjects, pointAt, modeSOf, radarNameOf, tcasRaOf,
+  unpackBatch, clearGlobalTables,
+} from "./pointSoA";
 
 // ─── 타입 (Worker 내 로컬 재선언) ───────────────────
 
@@ -24,6 +33,7 @@ interface TrackPoint {
   radar_type: string;
   raw_data?: string;
   radar_name?: string;
+  tcas_ra?: number[];
 }
 
 interface LossPoint {
@@ -130,21 +140,27 @@ const MIN_VALID_ALTITUDE_M = -100;
 const MAX_VALID_ALTITUDE_M = 20000;
 const SPIKE_DEVIATION_M = 300;
 
-// ─── 포인트 축적 버퍼 + 비행 인덱스 ─────────────────
+// ─── 포인트 축적 버퍼 + 비행 인덱스 (SoA 기반) ─────────
 
-let _pointBuffer: TrackPoint[] = [];
+/** ADD_POINTS로 누적된 SoA 청크. CONSOLIDATE 시 그룹화 후 비움. */
+let _pointBatches: PointBatch[] = [];
 
-/** 비행별 포인트 인덱스 (consolidation 완료 후 포인트 소유) */
+/** 비행별 포인트 인덱스 — points는 SoA로 보관 (consolidation 후) */
 interface FlightIndexEntry {
   flightId: string;
   modeS: string;
   radarName: string;
   startTime: number;
   endTime: number;
-  points: TrackPoint[];
+  points: FlightPointsSoA;
 }
 let _flightIndex = new Map<string, FlightIndexEntry>();
-let _consolidating = false; // 통합 중 뷰포트 쿼리가 빈 결과 반환 방지
+
+/** SoA → TrackPoint[]로 한 비행씩 unpack — 외부 함수 호출 시 사용 */
+function pointsArrayOf(entry: FlightIndexEntry): TrackPoint[] {
+  return unpackBatch(entry.points) as TrackPoint[];
+}
+
 
 // ─── Haversine 거리 계산 ────────────────────────────
 
@@ -618,23 +634,23 @@ function mergeFlightRecords(records: FlightRecord[]): FlightRecord[] {
 /** 이벤트 루프 양보 — postMessage 전달 + GC 허용 */
 const yieldWorker = () => new Promise<void>(r => setTimeout(r, 0));
 
-/** 이진탐색: timestamp >= target인 첫 인덱스 */
-function lowerBound(pts: TrackPoint[], target: number): number {
-  let lo = 0, hi = pts.length;
+/** SoA용 이진탐색: timestamp >= target인 첫 인덱스 */
+function lowerBoundSoA(soa: PointBatch, target: number): number {
+  let lo = 0, hi = soa.count;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    if (pts[mid].timestamp < target) lo = mid + 1;
+    if (soa.timestamp[mid] < target) lo = mid + 1;
     else hi = mid;
   }
   return lo;
 }
 
-/** 이진탐색: timestamp > target인 첫 인덱스 */
-function upperBound(pts: TrackPoint[], target: number): number {
-  let lo = 0, hi = pts.length;
+/** SoA용 이진탐색: timestamp > target인 첫 인덱스 */
+function upperBoundSoA(soa: PointBatch, target: number): number {
+  let lo = 0, hi = soa.count;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    if (pts[mid].timestamp <= target) lo = mid + 1;
+    if (soa.timestamp[mid] <= target) lo = mid + 1;
     else hi = mid;
   }
   return lo;
@@ -648,7 +664,7 @@ function upperBound(pts: TrackPoint[], target: number): number {
  *  2. Worker 쪽 GC가 이전 비행의 중간 데이터를 수거 가능
  */
 async function consolidateAndStream(
-  allTrackPoints: TrackPoint[],
+  sourceBatches: PointBatch[],
   flightHistory: FlightRecord[],
   aircraft: Aircraft[],
   radarSite: RadarSite,
@@ -660,32 +676,37 @@ async function consolidateAndStream(
   // 이전 인덱스 해제 (consolidateAndStream 시작 시점에서 클리어)
   _flightIndex.clear();
 
-  if (allTrackPoints.length === 0) {
+  // 총 포인트 수
+  let totalPoints = 0;
+  for (const b of sourceBatches) totalPoints += b.count;
+  if (totalPoints === 0) {
     self.postMessage({ type: "CONSOLIDATE_DONE", id: requestId, totalFlights: 0 });
     return;
   }
 
   const mergedHistory = mergeFlightRecords(flightHistory);
 
-  // 진행률 보고: 그룹핑 단계
-  const totalPoints = allTrackPoints.length;
   self.postMessage({ type: "CONSOLIDATE_PROGRESS", id: requestId, stage: "grouping", current: 0, total: totalPoints, flightsBuilt: 0 });
 
-  // mode_s + radar_name 그룹핑
-  const byModeSRadar = new Map<string, TrackPoint[]>();
-  for (let i = 0; i < allTrackPoints.length; i++) {
-    const p = allTrackPoints[i];
-    const key = `${p.mode_s.toUpperCase()}|${p.radar_name ?? ""}`;
-    let arr = byModeSRadar.get(key);
-    if (!arr) { arr = []; byModeSRadar.set(key, arr); }
-    arr.push(p);
-    if (i > 0 && i % 200_000 === 0) {
-      self.postMessage({ type: "CONSOLIDATE_PROGRESS", id: requestId, stage: "grouping", current: i, total: totalPoints, flightsBuilt: 0 });
+  // mode_s + radar_name 그룹핑 — SoA 참조(ref) 단위로 보관 (객체 생성 X).
+  // refs: { b: batchIdx, i: pointIdx } 16B/point 정도, 객체 250B 대비 메모리 절약.
+  const byModeSRadar = new Map<string, Array<{ b: number; i: number }>>();
+  let processed = 0;
+  for (let bi = 0; bi < sourceBatches.length; bi++) {
+    const batch = sourceBatches[bi];
+    for (let pi = 0; pi < batch.count; pi++) {
+      const ms = modeSOf(batch, pi).toUpperCase();
+      const rn = radarNameOf(batch, pi);
+      const key = `${ms}|${rn}`;
+      let arr = byModeSRadar.get(key);
+      if (!arr) { arr = []; byModeSRadar.set(key, arr); }
+      arr.push({ b: bi, i: pi });
+      processed++;
+      if (processed % 200_000 === 0) {
+        self.postMessage({ type: "CONSOLIDATE_PROGRESS", id: requestId, stage: "grouping", current: processed, total: totalPoints, flightsBuilt: 0 });
+      }
     }
   }
-
-  // 그룹핑 완료 → 원본 배열 참조 해제 (byModeSRadar가 포인트 소유)
-  allTrackPoints.length = 0;
 
   const aircraftByModeS = new Map<string, Aircraft>();
   for (const a of aircraft) {
@@ -697,15 +718,22 @@ async function consolidateAndStream(
   const groupKeys = Array.from(byModeSRadar.keys());
   const totalGroups = groupKeys.length;
 
-  // 진행률 보고: 비행 생성 단계
   self.postMessage({ type: "CONSOLIDATE_PROGRESS", id: requestId, stage: "building", current: 0, total: totalGroups, flightsBuilt: 0 });
 
   for (let gi = 0; gi < groupKeys.length; gi++) {
     const groupKey = groupKeys[gi];
-    const points = byModeSRadar.get(groupKey)!;
+    const refs = byModeSRadar.get(groupKey)!;
     const [modeS, radarName] = groupKey.split("|");
-    points.sort((a, b) => a.timestamp - b.timestamp);
+    // ref 정렬 (시간순)
+    refs.sort((a, b) => sourceBatches[a.b].timestamp[a.i] - sourceBatches[b.b].timestamp[b.i]);
     const ac = aircraftByModeS.get(modeS.toUpperCase());
+
+    // 이 그룹의 객체 배열 일시 unpacking (한 그룹만 — 피크 메모리 제한)
+    const points: TrackPoint[] = new Array(refs.length);
+    for (let k = 0; k < refs.length; k++) {
+      const r = refs[k];
+      points[k] = pointAt(sourceBatches[r.b], r.i) as TrackPoint;
+    }
 
     const matchingRecords = mergedHistory.filter(
       (fr) => fr.icao24.toUpperCase() === modeS.toUpperCase()
@@ -739,11 +767,12 @@ async function consolidateAndStream(
         fr.est_arrival_airport ?? undefined,
         radarName || undefined,
       );
-      // 포인트를 인덱스에 저장, 메인에는 메타만 전송
+      // flight.track_points(객체)를 SoA로 다시 패킹하여 _flightIndex에 저장
+      const soa = batchFromObjects(flight.track_points);
       _flightIndex.set(flight.id, {
         flightId: flight.id, modeS: flight.mode_s, radarName: flight.radar_name ?? "",
         startTime: flight.start_time, endTime: flight.end_time,
-        points: flight.track_points,
+        points: soa,
       });
       const { track_points: _, ...meta } = flight;
       self.postMessage({ type: "FLIGHT_CHUNK", id: requestId, flights: [{ ...meta, track_points: [] }] });
@@ -759,10 +788,11 @@ async function consolidateAndStream(
           modeS, group, radarLat, radarLon, "gap", ac?.name,
           undefined, undefined, undefined, radarName || undefined,
         );
+        const soa = batchFromObjects(flight.track_points);
         _flightIndex.set(flight.id, {
           flightId: flight.id, modeS: flight.mode_s, radarName: flight.radar_name ?? "",
           startTime: flight.start_time, endTime: flight.end_time,
-          points: flight.track_points,
+          points: soa,
         });
         const { track_points: _, ...meta } = flight;
         self.postMessage({ type: "FLIGHT_CHUNK", id: requestId, flights: [{ ...meta, track_points: [] }] });
@@ -771,12 +801,15 @@ async function consolidateAndStream(
       }
     }
 
-    // 이 그룹의 원본 포인트 참조 해제 → GC 허용
+    // 이 그룹 처리 완료 — refs/points 객체 배열 GC 허용
     byModeSRadar.delete(groupKey);
 
-    // 진행률 보고
     self.postMessage({ type: "CONSOLIDATE_PROGRESS", id: requestId, stage: "building", current: gi + 1, total: totalGroups, flightsBuilt: totalFlights });
   }
+
+  // SoA 입력 배치들도 해제
+  for (let i = 0; i < sourceBatches.length; i++) sourceBatches[i] = null as unknown as PointBatch;
+  sourceBatches.length = 0;
 
   self.postMessage({ type: "CONSOLIDATE_PROGRESS", id: requestId, stage: "done", current: totalGroups, total: totalGroups, flightsBuilt: totalFlights });
   self.postMessage({ type: "CONSOLIDATE_DONE", id: requestId, totalFlights });
@@ -804,32 +837,32 @@ self.onmessage = async (e: MessageEvent) => {
   try {
     switch (type) {
       case "ADD_POINTS": {
+        // fire-and-forget — ACK 없음. 객체 → SoA 변환 즉시, pts는 listener scope 후 GC.
         const pts: TrackPoint[] = e.data.points;
-        for (let i = 0; i < pts.length; i++) _pointBuffer.push(pts[i]);
-        self.postMessage({ type: "ADD_POINTS_ACK", id });
+        if (pts.length > 0) {
+          _pointBatches.push(batchFromObjects(pts));
+        }
         break;
       }
 
       case "CONSOLIDATE": {
         const { flightHistory, aircraft, radarSite } = e.data;
         const t0 = performance.now();
-        // _pointBuffer가 있으면 초기 통합, 비어있으면 _flightIndex에서 재통합
-        let sourcePoints: TrackPoint[];
-        if (_pointBuffer.length > 0) {
-          sourcePoints = _pointBuffer;
-          _pointBuffer = []; // 소유권 이전 (복사 없음)
+        // _pointBatches가 있으면 초기 통합, 비어있으면 _flightIndex에서 재통합 (SoA 직접 사용).
+        // consolidateAndStream은 (sourceBatches: PointBatch[]) 형태를 받음.
+        // 1) 초기 통합: _pointBatches 그대로 사용 후 클리어.
+        // 2) 재통합: 각 _flightIndex.points(SoA)를 그대로 batches 배열로 묶음.
+        let sourceBatches: PointBatch[];
+        if (_pointBatches.length > 0) {
+          sourceBatches = _pointBatches;
+          _pointBatches = [];
         } else {
-          // 재통합: _flightIndex에서 포인트 추출
-          sourcePoints = [];
+          sourceBatches = [];
           for (const entry of _flightIndex.values()) {
-            for (const p of entry.points) sourcePoints.push(p);
+            sourceBatches.push(entry.points);
           }
         }
-        // 통합 중 QUERY_VIEWPORT_POINTS에서 빈 결과를 반환하지 않도록
-        // _flightIndex 클리어를 consolidateAndStream 완료 후로 이동
-        _consolidating = true;
-        await consolidateAndStream(sourcePoints, flightHistory, aircraft, radarSite, id);
-        _consolidating = false;
+        await consolidateAndStream(sourceBatches, flightHistory, aircraft, radarSite, id);
         console.log(`[Worker] consolidateFlights: ${(performance.now() - t0).toFixed(0)}ms`);
         break;
       }
@@ -845,12 +878,16 @@ self.onmessage = async (e: MessageEvent) => {
         const { selectedFlights, flightIds, radarSite } = e.data;
         let flight: Flight;
         if (flightIds && flightIds.length > 0) {
-          // 새 방식: ID로 _flightIndex에서 포인트 수집
+          // 새 방식: ID로 _flightIndex에서 포인트 수집 (SoA → 객체)
           const allPts: TrackPoint[] = [];
           const metas: Flight[] = selectedFlights ?? [];
           for (const fid of flightIds as string[]) {
             const entry = _flightIndex.get(fid);
-            if (entry) for (const p of entry.points) allPts.push(p);
+            if (entry) {
+              for (let i = 0; i < entry.points.count; i++) {
+                allPts.push(pointAt(entry.points, i) as TrackPoint);
+              }
+            }
           }
           const sorted = [...metas].sort((a: Flight, b: Flight) => a.start_time - b.start_time);
           const modeS = sorted[0]?.mode_s ?? (allPts[0]?.mode_s ?? "");
@@ -860,12 +897,12 @@ self.onmessage = async (e: MessageEvent) => {
           const arr = [...sorted].reverse().find((f: Flight) => f.arrival_airport)?.arrival_airport;
           const rn = sorted.find((f: Flight) => f.radar_name)?.radar_name;
           flight = buildFlight(modeS, allPts, radarSite.latitude, radarSite.longitude, "manual", acName, cs, dep, arr, rn);
-          // 인덱스 업데이트: 기존 삭제 + 새 항목 추가
+          // 인덱스 업데이트: 기존 삭제 + 새 항목 추가 (SoA로 저장)
           for (const fid of flightIds as string[]) _flightIndex.delete(fid);
           _flightIndex.set(flight.id, {
             flightId: flight.id, modeS: flight.mode_s, radarName: flight.radar_name ?? "",
             startTime: flight.start_time, endTime: flight.end_time,
-            points: flight.track_points,
+            points: batchFromObjects(flight.track_points),
           });
         } else {
           // 레거시 방식: 전체 Flight 객체 전달 (호환)
@@ -878,41 +915,43 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case "CLEAR_POINTS": {
-        _pointBuffer.length = 0;
-        _pointBuffer = [];
+        _pointBatches.length = 0;
+        _pointBatches = [];
         _flightIndex.clear();
+        clearGlobalTables();
         self.postMessage({ type: "CLEAR_POINTS_ACK", id });
         break;
       }
 
       case "GET_POINT_SUMMARY": {
-        // mode_s별 카운트 + 시간 범위 요약 (경량)
+        // mode_s별 카운트 + 시간 범위 요약 (경량). SoA 직접 접근.
         const summary = new Map<string, { count: number; minTs: number; maxTs: number }>();
         let totalPts = 0;
-        // _pointBuffer 또는 _flightIndex 중 데이터가 있는 쪽 사용
-        if (_pointBuffer.length > 0) {
-          totalPts = _pointBuffer.length;
-          for (let i = 0; i < _pointBuffer.length; i++) {
-            const p = _pointBuffer[i];
-            const ms = p.mode_s.toUpperCase();
-            const prev = summary.get(ms);
-            if (!prev) {
-              summary.set(ms, { count: 1, minTs: p.timestamp, maxTs: p.timestamp });
-            } else {
-              prev.count++;
-              if (p.timestamp < prev.minTs) prev.minTs = p.timestamp;
-              if (p.timestamp > prev.maxTs) prev.maxTs = p.timestamp;
+        if (_pointBatches.length > 0) {
+          for (const b of _pointBatches) {
+            totalPts += b.count;
+            for (let i = 0; i < b.count; i++) {
+              const ms = modeSOf(b, i).toUpperCase();
+              const ts = b.timestamp[i];
+              const prev = summary.get(ms);
+              if (!prev) {
+                summary.set(ms, { count: 1, minTs: ts, maxTs: ts });
+              } else {
+                prev.count++;
+                if (ts < prev.minTs) prev.minTs = ts;
+                if (ts > prev.maxTs) prev.maxTs = ts;
+              }
             }
           }
         } else {
           for (const entry of _flightIndex.values()) {
-            totalPts += entry.points.length;
+            totalPts += entry.points.count;
             const ms = entry.modeS.toUpperCase();
             const prev = summary.get(ms);
             if (!prev) {
-              summary.set(ms, { count: entry.points.length, minTs: entry.startTime, maxTs: entry.endTime });
+              summary.set(ms, { count: entry.points.count, minTs: entry.startTime, maxTs: entry.endTime });
             } else {
-              prev.count += entry.points.length;
+              prev.count += entry.points.count;
               if (entry.startTime < prev.minTs) prev.minTs = entry.startTime;
               if (entry.endTime > prev.maxTs) prev.maxTs = entry.endTime;
             }
@@ -957,28 +996,25 @@ self.onmessage = async (e: MessageEvent) => {
           return true;
         };
 
-        // 전체 포인트 전송 (샘플링 없음)
+        // SoA에서 직접 범위 이진탐색 후 청크 단위로 객체 unpacking
         for (const entry of _flightIndex.values()) {
           if (!matchesFilter(entry)) continue;
-          const pts = entry.points;
+          const soa = entry.points;
+          let lo = 0;
+          let hi = soa.count;
           if (timeRange) {
             const [tMin, tMax] = timeRange as [number, number];
             if (entry.endTime < tMin || entry.startTime > tMax) continue;
-            let lo = lowerBound(pts, tMin);
-            let hi = upperBound(pts, tMax);
+            lo = lowerBoundSoA(soa, tMin);
+            hi = upperBoundSoA(soa, tMax);
             if (paddingPoints) {
               if (lo > 0) lo--;
-              if (hi < pts.length) hi++;
+              if (hi < soa.count) hi++;
             }
-            for (let i = lo; i < hi; i++) {
-              chunk.push(pts[i]);
-              if (chunk.length >= CHUNK_SIZE) flushChunk();
-            }
-          } else {
-            for (let i = 0; i < pts.length; i++) {
-              chunk.push(pts[i]);
-              if (chunk.length >= CHUNK_SIZE) flushChunk();
-            }
+          }
+          for (let i = lo; i < hi; i++) {
+            chunk.push(pointAt(soa, i) as TrackPoint);
+            if (chunk.length >= CHUNK_SIZE) flushChunk();
           }
         }
         flushChunk();
@@ -988,10 +1024,8 @@ self.onmessage = async (e: MessageEvent) => {
 
       case "QUERY_FLIGHT_POINTS": {
         const entry = _flightIndex.get(e.data.flightId as string);
-        self.postMessage({
-          type: "QUERY_FLIGHT_POINTS_RESULT", id,
-          points: entry ? entry.points : [],
-        });
+        const points: TrackPoint[] = entry ? pointsArrayOf(entry) : [];
+        self.postMessage({ type: "QUERY_FLIGHT_POINTS_RESULT", id, points });
         break;
       }
 
@@ -1000,10 +1034,64 @@ self.onmessage = async (e: MessageEvent) => {
         const allPts: TrackPoint[] = [];
         for (const fid of batchIds) {
           const entry = _flightIndex.get(fid);
-          if (entry) for (const p of entry.points) allPts.push(p);
+          if (entry) {
+            for (let i = 0; i < entry.points.count; i++) {
+              allPts.push(pointAt(entry.points, i) as TrackPoint);
+            }
+          }
         }
         allPts.sort((a, b) => a.timestamp - b.timestamp);
         self.postMessage({ type: "QUERY_FLIGHT_POINTS_BATCH_RESULT", id, points: allPts });
+        break;
+      }
+
+      case "QUERY_RA_EVENTS": {
+        const { radarName, selectedModeS, registeredModeS, timeRange } = e.data;
+        // 필터 매칭 — viewport 쿼리와 동일 규칙
+        const matchesFilter = (entry: FlightIndexEntry): boolean => {
+          if (radarName && entry.radarName && entry.radarName !== radarName) return false;
+          if (selectedModeS !== undefined && selectedModeS !== "__ALL__") {
+            if (selectedModeS === null) {
+              if (!registeredModeS || !(registeredModeS as string[]).includes(entry.modeS.toUpperCase())) return false;
+            } else {
+              if (entry.modeS.toUpperCase() !== selectedModeS.toUpperCase()) return false;
+            }
+          }
+          return true;
+        };
+
+        // RA 포인트를 mode_s별로 수집 (SoA 직접 접근). 위협 매칭/궤적 lookup 없음 — 데이터-only.
+        const raPointsByMs = new Map<string, RaPoint[]>();
+        const tMin = timeRange ? (timeRange as [number, number])[0] : -Infinity;
+        const tMax = timeRange ? (timeRange as [number, number])[1] : Infinity;
+
+        let scanned = 0;
+        for (const entry of _flightIndex.values()) {
+          if (!matchesFilter(entry)) continue;
+          if (entry.endTime < tMin || entry.startTime > tMax) continue;
+
+          const soa = entry.points;
+          for (let i = 0; i < soa.count; i++) {
+            const blob = tcasRaOf(soa, i);
+            if (!blob) continue;
+            const ts = soa.timestamp[i];
+            if (ts < tMin || ts > tMax) continue;
+            const raBytes = [blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6]];
+            const decoded = decodeRaReport(raBytes);
+            if (!decoded || !decoded.hasRa) continue;
+            let arr = raPointsByMs.get(entry.modeS);
+            if (!arr) { arr = []; raPointsByMs.set(entry.modeS, arr); }
+            arr.push({ ts, lat: soa.latitude[i], lon: soa.longitude[i], altM: soa.altitude[i], decoded, rawBytes: raBytes });
+            scanned++;
+            if (scanned % 10000 === 0) {
+              await yieldWorker();
+            }
+          }
+        }
+
+        const events = buildTcasEvents(raPointsByMs);
+
+        self.postMessage({ type: "QUERY_RA_EVENTS_RESULT", id, events, raPointCount: scanned });
         break;
       }
 

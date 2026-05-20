@@ -10,7 +10,7 @@ import { ToastContainer } from "../components/common/Toast";
 import SourceOverlay from "../dev/SourceOverlay";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import {
-  sendPointsToWorker, startConsolidate, getPointSummary,
+  postPointsToWorker, startConsolidate, getPointSummary,
   createThrottledChunkHandler, setConsolidationProgressCallback,
 } from "../utils/flightConsolidationWorker";
 import type { Aircraft, RadarSite, TrackPoint } from "../types";
@@ -78,12 +78,14 @@ function useAssFilePicker() {
 
     const site = useAppStore.getState().radarSite;
 
-    // 배치 파싱 이벤트 리스너
-    const pointChunks: TrackPoint[] = [];
+    // 배치 파싱 이벤트 리스너 — 청크를 즉시 Worker로 fire-and-forget.
+    // listener scope 종료 후 pts는 GC 가능 (closure capture 없음).
+    let totalForwarded = 0;
     const unlisten = await listen<{ points: TrackPoint[] }>("parse-points-chunk", (event) => {
       const pts = event.payload.points;
       for (const p of pts) p.radar_name = site.name;
-      pointChunks.push(...pts);
+      totalForwarded += pts.length;
+      postPointsToWorker(pts);
     });
 
     try {
@@ -102,9 +104,7 @@ function useAssFilePicker() {
 
     unlisten();
 
-    // Worker에 포인트 전송
-    if (pointChunks.length > 0) {
-      await sendPointsToWorker(pointChunks);
+    if (totalForwarded > 0) {
       const summary = await getPointSummary();
       useAppStore.setState({
         workerPointCount: summary.totalPoints,

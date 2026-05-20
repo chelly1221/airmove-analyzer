@@ -92,6 +92,10 @@ struct Cat048Record {
     radar_typ: u8,
     sim_flag: bool,
     track_number: Option<u16>,
+    /// I048/260 ACAS RA Report (7바이트) — 있을 때만
+    acas_ra_report: Option<[u8; 7]>,
+    /// I048/250 Mode-S MB 블록 중 BDS 3,0 (ACAS Active RA) 의 7바이트 페이로드
+    bds30_mb: Option<[u8; 7]>,
 }
 
 /// 유령 표적 탐지용 추가 데이터 (극좌표 + Track Number)
@@ -779,6 +783,12 @@ fn classify_and_convert(
         _ => String::new(), // Mode-S 없는 ATCRBS 레코드
     };
 
+    // TCAS RA 페이로드: I260 우선, 없으면 I250 BDS 3,0
+    let tcas_ra = record
+        .acas_ra_report
+        .or(record.bds30_mb)
+        .map(|b| b.to_vec());
+
     let point = TrackPoint {
         timestamp,
         mode_s: if mode_s.is_empty() { "NO_MODES".to_string() } else { mode_s.clone() },
@@ -789,6 +799,7 @@ fn classify_and_convert(
         heading,
         radar_type: radar_type.clone(),
         raw_data: Vec::new(),
+        tcas_ra,
     };
 
     if radar_type.is_atcrbs() && mode_s.is_empty() {
@@ -1460,11 +1471,25 @@ fn parse_cat048_record(
             }
 
             UAP_I250 => {
+                // I048/250 Mode-S MB Data: REP × 8바이트.
+                // 각 8바이트의 byte 8 상위 4비트 = BDS1, 하위 4비트 = BDS2.
+                // BDS 3,0 (ACAS Active RA) 발견 시 앞 7바이트를 보관.
                 if pos >= block.len() { truncated = true; break; }
                 let rep = block[pos] as usize;
                 pos += 1;
                 let mb_size = rep.saturating_mul(8);
                 if pos + mb_size > block.len() { truncated = true; break; }
+                for i in 0..rep {
+                    let off = pos + i * 8;
+                    let bds_byte = block[off + 7];
+                    let bds1 = (bds_byte >> 4) & 0x0F;
+                    let bds2 = bds_byte & 0x0F;
+                    if bds1 == 3 && bds2 == 0 {
+                        let mut buf = [0u8; 7];
+                        buf.copy_from_slice(&block[off..off + 7]);
+                        record.bds30_mb = Some(buf);
+                    }
+                }
                 pos += mb_size;
             }
 
@@ -1562,7 +1587,11 @@ fn parse_cat048_record(
             }
 
             UAP_I260 => {
+                // I048/260 ACAS Resolution Advisory Report: 7바이트 고정.
                 if pos + 7 > block.len() { truncated = true; break; }
+                let mut buf = [0u8; 7];
+                buf.copy_from_slice(&block[pos..pos + 7]);
+                record.acas_ra_report = Some(buf);
                 pos += 7;
             }
 
