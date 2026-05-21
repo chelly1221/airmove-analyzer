@@ -936,13 +936,13 @@ pub fn parse_ass_file(
     // 날짜에 걸친다(예: 23:5x 시작 파일 → D/D+1/D+2 3일).
     // 단일 날짜 고정 시 자정 이후 프레임 미인식 → nec_kst 고정 → NEC↔TOD 교차검증이
     // 자정 이후 레코드를 전부 폐기하던 버그 수정.
-    let valid_dates: Vec<(u8, u8)> = if let Some((m, d)) = nec {
+    let valid_dates: Vec<(i64, u8, u8)> = if let Some((m, d)) = nec {
         let year: i64 = extract_date_from_filename(path)
             .and_then(|s| s.get(0..4).and_then(|y| y.parse::<i64>().ok()))
             .unwrap_or(2026);
         let (y1, m1, d1) = next_day(year, m, d);
-        let (_y2, m2, d2) = next_day(y1, m1, d1);
-        vec![(m, d), (m1, d1), (m2, d2)]
+        let (y2, m2, d2) = next_day(y1, m1, d1);
+        vec![(year, m, d), (y1, m1, d1), (y2, m2, d2)]
     } else {
         Vec::new()
     };
@@ -980,6 +980,8 @@ pub fn parse_ass_file(
     // NEC 프레임 시각 추적 (KST hour/minute → UTC TOD 교차검증용)
     let mut nec_kst_hour: Option<u8> = None;
     let mut nec_kst_min: Option<u8> = None;
+    // 직전 NEC 프레임의 절대 UTC 시각(초) — per-record day_offset 산정 기준
+    let mut nec_frame_utc_abs: Option<f64> = None;
 
     /// NEC↔TOD 교차검증: NEC KST 시각에서 예상 UTC TOD를 계산하고,
     /// ASTERIX I140 TOD와 비교. 허용 오차 이상이면 오염 레코드로 판정.
@@ -996,9 +998,25 @@ pub fn parse_ass_file(
     while offset < data.len() {
         // Check for NEC frame header (5 bytes: month, day, hour, minute, counter)
         if !valid_dates.is_empty() && is_nec_frame(&data, offset, &valid_dates) {
+            let fm = data[offset];
+            let fd = data[offset + 1];
+            let fh = data[offset + 2];
+            let fmin = data[offset + 3];
             // NEC 프레임 시각 갱신 (KST)
-            nec_kst_hour = Some(data[offset + 2]);
-            nec_kst_min = Some(data[offset + 3]);
+            nec_kst_hour = Some(fh);
+            nec_kst_min = Some(fmin);
+            // 프레임 절대 UTC 시각 (KST 벽시계 - 9h). 매칭된 날짜의 연도 사용.
+            let fyear = valid_dates
+                .iter()
+                .find(|&&(_, m, d)| m == fm && d == fd)
+                .map(|&(y, _, _)| y)
+                .unwrap_or(2026);
+            nec_frame_utc_abs = Some(
+                days_from_epoch(fyear, fm as u32, fd as u32) as f64 * 86400.0
+                    + fh as f64 * 3600.0
+                    + fmin as f64 * 60.0
+                    - 9.0 * 3600.0,
+            );
             offset += 5;
             continue;
         }
@@ -1053,18 +1071,13 @@ pub fn parse_ass_file(
                                 }
                             }
 
-                            // 파일명 기반 per-record 날짜 결정:
-                            // TOD가 파일명 시작 TOD보다 충분히 작으면 → 다음 날 데이터
-                            // (자정 교차를 순차 추적하지 않으므로 인터리빙/불량 데이터에 강건)
-                            let day_offset = if let (Some(tod), Some(st)) = (record.time_of_day, start_tod) {
-                                if tod < st - 300.0 {
-                                    86400.0 // 시작 TOD보다 5분 이상 이전 → 다음 날
-                                } else {
-                                    0.0
-                                }
-                            } else {
-                                0.0
-                            };
+                            // per-record 날짜(day_offset) 결정 (compute_day_offset 참고).
+                            let day_offset = compute_day_offset(
+                                record.time_of_day,
+                                nec_frame_utc_abs,
+                                base_date_secs,
+                                start_tod,
+                            );
 
                             // TCAS 보고 전수 추출 (트랙 독립 — discard와 무관)
                             extract_tcas_reports(
@@ -1283,13 +1296,13 @@ fn detect_nec_frame(data: &[u8]) -> Option<(u8, u8)> {
 /// 검출 날짜 D와 다음 2일(D+1, D+2) 중 하나에 해당하면 인식한다(자정 교차 대응).
 /// 시(0-23)/분(0-59)이 유효하고, 5바이트 프레임 뒤 바이트가 알려진 ASTERIX 카테고리이거나
 /// 다음 프레임의 월 바이트인지 확인한다.
-fn is_nec_frame(data: &[u8], offset: usize, valid_dates: &[(u8, u8)]) -> bool {
+fn is_nec_frame(data: &[u8], offset: usize, valid_dates: &[(i64, u8, u8)]) -> bool {
     if offset + 5 > data.len() {
         return false;
     }
     let mo = data[offset];
     let dy = data[offset + 1];
-    if !valid_dates.iter().any(|&(m, d)| m == mo && d == dy) {
+    if !valid_dates.iter().any(|&(_, m, d)| m == mo && d == dy) {
         return false;
     }
     if data[offset + 2] > 23 || data[offset + 3] > 59 {
@@ -1303,7 +1316,7 @@ fn is_nec_frame(data: &[u8], offset: usize, valid_dates: &[(u8, u8)]) -> bool {
     after == CAT048
         || after == CAT034
         || after == CAT008
-        || valid_dates.iter().any(|&(m, _)| after == m)
+        || valid_dates.iter().any(|&(_, m, _)| after == m)
 }
 
 /// 윤년 판정 (그레고리력)
@@ -1329,6 +1342,42 @@ fn next_day(year: i64, month: u8, day: u8) -> (i64, u8, u8) {
         (year, month + 1, 1)
     } else {
         (year + 1, 1, 1)
+    }
+}
+
+/// per-record day_offset(초) 산정.
+///
+/// 직전 NEC 프레임의 절대 UTC 시각(`frame_abs`)으로 정확히 산정한다:
+///   `k = round((frame_abs - tod - base) / 86400)`,  `day_offset = k * 86400`
+/// 이렇게 하면 >24h 녹화에서 시작 TOD를 다시 지나치는 꼬리 구간(다음날 데이터가
+/// 시작 TOD보다 큰 TOD를 갖는 구간)도 올바른 날짜에 배치된다. 프레임 시각은 초당
+/// 수십 회 갱신되고 NEC↔TOD 교차검증(±10분)을 이미 통과하므로 record당 독립 계산이라
+/// 인터리빙/불량 데이터에 강건하다.
+///
+/// 프레임 또는 base 날짜가 없으면 파일명 시작 TOD 기반 폴백(시작 TOD보다 5분 이상
+/// 이전 TOD → 다음 날)을 사용한다.
+fn compute_day_offset(
+    tod: Option<f64>,
+    frame_abs: Option<f64>,
+    base_date_secs: f64,
+    start_tod: Option<f64>,
+) -> f64 {
+    match (tod, frame_abs) {
+        (Some(tod), Some(frame_abs)) if base_date_secs > 0.0 => {
+            let k = ((frame_abs - tod - base_date_secs) / 86400.0).round();
+            k.max(0.0) * 86400.0
+        }
+        _ => {
+            if let (Some(tod), Some(st)) = (tod, start_tod) {
+                if tod < st - 300.0 {
+                    86400.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        }
     }
 }
 
@@ -1791,6 +1840,10 @@ mod tests {
     fn test_gimpo_210209_simultaneous_tracks() {
         let path = r"C:\Users\chell\OneDrive\바탕 화면\gimpo_210209_1352.ass";
         let filename = "gimpo_210209_1352.ass";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip: 데이터 파일 없음: {}", path);
+            return;
+        }
 
         let ts_to_date = |ts: f64| -> String {
             let days = (ts / 86400.0).floor() as i64;
@@ -1978,6 +2031,10 @@ mod tests {
         // 자정(KST) 교차 회귀 방지: is_nec_frame 날짜 윈도우 수정 전에는 자정 이후
         // 레코드가 NEC↔TOD 교차검증에서 폐기되어 ~14h만 커버됐다. 수정 후 전체 구간 커버.
         let path = r"C:\Users\chell\OneDrive\바탕 화면\1Data\gimpo_260201_0957.ass";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip: 데이터 파일 없음: {}", path);
+            return;
+        }
         let parsed = parse_ass_file(path, 37.5585, 126.7908, &[], &[], &[], &[], -8.5, |_| {}).unwrap();
         let first = parsed.track_points.first().unwrap().timestamp;
         let last = parsed.track_points.last().unwrap().timestamp;
@@ -1985,6 +2042,40 @@ mod tests {
         eprintln!("points={} dur={:.2}h first={:.0} last={:.0}",
             parsed.track_points.len(), dur_h, first, last);
         assert!(dur_h > 23.0, "자정 교차 후에도 전체 구간이 파싱되어야 함, got {:.2}h", dur_h);
+    }
+
+    #[test]
+    fn test_compute_day_offset_frame_anchored() {
+        // base = Feb1 00:00 UTC, 시작 09:57 KST(=00:57 UTC, start_tod=3420)
+        let base = days_from_epoch(2026, 2, 1) as f64 * 86400.0;
+        let start_tod = Some(3420.0);
+        // 프레임 절대 UTC = days_from_epoch(KST date) - 9h
+        let frame_abs = |y, m, d, h, mi: f64| {
+            days_from_epoch(y, m, d) as f64 * 86400.0 + h as f64 * 3600.0 + mi * 60.0 - 9.0 * 3600.0
+        };
+
+        // 1일차 정상: KST Feb1 12:00 = 03:00 UTC (tod=10800) → offset 0
+        let off = compute_day_offset(Some(10800.0), Some(frame_abs(2026, 2, 1, 12, 0.0)), base, start_tod);
+        assert_eq!(off, 0.0);
+
+        // KST Feb2지만 UTC는 아직 Feb1: KST Feb2 02:00 = 17:00 UTC (tod=61200) → offset 0
+        let off = compute_day_offset(Some(61200.0), Some(frame_abs(2026, 2, 2, 2, 0.0)), base, start_tod);
+        assert_eq!(off, 0.0);
+
+        // 꼬리 구간(핵심): KST Feb2 10:30 = Feb2 01:30 UTC (tod=5400) → offset +86400
+        // 예전 폴백 로직은 tod(5400) >= start_tod-300 이라 0으로 잘못 배치하던 케이스.
+        let off = compute_day_offset(Some(5400.0), Some(frame_abs(2026, 2, 2, 10, 30.0)), base, start_tod);
+        assert_eq!(off, 86400.0);
+
+        // 자정 직후: KST Feb2 09:00 = Feb2 00:00 UTC (tod=0) → offset +86400
+        let off = compute_day_offset(Some(0.0), Some(frame_abs(2026, 2, 2, 9, 0.0)), base, start_tod);
+        assert_eq!(off, 86400.0);
+
+        // 프레임 미가용 → 폴백(start_tod): tod < start_tod-300 → 다음 날
+        assert_eq!(compute_day_offset(Some(100.0), None, base, start_tod), 86400.0);
+        assert_eq!(compute_day_offset(Some(10800.0), None, base, start_tod), 0.0);
+        // base 없음(파일명 실패) → 0
+        assert_eq!(compute_day_offset(Some(100.0), Some(frame_abs(2026, 2, 2, 9, 0.0)), 0.0, None), 0.0);
     }
 
     #[test]
@@ -2006,7 +2097,7 @@ mod tests {
     #[test]
     fn test_is_nec_frame_accepts_date_window() {
         // 검출 날짜 D=2/24, 윈도우 = [2/24, 2/25, 2/26] (23:5x 시작 파일이 3일에 걸침)
-        let valid_dates = vec![(2u8, 24u8), (2, 25), (2, 26)];
+        let valid_dates = vec![(2026i64, 2u8, 24u8), (2026, 2, 25), (2026, 2, 26)];
         // [월][일][시][분][카운터][CAT][len_hi][len_lo]
         let mk = |m, d, h, mi| vec![m, d, h, mi, 0x00, CAT048, 0x00, 0x10];
 
