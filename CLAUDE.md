@@ -93,7 +93,7 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 
 ### 기존 Worker 참고
 - `src/workers/flightConsolidation.worker.ts` — 비행 통합 + 뷰포트 쿼리
-- `src/workers/coverageBuilder.worker.ts` — 커버리지 맵 빌드
+- `src/workers/gpuCoverage.worker.ts` — 커버리지 맵 빌드 (WebGPU)
 - `src/utils/flightConsolidationWorker.ts` — Worker 래퍼 (콜백 스트리밍 패턴)
 
 ## 코딩 컨벤션
