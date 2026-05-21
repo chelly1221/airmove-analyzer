@@ -19,7 +19,7 @@
  */
 
 export interface TcasRaDecoded {
-  /** ARA 비트가 하나라도 set 되었는지 */
+  /** 실제 RA 여부 (corrective/RAC/TTI/RAT/MTE 중 하나라도 — 유휴 30000000 패턴 제외) */
   hasRa: boolean;
   /** ARA 14비트 raw 값 (bits 1–14, bit 1 = MSB) */
   ara: number;
@@ -117,57 +117,9 @@ function describeRa(ara: number, rac: number, rat: boolean): string {
   return racParts.length > 0 ? `${main}, ${racParts.join(", ")}` : main;
 }
 
-// ─── BDS 1,6 (ACAS Coordination Reply) 디코더 ─────────
-//
-// 표준: ICAO Annex 10 Vol IV / DO-185B.
-// 일반적으로 BDS 1,6은 BDS 3,0과 매우 유사한 비트 구조를 가지나, 정확한 매핑은
-// 일부 자료에서 차이가 있다. 본 디코더는 BDS 3,0과 동일한 비트 매핑(ARA bits 1-14
-// / RAC 15-18 / RAT 19 / MTE 20 / TTI 21-22 / TID 23-56)을 적용하되, ICAO에서
-// 정의된 추가 필드(VDS/MTB 등)는 사용 데이터에서 확정 후 보강 예정. 우선 raw 7바이트
-// 와 공통 필드만 제공.
-
-export interface TcasCoordDecoded {
-  /** ARA 비트가 하나라도 set 되었는지 */
-  hasRa: boolean;
-  ara: number;
-  rac: number;
-  rat: boolean;
-  mte: boolean;
-  tti: 0 | 1 | 2 | 3;
-  threatModeS?: string;
-  description: string;
-  /** raw 7바이트 hex */
-  rawHex: string;
-}
-
-export function decodeCoordReply(bytes: number[] | undefined | null): TcasCoordDecoded | null {
-  if (!bytes || bytes.length < 7) return null;
-  let allZero = true;
-  for (let i = 0; i < 7; i++) if (bytes[i] !== 0) { allZero = false; break; }
-  if (allZero) return null;
-
-  const ara = readBits(bytes, 1, 14);
-  const rac = readBits(bytes, 15, 18);
-  const rat = bitSet(bytes, 19);
-  const mte = bitSet(bytes, 20);
-  const tti = readBits(bytes, 21, 22) as 0 | 1 | 2 | 3;
-
-  let threatModeS: string | undefined;
-  if (tti === 1) {
-    const addr = readBits(bytes, 23, 46);
-    if (addr > 0) threatModeS = addr.toString(16).toUpperCase().padStart(6, "0");
-  }
-
-  const rawHex = bytes.slice(0, 7).map((b) => b.toString(16).padStart(2, "0")).join("");
-
-  return {
-    hasRa: ara !== 0 || rac !== 0,
-    ara, rac, rat, mte, tti,
-    threatModeS,
-    description: describeRa(ara, rac, rat),
-    rawHex,
-  };
-}
+// 협의(Coordination)는 별도 BDS 1,6 레지스터가 아니라 BDS 3,0의 RAC/MTE 필드에 들어온다
+// (지상 SSR은 공대공 BDS 1,6을 다운링크하지 않음 — 실데이터 전수 검증). 따라서 별도
+// decodeCoordReply 없이 decodeRaReport 결과의 RAC≠0 / MTE 로 협의를 판정한다(tcasEvents.ts).
 
 /**
  * 7바이트 BDS 3,0 페이로드를 디코드. null = 모든 바이트가 0(공 RA).
@@ -185,8 +137,14 @@ export function decodeRaReport(bytes: number[] | undefined | null): TcasRaDecode
   const mte = bitSet(bytes, 20);
   const tti = readBits(bytes, 21, 22) as 0 | 1 | 2 | 3;
 
+  // 실제 RA 판정: corrective advisory(ARA bit 1) / 협의 보충(RAC) / 위협 정보(TTI) /
+  // 종료(RAT) / 다중 위협(MTE) 중 하나라도 있어야 함.
+  // `30 00 00 00 00 00 00` 같은 트랜스폰더 유휴 패턴(ara=0x0C00, 나머지 0)은 RA 아님 — 과탐 방지.
+  const corrective = ((ara >> 13) & 1) === 1;
+  const hasRa = corrective || rac !== 0 || tti !== 0 || rat || mte;
+
   const decoded: TcasRaDecoded = {
-    hasRa: ara !== 0 || rac !== 0,
+    hasRa,
     ara, rac, rat, mte, tti,
     description: describeRa(ara, rac, rat),
   };

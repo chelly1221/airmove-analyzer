@@ -9,7 +9,7 @@
  */
 
 import type { TcasReport } from "../types/track";
-import { decodeRaReport, decodeCoordReply, type TcasRaDecoded, type TcasCoordDecoded } from "./tcasDecoder";
+import { decodeRaReport, type TcasRaDecoded } from "./tcasDecoder";
 
 const M_PER_FT = 0.3048;
 const GROUP_GAP_SECS = 10;
@@ -21,16 +21,6 @@ interface RaPoint {
   altM: number | null;
   estimated: boolean;
   decoded: TcasRaDecoded;
-  rawBytes: number[];
-}
-
-interface CoordPoint {
-  ts: number;
-  lat: number | null;
-  lon: number | null;
-  altM: number | null;
-  estimated: boolean;
-  decoded: TcasCoordDecoded;
   rawBytes: number[];
 }
 
@@ -137,7 +127,7 @@ function buildRaEvents(byMs: Map<string, RaPoint[]>): TcasEvent[] {
   return events;
 }
 
-function buildCoordEventsInner(byMs: Map<string, CoordPoint[]>): CoordEvent[] {
+function buildCoordEventsInner(byMs: Map<string, RaPoint[]>): CoordEvent[] {
   const events: CoordEvent[] = [];
   for (const [modeS, points] of byMs.entries()) {
     if (points.length === 0) continue;
@@ -185,34 +175,35 @@ function buildCoordEventsInner(byMs: Map<string, CoordPoint[]>): CoordEvent[] {
 
 /**
  * TcasReport[] → { raEvents, coordEvents }.
- * source 0/1 = RA (BDS 3,0 / I260), source 2 = Coordination (BDS 1,6).
+ *
+ * 모든 보고를 BDS 3,0 동일 비트 매핑으로 디코드한다(I260/BDS3,0; 지상 SSR에 BDS1,6은
+ * 미수록 — 실데이터 전수 검증). 협의는 별도 레지스터가 아니라 RA의 **RAC(협의 보충)≠0
+ * 또는 MTE(다중 위협)** 로 판정한다. 협의 RA는 RA 탭과 협의 탭 양쪽에 나타난다(협의는
+ * RA의 속성). 유휴 패턴(`30000000` 등 비-RA)은 decodeRaReport의 hasRa로 걸러진다.
  */
 export function buildEventsFromReports(reports: TcasReport[]): {
   raEvents: TcasEvent[];
   coordEvents: CoordEvent[];
 } {
   const raByMs = new Map<string, RaPoint[]>();
-  const coordByMs = new Map<string, CoordPoint[]>();
+  const coordByMs = new Map<string, RaPoint[]>();
 
   for (const r of reports) {
-    if (r.source === 2) {
-      const decoded = decodeCoordReply(r.payload);
-      if (!decoded || !decoded.hasRa) continue;
-      let arr = coordByMs.get(r.mode_s);
-      if (!arr) { arr = []; coordByMs.set(r.mode_s, arr); }
-      arr.push({
-        ts: r.timestamp, lat: r.latitude, lon: r.longitude, altM: r.altitude,
-        estimated: r.time_estimated, decoded, rawBytes: r.payload,
-      });
-    } else {
-      const decoded = decodeRaReport(r.payload);
-      if (!decoded || !decoded.hasRa) continue;
-      let arr = raByMs.get(r.mode_s);
-      if (!arr) { arr = []; raByMs.set(r.mode_s, arr); }
-      arr.push({
-        ts: r.timestamp, lat: r.latitude, lon: r.longitude, altM: r.altitude,
-        estimated: r.time_estimated, decoded, rawBytes: r.payload,
-      });
+    const decoded = decodeRaReport(r.payload);
+    if (!decoded || !decoded.hasRa) continue; // 유휴/비-RA 제외
+    const pt: RaPoint = {
+      ts: r.timestamp, lat: r.latitude, lon: r.longitude, altM: r.altitude,
+      estimated: r.time_estimated, decoded, rawBytes: r.payload,
+    };
+    // RA 탭: 실제 RA 전부
+    let raArr = raByMs.get(r.mode_s);
+    if (!raArr) { raArr = []; raByMs.set(r.mode_s, raArr); }
+    raArr.push(pt);
+    // 협의 탭: 상대기와 협의된 회피 — RAC(협의 보충)≠0 또는 MTE(다중 위협)
+    if (decoded.rac !== 0 || decoded.mte) {
+      let coArr = coordByMs.get(r.mode_s);
+      if (!coArr) { coArr = []; coordByMs.set(r.mode_s, coArr); }
+      coArr.push(pt);
     }
   }
 

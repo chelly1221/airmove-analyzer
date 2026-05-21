@@ -235,9 +235,9 @@ export default function AcasAnalysis() {
               className={`px-4 py-2 text-[12px] font-medium border-b-2 -mb-px ${tab === "ra" ? "border-[#a60739] text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"}`}>
               RA 보고 (BDS 3,0) · {raEvents.length}
             </button>
-            <button onClick={() => setTab("coord")} title="BDS 1,6 — TCAS↔TCAS 협의 메시지 (BDS 3,0과 동일 매핑 가정)"
+            <button onClick={() => setTab("coord")} title="협의 — RA 중 RAC(협의 보충)≠0 또는 MTE(다중 위협). BDS 3,0에서 도출(별도 BDS 1,6 미수록)"
               className={`px-4 py-2 text-[12px] font-medium border-b-2 -mb-px ${tab === "coord" ? "border-[#a60739] text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"}`}>
-              협의 (BDS 1,6) · {coordEvents.length}
+              협의 (RAC/MTE) · {coordEvents.length}
             </button>
           </div>
 
@@ -401,7 +401,7 @@ export default function AcasAnalysis() {
 
       {/* RAW 상세 모달 */}
       {detailEv && (
-        <Modal open={true} onClose={() => setDetailEv(null)} title={detailKind === "ra" ? "RA 상세 (BDS 3,0)" : "협의 상세 (BDS 1,6)"} width="max-w-md">
+        <Modal open={true} onClose={() => setDetailEv(null)} title={detailKind === "ra" ? "RA 상세 (BDS 3,0)" : "협의 상세 (BDS 3,0 · RAC/MTE)"} width="max-w-md">
           <div className="space-y-3 text-[11px]">
             <div>
               <div className="text-gray-500 mb-1">시각 ({tz}) · Own</div>
@@ -411,7 +411,7 @@ export default function AcasAnalysis() {
               </div>
             </div>
             <div>
-              <div className="text-gray-500 mb-1">{detailKind === "ra" ? "BDS 3,0" : "BDS 1,6"} raw 페이로드 (7바이트)</div>
+              <div className="text-gray-500 mb-1">BDS 3,0 raw 페이로드 (7바이트)</div>
               <div className="rounded bg-gray-50 border border-gray-200 px-2 py-1.5 font-mono text-gray-800 break-all">{detailEv.rawHex.match(/.{2}/g)?.join(" ")}</div>
             </div>
             <div className="grid grid-cols-2 gap-2">
@@ -438,7 +438,7 @@ export default function AcasAnalysis() {
               </div>
             )}
             {detailKind === "coord" && (
-              <div className="text-[10px] text-gray-500 border-t border-gray-100 pt-2">참고: BDS 1,6의 정확한 비트 매핑은 표준에 따라 다를 수 있어 BDS 3,0과 동일 매핑을 가정한 결과입니다.</div>
+              <div className="text-[10px] text-gray-500 border-t border-gray-100 pt-2">참고: 협의는 별도 BDS 1,6 메시지가 아니라 이 RA(BDS 3,0)의 RAC(협의 보충)≠0 또는 MTE(다중 위협)로 판정합니다. 지상 SSR은 공대공 BDS 1,6을 다운링크하지 않습니다.</div>
             )}
           </div>
         </Modal>
