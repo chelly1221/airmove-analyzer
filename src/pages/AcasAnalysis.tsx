@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
-import { ArrowUp, ArrowDown, Search, Info, ShieldAlert } from "lucide-react";
+import { ArrowUp, ArrowDown, Search, Info, ShieldAlert, Clock, ChevronDown, ChevronUp, X } from "lucide-react";
 import Modal from "../components/common/Modal";
+import DateRangePicker from "../components/common/DateRangePicker";
 import { useAppStore } from "../store";
 import { buildEventsFromReports, type TcasEvent, type CoordEvent } from "../utils/tcasEvents";
 import type { Flight } from "../types";
@@ -11,7 +12,7 @@ const KST_OFFSET_SECS = 9 * 3600;
 
 type SortKey =
   | "startTime" | "ownLabel" | "ownAltFt" | "tti" | "threatLabel"
-  | "raDescription" | "raKind" | "threatRangeNm" | "threatBearingDeg"
+  | "raDescription" | "action" | "direction" | "threatRangeNm" | "threatBearingDeg"
   | "threatAltFt" | "duration" | "pointCount";
 
 function formatTime(ts: number, tz: TzMode): string {
@@ -30,15 +31,6 @@ function dtLocalToTs(s: string, tz: TzMode): number | null {
   if (!m) return null;
   const utcMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
   return (utcMs - (tz === "KST" ? KST_OFFSET_SECS * 1000 : 0)) / 1000;
-}
-function tsToDtLocal(ts: number, tz: TzMode): string {
-  const d = new Date((ts + (tz === "KST" ? KST_OFFSET_SECS : 0)) * 1000);
-  const yy = d.getUTCFullYear();
-  const MM = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mm = String(d.getUTCMinutes()).padStart(2, "0");
-  return `${yy}-${MM}-${dd}T${hh}:${mm}`;
 }
 function labelFor(modeS: string | undefined, flights: Flight[]): string {
   if (!modeS || modeS === "NO_MODES") return modeS ?? "—";
@@ -78,18 +70,12 @@ export default function AcasAnalysis() {
   const [sortDesc, setSortDesc] = useState(false);
   const [detailEv, setDetailEv] = useState<TcasEvent | CoordEvent | null>(null);
   const [detailKind, setDetailKind] = useState<TabId>("ra");
+  const [dateOpen, setDateOpen] = useState(false);
 
   const toggleSort = useCallback((k: SortKey) => {
     if (sortKey === k) setSortDesc((d) => !d);
     else { setSortKey(k); setSortDesc(k === "threatRangeNm" || k === "threatAltFt" ? false : true); }
   }, [sortKey]);
-
-  const eventRange = useMemo(() => {
-    let min = Infinity, max = -Infinity;
-    for (const ev of raEvents) { if (ev.startTime < min) min = ev.startTime; if (ev.startTime > max) max = ev.startTime; }
-    for (const ev of coordEvents) { if (ev.startTime < min) min = ev.startTime; if (ev.startTime > max) max = ev.startTime; }
-    return min === Infinity ? null : { min, max };
-  }, [raEvents, coordEvents]);
 
   // 공통 필터/정렬 (RA용)
   const raRows = useMemo(() => {
@@ -119,7 +105,8 @@ export default function AcasAnalysis() {
         case "threatLabel": av = labelFor(a.threatModeS, flights); bv = labelFor(b.threatModeS, flights); break;
         case "tti": av = a.threatTti; bv = b.threatTti; break;
         case "raDescription": av = a.raDescription; bv = b.raDescription; break;
-        case "raKind": av = (a.corrective ? 2 : 0) + (a.rat ? 1 : 0); bv = (b.corrective ? 2 : 0) + (b.rat ? 1 : 0); break;
+        case "action":    av = a.corrective ? 1 : 0; bv = b.corrective ? 1 : 0; break;
+        case "direction": av = a.downSense  ? 1 : 0; bv = b.downSense  ? 1 : 0; break;
         case "threatRangeNm": av = a.threatRangeNm ?? Infinity; bv = b.threatRangeNm ?? Infinity; break;
         case "threatBearingDeg": av = a.threatBearingDeg ?? Infinity; bv = b.threatBearingDeg ?? Infinity; break;
         case "threatAltFt": av = a.threatAltFt ?? Infinity; bv = b.threatAltFt ?? Infinity; break;
@@ -160,7 +147,8 @@ export default function AcasAnalysis() {
         case "threatLabel": av = labelFor(a.threatModeS, flights); bv = labelFor(b.threatModeS, flights); break;
         case "tti": av = a.threatTti; bv = b.threatTti; break;
         case "raDescription": av = a.description; bv = b.description; break;
-        case "raKind": av = (a.corrective ? 2 : 0) + (a.rat ? 1 : 0); bv = (b.corrective ? 2 : 0) + (b.rat ? 1 : 0); break;
+        case "action":    av = a.corrective ? 1 : 0; bv = b.corrective ? 1 : 0; break;
+        case "direction": av = a.downSense  ? 1 : 0; bv = b.downSense  ? 1 : 0; break;
         case "duration": av = a.endTime - a.startTime; bv = b.endTime - b.startTime; break;
         case "pointCount": av = a.pointCount; bv = b.pointCount; break;
         default: av = a.startTime; bv = b.startTime;
@@ -185,22 +173,47 @@ export default function AcasAnalysis() {
     </th>
   );
 
-  const KindBadges = ({ ev }: { ev: TcasEvent | CoordEvent }) => (
-    <div className="inline-flex flex-wrap items-center gap-1">
-      <span title={ev.corrective ? "Corrective — 현 비행 변경 필요" : "Preventive — 현 비행 유지"}
-        className={`rounded border px-1 py-0.5 text-[9px] uppercase tracking-wider ${ev.corrective ? "border-[#a60739]/30 bg-[#a60739]/10 text-[#a60739]" : "border-gray-300 bg-gray-100 text-gray-500"}`}>
-        {ev.corrective ? "Corr" : "Prev"}
-      </span>
-      <span title={ev.downSense ? "Descend sense (하강 회피)" : "Climb sense (상승 회피)"}
-        className={`rounded border px-1 py-0.5 text-[9px] ${ev.downSense ? "border-blue-300 bg-blue-50 text-blue-700" : "border-green-300 bg-green-50 text-green-700"}`}>
-        {ev.downSense ? "↓" : "↑"}
-      </span>
-      {ev.rat && <span title="RAT — RA 종료" className="rounded border border-gray-400 bg-gray-200 px-1 py-0.5 text-[9px] uppercase text-gray-600">RAT</span>}
-      {ev.mte && <span title="MTE — 다중 위협" className="rounded border border-amber-300 bg-amber-100 px-1 py-0.5 text-[9px] uppercase text-amber-700">MTE</span>}
-    </div>
+  // 「종류」 → 「동작」(Corr/Prev) + 「방향」(↑/↓) 두 셀로 분할
+  const KindCell = ({ ev }: { ev: TcasEvent | CoordEvent }) => (
+    <>
+      <td className="px-3 py-1.5 text-center">
+        <span title={ev.corrective ? "Corrective — 즉시 회피 동작 필요" : "Preventive — 현 비행 유지"}
+          className={`inline-block rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${ev.corrective ? "bg-[#a60739] text-white" : "border border-gray-300 bg-white text-gray-500"}`}>
+          {ev.corrective ? "Corr" : "Prev"}
+        </span>
+      </td>
+      <td className="px-3 py-1.5 text-center">
+        <span title={ev.downSense ? "Descend — 하강 회피" : "Climb — 상승 회피"}
+          className={`inline-flex items-center justify-center ${ev.downSense ? "text-blue-600" : "text-[#a60739]"}`}>
+          {ev.downSense ? <ArrowDown size={16} strokeWidth={3} /> : <ArrowUp size={16} strokeWidth={3} />}
+        </span>
+      </td>
+    </>
   );
 
+  // MTE — 위협 Mode-S 셀 끝 인라인 칩
+  const MteFlag = ({ ev }: { ev: TcasEvent | CoordEvent }) =>
+    ev.mte ? (
+      <span title="MTE — 다중 위협"
+        className="ml-1 inline-block rounded border border-amber-300 bg-amber-100 px-1 py-0.5 text-[9px] font-medium uppercase text-amber-700">
+        MTE
+      </span>
+    ) : null;
+
   const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); };
+
+  const anyFilterActive = !!(search || descKeyword || startDt || endDt || !tti0 || !tti1 || !tti2);
+  const clearAllFilters = () => {
+    setSearch(""); setDescKeyword(""); setStartDt(""); setEndDt("");
+    setTti0(true); setTti1(true); setTti2(true);
+  };
+
+  // TTI 세그먼트 컨트롤 메타
+  const TTI_META = [
+    { key: "modes",  label: "Mode-S",     active: tti1, toggle: () => setTti1(!tti1), color: "#a60739" },
+    { key: "atcrbs", label: "ATCRBS",     active: tti2, toggle: () => setTti2(!tti2), color: "#d97706" },
+    { key: "none",   label: "상대정보없음", active: tti0, toggle: () => setTti0(!tti0), color: "#9ca3af" },
+  ];
 
   return (
     <div className="flex h-full flex-col bg-white">
@@ -228,37 +241,86 @@ export default function AcasAnalysis() {
             </button>
           </div>
 
-          {/* 필터 */}
-          <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
-            <span className="text-gray-500">기간</span>
-            <div className="inline-flex overflow-hidden rounded border border-gray-300 bg-white">
-              {(["UTC", "KST"] as TzMode[]).map((m) => (
-                <button key={m} onClick={() => setTz(m)}
-                  className={`px-2 py-1 text-[10px] uppercase tracking-wider ${tz === m ? "bg-[#a60739] text-white" : "text-gray-500 hover:bg-gray-100"}`}>{m}</button>
+          {/* 필터 — 1행 압축 (평면 배경) */}
+          <div className="mt-3 flex items-center gap-2">
+            {/* 검색 */}
+            <div className="relative flex-shrink-0">
+              <span className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-gray-400">
+                <Search size={12} />
+              </span>
+              <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Mode-S / 콜사인 / 기체명"
+                className="h-7 w-48 rounded-md border border-gray-200 bg-white pl-7 pr-2 text-[11px] placeholder-gray-400 focus:border-[#a60739] focus:outline-none" />
+            </div>
+            <input type="text" value={descKeyword} onChange={(e) => setDescKeyword(e.target.value)} placeholder="RA 의도"
+              className="h-7 w-28 flex-shrink-0 rounded-md border border-gray-200 bg-white px-2 text-[11px] placeholder-gray-400 focus:border-[#a60739] focus:outline-none" />
+
+            {/* 세퍼레이터 */}
+            <span className="mx-0.5 h-4 w-px flex-shrink-0 bg-gray-200" />
+
+            {/* 기간 (팝오버) */}
+            <div className="relative flex flex-shrink-0 items-center">
+              <button onClick={() => setDateOpen((o) => !o)}
+                className={`inline-flex h-7 items-center gap-1.5 rounded-md border bg-white px-2.5 text-[10.5px] font-medium transition-colors ${
+                  startDt || endDt
+                    ? "border-[#a60739]/30 bg-[#a60739]/8 text-[#a60739]"
+                    : "border-gray-200 text-gray-500 hover:text-gray-700"
+                }`}>
+                <Clock size={12} />
+                {startDt || endDt ? (
+                  <span className="font-mono tabular-nums">
+                    {(startDt || "…").slice(5).replace("T", " ")} ~ {(endDt || "…").slice(5).replace("T", " ")}
+                  </span>
+                ) : (
+                  <span>기간</span>
+                )}
+                {dateOpen ? <ChevronUp size={11} className="text-gray-400" /> : <ChevronDown size={11} className="text-gray-400" />}
+              </button>
+              {dateOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setDateOpen(false)} />
+                  <div className="absolute left-0 top-[calc(100%+4px)] z-50 rounded-lg border border-gray-200 bg-white p-3 shadow-lg">
+                    <DateRangePicker
+                      startDt={startDt} endDt={endDt} tz={tz}
+                      onStartChange={setStartDt}
+                      onEndChange={setEndDt}
+                      onTzChange={setTz}
+                      onClear={() => { setStartDt(""); setEndDt(""); }}
+                      onDone={() => setDateOpen(false)} />
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* 세퍼레이터 */}
+            <span className="mx-0.5 h-4 w-px flex-shrink-0 bg-gray-200" />
+
+            {/* TTI (세그먼트) */}
+            <div className="inline-flex h-7 flex-shrink-0 overflow-hidden rounded-md border border-gray-200 bg-white">
+              {TTI_META.map((m, i) => (
+                <button key={m.key} onClick={m.toggle} title={`${m.label}: ${m.active ? "" : "비"}활성`}
+                  className={`relative px-2.5 text-[10.5px] font-medium transition-colors ${i > 0 ? "border-l border-gray-200" : ""} ${
+                    m.active ? "text-[#a60739]" : "text-gray-400 hover:text-gray-600"
+                  }`}>
+                  {m.active && (
+                    <span className="absolute left-1.5 top-1/2 -translate-y-1/2 h-1.5 w-1.5 rounded-full" style={{ background: m.color }} />
+                  )}
+                  <span className={m.active ? "pl-3" : ""}>{m.label}</span>
+                </button>
               ))}
             </div>
-            <input type="datetime-local" value={startDt} min={eventRange ? tsToDtLocal(eventRange.min, tz) : undefined} max={eventRange ? tsToDtLocal(eventRange.max, tz) : undefined}
-              onChange={(e) => setStartDt(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-[11px] focus:border-[#a60739] focus:outline-none" />
-            <span className="text-gray-400">~</span>
-            <input type="datetime-local" value={endDt} min={eventRange ? tsToDtLocal(eventRange.min, tz) : undefined} max={eventRange ? tsToDtLocal(eventRange.max, tz) : undefined}
-              onChange={(e) => setEndDt(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-[11px] focus:border-[#a60739] focus:outline-none" />
-            {(startDt || endDt) && <button onClick={() => { setStartDt(""); setEndDt(""); }} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-gray-500 hover:text-[#a60739]">기간 초기화</button>}
-          </div>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <div className="relative">
-              <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" />
-              <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Mode-S / 콜사인 / 기체명"
-                className="w-56 rounded border border-gray-300 bg-white pl-7 pr-2 py-1.5 text-[11px] placeholder-gray-400 focus:border-[#a60739] focus:outline-none" />
-            </div>
-            <input type="text" value={descKeyword} onChange={(e) => setDescKeyword(e.target.value)} placeholder="RA 의도 (예: climb)"
-              className="w-40 rounded border border-gray-300 bg-white px-2 py-1.5 text-[11px] placeholder-gray-400 focus:border-[#a60739] focus:outline-none" />
-            <div className="ml-auto flex items-center gap-2 text-[11px] text-gray-600">
-              <span className="text-gray-500">TTI:</span>
-              <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={tti1} onChange={(e) => setTti1(e.target.checked)} className="accent-[#a60739]" />Mode-S</label>
-              <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={tti2} onChange={(e) => setTti2(e.target.checked)} className="accent-[#a60739]" />ATCRBS</label>
-              <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={tti0} onChange={(e) => setTti0(e.target.checked)} className="accent-[#a60739]" />상대정보없음</label>
-              <span className="text-gray-300">|</span>
-              <span className="text-gray-500">표시 {tab === "ra" ? raRows.length : coordRows.length} / 전체 {stats.total}</span>
+
+            {/* 우측: 초기화 + 카운트 */}
+            <div className="ml-auto flex flex-shrink-0 items-center gap-2 pr-1 text-[10.5px]">
+              {anyFilterActive && (
+                <button onClick={clearAllFilters} title="모든 필터 초기화"
+                  className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-gray-500 hover:bg-white hover:text-[#a60739]">
+                  <X size={11} />초기화
+                </button>
+              )}
+              <span className="tabular-nums text-gray-600">
+                <span className="font-semibold text-gray-900">{tab === "ra" ? raRows.length : coordRows.length}</span>
+                <span className="text-gray-400"> / {stats.total}</span>
+              </span>
             </div>
           </div>
 
@@ -268,13 +330,14 @@ export default function AcasAnalysis() {
               <thead>
                 <tr>
                   <SortHeader k="startTime" label={`시각 (${tz})`} tip={`RA 시작 시각 (${tz}). 추정 시각은 ~ 표기.`} />
-                  <SortHeader k="ownLabel" label="Own (자기)" tip="보고 항공기 Mode-S + 기체명/콜사인" />
-                  <SortHeader k="ownAltFt" label="자기 고도(ft)" tip="레코드에 좌표/고도 있을 때만" />
+                  <SortHeader k="ownLabel" label="보고 항공기" tip="보고 항공기 Mode-S + 기체명/콜사인" />
+                  <SortHeader k="ownAltFt" label="고도(ft)" tip="레코드에 좌표/고도 있을 때만" />
                   <SortHeader k="tti" label="TID" tip="Threat Identity Data 종류" cls="text-center" />
                   <SortHeader k="tti" label="TTI" tip="BDS bits 21-22 raw 값 (0/1/2/3)" cls="text-center" />
                   <SortHeader k="threatLabel" label="위협 Mode-S" tip="TTI=1일 때 위협 식별" />
                   <SortHeader k="raDescription" label={tab === "ra" ? "RA 의도" : "협의 의도"} tip="ARA/RAC 비트 해석" />
-                  <SortHeader k="raKind" label="종류" tip="Corr/Prev · sense · RAT · MTE" cls="text-center" />
+                  <SortHeader k="action" label="동작" tip="Corrective(즉시 행동 필요) / Preventive(현 비행 유지)" cls="text-center" />
+                  <SortHeader k="direction" label="방향" tip="수직 회피 방향 (Climb/Descend)" cls="text-center" />
                   {tab === "ra" && <>
                     <SortHeader k="threatRangeNm" label="위협 거리(NM)" tip="TTI=2(ATCRBS)일 때만" />
                     <SortHeader k="threatBearingDeg" label="위협 방위(°)" tip="TTI=2일 때만" />
@@ -288,17 +351,17 @@ export default function AcasAnalysis() {
               <tbody>
                 {tab === "ra" ? (
                   raRows.length === 0 ? (
-                    <tr><td colSpan={14} className="px-3 py-8 text-center text-gray-400">조건에 맞는 RA 이벤트가 없습니다</td></tr>
+                    <tr><td colSpan={15} className="px-3 py-8 text-center text-gray-400">조건에 맞는 RA 이벤트가 없습니다</td></tr>
                   ) : raRows.map((ev) => (
-                    <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
+                    <tr key={ev.id} className={`border-t border-gray-100 hover:bg-[#a60739]/5 ${ev.rat ? "row-terminated" : ""}`}>
                       <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
                       <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, flights)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
                       <td className="px-3 py-1.5 text-center"><span className={`inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${TTI_COLOR[ev.threatTti]}`}>{TTI_LABEL[ev.threatTti]}</span></td>
                       <td className="px-3 py-1.5 text-center tabular-nums text-gray-700">{ev.threatTti}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, flights) : "—"}</td>
+                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, flights) : "—"}<MteFlag ev={ev} /></td>
                       <td className="px-3 py-1.5 text-gray-700" title={`ARA=0x${ev.araHex} · RAC=0x${ev.racHex}`}>{ev.raDescription}</td>
-                      <td className="px-3 py-1.5 text-center"><KindBadges ev={ev} /></td>
+                      <KindCell ev={ev} />
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatRangeNm != null ? ev.threatRangeNm.toFixed(1) : "—"}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatBearingDeg != null ? Math.round(ev.threatBearingDeg) : "—"}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatAltFt != null ? Math.round(ev.threatAltFt) : "—"}</td>
@@ -311,17 +374,17 @@ export default function AcasAnalysis() {
                   ))
                 ) : (
                   coordRows.length === 0 ? (
-                    <tr><td colSpan={11} className="px-3 py-8 text-center text-gray-400">조건에 맞는 협의 이벤트가 없습니다</td></tr>
+                    <tr><td colSpan={12} className="px-3 py-8 text-center text-gray-400">조건에 맞는 협의 이벤트가 없습니다</td></tr>
                   ) : coordRows.map((ev) => (
-                    <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
+                    <tr key={ev.id} className={`border-t border-gray-100 hover:bg-[#a60739]/5 ${ev.rat ? "row-terminated" : ""}`}>
                       <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
                       <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, flights)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
                       <td className="px-3 py-1.5 text-center"><span className={`inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${TTI_COLOR[ev.threatTti]}`}>{TTI_LABEL[ev.threatTti]}</span></td>
                       <td className="px-3 py-1.5 text-center tabular-nums text-gray-700">{ev.threatTti}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, flights) : "—"}</td>
+                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, flights) : "—"}<MteFlag ev={ev} /></td>
                       <td className="px-3 py-1.5 text-gray-700" title={`ARA=0x${ev.araHex} · RAC=0x${ev.racHex}`}>{ev.description}</td>
-                      <td className="px-3 py-1.5 text-center"><KindBadges ev={ev} /></td>
+                      <KindCell ev={ev} />
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{(ev.endTime - ev.startTime).toFixed(1)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{ev.pointCount}</td>
                       <td className="px-3 py-1.5 text-center">

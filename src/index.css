@@ -212,3 +212,14 @@ select {
 .leaflet-container {
   background: #f3f4f6;
 }
+
+/* ACAS 분석 — RAT(RA 종료) 행 시각화: 회색 처리 + 보고 항공기/위협 Mode-S/RA 의도 셀 취소선 */
+.row-terminated td {
+  color: #9ca3af !important;
+}
+.row-terminated td:nth-child(2),
+.row-terminated td:nth-child(6),
+.row-terminated td:nth-child(7) {
+  text-decoration: line-through;
+  text-decoration-color: #d1d5db;
+}
