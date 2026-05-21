@@ -9,6 +9,7 @@ import Settings from "./pages/Settings";
 import FileUpload from "./pages/FileUpload";
 import TrackMap from "./pages/TrackMap";
 import LoSObstacle from "./pages/LoSObstacle";
+import AcasAnalysis from "./pages/AcasAnalysis";
 import ReportGeneration from "./pages/ReportGeneration";
 import AircraftManagement from "./pages/AircraftManagement";
 import RadarManagement from "./pages/RadarManagement";
@@ -183,6 +184,7 @@ export default function App() {
                 <Route path="/" element={<PageWrapper><FileUpload /></PageWrapper>} />
                 <Route path="/map" element={null} />
                 <Route path="/obstacle" element={<PageWrapper><LoSObstacle /></PageWrapper>} />
+                <Route path="/acas" element={<PageWrapper><AcasAnalysis /></PageWrapper>} />
                 <Route path="/report" element={<PageWrapper><ReportGeneration /></PageWrapper>} />
                 <Route path="/settings" element={<PageWrapper><Settings /></PageWrapper>} />
                 <Route path="/aircraft" element={<PageWrapper><AircraftManagement /></PageWrapper>} />

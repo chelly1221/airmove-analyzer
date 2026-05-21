@@ -9,14 +9,11 @@
  *  - CONSOLIDATE   : 축적된 포인트로 consolidateFlights 실행, 결과를 비행 단위 청크로 반환
  *  - MANUAL_MERGE  : 선택 비행 수동 병합
  *  - BUILD_FLIGHT  : 단일 비행 구축 (소규모 데이터용)
- *  - QUERY_RA_EVENTS: 비행 인덱스 내 RA 포인트 → TcasEvent[] 생성
  */
 
-import { decodeRaReport } from "../utils/tcasDecoder";
-import { buildTcasEvents, type RaPoint } from "../utils/tcasEvents";
 import {
   type PointBatch, type FlightPointsSoA,
-  batchFromObjects, pointAt, modeSOf, radarNameOf, tcasRaOf,
+  batchFromObjects, pointAt, modeSOf, radarNameOf,
   unpackBatch, clearGlobalTables,
 } from "./pointSoA";
 
@@ -34,6 +31,7 @@ interface TrackPoint {
   raw_data?: string;
   radar_name?: string;
   tcas_ra?: number[];
+  tcas_coord?: number[];
 }
 
 interface LossPoint {
@@ -1042,56 +1040,6 @@ self.onmessage = async (e: MessageEvent) => {
         }
         allPts.sort((a, b) => a.timestamp - b.timestamp);
         self.postMessage({ type: "QUERY_FLIGHT_POINTS_BATCH_RESULT", id, points: allPts });
-        break;
-      }
-
-      case "QUERY_RA_EVENTS": {
-        const { radarName, selectedModeS, registeredModeS, timeRange } = e.data;
-        // 필터 매칭 — viewport 쿼리와 동일 규칙
-        const matchesFilter = (entry: FlightIndexEntry): boolean => {
-          if (radarName && entry.radarName && entry.radarName !== radarName) return false;
-          if (selectedModeS !== undefined && selectedModeS !== "__ALL__") {
-            if (selectedModeS === null) {
-              if (!registeredModeS || !(registeredModeS as string[]).includes(entry.modeS.toUpperCase())) return false;
-            } else {
-              if (entry.modeS.toUpperCase() !== selectedModeS.toUpperCase()) return false;
-            }
-          }
-          return true;
-        };
-
-        // RA 포인트를 mode_s별로 수집 (SoA 직접 접근). 위협 매칭/궤적 lookup 없음 — 데이터-only.
-        const raPointsByMs = new Map<string, RaPoint[]>();
-        const tMin = timeRange ? (timeRange as [number, number])[0] : -Infinity;
-        const tMax = timeRange ? (timeRange as [number, number])[1] : Infinity;
-
-        let scanned = 0;
-        for (const entry of _flightIndex.values()) {
-          if (!matchesFilter(entry)) continue;
-          if (entry.endTime < tMin || entry.startTime > tMax) continue;
-
-          const soa = entry.points;
-          for (let i = 0; i < soa.count; i++) {
-            const blob = tcasRaOf(soa, i);
-            if (!blob) continue;
-            const ts = soa.timestamp[i];
-            if (ts < tMin || ts > tMax) continue;
-            const raBytes = [blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6]];
-            const decoded = decodeRaReport(raBytes);
-            if (!decoded || !decoded.hasRa) continue;
-            let arr = raPointsByMs.get(entry.modeS);
-            if (!arr) { arr = []; raPointsByMs.set(entry.modeS, arr); }
-            arr.push({ ts, lat: soa.latitude[i], lon: soa.longitude[i], altM: soa.altitude[i], decoded, rawBytes: raBytes });
-            scanned++;
-            if (scanned % 10000 === 0) {
-              await yieldWorker();
-            }
-          }
-        }
-
-        const events = buildTcasEvents(raPointsByMs);
-
-        self.postMessage({ type: "QUERY_RA_EVENTS_RESULT", id, events, raPointCount: scanned });
         break;
       }
 

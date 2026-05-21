@@ -120,9 +120,27 @@ pub struct TrackPoint {
     /// Original bytes for debugging
     #[serde(with = "serde_bytes_base64")]
     pub raw_data: Vec<u8>,
-    /// TCAS RA 보고 페이로드 (BDS 3,0 7바이트) — I048/260 우선, 없으면 I048/250 BDS 3,0
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tcas_ra: Option<Vec<u8>>,
+}
+
+/// TCAS/ACAS 보고 — 트랙 포인트와 독립적으로 전수 추출.
+/// 좌표/시간이 없는 Comm-B 응답 레코드에도 실려오므로 별도 수집한다.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TcasReport {
+    /// Unix timestamp (I140 우선, 없으면 직전 유효 시각으로 추정)
+    pub timestamp: f64,
+    /// 시각이 직전 레코드에서 추정된 값인지 (I140 부재)
+    pub time_estimated: bool,
+    /// 보고 항공기 Mode-S (I220, hex 6자리). 없으면 "NO_MODES"
+    pub mode_s: String,
+    /// 0 = I048/260 ACAS RA, 1 = I048/250 BDS 3,0 RA, 2 = I048/250 BDS 1,6 Coordination
+    pub source: u8,
+    /// BDS 페이로드 7바이트
+    pub payload: Vec<u8>,
+    /// 레코드에 좌표가 있으면 WGS84 (없으면 None)
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    /// 고도 (m, flight level 변환). 없으면 None
+    pub altitude: Option<f64>,
 }
 
 /// Loss 구간 (Loss Segment)
@@ -163,6 +181,9 @@ pub struct ParsedFile {
     /// 파싱 통계 (진단용)
     #[serde(default)]
     pub parse_stats: Option<ParseStatistics>,
+    /// TCAS/ACAS 보고 (트랙 독립 전수 추출)
+    #[serde(default)]
+    pub tcas_reports: Vec<TcasReport>,
 }
 
 /// 분석 결과 (Analysis Result)

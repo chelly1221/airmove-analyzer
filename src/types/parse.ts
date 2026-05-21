@@ -1,4 +1,4 @@
-import type { TrackPoint } from "./track";
+import type { TrackPoint, TcasReport } from "./track";
 import type { LossSegment } from "./loss";
 
 /** 파싱 통계 */
@@ -24,6 +24,8 @@ export interface ParsedFile {
   radar_lat: number;
   radar_lon: number;
   parse_stats?: ParseStatistics;
+  /** TCAS/ACAS 보고 (트랙 독립 전수 추출) */
+  tcas_reports?: TcasReport[];
 }
 
 /** 분석 결과 (Analysis Result) */

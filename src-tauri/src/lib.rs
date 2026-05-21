@@ -184,6 +184,8 @@ struct BatchFileInfo {
     radar_lon: f64,
     parse_stats: Option<models::ParseStatistics>,
     track_point_count: usize,
+    /// TCAS/ACAS 보고 (트랙 독립 전수 추출)
+    tcas_reports: Vec<models::TcasReport>,
 }
 
 /// 배치 완료 이벤트 페이로드
@@ -270,6 +272,7 @@ async fn parse_and_analyze_batch(
                         radar_lon: analysis.file_info.radar_lon,
                         parse_stats: analysis.file_info.parse_stats.clone(),
                         track_point_count: analysis.file_info.track_points.len(),
+                        tcas_reports: std::mem::take(&mut analysis.file_info.tcas_reports),
                     };
                     // track_points를 청크로 스트리밍 후 메모리 해제
                     emit_and_drain_track_points(&handle, &path, &mut analysis.file_info.track_points);

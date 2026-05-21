@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use log::{debug, info, warn};
 
-use crate::models::{ParseStatistics, RadarDetectionType, TrackPoint};
+use crate::models::{ParseStatistics, RadarDetectionType, TcasReport, TrackPoint};
 
 const CAT048: u8 = 0x30;
 const CAT034: u8 = 0x22;
@@ -96,6 +96,8 @@ struct Cat048Record {
     acas_ra_report: Option<[u8; 7]>,
     /// I048/250 Mode-S MB 블록 중 BDS 3,0 (ACAS Active RA) 의 7바이트 페이로드
     bds30_mb: Option<[u8; 7]>,
+    /// I048/250 Mode-S MB 블록 중 BDS 1,6 (ACAS Coordination Reply) 의 7바이트 페이로드
+    bds16_mb: Option<[u8; 7]>,
 }
 
 /// 유령 표적 탐지용 추가 데이터 (극좌표 + Track Number)
@@ -783,12 +785,6 @@ fn classify_and_convert(
         _ => String::new(), // Mode-S 없는 ATCRBS 레코드
     };
 
-    // TCAS RA 페이로드: I260 우선, 없으면 I250 BDS 3,0
-    let tcas_ra = record
-        .acas_ra_report
-        .or(record.bds30_mb)
-        .map(|b| b.to_vec());
-
     let point = TrackPoint {
         timestamp,
         mode_s: if mode_s.is_empty() { "NO_MODES".to_string() } else { mode_s.clone() },
@@ -799,7 +795,6 @@ fn classify_and_convert(
         heading,
         radar_type: radar_type.clone(),
         raw_data: Vec::new(),
-        tcas_ra,
     };
 
     if radar_type.is_atcrbs() && mode_s.is_empty() {
@@ -811,6 +806,87 @@ fn classify_and_convert(
             track_number: record.track_number,
         };
         RecordOutcome::ModesSPoint(point, record.mode3a, extra)
+    }
+}
+
+/// TCAS/ACAS 보고를 트랙과 독립적으로 전수 추출.
+/// classify_and_convert의 discard 조건(좌표/시간/TYP)과 무관하게,
+/// I260/BDS3,0/BDS1,6 페이로드가 있으면 보고로 수집한다.
+///
+/// 시각: I140 있으면 사용 + last_valid_ts 갱신. 없으면 직전 유효 시각으로 추정.
+/// 좌표/고도: 레코드에 있으면 채우고 없으면 None.
+fn extract_tcas_reports(
+    record: &Cat048Record,
+    base_secs: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+    mag_dec_deg: f64,
+    last_valid_ts: &mut Option<f64>,
+    out: &mut Vec<TcasReport>,
+) {
+    // 시각 결정 + 직전 유효 시각 갱신
+    let (ts_opt, estimated) = match record.time_of_day {
+        Some(tod) => {
+            let t = if base_secs > 0.0 { base_secs + tod } else { 1_700_000_000.0 + tod };
+            *last_valid_ts = Some(t);
+            (Some(t), false)
+        }
+        None => (*last_valid_ts, true),
+    };
+
+    let has_tcas = record.acas_ra_report.is_some()
+        || record.bds30_mb.is_some()
+        || record.bds16_mb.is_some();
+    if !has_tcas {
+        return;
+    }
+    let ts = match ts_opt {
+        Some(t) => t,
+        None => return, // 시각을 전혀 알 수 없으면 보류
+    };
+
+    // 좌표 (있으면)
+    let (lat, lon) = if let (Some(rho), Some(theta)) = (record.rho_nm, record.theta_deg) {
+        let (la, lo) = polar_to_latlon(rho, theta, radar_lat, radar_lon, mag_dec_deg);
+        (Some(la), Some(lo))
+    } else if let (Some(x), Some(y)) = (record.cart_x_nm, record.cart_y_nm) {
+        let (la, lo) = cartesian_to_latlon(x, y, radar_lat, radar_lon, mag_dec_deg);
+        (Some(la), Some(lo))
+    } else {
+        (None, None)
+    };
+    let altitude = record.flight_level.map(|fl| fl * 100.0 * 0.3048);
+    let mode_s = match record.mode_s_address {
+        Some(addr) if addr > 0 => format!("{:06X}", addr),
+        _ => "NO_MODES".to_string(),
+    };
+
+    // RA: I260 우선, 없으면 BDS 3,0
+    if let Some(ra) = record.acas_ra_report.or(record.bds30_mb) {
+        let source = if record.acas_ra_report.is_some() { 0 } else { 1 };
+        out.push(TcasReport {
+            timestamp: ts,
+            time_estimated: estimated,
+            mode_s: mode_s.clone(),
+            source,
+            payload: ra.to_vec(),
+            latitude: lat,
+            longitude: lon,
+            altitude,
+        });
+    }
+    // Coordination: BDS 1,6
+    if let Some(coord) = record.bds16_mb {
+        out.push(TcasReport {
+            timestamp: ts,
+            time_estimated: estimated,
+            mode_s,
+            source: 2,
+            payload: coord.to_vec(),
+            latitude: lat,
+            longitude: lon,
+            altitude,
+        });
     }
 }
 
@@ -895,6 +971,10 @@ pub fn parse_ass_file(
     /// ±10분 허용. 실제 오염 레코드는 수 시간 이상 차이남.
     const NEC_TOD_TOLERANCE_SECS: f64 = 600.0; // ±10분
 
+    // TCAS 보고 전수 추출용 (트랙 독립)
+    let mut tcas_reports: Vec<TcasReport> = Vec::new();
+    let mut last_valid_tcas_ts: Option<f64> = None;
+
     let mut offset = 0usize;
 
     while offset < data.len() {
@@ -971,6 +1051,17 @@ pub fn parse_ass_file(
                             } else {
                                 0.0
                             };
+
+                            // TCAS 보고 전수 추출 (트랙 독립 — discard와 무관)
+                            extract_tcas_reports(
+                                &record,
+                                base_date_secs + day_offset,
+                                radar_lat,
+                                radar_lon,
+                                mag_dec_deg,
+                                &mut last_valid_tcas_ts,
+                                &mut tcas_reports,
+                            );
 
                             match classify_and_convert(
                                 &record,
@@ -1106,6 +1197,7 @@ pub fn parse_ass_file(
         radar_lat,
         radar_lon,
         parse_stats: Some(stats),
+        tcas_reports,
     })
 }
 
@@ -1488,6 +1580,10 @@ fn parse_cat048_record(
                         let mut buf = [0u8; 7];
                         buf.copy_from_slice(&block[off..off + 7]);
                         record.bds30_mb = Some(buf);
+                    } else if bds1 == 1 && bds2 == 6 {
+                        let mut buf = [0u8; 7];
+                        buf.copy_from_slice(&block[off..off + 7]);
+                        record.bds16_mb = Some(buf);
                     }
                 }
                 pos += mb_size;

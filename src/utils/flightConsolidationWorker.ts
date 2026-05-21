@@ -310,21 +310,3 @@ export async function queryFlightPointsBatch(flightIds: string[]): Promise<Track
   const result = await workerSend({ type: "QUERY_FLIGHT_POINTS_BATCH", flightIds });
   return result.points;
 }
-
-// ─── TCAS RA Events ─────────────────────────────────
-
-export interface RaEventQueryParams {
-  radarName?: string;
-  selectedModeS?: string | null;
-  registeredModeS?: string[];
-  timeRange?: [number, number];
-}
-
-/**
- * Worker에 RA 이벤트 쿼리. RA 점들을 모아 위협 매칭 + CPA 계산 → 이벤트 배열 반환.
- * 결과 크기는 작아 청크 스트리밍 불필요(보통 < 수백 건).
- */
-export async function queryRaEvents(params: RaEventQueryParams): Promise<{ events: import("./tcasEvents").TcasEvent[]; raPointCount: number }> {
-  const result = await workerSend({ type: "QUERY_RA_EVENTS", ...params });
-  return { events: result.events ?? [], raPointCount: result.raPointCount ?? 0 };
-}

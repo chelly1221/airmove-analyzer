@@ -20,6 +20,23 @@ export interface TrackPoint {
   raw_data: number[];
   /** 파싱 시 사용된 레이더 사이트 이름 (필터링용) */
   radar_name?: string;
-  /** TCAS RA 페이로드 7바이트 (BDS 3,0). 있을 때만. */
-  tcas_ra?: number[];
+}
+
+/** TCAS/ACAS 보고 — 트랙과 독립적으로 추출 (Rust TcasReport 대응) */
+export interface TcasReport {
+  /** Unix timestamp */
+  timestamp: number;
+  /** 시각이 직전 레코드에서 추정된 값인지 (I140 부재) */
+  time_estimated: boolean;
+  /** 보고 항공기 Mode-S */
+  mode_s: string;
+  /** 0 = I048/260 ACAS RA, 1 = I048/250 BDS 3,0 RA, 2 = I048/250 BDS 1,6 Coordination */
+  source: number;
+  /** BDS 페이로드 7바이트 */
+  payload: number[];
+  /** WGS84 (없으면 null) */
+  latitude: number | null;
+  longitude: number | null;
+  /** 고도 (m, 없으면 null) */
+  altitude: number | null;
 }

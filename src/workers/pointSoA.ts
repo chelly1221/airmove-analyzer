@@ -20,7 +20,6 @@ interface TrackPointLike {
   heading: number;
   radar_type: string;
   radar_name?: string;
-  tcas_ra?: number[];
 }
 
 export interface PointBatch {
@@ -37,8 +36,6 @@ export interface PointBatch {
   radarTypeIdx: Uint8Array;
   /** _radarNameTable 인덱스. 0xFFFF = 없음 */
   radarNameIdx: Uint16Array;
-  /** _tcasRaBlob의 7바이트 슬롯 인덱스. -1 = RA 없음 */
-  tcasRaSlot: Int32Array;
 }
 
 // ─── 전역 문자열 테이블 (interning) ───────────────────
@@ -52,8 +49,6 @@ const _radarTypeMap = new Map<string, number>();
 const _radarNameTable: string[] = [];
 const _radarNameMap = new Map<string, number>();
 
-// TCAS RA blob: 7바이트씩 슬롯에 저장. 슬롯 인덱스 = blob_offset / 7
-const _tcasRaBlobChunks: Uint8Array[] = []; // 각 청크 = 한 RA 슬롯의 7바이트
 const NO_RADAR_NAME = 0xFFFF;
 
 function intern(table: string[], map: Map<string, number>, value: string): number {
@@ -64,14 +59,6 @@ function intern(table: string[], map: Map<string, number>, value: string): numbe
     map.set(value, idx);
   }
   return idx;
-}
-
-function addTcasRa(bytes: number[]): number {
-  const slot = _tcasRaBlobChunks.length;
-  const buf = new Uint8Array(7);
-  for (let i = 0; i < 7 && i < bytes.length; i++) buf[i] = bytes[i] & 0xFF;
-  _tcasRaBlobChunks.push(buf);
-  return slot;
 }
 
 // ─── 객체 배열 → SoA 변환 ─────────────────────────────
@@ -89,7 +76,6 @@ export function batchFromObjects(pts: TrackPointLike[]): PointBatch {
     modeSIdx: new Uint32Array(n),
     radarTypeIdx: new Uint8Array(n),
     radarNameIdx: new Uint16Array(n),
-    tcasRaSlot: new Int32Array(n),
   };
   for (let i = 0; i < n; i++) {
     const p = pts[i];
@@ -104,7 +90,6 @@ export function batchFromObjects(pts: TrackPointLike[]): PointBatch {
     batch.radarNameIdx[i] = p.radar_name
       ? intern(_radarNameTable, _radarNameMap, p.radar_name)
       : NO_RADAR_NAME;
-    batch.tcasRaSlot[i] = (p.tcas_ra && p.tcas_ra.length >= 7) ? addTcasRa(p.tcas_ra) : -1;
   }
   return batch;
 }
@@ -113,12 +98,6 @@ export function batchFromObjects(pts: TrackPointLike[]): PointBatch {
 
 export function pointAt(batch: PointBatch, idx: number): TrackPointLike {
   const radarNameIdx = batch.radarNameIdx[idx];
-  const slot = batch.tcasRaSlot[idx];
-  let tcas_ra: number[] | undefined = undefined;
-  if (slot >= 0) {
-    const blob = _tcasRaBlobChunks[slot];
-    tcas_ra = [blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6]];
-  }
   return {
     timestamp: batch.timestamp[idx],
     mode_s: _modeSTable[batch.modeSIdx[idx]],
@@ -129,7 +108,6 @@ export function pointAt(batch: PointBatch, idx: number): TrackPointLike {
     heading: batch.heading[idx],
     radar_type: _radarTypeTable[batch.radarTypeIdx[idx]],
     radar_name: radarNameIdx === NO_RADAR_NAME ? undefined : _radarNameTable[radarNameIdx],
-    tcas_ra,
   };
 }
 
@@ -142,11 +120,6 @@ export function modeSOf(batch: PointBatch, idx: number): string {
 export function radarNameOf(batch: PointBatch, idx: number): string {
   const i = batch.radarNameIdx[idx];
   return i === NO_RADAR_NAME ? "" : _radarNameTable[i];
-}
-
-export function tcasRaOf(batch: PointBatch, idx: number): Uint8Array | null {
-  const slot = batch.tcasRaSlot[idx];
-  return slot >= 0 ? _tcasRaBlobChunks[slot] : null;
 }
 
 // ─── 다중 배치에서 정렬된 인덱스 빌드 ─────────────────
@@ -198,7 +171,6 @@ export function buildFlightSoA(
     modeSIdx: new Uint32Array(n),
     radarTypeIdx: new Uint8Array(n),
     radarNameIdx: new Uint16Array(n),
-    tcasRaSlot: new Int32Array(n),
   };
   for (let k = 0; k < n; k++) {
     const { b, i } = refs[k];
@@ -212,7 +184,6 @@ export function buildFlightSoA(
     out.modeSIdx[k] = src.modeSIdx[i];
     out.radarTypeIdx[k] = src.radarTypeIdx[i];
     out.radarNameIdx[k] = src.radarNameIdx[i];
-    out.tcasRaSlot[k] = src.tcasRaSlot[i];
   }
   return out;
 }
@@ -236,7 +207,6 @@ export function clearGlobalTables(): void {
   _radarTypeMap.clear();
   _radarNameTable.length = 0;
   _radarNameMap.clear();
-  _tcasRaBlobChunks.length = 0;
 }
 
 /**
@@ -249,7 +219,7 @@ export function estimateSoABytes(batches: PointBatch[]): number {
       + b.latitude.byteLength + b.longitude.byteLength
       + b.altitude.byteLength + b.speed.byteLength + b.heading.byteLength
       + b.modeSIdx.byteLength + b.radarTypeIdx.byteLength
-      + b.radarNameIdx.byteLength + b.tcasRaSlot.byteLength;
+      + b.radarNameIdx.byteLength;
   }
   return bytes;
 }

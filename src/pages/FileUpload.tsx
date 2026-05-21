@@ -819,6 +819,7 @@ export default function FileUpload() {
     try {
       await clearWorkerPoints();
       useAppStore.setState({ workerPointCount: 0, workerPointSummary: null, flights: [] });
+      useAppStore.getState().clearTcasReports();
     } catch (e) {
       console.error("[FileUpload] clearAndResetData 실패:", e);
     }
@@ -936,6 +937,11 @@ export default function FileUpload() {
       // Worker 요약 갱신
       const summary = await getPointSummary();
       useAppStore.setState({ workerPointCount: summary.totalPoints, workerPointSummary: summary.entries });
+
+      // ACAS 보고 누적 (트랙 독립 전수 추출)
+      if (result.file_info.tcas_reports?.length) {
+        useAppStore.getState().appendTcasReports(result.file_info.tcas_reports);
+      }
 
       // 파싱 통계 저장
       if (result.file_info.parse_stats) {

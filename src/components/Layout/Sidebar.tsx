@@ -12,6 +12,7 @@ import {
   MapPin,
   ExternalLink,
   Loader2,
+  ShieldAlert,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import Modal from "../common/Modal";
@@ -53,6 +54,7 @@ const navSections: NavSection[] = [
     label: "분석",
     items: [
       { id: "obstacle", label: "LoS 장애물", icon: Eye, path: "/obstacle" },
+      { id: "acas", label: "ACAS", icon: ShieldAlert, path: "/acas" },
       { id: "report", label: "보고서", icon: FileText, path: "/report" },
     ],
   },

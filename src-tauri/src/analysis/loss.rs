@@ -288,7 +288,6 @@ mod tests {
             heading: 90.0,
             radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
-            tcas_ra: None,
         }
     }
 
@@ -303,7 +302,6 @@ mod tests {
             heading: 90.0,
             radar_type: RadarDetectionType::ModeSRollCallPsr,
             raw_data: vec![],
-            tcas_ra: None,
         }
     }
 
@@ -397,6 +395,7 @@ mod tests {
             radar_lat: 37.5585,
             radar_lon: 126.7906,
             parse_stats: None,
+            tcas_reports: vec![],
         };
 
         let result = analyze_tracks(parsed, 12.0);
