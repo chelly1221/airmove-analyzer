@@ -353,7 +353,7 @@ export default function AcasAnalysis() {
                   raRows.length === 0 ? (
                     <tr><td colSpan={15} className="px-3 py-8 text-center text-gray-400">조건에 맞는 RA 이벤트가 없습니다</td></tr>
                   ) : raRows.map((ev) => (
-                    <tr key={ev.id} className={`border-t border-gray-100 hover:bg-[#a60739]/5 ${ev.rat ? "row-terminated" : ""}`}>
+                    <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
                       <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
                       <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, flights)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
@@ -376,7 +376,7 @@ export default function AcasAnalysis() {
                   coordRows.length === 0 ? (
                     <tr><td colSpan={12} className="px-3 py-8 text-center text-gray-400">조건에 맞는 협의 이벤트가 없습니다</td></tr>
                   ) : coordRows.map((ev) => (
-                    <tr key={ev.id} className={`border-t border-gray-100 hover:bg-[#a60739]/5 ${ev.rat ? "row-terminated" : ""}`}>
+                    <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
                       <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
                       <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, flights)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
