@@ -931,6 +931,22 @@ pub fn parse_ass_file(
         info!("NEC frame detected: month={}, day={}", m, d);
     }
 
+    // 자정(KST) 교차 대응: 프레임 헤더 날짜는 KST 자정마다 바뀌므로, 검출 날짜 D와
+    // 다음 2일(D+1, D+2)까지 NEC 프레임으로 인식한다. ≤24.7h 녹화는 최대 3개 연속
+    // 날짜에 걸친다(예: 23:5x 시작 파일 → D/D+1/D+2 3일).
+    // 단일 날짜 고정 시 자정 이후 프레임 미인식 → nec_kst 고정 → NEC↔TOD 교차검증이
+    // 자정 이후 레코드를 전부 폐기하던 버그 수정.
+    let valid_dates: Vec<(u8, u8)> = if let Some((m, d)) = nec {
+        let year: i64 = extract_date_from_filename(path)
+            .and_then(|s| s.get(0..4).and_then(|y| y.parse::<i64>().ok()))
+            .unwrap_or(2026);
+        let (y1, m1, d1) = next_day(year, m, d);
+        let (_y2, m2, d2) = next_day(y1, m1, d1);
+        vec![(m, d), (m1, d1), (m2, d2)]
+    } else {
+        Vec::new()
+    };
+
     // Extract base date + start TOD from filename
     let (base_date_secs, start_tod) = extract_base_date_and_start_tod(&filename);
 
@@ -979,14 +995,12 @@ pub fn parse_ass_file(
 
     while offset < data.len() {
         // Check for NEC frame header (5 bytes: month, day, hour, minute, counter)
-        if let Some((m, d)) = nec {
-            if is_nec_frame(&data, offset, m, d) {
-                // NEC 프레임 시각 갱신 (KST)
-                nec_kst_hour = Some(data[offset + 2]);
-                nec_kst_min = Some(data[offset + 3]);
-                offset += 5;
-                continue;
-            }
+        if !valid_dates.is_empty() && is_nec_frame(&data, offset, &valid_dates) {
+            // NEC 프레임 시각 갱신 (KST)
+            nec_kst_hour = Some(data[offset + 2]);
+            nec_kst_min = Some(data[offset + 3]);
+            offset += 5;
+            continue;
         }
 
         // Try to read an ASTERIX block
@@ -1266,13 +1280,16 @@ fn detect_nec_frame(data: &[u8]) -> Option<(u8, u8)> {
 }
 
 /// Check if the data at `offset` looks like a NEC frame header.
-/// Matches on the detected month+day, with valid hour (0-23) and minute (0-59),
-/// and verifies the byte after the 5-byte frame is a known ASTERIX category or another frame.
-fn is_nec_frame(data: &[u8], offset: usize, month: u8, day: u8) -> bool {
+/// 검출 날짜 D와 다음 2일(D+1, D+2) 중 하나에 해당하면 인식한다(자정 교차 대응).
+/// 시(0-23)/분(0-59)이 유효하고, 5바이트 프레임 뒤 바이트가 알려진 ASTERIX 카테고리이거나
+/// 다음 프레임의 월 바이트인지 확인한다.
+fn is_nec_frame(data: &[u8], offset: usize, valid_dates: &[(u8, u8)]) -> bool {
     if offset + 5 > data.len() {
         return false;
     }
-    if data[offset] != month || data[offset + 1] != day {
+    let mo = data[offset];
+    let dy = data[offset + 1];
+    if !valid_dates.iter().any(|&(m, d)| m == mo && d == dy) {
         return false;
     }
     if data[offset + 2] > 23 || data[offset + 3] > 59 {
@@ -1283,7 +1300,36 @@ fn is_nec_frame(data: &[u8], offset: usize, month: u8, day: u8) -> bool {
         return true; // Frame at EOF
     }
     let after = data[offset + 5];
-    after == CAT048 || after == CAT034 || after == CAT008 || after == month
+    after == CAT048
+        || after == CAT034
+        || after == CAT008
+        || valid_dates.iter().any(|&(m, _)| after == m)
+}
+
+/// 윤년 판정 (그레고리력)
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// 해당 월의 일수
+fn days_in_month(year: i64, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap_year(year) { 29 } else { 28 },
+        _ => 31,
+    }
+}
+
+/// 다음 날짜 (월/연 경계 처리). 반환: (year, month, day)
+fn next_day(year: i64, month: u8, day: u8) -> (i64, u8, u8) {
+    if day < days_in_month(year, month) {
+        (year, month, day + 1)
+    } else if month < 12 {
+        (year, month + 1, 1)
+    } else {
+        (year + 1, 1, 1)
+    }
 }
 
 /// 파일명에서 날짜 추출 (YYYY-MM-DD 형식 반환). 편각 조회용.
@@ -1741,6 +1787,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "로컬 ASS 데이터 파일 필요 (수동 통합 테스트)"]
     fn test_gimpo_210209_simultaneous_tracks() {
         let path = r"C:\Users\chell\OneDrive\바탕 화면\gimpo_210209_1352.ass";
         let filename = "gimpo_210209_1352.ass";
@@ -1773,7 +1820,7 @@ mod tests {
                 format!("{:02}:{:02}", s / 3600, (s % 3600) / 60)
             }).unwrap_or("N/A".into()));
 
-        let result = parse_ass_file(path, 37.5585, 126.7908, &[], &[], -8.5, "and", false, false, |_| {}).unwrap();
+        let result = parse_ass_file(path, 37.5585, 126.7908, &[], &[], &[], &[], -8.5, |_| {}).unwrap();
         eprintln!("  Parsed points: {}", result.track_points.len());
         // 공간 이상점 검증: 71BF78 최종 항적에 이상점 없음
         let bf78_pts: Vec<_> = result.track_points.iter().filter(|p| p.mode_s == "71BF78").collect();
@@ -1847,6 +1894,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "로컬 ASS 데이터 파일 필요 (수동 통합 테스트)"]
     fn test_filename_based_day_offset() {
         let files = [
             r"C:\Users\chell\OneDrive\바탕 화면\Data\gimpo_231014_0111.ass",
@@ -1892,7 +1940,7 @@ mod tests {
             );
             eprintln!("  Expected first ts >= {}", ts_to_date(base + start_tod.unwrap_or(0.0)));
 
-            let result = parse_ass_file(path, 37.5585, 126.7908, &[], &[], -8.5, "and", false, false, |_| {});
+            let result = parse_ass_file(path, 37.5585, 126.7908, &[], &[], &[], &[], -8.5, |_| {});
             match result {
                 Ok(parsed) => {
                     eprintln!("  Parsed points: {}", parsed.track_points.len());
@@ -1922,6 +1970,66 @@ mod tests {
             }
             eprintln!();
         }
+    }
+
+    #[test]
+    #[ignore = "로컬 ASS 데이터 파일 필요 (자정 교차 수정 수동 검증)"]
+    fn test_midnight_crossing_full_coverage() {
+        // 자정(KST) 교차 회귀 방지: is_nec_frame 날짜 윈도우 수정 전에는 자정 이후
+        // 레코드가 NEC↔TOD 교차검증에서 폐기되어 ~14h만 커버됐다. 수정 후 전체 구간 커버.
+        let path = r"C:\Users\chell\OneDrive\바탕 화면\1Data\gimpo_260201_0957.ass";
+        let parsed = parse_ass_file(path, 37.5585, 126.7908, &[], &[], &[], &[], -8.5, |_| {}).unwrap();
+        let first = parsed.track_points.first().unwrap().timestamp;
+        let last = parsed.track_points.last().unwrap().timestamp;
+        let dur_h = (last - first) / 3600.0;
+        eprintln!("points={} dur={:.2}h first={:.0} last={:.0}",
+            parsed.track_points.len(), dur_h, first, last);
+        assert!(dur_h > 23.0, "자정 교차 후에도 전체 구간이 파싱되어야 함, got {:.2}h", dur_h);
+    }
+
+    #[test]
+    fn test_next_day_boundaries() {
+        // 일반
+        assert_eq!(next_day(2026, 2, 1), (2026, 2, 2));
+        // 월 경계 (비윤년 2월 → 3월)
+        assert_eq!(next_day(2026, 2, 28), (2026, 3, 1));
+        // 윤년 2월
+        assert_eq!(next_day(2024, 2, 28), (2024, 2, 29));
+        assert_eq!(next_day(2024, 2, 29), (2024, 3, 1));
+        // 30/31일 월 경계
+        assert_eq!(next_day(2026, 4, 30), (2026, 5, 1));
+        assert_eq!(next_day(2026, 1, 31), (2026, 2, 1));
+        // 연 경계
+        assert_eq!(next_day(2025, 12, 31), (2026, 1, 1));
+    }
+
+    #[test]
+    fn test_is_nec_frame_accepts_date_window() {
+        // 검출 날짜 D=2/24, 윈도우 = [2/24, 2/25, 2/26] (23:5x 시작 파일이 3일에 걸침)
+        let valid_dates = vec![(2u8, 24u8), (2, 25), (2, 26)];
+        // [월][일][시][분][카운터][CAT][len_hi][len_lo]
+        let mk = |m, d, h, mi| vec![m, d, h, mi, 0x00, CAT048, 0x00, 0x10];
+
+        // D, D+1, D+2 모두 인식 (자정 교차 — 이전 버그에서 누락되던 구간)
+        assert!(is_nec_frame(&mk(2, 24, 23, 59), 0, &valid_dates));
+        assert!(is_nec_frame(&mk(2, 25, 0, 0), 0, &valid_dates));
+        assert!(is_nec_frame(&mk(2, 26, 0, 30), 0, &valid_dates));
+
+        // 윈도우 밖 날짜 거부
+        assert!(!is_nec_frame(&mk(2, 27, 0, 0), 0, &valid_dates));
+        assert!(!is_nec_frame(&mk(3, 24, 0, 0), 0, &valid_dates));
+
+        // 시/분 범위 위반 거부
+        assert!(!is_nec_frame(&mk(2, 24, 24, 0), 0, &valid_dates));
+        assert!(!is_nec_frame(&mk(2, 24, 0, 60), 0, &valid_dates));
+
+        // 5바이트 뒤가 유효 CAT도 유효 월도 아니면 거부 (false positive 방지)
+        let mut bad = mk(2, 24, 10, 0);
+        bad[5] = 0x99;
+        assert!(!is_nec_frame(&bad, 0, &valid_dates));
+
+        // 빈 윈도우(검출 실패)면 항상 거부
+        assert!(!is_nec_frame(&mk(2, 24, 10, 0), 0, &[]));
     }
 }
 
