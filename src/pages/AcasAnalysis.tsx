@@ -203,7 +203,7 @@ export default function AcasAnalysis() {
   const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); };
 
   return (
-    <div className="flex h-full flex-col bg-white p-5">
+    <div className="flex h-full flex-col bg-white">
       <div className="mb-3 flex items-center gap-2">
         <ShieldAlert size={20} className="text-[#a60739]" />
         <h1 className="text-lg font-semibold text-gray-800">ACAS 분석</h1>
