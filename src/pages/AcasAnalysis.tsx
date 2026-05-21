@@ -344,14 +344,6 @@ export default function AcasAnalysis() {
         <ShieldAlert size={20} className="text-[#a60739]" />
         <h1 className="text-lg font-semibold text-gray-800">ACAS 분석</h1>
         <span className="text-[11px] text-gray-400">RA {raEvents.length} · 협의 {coordEvents.length}</span>
-        <button
-          onClick={pickFiles}
-          disabled={parsing || consolidating}
-          className="ml-auto flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a062f] disabled:opacity-50"
-        >
-          {parsing ? <Loader2 size={13} className="animate-spin" /> : <FolderOpen size={13} />}
-          {parsing ? `파싱 중 (${fileCount})...` : "ASS 파일 열기"}
-        </button>
       </div>
 
       {tcasReports.length === 0 ? (
