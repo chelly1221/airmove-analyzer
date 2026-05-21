@@ -1,10 +1,128 @@
-import { useCallback, useMemo, useState } from "react";
-import { ArrowUp, ArrowDown, Search, Info, ShieldAlert, Clock, ChevronDown, ChevronUp, X } from "lucide-react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { ArrowUp, ArrowDown, Search, Info, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import Modal from "../components/common/Modal";
+import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import DateRangePicker from "../components/common/DateRangePicker";
 import { useAppStore } from "../store";
 import { buildEventsFromReports, type TcasEvent, type CoordEvent } from "../utils/tcasEvents";
-import type { Flight } from "../types";
+import {
+  postPointsToWorker, startConsolidate, getPointSummary,
+  createThrottledChunkHandler, setConsolidationProgressCallback,
+} from "../utils/flightConsolidationWorker";
+import type { Flight, TrackPoint } from "../types";
+import type { TcasReport } from "../types/track";
+
+/**
+ * ASS 파일 선택 → 필터 모달 → 배치 스트리밍 파싱 → Worker 전송 + TCAS 누적 → 비행 통합.
+ * 3D 지도·2D 항적도(useAssFilePicker)와 동일 패턴이며, ACAS용으로 TCAS 보고 수집을 추가.
+ */
+function useAssFilePicker() {
+  const [parsing, setParsing] = useState(false);
+  const [fileCount, setFileCount] = useState(0);
+  const [filterModalOpen, setFilterModalOpen] = useState(false);
+  const [pendingPaths, setPendingPaths] = useState<string[]>([]);
+  const consolidatingRef = useRef(false);
+
+  const pickFiles = useCallback(async () => {
+    if (parsing) return;
+    const result = await open({
+      multiple: true,
+      filters: [{ name: "ASS Files", extensions: ["ass", "ASS"] }],
+    });
+    if (!result) return;
+    const paths = (Array.isArray(result) ? result : [result]).filter((p): p is string => typeof p === "string");
+    if (paths.length === 0) return;
+    setPendingPaths(paths);
+    setFilterModalOpen(true);
+  }, [parsing]);
+
+  const parseWithFilter = useCallback(async (filter: ParseFilterResult) => {
+    setFilterModalOpen(false);
+    const paths = pendingPaths;
+    if (paths.length === 0) return;
+
+    setParsing(true);
+    setFileCount(paths.length);
+
+    const site = useAppStore.getState().radarSite;
+
+    // 트랙 포인트: 청크 즉시 Worker로 fire-and-forget (메모리 일괄 보유 방지)
+    let totalForwarded = 0;
+    const unlistenPoints = await listen<{ points: TrackPoint[] }>("parse-points-chunk", (event) => {
+      const pts = event.payload.points;
+      for (const p of pts) p.radar_name = site.name;
+      totalForwarded += pts.length;
+      postPointsToWorker(pts);
+    });
+    // 파일별 결과: TCAS/ACAS 보고 누적 (트랙 독립 전수 추출)
+    const unlistenResult = await listen<{ success: boolean; file_info?: { tcas_reports?: TcasReport[] } }>(
+      "batch-parse-result",
+      (event) => {
+        const fi = event.payload.file_info;
+        if (event.payload.success && fi?.tcas_reports?.length) {
+          useAppStore.getState().appendTcasReports(fi.tcas_reports);
+        }
+      },
+    );
+
+    try {
+      await invoke("parse_and_analyze_batch", {
+        filePaths: paths,
+        radarLat: site.latitude,
+        radarLon: site.longitude,
+        modeSInclude: filter.modeSInclude,
+        modeSExclude: filter.modeSExclude,
+        mode3aInclude: filter.mode3aInclude,
+        mode3aExclude: filter.mode3aExclude,
+      });
+    } catch (e) {
+      console.error("[ACAS] 배치 파싱 실패:", e);
+    }
+
+    unlistenPoints();
+    unlistenResult();
+
+    if (totalForwarded > 0) {
+      const summary = await getPointSummary();
+      useAppStore.setState({ workerPointCount: summary.totalPoints, workerPointSummary: summary.entries });
+    }
+
+    // 비행 통합 — 위협/보고 항공기 라벨용 flights 생성
+    if (!consolidatingRef.current && useAppStore.getState().workerPointCount > 0) {
+      consolidatingRef.current = true;
+      useAppStore.getState().setConsolidating(true);
+      useAppStore.getState().setConsolidationProgress({ stage: "grouping", current: 0, total: 0, flightsBuilt: 0 });
+      setConsolidationProgressCallback((p) => useAppStore.getState().setConsolidationProgress(p as any));
+      try {
+        const state = useAppStore.getState();
+        const { handler, flush } = createThrottledChunkHandler(
+          (batch) => useAppStore.getState().appendFlights(batch), 250,
+        );
+        await startConsolidate([], state.aircraft, state.radarSite, handler);
+        flush();
+      } finally {
+        consolidatingRef.current = false;
+        setConsolidationProgressCallback(null);
+        useAppStore.getState().setConsolidating(false);
+        useAppStore.getState().setConsolidationProgress(null);
+        useAppStore.getState().finalizeFlights();
+      }
+    }
+
+    setParsing(false);
+    setPendingPaths([]);
+  }, [pendingPaths]);
+
+  const closeFilterModal = useCallback(() => {
+    setFilterModalOpen(false);
+    setPendingPaths([]);
+  }, []);
+
+  return { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount };
+}
 
 type TabId = "ra" | "coord";
 type TzMode = "UTC" | "KST";
@@ -51,6 +169,11 @@ const TTI_COLOR: Record<number, string> = {
 export default function AcasAnalysis() {
   const tcasReports = useAppStore((s) => s.tcasReports);
   const flights = useAppStore((s) => s.flights);
+  const aircraft = useAppStore((s) => s.aircraft);
+  const consolidating = useAppStore((s) => s.consolidating);
+  const consolidationProgress = useAppStore((s) => s.consolidationProgress);
+
+  const { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount } = useAssFilePicker();
 
   const { raEvents, coordEvents } = useMemo(
     () => buildEventsFromReports(tcasReports),
@@ -221,11 +344,27 @@ export default function AcasAnalysis() {
         <ShieldAlert size={20} className="text-[#a60739]" />
         <h1 className="text-lg font-semibold text-gray-800">ACAS 분석</h1>
         <span className="text-[11px] text-gray-400">RA {raEvents.length} · 협의 {coordEvents.length}</span>
+        <button
+          onClick={pickFiles}
+          disabled={parsing || consolidating}
+          className="ml-auto flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a062f] disabled:opacity-50"
+        >
+          {parsing ? <Loader2 size={13} className="animate-spin" /> : <FolderOpen size={13} />}
+          {parsing ? `파싱 중 (${fileCount})...` : "ASS 파일 열기"}
+        </button>
       </div>
 
       {tcasReports.length === 0 ? (
-        <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
-          ACAS 데이터가 없습니다. "자료 관리"에서 ASS 파일을 로드하세요.
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-gray-400">
+          <p>ACAS 데이터가 없습니다.</p>
+          <button
+            onClick={pickFiles}
+            disabled={parsing || consolidating}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#8a062f] disabled:opacity-50"
+          >
+            {parsing ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
+            {parsing ? `파싱 중 (${fileCount})...` : "ASS 파일 열기"}
+          </button>
         </div>
       ) : (
         <>
@@ -442,6 +581,25 @@ export default function AcasAnalysis() {
             )}
           </div>
         </Modal>
+      )}
+
+      {/* 파싱 필터 모달 */}
+      <ParseFilterModal open={filterModalOpen} onClose={closeFilterModal} onConfirm={parseWithFilter} aircraft={aircraft} />
+
+      {/* 비행 통합 진행 오버레이 */}
+      {consolidating && consolidationProgress && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/30 backdrop-blur-sm">
+          <div className="flex min-w-[280px] flex-col items-center gap-3 rounded-xl border border-gray-200 bg-white p-8 shadow-2xl">
+            <Loader2 size={28} className="animate-spin text-[#a60739]" />
+            <p className="text-sm text-gray-600">
+              {consolidationProgress.stage === "grouping" && "포인트 그룹핑 중..."}
+              {consolidationProgress.stage === "building" && `비행 생성 중... (${consolidationProgress.flightsBuilt}건)`}
+              {consolidationProgress.stage === "history" && "운항이력 로드 중..."}
+              {consolidationProgress.stage === "loading" && "DB에서 항적 로드 중..."}
+              {consolidationProgress.stage === "done" && "완료"}
+            </p>
+          </div>
+        </div>
       )}
     </div>
   );
