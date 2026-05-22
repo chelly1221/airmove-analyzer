@@ -5,8 +5,11 @@ import { invoke } from "@tauri-apps/api/core";
 import Modal from "./common/Modal";
 import { Dropdown } from "./common/Dropdown";
 import AddressSearch, { AddressMarker } from "./Map/AddressSearch";
-import type { BuildingGroup, GeometryType, ManualBuilding } from "../types";
+import type { BuildingGroup, GeometryType, ManualBuilding, BuildingFormData, BuildingModalDraft } from "../types";
+import { useAppStore } from "../store";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
+
+export type { BuildingFormData };
 
 // ─── landuse 프로토콜 (BuildingModal 전용) ──────────────────────
 import maplibregl from "maplibre-gl";
@@ -33,18 +36,6 @@ function ensureLanduseProtocol() {
 
 // ─── 타입 & 유틸 ──────────────────────────────────────────────
 
-export interface BuildingFormData {
-  name: string;
-  latitude: string;
-  longitude: string;
-  height: string;
-  ground_elev: string;
-  memo: string;
-  geometry_type: GeometryType;
-  geometry_json: string | null;
-  group_id: number | null;
-}
-
 const emptyForm: BuildingFormData = {
   name: "",
   latitude: "",
@@ -56,6 +47,38 @@ const emptyForm: BuildingFormData = {
   geometry_json: null,
   group_id: null,
 };
+
+/** 편집 대상/그룹으로부터 초기 작성 상태(draft) 생성 — 모달 오픈 시 1회 시드 */
+export function makeInitialDraft(
+  initial: ManualBuilding | null | undefined,
+  defaultGroupId: number | null | undefined,
+): BuildingModalDraft {
+  if (initial) {
+    const isMulti = initial.geometry_type === "multi";
+    let shapes: { type: GeometryType; json: string }[] = [];
+    if (isMulti && initial.geometry_json) {
+      try { shapes = JSON.parse(initial.geometry_json); } catch { shapes = []; }
+    }
+    return {
+      form: {
+        name: initial.name,
+        latitude: String(initial.latitude),
+        longitude: String(initial.longitude),
+        height: String(initial.height),
+        ground_elev: String(initial.ground_elev),
+        memo: initial.memo,
+        geometry_type: isMulti ? "polygon" : (initial.geometry_type || "polygon"),
+        geometry_json: isMulti ? null : (initial.geometry_json || null),
+        group_id: initial.group_id ?? null,
+      },
+      shapes,
+    };
+  }
+  return {
+    form: defaultGroupId != null ? { ...emptyForm, group_id: defaultGroupId } : emptyForm,
+    shapes: [],
+  };
+}
 
 function shapeCentroid(shape: { type: GeometryType; json: string | null }): [number, number] | null {
   if (!shape.json) return null;
@@ -116,7 +139,38 @@ interface Props {
 export default function BuildingModal({
   open: isOpen, onClose, onSave, initial, groups, allBuildings, defaultGroupId,
 }: Props) {
-  const [form, setForm] = useState<BuildingFormData>(emptyForm);
+  // 폼/도형은 전역 스토어 draft에 보관 → 페이지 이동 후 복귀 시에도 작성 내용 유지
+  const draft = useAppStore((s) => s.buildingModalDraft);
+  const setDraft = useAppStore((s) => s.setBuildingModalDraft);
+  const form = draft?.form ?? emptyForm;
+  const confirmedShapes = useMemo<{ type: GeometryType; json: string }[]>(() => draft?.shapes ?? [], [draft]);
+  const setForm = useCallback(
+    (u: BuildingFormData | ((f: BuildingFormData) => BuildingFormData)) => {
+      setDraft((d) => {
+        const cur = d ?? { form: emptyForm, shapes: [] };
+        return { ...cur, form: typeof u === "function" ? (u as (f: BuildingFormData) => BuildingFormData)(cur.form) : u };
+      });
+    },
+    [setDraft],
+  );
+  const setConfirmedShapes = useCallback(
+    (
+      u:
+        | { type: GeometryType; json: string }[]
+        | ((s: { type: GeometryType; json: string }[]) => { type: GeometryType; json: string }[]),
+    ) => {
+      setDraft((d) => {
+        const cur = d ?? { form: emptyForm, shapes: [] };
+        return {
+          ...cur,
+          shapes: typeof u === "function"
+            ? (u as (s: { type: GeometryType; json: string }[]) => { type: GeometryType; json: string }[])(cur.shapes)
+            : u,
+        };
+      });
+    },
+    [setDraft],
+  );
   const miniMapRef = useRef<MapRef>(null);
   const [miniMapReady, setMiniMapReady] = useState(false);
 
@@ -170,39 +224,18 @@ export default function BuildingModal({
 
   const [clickPts, setClickPts] = useState<[number, number][]>([]);
   const [mousePt, setMousePt] = useState<[number, number] | null>(null);
-  const [confirmedShapes, setConfirmedShapes] = useState<{ type: GeometryType; json: string }[]>([]);
   const [hoveredShapeIdx, setHoveredShapeIdx] = useState<number | null>(null);
   const [noGeomWarning, setNoGeomWarning] = useState(false);
 
+  // 모달 오픈 시 일시적(그리는 중) 상태만 초기화 — form/confirmedShapes는 스토어 draft에서 유지
   useEffect(() => {
-    if (initial) {
-      const isMulti = initial.geometry_type === "multi";
-      setForm({
-        name: initial.name,
-        latitude: String(initial.latitude),
-        longitude: String(initial.longitude),
-        height: String(initial.height),
-        ground_elev: String(initial.ground_elev),
-        memo: initial.memo,
-        geometry_type: isMulti ? "polygon" : (initial.geometry_type || "polygon"),
-        geometry_json: isMulti ? null : (initial.geometry_json || null),
-        group_id: initial.group_id ?? null,
-      });
-      if (isMulti && initial.geometry_json) {
-        try { setConfirmedShapes(JSON.parse(initial.geometry_json)); } catch { setConfirmedShapes([]); }
-      } else {
-        setConfirmedShapes([]);
-      }
-    } else {
-      setForm(defaultGroupId != null ? { ...emptyForm, group_id: defaultGroupId } : emptyForm);
-      setConfirmedShapes([]);
-    }
+    if (!isOpen) return;
     setClickPts([]);
     setMousePt(null);
     setHoveredShapeIdx(null);
     setNoGeomWarning(false);
     setMiniMapReady(false);
-  }, [initial, isOpen, defaultGroupId]);
+  }, [isOpen, initial, defaultGroupId]);
 
   const handleSubmit = () => {
     if (!form.name.trim() || !form.latitude || !form.longitude || !form.height) return;
@@ -270,7 +303,7 @@ export default function BuildingModal({
       window.addEventListener("keydown", handler);
       return () => window.removeEventListener("keydown", handler);
     }
-  }, [isOpen, clickPts, form.geometry_json, form.geometry_type, confirmedShapes.length]);
+  }, [isOpen, clickPts, form.geometry_json, form.geometry_type, confirmedShapes.length, setForm, setConfirmedShapes]);
 
   const addShapeToList = useCallback(() => {
     if (!form.geometry_json) return;
@@ -278,7 +311,7 @@ export default function BuildingModal({
     setConfirmedShapes((prev) => [...prev, { type: form.geometry_type, json: form.geometry_json! }]);
     setForm((f) => ({ ...f, geometry_type: "polygon" as GeometryType, geometry_json: null }));
     setClickPts([]);
-  }, [form.geometry_json, form.geometry_type]);
+  }, [form.geometry_json, form.geometry_type, setForm, setConfirmedShapes]);
 
   useEffect(() => {
     if (!miniMapRef.current || !form.geometry_json || clickPts.length > 0) return;
@@ -374,7 +407,7 @@ export default function BuildingModal({
       setForm((f) => ({ ...f, latitude: center[0].toFixed(6), longitude: center[1].toFixed(6), geometry_type: "polygon", geometry_json: JSON.stringify(updated) }));
       return updated;
     });
-  }, [form.geometry_json, clickPts.length, addShapeToList]);
+  }, [form.geometry_json, clickPts.length, addShapeToList, setForm]);
 
   const handleMapDblClick = useCallback((evt: any) => {
     evt.preventDefault();
@@ -388,7 +421,7 @@ export default function BuildingModal({
       setForm((f) => ({ ...f, latitude: center[0].toFixed(6), longitude: center[1].toFixed(6), geometry_type: "polygon" as GeometryType, geometry_json: JSON.stringify(cleaned) }));
       return [];
     });
-  }, []);
+  }, [setForm]);
 
   const handleMapMouseMove = useCallback((evt: any) => {
     const { lngLat, point } = evt;
@@ -507,7 +540,7 @@ export default function BuildingModal({
       .catch(() => { if (!cancelled) setForm((f) => ({ ...f, ground_elev: "0" })); })
       .finally(() => { if (!cancelled) setElevLoading(false); });
     return () => { cancelled = true; };
-  }, [elevMode, form.latitude, form.longitude]);
+  }, [elevMode, form.latitude, form.longitude, setForm]);
 
   const fields: { key: keyof BuildingFormData; label: string; placeholder: string; type?: string; required?: boolean }[] = [
     { key: "name", label: "건물명", placeholder: "예: 남산타워", required: true },

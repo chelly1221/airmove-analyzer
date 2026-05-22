@@ -102,3 +102,22 @@ export interface ManualBuilding {
   /** 소속 그룹 ID (null이면 미분류) */
   group_id: number | null;
 }
+
+/** 건물 수동 등록/수정 모달 폼 데이터 */
+export interface BuildingFormData {
+  name: string;
+  latitude: string;
+  longitude: string;
+  height: string;
+  ground_elev: string;
+  memo: string;
+  geometry_type: GeometryType;
+  geometry_json: string | null;
+  group_id: number | null;
+}
+
+/** 건물 모달 작성 중 상태 (페이지 이동에도 유지) */
+export interface BuildingModalDraft {
+  form: BuildingFormData;
+  shapes: { type: GeometryType; json: string }[];
+}

@@ -4,6 +4,7 @@ import { useToastStore } from "../components/common/Toast";
 import type {
   Aircraft,
   BuildingGroup,
+  BuildingModalDraft,
   Flight,
   LoSProfileData,
   ManualBuilding,
@@ -141,6 +142,17 @@ interface AppState {
   manualBuildings: ManualBuilding[];
   loadBuildingGroups: () => Promise<void>;
   loadManualBuildings: () => Promise<void>;
+
+  // 건물 수동 등록/수정 모달 (페이지 이동에도 열림/작성 내용 유지)
+  buildingModalOpen: boolean;
+  buildingModalEditTarget: ManualBuilding | null;
+  buildingModalAddGroupId: number | null;
+  buildingModalDraft: BuildingModalDraft | null;
+  openBuildingModal: (target: ManualBuilding | null, groupId: number | null, draft: BuildingModalDraft) => void;
+  closeBuildingModal: () => void;
+  setBuildingModalDraft: (
+    updater: BuildingModalDraft | null | ((d: BuildingModalDraft | null) => BuildingModalDraft | null),
+  ) => void;
   activePlanOverlays: Map<number, { imageDataUrl: string; bounds: PlanImageBounds; opacity: number; rotation: number }>;
   setActivePlanOverlay: (groupId: number, data: { imageDataUrl: string; bounds: PlanImageBounds; opacity: number; rotation?: number } | null) => void;
   updatePlanOverlayProps: (groupId: number, props: { opacity?: number; rotation?: number }) => void;
@@ -577,6 +589,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.warn("[ManualBuildings] 로드 실패:", e);
     }
   },
+
+  // 건물 모달 상태 — 자료관리 페이지를 떠났다 돌아와도 유지
+  buildingModalOpen: false,
+  buildingModalEditTarget: null,
+  buildingModalAddGroupId: null,
+  buildingModalDraft: null,
+  openBuildingModal: (target, groupId, draft) => set({
+    buildingModalOpen: true,
+    buildingModalEditTarget: target,
+    buildingModalAddGroupId: groupId,
+    buildingModalDraft: draft,
+  }),
+  closeBuildingModal: () => set({
+    buildingModalOpen: false,
+    buildingModalEditTarget: null,
+    buildingModalAddGroupId: null,
+    buildingModalDraft: null,
+  }),
+  setBuildingModalDraft: (updater) => set((state) => ({
+    buildingModalDraft: typeof updater === "function" ? updater(state.buildingModalDraft) : updater,
+  })),
   activePlanOverlays: new Map(),
   setActivePlanOverlay: (groupId, data) =>
     set((state) => {

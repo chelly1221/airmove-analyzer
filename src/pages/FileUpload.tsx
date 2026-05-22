@@ -17,7 +17,8 @@ import Modal from "../components/common/Modal";
 import { SrtmDownloadSection, FacBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
 import type { BuildingGroup, ManualBuilding } from "../types";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
-import BuildingModal, { shapeTypeLabel, type BuildingFormData } from "../components/BuildingModal";
+import BuildingModal, { shapeTypeLabel, makeInitialDraft, type BuildingFormData } from "../components/BuildingModal";
+import { useAppStore } from "../store";
 
 // ─── landuse 타일 프로토콜 ──────────────────────────────────────
 let landuseProtocolRegistered = false;
@@ -49,9 +50,12 @@ function ManualBuildingPanel() {
   const [buildings, setBuildings] = useState<ManualBuilding[]>([]);
   const [groups, setGroups] = useState<BuildingGroup[]>([]);
   const [loading, setLoading] = useState(true);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editTarget, setEditTarget] = useState<ManualBuilding | null>(null);
-  const [addGroupId, setAddGroupId] = useState<number | null>(null);
+  // 건물 모달 상태는 전역 스토어 — 페이지 이동 후 복귀해도 열림/작성 내용 유지
+  const modalOpen = useAppStore((s) => s.buildingModalOpen);
+  const editTarget = useAppStore((s) => s.buildingModalEditTarget);
+  const addGroupId = useAppStore((s) => s.buildingModalAddGroupId);
+  const openBuildingModal = useAppStore((s) => s.openBuildingModal);
+  const closeBuildingModal = useAppStore((s) => s.closeBuildingModal);
   // 그룹 관리
   const [groupModalOpen, setGroupModalOpen] = useState(false);
   const [editGroup, setEditGroup] = useState<BuildingGroup | null>(null);
@@ -112,8 +116,7 @@ function ManualBuildingPanel() {
           groupId: data.group_id,
         });
       }
-      setModalOpen(false);
-      setEditTarget(null);
+      closeBuildingModal();
       loadData();
     } catch (e) {
       console.error("건물 저장 실패:", e);
@@ -130,21 +133,15 @@ function ManualBuildingPanel() {
   };
 
   const openAdd = () => {
-    setEditTarget(null);
-    setAddGroupId(null);
-    setModalOpen(true);
+    openBuildingModal(null, null, makeInitialDraft(null, null));
   };
 
   const openAddInGroup = (groupId: number) => {
-    setEditTarget(null);
-    setAddGroupId(groupId);
-    setModalOpen(true);
+    openBuildingModal(null, groupId, makeInitialDraft(null, groupId));
   };
 
   const openEdit = (b: ManualBuilding) => {
-    setEditTarget(b);
-    setAddGroupId(null);
-    setModalOpen(true);
+    openBuildingModal(b, null, makeInitialDraft(b, null));
   };
 
   // 그룹 CRUD
@@ -435,7 +432,7 @@ function ManualBuildingPanel() {
 
       <BuildingModal
         open={modalOpen}
-        onClose={() => { setModalOpen(false); setEditTarget(null); setAddGroupId(null); }}
+        onClose={closeBuildingModal}
         onSave={handleSave}
         initial={editTarget}
         groups={groups}

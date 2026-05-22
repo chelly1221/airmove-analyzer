@@ -15,6 +15,8 @@ export type {
   BuildingGroup,
   PlanImageBounds,
   ManualBuilding,
+  BuildingFormData,
+  BuildingModalDraft,
 } from "./building";
 export type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult, PanoramaMergeDualResult } from "./panorama";
 export type { Flight, ManualMergeRecord } from "./flight";

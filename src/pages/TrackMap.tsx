@@ -28,7 +28,7 @@ const TrackLineIcon = ({ size = 16 }: { size?: number }) => (
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup } from "../types";
 import { queryViewportPoints } from "../utils/flightConsolidationWorker";
 import LoSProfilePanel from "../components/Map/LoSProfilePanel";
 import { isGPUCacheValidFor, renderCoverageImageAsync, queryMinDetectionAlt, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
@@ -186,6 +186,110 @@ function LosAddressSearch({ onSelect }: { onSelect: (lat: number, lon: number) =
   );
 }
 
+/** LoS 분석용 등록 장애물(수동 건물) 선택 — 그룹별 + 이름 검색 */
+function LosObstaclePicker({ buildings, groups, onSelect }: {
+  buildings: ManualBuilding[];
+  groups: BuildingGroup[];
+  onSelect: (b: ManualBuilding) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  // 검색 필터 + 그룹별 묶기 (미분류는 마지막)
+  const grouped = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const filtered = q ? buildings.filter((b) => b.name.toLowerCase().includes(q)) : buildings;
+    const byGroup = new Map<number | null, ManualBuilding[]>();
+    for (const b of filtered) {
+      const key = b.group_id ?? null;
+      const arr = byGroup.get(key);
+      if (arr) arr.push(b); else byGroup.set(key, [b]);
+    }
+    const order: { id: number | null; name: string; color: string; items: ManualBuilding[] }[] = [];
+    for (const g of groups) {
+      const items = byGroup.get(g.id);
+      if (items && items.length > 0) order.push({ id: g.id, name: g.name, color: g.color, items });
+    }
+    const unclassified = byGroup.get(null);
+    if (unclassified && unclassified.length > 0) {
+      order.push({ id: null, name: "미분류", color: "#9ca3af", items: unclassified });
+    }
+    return order;
+  }, [buildings, groups, query]);
+
+  const total = buildings.length;
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        disabled={total === 0}
+        className={`flex w-full items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors ${
+          total === 0
+            ? "border-gray-200 bg-gray-50 text-gray-300"
+            : open
+              ? "border-[#a60739] text-[#a60739]"
+              : "border-gray-200 bg-white text-gray-600 hover:border-gray-300"
+        }`}
+        title={total === 0 ? "등록된 장애물이 없습니다 (자료관리에서 등록)" : "등록 장애물 선택"}
+      >
+        <Building2 size={11} className="shrink-0" />
+        <span className="flex-1 text-left truncate">{total === 0 ? "등록 장애물 없음" : "등록 장애물 선택"}</span>
+        {total > 0 && <span className="shrink-0 text-[9px] text-gray-400">{total}</span>}
+        <ChevronDown size={11} className={`shrink-0 text-gray-400 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+
+      {open && total > 0 && (
+        <div className="absolute left-0 right-0 z-20 mt-1 rounded-md border border-gray-200 bg-white shadow-lg">
+          <div className="flex items-center gap-1 border-b border-gray-100 px-2 py-1">
+            <Search size={11} className="shrink-0 text-gray-400" />
+            <input
+              type="text" value={query} autoFocus
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="건물명 검색..."
+              className="flex-1 min-w-0 bg-transparent text-[11px] text-gray-700 outline-none placeholder:text-gray-400"
+            />
+            {query && (
+              <button onClick={() => setQuery("")} className="text-gray-400 hover:text-gray-600"><X size={10} /></button>
+            )}
+          </div>
+          <div className="max-h-[200px] overflow-y-auto py-0.5">
+            {grouped.length === 0 ? (
+              <div className="px-2 py-2 text-center text-[10px] text-gray-400">검색 결과 없음</div>
+            ) : grouped.map((g) => (
+              <div key={g.id ?? "none"}>
+                <div className="flex items-center gap-1.5 px-2 pt-1 pb-0.5">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: g.color }} />
+                  <span className="text-[9px] font-medium uppercase tracking-wide text-gray-400">{g.name}</span>
+                </div>
+                {g.items.map((b) => (
+                  <button
+                    key={b.id}
+                    onClick={() => { onSelect(b); setOpen(false); setQuery(""); }}
+                    className="flex w-full items-center gap-1.5 px-2.5 py-1 text-left text-[11px] text-gray-700 hover:bg-gray-50"
+                  >
+                    <span className="min-w-0 flex-1 truncate">{b.name}</span>
+                    <span className="shrink-0 text-[9px] text-gray-400">{b.height.toFixed(0)}m</span>
+                  </button>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface TrackPath {
   modeS: string;
   radarType: string;
@@ -329,6 +433,12 @@ export default function TrackMap() {
   const panoramaViewActive = useAppStore((s) => s.panoramaViewActive);
   const panoramaActivePoint = useAppStore((s) => s.panoramaActivePoint);
   const panoramaPinned = useAppStore((s) => s.panoramaPinned);
+
+  // 등록 장애물(수동 건물) — LoS 분석에서 빠르게 선택
+  const manualBuildings = useAppStore((s) => s.manualBuildings);
+  const buildingGroups = useAppStore((s) => s.buildingGroups);
+  const loadManualBuildings = useAppStore((s) => s.loadManualBuildings);
+  const loadBuildingGroups = useAppStore((s) => s.loadBuildingGroups);
 
   // LoS Analysis state
   const [losMode, setLosMode] = useState(false);
@@ -1643,6 +1753,27 @@ export default function TrackMap() {
     setLosTarget({ lat, lon });
   }, [radarSite.latitude, radarSite.longitude, losMode, viewState.pitch, viewState.bearing]);
 
+  // 등록 장애물 선택 → 해당 방위로 LoS 분석 (단면도는 장애물 살짝 너머까지)
+  const setLosToObstacle = useCallback((b: ManualBuilding) => {
+    const dLat = b.latitude - radarSite.latitude;
+    const dLon = b.longitude - radarSite.longitude;
+    const cosLat = Math.cos(radarSite.latitude * Math.PI / 180);
+    const az = ((Math.atan2(dLon * cosLat, dLat) * 180 / Math.PI) + 360) % 360;
+    const distKm = Math.sqrt((dLat * 111.32) ** 2 + (dLon * 111.32 * cosLat) ** 2);
+    const rangeKm = radarSite.range_nm > 0 ? radarSite.range_nm * 1.852 : Infinity;
+    // 장애물이 단면도 끝에 걸려 하이라이트가 누락되지 않도록 약간 더 길게 (레이더 범위 내로 제한)
+    const targetKm = Math.min(distKm * 1.08 + 1, rangeKm);
+    setLosFromAzDist(az, targetKm);
+    setLosSearchedAddress({ lat: b.latitude, lon: b.longitude });
+    setLosAzFineCenter(az);
+    setLosCursorPicking(false);
+  }, [radarSite.latitude, radarSite.longitude, radarSite.range_nm, setLosFromAzDist]);
+
+  // LoS 패널 열 때 등록 장애물/그룹 최신화 (자료관리에서 추가/수정된 내용 반영)
+  useEffect(() => {
+    if (losExpanded) { loadManualBuildings(); loadBuildingGroups(); }
+  }, [losExpanded, loadManualBuildings, loadBuildingGroups]);
+
   // LoS 선상 항적/Loss 포인트 전체 (단면도 전달용)
   const losTrackPoints = useMemo(() => {
     if (!losTarget) return [];
@@ -2849,6 +2980,13 @@ export default function TrackMap() {
                     }
                   }} />
                 </div>
+
+                {/* 등록 장애물(수동 건물) 선택 */}
+                <LosObstaclePicker
+                  buildings={manualBuildings}
+                  groups={buildingGroups}
+                  onSelect={setLosToObstacle}
+                />
 
                 {/* 방위 선택 원 + 정보 */}
                 <div className="flex items-center gap-3">
