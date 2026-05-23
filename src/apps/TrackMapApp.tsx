@@ -13,7 +13,7 @@ import {
   postPointsToWorker, startConsolidate, getPointSummary,
   createThrottledChunkHandler, setConsolidationProgressCallback,
 } from "../utils/flightConsolidationWorker";
-import type { Aircraft, RadarSite, TrackPoint } from "../types";
+import type { Aircraft, RadarSite, TrackPoint, WeatherVector } from "../types";
 
 /** DB에서 설정 복원 */
 function useRestoreSettings() {
@@ -27,7 +27,7 @@ function useRestoreSettings() {
         if (dbAircraft.length > 0) useAppStore.setState({ aircraft: dbAircraft });
       } catch {}
       try {
-        for (const key of ["custom_radar_sites", "selected_radar_site", "dev_mode"]) {
+        for (const key of ["custom_radar_sites", "selected_radar_site", "dev_mode", "weather_nm_per_bin"]) {
           const value = await invoke<string | null>("load_setting", { key });
           if (!value) continue;
           if (key === "custom_radar_sites") {
@@ -37,6 +37,9 @@ function useRestoreSettings() {
             useAppStore.getState().setRadarSite(JSON.parse(value));
           } else if (key === "dev_mode") {
             if (JSON.parse(value) === true) useAppStore.setState({ devMode: true });
+          } else if (key === "weather_nm_per_bin") {
+            const v = JSON.parse(value);
+            if (typeof v === "number" && v > 0) useAppStore.setState({ weatherNmPerBin: v });
           }
         }
       } catch {}
@@ -78,6 +81,9 @@ function useAssFilePicker() {
 
     const site = useAppStore.getState().radarSite;
 
+    // 이전 기상 데이터 초기화
+    useAppStore.getState().clearWeatherVectors();
+
     // 배치 파싱 이벤트 리스너 — 청크를 즉시 Worker로 fire-and-forget.
     // listener scope 종료 후 pts는 GC 가능 (closure capture 없음).
     let totalForwarded = 0;
@@ -86,6 +92,13 @@ function useAssFilePicker() {
       for (const p of pts) p.radar_name = site.name;
       totalForwarded += pts.length;
       postPointsToWorker(pts);
+    });
+
+    // 기상 벡터 청크 수신 → 누적 (CAT008, 트랙 독립). ~0.5M로 메인 보관 가능.
+    const weatherAccum: WeatherVector[] = [];
+    const unlistenWeather = await listen<{ vectors: WeatherVector[] }>("parse-weather-chunk", (event) => {
+      const vs = event.payload.vectors;
+      for (const v of vs) weatherAccum.push(v);
     });
 
     try {
@@ -103,6 +116,13 @@ function useAssFilePicker() {
     }
 
     unlisten();
+    unlistenWeather();
+
+    // 기상 벡터 시간순 정렬 후 store 커밋 (여러 파일 병렬 도착 → 순서 보장 필요)
+    if (weatherAccum.length > 0) {
+      weatherAccum.sort((a, b) => a.time - b.time);
+      useAppStore.getState().setWeatherVectors(weatherAccum);
+    }
 
     if (totalForwarded > 0) {
       const summary = await getPointSummary();

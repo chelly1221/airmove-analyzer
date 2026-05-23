@@ -1,6 +1,6 @@
 // Barrel re-export — 기존 import 100% 호환
 export type { Aircraft } from "./aircraft";
-export type { TrackPoint } from "./track";
+export type { TrackPoint, WeatherVector } from "./track";
 export type { LossPoint, LossSegment } from "./loss";
 export type { ParseStatistics, ParsedFile, AnalysisResult } from "./parse";
 export type { RadarSite } from "./radar";

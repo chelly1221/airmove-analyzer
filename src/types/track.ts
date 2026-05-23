@@ -22,6 +22,21 @@ export interface TrackPoint {
   radar_name?: string;
 }
 
+/** CAT008 기상 극좌표 벡터 (Rust WeatherVector 대응).
+ *  레이더 1차(PSR) 강수 에코. 거리는 bin 단위 — 실거리 = bin × NM/bin. */
+export interface WeatherVector {
+  /** Unix timestamp (NEC 프레임 분 단위 UTC) */
+  time: number;
+  /** 진북 기준 방위 (도, mag_dec 보정됨) */
+  azimuth: number;
+  /** 시작 거리 (bin) */
+  start_bin: number;
+  /** 끝 거리 (bin) */
+  end_bin: number;
+  /** 강도 레벨 1~6 */
+  intensity: number;
+}
+
 /** TCAS/ACAS 보고 — 트랙과 독립적으로 추출 (Rust TcasReport 대응) */
 export interface TcasReport {
   /** Unix timestamp */

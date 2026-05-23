@@ -18,7 +18,7 @@ import type {
   UploadedFile,
 } from "../types";
 import type { MultiCoverageResult } from "../utils/radarCoverage";
-import type { TcasReport } from "../types/track";
+import type { TcasReport, WeatherVector } from "../types/track";
 import type { AsterixStats } from "../types/asterix";
 import { manualMergeFlightsAsync, clearWorkerPoints } from "../utils/flightConsolidationWorker";
 
@@ -71,6 +71,21 @@ interface AppState {
   setConsolidationProgress: (p: { stage: "loading" | "history" | "grouping" | "building" | "done"; current: number; total: number; flightsBuilt: number } | null) => void;
   /** 선택된 비행들을 하나로 수동 병합 */
   mergeFlights: (ids: string[]) => void;
+
+  // CAT008 기상 (극좌표 강수 에코) — 트랙맵 오버레이
+  /** 전체 기상 벡터 (시간순 정렬, ~0.5M로 메인 보관) */
+  weatherVectors: WeatherVector[];
+  setWeatherVectors: (v: WeatherVector[]) => void;
+  clearWeatherVectors: () => void;
+  /** 기상 레이어 표시 토글 */
+  weatherVisible: boolean;
+  setWeatherVisible: (v: boolean) => void;
+  /** 거리 bin당 NM (SOP f 미전송 → 사용자 조정. 기본 0.5 = ASR/f6) */
+  weatherNmPerBin: number;
+  setWeatherNmPerBin: (v: number) => void;
+  /** 기상 레이어 투명도 (0~1) */
+  weatherOpacity: number;
+  setWeatherOpacity: (v: number) => void;
 
   // 레이더 사이트
   radarSite: RadarSite;
@@ -372,6 +387,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     });
   },
+
+  // CAT008 기상
+  weatherVectors: [],
+  setWeatherVectors: (v) => set({ weatherVectors: v }),
+  clearWeatherVectors: () => set({ weatherVectors: [] }),
+  weatherVisible: false,
+  setWeatherVisible: (v) => set({ weatherVisible: v }),
+  weatherNmPerBin: 0.5,
+  setWeatherNmPerBin: (v) => {
+    set({ weatherNmPerBin: v });
+    persistSetting("weather_nm_per_bin", v);
+  },
+  weatherOpacity: 0.55,
+  setWeatherOpacity: (v) => set({ weatherOpacity: v }),
 
   // 레이더 사이트 (기본: 김포 #1)
   radarSite: {

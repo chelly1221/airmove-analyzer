@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use log::{debug, info, warn};
 
-use crate::models::{ParseStatistics, RadarDetectionType, TcasReport, TrackPoint};
+use crate::models::{ParseStatistics, RadarDetectionType, TcasReport, TrackPoint, WeatherVector};
 
 const CAT048: u8 = 0x30;
 const CAT034: u8 = 0x22;
@@ -809,6 +809,114 @@ fn classify_and_convert(
     }
 }
 
+/// CAT008 블록에서 기상 극좌표 벡터(I008/034)를 전수 추출.
+/// 한 블록에 11바이트 레코드 N개. UAP: FRN1 I008/010(SAC/SIC),
+/// FRN2 I008/000(메시지타입), FRN3 I008/020(벡터 한정자/강도, FX),
+/// FRN4 I008/036(직교벡터, 미사용), FRN5 I008/034(극좌표벡터).
+/// 극좌표벡터 = REP(1) + REP×4옥텟[시작거리, 끝거리, 방위 16-bit].
+/// 방위 LSB = 360/2^16 deg. 강도 = I008/020 옥텟1 bits 7-5.
+/// 거리는 bin 그대로 보관(스케일은 프론트에서 적용). 방위는 자북→진북 보정 적용.
+fn extract_weather_vectors(
+    block: &[u8],
+    time: f64,
+    mag_dec_deg: f64,
+    out: &mut Vec<WeatherVector>,
+) {
+    let mut p = 3usize; // CAT(1)+LEN(2) 이후
+    while p < block.len() {
+        // FSPEC (FX 체인)
+        let mut present = [false; 8];
+        let mut item = 0usize;
+        loop {
+            if p >= block.len() {
+                return;
+            }
+            let byte = block[p];
+            p += 1;
+            for bit in (1..=7).rev() {
+                if item < 8 {
+                    present[item] = (byte >> bit) & 1 == 1;
+                }
+                item += 1;
+            }
+            if byte & 0x01 == 0 {
+                break;
+            }
+        }
+        // FRN1 I008/010 Data Source Identifier (SAC, SIC)
+        if present[0] {
+            if p + 2 > block.len() {
+                return;
+            }
+            p += 2;
+        }
+        // FRN2 I008/000 Message Type
+        if present[1] {
+            if p >= block.len() {
+                return;
+            }
+            p += 1;
+        }
+        // FRN3 I008/020 Vector Qualifier (강도 = bits 7-5 of 옥텟1, FX 확장)
+        let mut intensity = 0u8;
+        if present[2] {
+            if p >= block.len() {
+                return;
+            }
+            intensity = (block[p] >> 4) & 0x07;
+            while p < block.len() {
+                let o = block[p];
+                p += 1;
+                if o & 0x01 == 0 {
+                    break;
+                }
+            }
+        }
+        // FRN4 I008/036 Sequence of Cartesian Vectors (관측 데이터엔 없음, 정렬 유지용 스킵)
+        if present[3] {
+            if p >= block.len() {
+                return;
+            }
+            let rep = block[p] as usize;
+            p += 1 + rep * 3; // REP + REP×3옥텟(X,Y,Length)
+            if p > block.len() {
+                return;
+            }
+        }
+        // FRN5 I008/034 Sequence of Polar Vectors
+        if present[4] {
+            if p >= block.len() {
+                return;
+            }
+            let rep = block[p] as usize;
+            p += 1;
+            for _ in 0..rep {
+                if p + 4 > block.len() {
+                    return;
+                }
+                let start_bin = block[p];
+                let end_bin = block[p + 1];
+                let az_raw = ((block[p + 2] as u16) << 8) | (block[p + 3] as u16);
+                p += 4;
+                let az_deg = az_raw as f64 * (360.0 / 65536.0) + mag_dec_deg;
+                let az_norm = az_deg.rem_euclid(360.0);
+                out.push(WeatherVector {
+                    time,
+                    azimuth: az_norm as f32,
+                    start_bin,
+                    end_bin,
+                    intensity,
+                });
+            }
+        }
+        // 관측 데이터의 FSPEC는 항상 [I010,I000,I020,I034] → 여기서 p는 다음 레코드 경계.
+        // 그 외 항목(FRN6+)이 있으면 정렬을 보장할 수 없으므로 블록 파싱 중단.
+        if present[5] || present[6] || present[7] {
+            return;
+        }
+    }
+}
+
 /// TCAS/ACAS 보고를 트랙과 독립적으로 전수 추출.
 /// classify_and_convert의 discard 조건(좌표/시간/TYP)과 무관하게,
 /// I260/BDS3,0/BDS1,6 페이로드가 있으면 보고로 수집한다.
@@ -996,6 +1104,8 @@ pub fn parse_ass_file(
     // TCAS 보고 전수 추출용 (트랙 독립)
     let mut tcas_reports: Vec<TcasReport> = Vec::new();
     let mut last_valid_tcas_ts: Option<f64> = None;
+    // CAT008 기상 극좌표 벡터 전수 추출용 (트랙 독립)
+    let mut weather_vectors: Vec<WeatherVector> = Vec::new();
     // 프레임 전문 캡처: NEC 헤더~다음 헤더 직전까지 전체 바이트를 해당 프레임의 보고에 기록.
     // 경계(다음 헤더/EOF)를 만나야 끝을 알 수 있으므로 보고를 모았다가 일괄 기록한다.
     let mut tcas_frame_start: Option<usize> = None; // 현재 NEC 프레임 헤더 시작 오프셋
@@ -1188,6 +1298,12 @@ pub fn parse_ass_file(
                         }
                     }
                 }
+            } else if cat == CAT008 {
+                // CAT008 기상 극좌표 벡터 추출 (트랙 독립). CAT008엔 시각필드가 없어
+                // 직전 NEC 프레임 헤더의 분 단위 UTC를 타임스탬프로 사용.
+                let block_data = &data[offset..offset + block_len];
+                let t = nec_frame_utc_abs.unwrap_or(base_date_secs);
+                extract_weather_vectors(block_data, t, mag_dec_deg, &mut weather_vectors);
             }
 
             offset += block_len;
@@ -1259,6 +1375,7 @@ pub fn parse_ass_file(
         radar_lon,
         parse_stats: Some(stats),
         tcas_reports,
+        weather_vectors,
     })
 }
 

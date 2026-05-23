@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
-import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer } from "@deck.gl/layers";
 import {
   Mountain,
   Crosshair,
@@ -15,6 +15,7 @@ import {
   X,
   Search,
   MapPin,
+  CloudRain,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -42,6 +43,19 @@ import CoveragePanel from "../components/Map/CoveragePanel";
 
 /** 전체 항적 표시 시 최대 선택 가능 윈도우 (초) = 24시간 */
 const MAX_WINDOW_SECS = 86400;
+
+/** CAT008 기상 강도(1~6) → 색상 (NWS 스타일 강수 램프). 인덱스 0 미사용. */
+const WEATHER_COLORS: [number, number, number][] = [
+  [0, 0, 0],
+  [40, 180, 99],   // 1 약
+  [30, 132, 73],   // 2
+  [241, 196, 15],  // 3 중
+  [230, 126, 34],  // 4
+  [231, 76, 60],   // 5 강
+  [155, 30, 150],  // 6 매우 강
+];
+/** 기상 강도 범례 라벨 */
+const WEATHER_LEVEL_LABELS = ["", "약", "", "중", "", "강", "매우강"];
 
 /** 방위 선택 원형 컨트롤 */
 function AzimuthCircle({ azimuth, onChange, disabled }: { azimuth: number; onChange: (az: number) => void; disabled?: boolean }) {
@@ -311,6 +325,14 @@ export default function TrackMap() {
   const setSelectedModeS = useAppStore((s) => s.setSelectedModeS);
   const selectedFlightId = useAppStore((s) => s.selectedFlightId);
   const setSelectedFlightId = useAppStore((s) => s.setSelectedFlightId);
+  // CAT008 기상
+  const weatherVectors = useAppStore((s) => s.weatherVectors);
+  const weatherVisible = useAppStore((s) => s.weatherVisible);
+  const setWeatherVisible = useAppStore((s) => s.setWeatherVisible);
+  const weatherNmPerBin = useAppStore((s) => s.weatherNmPerBin);
+  const setWeatherNmPerBin = useAppStore((s) => s.setWeatherNmPerBin);
+  const weatherOpacity = useAppStore((s) => s.weatherOpacity);
+  const setWeatherOpacity = useAppStore((s) => s.setWeatherOpacity);
 
   const [portalReady, setPortalReady] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
@@ -2070,6 +2092,79 @@ export default function TrackMap() {
     ];
   }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight]);
 
+  // CAT008 기상 극좌표 벡터 → 부채꼴 폴리곤 레이어.
+  // 시간은 NEC 프레임 분 단위로 양자화 → 재생 시점(visibleMaxTs) 이하의 최신 1분 스냅샷만 표시.
+  // (전체 표시 시 44만개 누적 블롭 방지 + 실제 레이더 기상화면처럼 "현재 강수" 표현)
+  const weatherDeckLayers = useMemo(() => {
+    if (!weatherVisible || weatherVectors.length === 0 || !radarInfo) return [];
+
+    // 표시 상한 시각 (전체 보기면 마지막 데이터 시각)
+    const lastT = weatherVectors[weatherVectors.length - 1].time;
+    const upper = visibleMaxTs === Infinity ? lastT : visibleMaxTs;
+
+    // upper 이하 최신 인덱스 (시간 오름차순 정렬 → 이진탐색)
+    let lo = 0, hi = weatherVectors.length; // [lo, hi)
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (weatherVectors[mid].time <= upper) lo = mid + 1; else hi = mid;
+    }
+    const lastIdx = lo - 1;
+    if (lastIdx < 0) return [];
+
+    // 동일 타임스탬프(같은 분)의 벡터 = 한 스냅샷
+    const T = weatherVectors[lastIdx].time;
+    let start = lastIdx;
+    while (start > 0 && weatherVectors[start - 1].time === T) start--;
+    const snapshot = weatherVectors.slice(start, lastIdx + 1);
+    if (snapshot.length === 0) return [];
+
+    // 구면 destination (polar_to_latlon과 동일 공식, mag_dec는 azimuth에 이미 반영됨)
+    const R = 6371.0;
+    const rlat = radarInfo.lat, rlon = radarInfo.lon;
+    const la1 = (rlat * Math.PI) / 180;
+    const lo1 = (rlon * Math.PI) / 180;
+    const sinLa1 = Math.sin(la1), cosLa1 = Math.cos(la1);
+    const dest = (azDeg: number, nm: number): [number, number] => {
+      const d = (nm * 1.852) / R;
+      const th = (azDeg * Math.PI) / 180;
+      const sinD = Math.sin(d), cosD = Math.cos(d);
+      const la2 = Math.asin(sinLa1 * cosD + cosLa1 * sinD * Math.cos(th));
+      const lo2 = lo1 + Math.atan2(Math.sin(th) * sinD * cosLa1, cosD - sinLa1 * Math.sin(la2));
+      return [(lo2 * 180) / Math.PI, (la2 * 180) / Math.PI];
+    };
+
+    const HALF_BEAM = 360 / 256 / 2; // 방위 분해능 절반 (deg)
+    const nmPerBin = weatherNmPerBin;
+    const data = snapshot.map((w) => {
+      const az0 = w.azimuth - HALF_BEAM;
+      const az1 = w.azimuth + HALF_BEAM;
+      const r0 = w.start_bin * nmPerBin;
+      const r1 = (w.end_bin + 1) * nmPerBin; // end bin 포함 → +1
+      return {
+        polygon: [dest(az0, r0), dest(az0, r1), dest(az1, r1), dest(az1, r0)],
+        intensity: w.intensity,
+      };
+    });
+
+    const alpha = Math.round(Math.max(0, Math.min(1, weatherOpacity)) * 255);
+    return [
+      new PolygonLayer<{ polygon: [number, number][]; intensity: number }>({
+        id: "weather-sectors",
+        data,
+        getPolygon: (d) => d.polygon,
+        getFillColor: (d) => {
+          const c = WEATHER_COLORS[d.intensity] || WEATHER_COLORS[1];
+          return [c[0], c[1], c[2], alpha];
+        },
+        stroked: false,
+        filled: true,
+        extruded: false,
+        pickable: false,
+        updateTriggers: { getFillColor: [alpha] },
+      }),
+    ];
+  }, [weatherVisible, weatherVectors, radarInfo, weatherNmPerBin, weatherOpacity, visibleMaxTs]);
+
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
     if (!panoramaViewActive || !panoramaActivePoint) return [];
@@ -2189,6 +2284,9 @@ export default function TrackMap() {
       const a = aircraft.find((ac) => ac.mode_s_code.toLowerCase() === ms.toLowerCase());
       return a ? a.name : ms;
     };
+
+    // 기상 레이어 (항적 아래에 깔리도록 가장 먼저 합성)
+    layers.push(...weatherDeckLayers);
 
     // 항적선 또는 원시 탐지점
     if (!trackLine) {
@@ -2478,7 +2576,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackLine, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackLine, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2901,6 +2999,69 @@ export default function TrackMap() {
             <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${terrainEnabled ? "translate-x-4.5" : "translate-x-0.5"}`} />
           </button>
         </div>
+
+        {/* 기상 (CAT008) */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <CloudRain size={14} className={weatherVisible && weatherVectors.length > 0 ? "text-[#a60739]" : "text-gray-400"} />
+            <span className="text-xs text-gray-600">기상</span>
+            {weatherVectors.length === 0 && <span className="text-[9px] text-gray-300">데이터 없음</span>}
+          </div>
+          <button
+            onClick={() => setWeatherVisible(!weatherVisible)}
+            disabled={weatherVectors.length === 0}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-40 ${weatherVisible && weatherVectors.length > 0 ? "bg-[#a60739]" : "bg-gray-300"}`}
+            role="switch"
+            aria-checked={weatherVisible && weatherVectors.length > 0}
+          >
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${weatherVisible && weatherVectors.length > 0 ? "translate-x-4.5" : "translate-x-0.5"}`} />
+          </button>
+        </div>
+
+        {/* 기상 컨트롤 (토글 ON + 데이터 있을 때) */}
+        {weatherVisible && weatherVectors.length > 0 && (
+          <div className="ml-1 space-y-2 rounded-md bg-gray-50 p-2">
+            {/* 강도 범례 */}
+            <div className="flex items-center gap-1">
+              {[1, 2, 3, 4, 5, 6].map((lv) => (
+                <div key={lv} className="flex flex-1 flex-col items-center gap-0.5">
+                  <div
+                    className="h-2.5 w-full rounded-sm"
+                    style={{ backgroundColor: `rgb(${WEATHER_COLORS[lv][0]},${WEATHER_COLORS[lv][1]},${WEATHER_COLORS[lv][2]})` }}
+                  />
+                  <span className="text-[8px] text-gray-400">{WEATHER_LEVEL_LABELS[lv] || lv}</span>
+                </div>
+              ))}
+            </div>
+            {/* 거리 스케일 (NM/bin) */}
+            <div>
+              <div className="mb-0.5 flex items-center justify-between">
+                <span className="text-[10px] text-gray-500">거리 스케일</span>
+                <span className="text-[10px] font-medium tabular-nums text-gray-700">{weatherNmPerBin.toFixed(2)} NM/bin</span>
+              </div>
+              <input
+                type="range" min={0.25} max={2} step={0.25}
+                value={weatherNmPerBin}
+                onChange={(e) => setWeatherNmPerBin(Number(e.target.value))}
+                className="h-1 w-full cursor-pointer accent-[#a60739]"
+              />
+              <div className="mt-0.5 text-[8.5px] text-gray-400">최대 {(123 * weatherNmPerBin).toFixed(0)} NM (SOP f 미전송 → 추정값)</div>
+            </div>
+            {/* 투명도 */}
+            <div>
+              <div className="mb-0.5 flex items-center justify-between">
+                <span className="text-[10px] text-gray-500">투명도</span>
+                <span className="text-[10px] font-medium tabular-nums text-gray-700">{Math.round(weatherOpacity * 100)}%</span>
+              </div>
+              <input
+                type="range" min={0.1} max={1} step={0.05}
+                value={weatherOpacity}
+                onChange={(e) => setWeatherOpacity(Number(e.target.value))}
+                className="h-1 w-full cursor-pointer accent-[#a60739]"
+              />
+            </div>
+          </div>
+        )}
 
           </div>
         </div>

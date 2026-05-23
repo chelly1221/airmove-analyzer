@@ -52,6 +52,29 @@ fn emit_and_drain_track_points(
     points.shrink_to_fit();
 }
 
+/// CAT008 기상 벡터 청크 스트리밍 이벤트 페이로드
+#[derive(Clone, serde::Serialize)]
+struct WeatherChunk {
+    file_path: String,
+    vectors: Vec<models::WeatherVector>,
+}
+
+/// 기상 벡터를 청크 단위로 이벤트 emit한 뒤, 원본에서 제거.
+fn emit_and_drain_weather_vectors(
+    handle: &tauri::AppHandle,
+    file_path: &str,
+    vectors: &mut Vec<models::WeatherVector>,
+) {
+    for chunk in vectors.chunks(CHUNK_SIZE) {
+        let _ = handle.emit("parse-weather-chunk", WeatherChunk {
+            file_path: file_path.to_string(),
+            vectors: chunk.to_vec(),
+        });
+    }
+    vectors.clear();
+    vectors.shrink_to_fit();
+}
+
 /// Application state for managing aircraft data.
 struct AppState {
     app_data_dir: Mutex<PathBuf>,
@@ -186,6 +209,8 @@ struct BatchFileInfo {
     track_point_count: usize,
     /// TCAS/ACAS 보고 (트랙 독립 전수 추출)
     tcas_reports: Vec<models::TcasReport>,
+    /// CAT008 기상 벡터 개수 (벡터 자체는 청크로 별도 스트리밍)
+    weather_vector_count: usize,
 }
 
 /// 배치 완료 이벤트 페이로드
@@ -273,9 +298,12 @@ async fn parse_and_analyze_batch(
                         parse_stats: analysis.file_info.parse_stats.clone(),
                         track_point_count: analysis.file_info.track_points.len(),
                         tcas_reports: std::mem::take(&mut analysis.file_info.tcas_reports),
+                        weather_vector_count: analysis.file_info.weather_vectors.len(),
                     };
                     // track_points를 청크로 스트리밍 후 메모리 해제
                     emit_and_drain_track_points(&handle, &path, &mut analysis.file_info.track_points);
+                    // 기상 벡터를 청크로 스트리밍 후 메모리 해제
+                    emit_and_drain_weather_vectors(&handle, &path, &mut analysis.file_info.weather_vectors);
 
                     // analysis는 여기서 drop → 메모리 즉시 해제
                     BatchResultEvent {

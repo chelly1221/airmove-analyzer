@@ -12,6 +12,13 @@ dist
 dist-ssr
 *.local
 
+# TypeScript 빌드 산출물 (tsc emit + 증분 캐시)
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+src/dev/babelPluginSourceAttrs.js
+src/dev/babelPluginSourceAttrs.d.ts
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -29,5 +36,11 @@ src-tauri/target/
 # Reference ASS data files (large binary)
 ass/
 
+# 진단용 ASS 데이터 (대용량 바이너리)
+diagdata/
+
 # vworld 다운로드
 downloads/
+
+# Claude Code 로컬 상태
+.claude/scheduled_tasks.lock

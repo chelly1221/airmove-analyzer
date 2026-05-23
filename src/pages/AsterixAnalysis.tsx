@@ -337,7 +337,6 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
 
   const [search, setSearch] = useState("");
   const [catFilter, setCatFilter] = useState<number | null>(null);
-  const [acasOnly, setAcasOnly] = useState(false);
   const [startDt, setStartDt] = useState("");
   const [endDt, setEndDt] = useState("");
   const [dateOpen, setDateOpen] = useState(false);
@@ -356,7 +355,6 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
     const tMax = dtLocalToTs(endDt, tz);
     if (tMin != null) filter.timeMin = tMin;
     if (tMax != null) filter.timeMax = tMax;
-    if (acasOnly) filter.hasAcas = true;
 
     setQuerying(true);
     try {
@@ -370,16 +368,15 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
     } finally {
       setQuerying(false);
     }
-  }, [querying, search, catFilter, acasOnly, startDt, endDt, tz, filePaths]);
+  }, [querying, search, catFilter, startDt, endDt, tz, filePaths]);
 
   const clearFilters = () => {
     setSearch("");
     setCatFilter(null);
-    setAcasOnly(false);
     setStartDt("");
     setEndDt("");
   };
-  const anyFilter = !!(search || catFilter != null || acasOnly || startDt || endDt);
+  const anyFilter = !!(search || catFilter != null || startDt || endDt);
 
   // 상세 프레임 디코드
   const frameBytes = useMemo<number[]>(() => {
@@ -460,11 +457,6 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
             </>
           )}
         </div>
-
-        <label className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md border border-gray-200 bg-white px-2.5 text-[10.5px] font-medium text-gray-600">
-          <input type="checkbox" checked={acasOnly} onChange={(e) => setAcasOnly(e.target.checked)} className="accent-[#a60739]" />
-          ACAS RA 포함만
-        </label>
 
         <button
           onClick={runQuery}

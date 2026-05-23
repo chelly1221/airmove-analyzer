@@ -146,6 +146,23 @@ pub struct TcasReport {
     pub raw_frame: Vec<u8>,
 }
 
+/// CAT008 기상 극좌표 벡터 (I008/034) — 트랙 독립 전수 추출.
+/// 레이더 1차(PSR) 채널의 강수 에코. 방위별 거리구간 + 강도(6단계).
+/// 거리는 bin 단위로 보관 (실거리 = bin × NM/bin, SOP의 f 미전송이라 프론트에서 스케일 적용).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WeatherVector {
+    /// Unix timestamp (NEC 프레임 헤더의 분 단위 UTC — CAT008엔 시각필드 없음)
+    pub time: f64,
+    /// 진북 기준 방위 (도). 자북 → 진북(mag_dec) 보정 적용됨.
+    pub azimuth: f32,
+    /// 시작 거리 (bin)
+    pub start_bin: u8,
+    /// 끝 거리 (bin)
+    pub end_bin: u8,
+    /// 강도 레벨 1~6 (I008/020 bits 7-5)
+    pub intensity: u8,
+}
+
 /// Loss 구간 (Loss Segment)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LossSegment {
@@ -187,6 +204,9 @@ pub struct ParsedFile {
     /// TCAS/ACAS 보고 (트랙 독립 전수 추출)
     #[serde(default)]
     pub tcas_reports: Vec<TcasReport>,
+    /// CAT008 기상 극좌표 벡터 (트랙 독립 전수 추출)
+    #[serde(default)]
+    pub weather_vectors: Vec<WeatherVector>,
 }
 
 /// 분석 결과 (Analysis Result)
