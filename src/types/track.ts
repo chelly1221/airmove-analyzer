@@ -39,4 +39,6 @@ export interface TcasReport {
   longitude: number | null;
   /** 고도 (m, 없으면 null) */
   altitude: number | null;
+  /** 이 보고가 추출된 CAT048 레코드 원본 바이트 (프레임 전문) */
+  raw_frame: number[];
 }

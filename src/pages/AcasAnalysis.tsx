@@ -8,6 +8,7 @@ import ParseFilterModal, { type ParseFilterResult } from "../components/common/P
 import DateRangePicker from "../components/common/DateRangePicker";
 import { useAppStore } from "../store";
 import { buildEventsFromReports, type TcasEvent, type CoordEvent } from "../utils/tcasEvents";
+import { decodeFrame, type DecodedFrame } from "../utils/asterixDecoder";
 import {
   postPointsToWorker, startConsolidate, getPointSummary,
   createThrottledChunkHandler, setConsolidationProgressCallback,
@@ -43,6 +44,10 @@ function useAssFilePicker() {
     setFilterModalOpen(false);
     const paths = pendingPaths;
     if (paths.length === 0) return;
+
+    // 기존 데이터 전체 비우고 새로 불러오기 (worker 포인트/비행/커버리지/업로드목록 + TCAS 보고)
+    useAppStore.getState().clearUploadedFiles();
+    useAppStore.getState().clearTcasReports();
 
     setParsing(true);
     setFileCount(paths.length);
@@ -166,6 +171,60 @@ const TTI_COLOR: Record<number, string> = {
   3: "bg-gray-100 text-gray-500 border-gray-300",
 };
 
+const CAT_LABEL: Record<number, string> = { 0x30: "CAT048 표적보고", 0x22: "CAT034 서비스", 0x08: "CAT008 기상" };
+
+/** 프레임 디코드 결과 트리 렌더러 */
+function FrameDecodeView({ frame }: { frame: DecodedFrame }) {
+  return (
+    <div className="space-y-2 text-[10.5px]">
+      {frame.necHeader && (
+        <div className="flex items-baseline gap-2">
+          <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 font-medium text-[#a60739]">NEC 헤더</span>
+          <span className="text-gray-800">{frame.necHeader.text}</span>
+          <span className="font-mono text-gray-400">{frame.necHeader.rawHex}</span>
+        </div>
+      )}
+      {frame.blocks.length === 0 && <div className="text-gray-400">디코드된 블록 없음</div>}
+      {frame.blocks.map((blk, bi) => (
+        <div key={bi} className="rounded border border-gray-100">
+          <div className="flex items-baseline justify-between bg-gray-50 px-2 py-1">
+            <span className="font-medium text-gray-700">{CAT_LABEL[blk.cat] ?? `CAT${blk.cat.toString(16)}`}</span>
+            <span className="text-gray-400">len {blk.len} · rec {blk.records.length}</span>
+          </div>
+          <div className="divide-y divide-gray-50">
+            {blk.records.map((rec, ri) => (
+              <div key={ri} className="px-2 py-1">
+                {blk.records.length > 1 && <div className="mb-0.5 text-[9.5px] uppercase tracking-wider text-gray-400">레코드 {ri + 1}</div>}
+                <table className="w-full">
+                  <tbody>
+                    {rec.items.map((it, ii) => (
+                      <tr key={ii} className="align-top">
+                        <td className="whitespace-nowrap py-0.5 pr-2 font-mono text-gray-500">{it.id}</td>
+                        <td className="whitespace-nowrap py-0.5 pr-2 text-gray-600">{it.name}</td>
+                        <td className="py-0.5 pr-2 text-gray-900">{it.value ?? <span className="text-gray-300">—</span>}</td>
+                        <td className="py-0.5 font-mono text-[9.5px] text-gray-400 break-all">{it.rawHex}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {rec.note && <div className="mt-0.5 text-[9.5px] text-amber-600">※ {rec.note}</div>}
+              </div>
+            ))}
+          </div>
+          {blk.note && <div className="px-2 py-1 text-[9.5px] text-amber-600">※ {blk.note}</div>}
+        </div>
+      ))}
+      {frame.trailingRawHex && (
+        <div className="text-gray-400">
+          <span className="text-[9.5px] uppercase tracking-wider">잔여 </span>
+          <span className="font-mono">{frame.trailingRawHex}</span>
+        </div>
+      )}
+      {frame.note && <div className="text-[9.5px] text-amber-600">※ {frame.note}</div>}
+    </div>
+  );
+}
+
 export default function AcasAnalysis() {
   const tcasReports = useAppStore((s) => s.tcasReports);
   const flights = useAppStore((s) => s.flights);
@@ -193,6 +252,7 @@ export default function AcasAnalysis() {
   const [sortDesc, setSortDesc] = useState(false);
   const [detailEv, setDetailEv] = useState<TcasEvent | CoordEvent | null>(null);
   const [detailKind, setDetailKind] = useState<TabId>("ra");
+  const [showFrame, setShowFrame] = useState(false);
   const [dateOpen, setDateOpen] = useState(false);
 
   const toggleSort = useCallback((k: SortKey) => {
@@ -323,7 +383,14 @@ export default function AcasAnalysis() {
       </span>
     ) : null;
 
-  const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); };
+  const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); setShowFrame(false); };
+
+  // 선택된 보고의 프레임 전문 디코드 (모달 펼칠 때만 의미, 가벼움)
+  const decodedFrame = useMemo<DecodedFrame | null>(() => {
+    if (!detailEv?.frameHex) return null;
+    const bytes = detailEv.frameHex.match(/.{2}/g)?.map((h) => parseInt(h, 16)) ?? [];
+    return decodeFrame(bytes);
+  }, [detailEv]);
 
   const anyFilterActive = !!(search || descKeyword || startDt || endDt || !tti0 || !tti1 || !tti2);
   const clearAllFilters = () => {
@@ -344,6 +411,17 @@ export default function AcasAnalysis() {
         <ShieldAlert size={20} className="text-[#a60739]" />
         <h1 className="text-lg font-semibold text-gray-800">ACAS 분석</h1>
         <span className="text-[11px] text-gray-400">RA {raEvents.length} · 협의 {coordEvents.length}</span>
+        {tcasReports.length > 0 && (
+          <button
+            onClick={pickFiles}
+            disabled={parsing || consolidating}
+            title="기존 데이터를 비우고 새 ASS 파일을 불러옵니다"
+            className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-[#a60739]/30 bg-white px-3 py-1.5 text-[12px] font-medium text-[#a60739] transition-colors hover:bg-[#a60739]/5 disabled:opacity-50"
+          >
+            {parsing ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
+            {parsing ? `파싱 중 (${fileCount})...` : "새 ASS 파일"}
+          </button>
+        )}
       </div>
 
       {tcasReports.length === 0 ? (
@@ -532,7 +610,7 @@ export default function AcasAnalysis() {
 
       {/* RAW 상세 모달 */}
       {detailEv && (
-        <Modal open={true} onClose={() => setDetailEv(null)} title={detailKind === "ra" ? "RA 상세 (BDS 3,0)" : "협의 상세 (BDS 3,0 · RAC/MTE)"} width="max-w-md">
+        <Modal open={true} onClose={() => setDetailEv(null)} title={detailKind === "ra" ? "RA 상세 (BDS 3,0)" : "협의 상세 (BDS 3,0 · RAC/MTE)"} width="max-w-2xl">
           <div className="space-y-3 text-[11px]">
             <div>
               <div className="text-gray-500 mb-1">시각 ({tz}) · Own</div>
@@ -544,6 +622,37 @@ export default function AcasAnalysis() {
             <div>
               <div className="text-gray-500 mb-1">BDS 3,0 raw 페이로드 (7바이트)</div>
               <div className="rounded bg-gray-50 border border-gray-200 px-2 py-1.5 font-mono text-gray-800 break-all">{detailEv.rawHex.match(/.{2}/g)?.join(" ")}</div>
+            </div>
+            <div>
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-gray-500">프레임 전문 (NEC 프레임 · 전체 블록{detailEv.frameHex ? `, ${detailEv.frameHex.length / 2}바이트` : ""})</span>
+                <button
+                  onClick={() => setShowFrame((v) => !v)}
+                  disabled={!detailEv.frameHex}
+                  className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-0.5 text-[10px] font-medium text-gray-600 hover:border-[#a60739]/30 hover:text-[#a60739] disabled:opacity-40"
+                >
+                  {showFrame ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+                  {showFrame ? "접기" : "보기"}
+                </button>
+              </div>
+              {showFrame && (
+                <div className="space-y-2">
+                  {/* RAW HEX */}
+                  <div>
+                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">RAW HEX</div>
+                    <div className="max-h-32 overflow-auto rounded border border-gray-200 bg-gray-50 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed text-gray-800 break-all">
+                      {detailEv.frameHex ? detailEv.frameHex.match(/.{2}/g)?.join(" ") : "프레임 데이터 없음 (재파싱 필요)"}
+                    </div>
+                  </div>
+                  {/* 해석 */}
+                  <div>
+                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">해석</div>
+                    <div className="max-h-72 overflow-auto rounded border border-gray-200 bg-white px-2 py-1.5">
+                      {decodedFrame ? <FrameDecodeView frame={decodedFrame} /> : <span className="text-[10.5px] text-gray-400">프레임 데이터 없음 (재파싱 필요)</span>}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div><div className="text-gray-500">ARA (1-14)</div><div className="font-mono text-gray-800">0x{detailEv.araHex}</div></div>

@@ -141,6 +141,9 @@ pub struct TcasReport {
     pub longitude: Option<f64>,
     /// 고도 (m, flight level 변환). 없으면 None
     pub altitude: Option<f64>,
+    /// 프레임 전문 — NEC 프레임 헤더([월][일][시][분]+카운터) + 해당 프레임의 모든
+    /// ASTERIX 블록(CAT048/034/008 등) 원본 바이트. NEC 프레이밍이 없으면 해당 CAT048 블록.
+    pub raw_frame: Vec<u8>,
 }
 
 /// Loss 구간 (Loss Segment)

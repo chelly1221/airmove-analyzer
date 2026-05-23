@@ -817,6 +817,8 @@ fn classify_and_convert(
 /// 좌표/고도: 레코드에 있으면 채우고 없으면 None.
 fn extract_tcas_reports(
     record: &Cat048Record,
+    // 폴백 전문(해당 CAT048 블록). NEC 프레이밍이 있으면 프레임 경계에서 전체 프레임으로 덮어씀.
+    fallback_frame: &[u8],
     base_secs: f64,
     radar_lat: f64,
     radar_lon: f64,
@@ -873,6 +875,7 @@ fn extract_tcas_reports(
             latitude: lat,
             longitude: lon,
             altitude,
+            raw_frame: fallback_frame.to_vec(),
         });
     }
     // Coordination: BDS 1,6
@@ -886,6 +889,7 @@ fn extract_tcas_reports(
             latitude: lat,
             longitude: lon,
             altitude,
+            raw_frame: fallback_frame.to_vec(),
         });
     }
 }
@@ -992,12 +996,28 @@ pub fn parse_ass_file(
     // TCAS 보고 전수 추출용 (트랙 독립)
     let mut tcas_reports: Vec<TcasReport> = Vec::new();
     let mut last_valid_tcas_ts: Option<f64> = None;
+    // 프레임 전문 캡처: NEC 헤더~다음 헤더 직전까지 전체 바이트를 해당 프레임의 보고에 기록.
+    // 경계(다음 헤더/EOF)를 만나야 끝을 알 수 있으므로 보고를 모았다가 일괄 기록한다.
+    let mut tcas_frame_start: Option<usize> = None; // 현재 NEC 프레임 헤더 시작 오프셋
+    let mut tcas_frame_report_idx: usize = 0; // 현재 프레임에서 시작된 보고의 인덱스
 
     let mut offset = 0usize;
 
     while offset < data.len() {
         // Check for NEC frame header (5 bytes: month, day, hour, minute, counter)
         if !valid_dates.is_empty() && is_nec_frame(&data, offset, &valid_dates) {
+            // 직전 프레임 확정: [직전 헤더 .. 현재 헤더) 전체를 그 프레임 보고의 전문으로 기록
+            if let Some(fs) = tcas_frame_start {
+                if tcas_reports.len() > tcas_frame_report_idx {
+                    let frame = data[fs..offset].to_vec();
+                    for r in &mut tcas_reports[tcas_frame_report_idx..] {
+                        r.raw_frame = frame.clone();
+                    }
+                }
+            }
+            tcas_frame_start = Some(offset);
+            tcas_frame_report_idx = tcas_reports.len();
+
             let fm = data[offset];
             let fd = data[offset + 1];
             let fh = data[offset + 2];
@@ -1080,8 +1100,11 @@ pub fn parse_ass_file(
                             );
 
                             // TCAS 보고 전수 추출 (트랙 독립 — discard와 무관)
+                            // 폴백 전문은 해당 CAT048 블록. NEC 프레이밍이 있으면
+                            // 프레임 경계에서 전체 프레임 바이트로 덮어쓴다.
                             extract_tcas_reports(
                                 &record,
+                                block_data,
                                 base_date_secs + day_offset,
                                 radar_lat,
                                 radar_lon,
@@ -1171,6 +1194,17 @@ pub fn parse_ass_file(
         } else {
             skipped_bytes += 1;
             offset += 1;
+        }
+    }
+
+    // 마지막 프레임 확정: [마지막 헤더 .. EOF) 전체를 전문으로 기록
+    if let Some(fs) = tcas_frame_start {
+        if tcas_reports.len() > tcas_frame_report_idx {
+            let end = offset.min(data.len());
+            let frame = data[fs..end].to_vec();
+            for r in &mut tcas_reports[tcas_frame_report_idx..] {
+                r.raw_frame = frame.clone();
+            }
         }
     }
 

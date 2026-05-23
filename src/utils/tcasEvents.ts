@@ -22,6 +22,7 @@ interface RaPoint {
   estimated: boolean;
   decoded: TcasRaDecoded;
   rawBytes: number[];
+  frameBytes: number[];
 }
 
 export interface TcasEvent {
@@ -49,6 +50,8 @@ export interface TcasEvent {
   araHex: string;
   racHex: string;
   rawHex: string;
+  /** CAT048 레코드 원본 바이트 hex (프레임 전문) */
+  frameHex: string;
 }
 
 export interface CoordEvent {
@@ -71,6 +74,8 @@ export interface CoordEvent {
   araHex: string;
   racHex: string;
   rawHex: string;
+  /** CAT048 레코드 원본 바이트 hex (프레임 전문) */
+  frameHex: string;
 }
 
 function altFt(altM: number | null): number | undefined {
@@ -120,6 +125,7 @@ function buildRaEvents(byMs: Map<string, RaPoint[]>): TcasEvent[] {
         araHex: dec.ara.toString(16).toUpperCase().padStart(4, "0"),
         racHex: dec.rac.toString(16).toUpperCase(),
         rawHex: rep.rawBytes.map((b) => b.toString(16).padStart(2, "0")).join(""),
+        frameHex: rep.frameBytes.map((b) => b.toString(16).padStart(2, "0")).join(""),
       });
     }
   }
@@ -166,6 +172,7 @@ function buildCoordEventsInner(byMs: Map<string, RaPoint[]>): CoordEvent[] {
         araHex: dec.ara.toString(16).toUpperCase().padStart(4, "0"),
         racHex: dec.rac.toString(16).toUpperCase(),
         rawHex: rep.rawBytes.map((b) => b.toString(16).padStart(2, "0")).join(""),
+        frameHex: rep.frameBytes.map((b) => b.toString(16).padStart(2, "0")).join(""),
       });
     }
   }
@@ -193,7 +200,7 @@ export function buildEventsFromReports(reports: TcasReport[]): {
     if (!decoded || !decoded.hasRa) continue; // 유휴/비-RA 제외
     const pt: RaPoint = {
       ts: r.timestamp, lat: r.latitude, lon: r.longitude, altM: r.altitude,
-      estimated: r.time_estimated, decoded, rawBytes: r.payload,
+      estimated: r.time_estimated, decoded, rawBytes: r.payload, frameBytes: r.raw_frame ?? [],
     };
     // RA 탭: 실제 RA 전부
     let raArr = raByMs.get(r.mode_s);
