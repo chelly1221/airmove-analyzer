@@ -252,16 +252,28 @@ function FrameInspector({ frameBytes, decoded }: { frameBytes: number[]; decoded
           <FrameDecodeTree frame={decoded} hover={hover} onHover={setHover} />
         </div>
       </div>
-      {/* 우: RAW HEX */}
-      <div className="flex w-[38%] min-w-0 flex-col">
+      {/* 우: RAW HEX — 오프셋 컬럼 + 16바이트/행 (8바이트마다 간격) */}
+      <div className="flex w-[40%] min-w-0 flex-col">
         <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">RAW HEX</div>
-        <div className="flex-1 overflow-auto rounded border border-gray-200 bg-gray-50 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed break-all">
-          {frameBytes.map((b, i) => {
-            const hi = hover != null && i >= hover.start && i < hiEnd;
+        <div className="flex-1 overflow-auto rounded border border-gray-200 bg-gray-50 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed">
+          {Array.from({ length: Math.ceil(frameBytes.length / 16) }, (_, row) => {
+            const base = row * 16;
             return (
-              <span key={i} className={hi ? "bg-[#a60739] text-white" : "text-gray-700"}>
-                {b.toString(16).padStart(2, "0")}{i < frameBytes.length - 1 ? " " : ""}
-              </span>
+              <div key={row} className="whitespace-pre">
+                <span className="select-none text-gray-300">{base.toString(16).padStart(4, "0")}</span>
+                {"  "}
+                {Array.from({ length: 16 }, (_, j) => {
+                  const i = base + j;
+                  if (i >= frameBytes.length) return null;
+                  const hi = hover != null && i >= hover.start && i < hiEnd;
+                  const sep = j === 0 ? "" : j === 8 ? "  " : " ";
+                  return (
+                    <span key={j} className={hi ? "bg-[#a60739] text-white" : "text-gray-700"}>
+                      {sep}{frameBytes[i].toString(16).padStart(2, "0")}
+                    </span>
+                  );
+                })}
+              </div>
             );
           })}
         </div>
