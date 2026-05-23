@@ -26,6 +26,9 @@ export interface DecodedItem {
   rawHex: string;
   /** 해석 결과 (없으면 미해석) */
   value?: string;
+  /** 프레임 내 절대 바이트 오프셋 (RAW HEX 하이라이트용) */
+  start: number;
+  len: number;
 }
 
 export interface DecodedRecord {
@@ -45,7 +48,7 @@ export interface DecodedBlock {
 export interface DecodedFrame {
   necHeader?: {
     month: number; day: number; hour: number; minute: number; counter: number;
-    rawHex: string; text: string;
+    rawHex: string; text: string; start: number; len: number;
   };
   blocks: DecodedBlock[];
   /** 블록으로 해석되지 않은 잔여 바이트 */
@@ -275,8 +278,8 @@ const CAT048_UAP: ItemMeta[] = [
   { id: "RE", name: "예약확장 필드", kind: { k: "explicit" } },
 ];
 
-/** CAT048 레코드 디코드 — block[start..]에서 한 레코드. 반환 {items, next, note} */
-function decodeCat048Record(block: number[], start: number): { items: DecodedItem[]; next: number; note?: string } {
+/** CAT048 레코드 디코드 — block[start..]에서 한 레코드. base = block[0]의 프레임 절대 오프셋. */
+function decodeCat048Record(block: number[], start: number, base: number): { items: DecodedItem[]; next: number; note?: string } {
   const fspec = parseFspec(block, start, CAT048_UAP.length);
   if (!fspec) return { items: [], next: block.length, note: "FSPEC 파싱 불가" };
   const items: DecodedItem[] = [];
@@ -318,7 +321,7 @@ function decodeCat048Record(block: number[], start: number): { items: DecodedIte
     const raw = block.slice(pos, pos + len);
     let value: string | undefined;
     if (meta.decode) { try { value = meta.decode(raw); } catch { value = undefined; } }
-    items.push({ id: meta.id, name: meta.name, rawHex: hex(raw), value });
+    items.push({ id: meta.id, name: meta.name, rawHex: hex(raw), value, start: base + pos, len });
     pos += len;
   }
   return { items, next: pos, note };
@@ -382,8 +385,8 @@ const CAT008_UAP: GenMeta[] = [
   { id: "RE", name: "예약확장 필드", kind: { k: "stop" } },
 ];
 
-/** CAT034/008 레코드 디코드 — 선두 신뢰 항목까지. 나머지는 raw로 1건 추가하고 종료. */
-function decodeGenericRecord(block: number[], start: number, uap: GenMeta[]): { items: DecodedItem[]; next: number; note?: string } {
+/** CAT034/008 레코드 디코드 — 선두 신뢰 항목까지. 나머지는 raw로 1건 추가하고 종료. base=절대 오프셋. */
+function decodeGenericRecord(block: number[], start: number, base: number, uap: GenMeta[]): { items: DecodedItem[]; next: number; note?: string } {
   const fspec = parseFspec(block, start, uap.length);
   if (!fspec) return { items: [], next: block.length, note: "FSPEC 파싱 불가" };
   const items: DecodedItem[] = [];
@@ -405,12 +408,12 @@ function decodeGenericRecord(block: number[], start: number, uap: GenMeta[]): { 
     let value: string | undefined;
     const dec = meta.kind.k === "fixed" || meta.kind.k === "ext" ? meta.kind.decode : undefined;
     if (dec) { try { value = dec(raw); } catch { value = undefined; } }
-    items.push({ id: meta.id, name: meta.name, rawHex: hex(raw), value });
+    items.push({ id: meta.id, name: meta.name, rawHex: hex(raw), value, start: base + pos, len });
     pos += len;
   }
   // 남은 바이트는 raw로 노출 (블록 끝까지를 한 레코드로 간주 — 서비스/기상 메시지는 보통 단일 레코드)
   if (pos < block.length) {
-    items.push({ id: "(raw)", name: "미해석 잔여", rawHex: hex(block.slice(pos)) });
+    items.push({ id: "(raw)", name: "미해석 잔여", rawHex: hex(block.slice(pos)), start: base + pos, len: block.length - pos });
   }
   return { items, next: block.length, note };
 }
@@ -429,9 +432,9 @@ function decodeBlock(data: number[], offset: number): { block: DecodedBlock; nex
   while (recPos < blockBytes.length && guard < 1000) {
     guard += 1;
     let res;
-    if (cat === CAT048) res = decodeCat048Record(blockBytes, recPos);
-    else if (cat === CAT034) res = decodeGenericRecord(blockBytes, recPos, CAT034_UAP);
-    else if (cat === CAT008) res = decodeGenericRecord(blockBytes, recPos, CAT008_UAP);
+    if (cat === CAT048) res = decodeCat048Record(blockBytes, recPos, offset);
+    else if (cat === CAT034) res = decodeGenericRecord(blockBytes, recPos, offset, CAT034_UAP);
+    else if (cat === CAT008) res = decodeGenericRecord(blockBytes, recPos, offset, CAT008_UAP);
     else { block.note = `CAT${cat.toString(16)} 미지원`; break; }
 
     block.records.push({ items: res.items, note: res.note });
@@ -459,6 +462,7 @@ export function decodeFrame(bytes: number[]): DecodedFrame {
       month: h[0], day: h[1], hour: h[2], minute: h[3], counter: h[4],
       rawHex: hex(h),
       text: `${String(h[0]).padStart(2, "0")}-${String(h[1]).padStart(2, "0")} ${String(h[2]).padStart(2, "0")}:${String(h[3]).padStart(2, "0")} (KST) #${h[4]}`,
+      start: 0, len: 5,
     };
     pos = 5;
   }

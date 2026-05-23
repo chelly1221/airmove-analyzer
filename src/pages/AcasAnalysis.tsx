@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { ArrowUp, ArrowDown, Search, Info, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2 } from "lucide-react";
+import { ArrowUp, ArrowDown, Search, FileText, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -173,12 +173,21 @@ const TTI_COLOR: Record<number, string> = {
 
 const CAT_LABEL: Record<number, string> = { 0x30: "CAT048 표적보고", 0x22: "CAT034 서비스", 0x08: "CAT008 기상" };
 
-/** 프레임 디코드 결과 트리 렌더러 */
-function FrameDecodeView({ frame }: { frame: DecodedFrame }) {
+type ByteRange = { start: number; len: number } | null;
+
+/** 프레임 디코드 결과 트리 — 항목 hover 시 onHover로 바이트 범위 통지 */
+function FrameDecodeTree({ frame, hover, onHover }: { frame: DecodedFrame; hover: ByteRange; onHover: (r: ByteRange) => void }) {
+  const isActive = (start: number, len: number) => hover != null && hover.start === start && hover.len === len;
+  const rowCls = (start: number, len: number) =>
+    `cursor-default align-top ${isActive(start, len) ? "bg-[#a60739]/10" : "hover:bg-gray-50"}`;
   return (
     <div className="space-y-2 text-[10.5px]">
       {frame.necHeader && (
-        <div className="flex items-baseline gap-2">
+        <div
+          className={`flex items-baseline gap-2 rounded px-1 ${isActive(frame.necHeader.start, frame.necHeader.len) ? "bg-[#a60739]/10" : "hover:bg-gray-50"}`}
+          onMouseEnter={() => onHover({ start: frame.necHeader!.start, len: frame.necHeader!.len })}
+          onMouseLeave={() => onHover(null)}
+        >
           <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 font-medium text-[#a60739]">NEC 헤더</span>
           <span className="text-gray-800">{frame.necHeader.text}</span>
           <span className="font-mono text-gray-400">{frame.necHeader.rawHex}</span>
@@ -198,7 +207,12 @@ function FrameDecodeView({ frame }: { frame: DecodedFrame }) {
                 <table className="w-full">
                   <tbody>
                     {rec.items.map((it, ii) => (
-                      <tr key={ii} className="align-top">
+                      <tr
+                        key={ii}
+                        className={rowCls(it.start, it.len)}
+                        onMouseEnter={() => onHover({ start: it.start, len: it.len })}
+                        onMouseLeave={() => onHover(null)}
+                      >
                         <td className="whitespace-nowrap py-0.5 pr-2 font-mono text-gray-500">{it.id}</td>
                         <td className="whitespace-nowrap py-0.5 pr-2 text-gray-600">{it.name}</td>
                         <td className="py-0.5 pr-2 text-gray-900">{it.value ?? <span className="text-gray-300">—</span>}</td>
@@ -221,6 +235,37 @@ function FrameDecodeView({ frame }: { frame: DecodedFrame }) {
         </div>
       )}
       {frame.note && <div className="text-[9.5px] text-amber-600">※ {frame.note}</div>}
+    </div>
+  );
+}
+
+/** 프레임 전문 인스펙터 — 좌: 해석(항목별 hover), 우: RAW HEX(해당 바이트 하이라이트) */
+function FrameInspector({ frameBytes, decoded }: { frameBytes: number[]; decoded: DecodedFrame }) {
+  const [hover, setHover] = useState<ByteRange>(null);
+  const hiEnd = hover ? hover.start + hover.len : -1;
+  return (
+    <div className="flex min-h-0 flex-1 gap-2">
+      {/* 좌: 해석 */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">해석 (항목에 마우스를 올리면 우측 RAW가 강조됩니다)</div>
+        <div className="flex-1 overflow-auto rounded border border-gray-200 bg-white px-2 py-1.5">
+          <FrameDecodeTree frame={decoded} hover={hover} onHover={setHover} />
+        </div>
+      </div>
+      {/* 우: RAW HEX */}
+      <div className="flex w-[38%] min-w-0 flex-col">
+        <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">RAW HEX</div>
+        <div className="flex-1 overflow-auto rounded border border-gray-200 bg-gray-50 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed break-all">
+          {frameBytes.map((b, i) => {
+            const hi = hover != null && i >= hover.start && i < hiEnd;
+            return (
+              <span key={i} className={hi ? "bg-[#a60739] text-white" : "text-gray-700"}>
+                {b.toString(16).padStart(2, "0")}{i < frameBytes.length - 1 ? " " : ""}
+              </span>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }
@@ -384,12 +429,15 @@ export default function AcasAnalysis() {
 
   const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); };
 
-  // 선택된 보고의 프레임 전문 디코드 (모달 펼칠 때만 의미, 가벼움)
-  const decodedFrame = useMemo<DecodedFrame | null>(() => {
-    if (!detailEv?.frameHex) return null;
-    const bytes = detailEv.frameHex.match(/.{2}/g)?.map((h) => parseInt(h, 16)) ?? [];
-    return decodeFrame(bytes);
+  // 선택된 보고의 프레임 전문 바이트 + 디코드 (모달용, 가벼움)
+  const frameBytes = useMemo<number[]>(() => {
+    if (!detailEv?.frameHex) return [];
+    return detailEv.frameHex.match(/.{2}/g)?.map((h) => parseInt(h, 16)) ?? [];
   }, [detailEv]);
+  const decodedFrame = useMemo<DecodedFrame | null>(
+    () => (frameBytes.length ? decodeFrame(frameBytes) : null),
+    [frameBytes],
+  );
 
   const anyFilterActive = !!(search || descKeyword || startDt || endDt || !tti0 || !tti1 || !tti2);
   const clearAllFilters = () => {
@@ -553,7 +601,7 @@ export default function AcasAnalysis() {
                   </>}
                   <SortHeader k="duration" label="지속(s)" tip="첫~마지막 보고 간격" />
                   <SortHeader k="pointCount" label="횟수" tip="보고 점 수" />
-                  <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-center text-[11px] font-medium text-gray-600 w-10">상세</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-center text-[11px] font-medium text-gray-600 w-24">전문</th>
                 </tr>
               </thead>
               <tbody>
@@ -576,7 +624,7 @@ export default function AcasAnalysis() {
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{(ev.endTime - ev.startTime).toFixed(1)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{ev.raPointCount}</td>
                       <td className="px-3 py-1.5 text-center">
-                        <button onClick={() => openDetail(ev, "ra")} className="rounded p-1 text-gray-400 hover:bg-[#a60739]/10 hover:text-[#a60739]" title="raw 페이로드 상세"><Info size={12} /></button>
+                        <button onClick={() => openDetail(ev, "ra")} className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-1 text-[10px] font-medium text-gray-600 transition-colors hover:border-[#a60739]/40 hover:bg-[#a60739]/5 hover:text-[#a60739]" title="프레임 전문 + 해석 보기"><FileText size={11} />전문보기</button>
                       </td>
                     </tr>
                   ))
@@ -596,7 +644,7 @@ export default function AcasAnalysis() {
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{(ev.endTime - ev.startTime).toFixed(1)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{ev.pointCount}</td>
                       <td className="px-3 py-1.5 text-center">
-                        <button onClick={() => openDetail(ev, "coord")} className="rounded p-1 text-gray-400 hover:bg-[#a60739]/10 hover:text-[#a60739]" title="raw 페이로드 상세"><Info size={12} /></button>
+                        <button onClick={() => openDetail(ev, "coord")} className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-1 text-[10px] font-medium text-gray-600 transition-colors hover:border-[#a60739]/40 hover:bg-[#a60739]/5 hover:text-[#a60739]" title="프레임 전문 + 해석 보기"><FileText size={11} />전문보기</button>
                       </td>
                     </tr>
                   ))
@@ -660,23 +708,8 @@ export default function AcasAnalysis() {
               <div className="mb-2 shrink-0 text-gray-500">
                 프레임 전문 (NEC 프레임 · 전체 블록{detailEv.frameHex ? `, ${detailEv.frameHex.length / 2}바이트` : ""})
               </div>
-              {detailEv.frameHex ? (
-                <div className="flex min-h-0 flex-1 flex-col gap-2">
-                  {/* RAW HEX */}
-                  <div className="flex max-h-[32%] shrink-0 flex-col">
-                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">RAW HEX</div>
-                    <div className="flex-1 overflow-auto rounded border border-gray-200 bg-gray-50 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed text-gray-800 break-all">
-                      {detailEv.frameHex.match(/.{2}/g)?.join(" ")}
-                    </div>
-                  </div>
-                  {/* 해석 */}
-                  <div className="flex min-h-0 flex-1 flex-col">
-                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">해석</div>
-                    <div className="flex-1 overflow-auto rounded border border-gray-200 bg-white px-2 py-1.5">
-                      {decodedFrame ? <FrameDecodeView frame={decodedFrame} /> : <span className="text-[10.5px] text-gray-400">해석 불가</span>}
-                    </div>
-                  </div>
-                </div>
+              {detailEv.frameHex && decodedFrame ? (
+                <FrameInspector frameBytes={frameBytes} decoded={decodedFrame} />
               ) : (
                 <div className="flex flex-1 items-center justify-center rounded border border-dashed border-gray-200 text-gray-400">
                   프레임 데이터 없음 (재파싱 필요)
