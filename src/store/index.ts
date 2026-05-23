@@ -19,6 +19,7 @@ import type {
 } from "../types";
 import type { MultiCoverageResult } from "../utils/radarCoverage";
 import type { TcasReport } from "../types/track";
+import type { AsterixStats } from "../types/asterix";
 import { manualMergeFlightsAsync, clearWorkerPoints } from "../utils/flightConsolidationWorker";
 
 /** 설정을 DB에 비동기 저장 (fire-and-forget) */
@@ -125,6 +126,12 @@ interface AppState {
   tcasReports: TcasReport[];
   appendTcasReports: (reports: TcasReport[]) => void;
   clearTcasReports: () => void;
+
+  // ASTERIX 분석 — 전수 스캔 통계 + 업로드 파일 경로(온디맨드 조회용). 자체 업로드 독립.
+  asterixStats: AsterixStats | null;
+  asterixFilePaths: string[];
+  setAsterixResult: (stats: AsterixStats, paths: string[]) => void;
+  clearAsterix: () => void;
 
 
   // 보고서 메타데이터
@@ -538,6 +545,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   tcasReports: [],
   appendTcasReports: (reports) => set((s) => ({ tcasReports: [...s.tcasReports, ...reports] })),
   clearTcasReports: () => set({ tcasReports: [] }),
+
+  asterixStats: null,
+  asterixFilePaths: [],
+  setAsterixResult: (stats, paths) => set({ asterixStats: stats, asterixFilePaths: paths }),
+  clearAsterix: () => set({ asterixStats: null, asterixFilePaths: [] }),
 
 
   // 보고서 메타데이터

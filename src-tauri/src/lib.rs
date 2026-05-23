@@ -308,6 +308,59 @@ async fn parse_and_analyze_batch(
     .map_err(|e| format!("Task join error: {}", e))
 }
 
+/// ASTERIX 스캔 진행 이벤트.
+#[derive(Clone, serde::Serialize)]
+struct AsterixScanProgress {
+    done: usize,
+    total: usize,
+    filename: String,
+}
+
+/// "ASTERIX 분석" 탭: 선택 ASS 파일들을 전수 1패스 스캔하여 집계 통계 반환.
+/// 트랙/비행/ACAS 보고와 무관하게 모든 프레임/블록/레코드를 순회한다.
+#[tauri::command]
+async fn scan_asterix_batch(
+    app_handle: tauri::AppHandle,
+    file_paths: Vec<String>,
+) -> Result<parser::ass::AsterixStats, String> {
+    info!("Command: scan_asterix_batch({} files)", file_paths.len());
+    tauri::async_runtime::spawn_blocking(move || {
+        let total = file_paths.len();
+        let mut state = parser::ass::AsterixScanState::default();
+        for (i, path) in file_paths.iter().enumerate() {
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            if let Err(e) = parser::ass::asterix_scan_file(path, &mut state) {
+                info!("[ASTERIX] 스캔 실패 {}: {}", filename, e);
+            }
+            let _ = app_handle.emit(
+                "asterix-scan-progress",
+                AsterixScanProgress {
+                    done: i + 1,
+                    total,
+                    filename,
+                },
+            );
+        }
+        Ok(parser::ass::asterix_finalize(state))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// "ASTERIX 분석" 탭: 필터 기반 온디맨드 프레임 조회 (재스캔, 상한까지 수집).
+#[tauri::command]
+async fn query_asterix_frames(
+    file_paths: Vec<String>,
+    filter: parser::ass::AsterixFilter,
+) -> Result<parser::ass::AsterixQueryResult, String> {
+    tauri::async_runtime::spawn_blocking(move || parser::ass::asterix_query(&file_paths, &filter))
+        .await
+        .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// Filter track points by Mode-S code (case-insensitive match).
 
 /// 파일을 읽어 base64로 반환 (한글 폰트 등)
@@ -2460,6 +2513,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             parse_and_analyze,
             parse_and_analyze_batch,
+            scan_asterix_batch,
+            query_asterix_frames,
             get_aircraft_list,
             save_aircraft,
             delete_aircraft,

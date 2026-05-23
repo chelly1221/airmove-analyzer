@@ -13,6 +13,7 @@ import {
   ExternalLink,
   Loader2,
   ShieldAlert,
+  Binary,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import Modal from "../common/Modal";
@@ -55,6 +56,7 @@ const navSections: NavSection[] = [
     items: [
       { id: "obstacle", label: "LoS 장애물", icon: Eye, path: "/obstacle" },
       { id: "acas", label: "ACAS", icon: ShieldAlert, path: "/acas" },
+      { id: "asterix", label: "ASTERIX", icon: Binary, path: "/asterix" },
       { id: "report", label: "보고서", icon: FileText, path: "/report" },
     ],
   },

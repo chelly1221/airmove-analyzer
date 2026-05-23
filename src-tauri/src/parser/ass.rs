@@ -1865,6 +1865,850 @@ fn parse_cat048_record(
     Ok((record, pos, truncated))
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// ASTERIX 전수 스캐너 — "ASTERIX 분석" 탭 전용.
+//
+// 트랙/비행 통합과 무관하게 모든 NEC 프레임 / ASTERIX 블록 / 레코드를 전수 순회하여
+//   (1) 집계 통계(대시보드용 AsterixStats)
+//   (2) 필터 기반 온디맨드 프레임 조회(AsterixQueryResult)
+// 를 제공한다. framing/date/parse 헬퍼(parse_cat048_record, parse_fspec, is_nec_frame,
+// is_valid_block_start, compute_day_offset, days_from_epoch 등)를 그대로 재사용하여
+// 본 파서(parse_ass_file)와 정합한다. 메모리는 집계(작은 맵/셋)와 조회 상한으로 항상 유한.
+// ─────────────────────────────────────────────────────────────────────
+
+use serde::{Deserialize, Serialize};
+
+/// 온디맨드 조회로 한 번에 반환하는 최대 프레임 수 (초과분은 필터로 좁히도록 안내).
+const ASTERIX_QUERY_MAX: usize = 2000;
+
+/// CAT048 FRN(1-28) 식별자/이름 — asterixDecoder.ts의 CAT048_UAP와 동일 순서.
+const CAT048_FRN_META: [(&str, &str); UAP_MAX] = [
+    ("I048/010", "데이터 출처 식별"),
+    ("I048/140", "시각(TOD)"),
+    ("I048/020", "표적보고 기술자"),
+    ("I048/040", "측정위치(극좌표)"),
+    ("I048/070", "Mode-3/A 코드"),
+    ("I048/090", "고도(FL)"),
+    ("I048/130", "레이더 플롯 특성"),
+    ("I048/220", "항공기 주소"),
+    ("I048/240", "항공기 식별(콜사인)"),
+    ("I048/250", "Mode-S MB 데이터"),
+    ("I048/161", "트랙 번호"),
+    ("I048/042", "계산위치(직교)"),
+    ("I048/200", "계산 속도(극좌표)"),
+    ("I048/170", "트랙 상태"),
+    ("I048/210", "트랙 품질"),
+    ("I048/030", "경고/오류 조건"),
+    ("I048/080", "Mode-3/A 신뢰도"),
+    ("I048/100", "Mode-C 신뢰도"),
+    ("I048/110", "3D 높이"),
+    ("I048/120", "레이디얼 도플러 속도"),
+    ("I048/230", "통신/ACAS 능력"),
+    ("I048/260", "ACAS RA 보고"),
+    ("I048/055", "Mode-1 코드"),
+    ("I048/050", "Mode-2 코드"),
+    ("I048/065", "Mode-1 신뢰도"),
+    ("I048/060", "Mode-2 신뢰도"),
+    ("SP", "특수목적 필드"),
+    ("RE", "예약확장 필드"),
+];
+
+const TYP048_LABELS: [&str; 8] = [
+    "탐지없음",
+    "Single PSR",
+    "Single SSR",
+    "SSR+PSR",
+    "Mode S All-Call",
+    "Mode S Roll-Call",
+    "Mode S All-Call+PSR",
+    "Mode S Roll-Call+PSR",
+];
+
+fn msg_type_034_label(t: u8) -> &'static str {
+    match t {
+        1 => "North marker",
+        2 => "섹터 통과",
+        3 => "지리적 필터링",
+        4 => "재밍 스트로브",
+        5 => "태양 폭풍",
+        _ => "기타",
+    }
+}
+fn msg_type_008_label(t: u8) -> &'static str {
+    match t {
+        1 => "극좌표 벡터",
+        2 => "직교 벡터",
+        3 => "윤곽 기록",
+        4 => "절대 직교 벡터",
+        254 => "SOP 메시지",
+        255 => "EOP 메시지",
+        _ => "기타",
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct CatCount {
+    pub cat: u8,
+    pub blocks: u64,
+    pub records: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct FrnCount {
+    pub id: String,
+    pub name: String,
+    pub count: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct SacSicCount {
+    pub sac: u8,
+    pub sic: u8,
+    pub count: u64,
+}
+
+/// 키/라벨/카운트 일반 항목 (레이더 유형, Mode-S Top-N, 메시지 유형 등에 공용).
+#[derive(Serialize, Clone)]
+pub struct LabeledCount {
+    pub key: String,
+    pub label: String,
+    pub count: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct AsterixFileStat {
+    pub filename: String,
+    pub bytes: u64,
+    pub frames: u64,
+    pub records: u64,
+}
+
+/// 대시보드 집계 통계 (전수 1패스).
+#[derive(Serialize, Clone, Default)]
+pub struct AsterixStats {
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub frame_count: u64,
+    pub block_count: u64,
+    pub record_count: u64,
+    pub skipped_bytes: u64,
+    pub parse_errors: u64,
+    pub truncated_records: u64,
+    pub cat_counts: Vec<CatCount>,
+    pub cat048_frn_counts: Vec<FrnCount>,
+    pub radar_typ_counts: Vec<LabeledCount>,
+    pub sac_sic_counts: Vec<SacSicCount>,
+    pub modes_distinct: usize,
+    pub modes_top: Vec<LabeledCount>,
+    pub msg_type_034: Vec<LabeledCount>,
+    pub msg_type_008: Vec<LabeledCount>,
+    pub tod_min: Option<f64>,
+    pub tod_max: Option<f64>,
+    pub time_min: Option<f64>,
+    pub time_max: Option<f64>,
+    pub nec_dates: Vec<String>,
+    pub acas_ra_records: u64,
+    pub mode3a_garbled: u64,
+    pub files: Vec<AsterixFileStat>,
+}
+
+/// 온디맨드 프레임 조회 필터 (프런트는 camelCase로 전달).
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AsterixFilter {
+    /// Mode-S hex 부분일치 (대문자)
+    pub mode_s: Option<String>,
+    /// 특정 카테고리(0x30/0x22/0x08) 포함 프레임만
+    pub cat: Option<u8>,
+    /// 절대 Unix 시각(초) 범위 — 레코드 abs_time 기준
+    pub time_min: Option<f64>,
+    pub time_max: Option<f64>,
+    /// ACAS RA(I260/BDS3,0) 포함 여부
+    pub has_acas: Option<bool>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct AsterixFrameSummary {
+    pub file_index: usize,
+    pub frame_offset: u64,
+    pub byte_len: usize,
+    pub cats: Vec<u8>,
+    pub record_count: usize,
+    pub mode_s_list: Vec<String>,
+    pub tod: Option<f64>,
+    pub abs_time: Option<f64>,
+    pub has_acas: bool,
+    /// 프레임 전문 hex (NEC 헤더 + 모든 블록). 프런트가 asterixDecoder로 디코드.
+    pub frame_hex: String,
+}
+
+#[derive(Serialize)]
+pub struct AsterixQueryResult {
+    /// 필터에 매칭된 전체 프레임 수 (상한 초과 시 frames보다 큼)
+    pub total_matched: usize,
+    /// 상한(ASTERIX_QUERY_MAX) 초과로 일부만 반환되었는지
+    pub truncated: bool,
+    pub frames: Vec<AsterixFrameSummary>,
+}
+
+/// 스캔 1패스에서 채우는 내부 누산기 (여러 파일에 걸쳐 공유).
+#[derive(Default)]
+struct StatAccum {
+    frame_count: u64,
+    record_count: u64,
+    truncated: u64,
+    mode3a_garbled: u64,
+    acas_ra: u64,
+    cat_records: HashMap<u8, u64>,
+    cat_blocks: HashMap<u8, u64>,
+    frn_counts: [u64; UAP_MAX],
+    radar_typ: [u64; 8],
+    sac_sic: HashMap<(u8, u8), u64>,
+    modes: HashMap<u32, u64>,
+    msg034: HashMap<u8, u64>,
+    msg008: HashMap<u8, u64>,
+    tod_min: Option<f64>,
+    tod_max: Option<f64>,
+    time_min: Option<f64>,
+    time_max: Option<f64>,
+    nec_dates: std::collections::BTreeSet<(u8, u8)>,
+    total_bytes: u64,
+    skipped_bytes: u64,
+    parse_errors: u64,
+    block_count: u64,
+}
+
+/// 스캔 진행 상태 (커맨드가 파일별로 누적 후 finalize).
+#[derive(Default)]
+pub struct AsterixScanState {
+    acc: StatAccum,
+    files: Vec<AsterixFileStat>,
+}
+
+/// 한 레코드의 스캔 요약 (집계/조회 공용 중간 표현).
+struct ScanRecord {
+    cat: u8,
+    mode_s: Option<u32>,
+    tod: Option<f64>,
+    abs_time: Option<f64>,
+    radar_typ: Option<u8>,
+    sac: u8,
+    sic: u8,
+    has_acas: bool,
+    msg_type: Option<u8>,
+    frns: Vec<usize>,
+    truncated: bool,
+    mode3a_garbled: bool,
+}
+
+/// 한 프레임(NEC 헤더~다음 헤더 직전, 또는 비프레이밍 시 단일 블록).
+struct ScanFrame {
+    start: usize,
+    end: usize,
+    records: Vec<ScanRecord>,
+}
+
+#[derive(Default)]
+struct WalkTotals {
+    skipped: u64,
+    parse_errors: u64,
+    block_count: u64,
+    cat_blocks: HashMap<u8, u64>,
+    nec_dates: std::collections::BTreeSet<(u8, u8)>,
+}
+
+/// 파일명/내용으로 NEC 날짜 컨텍스트(valid_dates, base_date_secs, start_tod) 산정.
+/// parse_ass_file 선두 로직과 동일.
+fn asterix_date_context(path: &str, data: &[u8]) -> (Vec<(i64, u8, u8)>, f64, Option<f64>) {
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let nec = detect_nec_frame(data);
+    let valid_dates: Vec<(i64, u8, u8)> = if let Some((m, d)) = nec {
+        let year: i64 = extract_date_from_filename(path)
+            .and_then(|s| s.get(0..4).and_then(|y| y.parse::<i64>().ok()))
+            .unwrap_or(2026);
+        let (y1, m1, d1) = next_day(year, m, d);
+        let (y2, m2, d2) = next_day(y1, m1, d1);
+        vec![(year, m, d), (y1, m1, d1), (y2, m2, d2)]
+    } else {
+        Vec::new()
+    };
+    let (base_date_secs, start_tod) = extract_base_date_and_start_tod(&filename);
+    (valid_dates, base_date_secs, start_tod)
+}
+
+/// CAT034/008 블록 선두에서 (메시지유형 I000, SAC, SIC) 추출 (best-effort).
+/// 일반 UAP: FRN1=I010(2B), FRN2=I000(1B). 그 외 항목 레이아웃은 무시.
+fn parse_generic_msg(block: &[u8]) -> (Option<u8>, u8, u8) {
+    if block.len() < 4 {
+        return (None, 0, 0);
+    }
+    let rec = &block[3..]; // CAT(1)+LEN(2) 이후
+    let mut pos = 0usize;
+    let mut item = 0usize;
+    let mut present: Vec<usize> = Vec::new();
+    loop {
+        if pos >= rec.len() || pos > 8 {
+            break;
+        }
+        let byte = rec[pos];
+        pos += 1;
+        for bit in (1..=7).rev() {
+            if (byte >> bit) & 1 == 1 {
+                present.push(item);
+            }
+            item += 1;
+        }
+        if byte & 0x01 == 0 {
+            break;
+        }
+    }
+    let mut p = pos;
+    let (mut sac, mut sic, mut msg) = (0u8, 0u8, None);
+    for &fr in &present {
+        match fr {
+            0 => {
+                if p + 2 <= rec.len() {
+                    sac = rec[p];
+                    sic = rec[p + 1];
+                    p += 2;
+                } else {
+                    break;
+                }
+            }
+            1 => {
+                if p < rec.len() {
+                    msg = Some(rec[p]);
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    (msg, sac, sic)
+}
+
+/// 한 ASTERIX 블록의 레코드들을 스캔 요약으로 파싱.
+#[allow(clippy::too_many_arguments)]
+fn parse_block_records(
+    data: &[u8],
+    offset: usize,
+    block_len: usize,
+    nec_abs: Option<f64>,
+    base_date_secs: f64,
+    start_tod: Option<f64>,
+    parse_errors_out: &mut u64,
+) -> Vec<ScanRecord> {
+    let cat = data[offset];
+    let block = &data[offset..(offset + block_len).min(data.len())];
+    let mut recs: Vec<ScanRecord> = Vec::new();
+
+    if cat == CAT048 {
+        let mut rec_offset = 3;
+        while rec_offset < block.len() {
+            match parse_cat048_record(block, rec_offset) {
+                Ok((record, next, truncated)) => {
+                    let frns = parse_fspec(block, rec_offset)
+                        .map(|(f, _)| f)
+                        .unwrap_or_default();
+                    let tod = record.time_of_day;
+                    let abs_time = tod.map(|t| {
+                        let base = base_date_secs
+                            + compute_day_offset(Some(t), nec_abs, base_date_secs, start_tod);
+                        if base > 0.0 {
+                            base + t
+                        } else {
+                            1_700_000_000.0 + t
+                        }
+                    });
+                    let has_acas =
+                        record.acas_ra_report.is_some() || record.bds30_mb.is_some();
+                    recs.push(ScanRecord {
+                        cat,
+                        mode_s: record.mode_s_address,
+                        tod,
+                        abs_time,
+                        radar_typ: Some(record.radar_typ),
+                        sac: record.sac,
+                        sic: record.sic,
+                        has_acas,
+                        msg_type: None,
+                        frns,
+                        truncated,
+                        mode3a_garbled: record.mode3a_garbled,
+                    });
+                    if next <= rec_offset {
+                        break;
+                    }
+                    rec_offset = next;
+                }
+                Err(_) => {
+                    *parse_errors_out += 1;
+                    // 바이트 스캔으로 다음 유효 레코드 복구
+                    let mut scan = rec_offset + 1;
+                    let mut recovered = false;
+                    while scan < block.len().saturating_sub(2) {
+                        if parse_cat048_record(block, scan).is_ok() {
+                            rec_offset = scan;
+                            recovered = true;
+                            break;
+                        }
+                        scan += 1;
+                    }
+                    if !recovered {
+                        break;
+                    }
+                }
+            }
+        }
+    } else if cat == CAT034 || cat == CAT008 {
+        let (msg_type, sac, sic) = parse_generic_msg(block);
+        recs.push(ScanRecord {
+            cat,
+            mode_s: None,
+            tod: None,
+            abs_time: None,
+            radar_typ: None,
+            sac,
+            sic,
+            has_acas: false,
+            msg_type,
+            frns: Vec::new(),
+            truncated: false,
+            mode3a_garbled: false,
+        });
+    }
+    recs
+}
+
+/// 전체 데이터를 NEC 프레임 단위로 순회하며 프레임마다 on_frame 호출.
+/// 비프레이밍(valid_dates 없음) 파일은 블록 1개 = 프레임 1개로 취급.
+fn walk_asterix<F: FnMut(&ScanFrame)>(
+    data: &[u8],
+    valid_dates: &[(i64, u8, u8)],
+    base_date_secs: f64,
+    start_tod: Option<f64>,
+    totals: &mut WalkTotals,
+    mut on_frame: F,
+) {
+    let framed = !valid_dates.is_empty();
+    let mut nec_abs: Option<f64> = None;
+    let mut frame_start: Option<usize> = None;
+    let mut frame = ScanFrame {
+        start: 0,
+        end: 0,
+        records: Vec::new(),
+    };
+    let mut offset = 0usize;
+
+    while offset < data.len() {
+        if framed && is_nec_frame(data, offset, valid_dates) {
+            if let Some(fs) = frame_start {
+                frame.start = fs;
+                frame.end = offset;
+                on_frame(&frame);
+                frame.records.clear();
+            }
+            frame_start = Some(offset);
+            let fm = data[offset];
+            let fd = data[offset + 1];
+            let fh = data[offset + 2];
+            let fmin = data[offset + 3];
+            totals.nec_dates.insert((fm, fd));
+            let fyear = valid_dates
+                .iter()
+                .find(|&&(_, m, d)| m == fm && d == fd)
+                .map(|&(y, _, _)| y)
+                .unwrap_or(2026);
+            nec_abs = Some(
+                days_from_epoch(fyear, fm as u32, fd as u32) as f64 * 86400.0
+                    + fh as f64 * 3600.0
+                    + fmin as f64 * 60.0
+                    - 9.0 * 3600.0,
+            );
+            offset += 5;
+            continue;
+        }
+
+        if is_valid_block_start(data, offset) {
+            let cat = data[offset];
+            let block_len = ((data[offset + 1] as usize) << 8) | (data[offset + 2] as usize);
+            totals.block_count += 1;
+            *totals.cat_blocks.entry(cat).or_insert(0) += 1;
+            let recs = parse_block_records(
+                data,
+                offset,
+                block_len,
+                nec_abs,
+                base_date_secs,
+                start_tod,
+                &mut totals.parse_errors,
+            );
+            if framed {
+                if frame_start.is_none() {
+                    frame_start = Some(offset);
+                }
+                for r in recs {
+                    frame.records.push(r);
+                }
+            } else {
+                frame.start = offset;
+                frame.end = (offset + block_len).min(data.len());
+                frame.records = recs;
+                on_frame(&frame);
+                frame.records = Vec::new();
+            }
+            offset += block_len;
+        } else {
+            totals.skipped += 1;
+            offset += 1;
+        }
+    }
+
+    if framed {
+        if let Some(fs) = frame_start {
+            frame.start = fs;
+            frame.end = offset.min(data.len());
+            on_frame(&frame);
+        }
+    }
+}
+
+/// 한 파일을 스캔하여 누산기에 통계 누적 + 파일별 요약 추가.
+pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(), ParseError> {
+    let data = std::fs::read(path).map_err(|e| ParseError::FileReadError(e.to_string()))?;
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    let (valid_dates, base_date_secs, start_tod) = asterix_date_context(path, &data);
+    let mut totals = WalkTotals::default();
+
+    let acc = &mut state.acc;
+    acc.total_bytes += data.len() as u64;
+
+    let mut file_frames = 0u64;
+    let mut file_records = 0u64;
+
+    walk_asterix(
+        &data,
+        &valid_dates,
+        base_date_secs,
+        start_tod,
+        &mut totals,
+        |frame| {
+            acc.frame_count += 1;
+            file_frames += 1;
+            for r in &frame.records {
+                acc.record_count += 1;
+                file_records += 1;
+                *acc.cat_records.entry(r.cat).or_insert(0) += 1;
+                if r.truncated {
+                    acc.truncated += 1;
+                }
+                if r.mode3a_garbled {
+                    acc.mode3a_garbled += 1;
+                }
+                if r.has_acas {
+                    acc.acas_ra += 1;
+                }
+                if let Some(t) = r.tod {
+                    acc.tod_min = Some(acc.tod_min.map_or(t, |m| m.min(t)));
+                    acc.tod_max = Some(acc.tod_max.map_or(t, |m| m.max(t)));
+                }
+                if let Some(a) = r.abs_time {
+                    acc.time_min = Some(acc.time_min.map_or(a, |m| m.min(a)));
+                    acc.time_max = Some(acc.time_max.map_or(a, |m| m.max(a)));
+                }
+                match r.cat {
+                    CAT048 => {
+                        for &frn in &r.frns {
+                            if frn < UAP_MAX {
+                                acc.frn_counts[frn] += 1;
+                            }
+                        }
+                        if let Some(typ) = r.radar_typ {
+                            if (typ as usize) < 8 {
+                                acc.radar_typ[typ as usize] += 1;
+                            }
+                        }
+                        *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
+                        if let Some(ms) = r.mode_s {
+                            *acc.modes.entry(ms).or_insert(0) += 1;
+                        }
+                    }
+                    CAT034 => {
+                        if let Some(mt) = r.msg_type {
+                            *acc.msg034.entry(mt).or_insert(0) += 1;
+                        }
+                        *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
+                    }
+                    CAT008 => {
+                        if let Some(mt) = r.msg_type {
+                            *acc.msg008.entry(mt).or_insert(0) += 1;
+                        }
+                        *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
+                    }
+                    _ => {}
+                }
+            }
+        },
+    );
+
+    acc.skipped_bytes += totals.skipped;
+    acc.parse_errors += totals.parse_errors;
+    acc.block_count += totals.block_count;
+    for (cat, n) in totals.cat_blocks {
+        *acc.cat_blocks.entry(cat).or_insert(0) += n;
+    }
+    for d in totals.nec_dates {
+        acc.nec_dates.insert(d);
+    }
+
+    state.files.push(AsterixFileStat {
+        filename,
+        bytes: data.len() as u64,
+        frames: file_frames,
+        records: file_records,
+    });
+
+    Ok(())
+}
+
+/// 누적된 스캔 상태를 직렬화 가능한 AsterixStats로 확정.
+pub fn asterix_finalize(state: AsterixScanState) -> AsterixStats {
+    let acc = state.acc;
+
+    // 카테고리별 블록/레코드
+    let mut cat_keys: Vec<u8> = acc
+        .cat_blocks
+        .keys()
+        .chain(acc.cat_records.keys())
+        .copied()
+        .collect();
+    cat_keys.sort_unstable();
+    cat_keys.dedup();
+    let cat_counts: Vec<CatCount> = cat_keys
+        .iter()
+        .map(|&cat| CatCount {
+            cat,
+            blocks: *acc.cat_blocks.get(&cat).unwrap_or(&0),
+            records: *acc.cat_records.get(&cat).unwrap_or(&0),
+        })
+        .collect();
+
+    // CAT048 FRN 출현 빈도
+    let cat048_frn_counts: Vec<FrnCount> = (0..UAP_MAX)
+        .filter(|&i| acc.frn_counts[i] > 0)
+        .map(|i| FrnCount {
+            id: CAT048_FRN_META[i].0.to_string(),
+            name: CAT048_FRN_META[i].1.to_string(),
+            count: acc.frn_counts[i],
+        })
+        .collect();
+
+    // 레이더 유형 (I020 TYP)
+    let radar_typ_counts: Vec<LabeledCount> = (0..8)
+        .filter(|&i| acc.radar_typ[i] > 0)
+        .map(|i| LabeledCount {
+            key: i.to_string(),
+            label: TYP048_LABELS[i].to_string(),
+            count: acc.radar_typ[i],
+        })
+        .collect();
+
+    // SAC/SIC (카운트 내림차순)
+    let mut sac_sic_counts: Vec<SacSicCount> = acc
+        .sac_sic
+        .iter()
+        .map(|(&(sac, sic), &count)| SacSicCount { sac, sic, count })
+        .collect();
+    sac_sic_counts.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // Mode-S Top-N
+    let modes_distinct = acc.modes.len();
+    let mut modes_vec: Vec<(u32, u64)> = acc.modes.into_iter().collect();
+    modes_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    let modes_top: Vec<LabeledCount> = modes_vec
+        .into_iter()
+        .take(50)
+        .map(|(ms, count)| {
+            let hex = format!("{:06X}", ms);
+            LabeledCount {
+                key: hex.clone(),
+                label: hex,
+                count,
+            }
+        })
+        .collect();
+
+    let to_labeled = |m: HashMap<u8, u64>, label: fn(u8) -> &'static str| -> Vec<LabeledCount> {
+        let mut v: Vec<LabeledCount> = m
+            .into_iter()
+            .map(|(t, count)| LabeledCount {
+                key: t.to_string(),
+                label: label(t).to_string(),
+                count,
+            })
+            .collect();
+        v.sort_by(|a, b| b.count.cmp(&a.count));
+        v
+    };
+    let msg_type_034 = to_labeled(acc.msg034, msg_type_034_label);
+    let msg_type_008 = to_labeled(acc.msg008, msg_type_008_label);
+
+    let nec_dates: Vec<String> = acc
+        .nec_dates
+        .iter()
+        .map(|&(m, d)| format!("{:02}-{:02}", m, d))
+        .collect();
+
+    AsterixStats {
+        file_count: state.files.len(),
+        total_bytes: acc.total_bytes,
+        frame_count: acc.frame_count,
+        block_count: acc.block_count,
+        record_count: acc.record_count,
+        skipped_bytes: acc.skipped_bytes,
+        parse_errors: acc.parse_errors,
+        truncated_records: acc.truncated,
+        cat_counts,
+        cat048_frn_counts,
+        radar_typ_counts,
+        sac_sic_counts,
+        modes_distinct,
+        modes_top,
+        msg_type_034,
+        msg_type_008,
+        tod_min: acc.tod_min,
+        tod_max: acc.tod_max,
+        time_min: acc.time_min,
+        time_max: acc.time_max,
+        nec_dates,
+        acas_ra_records: acc.acas_ra,
+        mode3a_garbled: acc.mode3a_garbled,
+        files: state.files,
+    }
+}
+
+/// 필터 기반 온디맨드 프레임 조회 — 매칭 프레임을 상한까지 수집 + 전체 매칭 수 집계.
+pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<AsterixQueryResult, String> {
+    let mut frames: Vec<AsterixFrameSummary> = Vec::new();
+    let mut total: usize = 0;
+    let ms_filter = filter
+        .mode_s
+        .as_ref()
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty());
+
+    for (file_index, path) in paths.iter().enumerate() {
+        let data = std::fs::read(path).map_err(|e| e.to_string())?;
+        let (valid_dates, base_date_secs, start_tod) = asterix_date_context(path, &data);
+        let mut totals = WalkTotals::default();
+
+        walk_asterix(
+            &data,
+            &valid_dates,
+            base_date_secs,
+            start_tod,
+            &mut totals,
+            |frame| {
+                if frame.records.is_empty() {
+                    return;
+                }
+                // 필터
+                if let Some(f) = &ms_filter {
+                    let any = frame
+                        .records
+                        .iter()
+                        .any(|r| r.mode_s.map_or(false, |m| format!("{:06X}", m).contains(f.as_str())));
+                    if !any {
+                        return;
+                    }
+                }
+                if let Some(c) = filter.cat {
+                    if !frame.records.iter().any(|r| r.cat == c) {
+                        return;
+                    }
+                }
+                if let Some(ha) = filter.has_acas {
+                    let h = frame.records.iter().any(|r| r.has_acas);
+                    if h != ha {
+                        return;
+                    }
+                }
+                if filter.time_min.is_some() || filter.time_max.is_some() {
+                    let any = frame.records.iter().any(|r| match r.abs_time {
+                        Some(t) => {
+                            filter.time_min.map_or(true, |mn| t >= mn)
+                                && filter.time_max.map_or(true, |mx| t <= mx)
+                        }
+                        None => false,
+                    });
+                    if !any {
+                        return;
+                    }
+                }
+
+                total += 1;
+                if frames.len() >= ASTERIX_QUERY_MAX {
+                    return;
+                }
+
+                // 요약 생성
+                let mut cats: Vec<u8> = Vec::new();
+                let mut mode_s_list: Vec<String> = Vec::new();
+                let mut tod: Option<f64> = None;
+                let mut abs_time: Option<f64> = None;
+                let mut has_acas = false;
+                for r in &frame.records {
+                    if !cats.contains(&r.cat) {
+                        cats.push(r.cat);
+                    }
+                    if let Some(m) = r.mode_s {
+                        let h = format!("{:06X}", m);
+                        if !mode_s_list.contains(&h) {
+                            mode_s_list.push(h);
+                        }
+                    }
+                    if tod.is_none() {
+                        tod = r.tod;
+                    }
+                    if abs_time.is_none() {
+                        abs_time = r.abs_time;
+                    }
+                    if r.has_acas {
+                        has_acas = true;
+                    }
+                }
+                let bytes = &data[frame.start..frame.end.min(data.len())];
+                let frame_hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                frames.push(AsterixFrameSummary {
+                    file_index,
+                    frame_offset: frame.start as u64,
+                    byte_len: bytes.len(),
+                    cats,
+                    record_count: frame.records.len(),
+                    mode_s_list,
+                    tod,
+                    abs_time,
+                    has_acas,
+                    frame_hex,
+                });
+            },
+        );
+    }
+
+    Ok(AsterixQueryResult {
+        truncated: total > frames.len(),
+        total_matched: total,
+        frames,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

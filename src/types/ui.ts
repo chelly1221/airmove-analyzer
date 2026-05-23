@@ -12,7 +12,8 @@ export type PageId =
   | "settings"
   | "aircraft"
   | "obstacle"
-  | "acas";
+  | "acas"
+  | "asterix";
 
 /** 파일 업로드 상태 */
 export interface UploadedFile {
