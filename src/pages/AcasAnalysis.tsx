@@ -7,7 +7,7 @@ import Modal from "../components/common/Modal";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import DateRangePicker from "../components/common/DateRangePicker";
 import { useAppStore } from "../store";
-import { buildEventsFromReports, type TcasEvent, type CoordEvent } from "../utils/tcasEvents";
+import { buildEventsFromReports, type TcasEvent } from "../utils/tcasEvents";
 import { decodeFrame, type DecodedFrame } from "../utils/asterixDecoder";
 import { FrameInspector } from "../components/common/FrameInspector";
 import type { Aircraft } from "../types";
@@ -103,7 +103,6 @@ function useAssFilePicker() {
   return { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount, notice, closeNotice: () => setNotice(null) };
 }
 
-type TabId = "ra" | "coord";
 type TzMode = "UTC" | "KST";
 const KST_OFFSET_SECS = 9 * 3600;
 
@@ -150,12 +149,11 @@ export default function AcasAnalysis() {
 
   const { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount, notice, closeNotice } = useAssFilePicker();
 
-  const { raEvents, coordEvents } = useMemo(
+  const raEvents = useMemo(
     () => buildEventsFromReports(tcasReports),
     [tcasReports],
   );
 
-  const [tab, setTab] = useState<TabId>("ra");
   const [tz, setTz] = useState<TzMode>("KST");
   const [search, setSearch] = useState("");
   const [descKeyword, setDescKeyword] = useState("");
@@ -166,8 +164,7 @@ export default function AcasAnalysis() {
   const [endDt, setEndDt] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("startTime");
   const [sortDesc, setSortDesc] = useState(false);
-  const [detailEv, setDetailEv] = useState<TcasEvent | CoordEvent | null>(null);
-  const [detailKind, setDetailKind] = useState<TabId>("ra");
+  const [detailEv, setDetailEv] = useState<TcasEvent | null>(null);
   const [dateOpen, setDateOpen] = useState(false);
 
   const toggleSort = useCallback((k: SortKey) => {
@@ -218,51 +215,11 @@ export default function AcasAnalysis() {
     return filtered;
   }, [raEvents, aircraft, search, descKeyword, startDt, endDt, tz, tti0, tti1, tti2, sortKey, sortDesc]);
 
-  const coordRows = useMemo(() => {
-    const q = search.trim().toUpperCase();
-    const desc = descKeyword.trim().toLowerCase();
-    const tMin = dtLocalToTs(startDt, tz), tMax = dtLocalToTs(endDt, tz);
-    const filtered = coordEvents.filter((ev) => {
-      if (tMin != null && ev.startTime < tMin) return false;
-      if (tMax != null && ev.startTime > tMax) return false;
-      if (ev.threatTti === 0 && !tti0) return false;
-      if (ev.threatTti === 1 && !tti1) return false;
-      if (ev.threatTti === 2 && !tti2) return false;
-      if (q) {
-        const o = labelFor(ev.ownModeS, aircraft).toUpperCase();
-        const t = labelFor(ev.threatModeS, aircraft).toUpperCase();
-        if (!o.includes(q) && !t.includes(q)) return false;
-      }
-      if (desc && !ev.description.toLowerCase().includes(desc)) return false;
-      return true;
-    });
-    const dir = sortDesc ? -1 : 1;
-    filtered.sort((a, b) => {
-      let av: number | string, bv: number | string;
-      switch (sortKey) {
-        case "ownLabel": av = labelFor(a.ownModeS, aircraft); bv = labelFor(b.ownModeS, aircraft); break;
-        case "ownAltFt": av = a.ownAltFt ?? Infinity; bv = b.ownAltFt ?? Infinity; break;
-        case "threatLabel": av = labelFor(a.threatModeS, aircraft); bv = labelFor(b.threatModeS, aircraft); break;
-        case "tti": av = a.threatTti; bv = b.threatTti; break;
-        case "raDescription": av = a.description; bv = b.description; break;
-        case "action":    av = a.corrective ? 1 : 0; bv = b.corrective ? 1 : 0; break;
-        case "direction": av = a.downSense  ? 1 : 0; bv = b.downSense  ? 1 : 0; break;
-        case "duration": av = a.endTime - a.startTime; bv = b.endTime - b.startTime; break;
-        case "pointCount": av = a.pointCount; bv = b.pointCount; break;
-        default: av = a.startTime; bv = b.startTime;
-      }
-      if (typeof av === "number" && typeof bv === "number") return (av - bv) * dir;
-      return String(av).localeCompare(String(bv)) * dir;
-    });
-    return filtered;
-  }, [coordEvents, aircraft, search, descKeyword, startDt, endDt, tz, tti0, tti1, tti2, sortKey, sortDesc]);
-
   const stats = useMemo(() => {
-    const src = tab === "ra" ? raEvents : coordEvents;
     let n0 = 0, n1 = 0, n2 = 0;
-    for (const ev of src) { if (ev.threatTti === 1) n1++; else if (ev.threatTti === 2) n2++; else n0++; }
-    return { total: src.length, tti0: n0, tti1: n1, tti2: n2 };
-  }, [tab, raEvents, coordEvents]);
+    for (const ev of raEvents) { if (ev.threatTti === 1) n1++; else if (ev.threatTti === 2) n2++; else n0++; }
+    return { total: raEvents.length, tti0: n0, tti1: n1, tti2: n2 };
+  }, [raEvents]);
 
   const SortHeader = ({ k, label, tip, cls = "" }: { k: SortKey; label: string; tip?: string; cls?: string }) => (
     <th onClick={() => toggleSort(k)} title={tip}
@@ -272,7 +229,7 @@ export default function AcasAnalysis() {
   );
 
   // 「종류」 → 「동작」(Corr/Prev) + 「방향」(↑/↓) 두 셀로 분할
-  const KindCell = ({ ev }: { ev: TcasEvent | CoordEvent }) => (
+  const KindCell = ({ ev }: { ev: TcasEvent }) => (
     <>
       <td className="px-3 py-1.5 text-center">
         <span title={ev.corrective ? "Corrective — 즉시 회피 동작 필요" : "Preventive — 현 비행 유지"}
@@ -290,7 +247,7 @@ export default function AcasAnalysis() {
   );
 
   // MTE — 위협 Mode-S 셀 끝 인라인 칩
-  const MteFlag = ({ ev }: { ev: TcasEvent | CoordEvent }) =>
+  const MteFlag = ({ ev }: { ev: TcasEvent }) =>
     ev.mte ? (
       <span title="MTE — 다중 위협"
         className="ml-1 inline-block rounded border border-amber-300 bg-amber-100 px-1 py-0.5 text-[9px] font-medium uppercase text-amber-700">
@@ -298,7 +255,7 @@ export default function AcasAnalysis() {
       </span>
     ) : null;
 
-  const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); };
+  const openDetail = (ev: TcasEvent) => setDetailEv(ev);
 
   // 선택된 보고의 프레임 전문 바이트 + 디코드 (모달용, 가벼움)
   const frameBytes = useMemo<number[]>(() => {
@@ -328,7 +285,7 @@ export default function AcasAnalysis() {
       <div className="mb-3 flex items-center gap-2">
         <ShieldAlert size={20} className="text-[#a60739]" />
         <h1 className="text-lg font-semibold text-gray-800">ACAS 분석</h1>
-        <span className="text-[11px] text-gray-400">RA {raEvents.length} · 협의 {coordEvents.length}</span>
+        <span className="text-[11px] text-gray-400">RA {raEvents.length}</span>
         {tcasReports.length > 0 && (
           <button
             onClick={pickFiles}
@@ -356,18 +313,6 @@ export default function AcasAnalysis() {
         </div>
       ) : (
         <>
-          {/* 탭 */}
-          <div className="flex items-center gap-1 border-b border-gray-200">
-            <button onClick={() => setTab("ra")} title="BDS 3,0 / I048/260 — 항공기가 보고한 ACAS Active RA"
-              className={`px-4 py-2 text-[12px] font-medium border-b-2 -mb-px ${tab === "ra" ? "border-[#a60739] text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"}`}>
-              RA 보고 (BDS 3,0) · {raEvents.length}
-            </button>
-            <button onClick={() => setTab("coord")} title="협의 — RA 중 RAC(협의 보충)≠0 또는 MTE(다중 위협). BDS 3,0에서 도출(별도 BDS 1,6 미수록)"
-              className={`px-4 py-2 text-[12px] font-medium border-b-2 -mb-px ${tab === "coord" ? "border-[#a60739] text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"}`}>
-              협의 (RAC/MTE) · {coordEvents.length}
-            </button>
-          </div>
-
           {/* 필터 — 1행 압축 (평면 배경) */}
           <div className="mt-3 flex items-center gap-2">
             {/* 검색 */}
@@ -445,7 +390,7 @@ export default function AcasAnalysis() {
                 </button>
               )}
               <span className="tabular-nums text-gray-600">
-                <span className="font-semibold text-gray-900">{tab === "ra" ? raRows.length : coordRows.length}</span>
+                <span className="font-semibold text-gray-900">{raRows.length}</span>
                 <span className="text-gray-400"> / {stats.total}</span>
               </span>
             </div>
@@ -462,64 +407,40 @@ export default function AcasAnalysis() {
                   <SortHeader k="tti" label="TID" tip="Threat Identity Data 종류" cls="text-center" />
                   <SortHeader k="tti" label="TTI" tip="BDS bits 21-22 raw 값 (0/1/2/3)" cls="text-center" />
                   <SortHeader k="threatLabel" label="위협 Mode-S" tip="TTI=1일 때 위협 식별" />
-                  <SortHeader k="raDescription" label={tab === "ra" ? "RA 의도" : "협의 의도"} tip="ARA/RAC 비트 해석" />
+                  <SortHeader k="raDescription" label="RA 의도" tip="ARA/RAC 비트 해석" />
                   <SortHeader k="action" label="동작" tip="Corrective(즉시 행동 필요) / Preventive(현 비행 유지)" cls="text-center" />
                   <SortHeader k="direction" label="방향" tip="수직 회피 방향 (Climb/Descend)" cls="text-center" />
-                  {tab === "ra" && <>
-                    <SortHeader k="threatRangeNm" label="위협 거리(NM)" tip="TTI=2(ATCRBS)일 때만" />
-                    <SortHeader k="threatBearingDeg" label="위협 방위(°)" tip="TTI=2일 때만" />
-                    <SortHeader k="threatAltFt" label="위협 고도(ft)" tip="TTI=2일 때만" />
-                  </>}
+                  <SortHeader k="threatRangeNm" label="위협 거리(NM)" tip="TTI=2(ATCRBS)일 때만" />
+                  <SortHeader k="threatBearingDeg" label="위협 방위(°)" tip="TTI=2일 때만" />
+                  <SortHeader k="threatAltFt" label="위협 고도(ft)" tip="TTI=2일 때만" />
                   <SortHeader k="duration" label="지속(s)" tip="첫~마지막 보고 간격" />
                   <SortHeader k="pointCount" label="횟수" tip="보고 점 수" />
                   <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-center text-[11px] font-medium text-gray-600 w-24">전문</th>
                 </tr>
               </thead>
               <tbody>
-                {tab === "ra" ? (
-                  raRows.length === 0 ? (
-                    <tr><td colSpan={15} className="px-3 py-8 text-center text-gray-400">조건에 맞는 RA 이벤트가 없습니다</td></tr>
-                  ) : raRows.map((ev) => (
-                    <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
-                      <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, aircraft)}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
-                      <td className="px-3 py-1.5 text-center"><span className={`inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${TTI_COLOR[ev.threatTti]}`}>{TTI_LABEL[ev.threatTti]}</span></td>
-                      <td className="px-3 py-1.5 text-center tabular-nums text-gray-700">{ev.threatTti}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, aircraft) : "—"}<MteFlag ev={ev} /></td>
-                      <td className="px-3 py-1.5 text-gray-700" title={`ARA=0x${ev.araHex} · RAC=0x${ev.racHex}`}>{ev.raDescription}</td>
-                      <KindCell ev={ev} />
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatRangeNm != null ? ev.threatRangeNm.toFixed(1) : "—"}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatBearingDeg != null ? Math.round(ev.threatBearingDeg) : "—"}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatAltFt != null ? Math.round(ev.threatAltFt) : "—"}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{(ev.endTime - ev.startTime).toFixed(1)}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{ev.raPointCount}</td>
-                      <td className="px-3 py-1.5 text-center">
-                        <button onClick={() => openDetail(ev, "ra")} className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-1 text-[10px] font-medium text-gray-600 transition-colors hover:border-[#a60739]/40 hover:bg-[#a60739]/5 hover:text-[#a60739]" title="프레임 전문 + 해석 보기"><FileText size={11} />전문보기</button>
-                      </td>
-                    </tr>
-                  ))
-                ) : (
-                  coordRows.length === 0 ? (
-                    <tr><td colSpan={12} className="px-3 py-8 text-center text-gray-400">조건에 맞는 협의 이벤트가 없습니다</td></tr>
-                  ) : coordRows.map((ev) => (
-                    <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
-                      <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, aircraft)}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
-                      <td className="px-3 py-1.5 text-center"><span className={`inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${TTI_COLOR[ev.threatTti]}`}>{TTI_LABEL[ev.threatTti]}</span></td>
-                      <td className="px-3 py-1.5 text-center tabular-nums text-gray-700">{ev.threatTti}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, aircraft) : "—"}<MteFlag ev={ev} /></td>
-                      <td className="px-3 py-1.5 text-gray-700" title={`ARA=0x${ev.araHex} · RAC=0x${ev.racHex}`}>{ev.description}</td>
-                      <KindCell ev={ev} />
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{(ev.endTime - ev.startTime).toFixed(1)}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{ev.pointCount}</td>
-                      <td className="px-3 py-1.5 text-center">
-                        <button onClick={() => openDetail(ev, "coord")} className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-1 text-[10px] font-medium text-gray-600 transition-colors hover:border-[#a60739]/40 hover:bg-[#a60739]/5 hover:text-[#a60739]" title="프레임 전문 + 해석 보기"><FileText size={11} />전문보기</button>
-                      </td>
-                    </tr>
-                  ))
-                )}
+                {raRows.length === 0 ? (
+                  <tr><td colSpan={15} className="px-3 py-8 text-center text-gray-400">조건에 맞는 RA 이벤트가 없습니다</td></tr>
+                ) : raRows.map((ev) => (
+                  <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
+                    <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
+                    <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, aircraft)}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
+                    <td className="px-3 py-1.5 text-center"><span className={`inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${TTI_COLOR[ev.threatTti]}`}>{TTI_LABEL[ev.threatTti]}</span></td>
+                    <td className="px-3 py-1.5 text-center tabular-nums text-gray-700">{ev.threatTti}</td>
+                    <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, aircraft) : "—"}<MteFlag ev={ev} /></td>
+                    <td className="px-3 py-1.5 text-gray-700" title={`ARA=0x${ev.araHex} · RAC=0x${ev.racHex}`}>{ev.raDescription}</td>
+                    <KindCell ev={ev} />
+                    <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatRangeNm != null ? ev.threatRangeNm.toFixed(1) : "—"}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatBearingDeg != null ? Math.round(ev.threatBearingDeg) : "—"}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatAltFt != null ? Math.round(ev.threatAltFt) : "—"}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{(ev.endTime - ev.startTime).toFixed(1)}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{ev.raPointCount}</td>
+                    <td className="px-3 py-1.5 text-center">
+                      <button onClick={() => openDetail(ev)} className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-1 text-[10px] font-medium text-gray-600 transition-colors hover:border-[#a60739]/40 hover:bg-[#a60739]/5 hover:text-[#a60739]" title="프레임 전문 + 해석 보기"><FileText size={11} />전문보기</button>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
@@ -528,7 +449,7 @@ export default function AcasAnalysis() {
 
       {/* RAW 상세 모달 */}
       {detailEv && (
-        <Modal open={true} onClose={() => setDetailEv(null)} title={detailKind === "ra" ? "RA 상세 (BDS 3,0)" : "협의 상세 (BDS 3,0 · RAC/MTE)"} width="max-w-[95vw]">
+        <Modal open={true} onClose={() => setDetailEv(null)} title="RA 상세 (BDS 3,0)" width="max-w-[95vw]">
           <div className="flex h-[82vh] gap-4 text-[11px]">
             {/* 좌: 보고 상세 */}
             <div className="w-[340px] shrink-0 space-y-3 overflow-auto pr-1">
@@ -552,22 +473,19 @@ export default function AcasAnalysis() {
                 <div><div className="text-gray-500">종류</div><div className="text-gray-800">{detailEv.corrective ? "Corrective" : "Preventive"} · {detailEv.downSense ? "Descend" : "Climb"}</div></div>
               </div>
               <div>
-                <div className="text-gray-500 mb-1">{detailKind === "ra" ? "RA 의도" : "협의 의도"}</div>
-                <div className="text-gray-800">{detailKind === "ra" ? (detailEv as TcasEvent).raDescription : (detailEv as CoordEvent).description}</div>
+                <div className="text-gray-500 mb-1">RA 의도</div>
+                <div className="text-gray-800">{detailEv.raDescription}</div>
               </div>
               {detailEv.threatTti === 1 && detailEv.threatModeS && (
                 <div><div className="text-gray-500">위협 Mode-S (TID, 23-46)</div><div className="font-mono text-gray-800">{detailEv.threatModeS}</div></div>
               )}
-              {detailKind === "ra" && detailEv.threatTti === 2 && (
+              {detailEv.threatTti === 2 && (
                 <div>
                   <div className="text-gray-500 mb-1">위협 위치 (TID, ATCRBS)</div>
                   <div className="text-gray-800">
-                    거리 {(detailEv as TcasEvent).threatRangeNm?.toFixed(1) ?? "—"} NM · 방위 {(detailEv as TcasEvent).threatBearingDeg != null ? Math.round((detailEv as TcasEvent).threatBearingDeg!) : "—"}° · 고도 {(detailEv as TcasEvent).threatAltFt != null ? Math.round((detailEv as TcasEvent).threatAltFt!) : "—"} ft
+                    거리 {detailEv.threatRangeNm?.toFixed(1) ?? "—"} NM · 방위 {detailEv.threatBearingDeg != null ? Math.round(detailEv.threatBearingDeg) : "—"}° · 고도 {detailEv.threatAltFt != null ? Math.round(detailEv.threatAltFt) : "—"} ft
                   </div>
                 </div>
-              )}
-              {detailKind === "coord" && (
-                <div className="text-[10px] text-gray-500 border-t border-gray-100 pt-2">참고: 협의는 별도 BDS 1,6 메시지가 아니라 이 RA(BDS 3,0)의 RAC(협의 보충)≠0 또는 MTE(다중 위협)로 판정합니다. 지상 SSR은 공대공 BDS 1,6을 다운링크하지 않습니다.</div>
               )}
             </div>
 
