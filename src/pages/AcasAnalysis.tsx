@@ -252,7 +252,6 @@ export default function AcasAnalysis() {
   const [sortDesc, setSortDesc] = useState(false);
   const [detailEv, setDetailEv] = useState<TcasEvent | CoordEvent | null>(null);
   const [detailKind, setDetailKind] = useState<TabId>("ra");
-  const [showFrame, setShowFrame] = useState(false);
   const [dateOpen, setDateOpen] = useState(false);
 
   const toggleSort = useCallback((k: SortKey) => {
@@ -383,7 +382,7 @@ export default function AcasAnalysis() {
       </span>
     ) : null;
 
-  const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); setShowFrame(false); };
+  const openDetail = (ev: TcasEvent | CoordEvent, kind: TabId) => { setDetailEv(ev); setDetailKind(kind); };
 
   // 선택된 보고의 프레임 전문 디코드 (모달 펼칠 때만 의미, 가벼움)
   const decodedFrame = useMemo<DecodedFrame | null>(() => {
@@ -610,76 +609,80 @@ export default function AcasAnalysis() {
 
       {/* RAW 상세 모달 */}
       {detailEv && (
-        <Modal open={true} onClose={() => setDetailEv(null)} title={detailKind === "ra" ? "RA 상세 (BDS 3,0)" : "협의 상세 (BDS 3,0 · RAC/MTE)"} width="max-w-2xl">
-          <div className="space-y-3 text-[11px]">
-            <div>
-              <div className="text-gray-500 mb-1">시각 ({tz}) · Own</div>
-              <div className="font-mono text-gray-800">
-                {detailEv.timeEstimated ? "~" : ""}{formatTime(detailEv.startTime, tz)} · {labelFor(detailEv.ownModeS, flights)}
-                {detailEv.timeEstimated && <span className="ml-1 text-gray-400">(시각 추정 — I140 부재)</span>}
+        <Modal open={true} onClose={() => setDetailEv(null)} title={detailKind === "ra" ? "RA 상세 (BDS 3,0)" : "협의 상세 (BDS 3,0 · RAC/MTE)"} width="max-w-[95vw]">
+          <div className="flex h-[82vh] gap-4 text-[11px]">
+            {/* 좌: 보고 상세 */}
+            <div className="w-[340px] shrink-0 space-y-3 overflow-auto pr-1">
+              <div>
+                <div className="text-gray-500 mb-1">시각 ({tz}) · Own</div>
+                <div className="font-mono text-gray-800">
+                  {detailEv.timeEstimated ? "~" : ""}{formatTime(detailEv.startTime, tz)} · {labelFor(detailEv.ownModeS, flights)}
+                  {detailEv.timeEstimated && <span className="ml-1 text-gray-400">(시각 추정 — I140 부재)</span>}
+                </div>
               </div>
-            </div>
-            <div>
-              <div className="text-gray-500 mb-1">BDS 3,0 raw 페이로드 (7바이트)</div>
-              <div className="rounded bg-gray-50 border border-gray-200 px-2 py-1.5 font-mono text-gray-800 break-all">{detailEv.rawHex.match(/.{2}/g)?.join(" ")}</div>
-            </div>
-            <div>
-              <div className="mb-1 flex items-center justify-between">
-                <span className="text-gray-500">프레임 전문 (NEC 프레임 · 전체 블록{detailEv.frameHex ? `, ${detailEv.frameHex.length / 2}바이트` : ""})</span>
-                <button
-                  onClick={() => setShowFrame((v) => !v)}
-                  disabled={!detailEv.frameHex}
-                  className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-0.5 text-[10px] font-medium text-gray-600 hover:border-[#a60739]/30 hover:text-[#a60739] disabled:opacity-40"
-                >
-                  {showFrame ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-                  {showFrame ? "접기" : "보기"}
-                </button>
+              <div>
+                <div className="text-gray-500 mb-1">BDS 3,0 raw 페이로드 (7바이트)</div>
+                <div className="rounded bg-gray-50 border border-gray-200 px-2 py-1.5 font-mono text-gray-800 break-all">{detailEv.rawHex.match(/.{2}/g)?.join(" ")}</div>
               </div>
-              {showFrame && (
-                <div className="space-y-2">
-                  {/* RAW HEX */}
-                  <div>
-                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">RAW HEX</div>
-                    <div className="max-h-32 overflow-auto rounded border border-gray-200 bg-gray-50 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed text-gray-800 break-all">
-                      {detailEv.frameHex ? detailEv.frameHex.match(/.{2}/g)?.join(" ") : "프레임 데이터 없음 (재파싱 필요)"}
-                    </div>
-                  </div>
-                  {/* 해석 */}
-                  <div>
-                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">해석</div>
-                    <div className="max-h-72 overflow-auto rounded border border-gray-200 bg-white px-2 py-1.5">
-                      {decodedFrame ? <FrameDecodeView frame={decodedFrame} /> : <span className="text-[10.5px] text-gray-400">프레임 데이터 없음 (재파싱 필요)</span>}
-                    </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div><div className="text-gray-500">ARA (1-14)</div><div className="font-mono text-gray-800">0x{detailEv.araHex}</div></div>
+                <div><div className="text-gray-500">RAC (15-18)</div><div className="font-mono text-gray-800">0x{detailEv.racHex}</div></div>
+                <div><div className="text-gray-500">RAT (19)</div><div className="text-gray-800">{detailEv.rat ? "1 (종료)" : "0 (활성)"}</div></div>
+                <div><div className="text-gray-500">MTE (20)</div><div className="text-gray-800">{detailEv.mte ? "1 (다중)" : "0"}</div></div>
+                <div><div className="text-gray-500">TTI (21-22)</div><div className="text-gray-800">{detailEv.threatTti} ({TTI_LABEL[detailEv.threatTti]})</div></div>
+                <div><div className="text-gray-500">종류</div><div className="text-gray-800">{detailEv.corrective ? "Corrective" : "Preventive"} · {detailEv.downSense ? "Descend" : "Climb"}</div></div>
+              </div>
+              <div>
+                <div className="text-gray-500 mb-1">{detailKind === "ra" ? "RA 의도" : "협의 의도"}</div>
+                <div className="text-gray-800">{detailKind === "ra" ? (detailEv as TcasEvent).raDescription : (detailEv as CoordEvent).description}</div>
+              </div>
+              {detailEv.threatTti === 1 && detailEv.threatModeS && (
+                <div><div className="text-gray-500">위협 Mode-S (TID, 23-46)</div><div className="font-mono text-gray-800">{detailEv.threatModeS}</div></div>
+              )}
+              {detailKind === "ra" && detailEv.threatTti === 2 && (
+                <div>
+                  <div className="text-gray-500 mb-1">위협 위치 (TID, ATCRBS)</div>
+                  <div className="text-gray-800">
+                    거리 {(detailEv as TcasEvent).threatRangeNm?.toFixed(1) ?? "—"} NM · 방위 {(detailEv as TcasEvent).threatBearingDeg != null ? Math.round((detailEv as TcasEvent).threatBearingDeg!) : "—"}° · 고도 {(detailEv as TcasEvent).threatAltFt != null ? Math.round((detailEv as TcasEvent).threatAltFt!) : "—"} ft
                   </div>
                 </div>
               )}
+              {detailKind === "coord" && (
+                <div className="text-[10px] text-gray-500 border-t border-gray-100 pt-2">참고: 협의는 별도 BDS 1,6 메시지가 아니라 이 RA(BDS 3,0)의 RAC(협의 보충)≠0 또는 MTE(다중 위협)로 판정합니다. 지상 SSR은 공대공 BDS 1,6을 다운링크하지 않습니다.</div>
+              )}
             </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div><div className="text-gray-500">ARA (1-14)</div><div className="font-mono text-gray-800">0x{detailEv.araHex}</div></div>
-              <div><div className="text-gray-500">RAC (15-18)</div><div className="font-mono text-gray-800">0x{detailEv.racHex}</div></div>
-              <div><div className="text-gray-500">RAT (19)</div><div className="text-gray-800">{detailEv.rat ? "1 (종료)" : "0 (활성)"}</div></div>
-              <div><div className="text-gray-500">MTE (20)</div><div className="text-gray-800">{detailEv.mte ? "1 (다중)" : "0"}</div></div>
-              <div><div className="text-gray-500">TTI (21-22)</div><div className="text-gray-800">{detailEv.threatTti} ({TTI_LABEL[detailEv.threatTti]})</div></div>
-              <div><div className="text-gray-500">종류</div><div className="text-gray-800">{detailEv.corrective ? "Corrective" : "Preventive"} · {detailEv.downSense ? "Descend" : "Climb"}</div></div>
-            </div>
-            <div>
-              <div className="text-gray-500 mb-1">{detailKind === "ra" ? "RA 의도" : "협의 의도"}</div>
-              <div className="text-gray-800">{detailKind === "ra" ? (detailEv as TcasEvent).raDescription : (detailEv as CoordEvent).description}</div>
-            </div>
-            {detailEv.threatTti === 1 && detailEv.threatModeS && (
-              <div><div className="text-gray-500">위협 Mode-S (TID, 23-46)</div><div className="font-mono text-gray-800">{detailEv.threatModeS}</div></div>
-            )}
-            {detailKind === "ra" && detailEv.threatTti === 2 && (
-              <div>
-                <div className="text-gray-500 mb-1">위협 위치 (TID, ATCRBS)</div>
-                <div className="text-gray-800">
-                  거리 {(detailEv as TcasEvent).threatRangeNm?.toFixed(1) ?? "—"} NM · 방위 {(detailEv as TcasEvent).threatBearingDeg != null ? Math.round((detailEv as TcasEvent).threatBearingDeg!) : "—"}° · 고도 {(detailEv as TcasEvent).threatAltFt != null ? Math.round((detailEv as TcasEvent).threatAltFt!) : "—"} ft
-                </div>
+
+            {/* 세퍼레이터 */}
+            <div className="w-px shrink-0 bg-gray-200" />
+
+            {/* 우: 프레임 전문 (RAW HEX + 해석) */}
+            <div className="flex min-w-0 flex-1 flex-col">
+              <div className="mb-2 shrink-0 text-gray-500">
+                프레임 전문 (NEC 프레임 · 전체 블록{detailEv.frameHex ? `, ${detailEv.frameHex.length / 2}바이트` : ""})
               </div>
-            )}
-            {detailKind === "coord" && (
-              <div className="text-[10px] text-gray-500 border-t border-gray-100 pt-2">참고: 협의는 별도 BDS 1,6 메시지가 아니라 이 RA(BDS 3,0)의 RAC(협의 보충)≠0 또는 MTE(다중 위협)로 판정합니다. 지상 SSR은 공대공 BDS 1,6을 다운링크하지 않습니다.</div>
-            )}
+              {detailEv.frameHex ? (
+                <div className="flex min-h-0 flex-1 flex-col gap-2">
+                  {/* RAW HEX */}
+                  <div className="flex max-h-[32%] shrink-0 flex-col">
+                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">RAW HEX</div>
+                    <div className="flex-1 overflow-auto rounded border border-gray-200 bg-gray-50 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed text-gray-800 break-all">
+                      {detailEv.frameHex.match(/.{2}/g)?.join(" ")}
+                    </div>
+                  </div>
+                  {/* 해석 */}
+                  <div className="flex min-h-0 flex-1 flex-col">
+                    <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">해석</div>
+                    <div className="flex-1 overflow-auto rounded border border-gray-200 bg-white px-2 py-1.5">
+                      {decodedFrame ? <FrameDecodeView frame={decodedFrame} /> : <span className="text-[10.5px] text-gray-400">해석 불가</span>}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-1 items-center justify-center rounded border border-dashed border-gray-200 text-gray-400">
+                  프레임 데이터 없음 (재파싱 필요)
+                </div>
+              )}
+            </div>
           </div>
         </Modal>
       )}
