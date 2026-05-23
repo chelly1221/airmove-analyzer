@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { ArrowUp, ArrowDown, Search, FileText, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -9,23 +9,20 @@ import DateRangePicker from "../components/common/DateRangePicker";
 import { useAppStore } from "../store";
 import { buildEventsFromReports, type TcasEvent, type CoordEvent } from "../utils/tcasEvents";
 import { decodeFrame, type DecodedFrame } from "../utils/asterixDecoder";
-import {
-  postPointsToWorker, startConsolidate, getPointSummary,
-  createThrottledChunkHandler, setConsolidationProgressCallback,
-} from "../utils/flightConsolidationWorker";
-import type { Flight, TrackPoint } from "../types";
+import type { Aircraft } from "../types";
 import type { TcasReport } from "../types/track";
 
 /**
- * ASS 파일 선택 → 필터 모달 → 배치 스트리밍 파싱 → Worker 전송 + TCAS 누적 → 비행 통합.
- * 3D 지도·2D 항적도(useAssFilePicker)와 동일 패턴이며, ACAS용으로 TCAS 보고 수집을 추가.
+ * ASS 파일 선택 → 필터 모달 → 배치 파싱 → TCAS 보고만 누적.
+ * ACAS는 TCAS 보고만 사용. 트랙 포인트/비행 통합은 하지 않으며(라벨은 aircraft 레지스트리),
+ * 항적도는 별도 업로드 로직으로 독립 관리되므로 worker/flights를 건드리지 않는다.
  */
 function useAssFilePicker() {
   const [parsing, setParsing] = useState(false);
   const [fileCount, setFileCount] = useState(0);
   const [filterModalOpen, setFilterModalOpen] = useState(false);
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
-  const consolidatingRef = useRef(false);
+  const [notice, setNotice] = useState<{ title: string; message: string } | null>(null);
 
   const pickFiles = useCallback(async () => {
     if (parsing) return;
@@ -45,8 +42,8 @@ function useAssFilePicker() {
     const paths = pendingPaths;
     if (paths.length === 0) return;
 
-    // 기존 데이터 전체 비우고 새로 불러오기 (worker 포인트/비행/커버리지/업로드목록 + TCAS 보고)
-    useAppStore.getState().clearUploadedFiles();
+    // 기존 ACAS 보고만 비우고 새로 불러오기. 항적도(worker 포인트/비행/커버리지)는
+    // 별도 업로드 로직으로 독립 관리되므로 ACAS 업로드에서 건드리지 않는다.
     useAppStore.getState().clearTcasReports();
 
     setParsing(true);
@@ -54,15 +51,7 @@ function useAssFilePicker() {
 
     const site = useAppStore.getState().radarSite;
 
-    // 트랙 포인트: 청크 즉시 Worker로 fire-and-forget (메모리 일괄 보유 방지)
-    let totalForwarded = 0;
-    const unlistenPoints = await listen<{ points: TrackPoint[] }>("parse-points-chunk", (event) => {
-      const pts = event.payload.points;
-      for (const p of pts) p.radar_name = site.name;
-      totalForwarded += pts.length;
-      postPointsToWorker(pts);
-    });
-    // 파일별 결과: TCAS/ACAS 보고 누적 (트랙 독립 전수 추출)
+    // 파일별 결과: TCAS/ACAS 보고만 누적 (트랙 독립 전수 추출). 트랙 포인트는 무시.
     const unlistenResult = await listen<{ success: boolean; file_info?: { tcas_reports?: TcasReport[] } }>(
       "batch-parse-result",
       (event) => {
@@ -73,6 +62,7 @@ function useAssFilePicker() {
       },
     );
 
+    let failed = false;
     try {
       await invoke("parse_and_analyze_batch", {
         filePaths: paths,
@@ -84,41 +74,24 @@ function useAssFilePicker() {
         mode3aExclude: filter.mode3aExclude,
       });
     } catch (e) {
+      failed = true;
       console.error("[ACAS] 배치 파싱 실패:", e);
     }
 
-    unlistenPoints();
     unlistenResult();
-
-    if (totalForwarded > 0) {
-      const summary = await getPointSummary();
-      useAppStore.setState({ workerPointCount: summary.totalPoints, workerPointSummary: summary.entries });
-    }
-
-    // 비행 통합 — 위협/보고 항공기 라벨용 flights 생성
-    if (!consolidatingRef.current && useAppStore.getState().workerPointCount > 0) {
-      consolidatingRef.current = true;
-      useAppStore.getState().setConsolidating(true);
-      useAppStore.getState().setConsolidationProgress({ stage: "grouping", current: 0, total: 0, flightsBuilt: 0 });
-      setConsolidationProgressCallback((p) => useAppStore.getState().setConsolidationProgress(p as any));
-      try {
-        const state = useAppStore.getState();
-        const { handler, flush } = createThrottledChunkHandler(
-          (batch) => useAppStore.getState().appendFlights(batch), 250,
-        );
-        await startConsolidate([], state.aircraft, state.radarSite, handler);
-        flush();
-      } finally {
-        consolidatingRef.current = false;
-        setConsolidationProgressCallback(null);
-        useAppStore.getState().setConsolidating(false);
-        useAppStore.getState().setConsolidationProgress(null);
-        useAppStore.getState().finalizeFlights();
-      }
-    }
 
     setParsing(false);
     setPendingPaths([]);
+
+    // 파싱 결과 피드백 — 파싱 실패 또는 ACAS 보고 0건이면 안내
+    if (failed) {
+      setNotice({ title: "파싱 실패", message: "파일을 읽지 못했습니다. ASS 파일 형식과 경로를 확인하세요." });
+    } else if (useAppStore.getState().tcasReports.length === 0) {
+      setNotice({
+        title: "ACAS 정보 없음",
+        message: `선택한 ${paths.length}개 파일에서 ACAS(TCAS) 보고를 찾지 못했습니다.\n파일에 ACAS RA(I048/260) 또는 BDS 3,0 데이터가 없을 수 있습니다.`,
+      });
+    }
   }, [pendingPaths]);
 
   const closeFilterModal = useCallback(() => {
@@ -126,7 +99,7 @@ function useAssFilePicker() {
     setPendingPaths([]);
   }, []);
 
-  return { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount };
+  return { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount, notice, closeNotice: () => setNotice(null) };
 }
 
 type TabId = "ra" | "coord";
@@ -155,11 +128,10 @@ function dtLocalToTs(s: string, tz: TzMode): number | null {
   const utcMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
   return (utcMs - (tz === "KST" ? KST_OFFSET_SECS * 1000 : 0)) / 1000;
 }
-function labelFor(modeS: string | undefined, flights: Flight[]): string {
+function labelFor(modeS: string | undefined, aircraft: Aircraft[]): string {
   if (!modeS || modeS === "NO_MODES") return modeS ?? "—";
-  const f = flights.find((fl) => fl.mode_s === modeS);
-  if (!f) return modeS;
-  const name = f.aircraft_name || f.callsign;
+  const a = aircraft.find((ac) => ac.mode_s_code?.toUpperCase() === modeS.toUpperCase());
+  const name = a?.name || a?.registration;
   return name ? `${name} (${modeS})` : modeS;
 }
 
@@ -284,12 +256,9 @@ function FrameInspector({ frameBytes, decoded }: { frameBytes: number[]; decoded
 
 export default function AcasAnalysis() {
   const tcasReports = useAppStore((s) => s.tcasReports);
-  const flights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
-  const consolidating = useAppStore((s) => s.consolidating);
-  const consolidationProgress = useAppStore((s) => s.consolidationProgress);
 
-  const { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount } = useAssFilePicker();
+  const { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount, notice, closeNotice } = useAssFilePicker();
 
   const { raEvents, coordEvents } = useMemo(
     () => buildEventsFromReports(tcasReports),
@@ -328,8 +297,8 @@ export default function AcasAnalysis() {
       if (ev.threatTti === 1 && !tti1) return false;
       if (ev.threatTti === 2 && !tti2) return false;
       if (q) {
-        const o = labelFor(ev.ownModeS, flights).toUpperCase();
-        const t = labelFor(ev.threatModeS, flights).toUpperCase();
+        const o = labelFor(ev.ownModeS, aircraft).toUpperCase();
+        const t = labelFor(ev.threatModeS, aircraft).toUpperCase();
         if (!o.includes(q) && !t.includes(q)) return false;
       }
       if (desc && !ev.raDescription.toLowerCase().includes(desc)) return false;
@@ -339,9 +308,9 @@ export default function AcasAnalysis() {
     filtered.sort((a, b) => {
       let av: number | string, bv: number | string;
       switch (sortKey) {
-        case "ownLabel": av = labelFor(a.ownModeS, flights); bv = labelFor(b.ownModeS, flights); break;
+        case "ownLabel": av = labelFor(a.ownModeS, aircraft); bv = labelFor(b.ownModeS, aircraft); break;
         case "ownAltFt": av = a.ownAltFt ?? Infinity; bv = b.ownAltFt ?? Infinity; break;
-        case "threatLabel": av = labelFor(a.threatModeS, flights); bv = labelFor(b.threatModeS, flights); break;
+        case "threatLabel": av = labelFor(a.threatModeS, aircraft); bv = labelFor(b.threatModeS, aircraft); break;
         case "tti": av = a.threatTti; bv = b.threatTti; break;
         case "raDescription": av = a.raDescription; bv = b.raDescription; break;
         case "action":    av = a.corrective ? 1 : 0; bv = b.corrective ? 1 : 0; break;
@@ -357,7 +326,7 @@ export default function AcasAnalysis() {
       return String(av).localeCompare(String(bv)) * dir;
     });
     return filtered;
-  }, [raEvents, flights, search, descKeyword, startDt, endDt, tz, tti0, tti1, tti2, sortKey, sortDesc]);
+  }, [raEvents, aircraft, search, descKeyword, startDt, endDt, tz, tti0, tti1, tti2, sortKey, sortDesc]);
 
   const coordRows = useMemo(() => {
     const q = search.trim().toUpperCase();
@@ -370,8 +339,8 @@ export default function AcasAnalysis() {
       if (ev.threatTti === 1 && !tti1) return false;
       if (ev.threatTti === 2 && !tti2) return false;
       if (q) {
-        const o = labelFor(ev.ownModeS, flights).toUpperCase();
-        const t = labelFor(ev.threatModeS, flights).toUpperCase();
+        const o = labelFor(ev.ownModeS, aircraft).toUpperCase();
+        const t = labelFor(ev.threatModeS, aircraft).toUpperCase();
         if (!o.includes(q) && !t.includes(q)) return false;
       }
       if (desc && !ev.description.toLowerCase().includes(desc)) return false;
@@ -381,9 +350,9 @@ export default function AcasAnalysis() {
     filtered.sort((a, b) => {
       let av: number | string, bv: number | string;
       switch (sortKey) {
-        case "ownLabel": av = labelFor(a.ownModeS, flights); bv = labelFor(b.ownModeS, flights); break;
+        case "ownLabel": av = labelFor(a.ownModeS, aircraft); bv = labelFor(b.ownModeS, aircraft); break;
         case "ownAltFt": av = a.ownAltFt ?? Infinity; bv = b.ownAltFt ?? Infinity; break;
-        case "threatLabel": av = labelFor(a.threatModeS, flights); bv = labelFor(b.threatModeS, flights); break;
+        case "threatLabel": av = labelFor(a.threatModeS, aircraft); bv = labelFor(b.threatModeS, aircraft); break;
         case "tti": av = a.threatTti; bv = b.threatTti; break;
         case "raDescription": av = a.description; bv = b.description; break;
         case "action":    av = a.corrective ? 1 : 0; bv = b.corrective ? 1 : 0; break;
@@ -396,7 +365,7 @@ export default function AcasAnalysis() {
       return String(av).localeCompare(String(bv)) * dir;
     });
     return filtered;
-  }, [coordEvents, flights, search, descKeyword, startDt, endDt, tz, tti0, tti1, tti2, sortKey, sortDesc]);
+  }, [coordEvents, aircraft, search, descKeyword, startDt, endDt, tz, tti0, tti1, tti2, sortKey, sortDesc]);
 
   const stats = useMemo(() => {
     const src = tab === "ra" ? raEvents : coordEvents;
@@ -473,7 +442,7 @@ export default function AcasAnalysis() {
         {tcasReports.length > 0 && (
           <button
             onClick={pickFiles}
-            disabled={parsing || consolidating}
+            disabled={parsing}
             title="기존 데이터를 비우고 새 ASS 파일을 불러옵니다"
             className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-[#a60739]/30 bg-white px-3 py-1.5 text-[12px] font-medium text-[#a60739] transition-colors hover:bg-[#a60739]/5 disabled:opacity-50"
           >
@@ -488,7 +457,7 @@ export default function AcasAnalysis() {
           <p>ACAS 데이터가 없습니다.</p>
           <button
             onClick={pickFiles}
-            disabled={parsing || consolidating}
+            disabled={parsing}
             className="inline-flex items-center gap-1.5 rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#8a062f] disabled:opacity-50"
           >
             {parsing ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
@@ -623,11 +592,11 @@ export default function AcasAnalysis() {
                   ) : raRows.map((ev) => (
                     <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
                       <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, flights)}</td>
+                      <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, aircraft)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
                       <td className="px-3 py-1.5 text-center"><span className={`inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${TTI_COLOR[ev.threatTti]}`}>{TTI_LABEL[ev.threatTti]}</span></td>
                       <td className="px-3 py-1.5 text-center tabular-nums text-gray-700">{ev.threatTti}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, flights) : "—"}<MteFlag ev={ev} /></td>
+                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, aircraft) : "—"}<MteFlag ev={ev} /></td>
                       <td className="px-3 py-1.5 text-gray-700" title={`ARA=0x${ev.araHex} · RAC=0x${ev.racHex}`}>{ev.raDescription}</td>
                       <KindCell ev={ev} />
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.threatRangeNm != null ? ev.threatRangeNm.toFixed(1) : "—"}</td>
@@ -646,11 +615,11 @@ export default function AcasAnalysis() {
                   ) : coordRows.map((ev) => (
                     <tr key={ev.id} className="border-t border-gray-100 hover:bg-[#a60739]/5">
                       <td className="px-3 py-1.5 font-mono text-gray-700">{ev.timeEstimated ? "~" : ""}{formatTime(ev.startTime, tz)}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, flights)}</td>
+                      <td className="px-3 py-1.5 text-gray-800">{labelFor(ev.ownModeS, aircraft)}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-700">{ev.ownAltFt != null ? Math.round(ev.ownAltFt) : "—"}</td>
                       <td className="px-3 py-1.5 text-center"><span className={`inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${TTI_COLOR[ev.threatTti]}`}>{TTI_LABEL[ev.threatTti]}</span></td>
                       <td className="px-3 py-1.5 text-center tabular-nums text-gray-700">{ev.threatTti}</td>
-                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, flights) : "—"}<MteFlag ev={ev} /></td>
+                      <td className="px-3 py-1.5 text-gray-800">{ev.threatTti === 1 ? labelFor(ev.threatModeS, aircraft) : "—"}<MteFlag ev={ev} /></td>
                       <td className="px-3 py-1.5 text-gray-700" title={`ARA=0x${ev.araHex} · RAC=0x${ev.racHex}`}>{ev.description}</td>
                       <KindCell ev={ev} />
                       <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{(ev.endTime - ev.startTime).toFixed(1)}</td>
@@ -676,7 +645,7 @@ export default function AcasAnalysis() {
               <div>
                 <div className="text-gray-500 mb-1">시각 ({tz}) · Own</div>
                 <div className="font-mono text-gray-800">
-                  {detailEv.timeEstimated ? "~" : ""}{formatTime(detailEv.startTime, tz)} · {labelFor(detailEv.ownModeS, flights)}
+                  {detailEv.timeEstimated ? "~" : ""}{formatTime(detailEv.startTime, tz)} · {labelFor(detailEv.ownModeS, aircraft)}
                   {detailEv.timeEstimated && <span className="ml-1 text-gray-400">(시각 추정 — I140 부재)</span>}
                 </div>
               </div>
@@ -735,20 +704,18 @@ export default function AcasAnalysis() {
       {/* 파싱 필터 모달 */}
       <ParseFilterModal open={filterModalOpen} onClose={closeFilterModal} onConfirm={parseWithFilter} aircraft={aircraft} />
 
-      {/* 비행 통합 진행 오버레이 */}
-      {consolidating && consolidationProgress && (
-        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/30 backdrop-blur-sm">
-          <div className="flex min-w-[280px] flex-col items-center gap-3 rounded-xl border border-gray-200 bg-white p-8 shadow-2xl">
-            <Loader2 size={28} className="animate-spin text-[#a60739]" />
-            <p className="text-sm text-gray-600">
-              {consolidationProgress.stage === "grouping" && "포인트 그룹핑 중..."}
-              {consolidationProgress.stage === "building" && `비행 생성 중... (${consolidationProgress.flightsBuilt}건)`}
-              {consolidationProgress.stage === "history" && "운항이력 로드 중..."}
-              {consolidationProgress.stage === "loading" && "DB에서 항적 로드 중..."}
-              {consolidationProgress.stage === "done" && "완료"}
-            </p>
+      {/* 파싱 결과 안내 (ACAS 없음 / 실패) */}
+      {notice && (
+        <Modal open={true} onClose={closeNotice} title={notice.title} width="max-w-md">
+          <div className="space-y-4 text-sm text-gray-700">
+            <p className="whitespace-pre-line leading-relaxed">{notice.message}</p>
+            <div className="flex justify-end">
+              <button onClick={closeNotice} className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#8a062f]">
+                확인
+              </button>
+            </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   );
