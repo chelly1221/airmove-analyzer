@@ -43,8 +43,15 @@ export function FrameDecodeTree({
       {frame.blocks.length === 0 && <div className="text-gray-400">디코드된 블록 없음</div>}
       {frame.blocks.map((blk, bi) => (
         <div key={bi} className="rounded border border-gray-100">
-          <div className="flex items-baseline justify-between bg-gray-50 px-2 py-1">
-            <span className="font-medium text-gray-700">{CAT_LABEL[blk.cat] ?? `CAT${blk.cat.toString(16)}`}</span>
+          <div
+            className={`flex items-baseline justify-between px-2 py-1 ${isActive(blk.start, 3) ? "bg-[#a60739]/10" : "bg-gray-50 hover:bg-gray-100"}`}
+            onMouseEnter={() => onHover({ start: blk.start, len: 3 })}
+            onMouseLeave={() => onHover(null)}
+          >
+            <span className="font-medium text-gray-700">
+              {CAT_LABEL[blk.cat] ?? `CAT${blk.cat.toString(16)}`}
+              <span className="ml-1 font-mono text-[9px] uppercase tracking-wider text-gray-400">CAT+LEN</span>
+            </span>
             <span className="text-gray-400">len {blk.len} · rec {blk.records.length}</span>
           </div>
           <div className="divide-y divide-gray-50">
@@ -53,6 +60,18 @@ export function FrameDecodeTree({
                 {blk.records.length > 1 && <div className="mb-0.5 text-[9.5px] uppercase tracking-wider text-gray-400">레코드 {ri + 1}</div>}
                 <table className="w-full">
                   <tbody>
+                    {rec.fspec && (
+                      <tr
+                        className={rowCls(rec.fspec.start, rec.fspec.len)}
+                        onMouseEnter={() => onHover({ start: rec.fspec!.start, len: rec.fspec!.len })}
+                        onMouseLeave={() => onHover(null)}
+                      >
+                        <td className="whitespace-nowrap py-0.5 pr-2 font-mono text-gray-500">FSPEC</td>
+                        <td className="whitespace-nowrap py-0.5 pr-2 text-gray-600">필드 명세</td>
+                        <td className="py-0.5 pr-2 text-gray-400">{rec.items.length}개 항목</td>
+                        <td className="py-0.5 font-mono text-[9.5px] text-gray-400 break-all">{rec.fspec.rawHex}</td>
+                      </tr>
+                    )}
                     {rec.items.map((it, ii) => (
                       <tr
                         key={ii}

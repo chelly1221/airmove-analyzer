@@ -33,6 +33,8 @@ export interface DecodedItem {
 
 export interface DecodedRecord {
   items: DecodedItem[];
+  /** FSPEC(필드 명세) 바이트 범위 — 이 레코드에 어떤 데이터 항목이 존재하는지 나타내는 비트맵 */
+  fspec?: { rawHex: string; start: number; len: number };
   /** truncation / 중단 사유 등 */
   note?: string;
 }
@@ -41,6 +43,8 @@ export interface DecodedBlock {
   cat: number;
   len: number;
   rawHex: string;
+  /** 블록의 프레임 절대 시작 오프셋 (CAT 1B + LEN 2B 헤더 하이라이트용) */
+  start: number;
   records: DecodedRecord[];
   note?: string;
 }
@@ -279,9 +283,10 @@ const CAT048_UAP: ItemMeta[] = [
 ];
 
 /** CAT048 레코드 디코드 — block[start..]에서 한 레코드. base = block[0]의 프레임 절대 오프셋. */
-function decodeCat048Record(block: number[], start: number, base: number): { items: DecodedItem[]; next: number; note?: string } {
+function decodeCat048Record(block: number[], start: number, base: number): { items: DecodedItem[]; next: number; fspec?: { rawHex: string; start: number; len: number }; note?: string } {
   const fspec = parseFspec(block, start, CAT048_UAP.length);
   if (!fspec) return { items: [], next: block.length, note: "FSPEC 파싱 불가" };
+  const fspecInfo = { rawHex: hex(block.slice(start, fspec.next)), start: base + start, len: fspec.next - start };
   const items: DecodedItem[] = [];
   let pos = fspec.next;
   let note: string | undefined;
@@ -324,7 +329,7 @@ function decodeCat048Record(block: number[], start: number, base: number): { ite
     items.push({ id: meta.id, name: meta.name, rawHex: hex(raw), value, start: base + pos, len });
     pos += len;
   }
-  return { items, next: pos, note };
+  return { items, next: pos, fspec: fspecInfo, note };
 }
 
 // ─── CAT034 / CAT008 (표준 UAP, best-effort) ─────────
@@ -386,9 +391,10 @@ const CAT008_UAP: GenMeta[] = [
 ];
 
 /** CAT034/008 레코드 디코드 — 선두 신뢰 항목까지. 나머지는 raw로 1건 추가하고 종료. base=절대 오프셋. */
-function decodeGenericRecord(block: number[], start: number, base: number, uap: GenMeta[]): { items: DecodedItem[]; next: number; note?: string } {
+function decodeGenericRecord(block: number[], start: number, base: number, uap: GenMeta[]): { items: DecodedItem[]; next: number; fspec?: { rawHex: string; start: number; len: number }; note?: string } {
   const fspec = parseFspec(block, start, uap.length);
   if (!fspec) return { items: [], next: block.length, note: "FSPEC 파싱 불가" };
+  const fspecInfo = { rawHex: hex(block.slice(start, fspec.next)), start: base + start, len: fspec.next - start };
   const items: DecodedItem[] = [];
   let pos = fspec.next;
   let note: string | undefined;
@@ -415,7 +421,7 @@ function decodeGenericRecord(block: number[], start: number, base: number, uap: 
   if (pos < block.length) {
     items.push({ id: "(raw)", name: "미해석 잔여", rawHex: hex(block.slice(pos)), start: base + pos, len: block.length - pos });
   }
-  return { items, next: block.length, note };
+  return { items, next: block.length, fspec: fspecInfo, note };
 }
 
 // ─── 블록/프레임 ─────────────────────────────────────
@@ -425,7 +431,7 @@ function decodeBlock(data: number[], offset: number): { block: DecodedBlock; nex
   const len = (data[offset + 1] << 8) | data[offset + 2];
   const end = Math.min(offset + len, data.length);
   const blockBytes = data.slice(offset, end);
-  const block: DecodedBlock = { cat, len, rawHex: hex(blockBytes), records: [] };
+  const block: DecodedBlock = { cat, len, rawHex: hex(blockBytes), start: offset, records: [] };
 
   let recPos = 3; // CAT(1)+LEN(2) 이후
   let guard = 0;
@@ -437,7 +443,7 @@ function decodeBlock(data: number[], offset: number): { block: DecodedBlock; nex
     else if (cat === CAT008) res = decodeGenericRecord(blockBytes, recPos, offset, CAT008_UAP);
     else { block.note = `CAT${cat.toString(16)} 미지원`; break; }
 
-    block.records.push({ items: res.items, note: res.note });
+    block.records.push({ items: res.items, fspec: res.fspec, note: res.note });
     if (res.next <= recPos) break; // 진행 불가 → 무한루프 방지
     recPos = res.next;
   }
