@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { ArrowUp, ArrowDown, Search, FileText, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2 } from "lucide-react";
+import { ArrowUp, ArrowDown, Search, FileText, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2, FileSpreadsheet } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -9,6 +9,7 @@ import DateRangePicker from "../components/common/DateRangePicker";
 import { useAppStore } from "../store";
 import { buildEventsFromReports, type TcasEvent } from "../utils/tcasEvents";
 import { decodeFrame, type DecodedFrame } from "../utils/asterixDecoder";
+import { saveXlsx, type Cell } from "../utils/xlsxExport";
 import { FrameInspector } from "../components/common/FrameInspector";
 import type { Aircraft } from "../types";
 import type { TcasReport } from "../types/track";
@@ -221,6 +222,61 @@ export default function AcasAnalysis() {
     return { total: raEvents.length, tti0: n0, tti1: n1, tti2: n2 };
   }, [raEvents]);
 
+  // EXCEL 내보내기 — 현재 필터/정렬이 적용된 RA 목록을 그대로 .xlsx로 저장
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const nameOf = useCallback((modeS?: string) => {
+    if (!modeS || modeS === "NO_MODES") return "";
+    const a = aircraft.find((ac) => ac.mode_s_code?.toUpperCase() === modeS.toUpperCase());
+    return a?.name || a?.registration || "";
+  }, [aircraft]);
+
+  const exportExcel = useCallback(async () => {
+    if (exporting || raRows.length === 0) return;
+    setExporting(true);
+    try {
+      const header = [
+        `시각(${tz})`, "시각추정", "보고 Mode-S", "보고 기체", "보고 고도(ft)",
+        "TID", "TTI", "위협 Mode-S", "위협 기체", "MTE", "RA 의도",
+        "동작", "방향", "위협 거리(NM)", "위협 방위(°)", "위협 고도(ft)",
+        "지속(s)", "횟수", "ARA(hex)", "RAC(hex)",
+      ];
+      const rows: Cell[][] = [header];
+      for (const ev of raRows) {
+        rows.push([
+          formatTime(ev.startTime, tz),
+          ev.timeEstimated ? "추정" : "실측",
+          ev.ownModeS === "NO_MODES" ? "" : ev.ownModeS,
+          nameOf(ev.ownModeS),
+          ev.ownAltFt != null ? Math.round(ev.ownAltFt) : null,
+          TTI_LABEL[ev.threatTti],
+          ev.threatTti,
+          ev.threatTti === 1 ? (ev.threatModeS ?? "") : "",
+          ev.threatTti === 1 ? nameOf(ev.threatModeS) : "",
+          ev.mte ? "MTE" : "",
+          ev.raDescription,
+          ev.corrective ? "Corrective" : "Preventive",
+          ev.downSense ? "Descend" : "Climb",
+          ev.threatRangeNm != null ? Number(ev.threatRangeNm.toFixed(1)) : null,
+          ev.threatBearingDeg != null ? Math.round(ev.threatBearingDeg) : null,
+          ev.threatAltFt != null ? Math.round(ev.threatAltFt) : null,
+          Number((ev.endTime - ev.startTime).toFixed(1)),
+          ev.raPointCount,
+          `0x${ev.araHex}`,
+          `0x${ev.racHex}`,
+        ]);
+      }
+      const stamp = new Date().toISOString().slice(0, 10);
+      await saveXlsx([{ name: "ACAS RA", rows }], `ACAS_RA_${stamp}.xlsx`);
+    } catch (e) {
+      console.error("[ACAS] EXCEL 내보내기 실패:", e);
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  }, [exporting, raRows, tz, nameOf]);
+
   const SortHeader = ({ k, label, tip, cls = "" }: { k: SortKey; label: string; tip?: string; cls?: string }) => (
     <th onClick={() => toggleSort(k)} title={tip}
       className={`sticky top-0 z-10 bg-gray-50 px-3 py-2 text-left text-[11px] font-medium text-gray-600 select-none cursor-pointer hover:bg-gray-100 ${cls}`}>
@@ -287,15 +343,26 @@ export default function AcasAnalysis() {
         <h1 className="text-lg font-semibold text-gray-800">ACAS 분석</h1>
         <span className="text-[11px] text-gray-400">RA {raEvents.length}</span>
         {tcasReports.length > 0 && (
-          <button
-            onClick={pickFiles}
-            disabled={parsing}
-            title="기존 데이터를 비우고 새 ASS 파일을 불러옵니다"
-            className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-[#a60739]/30 bg-white px-3 py-1.5 text-[12px] font-medium text-[#a60739] transition-colors hover:bg-[#a60739]/5 disabled:opacity-50"
-          >
-            {parsing ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
-            {parsing ? `파싱 중 (${fileCount})...` : "새 ASS 파일"}
-          </button>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={exportExcel}
+              disabled={exporting || raRows.length === 0}
+              title="현재 필터·정렬된 RA 목록을 Excel(.xlsx)로 내보냅니다"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-600/30 bg-white px-3 py-1.5 text-[12px] font-medium text-emerald-700 transition-colors hover:bg-emerald-50 disabled:opacity-50"
+            >
+              {exporting ? <Loader2 size={14} className="animate-spin" /> : <FileSpreadsheet size={14} />}
+              EXCEL
+            </button>
+            <button
+              onClick={pickFiles}
+              disabled={parsing}
+              title="기존 데이터를 비우고 새 ASS 파일을 불러옵니다"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#a60739]/30 bg-white px-3 py-1.5 text-[12px] font-medium text-[#a60739] transition-colors hover:bg-[#a60739]/5 disabled:opacity-50"
+            >
+              {parsing ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
+              {parsing ? `파싱 중 (${fileCount})...` : "새 ASS 파일"}
+            </button>
+          </div>
         )}
       </div>
 
@@ -523,6 +590,20 @@ export default function AcasAnalysis() {
             <p className="whitespace-pre-line leading-relaxed">{notice.message}</p>
             <div className="flex justify-end">
               <button onClick={closeNotice} className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#8a062f]">
+                확인
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* EXCEL 내보내기 실패 */}
+      {exportError && (
+        <Modal open={true} onClose={() => setExportError(null)} title="EXCEL 내보내기 실패" width="max-w-md">
+          <div className="space-y-4 text-sm text-gray-700">
+            <p className="break-all leading-relaxed">{exportError}</p>
+            <div className="flex justify-end">
+              <button onClick={() => setExportError(null)} className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#8a062f]">
                 확인
               </button>
             </div>
