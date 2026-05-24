@@ -10,7 +10,6 @@ import {
   X,
   FileText,
   ShieldAlert,
-  FileSpreadsheet,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -21,6 +20,8 @@ import { FrameInspector, CAT_LABEL } from "../components/common/FrameInspector";
 import { useAppStore } from "../store";
 import { decodeFrame, type DecodedFrame } from "../utils/asterixDecoder";
 import { saveXlsx, type Cell } from "../utils/xlsxExport";
+import { exportStrings, type ExportLang } from "../utils/exportI18n";
+import { ExcelExportButton } from "../components/common/ExcelExportButton";
 import type {
   AsterixStats,
   AsterixFrameSummary,
@@ -194,59 +195,60 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
-  const exportExcel = useCallback(async () => {
+  const exportExcel = useCallback(async (lang: ExportLang) => {
     if (exporting) return;
     setExporting(true);
     try {
+      const L = exportStrings(lang);
       const summary: Cell[][] = [
-        ["항목", "값"],
-        ["파일 수", stats.file_count],
-        ["총 용량(bytes)", stats.total_bytes],
-        ["프레임", stats.frame_count],
-        ["블록", stats.block_count],
-        ["레코드", stats.record_count],
-        ["Mode-S 고유", stats.modes_distinct],
-        ["ACAS RA 레코드", stats.acas_ra_records],
-        ["시각 범위", timeRange],
-        ["NEC 프레임 날짜", stats.nec_dates.join(", ")],
-        ["스킵 바이트", stats.skipped_bytes],
-        ["파싱 오류", stats.parse_errors],
-        ["절단 레코드", stats.truncated_records],
-        ["Mode-3/A 무효", stats.mode3a_garbled],
+        L.sumHeader,
+        [L.sum.files, stats.file_count],
+        [L.sum.totalBytes, stats.total_bytes],
+        [L.sum.frames, stats.frame_count],
+        [L.sum.blocks, stats.block_count],
+        [L.sum.records, stats.record_count],
+        [L.sum.distinctModeS, stats.modes_distinct],
+        [L.sum.acasRa, stats.acas_ra_records],
+        [L.sum.timeRange, timeRange],
+        [L.sum.necDates, stats.nec_dates.join(", ")],
+        [L.sum.skippedBytes, stats.skipped_bytes],
+        [L.sum.parseErrors, stats.parse_errors],
+        [L.sum.truncated, stats.truncated_records],
+        [L.sum.mode3aGarbled, stats.mode3a_garbled],
       ];
-      const cats: Cell[][] = [["카테고리", "블록", "레코드"]];
-      for (const c of stats.cat_counts) cats.push([CAT_LABEL[c.cat] ?? `CAT${catShort(c.cat)}`, c.blocks, c.records]);
+      const cats: Cell[][] = [L.catsHeader];
+      for (const c of stats.cat_counts) cats.push([L.catLabel(c.cat), c.blocks, c.records]);
 
-      const radarTyp: Cell[][] = [["탐지 유형", "건수"]];
-      for (const r of stats.radar_typ_counts) radarTyp.push([r.label, r.count]);
+      const radarTyp: Cell[][] = [L.radarTypHeader];
+      for (const r of stats.radar_typ_counts) radarTyp.push([L.radarTyp(r.key, r.label), r.count]);
 
-      const frn: Cell[][] = [["FRN", "항목", "건수"]];
-      for (const f of stats.cat048_frn_counts) frn.push([f.id, f.name, f.count]);
+      const frn: Cell[][] = [L.frnHeader];
+      for (const f of stats.cat048_frn_counts) frn.push([f.id, L.frnName(f.id, f.name), f.count]);
 
-      const modes: Cell[][] = [["Mode-S", "건수"]];
+      const modes: Cell[][] = [L.modesHeader];
       for (const m of stats.modes_top) modes.push([m.label, m.count]);
 
-      const sacSic: Cell[][] = [["SAC", "SIC", "건수"]];
+      const sacSic: Cell[][] = [L.sacSicHeader];
       for (const s of stats.sac_sic_counts) sacSic.push([s.sac, s.sic, s.count]);
 
-      const msg: Cell[][] = [["분류", "유형", "건수"]];
-      for (const m of stats.msg_type_034) msg.push(["CAT034", m.label, m.count]);
-      for (const m of stats.msg_type_008) msg.push(["CAT008", m.label, m.count]);
+      const msg: Cell[][] = [L.msgHeader];
+      for (const m of stats.msg_type_034) msg.push(["CAT034", L.msg034(m.key, m.label), m.count]);
+      for (const m of stats.msg_type_008) msg.push(["CAT008", L.msg008(m.key, m.label), m.count]);
 
-      const files: Cell[][] = [["파일", "용량(bytes)", "프레임", "레코드"]];
+      const files: Cell[][] = [L.filesHeader];
       for (const f of stats.files) files.push([f.filename, f.bytes, f.frames, f.records]);
 
       const stamp = new Date().toISOString().slice(0, 10);
       await saveXlsx(
         [
-          { name: "요약", rows: summary },
-          { name: "카테고리", rows: cats },
-          { name: "레이더 탐지유형", rows: radarTyp },
-          { name: "CAT048 항목", rows: frn },
-          { name: "Mode-S 상위", rows: modes },
-          { name: "SAC SIC", rows: sacSic },
-          { name: "메시지 유형", rows: msg },
-          { name: "파일별", rows: files },
+          { name: L.sheet.summary, rows: summary },
+          { name: L.sheet.categories, rows: cats },
+          { name: L.sheet.radarTyp, rows: radarTyp },
+          { name: L.sheet.frn, rows: frn },
+          { name: L.sheet.modesTop, rows: modes },
+          { name: L.sheet.sacSic, rows: sacSic },
+          { name: L.sheet.msgType, rows: msg },
+          { name: L.sheet.files, rows: files },
         ],
         `ASTERIX_통계_${stamp}.xlsx`,
       );
@@ -261,15 +263,11 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
   return (
     <div className="space-y-3">
       <div className="flex justify-end">
-        <button
-          onClick={exportExcel}
-          disabled={exporting}
-          title="대시보드 통계를 Excel(.xlsx)로 내보냅니다"
-          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-600/30 bg-white px-3 py-1.5 text-[12px] font-medium text-emerald-700 transition-colors hover:bg-emerald-50 disabled:opacity-50"
-        >
-          {exporting ? <Loader2 size={14} className="animate-spin" /> : <FileSpreadsheet size={14} />}
-          EXCEL
-        </button>
+        <ExcelExportButton
+          onExport={exportExcel}
+          busy={exporting}
+          title="대시보드 통계를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+        />
       </div>
 
       {/* 요약 카드 */}
@@ -516,12 +514,12 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
-  const exportExcel = useCallback(async () => {
+  const exportExcel = useCallback(async (lang: ExportLang) => {
     if (exporting || !result || result.frames.length === 0) return;
     setExporting(true);
     try {
-      const header = [`시각(${tz})`, "파일", "카테고리", "레코드", "Mode-S", "ACAS", "바이트", "오프셋", "TOD(s)"];
-      const rows: Cell[][] = [header];
+      const L = exportStrings(lang);
+      const rows: Cell[][] = [L.framesHeaders(tz)];
       for (const f of result.frames) {
         rows.push([
           f.abs_time != null ? formatTime(f.abs_time, tz) : f.tod != null ? `${fmtTod(f.tod)} UTC` : "",
@@ -536,7 +534,7 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
         ]);
       }
       const stamp = new Date().toISOString().slice(0, 10);
-      await saveXlsx([{ name: "프레임", rows }], `ASTERIX_프레임_${stamp}.xlsx`);
+      await saveXlsx([{ name: L.framesSheet, rows }], `ASTERIX_프레임_${stamp}.xlsx`);
     } catch (e) {
       console.error("[ASTERIX] 프레임 EXCEL 내보내기 실패:", e);
       setExportError(String(e));
@@ -639,15 +637,13 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
               <span className="text-gray-400"> / {result.total_matched.toLocaleString()} 매칭</span>
               {result.truncated && <span className="ml-1 text-amber-600">(상위 {result.frames.length.toLocaleString()}건만 — 필터를 좁히세요)</span>}
             </span>
-            <button
-              onClick={exportExcel}
-              disabled={exporting || result.frames.length === 0}
-              title="현재 조회된 프레임 목록을 Excel(.xlsx)로 내보냅니다"
-              className="inline-flex h-7 items-center gap-1.5 rounded-md border border-emerald-600/30 bg-white px-3 text-[11px] font-medium text-emerald-700 transition-colors hover:bg-emerald-50 disabled:opacity-50"
-            >
-              {exporting ? <Loader2 size={12} className="animate-spin" /> : <FileSpreadsheet size={12} />}
-              EXCEL
-            </button>
+            <ExcelExportButton
+              onExport={exportExcel}
+              busy={exporting}
+              disabled={result.frames.length === 0}
+              title="현재 조회된 프레임 목록을 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+              size="sm"
+            />
           </div>
         )}
       </div>

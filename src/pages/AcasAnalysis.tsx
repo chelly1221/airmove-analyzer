@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { ArrowUp, ArrowDown, Search, FileText, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2, FileSpreadsheet } from "lucide-react";
+import { ArrowUp, ArrowDown, Search, FileText, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -10,6 +10,8 @@ import { useAppStore } from "../store";
 import { buildEventsFromReports, type TcasEvent } from "../utils/tcasEvents";
 import { decodeFrame, type DecodedFrame } from "../utils/asterixDecoder";
 import { saveXlsx, type Cell } from "../utils/xlsxExport";
+import { exportStrings, type ExportLang } from "../utils/exportI18n";
+import { ExcelExportButton } from "../components/common/ExcelExportButton";
 import { FrameInspector } from "../components/common/FrameInspector";
 import type { Aircraft } from "../types";
 import type { TcasReport } from "../types/track";
@@ -232,25 +234,20 @@ export default function AcasAnalysis() {
     return a?.name || a?.registration || "";
   }, [aircraft]);
 
-  const exportExcel = useCallback(async () => {
+  const exportExcel = useCallback(async (lang: ExportLang) => {
     if (exporting || raRows.length === 0) return;
     setExporting(true);
     try {
-      const header = [
-        `시각(${tz})`, "시각추정", "보고 Mode-S", "보고 기체", "보고 고도(ft)",
-        "TID", "TTI", "위협 Mode-S", "위협 기체", "MTE", "RA 의도",
-        "동작", "방향", "위협 거리(NM)", "위협 방위(°)", "위협 고도(ft)",
-        "지속(s)", "횟수", "ARA(hex)", "RAC(hex)",
-      ];
-      const rows: Cell[][] = [header];
+      const L = exportStrings(lang);
+      const rows: Cell[][] = [L.acasHeaders(tz)];
       for (const ev of raRows) {
         rows.push([
           formatTime(ev.startTime, tz),
-          ev.timeEstimated ? "추정" : "실측",
+          L.estimated(ev.timeEstimated),
           ev.ownModeS === "NO_MODES" ? "" : ev.ownModeS,
           nameOf(ev.ownModeS),
           ev.ownAltFt != null ? Math.round(ev.ownAltFt) : null,
-          TTI_LABEL[ev.threatTti],
+          L.tti(ev.threatTti),
           ev.threatTti,
           ev.threatTti === 1 ? (ev.threatModeS ?? "") : "",
           ev.threatTti === 1 ? nameOf(ev.threatModeS) : "",
@@ -268,7 +265,7 @@ export default function AcasAnalysis() {
         ]);
       }
       const stamp = new Date().toISOString().slice(0, 10);
-      await saveXlsx([{ name: "ACAS RA", rows }], `ACAS_RA_${stamp}.xlsx`);
+      await saveXlsx([{ name: L.acasSheet, rows }], `ACAS_RA_${stamp}.xlsx`);
     } catch (e) {
       console.error("[ACAS] EXCEL 내보내기 실패:", e);
       setExportError(String(e));
@@ -344,15 +341,12 @@ export default function AcasAnalysis() {
         <span className="text-[11px] text-gray-400">RA {raEvents.length}</span>
         {tcasReports.length > 0 && (
           <div className="ml-auto flex items-center gap-2">
-            <button
-              onClick={exportExcel}
-              disabled={exporting || raRows.length === 0}
-              title="현재 필터·정렬된 RA 목록을 Excel(.xlsx)로 내보냅니다"
-              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-600/30 bg-white px-3 py-1.5 text-[12px] font-medium text-emerald-700 transition-colors hover:bg-emerald-50 disabled:opacity-50"
-            >
-              {exporting ? <Loader2 size={14} className="animate-spin" /> : <FileSpreadsheet size={14} />}
-              EXCEL
-            </button>
+            <ExcelExportButton
+              onExport={exportExcel}
+              busy={exporting}
+              disabled={raRows.length === 0}
+              title="현재 필터·정렬된 RA 목록을 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+            />
             <button
               onClick={pickFiles}
               disabled={parsing}
