@@ -13,7 +13,7 @@
  * 어떤 경우에도 raw hex는 별도로 항상 보이므로, 디코드가 부분적이어도 데이터는 숨겨지지 않는다.
  */
 
-import { decodeRaReport } from "./tcasDecoder";
+import { decodeBds } from "./bdsDecoder";
 
 const CAT048 = 0x30;
 const CAT034 = 0x22;
@@ -24,11 +24,13 @@ export interface DecodedItem {
   id: string;
   name: string;
   rawHex: string;
-  /** 해석 결과 (없으면 미해석) */
+  /** 해석 결과 (없으면 미해석). "\n" 포함 시 멀티라인으로 렌더 */
   value?: string;
   /** 프레임 내 절대 바이트 오프셋 (RAW HEX 하이라이트용) */
   start: number;
   len: number;
+  /** 하위 행 (I048/250 의 BDS 레지스터별 상세 등). 각 child도 자체 start/len 으로 hover 가능 */
+  children?: DecodedItem[];
 }
 
 export interface DecodedRecord {
@@ -213,6 +215,7 @@ function decodeI240(b: number[]): string {
   return out.trim();
 }
 
+/** I250 개요 한 줄 — 레지스터 목록 + 요약(상세는 하위 행에서). */
 function decodeI250(b: number[]): string {
   const rep = b[0];
   const regs: string[] = [];
@@ -220,19 +223,32 @@ function decodeI250(b: number[]): string {
     const off = 1 + i * 8;
     if (off + 8 > b.length) break;
     const bdsByte = b[off + 7];
-    const bds1 = (bdsByte >> 4) & 0x0f;
-    const bds2 = bdsByte & 0x0f;
-    let tag = `BDS${bds1},${bds2}`;
-    if (bds1 === 3 && bds2 === 0) tag += "(ACAS RA)";
-    else if (bds1 === 1 && bds2 === 6) tag += "(협의)";
-    regs.push(tag);
+    const d = decodeBds((bdsByte >> 4) & 0x0f, bdsByte & 0x0f, b.slice(off, off + 7));
+    regs.push(d.summary ? `BDS${d.code}(${d.summary})` : `BDS${d.code}`);
   }
   return `${rep}건: ${regs.join(" · ") || "—"}`;
 }
 
+/** I250 의 각 MB 블록을 BDS 레지스터별 하위 행으로 전개. base = b[0](REP 바이트)의 프레임 절대 오프셋. */
+function buildI250Children(b: number[], base: number): DecodedItem[] {
+  const rep = b[0];
+  const out: DecodedItem[] = [];
+  for (let i = 0; i < rep; i++) {
+    const off = 1 + i * 8;
+    if (off + 8 > b.length) break;
+    const blk = b.slice(off, off + 8);
+    const bdsByte = blk[7];
+    const d = decodeBds((bdsByte >> 4) & 0x0f, bdsByte & 0x0f, blk.slice(0, 7));
+    const value = d.fields.map((f) => (f.label ? `${f.label}: ${f.value}` : f.value)).join("\n");
+    out.push({ id: `BDS ${d.code}`, name: d.name, rawHex: hex(blk), value, start: base + off, len: 8 });
+  }
+  return out;
+}
+
+/** I260 ACAS RA — BDS 3,0 와 동일 페이로드를 필드별로 전개 */
 function decodeI260(b: number[]): string {
-  const d = decodeRaReport(b.slice(0, 7));
-  return d ? d.description : "RA 없음";
+  const d = decodeBds(3, 0, b.slice(0, 7));
+  return d.fields.map((f) => (f.label ? `${f.label}: ${f.value}` : f.value)).join("\n");
 }
 
 // CAT048 항목 메타 (FRN 1-28). 길이 규칙은 parse_cat048_record와 동일.
@@ -326,7 +342,9 @@ function decodeCat048Record(block: number[], start: number, base: number): { ite
     const raw = block.slice(pos, pos + len);
     let value: string | undefined;
     if (meta.decode) { try { value = meta.decode(raw); } catch { value = undefined; } }
-    items.push({ id: meta.id, name: meta.name, rawHex: hex(raw), value, start: base + pos, len });
+    let children: DecodedItem[] | undefined;
+    if (meta.kind.k === "i250") { try { children = buildI250Children(raw, base + pos); } catch { children = undefined; } }
+    items.push({ id: meta.id, name: meta.name, rawHex: hex(raw), value, start: base + pos, len, children });
     pos += len;
   }
   return { items, next: pos, fspec: fspecInfo, note };

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Binary,
   FolderOpen,
@@ -369,6 +369,35 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
       setQuerying(false);
     }
   }, [querying, search, catFilter, startDt, endDt, tz, filePaths]);
+
+  // 파일 업로드 시 필터 없는 전체 검색을 1회 자동 실행 (동일 파일셋 중복 방지)
+  const autoSearchedPaths = useRef<string[] | null>(null);
+  useEffect(() => {
+    if (filePaths.length === 0) {
+      autoSearchedPaths.current = null;
+      return;
+    }
+    if (autoSearchedPaths.current === filePaths) return;
+    autoSearchedPaths.current = filePaths;
+
+    // 필터 초기화 후 무필터 조회
+    setSearch("");
+    setCatFilter(null);
+    setStartDt("");
+    setEndDt("");
+    setQuerying(true);
+    invoke<AsterixQueryResult>("query_asterix_frames", { filePaths, filter: {} })
+      .then((res) => {
+        setResult(res);
+        setSearched(true);
+      })
+      .catch((e) => {
+        console.error("[ASTERIX] 자동 조회 실패:", e);
+        setResult({ total_matched: 0, truncated: false, frames: [] });
+        setSearched(true);
+      })
+      .finally(() => setQuerying(false));
+  }, [filePaths]);
 
   const clearFilters = () => {
     setSearch("");

@@ -495,10 +495,14 @@ export default function AcasAnalysis() {
             {/* 우: 프레임 전문 (RAW HEX + 해석) */}
             <div className="flex min-w-0 flex-1 flex-col">
               <div className="mb-2 shrink-0 text-gray-500">
-                프레임 전문 (NEC 프레임 · 전체 블록{detailEv.frameHex ? `, ${detailEv.frameHex.length / 2}바이트` : ""})
+                프레임 전문 (해당 RA 레코드 해석 · RAW는 NEC 프레임 전체{detailEv.frameHex ? `, ${detailEv.frameHex.length / 2}바이트` : ""})
               </div>
               {detailEv.frameHex && decodedFrame ? (
-                <FrameInspector frameBytes={frameBytes} decoded={decodedFrame} />
+                <FrameInspector
+                  frameBytes={frameBytes}
+                  decoded={decodedFrame}
+                  focus={{ i260Hex: detailEv.rawHex, modeSHex: detailEv.ownModeS }}
+                />
               ) : (
                 <div className="flex flex-1 items-center justify-center rounded border border-dashed border-gray-200 text-gray-400">
                   프레임 데이터 없음 (재파싱 필요)
