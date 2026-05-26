@@ -1,0 +1,523 @@
+/* ============================================================================
+ * KAC (한국공항공사) 보고서 디자인 토큰 + 컴포넌트 스타일
+ *
+ * 디자인 핸드오프(2026-05)로 OM(레이더 장애물 월간) 보고서 전 페이지에
+ * 적용되는 표지/섹션 헤더/표/KPI/판정 카드/산식 그리드 스타일. 모든 보고서
+ * 템플릿 표지에 동일 디자인을 사용한다는 사용자 결정에 따라 .kac-report 루트
+ * 컨테이너 단일 스코프로 적용 — ReportPreviewContent 외부엔 영향 없음.
+ * ========================================================================== */
+
+.kac-report {
+  /* KAC 표준 색조 */
+  --om-accent: #0046a0;            /* KAC 코발트 블루 */
+  --om-accent-deep: #003068;       /* 진한 네이비 */
+  --om-accent-soft: #eaf2fb;       /* 옅은 블루 배경 */
+  --om-accent-tint: rgba(0, 70, 160, 0.05);
+  --om-accent-shadow: rgba(0, 70, 160, 0.22);
+  --om-th-bg: #003068;
+  --om-th-border: #1f4276;
+  --om-th-color: #fff;
+  --om-psr: #3b82f6;
+  --om-loss: #ef4444;
+  --om-baseline: #9ca3af;
+  --om-dev-pos: #dc2626;
+  --om-dev-neg: #16a34a;
+  --om-text: #1f2937;
+  --om-text-muted: #6b7280;
+  --om-border: #e5e7eb;
+  --om-muted-bg: #f9fafb;
+
+  counter-reset: page;
+}
+
+/* ── A4 페이지 컨테이너 ────────────────────────────────────────────────── */
+.kac-report .report-page {
+  width: 210mm;
+  min-height: 297mm;
+  background: #ffffff;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08), 0 1px 3px rgba(0, 0, 0, 0.05);
+  position: relative;
+  overflow: hidden;
+  counter-increment: page;
+  margin: 0 auto 16px;
+  box-sizing: border-box;
+}
+.kac-report .report-page-inner {
+  padding: 16mm 14mm 18mm;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--om-text);
+  box-sizing: border-box;
+}
+/* 페이지 머리띠 — data-page-header 속성이 있을 때만, 표지 제외 */
+.kac-report .report-page[data-page-header]::before {
+  content: attr(data-page-header);
+  position: absolute;
+  top: 8mm;
+  left: 14mm;
+  right: 14mm;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #d1d5db;
+  font-size: 9.5px;
+  color: var(--om-text-muted);
+  letter-spacing: 0.02em;
+  font-family: "Pretendard Variable", sans-serif;
+}
+.kac-report .report-page.is-cover::before { display: none; }
+.kac-report .report-page.is-cover .report-page-inner { padding: 0; }
+
+/* 페이지 번호 — CSS counter */
+.kac-report .page-num {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 6mm;
+  text-align: center;
+  font-size: 9px;
+  color: #9ca3af;
+  font-variant-numeric: tabular-nums;
+}
+.kac-report .page-num::before { content: "— " counter(page) " —"; }
+.kac-report .report-page.is-cover .page-num { display: none; }
+
+/* ── 표지 (CoverD: 컬러 블록 + 정보 테이블) ────────────────────────────── */
+.kac-report .cover-d {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+}
+.kac-report .cover-d-block {
+  height: 60%;
+  background: linear-gradient(140deg, var(--om-accent-deep) 0%, var(--om-accent) 100%);
+  position: relative;
+  padding: 14mm 18mm;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+}
+.kac-report .cover-d-block-deco {
+  position: absolute;
+  right: 14mm;
+  top: 14mm;
+  width: 80mm;
+  height: 80mm;
+  opacity: 0.18;
+  background-image: repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.6) 0 1px, transparent 1px 8px);
+  pointer-events: none;
+}
+.kac-report .cover-d-mark {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+  z-index: 1;
+}
+.kac-report .cover-d-mark-square {
+  width: 34px;
+  height: 34px;
+  background: #fff;
+  color: var(--om-accent-deep);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 900;
+  font-size: 13px;
+  border-radius: 2px;
+}
+.kac-report .cover-d-mark-text {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.kac-report .cover-d-eyebrow {
+  margin-top: auto;
+  font-size: 13px;
+  letter-spacing: 0.3em;
+  opacity: 0.85;
+  font-weight: 600;
+  position: relative;
+  z-index: 1;
+}
+.kac-report .cover-d-title {
+  font-size: 34px;
+  font-weight: 800;
+  line-height: 1.25;
+  margin: 8px 0 0;
+  letter-spacing: -0.02em;
+  position: relative;
+  z-index: 1;
+}
+.kac-report .cover-d-subtitle {
+  font-size: 18px;
+  font-weight: 500;
+  margin-top: 14px;
+  opacity: 0.9;
+  font-variant-numeric: tabular-nums;
+  position: relative;
+  z-index: 1;
+}
+.kac-report .cover-d-info {
+  flex: 1;
+  padding: 14mm 18mm;
+  display: flex;
+  flex-direction: column;
+}
+.kac-report .cover-d-info-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 6mm;
+}
+.kac-report .cover-d-info-table th {
+  width: 30%;
+  padding: 7px 10px;
+  background: #f3f4f6;
+  color: #374151;
+  text-align: left;
+  border: 1px solid var(--om-border);
+  font-weight: 600;
+}
+.kac-report .cover-d-info-table td {
+  padding: 7px 10px;
+  border: 1px solid var(--om-border);
+  color: var(--om-text);
+}
+.kac-report .cover-d-issuer {
+  margin-top: auto;
+  text-align: center;
+  padding-top: 8mm;
+  border-top: 3px solid var(--om-accent-deep);
+}
+.kac-report .cover-d-issuer-name {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--om-accent-deep);
+  letter-spacing: 0.04em;
+}
+.kac-report .cover-d-issuer-sub {
+  font-size: 11px;
+  color: var(--om-text-muted);
+  margin-top: 2px;
+}
+
+/* ── 섹션 헤더 — band 변형 (좌측 6px 색띠 + 회색 박스) ──────────────────── */
+.kac-report .om-h2 {
+  font-size: 19px;
+  font-weight: 800;
+  color: #111827;
+  background: #f3f4f6;
+  border-left: 6px solid var(--om-accent);
+  padding: 9px 12px;
+  margin: 0 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.kac-report .om-h2 .sec-num {
+  color: var(--om-accent);
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+.kac-report .om-h3 {
+  font-size: 15px;
+  font-weight: 700;
+  color: #374151;
+  margin: 0 0 8px;
+}
+.kac-report .block-h3 {
+  font-size: 15px;
+  font-weight: 700;
+  color: #374151;
+  margin: 14px 0 8px;
+}
+.kac-report .cont-label {
+  font-size: 10px;
+  color: #9ca3af;
+  margin-bottom: 8px;
+}
+
+/* ── 표 (blueheader 변형) ────────────────────────────────────────────── */
+.kac-report .om-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.kac-report .om-table thead th {
+  background: var(--om-accent);
+  color: #fff;
+  font-weight: 700;
+  padding: 5px 8px;
+  border: 1px solid var(--om-accent-deep);
+  text-align: center;
+  font-size: 12.5px;
+}
+.kac-report .om-table thead tr.sub th {
+  background: var(--om-accent-soft);
+  color: var(--om-accent-deep);
+  font-weight: 700;
+  padding: 2px 8px;
+  border: 1px solid #b6cae8;
+  font-size: 11.5px;
+}
+.kac-report .om-table tbody td {
+  padding: 4px 8px;
+  border: 1px solid var(--om-border);
+  color: var(--om-text);
+}
+.kac-report .om-table tbody tr.alt { background: #f8fafd; }
+
+.kac-report .om-table.sm-table { font-size: 12px; }
+.kac-report .om-table.sm-table thead th { padding: 4px 6px; font-size: 11px; }
+.kac-report .om-table.sm-table tbody td { padding: 2px 6px; }
+.kac-report .om-table.weekly-table { margin-top: 8px; }
+
+/* 표 셀 정렬·서식 */
+.kac-report .ta-l { text-align: left; }
+.kac-report .ta-c { text-align: center; }
+.kac-report .ta-r { text-align: right; }
+.kac-report .w-5 { width: 24px; }
+.kac-report .mono {
+  font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+}
+.kac-report .muted { color: #9ca3af; }
+.kac-report .strong { font-weight: 700; }
+.kac-report .norm { font-weight: 400; }
+.kac-report .sm { font-size: 11.5px; }
+
+/* ── 방위·산식 통합 박스 (meta-merged) ──────────────────────────────────── */
+.kac-report .meta-merged {
+  margin: 12px 0;
+  border: 1px solid var(--om-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.kac-report .meta-merged-row { padding: 10px 12px; }
+.kac-report .meta-merged-row.az {
+  background: var(--om-muted-bg);
+  border-bottom: 1px solid var(--om-border);
+}
+.kac-report .meta-merged-row.formula {
+  background: #fff;
+  font-size: 10.5px;
+  color: var(--om-text-muted);
+  line-height: 1.55;
+}
+.kac-report .meta-merged-row.formula i {
+  font-family: "Times New Roman", serif;
+  font-style: italic;
+  color: var(--om-text);
+}
+.kac-report .meta-merged-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--om-accent-deep);
+  letter-spacing: 0.04em;
+  margin: 0 0 4px;
+  text-transform: uppercase;
+}
+.kac-report .az-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+
+/* ── KPI 행 리스트 (data-kpi="list") ────────────────────────────────────── */
+.kac-report .kpi-block { margin-bottom: 12px; }
+.kac-report .kpi-list {
+  border: 1px solid var(--om-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.kac-report .kpi-list .kpi {
+  border: 0;
+  border-bottom: 1px solid var(--om-border);
+  background: #fff;
+  display: grid;
+  grid-template-columns: 180px 1fr auto;
+  align-items: baseline;
+  padding: 8px 14px;
+  gap: 12px;
+  text-align: left;
+}
+.kac-report .kpi-list .kpi:last-child { border-bottom: 0; }
+.kac-report .kpi-list .kpi.grade {
+  background: var(--grade-bg, transparent);
+  color: var(--grade-color, inherit);
+}
+.kac-report .kpi-label {
+  margin: 0;
+  font-size: 12.5px;
+  color: #9ca3af;
+}
+.kac-report .kpi-list .kpi.grade .kpi-label {
+  color: inherit;
+  opacity: 0.75;
+}
+.kac-report .kpi-val {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--om-th-bg);
+}
+.kac-report .kpi-list .kpi.grade .kpi-val { color: inherit; }
+.kac-report .kpi-sigma {
+  margin: 0;
+  font-size: 10px;
+  color: #9ca3af;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 종합 소견 ───────────────────────────────────────────────────────── */
+.kac-report .summary-cards { display: grid; gap: 10px; margin-bottom: 14px; }
+.kac-report .sumcard {
+  border: 1px solid var(--om-border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #fff;
+}
+.kac-report .sumcard-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.kac-report .sumcard-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.kac-report .sumcard-table td { padding: 2px 0; }
+
+.kac-report .badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.kac-report .badge.ok { background: #dcfce7; color: #15803d; }
+.kac-report .badge.bad { background: #fee2e2; color: #b91c1c; }
+
+.kac-report .bldg-strip {
+  background: var(--om-muted-bg);
+  border: 1px solid var(--om-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 14px;
+}
+.kac-report .bldg-strip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 11.5px;
+  color: #374151;
+}
+
+.kac-report .findings-text {
+  border: 1px solid var(--om-border);
+  background: #fff;
+  border-radius: 4px;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--om-text);
+  white-space: pre-wrap;
+  margin-bottom: 14px;
+  min-height: 60px;
+}
+
+.kac-report .formula-grid {
+  background: var(--om-muted-bg);
+  border: 1px solid var(--om-border);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+.kac-report .formula-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #4b5563;
+  letter-spacing: 0.04em;
+  margin: 0 0 8px;
+}
+.kac-report .formula-grid-inner {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 18px;
+  font-size: 10.5px;
+  color: var(--om-text-muted);
+  line-height: 1.55;
+}
+.kac-report .formula-grid-inner p { margin: 1px 0; }
+.kac-report .formula-h {
+  font-size: 11px;
+  font-weight: 600;
+  color: #4b5563;
+  margin: 0 0 2px;
+}
+.kac-report .formula-math {
+  font-family: "Times New Roman", serif;
+  font-style: italic;
+  color: var(--om-text);
+  margin: 2px 0;
+  font-size: 12px;
+}
+.kac-report .pill {
+  display: inline-block;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-weight: 600;
+}
+.kac-report .pill-ok { background: #dcfce7; color: #15803d; }
+.kac-report .pill-warn { background: #fef3c7; color: #a16207; }
+.kac-report .pill-bad { background: #fee2e2; color: #b91c1c; }
+.kac-report .pill-hold { background: #e5e7eb; color: #4b5563; }
+
+/* ── LoS 통계 카드 (페이지 5 하단) ───────────────────────────────────── */
+.kac-report .los-stats { display: grid; gap: 10px; margin-top: 12px; }
+.kac-report .los-stat {
+  border: 1px solid var(--om-border);
+  background: var(--om-muted-bg);
+  border-radius: 6px;
+  padding: 8px 12px;
+  text-align: center;
+}
+.kac-report .los-stat-val {
+  font-size: 14px;
+  font-weight: 700;
+  margin: 2px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+.kac-report .los-stat .muted { font-size: 11.5px; }
+
+/* ── Loss events 헤더 ───────────────────────────────────────────────── */
+.kac-report .ev-block { margin-bottom: 18px; }
+.kac-report .ev-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.kac-report .ev-badge {
+  background: #fef2f2;
+  color: #b91c1c;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+/* ── 기타 ───────────────────────────────────────────────────────────── */
+.kac-report .empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 0;
+  color: #9ca3af;
+}
+.kac-report .om-section { margin-bottom: 0; }

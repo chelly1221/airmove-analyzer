@@ -4,7 +4,7 @@
  */
 import { useMemo, useCallback, useRef } from "react";
 import { Loader2 } from "lucide-react";
-import ReportPage from "./ReportPage";
+import ReportPage, { ReportPageHeaderProvider } from "./ReportPage";
 import ReportCoverPage from "./ReportCoverPage";
 import ReportSummarySection from "./ReportSummarySection";
 import ReportMapSection from "./ReportMapSection";
@@ -173,6 +173,20 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
 
   const singleFlight = template === "single" ? reportFlights[0] : null;
 
+  // 페이지 상단 머리띠 — 발행기관(metadata.organization) + 템플릿별 보고서 제목
+  const pageHeaderText = useMemo(() => {
+    const titles: Record<string, string> = {
+      obstacle_monthly: "레이더 장애물 월간 분석 보고서",
+      monthly: "월간 분석 보고서",
+      weekly: "주간 분석 보고서",
+      flights: "비행 분석 보고서",
+      single: "단일 비행 분석 보고서",
+      obstacle: "장애물 사전검토 보고서",
+    };
+    const title = titles[template] ?? "분석 보고서";
+    return `${reportMetadata.organization}  |  ${title}`;
+  }, [template, reportMetadata.organization]);
+
   // 활성 섹션 번호 계산
   const sectionNumbers = useMemo(() => {
     const nums: Record<string, number> = {};
@@ -259,7 +273,8 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
 
   return (
     <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">
-      <div>
+      <ReportPageHeaderProvider value={pageHeaderText}>
+      <div className="kac-report">
       {/* 표지 (공통) */}
       {sections.cover && (
         <ReportCoverPage
@@ -703,7 +718,8 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
         </>
       )}
-      </div>{/* /섹션 컨테이너 */}
+      </div>{/* /.kac-report */}
+      </ReportPageHeaderProvider>
     </div>
   );
 }

@@ -6,6 +6,9 @@
 /* MapLibre GL CSS (항적 지도 GPU) */
 @import "maplibre-gl/dist/maplibre-gl.css";
 
+/* KAC 보고서 디자인 토큰 — ReportPreviewContent.kac-report 스코프 한정 */
+@import "./components/Report/reportOmStyles.css";
+
 /* Pretendard Variable (self-hosted) */
 @font-face {
   font-family: "Pretendard Variable";
