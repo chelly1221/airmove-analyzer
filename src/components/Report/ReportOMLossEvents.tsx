@@ -26,7 +26,10 @@ function coverageRangeAt(layer: CoverageLayer, azDeg: number): number {
   return layer.bearings[idx].maxRangeKm;
 }
 
-/** Loss 포인트가 커버리지 차이(장애물로 인해 줄어든) 영역에 있는지 판정 */
+/**
+ * Loss 포인트가 커버리지 차이(장애물 포함 vs 제외)로 줄어든 영역에 있는지 판정.
+ * 시안의 단순 ±5° + 거리 80% 휴리스틱 대신 실제 커버리지 결과를 사용 — 더 정확.
+ */
 function isInCoverageDiffArea(
   lat: number, lon: number, altFt: number,
   radarLat: number, radarLon: number,
@@ -34,15 +37,11 @@ function isInCoverageDiffArea(
 ): boolean {
   const { azDeg, distKm } = azimuthAndDist(radarLat, radarLon, lat, lon);
 
-  // 해당 고도의 커버리지 범위를 보간으로 계산 (nearest 대신 linear interpolation)
   const interpolatedRange = (layers: CoverageLayer[]) => {
     if (layers.length === 0) return 0;
-    // 고도순 정렬
     const sorted = [...layers].sort((a, b) => a.altitudeFt - b.altitudeFt);
-    // 정확 일치 또는 범위 밖
     if (altFt <= sorted[0].altitudeFt) return coverageRangeAt(sorted[0], azDeg);
     if (altFt >= sorted[sorted.length - 1].altitudeFt) return coverageRangeAt(sorted[sorted.length - 1], azDeg);
-    // 두 레이어 간 보간
     for (let i = 0; i < sorted.length - 1; i++) {
       if (altFt >= sorted[i].altitudeFt && altFt <= sorted[i + 1].altitudeFt) {
         const t = (altFt - sorted[i].altitudeFt) / (sorted[i + 1].altitudeFt - sorted[i].altitudeFt);
@@ -56,13 +55,11 @@ function isInCoverageDiffArea(
 
   const rangeWith = interpolatedRange(withLayers);
   const rangeWithout = interpolatedRange(withoutLayers);
-
-  // 건물 제외 시 커버리지에 포함되지만 건물 포함 시 커버리지 밖 → 장애물 기인
   return distKm <= rangeWithout && distKm > rangeWith;
 }
 
-/** 최대 표시 건수 */
-const MAX_EVENTS = 30;
+/** 최대 표시 건수 (디자인 시안 락-인 값) */
+const MAX_EVENTS = 18;
 
 interface LossEvent {
   date: string;
@@ -75,6 +72,13 @@ interface LossEvent {
   obstacleCaused: boolean;
 }
 
+/**
+ * 장애물 기인 표적소실 상세 페이지 (페이지 6).
+ *
+ * 레이더별 블록 구조: 헤더 + ev-badge → 이벤트 표(sm-table, 상위 18건) →
+ * 장애물별 근접 표적소실 요약 표(상위 12개 건물). 스타일은
+ * reportOmStyles.css 의 `.ev-block`, `.ev-head`, `.ev-badge`, `.om-table.sm-table`.
+ */
 function ReportOMLossEvents({
   sectionNum,
   radarResults,
@@ -114,7 +118,6 @@ function ReportOMLossEvents({
         }
       }
 
-      // 장애물 기인 이벤트만 필터링 후 지속시간 내림차순 정렬
       const obstacleEvents = events.filter((e) => e.obstacleCaused);
       obstacleEvents.sort((a, b) => b.durationS - a.durationS);
 
@@ -137,131 +140,125 @@ function ReportOMLossEvents({
     const hasDailyData = radarResults.some((rr) => rr.daily_stats.length > 0);
     return (
       <AutoPaginate firstHeader={sectionHeader}>
-        <div className="flex flex-col items-center py-12 text-gray-400">
-          <AlertTriangle size={28} strokeWidth={1.2} className="mb-2" />
-          <p className="text-sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
+        <div className="empty">
+          <AlertTriangle size={28} strokeWidth={1.2} style={{ marginBottom: 8 }} />
+          <p className="sm">{hasDailyData ? "분석 기간 내 표적소실 미발생 (양호)" : "분석 데이터 없음"}</p>
         </div>
       </AutoPaginate>
     );
   }
 
   const radarBlocks = eventsByRadar.map(({ radarName, events, obstacleCausedCount, totalCount }) => {
-        if (events.length === 0) {
-          return (
-            <div key={radarName} className="mb-5">
-              <h3 className="mb-2 text-[15px] font-semibold text-gray-700">{radarName}</h3>
-              <p className="text-[12px] text-gray-400">장애물 기인 표적소실 없음 (전체 {totalCount}건 중 해당 없음)</p>
-            </div>
-          );
-        }
+    if (events.length === 0) {
+      return (
+        <div key={radarName} className="ev-block">
+          <div className="ev-head">
+            <h3 className="om-h3" style={{ margin: 0 }}>{radarName}</h3>
+          </div>
+          <p className="muted sm">장애물 기인 표적소실 없음 (전체 {totalCount}건 중 해당 없음)</p>
+        </div>
+      );
+    }
 
-        const hasCovData = layersWithTargets.size > 0 && layersWithoutTargets.size > 0;
-        const obstaclePct = totalCount > 0 ? (obstacleCausedCount / totalCount) * 100 : 0;
+    const hasCovData = layersWithTargets.size > 0 && layersWithoutTargets.size > 0;
+    const obstaclePct = totalCount > 0 ? (obstacleCausedCount / totalCount) * 100 : 0;
+    const rs = radarSites.find((r) => r.name === radarName);
 
-        return (
-          <div key={radarName} className="mb-6">
-            <div className="flex items-center gap-3 mb-2">
-              <h3 className="text-[15px] font-semibold text-gray-700">{radarName}</h3>
-              {hasCovData && (
-                <div className="flex items-center gap-2 text-[12px]">
-                  <span className="px-1.5 py-0.5 rounded bg-red-50 text-red-700 font-semibold">
-                    장애물 기인: {obstacleCausedCount}/{totalCount}건 ({obstaclePct.toFixed(1)}%)
-                  </span>
-                </div>
-              )}
-            </div>
+    return (
+      <div key={radarName} className="ev-block">
+        <div className="ev-head">
+          <h3 className="om-h3" style={{ margin: 0 }}>{radarName}</h3>
+          {hasCovData && (
+            <span className="ev-badge">
+              장애물 기인: {obstacleCausedCount}/{totalCount}건 ({obstaclePct.toFixed(1)}%)
+            </span>
+          )}
+        </div>
 
-            <table className="w-full border-collapse text-[12px]">
+        <table className="om-table sm-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>일자</th>
+              <th className="ta-r">방위(°)</th>
+              <th className="ta-r">거리(km)</th>
+              <th className="ta-r">거리(NM)</th>
+              <th className="ta-r">고도(ft)</th>
+              <th className="ta-r">지속(초)</th>
+              <th className="ta-c">좌표</th>
+            </tr>
+          </thead>
+          <tbody>
+            {events.map((ev, i) => (
+              <tr key={i} className={i % 2 === 0 ? "" : "alt"}>
+                <td className="ta-c muted">{i + 1}</td>
+                <td className="ta-c mono">{ev.date}</td>
+                <td className="ta-r mono">{ev.azDeg.toFixed(1)}</td>
+                <td className="ta-r mono">{ev.distKm.toFixed(1)}</td>
+                <td className="ta-r mono">{(ev.distKm / 1.852).toFixed(1)}</td>
+                <td className="ta-r mono">{ev.altFt.toFixed(0)}</td>
+                <td className="ta-r mono">{ev.durationS.toFixed(1)}</td>
+                <td className="ta-c mono muted">{ev.lat.toFixed(4)}, {ev.lon.toFixed(4)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        {obstacleCausedCount > MAX_EVENTS && (
+          <p className="muted sm" style={{ textAlign: "right", marginTop: 4 }}>
+            상위 {MAX_EVENTS}건 표시 (장애물 기인 {obstacleCausedCount}건, 지속시간 내림차순)
+          </p>
+        )}
+
+        {/* 장애물별 근접 표적소실 요약 — 상위 12개 건물 */}
+        {selectedBuildings.length > 0 && rs && (
+          <>
+            <div className="block-h3" style={{ marginTop: 12 }}>장애물별 근접 표적소실</div>
+            <table className="om-table sm-table">
               <thead>
-                <tr className="bg-[#28283c] text-white">
-                  <th className="border border-gray-300 px-1.5 py-1 text-center font-medium w-4">#</th>
-                  <th className="border border-gray-300 px-1.5 py-1 text-center font-medium">일자</th>
-                  <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">방위(°)</th>
-                  <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">거리(km)</th>
-                  <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">거리(NM)</th>
-                  <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">고도(ft)</th>
-                  <th className="border border-gray-300 px-1.5 py-1 text-right font-medium">지속(초)</th>
-                  <th className="border border-gray-300 px-1.5 py-1 text-center font-medium">좌표</th>
+                <tr>
+                  <th className="ta-l">건물명</th>
+                  <th className="ta-r">높이(m)</th>
+                  <th className="ta-r">방위(°)</th>
+                  <th className="ta-r">거리(km)</th>
+                  <th className="ta-r">±5° 내 Loss</th>
+                  <th className="ta-r">총 지속(초)</th>
                 </tr>
               </thead>
               <tbody>
-                {events.map((ev, i) => (
-                  <tr key={i} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-center text-gray-400">{i + 1}</td>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-center font-mono">{ev.date}</td>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-right font-mono">{ev.azDeg.toFixed(1)}</td>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-right font-mono">{ev.distKm.toFixed(1)}</td>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-right font-mono">{(ev.distKm / 1.852).toFixed(1)}</td>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-right font-mono">{ev.altFt.toFixed(0)}</td>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-right font-mono">{ev.durationS.toFixed(1)}</td>
-                    <td className="border border-gray-200 px-1.5 py-0.5 text-center font-mono text-gray-500">
-                      {ev.lat.toFixed(4)}, {ev.lon.toFixed(4)}
-                    </td>
-                  </tr>
-                ))}
+                {selectedBuildings.slice(0, 12).map((b, bi) => {
+                  const { azDeg: bAz, distKm: bDist } = azimuthAndDist(rs.latitude, rs.longitude, b.latitude, b.longitude);
+                  // 비대칭 거리 조건: 장애물에 의한 전파 차단은 건물 후방(레이더로부터
+                  // 더 먼 쪽)에서 발생하므로 건물 거리의 80% 이상인 Loss 만 포함.
+                  const nearby = events.filter((ev) => {
+                    let azDiff = Math.abs(ev.azDeg - bAz);
+                    if (azDiff > 180) azDiff = 360 - azDiff;
+                    return azDiff <= 5 && ev.distKm >= bDist * 0.8;
+                  });
+                  const totalDur = nearby.reduce((s, e) => s + e.durationS, 0);
+                  return (
+                    <tr key={b.id} className={bi % 2 === 0 ? "" : "alt"}>
+                      <td>{b.name || `건물${b.id}`}</td>
+                      <td className="ta-r mono">{b.height.toFixed(1)}</td>
+                      <td className="ta-r mono">{bAz.toFixed(1)}</td>
+                      <td className="ta-r mono">{bDist.toFixed(1)}</td>
+                      <td
+                        className="ta-r mono strong"
+                        style={{ color: nearby.length > 0 ? "#dc2626" : "#374151" }}
+                      >
+                        {nearby.length}건
+                      </td>
+                      <td className="ta-r mono">{totalDur.toFixed(1)}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
-
-            {obstacleCausedCount > MAX_EVENTS && (
-              <p className="mt-1 text-[11px] text-gray-400 text-right">
-                상위 {MAX_EVENTS}건 표시 (장애물 기인 {obstacleCausedCount}건, 지속시간 내림차순)
-              </p>
-            )}
-
-            {/* 장애물별 근접 표적소실 요약 */}
-            {selectedBuildings.length > 0 && (() => {
-              const rs = radarSites.find((r) => r.name === radarName);
-              if (!rs) return null;
-              return (
-                <div className="mt-3">
-                  <h3 className="mb-2 text-[15px] font-semibold text-gray-700">장애물별 근접 표적소실</h3>
-                  <table className="w-full border-collapse text-[12px]">
-                    <thead>
-                      <tr className="bg-[#28283c] text-white">
-                        <th className="border border-gray-300 px-2 py-1 text-left font-medium">건물명</th>
-                        <th className="border border-gray-300 px-2 py-1 text-right font-medium">높이(m)</th>
-                        <th className="border border-gray-300 px-2 py-1 text-right font-medium">방위(°)</th>
-                        <th className="border border-gray-300 px-2 py-1 text-right font-medium">거리(km)</th>
-                        <th className="border border-gray-300 px-2 py-1 text-right font-medium">±5° 내 Loss</th>
-                        <th className="border border-gray-300 px-2 py-1 text-right font-medium">총 지속시간(초)</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {selectedBuildings.map((b, bi) => {
-                        const { azDeg: bAz, distKm: bDist } = azimuthAndDist(rs.latitude, rs.longitude, b.latitude, b.longitude);
-                        // 방위 ±5° 이내 + 건물 후방(거리 ≥ 건물거리×0.8) Loss 필터
-                        // 비대칭 거리 조건: 장애물에 의한 전파 차단은 건물 후방(레이더로부터 더 먼 쪽)에서 발생하므로
-                        // 건물 거리의 80% 이상인 Loss만 포함. 전방(레이더~건물) 구간은 장애물 영향 범위 외.
-                        const nearby = events.filter((ev) => {
-                          let azDiff = Math.abs(ev.azDeg - bAz);
-                          if (azDiff > 180) azDiff = 360 - azDiff;
-                          return azDiff <= 5 && ev.distKm >= bDist * 0.8;
-                        });
-                        const totalDur = nearby.reduce((s, e) => s + e.durationS, 0);
-                        return (
-                          <tr key={b.id} className={bi % 2 === 0 ? "bg-white" : "bg-gray-50"}>
-                            <td className="border border-gray-200 px-2 py-0.5">{b.name || `건물${b.id}`}</td>
-                            <td className="border border-gray-200 px-2 py-0.5 text-right font-mono">{b.height.toFixed(1)}</td>
-                            <td className="border border-gray-200 px-2 py-0.5 text-right font-mono">{bAz.toFixed(1)}</td>
-                            <td className="border border-gray-200 px-2 py-0.5 text-right font-mono">{bDist.toFixed(1)}</td>
-                            <td className="border border-gray-200 px-2 py-0.5 text-right font-mono font-bold"
-                              style={{ color: nearby.length > 0 ? "#dc2626" : "#374151" }}>
-                              {nearby.length}건
-                            </td>
-                            <td className="border border-gray-200 px-2 py-0.5 text-right font-mono">
-                              {totalDur.toFixed(1)}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              );
-            })()}
-          </div>
-        );
-      });
+          </>
+        )}
+      </div>
+    );
+  });
 
   return (
     <AutoPaginate firstHeader={sectionHeader}>
