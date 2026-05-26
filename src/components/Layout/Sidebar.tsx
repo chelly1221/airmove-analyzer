@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import {
   Upload,
   Map as MapIcon,
@@ -375,7 +376,6 @@ export default function Sidebar() {
   const handleNav = async (item: NavItem) => {
     // 지도/도면은 별도 창으로 열기
     if (item.id === "map" || item.id === "drawing") {
-      const { WebviewWindow, getAllWebviewWindows } = await import("@tauri-apps/api/webviewWindow");
       const label = item.id === "map" ? "trackmap" : "drawing";
       const title = item.id === "map" ? "Track Map — AirMove Analyzer" : "Drawing — AirMove Analyzer";
       const existing = (await getAllWebviewWindows()).find((w) => w.label === label);

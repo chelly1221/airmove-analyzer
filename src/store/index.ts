@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useToastStore } from "../components/common/Toast";
 import type {
   Aircraft,
@@ -706,7 +707,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     let unlisten: (() => void) | null = null;
     try {
-      const { listen } = await import("@tauri-apps/api/event");
       unlisten = await listen<{ stage: string; message: string; current: number; total: number }>(
         "fac-building-vworld-progress",
         (e) => set({ facBuildingProgress: e.payload }),
@@ -750,7 +750,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     let unlisten: (() => void) | null = null;
     try {
-      const { listen } = await import("@tauri-apps/api/event");
       unlisten = await listen<{ stage: string; message: string; current: number; total: number }>(
         "n3p-download-progress",
         (e) => set({ n3pProgress: e.payload }),
@@ -790,7 +789,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     let unlisten: (() => void) | null = null;
     try {
-      const { listen } = await import("@tauri-apps/api/event");
       unlisten = await listen<{ message: string; current: number; total: number }>(
         "landuse-tile-progress",
         (e) => set({ landuseProgress: { stage: "downloading", ...e.payload } }),
@@ -821,7 +819,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     let unlisten: (() => void) | null = null;
     try {
-      const { listen } = await import("@tauri-apps/api/event");
       unlisten = await listen<{ total: number; downloaded: number; skipped?: number; current_tile?: string; status: string }>(
         "srtm-download-progress",
         (e) => set({ srtmProgress: e.payload }),
@@ -849,7 +846,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     let unlisten: (() => void) | null = null;
     try {
-      const { listen } = await import("@tauri-apps/api/event");
       unlisten = await listen<{ total: number; processed: number; status: string }>(
         "peak-import-progress",
         (e) => set({ peakImportProgress: e.payload }),

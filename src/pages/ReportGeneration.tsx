@@ -21,6 +21,7 @@ import { format } from "date-fns";
 import { useAppStore } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
+import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { queryFlightPoints } from "../utils/flightConsolidationWorker";
 import { type CoverageLayer } from "../utils/radarCoverage";
 import { haversineKm } from "../utils/geo";
@@ -248,7 +249,6 @@ export default function ReportGeneration() {
 
   /** 보고서 창 열기 헬퍼 */
   const openReportWindow = useCallback(async (mode: "config" | "data" = "config") => {
-    const { WebviewWindow, getAllWebviewWindows } = await import("@tauri-apps/api/webviewWindow");
     const existing = (await getAllWebviewWindows()).find((w) => w.label === "report");
     if (existing) {
       // 기존 창이 있으면 이벤트로 모드 전환 후 포커스
