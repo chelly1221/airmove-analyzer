@@ -286,6 +286,15 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           onTitleChange={onCoverTitleChange}
           subtitle={coverSubtitle}
           onSubtitleChange={onCoverSubtitleChange}
+          omMonthLabel={template === "obstacle_monthly" && omData.analysisMonth
+            ? `${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월`
+            : undefined}
+          omRadarNames={template === "obstacle_monthly"
+            ? omData.selectedRadarSites.map((r) => r.name)
+            : undefined}
+          omBuildingsCount={template === "obstacle_monthly"
+            ? omData.selectedBuildings.length
+            : undefined}
         />
       )}
 
