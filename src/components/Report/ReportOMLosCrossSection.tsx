@@ -97,15 +97,15 @@ function computeStraightLoS(
   return result;
 }
 
-interface ChartTrackPoint {
+export interface ChartTrackPoint {
   distKm: number;
   altM: number; // 곡률 보정 전 AMSL
   radarType: string;
   isLoss: boolean;
 }
 
-/** 단일 LoS 단면도 SVG */
-function LosCrossSection({
+/** 단일 LoS 단면도 SVG — 결합 페이지(빌딩별)에서도 import하여 재사용 */
+export function LosCrossSection({
   los, radarName, building, trackPoints, lossPoints,
 }: {
   los: LoSProfileData;
@@ -412,6 +412,35 @@ function LosCrossSection({
       </svg>
     </div>
   );
+}
+
+/** LoS 베어링 ±5° 안 + MAX_RANGE_KM 안 으로 항적/소실표적을 단면도 좌표로 투영 — 결합 페이지에서도 동일 규칙 적용 */
+export function projectPointsToLos(
+  los: LoSProfileData,
+  trackPoints: TrackPointGeo[],
+  lossPoints: LossPointGeo[],
+): { track: ChartTrackPoint[]; loss: ChartTrackPoint[] } {
+  const isInBearing = (lat: number, lon: number): boolean => {
+    const ptBearing = bearingDeg(los.radarLat, los.radarLon, lat, lon);
+    let diff = Math.abs(ptBearing - los.bearing);
+    if (diff > 180) diff = 360 - diff;
+    return diff <= 5;
+  };
+  const track: ChartTrackPoint[] = [];
+  for (const tp of trackPoints) {
+    if (!isInBearing(tp.lat, tp.lon)) continue;
+    const distKm = haversineKm(los.radarLat, los.radarLon, tp.lat, tp.lon);
+    if (distKm > MAX_RANGE_KM) continue;
+    track.push({ distKm, altM: tp.alt_ft / M_TO_FT, radarType: tp.radar_type, isLoss: false });
+  }
+  const loss: ChartTrackPoint[] = [];
+  for (const lp of lossPoints) {
+    if (!isInBearing(lp.lat, lp.lon)) continue;
+    const distKm = haversineKm(los.radarLat, los.radarLon, lp.lat, lp.lon);
+    if (distKm > MAX_RANGE_KM) continue;
+    loss.push({ distKm, altM: lp.alt_ft / M_TO_FT, radarType: "", isLoss: true });
+  }
+  return { track, loss };
 }
 
 /** 페이지당 차트 수 (각 차트 ≈ 80mm) */

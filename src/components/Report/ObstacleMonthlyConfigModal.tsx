@@ -66,9 +66,14 @@ export default function ObstacleMonthlyConfigModal({
     losMap: Map<string, LoSProfileData>,
     covWith: Map<string, CoverageLayer[]>,
     covWithout: Map<string, CoverageLayer[]>,
+    covWithoutPerBuilding: Map<string, Map<number, CoverageLayer[]>>,
     analysisMonth?: string,
   ) => void;
-  onCoverageReady: (covWith: Map<string, CoverageLayer[]>, covWithout: Map<string, CoverageLayer[]>) => void;
+  onCoverageReady: (
+    covWith: Map<string, CoverageLayer[]>,
+    covWithout: Map<string, CoverageLayer[]>,
+    covWithoutPerBuilding: Map<string, Map<number, CoverageLayer[]>>,
+  ) => void;
   onCoverageError?: () => void;
   coverageStatus?: CoverageStatus;
   panoramaStatus?: PanoramaStatus;
@@ -358,6 +363,7 @@ export default function ObstacleMonthlyConfigModal({
       // 커버리지 계산 — 전체 레이더 순회 (실패해도 보고서는 생성)
       const covWithMap = new Map<string, CoverageLayer[]>();
       const covWithoutMap = new Map<string, CoverageLayer[]>();
+      const covWithoutPerBuildingMap = new Map<string, Map<number, CoverageLayer[]>>();
       if (selectedRadars.length > 0) {
         setStage("coverage");
         setStageDetail((prev) => ({ ...prev, coverage: `0/${selectedRadars.length} 레이더 시작` }));
@@ -382,8 +388,9 @@ export default function ObstacleMonthlyConfigModal({
             );
             covWithMap.set(r.name, covResult.layersWith);
             covWithoutMap.set(r.name, covResult.layersWithout);
+            covWithoutPerBuildingMap.set(r.name, covResult.layersWithoutPerBuilding);
           }
-          setStageDetail((prev) => ({ ...prev, coverage: `${covWithMap.size}개 레이더 완료` }));
+          setStageDetail((prev) => ({ ...prev, coverage: `${covWithMap.size}개 레이더 완료 (빌딩별 카운터팩추얼 포함)` }));
         } catch (err) {
           setStageDetail((prev) => ({ ...prev, coverage: "계산 실패 — 커버리지 없이 진행" }));
           console.warn("GPU 커버리지 계산 실패:", err);
@@ -405,9 +412,9 @@ export default function ObstacleMonthlyConfigModal({
       setProgressPct(95);
       setStage("transfer");
       setStageDetail((prev) => ({ ...prev, transfer: "보고서 창으로 데이터 전송 중" }));
-      await onGenerate(filteredResult, selectedBuildings, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, effectiveMonth);
+      await onGenerate(filteredResult, selectedBuildings, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, covWithoutPerBuildingMap, effectiveMonth);
 
-      if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap);
+      if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap, covWithoutPerBuildingMap);
 
       setProgress("보고서 로딩 완료");
       setProgressPct(100);

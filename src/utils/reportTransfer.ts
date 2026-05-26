@@ -53,6 +53,8 @@ export interface SerializedOMData {
   losMap: [string, LoSProfileData][];
   covLayersWithBuildings: [string, CoverageLayer[]][];
   covLayersWithout: [string, CoverageLayer[]][];
+  /** 빌딩별 카운터팩추얼: [radarName, [buildingId, layers][]][] */
+  covLayersWithoutPerBuilding: [string, [number, CoverageLayer[]][]][];
   analysisMonth: string;
   findingsText: string;
   recommendText: string;
@@ -117,6 +119,7 @@ export function serializeOMData(om: OMReportData): SerializedOMData {
     losMap: [...om.losMap],
     covLayersWithBuildings: [...om.covLayersWithBuildings],
     covLayersWithout: [...om.covLayersWithout],
+    covLayersWithoutPerBuilding: [...om.covLayersWithoutPerBuilding].map(([rname, bm]) => [rname, [...bm]]),
     analysisMonth: om.analysisMonth,
     findingsText: om.findingsText,
     recommendText: om.recommendText,
@@ -138,6 +141,9 @@ export function deserializeOMData(s: SerializedOMData): OMReportData {
     losMap: new Map(s.losMap),
     covLayersWithBuildings: new Map(s.covLayersWithBuildings),
     covLayersWithout: new Map(s.covLayersWithout),
+    covLayersWithoutPerBuilding: new Map(
+      (s.covLayersWithoutPerBuilding ?? []).map(([rname, bm]) => [rname, new Map(bm)]),
+    ),
     analysisMonth: s.analysisMonth,
     findingsText: s.findingsText,
     recommendText: s.recommendText,

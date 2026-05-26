@@ -206,13 +206,24 @@ function pixelBearingStepDeg(rangeNm: number): number {
 /**
  * OM 보고서용 커버리지 레이어 계산
  * — compute_coverage_terrain_profile[_excluding] + compute_coverage_layers_batch[_excluded]
+ *
+ * 반환:
+ *   layersWith            — 전체 건물 포함(베이스라인 현실 커버리지)
+ *   layersWithout         — 분석 대상 전체 제외(합산 반사실 커버리지)
+ *   layersWithoutPerBuilding — 분석 대상 중 빌딩 한 채만 제외한 카운터팩추얼 (각 빌딩의 한계 효과)
+ *
+ * GPU 라운드: 1 (baseline) + 1 (합산) + N (빌딩별).
  */
 export async function computeCoverageLayersOM(
   params: CoverageOMParams,
   altFts: number[],
   excludeManualIds: number[],
   onProgress?: (msg: string) => void,
-): Promise<{ layersWith: CoverageLayer[]; layersWithout: CoverageLayer[] }> {
+): Promise<{
+  layersWith: CoverageLayer[];
+  layersWithout: CoverageLayer[];
+  layersWithoutPerBuilding: Map<number, CoverageLayer[]>;
+}> {
   const bearingStepDeg = pixelBearingStepDeg(params.rangeNm);
 
   onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (건물 포함)`);
@@ -230,7 +241,7 @@ export async function computeCoverageLayersOM(
     bearingStep: 1,
   });
 
-  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (건물 제외)`);
+  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (분석 대상 전체 제외)`);
   await invoke("compute_coverage_terrain_profile_excluding", {
     radarName: params.radarName,
     radarLat: params.radarLat,
@@ -246,5 +257,28 @@ export async function computeCoverageLayersOM(
     bearingStep: 1,
   });
 
-  return { layersWith, layersWithout };
+  // 빌딩별 카운터팩추얼: 한 채만 제외한 프로파일을 빌딩 수만큼 계산.
+  // _excluding 캐시는 매 호출마다 덮어쓰여지므로 빌딩별 결과는 즉시 batch 받아서 보존.
+  const layersWithoutPerBuilding = new Map<number, CoverageLayer[]>();
+  for (let bi = 0; bi < excludeManualIds.length; bi++) {
+    const bid = excludeManualIds[bi];
+    onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (빌딩 ${bi + 1}/${excludeManualIds.length} 단독 제외)`);
+    await invoke("compute_coverage_terrain_profile_excluding", {
+      radarName: params.radarName,
+      radarLat: params.radarLat,
+      radarLon: params.radarLon,
+      radarAltitude: params.radarAltitude,
+      antennaHeight: params.antennaHeight,
+      rangeNm: params.rangeNm,
+      excludeManualIds: [bid],
+      bearingStepDeg,
+    });
+    const layers = await invoke<CoverageLayer[]>("compute_coverage_layers_batch_excluded", {
+      altFts,
+      bearingStep: 1,
+    });
+    layersWithoutPerBuilding.set(bid, layers);
+  }
+
+  return { layersWith, layersWithout, layersWithoutPerBuilding };
 }

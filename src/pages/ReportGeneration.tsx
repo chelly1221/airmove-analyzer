@@ -62,6 +62,7 @@ export default function ReportGeneration() {
     losMap: new Map(),
     covLayersWithBuildings: new Map(),
     covLayersWithout: new Map(),
+    covLayersWithoutPerBuilding: new Map(),
     analysisMonth: "",
     findingsText: "",
     recommendText: "",

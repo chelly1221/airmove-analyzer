@@ -21,7 +21,7 @@ import ReportOMCombinedDailyChart from "./ReportOMCombinedDailyChart";
 import ReportOMWeeklyChart from "./ReportOMWeeklyChart";
 import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import ReportOMBuildingLoS from "./ReportOMBuildingLoS";
-import ReportOMLosCrossSection from "./ReportOMLosCrossSection";
+import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
 import ReportOMAltitudeDistribution from "./ReportOMAltitudeDistribution";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
@@ -122,10 +122,10 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
       { key: "omSummary", label: "요약" },
       { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
       { key: "omWeekly", label: "주차" },
-      { key: "omCoverageDiff", label: "커버리지" },
+      { key: "omCoverageDiff", label: "커버리지(합산)" },
       { key: "omAzDistScatter", label: "산점도" },
       { key: "omBuildingLos", label: "LoS" },
-      { key: "omLosCrossSection", label: "LoS단면" },
+      { key: "omLosCrossSection", label: "장애물별 상세" },
       { key: "omAltitude", label: "고도분포" },
       { key: "omLossEvents", label: "표적소실상세" },
       { key: "omFindings", label: "소견" },
@@ -275,25 +275,27 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       <div className="kac-report">
       {/* 표지 (공통) */}
       {sections.cover && (
-        <ReportCoverPage
-          template={template}
-          radarName={radarSite?.name ?? ""}
-          metadata={reportMetadata}
-          editable
-          title={coverTitle}
-          onTitleChange={onCoverTitleChange}
-          subtitle={coverSubtitle}
-          onSubtitleChange={onCoverSubtitleChange}
-          omMonthLabel={template === "obstacle_monthly" && omData.analysisMonth
-            ? `${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월`
-            : undefined}
-          omRadarNames={template === "obstacle_monthly"
-            ? omData.selectedRadarSites.map((r) => r.name)
-            : undefined}
-          omBuildingsCount={template === "obstacle_monthly"
-            ? omData.selectedBuildings.length
-            : undefined}
-        />
+        <div data-toc-key="cover">
+          <ReportCoverPage
+            template={template}
+            radarName={radarSite?.name ?? ""}
+            metadata={reportMetadata}
+            editable
+            title={coverTitle}
+            onTitleChange={onCoverTitleChange}
+            subtitle={coverSubtitle}
+            onSubtitleChange={onCoverSubtitleChange}
+            omMonthLabel={template === "obstacle_monthly" && omData.analysisMonth
+              ? `${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월`
+              : undefined}
+            omRadarNames={template === "obstacle_monthly"
+              ? omData.selectedRadarSites.map((r) => r.name)
+              : undefined}
+            omBuildingsCount={template === "obstacle_monthly"
+              ? omData.selectedBuildings.length
+              : undefined}
+          />
+        </div>
       )}
 
       {/* ─── 주간/월간 ─── */}
@@ -429,177 +431,227 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       {template === "obstacle_monthly" && omResultTrimmed && (
         <>
           {sections.omSummary && (
-            <ReportOMSummarySection
-              sectionNum={sectionNumbers.omSummary ?? 1}
-              radarResults={omResultTrimmed.radar_results}
-              selectedBuildings={omData.selectedBuildings}
-              radarSites={omData.selectedRadarSites}
-              azimuthSectorsByRadar={omData.azSectorsByRadar}
-              analysisMonth={omData.analysisMonth}
-            />
+            <div data-toc-key="omSummary">
+              <ReportOMSummarySection
+                sectionNum={sectionNumbers.omSummary ?? 1}
+                radarResults={omResultTrimmed.radar_results}
+                selectedBuildings={omData.selectedBuildings}
+                radarSites={omData.selectedRadarSites}
+                azimuthSectorsByRadar={omData.azSectorsByRadar}
+                analysisMonth={omData.analysisMonth}
+              />
+            </div>
           )}
 
-          {sections.omDailyPsrLoss && omResultTrimmed.radar_results.map((rr) => {
-            const info = omRadarConditions.get(rr.radar_name);
-            return (
-              <ReportOMCombinedDailyChart
-                key={`psrloss-${rr.radar_name}`}
-                sectionNum={sectionNumbers.omDailyPsrLoss ?? 2}
-                radarName={rr.radar_name}
-                dailyStats={rr.daily_stats}
-                analysisMonth={omData.analysisMonth}
-                conditions={[
-                  `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                  `• 영향 방위: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                  `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
-                ]}
-              />
-            );
-          })}
+          {sections.omDailyPsrLoss && (
+            <div data-toc-key="omDailyPsrLoss">
+              {omResultTrimmed.radar_results.map((rr) => {
+                const info = omRadarConditions.get(rr.radar_name);
+                return (
+                  <ReportOMCombinedDailyChart
+                    key={`psrloss-${rr.radar_name}`}
+                    sectionNum={sectionNumbers.omDailyPsrLoss ?? 2}
+                    radarName={rr.radar_name}
+                    dailyStats={rr.daily_stats}
+                    analysisMonth={omData.analysisMonth}
+                    conditions={[
+                      `• 대상 장애물: ${info?.bldgNames ?? ""}`,
+                      `• 영향 방위: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
+                      `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
+                    ]}
+                  />
+                );
+              })}
+            </div>
+          )}
 
-          {sections.omWeekly && omResultTrimmed.radar_results.map((rr) => {
-            const imgKey = `wk-${rr.radar_name}`;
-            return (
-              <ReportPage key={imgKey}>
-                <ReportOMWeeklyChart
-                  sectionNum={sectionNumbers.omWeekly ?? 4}
-                  radarName={rr.radar_name}
-                  dailyStats={rr.daily_stats}
-                  analysisMonth={omData.analysisMonth}
-                />
-              </ReportPage>
-            );
-          })}
+          {sections.omWeekly && (
+            <div data-toc-key="omWeekly">
+              {omResultTrimmed.radar_results.map((rr) => {
+                const imgKey = `wk-${rr.radar_name}`;
+                return (
+                  <ReportPage key={imgKey}>
+                    <ReportOMWeeklyChart
+                      sectionNum={sectionNumbers.omWeekly ?? 4}
+                      radarName={rr.radar_name}
+                      dailyStats={rr.daily_stats}
+                      analysisMonth={omData.analysisMonth}
+                    />
+                  </ReportPage>
+                );
+              })}
+            </div>
+          )}
 
-          {sections.omCoverageDiff && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? omData.selectedRadarSites.map((rs) => {
-            const rsLayersWith = omData.covLayersWithBuildings.get(rs.name) ?? [];
-            const rsLayersWithout = omData.covLayersWithout.get(rs.name) ?? [];
-            if (rsLayersWith.length === 0 && rsLayersWithout.length === 0) return null;
-            const rr = omResultTrimmed.radar_results.find((r) => r.radar_name === rs.name);
-            const allLoss = rr?.daily_stats.flatMap((d) => d.loss_points_summary) ?? [];
-            const covImgKey = `cov-${rs.name}`;
-            return (
-              <ReportPage key={covImgKey}>
-                <ReportOMSectionHeader sectionNum={sectionNumbers.omCoverageDiff ?? 5} title="커버리지 비교맵" radarName={rs.name} />
-                <ReportOMCoverageDiff
-                  ref={setRef(covImgKey)}
-                  sectionNum={sectionNumbers.omCoverageDiff ?? 5}
-                  radarSite={rs}
-                  layersWithTargets={rsLayersWith}
-                  layersWithoutTargets={rsLayersWithout}
-                  lossPoints={allLoss}
-                  defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
-                  selectedBuildings={omData.selectedBuildings}
-                  preCapturedImage={omData.sectionImages.get(covImgKey)}
-                  hideHeader
-                />
-              </ReportPage>
-            );
-          }) : omData.coverageStatus === "error" ? (
-            <ReportPage>
-              <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                <p className="text-sm text-red-400">커버리지 계산 실패</p>
-                <p className="mt-1 text-xs">SRTM 데이터 또는 건물 데이터를 확인하세요</p>
-              </div>
-            </ReportPage>
-          ) : (
-            <ReportPage>
-              <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                <Loader2 size={24} className="mb-3 animate-spin" />
-                <p className="text-sm">커버리지 비교맵 계산 중...</p>
-              </div>
-            </ReportPage>
-          ))}
+          {sections.omCoverageDiff && (
+            <div data-toc-key="omCoverageDiff">
+              {omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? omData.selectedRadarSites.map((rs) => {
+                const rsLayersWith = omData.covLayersWithBuildings.get(rs.name) ?? [];
+                const rsLayersWithout = omData.covLayersWithout.get(rs.name) ?? [];
+                if (rsLayersWith.length === 0 && rsLayersWithout.length === 0) return null;
+                const rr = omResultTrimmed.radar_results.find((r) => r.radar_name === rs.name);
+                const allLoss = rr?.daily_stats.flatMap((d) => d.loss_points_summary) ?? [];
+                const covImgKey = `cov-${rs.name}`;
+                return (
+                  <ReportPage key={covImgKey}>
+                    <ReportOMSectionHeader sectionNum={sectionNumbers.omCoverageDiff ?? 5} title="커버리지 비교맵" radarName={rs.name} />
+                    <ReportOMCoverageDiff
+                      ref={setRef(covImgKey)}
+                      sectionNum={sectionNumbers.omCoverageDiff ?? 5}
+                      radarSite={rs}
+                      layersWithTargets={rsLayersWith}
+                      layersWithoutTargets={rsLayersWithout}
+                      lossPoints={allLoss}
+                      defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
+                      selectedBuildings={omData.selectedBuildings}
+                      preCapturedImage={omData.sectionImages.get(covImgKey)}
+                      hideHeader
+                    />
+                  </ReportPage>
+                );
+              }) : omData.coverageStatus === "error" ? (
+                <ReportPage>
+                  <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                    <p className="text-sm text-red-400">커버리지 계산 실패</p>
+                    <p className="mt-1 text-xs">SRTM 데이터 또는 건물 데이터를 확인하세요</p>
+                  </div>
+                </ReportPage>
+              ) : (
+                <ReportPage>
+                  <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                    <Loader2 size={24} className="mb-3 animate-spin" />
+                    <p className="text-sm">커버리지 비교맵 계산 중...</p>
+                  </div>
+                </ReportPage>
+              )}
+            </div>
+          )}
 
-          {sections.omAzDistScatter && omResultTrimmed.radar_results.map((rr) => {
-            const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
-            const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
-            if (!rs) return null;
-            const azImgKey = `azdist-${rr.radar_name}`;
-            return (
-              <ReportPage key={azImgKey}>
-                <ReportOMSectionHeader sectionNum={sectionNumbers.omAzDistScatter ?? 6} title={`방위-거리 소실표적 산점도${omData.analysisMonth ? ` (${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월)` : ""}`} radarName={rs.name} />
-                <ReportOMAzDistScatter
-                  ref={setRef(azImgKey)}
-                  sectionNum={sectionNumbers.omAzDistScatter ?? 6}
-                  radarSite={rs}
-                  dailyStats={rr.daily_stats}
-                  selectedBuildings={omData.selectedBuildings}
-                  azSectors={sectors}
-                  analysisMonth={omData.analysisMonth}
-                  preCapturedImage={omData.sectionImages.get(azImgKey)}
-                  hideHeader
-                />
-              </ReportPage>
-            );
-          })}
+          {sections.omAzDistScatter && (
+            <div data-toc-key="omAzDistScatter">
+              {omResultTrimmed.radar_results.map((rr) => {
+                const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
+                const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
+                if (!rs) return null;
+                const azImgKey = `azdist-${rr.radar_name}`;
+                return (
+                  <ReportPage key={azImgKey}>
+                    <ReportOMSectionHeader sectionNum={sectionNumbers.omAzDistScatter ?? 6} title={`방위-거리 소실표적 산점도${omData.analysisMonth ? ` (${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월)` : ""}`} radarName={rs.name} />
+                    <ReportOMAzDistScatter
+                      ref={setRef(azImgKey)}
+                      sectionNum={sectionNumbers.omAzDistScatter ?? 6}
+                      radarSite={rs}
+                      dailyStats={rr.daily_stats}
+                      selectedBuildings={omData.selectedBuildings}
+                      azSectors={sectors}
+                      analysisMonth={omData.analysisMonth}
+                      preCapturedImage={omData.sectionImages.get(azImgKey)}
+                      hideHeader
+                    />
+                  </ReportPage>
+                );
+              })}
+            </div>
+          )}
 
           {sections.omBuildingLos && (
-            <ReportOMBuildingLoS
-              sectionNum={sectionNumbers.omBuildingLos ?? 7}
-              selectedBuildings={omData.selectedBuildings}
-              radarSites={omData.selectedRadarSites}
-              losMap={omData.losMap}
-            />
+            <div data-toc-key="omBuildingLos">
+              <ReportOMBuildingLoS
+                sectionNum={sectionNumbers.omBuildingLos ?? 7}
+                selectedBuildings={omData.selectedBuildings}
+                radarSites={omData.selectedRadarSites}
+                losMap={omData.losMap}
+              />
+            </div>
           )}
 
+          {/* 장애물별 상세 — (레이더 × 분석 대상 빌딩) 한 쌍당 한 페이지.
+              상단: 빌딩 단독 카운터팩추얼 커버리지 다이프 (그림자 bbox 줌, 영향 0 이면 "영향 없음").
+              하단: 빌딩 LoS 단면도. 기존 omLosCrossSection 의 독립 페이지를 본 결합 페이지로 대체. */}
           {sections.omLosCrossSection && omData.losMap.size > 0 && (
-            <ReportOMLosCrossSection
-              sectionNum={sectionNumbers.omLosCrossSection ?? 8}
-              selectedBuildings={omData.selectedBuildings}
-              radarSites={omData.selectedRadarSites}
-              losMap={omData.losMap}
-              omResult={omResultTrimmed}
-            />
+            <div data-toc-key="omLosCrossSection">
+              {omData.selectedRadarSites.map((rs) => {
+                const rsLayersWith = omData.covLayersWithBuildings.get(rs.name) ?? [];
+                const rsPerBld = omData.covLayersWithoutPerBuilding.get(rs.name);
+                return omData.selectedBuildings.map((b) => {
+                  const los = omData.losMap.get(`${rs.name}_${b.id}`);
+                  if (!los) return null;
+                  const layersWithoutThis = rsPerBld?.get(b.id) ?? [];
+                  const obsImgKey = `obs-${rs.name}-${b.id}`;
+                  return (
+                    <ReportOMObstacleDetail
+                      key={obsImgKey}
+                      sectionNum={sectionNumbers.omLosCrossSection ?? 8}
+                      radarSite={rs}
+                      building={b}
+                      layersWith={rsLayersWith}
+                      layersWithoutThis={layersWithoutThis}
+                      los={los}
+                      captureRef={setRef(obsImgKey)}
+                      preCapturedImage={omData.sectionImages.get(obsImgKey)}
+                      omResult={omResultTrimmed}
+                    />
+                  );
+                });
+              })}
+            </div>
           )}
 
           {sections.omAltitude && (
-            <ReportOMAltitudeDistribution
-              sectionNum={sectionNumbers.omAltitude ?? 9}
-              radarResults={omResultTrimmed.radar_results}
-              selectedBuildings={omData.selectedBuildings}
-              radarSites={omData.selectedRadarSites}
-              losMap={omData.losMap}
-              panoWithTargets={omData.panoWithTargets}
-              panoWithoutTargets={omData.panoWithoutTargets}
-            />
+            <div data-toc-key="omAltitude">
+              <ReportOMAltitudeDistribution
+                sectionNum={sectionNumbers.omAltitude ?? 9}
+                radarResults={omResultTrimmed.radar_results}
+                selectedBuildings={omData.selectedBuildings}
+                radarSites={omData.selectedRadarSites}
+                losMap={omData.losMap}
+                panoWithTargets={omData.panoWithTargets}
+                panoWithoutTargets={omData.panoWithoutTargets}
+              />
+            </div>
           )}
 
-          {sections.omLossEvents && (omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? (
-            <ReportOMLossEvents
-              sectionNum={sectionNumbers.omLossEvents ?? 10}
-              radarResults={omResultTrimmed.radar_results}
-              selectedBuildings={omData.selectedBuildings}
-              radarSites={omData.selectedRadarSites}
-              layersWithTargets={omData.covLayersWithBuildings}
-              layersWithoutTargets={omData.covLayersWithout}
-            />
-          ) : omData.coverageStatus === "error" ? (
-            <ReportPage>
-              <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                <p className="text-sm text-red-400">커버리지 계산 실패 — Loss 상세 표시 불가</p>
-              </div>
-            </ReportPage>
-          ) : (
-            <ReportPage>
-              <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                <Loader2 size={24} className="mb-3 animate-spin" />
-                <p className="text-sm">Loss 상세 계산 중...</p>
-              </div>
-            </ReportPage>
-          ))}
+          {sections.omLossEvents && (
+            <div data-toc-key="omLossEvents">
+              {omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? (
+                <ReportOMLossEvents
+                  sectionNum={sectionNumbers.omLossEvents ?? 10}
+                  radarResults={omResultTrimmed.radar_results}
+                  selectedBuildings={omData.selectedBuildings}
+                  radarSites={omData.selectedRadarSites}
+                  layersWithTargets={omData.covLayersWithBuildings}
+                  layersWithoutTargets={omData.covLayersWithout}
+                />
+              ) : omData.coverageStatus === "error" ? (
+                <ReportPage>
+                  <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                    <p className="text-sm text-red-400">커버리지 계산 실패 — Loss 상세 표시 불가</p>
+                  </div>
+                </ReportPage>
+              ) : (
+                <ReportPage>
+                  <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                    <Loader2 size={24} className="mb-3 animate-spin" />
+                    <p className="text-sm">Loss 상세 계산 중...</p>
+                  </div>
+                </ReportPage>
+              )}
+            </div>
+          )}
 
           {sections.omFindings && (
-            <ReportOMFindings
-              sectionNum={sectionNumbers.omFindings ?? 11}
-              radarResults={omResultTrimmed.radar_results}
-              selectedBuildings={omData.selectedBuildings}
-              radarSites={omData.selectedRadarSites}
-              findingsText={omData.findingsText}
-              onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}
-              editable={true}
-              analysisMonth={omData.analysisMonth}
-            />
+            <div data-toc-key="omFindings">
+              <ReportOMFindings
+                sectionNum={sectionNumbers.omFindings ?? 11}
+                radarResults={omResultTrimmed.radar_results}
+                selectedBuildings={omData.selectedBuildings}
+                radarSites={omData.selectedRadarSites}
+                findingsText={omData.findingsText}
+                onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}
+                editable={true}
+                analysisMonth={omData.analysisMonth}
+              />
+            </div>
           )}
         </>
       )}

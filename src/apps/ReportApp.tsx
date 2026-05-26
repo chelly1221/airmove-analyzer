@@ -10,6 +10,7 @@ import { format } from "date-fns";
 import { Download, Loader2, TriangleAlert, Check, Circle } from "lucide-react";
 import Titlebar from "../components/Layout/Titlebar";
 import ReportPreviewContent, { getSectionToggles } from "../components/Report/ReportPreviewContent";
+import ReportOMSidebar, { type OMSidebarTocItem } from "../components/Report/ReportOMSidebar";
 import { useReportExport, type ReportSaveMeta } from "../components/Report/useReportExport";
 import type { OMSectionCaptureHandle } from "../components/Report/omCapture";
 import TemplateConfigModal from "../components/Report/TemplateConfigModal";
@@ -191,6 +192,17 @@ export default function ReportApp() {
     }
   }, []);
 
+  // ── OM 사이드바 상태 ──
+  // 디자인 핸드오프 OM 사이드바: PDF 옵션(범위·용지) UI 상태 + 목차 active/페이지 추적.
+  // 페이지 인덱스는 프리뷰 컨테이너의 [data-page] / [data-toc-key] 마커를 측정해 갱신.
+  const [omSidebarPaper, setOmSidebarPaper] = useState<"A4" | "A3">("A4");
+  const [omSidebarRange, setOmSidebarRange] = useState<"all" | "current" | "custom">("all");
+  const [omActiveTocKey, setOmActiveTocKey] = useState<string | null>(null);
+  const [omCurrentPage, setOmCurrentPage] = useState(1);
+  const [omTotalPages, setOmTotalPages] = useState(0);
+  // tocKey → 1-based 첫 페이지 인덱스 (DOM 측정 결과)
+  const [omTocPageMap, setOmTocPageMap] = useState<Map<string, number>>(new Map());
+
   // 진행률 표시용 — 오케스트레이터가 호출
   const trackerRegister = useCallback((key: string, label: string) => {
     setCaptureMap((m) => {
@@ -335,7 +347,13 @@ export default function ReportApp() {
     });
 
     // 비동기 커버리지 업데이트 수신 — PDF 생성 중이면 큐에 저장
-    const unlistenCov = listen<{ covLayersWithBuildings: [string, CoverageLayer[]][]; covLayersWithout: [string, CoverageLayer[]][]; coverageStatus: string }>(
+    const unlistenCov = listen<{
+      covLayersWithBuildings: [string, CoverageLayer[]][];
+      covLayersWithout: [string, CoverageLayer[]][];
+      /** 빌딩별 카운터팩추얼: radarName → [buildingId, layers][] */
+      covLayersWithoutPerBuilding: [string, [number, CoverageLayer[]][]][];
+      coverageStatus: string;
+    }>(
       "report:coverage-update",
       (event) => {
         const apply = () => {
@@ -343,12 +361,17 @@ export default function ReportApp() {
             if (!prev) return prev;
             const nextImages = new Map(prev.sectionImages);
             for (const key of nextImages.keys()) {
-              if (key.startsWith("cov-") || key.startsWith("loss-ev")) nextImages.delete(key);
+              if (key.startsWith("cov-") || key.startsWith("loss-ev") || key.startsWith("obs-")) nextImages.delete(key);
+            }
+            const perBld = new Map<string, Map<number, CoverageLayer[]>>();
+            for (const [rname, entries] of event.payload.covLayersWithoutPerBuilding ?? []) {
+              perBld.set(rname, new Map(entries));
             }
             return {
               ...prev,
               covLayersWithBuildings: new Map(event.payload.covLayersWithBuildings),
               covLayersWithout: new Map(event.payload.covLayersWithout),
+              covLayersWithoutPerBuilding: perBld,
               coverageStatus: event.payload.coverageStatus as OMReportData["coverageStatus"],
               sectionImages: nextImages,
             };
@@ -436,6 +459,17 @@ export default function ReportApp() {
           if (w.length === 0 && wo.length === 0) continue;
           tasks.push({ key: `cov-${rs.name}`, label: `커버리지 비교맵 (${rs.name})` });
         }
+        // 장애물별 상세 페이지의 다이프 SVG 캡처
+        for (const rs of data.selectedRadarSites) {
+          const perBld = data.covLayersWithoutPerBuilding.get(rs.name);
+          if (!perBld) continue;
+          for (const b of data.selectedBuildings) {
+            if (!data.losMap.get(`${rs.name}_${b.id}`)) continue;
+            const woThis = perBld.get(b.id) ?? [];
+            if (woThis.length === 0) continue;
+            tasks.push({ key: `obs-${rs.name}-${b.id}`, label: `장애물 상세 (${rs.name} / ${b.name || `B${b.id}`})` });
+          }
+        }
       }
       if (data.result) {
         for (const rr of data.result.radar_results) {
@@ -516,6 +550,147 @@ export default function ReportApp() {
     return orchestratorState === "done";
   }, [activeTemplate, omData, orchestratorState]);
   const omPreparing = activeTemplate === "obstacle_monthly" && !omReady;
+
+  // ── OM 사이드바: 페이지/활성 섹션 측정 ──
+  // 프리뷰 컨테이너(.bg-gray-300 overflow-auto)의 스크롤 + DOM 변화에 반응해
+  //   - 전체 페이지 수
+  //   - 각 toc-key 의 첫 페이지 인덱스
+  //   - 현재 스크롤 위치 기준 active 페이지 / active toc-key
+  // 를 갱신. rAF 스로틀로 측정 비용 최소화.
+  useEffect(() => {
+    if (activeTemplate !== "obstacle_monthly") return;
+    if (!previewMountable) return;
+    const container = previewRef.current;
+    if (!container) return;
+
+    let rafId: number | null = null;
+
+    const measureNow = () => {
+      rafId = null;
+      const pages = Array.from(container.querySelectorAll<HTMLDivElement>("[data-page]"));
+      setOmTotalPages(pages.length);
+      if (pages.length === 0) {
+        setOmCurrentPage(1);
+        setOmActiveTocKey(null);
+        return;
+      }
+
+      // toc-key → 첫 페이지 인덱스(1-based)
+      const tocMap = new Map<string, number>();
+      for (let i = 0; i < pages.length; i++) {
+        let el: HTMLElement | null = pages[i];
+        while (el && el !== container) {
+          const k = el.dataset.tocKey;
+          if (k && !tocMap.has(k)) {
+            tocMap.set(k, i + 1);
+            break;
+          }
+          el = el.parentElement;
+        }
+      }
+      setOmTocPageMap(tocMap);
+
+      // 현재 페이지: 컨테이너 상단으로부터 80px 아래에 sentinel.
+      // sentinel 위쪽에 있는 페이지 중 가장 마지막 = active.
+      const containerRect = container.getBoundingClientRect();
+      const sentinel = containerRect.top + 80;
+      let activeIdx = 0;
+      for (let i = 0; i < pages.length; i++) {
+        const r = pages[i].getBoundingClientRect();
+        if (r.top > sentinel) break;
+        activeIdx = i;
+      }
+      setOmCurrentPage(activeIdx + 1);
+
+      // 활성 페이지의 toc-key 조상
+      let el: HTMLElement | null = pages[activeIdx];
+      let foundKey: string | null = null;
+      while (el && el !== container) {
+        const k = el.dataset.tocKey;
+        if (k) { foundKey = k; break; }
+        el = el.parentElement;
+      }
+      setOmActiveTocKey(foundKey);
+    };
+
+    const schedule = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(measureNow);
+    };
+
+    // 초기 측정 (DOM 안정화 시간 약간 확보)
+    const initialTimer = setTimeout(measureNow, 50);
+
+    container.addEventListener("scroll", schedule, { passive: true });
+    const mo = new MutationObserver(schedule);
+    mo.observe(container, { childList: true, subtree: true });
+    const ro = new ResizeObserver(schedule);
+    ro.observe(container);
+
+    return () => {
+      clearTimeout(initialTimer);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      container.removeEventListener("scroll", schedule);
+      mo.disconnect();
+      ro.disconnect();
+    };
+  }, [activeTemplate, previewMountable, omReady]);
+
+  // 사이드바 목차 클릭 → 해당 섹션 첫 페이지로 부드러운 스크롤
+  const handleTocJump = useCallback((key: string) => {
+    const container = previewRef.current;
+    if (!container) return;
+    const target = container.querySelector<HTMLElement>(`[data-toc-key="${key}"]`);
+    if (!target) return;
+    // scrollIntoView 는 부모 컨테이너(overflow:auto)에 대해 동작
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  // OM 사이드바 목차 데이터
+  const omTocList = useMemo<OMSidebarTocItem[]>(() => {
+    if (activeTemplate !== "obstacle_monthly" || !activeSections || !omData) return [];
+    const candidates: { key: string; name: string; visible: boolean }[] = [
+      { key: "cover",             name: "표지",              visible: !!activeSections.cover },
+      { key: "omSummary",         name: "분석 요약",         visible: !!activeSections.omSummary },
+      { key: "omDailyPsrLoss",    name: "일별 PSR·표적소실", visible: !!activeSections.omDailyPsrLoss },
+      { key: "omWeekly",          name: "주차별 추이",       visible: !!activeSections.omWeekly },
+      { key: "omCoverageDiff",    name: "커버리지 비교맵",   visible: !!activeSections.omCoverageDiff },
+      { key: "omAzDistScatter",   name: "방위·거리 산점도",  visible: !!activeSections.omAzDistScatter },
+      { key: "omBuildingLos",     name: "건물별 LoS",        visible: !!activeSections.omBuildingLos },
+      { key: "omLosCrossSection", name: "장애물별 상세",     visible: !!activeSections.omLosCrossSection && omData.losMap.size > 0 },
+      { key: "omAltitude",        name: "고도 분포",         visible: !!activeSections.omAltitude },
+      { key: "omLossEvents",      name: "표적소실 상세",     visible: !!activeSections.omLossEvents },
+      { key: "omFindings",        name: "종합 소견",         visible: !!activeSections.omFindings },
+    ];
+    return candidates.filter((c) => c.visible).map((c, i) => ({
+      key:  c.key,
+      num:  String(i + 1).padStart(2, "0"),
+      name: c.name,
+      page: omTocPageMap.get(c.key) ?? 0,
+    }));
+  }, [activeTemplate, activeSections, omData, omTocPageMap]);
+
+  // OM 사이드바 표시 메타 — 발행 기간 뱃지 텍스트 ("2026년 4월" 형식)
+  const omSidebarPeriod = useMemo(() => {
+    const iso = omData?.analysisMonth;
+    if (iso && /^\d{4}-\d{2}$/.test(iso)) {
+      return `${iso.slice(0, 4)}년 ${parseInt(iso.slice(5, 7))}월`;
+    }
+    return coverSubtitle || undefined;
+  }, [omData?.analysisMonth, coverSubtitle]);
+
+  // 문서번호: 편집 모드면 기존 ID 사용, 아니면 분석월 기반 placeholder
+  const omSidebarDocNo = useMemo(() => {
+    if (editingReportId) {
+      // 너무 길면 앞 16자만 표시 (사이드바 폭 192px 제한)
+      return editingReportId.length > 18 ? editingReportId.slice(0, 18) + "…" : editingReportId;
+    }
+    const iso = omData?.analysisMonth;
+    if (iso && /^\d{4}-\d{2}$/.test(iso)) {
+      return `RDR-RPT-${iso.slice(2, 4)}${iso.slice(5, 7)}-NEW`;
+    }
+    return "RDR-RPT-NEW";
+  }, [editingReportId, omData?.analysisMonth]);
 
   // PDF 내보내기 + DB 저장
   const handleExportPDF = useCallback(async () => {
@@ -634,6 +809,7 @@ export default function ReportApp() {
     losMap: Map<string, LoSProfileData>,
     covWith: Map<string, CoverageLayer[]>,
     covWithout: Map<string, CoverageLayer[]>,
+    covWithoutPerBuilding: Map<string, Map<number, CoverageLayer[]>>,
     monthStr?: string,
   ) => {
     const newOmData: OMReportData = {
@@ -644,6 +820,7 @@ export default function ReportApp() {
       losMap,
       covLayersWithBuildings: covWith,
       covLayersWithout: covWithout,
+      covLayersWithoutPerBuilding: covWithoutPerBuilding,
       analysisMonth: monthStr ?? "",
       findingsText: generateOMFindingsText({
         radarResults: result.radar_results,
@@ -678,9 +855,10 @@ export default function ReportApp() {
     const lightOmData: OMReportData = {
       ...newOmData,
       result: lightResult,
-      // 커버리지 레이어는 IDB에 저장하여 새로고침 시에도 복원
+      // 커버리지 레이어(베이스라인·합산·빌딩별)는 IDB에 저장하여 새로고침 시에도 복원
       covLayersWithBuildings: covWith,
       covLayersWithout: covWithout,
+      covLayersWithoutPerBuilding: covWithoutPerBuilding,
       coverageStatus: covWith.size > 0 ? "done" : "idle",
     };
 
@@ -731,18 +909,24 @@ export default function ReportApp() {
   }, []);
 
   // ── 커버리지 콜백 (모달 언마운트 후에도 동작) ──
-  const handleCoverageReady = useCallback((covWith: Map<string, CoverageLayer[]>, covWithout: Map<string, CoverageLayer[]>) => {
+  // PS(사전검토) 모달은 빌딩별 데이터를 보내지 않으므로 3번째 인자는 선택적.
+  const handleCoverageReady = useCallback((
+    covWith: Map<string, CoverageLayer[]>,
+    covWithout: Map<string, CoverageLayer[]>,
+    covWithoutPerBuilding?: Map<string, Map<number, CoverageLayer[]>>,
+  ) => {
     // 보고서 창 내부에서 직접 omData 업데이트
     setOmData((prev) => {
       if (!prev) return prev;
       const nextImages = new Map(prev.sectionImages);
       for (const key of nextImages.keys()) {
-        if (key.startsWith("cov-") || key.startsWith("loss-ev")) nextImages.delete(key);
+        if (key.startsWith("cov-") || key.startsWith("loss-ev") || key.startsWith("obs-")) nextImages.delete(key);
       }
       return {
         ...prev,
         covLayersWithBuildings: covWith,
         covLayersWithout: covWithout,
+        covLayersWithoutPerBuilding: covWithoutPerBuilding ?? prev.covLayersWithoutPerBuilding,
         coverageStatus: "done",
         sectionImages: nextImages,
       };
@@ -1010,59 +1194,46 @@ export default function ReportApp() {
     );
   }
 
-  return (
-    <>
-    <div className="relative flex h-screen flex-col bg-white">
-      <SourceOverlay />
-      <Titlebar controlsOnly>
-        {/* 섹션 토글 (컴팩트) */}
-        <div className="flex items-center gap-1">
-          {toggles.map((s) => (
-            <button
-              key={s.key}
-              onClick={() => setSections((prev) => prev ? { ...prev, [s.key]: !prev[s.key] } : prev)}
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
-                activeSections[s.key]
-                  ? "bg-[#a60739]/10 text-[#a60739] font-medium"
-                  : "text-gray-400 hover:bg-gray-100"
-              }`}
-            >
-              {s.label}
-            </button>
-          ))}
-        </div>
-
-        <div className="flex-1" />
-
-        {editingReportId && (
-          <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-[11px] font-medium text-blue-600">
-            수정 모드
-          </span>
-        )}
-
-{activeTemplate === "obstacle_monthly" && !omData?.result && editingReportId && (
-          <span className="rounded-full bg-orange-100 px-2.5 py-0.5 text-[11px] font-medium text-orange-600">
-            분석 데이터 없음 — 소견 텍스트만 복원됨 (재분석 필요)
-          </span>
-        )}
-
-        {exportError && (
-          <span className="text-xs text-red-500">{exportError}</span>
-        )}
-
+  // ── 공통 토글/상태 chip (타이틀바 children 으로 사용) ──
+  // OM 사이드바 분기에서는 PDF 버튼이 사이드바에 있으므로 타이틀바에서는 제외.
+  const sectionTogglePills = (
+    <div className="flex items-center gap-1">
+      {toggles.map((s) => (
         <button
-          onClick={handleExportPDF}
-          disabled={generating || omPreparing}
-          title={omPreparing ? "섹션 준비 중..." : undefined}
-          className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40"
+          key={s.key}
+          onClick={() => setSections((prev) => prev ? { ...prev, [s.key]: !prev[s.key] } : prev)}
+          className={`rounded px-2 py-1 text-[11px] transition-colors ${
+            activeSections[s.key]
+              ? "bg-[#a60739]/10 text-[#a60739] font-medium"
+              : "text-gray-400 hover:bg-gray-100"
+          }`}
         >
-          {generating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-          {generating ? `생성 중... ${exportElapsed}초` : omPreparing ? "섹션 준비 중..." : editingReportId ? "PDF 재저장" : "PDF"}
+          {s.label}
         </button>
-      </Titlebar>
+      ))}
+    </div>
+  );
 
-      {/* 닫기 확인 모달 */}
-      {closeConfirmOpen && (
+  const statusChips = (
+    <>
+      {editingReportId && (
+        <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-[11px] font-medium text-blue-600">
+          수정 모드
+        </span>
+      )}
+      {activeTemplate === "obstacle_monthly" && !omData?.result && editingReportId && (
+        <span className="rounded-full bg-orange-100 px-2.5 py-0.5 text-[11px] font-medium text-orange-600">
+          분석 데이터 없음 — 소견 텍스트만 복원됨 (재분석 필요)
+        </span>
+      )}
+      {exportError && (
+        <span className="text-xs text-red-500">{exportError}</span>
+      )}
+    </>
+  );
+
+  // ── 닫기 확인 모달 (공통) ──
+  const closeConfirmModal = closeConfirmOpen && (
         <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm">
           <div className="mx-4 w-full max-w-sm rounded-xl border border-gray-200 bg-white shadow-xl">
             <div className="flex flex-col items-center gap-3 px-6 pt-6 pb-4">
@@ -1091,13 +1262,13 @@ export default function ReportApp() {
             </div>
           </div>
         </div>
-      )}
+  );
 
-      {/* OM 섹션 준비 중 상세 진행 오버레이 — 프리뷰 위에 덮어 표시.
-          통합 모달(omFlowActive)이 떠 있는 동안에는 모달이 동일 정보를 표시하므로 숨김.
-          이 오버레이는 모달이 없는 시나리오(저장 보고서 재로딩, 레이더 재선택으로 인한
-          파노라마 재계산 등)의 안전망으로만 사용됨. */}
-      {!omFlowActive && omPreparing && omData && (() => {
+  // ── OM 섹션 준비 중 상세 진행 오버레이 (공통, 프리뷰 위 absolute) ──
+  // 통합 모달(omFlowActive)이 떠 있는 동안에는 모달이 동일 정보를 표시하므로 숨김.
+  // 이 오버레이는 모달이 없는 시나리오(저장 보고서 재로딩, 레이더 재선택으로 인한
+  // 파노라마 재계산 등)의 안전망으로만 사용됨.
+  const omPreparingOverlay = (!omFlowActive && omPreparing && omData) ? (() => {
         type StageStatus = "waiting" | "active" | "done" | "error";
         const coverageStage: StageStatus =
           omData.coverageStatus === "done" ? "done"
@@ -1233,59 +1404,142 @@ export default function ReportApp() {
             </div>
           </div>
         );
-      })()}
+      })() : null;
 
-      {/* 보고서 프리뷰 — coverage+panorama 완료 전에는 mount 자체를 안 함.
-          파노라마 IPC 응답(20MB+)이 프리뷰 렌더/이미지 로드와 경합해 영구 대기되는 문제 회피.
-          캡처 중에는 위 오버레이(bg-white/95, z-30)가 프리뷰를 시각적으로 가려줌.
-          주의: visibility:hidden 또는 display:none 사용 금지 — html2canvas-pro 가
-          hidden 컨테이너 안의 자식을 렌더하지 않아 캡처가 빈 캔버스 / 영구 hang 됨
-          (https://github.com/niklasvh/html2canvas/issues/2171) */}
-      {previewMountable && (
-      <div
-        className="flex flex-1 min-h-0"
-        aria-hidden={omPreparing}
-      >
-        <ReportPreviewContent
-          template={activeTemplate}
-          sections={activeSections}
-          flights={state.flights}
-          reportFlights={state.reportFlights}
-          losResults={state.losResults}
-          aircraft={state.aircraft}
-          radarSite={state.radarSite}
-          reportMetadata={state.reportMetadata}
-          panoramaData={state.panoramaData}
-          panoramaPeakNames={state.panoramaPeakNames}
-          coverageLayers={state.coverageLayers}
-          mapImage={state.mapImage}
-          omData={omData}
-          omResultTrimmed={omData?.result ?? null}
-          psResult={state.psResult}
-          psSelectedBuildings={state.psSelectedBuildings}
-          psSelectedRadarSites={state.psSelectedRadarSites}
-          psLosMap={state.psLosMap}
-          psCovLayersWith={state.psCovLayersWith}
-          psCovLayersWithout={state.psCovLayersWithout}
-          psAnalysisMonth={state.psAnalysisMonth}
-          coverTitle={coverTitle}
-          onCoverTitleChange={setCoverTitle}
-          coverSubtitle={coverSubtitle}
-          onCoverSubtitleChange={setCoverSubtitle}
-          commentary={commentary}
-          onCommentaryChange={setCommentary}
-          forceAllVisible={forceAllVisible}
-          onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
-          singleFlightChartPoints={state.singleFlightChartPoints}
-          setCaptureRef={setCaptureRef}
-          previewRef={previewRef}
-        />
-      </div>
-      )}
+  // ── 보고서 프리뷰 (공통) ──
+  // coverage+panorama 완료 전에는 mount 자체를 안 함.
+  // 파노라마 IPC 응답(20MB+)이 프리뷰 렌더/이미지 로드와 경합해 영구 대기되는 문제 회피.
+  // 캡처 중에는 위 오버레이(bg-white/95, z-30)가 프리뷰를 시각적으로 가려줌.
+  // 주의: visibility:hidden 또는 display:none 사용 금지 — html2canvas-pro 가
+  // hidden 컨테이너 안의 자식을 렌더하지 않아 캡처가 빈 캔버스 / 영구 hang 됨
+  // (https://github.com/niklasvh/html2canvas/issues/2171)
+  const previewBlock = previewMountable ? (
+    <div
+      className="flex flex-1 min-h-0"
+      aria-hidden={omPreparing}
+    >
+      <ReportPreviewContent
+        template={activeTemplate}
+        sections={activeSections}
+        flights={state.flights}
+        reportFlights={state.reportFlights}
+        losResults={state.losResults}
+        aircraft={state.aircraft}
+        radarSite={state.radarSite}
+        reportMetadata={state.reportMetadata}
+        panoramaData={state.panoramaData}
+        panoramaPeakNames={state.panoramaPeakNames}
+        coverageLayers={state.coverageLayers}
+        mapImage={state.mapImage}
+        omData={omData}
+        omResultTrimmed={omData?.result ?? null}
+        psResult={state.psResult}
+        psSelectedBuildings={state.psSelectedBuildings}
+        psSelectedRadarSites={state.psSelectedRadarSites}
+        psLosMap={state.psLosMap}
+        psCovLayersWith={state.psCovLayersWith}
+        psCovLayersWithout={state.psCovLayersWithout}
+        psAnalysisMonth={state.psAnalysisMonth}
+        coverTitle={coverTitle}
+        onCoverTitleChange={setCoverTitle}
+        coverSubtitle={coverSubtitle}
+        onCoverSubtitleChange={setCoverSubtitle}
+        commentary={commentary}
+        onCommentaryChange={setCommentary}
+        forceAllVisible={forceAllVisible}
+        onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
+        singleFlightChartPoints={state.singleFlightChartPoints}
+        setCaptureRef={setCaptureRef}
+        previewRef={previewRef}
+      />
     </div>
-    {/* 통합 OM 모달 — fragment 의 두 번째 자식 위치에 고정. 모든 분기에서 같은 트리
-        위치에 마운트되어 step/analyzing 등 로컬 state 가 분기 전환 시 보존된다. */}
-    {omModal}
+  ) : null;
+
+  // ── 최종 셸 분기 ──
+  // OM 템플릿: 좌측 사이드바(192px) + 우측(타이틀바 + 프리뷰).
+  // 그 외 템플릿: 기존 그대로 (타이틀바에 토글 + PDF 버튼 + 프리뷰만).
+  if (activeTemplate === "obstacle_monthly") {
+    return (
+      <>
+        <div className="relative flex h-screen flex-row bg-white">
+          <SourceOverlay />
+
+          {/* 좌측: OM 사이드바 (192px) */}
+          <ReportOMSidebar
+            docPeriod={omSidebarPeriod}
+            docTitle={coverTitle || "장애물 월간 분석 보고서"}
+            docNo={omSidebarDocNo}
+            agency={state.reportMetadata?.organization || undefined}
+            periodIso={omData?.analysisMonth || undefined}
+            toc={omTocList}
+            activeKey={omActiveTocKey}
+            currentPage={omCurrentPage}
+            totalPages={omTotalPages}
+            onJump={handleTocJump}
+            range={omSidebarRange}
+            onRangeChange={setOmSidebarRange}
+            paper={omSidebarPaper}
+            onPaperChange={setOmSidebarPaper}
+            onSave={handleExportPDF}
+            generating={generating}
+            disabled={generating || omPreparing}
+            disabledTitle={omPreparing ? "섹션 준비 중..." : undefined}
+            elapsedSec={exportElapsed}
+            editingMode={!!editingReportId}
+          />
+
+          {/* 우측 1px 구분선 — top-8(=32px) 아래로만 그어 타이틀바가 가로질러 흐름.
+              메인 Sidebar.tsx 와 동일 패턴. */}
+          <div className="relative w-px shrink-0">
+            <div className="absolute left-0 top-8 bottom-0 w-px bg-gray-200" />
+          </div>
+
+          {/* 우측: 타이틀바 + 프리뷰 */}
+          <div className="relative flex flex-1 flex-col min-w-0">
+            <Titlebar controlsOnly>
+              {sectionTogglePills}
+              <div className="flex-1" />
+              {statusChips}
+            </Titlebar>
+
+            {omPreparingOverlay}
+            {previewBlock}
+          </div>
+
+          {closeConfirmModal}
+        </div>
+        {/* 통합 OM 모달 — fragment 의 두 번째 자식 위치에 고정. 모든 분기에서 같은 트리
+            위치에 마운트되어 step/analyzing 등 로컬 state 가 분기 전환 시 보존된다. */}
+        {omModal}
+      </>
+    );
+  }
+
+  // 그 외 템플릿 — 사이드바 없음, 기존 셸 그대로
+  return (
+    <>
+      <div className="relative flex h-screen flex-col bg-white">
+        <SourceOverlay />
+        <Titlebar controlsOnly>
+          {sectionTogglePills}
+          <div className="flex-1" />
+          {statusChips}
+          <button
+            onClick={handleExportPDF}
+            disabled={generating || omPreparing}
+            title={omPreparing ? "섹션 준비 중..." : undefined}
+            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40"
+          >
+            {generating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+            {generating ? `생성 중... ${exportElapsed}초` : omPreparing ? "섹션 준비 중..." : editingReportId ? "PDF 재저장" : "PDF"}
+          </button>
+        </Titlebar>
+
+        {closeConfirmModal}
+        {omPreparingOverlay}
+        {previewBlock}
+      </div>
+      {omModal}
     </>
   );
 }

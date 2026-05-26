@@ -90,6 +90,9 @@ export interface OMReportData {
   /** 레이더별 커버리지 레이어 (key: radarName) */
   covLayersWithBuildings: Map<string, import("../utils/radarCoverage").CoverageLayer[]>;
   covLayersWithout: Map<string, import("../utils/radarCoverage").CoverageLayer[]>;
+  /** 빌딩별 카운터팩추얼 레이어 — 빌딩 한 채만 제외했을 때의 커버리지.
+   *  반환: radarName → buildingId → layers. 빌딩의 한계 영향 분석용. */
+  covLayersWithoutPerBuilding: Map<string, Map<number, import("../utils/radarCoverage").CoverageLayer[]>>;
   analysisMonth: string;
   findingsText: string;
   recommendText: string;

@@ -28,6 +28,9 @@ interface Props {
   hideHeader?: boolean;
   /** 사전 캡처된 SVG dataUrl. 있으면 라이브 SVG 대신 <img> 표시 */
   preCapturedImage?: string;
+  /** true면 focus bbox 를 diff 영역만으로 구성 (빌딩·소실표적 제외, 더 타이트한 줌).
+   *  레이더·장애물이 viewBox 밖이어도 OK — 빌딩 단독 영향이 미세할 때 가시성↑ */
+  focusOnDiffOnly?: boolean;
 }
 
 /** 방위별 커버리지 범위(km) lookup — O(1) 인덱스 기반 */
@@ -59,51 +62,90 @@ function coverageRangeAtAlt(
   return coverageRangeAt(lo, azDeg) + t * (coverageRangeAt(hi, azDeg) - coverageRangeAt(lo, azDeg));
 }
 
-/** 레이어 쌍에서 diff path 생성 (분석 대상 건물 영향 차이) */
+/** 레이어 쌍에서 diff path 생성 (분석 대상 건물 영향 차이).
+ *  isDense(deg): true 인 방위는 전수 검사(stride=1), false 면 ~1° 다운샘플 stride 적용.
+ *  진입/이탈 시 베어링 빈의 좌/우 경계(±stepDeg/2)도 폴리곤 꼭지점에 추가 →
+ *  1샘플 폭 그림자도 stepDeg 폭의 가는 sliver 로 폐합됨 (임계 미만 케이스 제거). */
 function buildDiffPath(
   layerWith: CoverageLayer, layerWithout: CoverageLayer,
   scale: number, cx: number, cy: number,
-): string | null {
+  isDense: (deg: number) => boolean,
+): { path: string | null; diffBearings: number } {
   const withBearings = layerWith.bearings;
   const withoutBearings = layerWithout.bearings;
-  if (withBearings.length === 0 || withoutBearings.length === 0) return null;
+  if (withBearings.length === 0 || withoutBearings.length === 0) {
+    return { path: null, diffBearings: 0 };
+  }
 
   const segments: string[] = [];
-  const every = Math.max(1, Math.floor(withoutBearings.length / 360));
+  const strideOutside = Math.max(1, Math.floor(withoutBearings.length / 360));
+  const halfStepDeg = (360 / withoutBearings.length) / 2;
 
   let outerPts: string[] = [];
   let innerPts: string[] = [];
   let inDiff = false;
+  let diffBearings = 0; // 실제 diff>0 인 베어링 수 (메시지 분기용)
+  // 진출 시 우측 경계점을 그리기 위해 마지막 in-diff 빈의 반지름 보존
+  let lastDiffBin: { deg: number; rWithout: number; rWith: number } | null = null;
 
-  // withBearings를 방위각 기준 Map으로 변환 (인덱스가 아닌 deg 기준 매칭)
+  // 베어링 색인: 인덱스 매칭이 아닌 deg 기준 (with/without 동일 deg 가정)
   const withByDeg = new Map<number, (typeof withBearings)[0]>();
   for (const wb of withBearings) {
     withByDeg.set(Math.round(wb.deg * 100), wb);
   }
 
-  for (let i = 0; i < withoutBearings.length; i += every) {
+  const pushPoint = (r: number, degVal: number, isOuter: boolean) => {
+    const rad = (degVal * Math.PI) / 180;
+    const x = (cx + r * Math.sin(rad)).toFixed(1);
+    const y = (cy - r * Math.cos(rad)).toFixed(1);
+    if (isOuter) outerPts.push(`${x} ${y}`);
+    else innerPts.unshift(`${x} ${y}`);
+  };
+
+  const commit = () => {
+    if (outerPts.length >= 2) {
+      segments.push(`M ${outerPts[0]} L ${outerPts.slice(1).join(" L ")} L ${innerPts.join(" L ")} Z`);
+    }
+    outerPts = []; innerPts = []; inDiff = false; lastDiffBin = null;
+  };
+
+  let i = 0;
+  while (i < withoutBearings.length) {
     const b = withoutBearings[i];
     const matchWith = withByDeg.get(Math.round(b.deg * 100)) ?? null;
     const rWithout = b.maxRangeKm * scale;
     const rWith = (matchWith?.maxRangeKm ?? b.maxRangeKm) * scale;
-    const rad = (b.deg * Math.PI) / 180;
     const diff = rWithout - rWith;
 
     if (diff > 0) {
-      outerPts.push(`${(cx + rWithout * Math.sin(rad)).toFixed(1)} ${(cy - rWithout * Math.cos(rad)).toFixed(1)}`);
-      innerPts.unshift(`${(cx + rWith * Math.sin(rad)).toFixed(1)} ${(cy - rWith * Math.cos(rad)).toFixed(1)}`);
-      inDiff = true;
-    } else if (inDiff) {
-      if (outerPts.length >= 2) {
-        segments.push(`M ${outerPts[0]} L ${outerPts.slice(1).join(" L ")} L ${innerPts.join(" L ")} Z`);
+      // 진입: 좌측 경계점 (현재 빈의 반지름으로) — 1샘플 폭도 stepDeg/2 만큼 좌측으로 확장됨
+      if (!inDiff) {
+        pushPoint(rWithout, b.deg - halfStepDeg, true);
+        pushPoint(rWith, b.deg - halfStepDeg, false);
       }
-      outerPts = []; innerPts = []; inDiff = false;
+      // 중심점
+      pushPoint(rWithout, b.deg, true);
+      pushPoint(rWith, b.deg, false);
+      inDiff = true;
+      lastDiffBin = { deg: b.deg, rWithout, rWith };
+      diffBearings++;
+    } else if (inDiff && lastDiffBin) {
+      // 이탈: 마지막 in-diff 빈의 우측 경계점으로 폴리곤 닫기
+      pushPoint(lastDiffBin.rWithout, lastDiffBin.deg + halfStepDeg, true);
+      pushPoint(lastDiffBin.rWith, lastDiffBin.deg + halfStepDeg, false);
+      commit();
     }
+
+    // 섹터 안: 전수 검사 (협소 그림자 포착) · 섹터 밖: 1° 다운샘플 (노드 수 통제)
+    i += isDense(b.deg) ? 1 : strideOutside;
   }
-  if (outerPts.length >= 2) {
-    segments.push(`M ${outerPts[0]} L ${outerPts.slice(1).join(" L ")} L ${innerPts.join(" L ")} Z`);
+  // 끝까지 diff>0 인 경우 마지막 빈의 우측 경계점으로 닫기
+  if (inDiff && lastDiffBin) {
+    pushPoint(lastDiffBin.rWithout, lastDiffBin.deg + halfStepDeg, true);
+    pushPoint(lastDiffBin.rWith, lastDiffBin.deg + halfStepDeg, false);
+    commit();
   }
-  return segments.length > 0 ? segments.join(" ") : null;
+  return { path: segments.length > 0 ? segments.join(" ") : null, diffBearings };
 }
 
 /* ── 타일 좌표 유틸 (Slippy Map) ── */
@@ -199,10 +241,10 @@ function useStaticMapImage(
 
 const SECTOR_PAD_DEG = 25;
 const FIXED_ALTS = [1000, 2000, 3000, 5000, 10000, 15000, 20000];
-/** diff 영역 확대(줌) 파라미터 */
-const MIN_FOCUS_HALF_KM = 4;   // 단일 지점 등 작은 diff 의 최소 반경(km)
-const FOCUS_PAD_FRAC = 0.18;   // diff 영역 주변 여백 비율
-const FOCUS_MARGIN_PX = 64;    // 캔버스 가장자리 여백(px, 라벨/축척 공간)
+/** diff 영역 확대(줌) 파라미터 — 소실표적·장애물·차이 영역만 남기고 최대 확대 */
+const MIN_FOCUS_HALF_KM = 1.5; // 단일 지점 등 작은 diff 의 최소 반경(km)
+const FOCUS_PAD_FRAC = 0.06;   // diff 영역 주변 여백 비율
+const FOCUS_MARGIN_PX = 28;    // 캔버스 가장자리 여백(px, 축척 바/북향 표시 공간만 확보)
 
 const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function ReportOMCoverageDiff({
   sectionNum,
@@ -213,6 +255,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
   selectedBuildings,
   hideHeader,
   preCapturedImage,
+  focusOnDiffOnly,
 }: Props, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -293,7 +336,8 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
   }, [fixedWith, fixedWithout, radarSite.range_nm]);
 
   // 장애물 영향 차이(diff) 영역의 km 바운딩박스 — 확대(줌) 기준.
-  // diff 세그먼트(제외>포함) + 건물 + 장애물 기인 소실표적을 모두 포함.
+  // focusOnDiffOnly=false: diff 세그먼트 + 건물 + 장애물 기인 소실표적 모두 포함 (합산 페이지).
+  // focusOnDiffOnly=true:  diff 세그먼트만 포함 → 레이더·장애물이 viewBox 밖이어도 무관 (단독 영향 페이지).
   const focusBboxKm = useMemo(() => {
     let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
     let any = false;
@@ -316,35 +360,41 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         if (b.maxRangeKm - rWith > 0) { add(b.maxRangeKm, b.deg); add(rWith, b.deg); }
       }
     }
-    for (const bld of selectedBuildings) {
-      const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, bld.latitude, bld.longitude);
-      add(distKm, azDeg);
-    }
-    for (const pt of filteredLoss) {
-      const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, pt.lat, pt.lon);
-      add(distKm, azDeg);
+    if (!focusOnDiffOnly) {
+      for (const bld of selectedBuildings) {
+        const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, bld.latitude, bld.longitude);
+        add(distKm, azDeg);
+      }
+      for (const pt of filteredLoss) {
+        const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, pt.lat, pt.lon);
+        add(distKm, azDeg);
+      }
     }
     return any ? { xMin, xMax, yMin, yMax } : null;
-  }, [fixedWith, fixedWithout, selectedBuildings, filteredLoss, radarSite]);
+  }, [fixedWith, fixedWithout, selectedBuildings, filteredLoss, radarSite, focusOnDiffOnly]);
 
   // 확대 변환: diff 영역이 캔버스를 채우도록 scale/center 계산.
   // viewBox 는 700×700 고정 → 라벨/마커/범례 크기는 일정 유지, 지오메트리만 확대.
+  // focusOnDiffOnly=true: 더 작은 최소 반경/패딩/캔버스 마진으로 극단적 확대.
   const { scale, cx, cy, focused } = useMemo(() => {
     if (!focusBboxKm) {
       return { scale: fullMaxR / globalMaxRange, cx: fullCx, cy: fullCy, focused: false };
     }
     const cxKm = (focusBboxKm.xMin + focusBboxKm.xMax) / 2;
     const cyKm = (focusBboxKm.yMin + focusBboxKm.yMax) / 2;
+    const minHalfKm = focusOnDiffOnly ? 0.25 : MIN_FOCUS_HALF_KM;
+    const padFrac = focusOnDiffOnly ? 0.02 : FOCUS_PAD_FRAC;
+    const marginPx = focusOnDiffOnly ? 12 : FOCUS_MARGIN_PX;
     let half = Math.max(
       (focusBboxKm.xMax - focusBboxKm.xMin) / 2,
       (focusBboxKm.yMax - focusBboxKm.yMin) / 2,
-      MIN_FOCUS_HALF_KM,
+      minHalfKm,
     );
-    half *= 1 + FOCUS_PAD_FRAC;
-    const inner = svgSize - FOCUS_MARGIN_PX * 2;
+    half *= 1 + padFrac;
+    const inner = svgSize - marginPx * 2;
     const s = inner / (half * 2);
     return { scale: s, cx: svgSize / 2 - cxKm * s, cy: svgSize / 2 - cyKm * s, focused: true };
-  }, [focusBboxKm, globalMaxRange, fullMaxR, fullCx, fullCy]);
+  }, [focusBboxKm, globalMaxRange, fullMaxR, fullCx, fullCy, focusOnDiffOnly]);
 
   // 가시 캔버스에 대응하는 지리 경계 → 줌 수준에 맞는 지도 타일 요청
   const geoBounds = useMemo(() => {
@@ -409,25 +459,33 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
     };
   }, []);
 
-  // 각 고도별 diff path (분석 대상 건물 영향 차이) — diff 영역만 그림
-  const diffPaths = useMemo(() => {
+  // 각 고도별 diff path (분석 대상 건물 영향 차이) — diff 영역만 그림.
+  // totalDiffBearings: 폴리곤 미폐합(협소 1샘플) 케이스도 검출하려고 누적 — 메시지 분기용.
+  const { diffPaths, totalDiffBearings } = useMemo(() => {
     const result: { altFt: number; color: string; path: string }[] = [];
+    let bearingsSum = 0;
+    const isDense = hasSector ? inSector : () => false;
     for (let i = 0; i < fixedWith.length; i++) {
       const lw = fixedWith[i];
       const lwo = fixedWithout.find((l) => Math.abs(l.altitudeFt - lw.altitudeFt) < 200);
       if (!lwo) continue;
-      const dp = buildDiffPath(lw, lwo, scale, cx, cy);
-      if (dp) {
+      const { path, diffBearings } = buildDiffPath(lw, lwo, scale, cx, cy, isDense);
+      bearingsSum += diffBearings;
+      if (path) {
         result.push({
           altFt: lw.altitudeFt,
           color: altToColor(lw.altitudeFt, MIN_ALT, MAX_ALT),
-          path: dp,
+          path,
         });
       }
     }
     // 낮은 고도(큰 영역) → 높은 고도(작은 영역) 순. 작은 영역이 위에 그려짐.
-    return result.sort((a, b) => a.altFt - b.altFt);
-  }, [fixedWith, fixedWithout, scale, cx, cy]);
+    return {
+      diffPaths: result.sort((a, b) => a.altFt - b.altFt),
+      totalDiffBearings: bearingsSum,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixedWith, fixedWithout, scale, cx, cy, hasSector, sectorStart, sectorEnd]);
 
   if (fixedWith.length === 0 && fixedWithout.length === 0) return (
     <div ref={containerRef} className="flex flex-col items-center py-16 text-gray-400">
@@ -663,13 +721,23 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         )}
       </div>
 
-      {/* 장애물 영향 차이 없음 안내 */}
+      {/* 장애물 영향 차이 없음 / 협소 안내 */}
       {diffPaths.length === 0 && fixedWith.length > 0 && fixedWithout.length > 0 && (
         <div className="mt-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-center text-[11px] text-blue-700">
-          분석 대상 장애물에 의한 실질적인 커버리지 차이가 발생하지 않았습니다.
-          {filteredLoss.length === 0
-            ? " 장애물 기인 소실표적 또한 없습니다."
-            : ` (단, 장애물 기인 소실표적 ${filteredLoss.length}건 존재)`}
+          {totalDiffBearings > 0 ? (
+            <>
+              협소 영역(폭 1샘플 미만)에 커버리지 차이가 감지되었으나
+              폴리곤화 임계 미만으로 도면 표시는 생략되었습니다.
+              {filteredLoss.length > 0 && ` (장애물 기인 소실표적 ${filteredLoss.length}건 존재)`}
+            </>
+          ) : (
+            <>
+              분석 대상 장애물에 의한 실질적인 커버리지 차이가 발생하지 않았습니다.
+              {filteredLoss.length === 0
+                ? " 장애물 기인 소실표적 또한 없습니다."
+                : ` (단, 장애물 기인 소실표적 ${filteredLoss.length}건 존재)`}
+            </>
+          )}
         </div>
       )}
 
