@@ -5,6 +5,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { RadarSite, ManualBuilding, LoSProfileData, AzSector } from "../types";
 
+/** OM 보고서 LoS 단면도 차트 최소 X축 (km) — 빌딩이 가까워도 이만큼은 terrain 을 샘플링.
+ *  100NM = 100 * 1.852 km. ReportOMLosCrossSection 의 MIN_X_NM 과 동일한 값. */
+const EXTEND_PROFILE_MIN_KM = 100 * 1.852;
+
 /** LoS 분석 — 4개씩 병렬 배치 실행 */
 export async function computeLosBatch(
   jobs: { radar: RadarSite; bldg: ManualBuilding }[],
@@ -21,13 +25,27 @@ export async function computeLosBatch(
     const results = await Promise.all(batch.map(async ({ radar, bldg }) => {
       try {
         const radarHeight = radar.altitude + radar.antenna_height;
-        const samples = 150;
+        const totalDist = Math.sqrt(
+          ((bldg.latitude - radar.latitude) * 111320) ** 2 +
+          ((bldg.longitude - radar.longitude) * 111320 * Math.cos(radar.latitude * Math.PI / 180)) ** 2,
+        ) / 1000;
+        // Terrain sampling 종료 거리: 빌딩 거리와 EXTEND_PROFILE_MIN_KM 중 큰 값.
+        //   빌딩이 가까워도 보고서 차트가 100NM 까지 길게 보이도록 — TrackMap 의 동작과 일관.
+        const profileEndKm = Math.max(totalDist, EXTEND_PROFILE_MIN_KM);
+        // 샘플 밀도: 빌딩까지 최소 150샘플 유지하되, 가까운 빌딩에서 폭주하지 않게 500 으로 상한.
+        //   100NM/500 = 370m 간격 → 차트 가시성 충분, fetch_elevation 1회 호출 부담 합리.
+        const samples = Math.min(500, Math.max(150, Math.round(150 * (profileEndKm / Math.max(totalDist, 1e-6)))));
+        // 빌딩 거리에 해당하는 샘플 인덱스 (블록 판정 루프 종료점)
+        const samplesToBuilding = Math.round((totalDist / profileEndKm) * samples);
+        // 방향 단위 벡터 (위/경도 변화량 per km) — 빌딩 너머도 같은 베어링 직선상으로 외삽
+        const dLatPerKm = totalDist > 1e-6 ? (bldg.latitude - radar.latitude) / totalDist : 0;
+        const dLonPerKm = totalDist > 1e-6 ? (bldg.longitude - radar.longitude) / totalDist : 0;
         const lats: number[] = [];
         const lons: number[] = [];
         for (let j = 0; j <= samples; j++) {
-          const t = j / samples;
-          lats.push(radar.latitude + (bldg.latitude - radar.latitude) * t);
-          lons.push(radar.longitude + (bldg.longitude - radar.longitude) * t);
+          const d = (j / samples) * profileEndKm;
+          lats.push(radar.latitude + dLatPerKm * d);
+          lons.push(radar.longitude + dLonPerKm * d);
         }
         const [elevations, pathBuildings] = await Promise.all([
           invoke<number[]>("fetch_elevation", { latitudes: lats, longitudes: lons }),
@@ -36,28 +54,26 @@ export async function computeLosBatch(
             { radarLat: radar.latitude, radarLon: radar.longitude, targetLat: bldg.latitude, targetLon: bldg.longitude, corridorWidthM: 200 },
           ),
         ]);
-        const totalDist = Math.sqrt(
-          ((bldg.latitude - radar.latitude) * 111320) ** 2 +
-          ((bldg.longitude - radar.longitude) * 111320 * Math.cos(radar.latitude * Math.PI / 180)) ** 2,
-        ) / 1000;
 
         const combinedElev = [...elevations];
         for (const pb of pathBuildings) {
-          const sampleIdx = Math.round((pb.distance_km / totalDist) * samples);
+          // 빌딩 거리(0~totalDist)를 확장 profile 인덱스(0~samples)로 변환
+          const sampleIdx = Math.round((pb.distance_km / profileEndKm) * samples);
           if (sampleIdx >= 0 && sampleIdx < combinedElev.length) {
             const bldgTop = pb.ground_elev_m + pb.height_m;
             if (bldgTop > combinedElev[sampleIdx]) combinedElev[sampleIdx] = bldgTop;
           }
         }
 
+        // 차단 판정: 빌딩 거리까지의 terrain 만 봄 (빌딩 너머 지형은 빌딩 가시성에 무관).
         let blocked = false;
         let maxBlockDist = 0, maxBlockElev = -Infinity, maxBlockName = "";
         const R = 6371000;
         const Reff = R * 4 / 3;
         const targetElev = bldg.ground_elev + bldg.height;
-        for (let k = 1; k < combinedElev.length; k++) {
-          const d = (k / samples) * totalDist * 1000;
-          const t = k / samples;
+        for (let k = 1; k <= samplesToBuilding && k < combinedElev.length; k++) {
+          const d = (k / samples) * profileEndKm * 1000;
+          const t = samplesToBuilding > 0 ? k / samplesToBuilding : 0; // radar↔building 보간 (0~1)
           const losHeight = radarHeight * (1 - t) + targetElev * t;
           const curvDrop = (d * d) / (2 * Reff);
           const terrainAdjusted = combinedElev[k] + curvDrop;
@@ -65,7 +81,7 @@ export async function computeLosBatch(
             blocked = true;
             if (terrainAdjusted > maxBlockElev) {
               maxBlockElev = terrainAdjusted;
-              maxBlockDist = t * totalDist;
+              maxBlockDist = (k / samples) * profileEndKm;
               const nearBldg = pathBuildings.find((pb) => Math.abs(pb.distance_km - maxBlockDist) < 0.5);
               maxBlockName = nearBldg?.name ?? nearBldg?.address ?? "";
             }
@@ -79,7 +95,7 @@ export async function computeLosBatch(
         ) * 180) / Math.PI + 360) % 360;
 
         const elevProfile = combinedElev.map((elev, idx) => ({
-          distance: (idx / samples) * totalDist,
+          distance: (idx / samples) * profileEndKm,
           elevation: elev,
           latitude: lats[idx],
           longitude: lons[idx],

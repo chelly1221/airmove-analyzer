@@ -33,6 +33,10 @@ const ch = H - PAD.top - PAD.bottom;
 const M_TO_FT = 3.28084;
 const KM_TO_NM = 1 / 1.852;
 
+/** X축 최소 범위 (NM) — 빌딩이 가까워도 차트는 최소 이 거리까지 그린다.
+ *  보고서 내 차트들의 X축 스케일을 통일해서 시각 비교를 쉽게 하기 위함. */
+const MIN_X_NM = 100;
+
 const LOSS_COLOR: [number, number, number] = [255, 23, 69]; // #ff1745
 
 /** 프로파일 보간 */
@@ -56,11 +60,16 @@ function interpTerrainElev(profile: ElevationPoint[], d: number): number {
  * 핵심: maxAngle 의 바닥은 0(레이더 안테나의 0° 라디오 호라이즌)이다.
  *   레이더보다 낮은 지형은 가시성을 막지 않으므로 LoS 선을 끌어내리면 안 된다.
  *
+ * `analysisEndKm` 너머의 지형은 maxAngle 누적에서 제외하고 마지막 각도로 선형 외삽한다.
+ *   (빌딩 가시성은 빌딩 거리까지의 지형에만 좌우되므로, 차트 확장용 후방 terrain 이
+ *    LoS 선을 위로 꺾어 올리는 오해를 막기 위함)
+ *
  * 선택적으로 건물 장애물을 추가해 "장애물 포함" LoS 산출.
  */
 function computeStraightLoS(
   profile: ElevationPoint[],
   radarHeight: number,
+  analysisEndKm: number,
   buildingObstacle?: { distanceKm: number; topElevM: number },
 ) {
   const sampleDists = profile.map((p) => p.distance);
@@ -85,10 +94,13 @@ function computeStraightLoS(
       continue;
     }
     const dM = d * 1000;
-    const elev = effectiveElevAt(d);
-    const adjH = elev - curvDrop(d);
-    const angle = (adjH - radarHeight) / dM;
-    if (angle > maxAngle) maxAngle = angle;
+    // analysisEndKm 까지만 maxAngle 누적 (외삽 구간에서 지형이 LoS 를 꺾어 올리지 않게)
+    if (d <= analysisEndKm) {
+      const elev = effectiveElevAt(d);
+      const adjH = elev - curvDrop(d);
+      const angle = (adjH - radarHeight) / dM;
+      if (angle > maxAngle) maxAngle = angle;
+    }
     const losH = radarHeight + maxAngle * dM;
     result.push({ distance: d, height: losH });
   }
@@ -118,8 +130,10 @@ export function LosCrossSection({
 
     const radarHeight = los.radarHeight;
     const profileEnd = profile[profile.length - 1].distance;
-    // X축은 프로파일 끝(= 레이더↔빌딩 거리)까지. TrackMap 과 동일하게 외삽 없음.
-    const maxDistance = profileEnd;
+    // X축은 최소 MIN_X_NM 보장 — 빌딩이 가까워도 차트 비교가 가능하도록.
+    //   신규 분석은 computeLosBatch 에서 profile 을 100NM 까지 샘플링하므로 terrain/LoS 가
+    //   끝까지 그려진다. (이전 DB 캐시 → profile 이 빌딩까지만 있을 경우 그 뒤는 빈 영역)
+    const maxDistance = Math.max(profileEnd, MIN_X_NM / KM_TO_NM);
 
     // 조정 지형 (실제지구 곡률 보정)
     const adjTerrain = profile.map((p) => ({
@@ -132,10 +146,10 @@ export function LosCrossSection({
     const bTopElev = building.ground_elev + building.height;
 
     // 직선 LoS — 장애물 미포함 (지형만, 회색 점선 참고용)
-    const losWithout = computeStraightLoS(profile, radarHeight, undefined);
+    const losWithout = computeStraightLoS(profile, radarHeight, bDistKm, undefined);
 
     // 직선 LoS — 장애물 포함 (메인, 주황 실선)
-    const losWith = computeStraightLoS(profile, radarHeight, {
+    const losWith = computeStraightLoS(profile, radarHeight, bDistKm, {
       distanceKm: bDistKm,
       topElevM: bTopElev,
     });
@@ -151,18 +165,23 @@ export function LosCrossSection({
       }
     }
 
-    // Y축 범위
+    // Y축 범위 — 빌딩 거리 + 20% 버퍼 안의 데이터만 사용.
+    //   100NM 까지 확장된 profile 의 먼 지점은 curvDrop 이 수천 m 로 커서
+    //   Y 범위를 잡으면 정작 빌딩 부근의 디테일이 압축돼 보이지 않게 됨.
+    //   그 너머 지점은 clipPath 로 자연스럽게 잘림.
+    const yWindowEndKm = bDistKm * 1.2;
+    const inYWindow = (d: number) => d <= yWindowEndKm;
     const allHeights = [
       radarHeight,
-      ...adjTerrain.map((p) => p.height),
-      ...losWithout.map((p) => p.height),
-      ...losWith.map((p) => p.height),
+      ...adjTerrain.filter((p) => inYWindow(p.distance)).map((p) => p.height),
+      ...losWithout.filter((p) => inYWindow(p.distance)).map((p) => p.height),
+      ...losWith.filter((p) => inYWindow(p.distance)).map((p) => p.height),
     ];
     let maxY = -Infinity;
     for (const h of allHeights) if (h > maxY) maxY = h;
     maxY += 100;
     let minY = 0;
-    for (const p of adjTerrain) if (p.height < minY) minY = p.height;
+    for (const p of adjTerrain) if (inYWindow(p.distance) && p.height < minY) minY = p.height;
     minY -= 50;
     // 0ft 가 차트 40% 이상으로 오지 않도록 maxY 보장
     if (minY < 0) {
