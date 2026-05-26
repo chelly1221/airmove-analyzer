@@ -1,10 +1,14 @@
 import React from "react";
 import type { RadarMonthlyResult, ManualBuilding, RadarSite, AzSector } from "../../types";
-import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedPsrStdDev, gradeWithConfidence } from "../../utils/omStats";
+import {
+  weightedLossAvg, weightedLossStdDev,
+  weightedPsrAvg, weightedPsrStdDev,
+  gradeWithConfidence,
+} from "../../utils/omStats";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportPage from "./ReportPage";
-import KatexMath from "./KatexMath";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import { PAGE_CONTENT_MM } from "./reportPageConstants";
 
 interface Props {
   sectionNum: number;
@@ -18,23 +22,21 @@ interface Props {
 }
 
 /**
- * A4 인쇄 영역 273mm (297-12×2 패딩) 내에서 요소별 예상 높이:
- *   - 섹션 헤더: ~12mm
- *   - 건물 테이블 헤더: ~8mm, 행당: ~7mm
- *   - 방위 구간 박스: ~20mm
- *   - 산식 주석 박스: ~15mm
- *   - 레이더 KPI 블록: ~25mm (1개당)
+ * 분석 요약 페이지 (페이지 1).
  *
- * 건물 테이블 + 방위 + 산식 + KPI를 합산하여 273mm 초과 시,
- * 건물 테이블을 maxRowsPerPage 단위로 분할하여 여러 ReportPage를 반환한다.
+ * 페이지 구성 순서(data-order="table-first"):
+ *   1) 분석 대상 장애물 표 (.om-table)
+ *   2) 방위·산식 통합 박스 (.meta-merged)
+ *   3) 레이더별 KPI 행 리스트 (.kpi-list, data-kpi="list")
+ *
+ * 건물이 많으면 첫 페이지에 KPI/방위/산식을 두고 잔여 건물 표는 후속 페이지로
+ * 분할. 페이지 inner padding 16/18mm + 새 KPI 행 리스트 높이를 반영한 추정치.
  */
-const HEADER_HEIGHT_MM = 12;
+const HEADER_HEIGHT_MM = 14;
 const TABLE_HEADER_MM = 8;
 const ROW_HEIGHT_MM = 7;
-const AZ_BOX_MM = 20;
-const FORMULA_BOX_MM = 15;
-const KPI_BLOCK_MM = 25;
-const PAGE_CONTENT_MM = 273; // 297 - 12*2 패딩
+const META_MERGED_MM = 30;   // 방위 + 산식 통합 박스 (.meta-merged)
+const KPI_BLOCK_MM = 50;     // h3(6) + 5 행 × 9mm + 보더 = ~50mm
 
 function ReportOMSummarySection({
   sectionNum,
@@ -49,7 +51,7 @@ function ReportOMSummarySection({
     : "";
 
   // 첫 페이지에 들어갈 수 있는 건물 행 수 계산
-  const fixedContentMm = HEADER_HEIGHT_MM + TABLE_HEADER_MM + AZ_BOX_MM + FORMULA_BOX_MM
+  const fixedContentMm = HEADER_HEIGHT_MM + TABLE_HEADER_MM + META_MERGED_MM
     + radarResults.length * KPI_BLOCK_MM;
   const availForRows = PAGE_CONTENT_MM - fixedContentMm;
   const maxRowsFirstPage = Math.max(3, Math.floor(availForRows / ROW_HEIGHT_MM));
@@ -59,43 +61,75 @@ function ReportOMSummarySection({
   const totalBuildings = selectedBuildings.length;
   const needsSplit = totalBuildings > maxRowsFirstPage;
 
-  // 건물 테이블 렌더 (지정 범위)
+  // ── 분석 대상 장애물 표 ────────────────────────────────────────────────
   const renderBuildingTable = (buildings: ManualBuilding[], startIdx: number) => (
-    <table className="w-full border-collapse text-[13px]">
+    <table className="om-table">
       <thead>
-        <tr className="bg-[#28283c] text-white">
-          <th className="border border-gray-300 px-2 py-1 text-center font-medium w-5">#</th>
-          <th className="border border-gray-300 px-2 py-1 text-left font-medium">건물명</th>
-          <th className="border border-gray-300 px-2 py-1 text-right font-medium">높이(m)</th>
+        <tr>
+          <th className="w-5">#</th>
+          <th className="ta-l">건물명</th>
+          <th className="ta-r">높이(m)</th>
           {radarSites.map((r) => (
-            <th key={r.name} className="border border-gray-300 px-2 py-1 text-right font-medium">
-              {r.name} 방위/거리
-            </th>
+            <th key={r.name} className="ta-r">{r.name} 방위/거리</th>
           ))}
         </tr>
       </thead>
       <tbody>
-        {buildings.map((b, i) => (
-          <tr key={b.id} className={(startIdx + i) % 2 === 0 ? "bg-white" : "bg-gray-50"}>
-            <td className="border border-gray-200 px-2 py-1 text-center">{startIdx + i + 1}</td>
-            <td className="border border-gray-200 px-2 py-1">{b.name || `건물 ${b.id}`}</td>
-            <td className="border border-gray-200 px-2 py-1 text-right font-mono">{b.height.toFixed(0)}</td>
-            {radarSites.map((r) => {
-              const az = bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude);
-              const dist = haversineKm(r.latitude, r.longitude, b.latitude, b.longitude);
-              return (
-                <td key={r.name} className="border border-gray-200 px-2 py-1 text-right font-mono">
-                  {az.toFixed(1)}° / {dist.toFixed(1)}km
-                </td>
-              );
-            })}
-          </tr>
-        ))}
+        {buildings.map((b, i) => {
+          const idx = startIdx + i;
+          return (
+            <tr key={b.id} className={idx % 2 === 0 ? "" : "alt"}>
+              <td className="ta-c">{idx + 1}</td>
+              <td>{b.name || `건물 ${b.id}`}</td>
+              <td className="ta-r mono">{b.height.toFixed(0)}</td>
+              {radarSites.map((r) => {
+                const az = bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude);
+                const dist = haversineKm(r.latitude, r.longitude, b.latitude, b.longitude);
+                return (
+                  <td key={r.name} className="ta-r mono">
+                    {az.toFixed(1)}° / {dist.toFixed(1)}km
+                  </td>
+                );
+              })}
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );
 
-  // 레이더별 KPI 블록 렌더
+  // ── 방위·산식 통합 박스 (.meta-merged) ────────────────────────────────
+  const renderMetaMerged = () => (
+    <div className="meta-merged">
+      <div className="meta-merged-row az">
+        <p className="meta-merged-label">분석 방위 구간</p>
+        <div className="az-grid">
+          {radarSites.map((r) => {
+            const sectors = azimuthSectorsByRadar.get(r.name) ?? [];
+            const sectorText = sectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ") || "—";
+            return (
+              <div key={r.name}>
+                <span className="muted">{r.name}:</span>{" "}
+                <span className="mono strong">{sectorText}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className="meta-merged-row formula">
+        <p className="meta-merged-label">통계 산식</p>
+        <div>
+          <span className="strong">통계 산식 · </span>
+          평균: 관측량 가중 평균 <i>x̄ᵥᵥ = Σ(wᵢ·xᵢ) / Σ(wᵢ)</i>
+          {" "}(Loss: w=비행시간, PSR: w=SSR포인트수){" · "}
+          <i>±σ</i>: 가중 모표준편차 <i>σᵥᵥ = √(Σ(wᵢ(xᵢ - x̄ᵥᵥ)²) / Σ(wᵢ))</i>{" · "}
+          판정: 양호(&lt;0.5%) / 주의(0.5–2%) / 경고(≥2%) / 보류(&lt;7일)
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── 레이더별 KPI 행 리스트 ─────────────────────────────────────────────
   const renderKPIBlocks = () => radarResults.map((rr) => {
     const days = rr.daily_stats.length;
     const avgPsr = weightedPsrAvg(rr.daily_stats) * 100;
@@ -104,36 +138,41 @@ function ReportOMSummarySection({
     const lossSigma = weightedLossStdDev(rr.daily_stats);
     const totalPts = rr.total_points_filtered;
     const grade = gradeWithConfidence(avgLoss, days);
+    // 종합 판정 행에 등급 색을 인라인 CSS 변수로 주입 → .kpi.grade 에서 사용
+    const gradeVars = { "--grade-bg": grade.bg, "--grade-color": grade.color } as React.CSSProperties;
 
     return (
-      <div key={rr.radar_name} className="mb-3">
-        <h3 className="mb-2 text-[15px] font-semibold text-gray-700">{rr.radar_name}</h3>
-        <div className="grid grid-cols-5 gap-2">
-          <div className="rounded-md border px-2 py-1.5 text-center" style={{ backgroundColor: grade.bg, color: grade.color }}>
-            <p className="text-[13px] text-gray-400">종합 판정</p>
-            <p className="text-[15px] font-bold">{grade.label}</p>
+      <div key={rr.radar_name} className="kpi-block">
+        <h3 className="om-h3">{rr.radar_name}</h3>
+        <div className="kpi-list">
+          <div className="kpi grade" style={gradeVars}>
+            <p className="kpi-label">종합 판정</p>
+            <p className="kpi-val">{grade.label}</p>
+            <p className="kpi-sigma" />
           </div>
-          <div className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-center">
-            <p className="text-[13px] text-gray-400">분석일수</p>
-            <p className="text-[13px] font-bold text-gray-800">{days}일</p>
+          <div className="kpi">
+            <p className="kpi-label">분석일수</p>
+            <p className="kpi-val">{days}일</p>
+            <p className="kpi-sigma" />
           </div>
-          <div className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-center">
-            <p className="text-[13px] text-gray-400">분석 포인트</p>
-            <p className="text-[13px] font-bold text-gray-800">{totalPts.toLocaleString()}</p>
+          <div className="kpi">
+            <p className="kpi-label">분석 포인트</p>
+            <p className="kpi-val">{totalPts.toLocaleString()}</p>
+            <p className="kpi-sigma" />
           </div>
-          <div className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-center">
-            <p className="text-[13px] text-gray-400">평균 PSR율</p>
-            <p className="text-[13px] font-bold text-blue-600">{avgPsr.toFixed(2)}%</p>
-            <p className="text-[10px] text-gray-400">±{psrSigma.toFixed(2)}</p>
+          <div className="kpi">
+            <p className="kpi-label">평균 PSR율</p>
+            <p className="kpi-val" style={{ color: "var(--om-accent)" }}>{avgPsr.toFixed(2)}%</p>
+            <p className="kpi-sigma">±{psrSigma.toFixed(2)}</p>
           </div>
-          <div className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-center">
-            <p className="text-[13px] text-gray-400">평균 표적소실율</p>
-            <p className="text-[13px] font-bold text-[#a60739]">{avgLoss.toFixed(3)}%</p>
-            <p className="text-[10px] text-gray-400">±{lossSigma.toFixed(3)}</p>
+          <div className="kpi">
+            <p className="kpi-label">평균 표적소실율</p>
+            <p className="kpi-val" style={{ color: "#a60739" }}>{avgLoss.toFixed(3)}%</p>
+            <p className="kpi-sigma">±{lossSigma.toFixed(3)}</p>
           </div>
         </div>
         {rr.failed_files.length > 0 && (
-          <p className="mt-1 text-[13px] text-red-500">
+          <p className="mt-1 text-[11px]" style={{ color: "#dc2626" }}>
             파싱 실패: {rr.failed_files.length}건 ({rr.failed_files.map((f) => f.split(/[/\\]/).pop()).join(", ")})
           </p>
         )}
@@ -141,98 +180,52 @@ function ReportOMSummarySection({
     );
   });
 
-  // 방위 구간 + 산식 주석 렌더
-  const renderAzAndFormula = () => (
-    <>
-      <div className="mb-4 rounded-lg border border-gray-200 bg-gray-50 p-3">
-        <h3 className="mb-2 text-[15px] font-semibold text-gray-700">분석 방위 구간</h3>
-        <div className="grid grid-cols-2 gap-2 text-[13px]">
-          {radarSites.map((r) => {
-            const sectors = azimuthSectorsByRadar.get(r.name) ?? [];
-            return (
-              <div key={r.name}>
-                <span className="text-gray-400">{r.name}:</span>{" "}
-                <span className="font-mono font-semibold text-gray-700">
-                  {sectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ") || "—"}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-      {/* 통계 산식 주석 (보고서 인쇄 시 근거 명시) */}
-      <div className="mb-4 rounded border border-gray-200 bg-gray-50/70 px-3 py-2 text-[10px] leading-relaxed text-gray-500">
-        <span className="font-semibold text-gray-600">통계 산식 · </span>
-        평균: 관측량 가중 평균{" "}
-        <KatexMath math="\bar{x}_w = \frac{\sum w_i \cdot x_i}{\sum w_i}" className="mx-0.5" />
-        {" "}(Loss: <KatexMath math="w" />=비행시간, PSR: <KatexMath math="w" />=SSR포인트수)
-        {" · "}<KatexMath math="\pm\sigma" />: 가중 모표준편차{" "}
-        <KatexMath math="\sigma_w = \sqrt{\frac{\sum w_i (x_i - \bar{x}_w)^2}{\sum w_i}}" className="mx-0.5" />
-        {" · "}<KatexMath math="N" />: 일별 총 탐지포인트
-        {" · "}판정: 양호(&lt;0.5%) / 주의(0.5–2%) / 경고(≥2%) / 보류(&lt;7일)
-      </div>
-    </>
-  );
-
-  // ── 분할 불필요: 모두 한 페이지 ──
+  // ── 분할 불필요: 한 페이지 ──
   if (!needsSplit) {
     return (
       <ReportPage>
-        <div className="mb-8">
-          <ReportOMSectionHeader
-            sectionNum={sectionNum}
-            title={`분석 요약${monthLabel ? ` (${monthLabel})` : ""}`}
-          />
-          <div className="mb-4">
-            <h3 className="mb-2 text-[15px] font-semibold text-gray-700">분석 대상 장애물</h3>
-            {renderBuildingTable(selectedBuildings, 0)}
-          </div>
-          {renderAzAndFormula()}
-          {renderKPIBlocks()}
-        </div>
-      </ReportPage>
-    );
-  }
-
-  // ── 분할 필요: 건물 테이블을 여러 페이지로 ──
-  const pages: React.ReactNode[] = [];
-
-  // 첫 페이지: 건물 테이블(일부) + 방위 + 산식 + KPI
-  const firstSlice = selectedBuildings.slice(0, maxRowsFirstPage);
-  pages.push(
-    <ReportPage key="summary-0">
-      <div className="mb-8">
         <ReportOMSectionHeader
           sectionNum={sectionNum}
           title={`분석 요약${monthLabel ? ` (${monthLabel})` : ""}`}
         />
-        <div className="mb-4">
-          <h3 className="mb-2 text-[15px] font-semibold text-gray-700">
-            분석 대상 장애물 ({totalBuildings}건 중 1–{maxRowsFirstPage})
-          </h3>
-          {renderBuildingTable(firstSlice, 0)}
-        </div>
-        {renderAzAndFormula()}
+        <div className="block-h3" style={{ marginTop: 0 }}>분석 대상 장애물</div>
+        {renderBuildingTable(selectedBuildings, 0)}
+        {renderMetaMerged()}
         {renderKPIBlocks()}
+      </ReportPage>
+    );
+  }
+
+  // ── 분할 필요: 첫 페이지 + 후속 페이지(잔여 건물 표) ──
+  const pages: React.ReactNode[] = [];
+  const firstSlice = selectedBuildings.slice(0, maxRowsFirstPage);
+  pages.push(
+    <ReportPage key="summary-0">
+      <ReportOMSectionHeader
+        sectionNum={sectionNum}
+        title={`분석 요약${monthLabel ? ` (${monthLabel})` : ""}`}
+      />
+      <div className="block-h3" style={{ marginTop: 0 }}>
+        분석 대상 장애물 ({totalBuildings}건 중 1–{maxRowsFirstPage})
       </div>
-    </ReportPage>
+      {renderBuildingTable(firstSlice, 0)}
+      {renderMetaMerged()}
+      {renderKPIBlocks()}
+    </ReportPage>,
   );
 
-  // 후속 페이지: 잔여 건물 테이블
   let offset = maxRowsFirstPage;
   let pageIdx = 1;
   while (offset < totalBuildings) {
     const slice = selectedBuildings.slice(offset, offset + maxRowsNextPage);
     pages.push(
       <ReportPage key={`summary-${pageIdx}`}>
-        <div className="mb-8">
-          <ReportOMSectionHeader
-            sectionNum={sectionNum}
-            title={`분석 요약 (계속) — 장애물 ${offset + 1}–${Math.min(offset + maxRowsNextPage, totalBuildings)}/${totalBuildings}`}
-          />
-          {renderBuildingTable(slice, offset)}
-        </div>
-      </ReportPage>
+        <ReportOMSectionHeader
+          sectionNum={sectionNum}
+          title={`분석 요약 (계속) — 장애물 ${offset + 1}–${Math.min(offset + maxRowsNextPage, totalBuildings)}/${totalBuildings}`}
+        />
+        {renderBuildingTable(slice, offset)}
+      </ReportPage>,
     );
     offset += maxRowsNextPage;
     pageIdx++;
