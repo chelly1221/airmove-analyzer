@@ -6,7 +6,7 @@ import { useAppStore } from "../../store";
 
 const appWindow = getCurrentWindow();
 
-export default function Titlebar({ title, controlsOnly, children }: { title?: string; controlsOnly?: boolean; children?: React.ReactNode }) {
+export default function Titlebar({ title, controlsOnly, noBorder, children }: { title?: string; controlsOnly?: boolean; noBorder?: boolean; children?: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
   const setActivePage = useAppStore((s) => s.setActivePage);
@@ -24,7 +24,7 @@ export default function Titlebar({ title, controlsOnly, children }: { title?: st
 
   if (controlsOnly) {
     return (
-      <div data-tauri-drag-region className="flex h-8 shrink-0 select-none items-center border-b border-gray-200 bg-white">
+      <div data-tauri-drag-region className={`flex h-8 shrink-0 select-none items-center bg-white${noBorder ? "" : " border-b border-gray-200"}`}>
         {children ? (
           <div className="flex flex-1 items-center gap-3 px-4">{children}</div>
         ) : (

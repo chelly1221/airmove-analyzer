@@ -20,6 +20,13 @@ export interface OMSidebarTocItem {
   page: number;      // 프리뷰 내 해당 anchor 의 1-based 페이지 인덱스 (없으면 0)
 }
 
+export interface OMSidebarSectionToggle {
+  key: string;
+  label: string;
+  active: boolean;
+  onToggle: () => void;
+}
+
 interface ReportOMSidebarProps {
   /** 발행 기간 뱃지 텍스트 (예: "2026년 4월"). 비면 표시 안 함 */
   docPeriod?: string;
@@ -40,6 +47,14 @@ interface ReportOMSidebarProps {
   totalPages: number;
   /** 목차 클릭 — 해당 섹션으로 점프 */
   onJump: (key: string) => void;
+  /** 표시 섹션 토글 — 기존 타이틀바에서 이관 */
+  sectionToggles?: OMSidebarSectionToggle[];
+  /** 수정 모드 chip 표시 여부 — 기존 타이틀바 statusChips 이관 */
+  showEditingModeChip?: boolean;
+  /** "분석 데이터 없음" 경고 chip 표시 여부 */
+  showNoResultChip?: boolean;
+  /** PDF 내보내기 에러 텍스트 — 있으면 빨간 배너로 표시 */
+  exportError?: string | null;
   /** PDF 페이지 범위 */
   range: "all" | "current" | "custom";
   onRangeChange: (v: "all" | "current" | "custom") => void;
@@ -61,10 +76,13 @@ interface ReportOMSidebarProps {
 export default function ReportOMSidebar({
   docPeriod, docTitle, docNo, agency, periodIso,
   toc, activeKey, currentPage, totalPages, onJump,
+  sectionToggles, showEditingModeChip, showNoResultChip, exportError,
   range, onRangeChange, paper, onPaperChange,
   onSave, generating, disabled, disabledTitle, elapsedSec, editingMode,
 }: ReportOMSidebarProps) {
   const pageRangeLabel = totalPages > 0 ? `전체 (1–${totalPages})` : "전체";
+  const hasStatus = !!(showEditingModeChip || showNoResultChip || exportError);
+  const hasToggles = !!(sectionToggles && sectionToggles.length > 0);
 
   return (
     <aside className="flex h-full w-48 shrink-0 flex-col bg-white select-none">
@@ -77,8 +95,9 @@ export default function ReportOMSidebar({
         </div>
       </div>
 
-      {/* 2) 문서 정보 */}
-      <div className="flex flex-col gap-1 border-t border-gray-200 px-3 pb-3 pt-3.5">
+      {/* 2) 문서 정보 — 브랜드 헤더와 시각적으로 연속되도록 상단 보더 없음.
+          (기존 타이틀바와의 경계선을 없애 좌·우 상단 32px 가 하나의 헤더 스트립처럼 흐름) */}
+      <div className="flex flex-col gap-1 px-3 pb-3 pt-3.5">
         {docPeriod && (
           <span
             className="self-start rounded-[3px] bg-[#a60739] px-1.5 py-px text-[9.5px] font-extrabold tracking-wider text-white"
@@ -124,6 +143,51 @@ export default function ReportOMSidebar({
           </div>
         )}
       </div>
+
+      {/* 2.5) 상태 배지 — 기존 타이틀바 statusChips 의 사이드바 이관 */}
+      {hasStatus && (
+        <div className="flex flex-col gap-1.5 border-t border-gray-200 px-3 py-2.5">
+          {showEditingModeChip && (
+            <span className="self-start rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-600">
+              수정 모드
+            </span>
+          )}
+          {showNoResultChip && (
+            <span className="rounded-[5px] bg-orange-50 px-2 py-1 text-[10px] font-medium leading-tight text-orange-600">
+              분석 데이터 없음 — 소견 텍스트만 복원됨 (재분석 필요)
+            </span>
+          )}
+          {exportError && (
+            <span className="rounded-[5px] bg-red-50 px-2 py-1 text-[10px] font-medium leading-tight text-red-600 break-words">
+              {exportError}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* 2.7) 표시 섹션 토글 — 기존 타이틀바 sectionTogglePills 의 사이드바 이관 */}
+      {hasToggles && (
+        <div className="flex flex-col gap-1.5 border-t border-gray-200 px-2.5 py-2.5">
+          <span className="px-1 text-[9.5px] font-bold uppercase tracking-[0.06em] text-gray-400">
+            표시 섹션
+          </span>
+          <div className="flex flex-wrap gap-1 px-0.5">
+            {sectionToggles!.map((s) => (
+              <button
+                key={s.key}
+                onClick={s.onToggle}
+                className={`rounded px-1.5 py-0.5 text-[10.5px] transition-colors ${
+                  s.active
+                    ? "bg-[#a60739]/10 text-[#a60739] font-medium"
+                    : "text-gray-400 hover:bg-gray-100"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* 3) 목차 — flex:1, 내부 스크롤 */}
       <div className="flex min-h-0 flex-1 flex-col border-t border-gray-200 px-2.5 pb-1.5 pt-2.5">

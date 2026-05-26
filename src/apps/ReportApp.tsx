@@ -1464,7 +1464,7 @@ export default function ReportApp() {
         <div className="relative flex h-screen flex-row bg-white">
           <SourceOverlay />
 
-          {/* 좌측: OM 사이드바 (192px) */}
+          {/* 좌측: OM 사이드바 (192px) — 기존 타이틀바의 토글/상태 chip 도 모두 흡수 */}
           <ReportOMSidebar
             docPeriod={omSidebarPeriod}
             docTitle={coverTitle || "장애물 월간 분석 보고서"}
@@ -1476,6 +1476,15 @@ export default function ReportApp() {
             currentPage={omCurrentPage}
             totalPages={omTotalPages}
             onJump={handleTocJump}
+            sectionToggles={toggles.map((s) => ({
+              key: s.key,
+              label: s.label,
+              active: !!activeSections?.[s.key],
+              onToggle: () => setSections((prev) => prev ? { ...prev, [s.key]: !prev[s.key] } : prev),
+            }))}
+            showEditingModeChip={!!editingReportId}
+            showNoResultChip={activeTemplate === "obstacle_monthly" && !omData?.result && !!editingReportId}
+            exportError={exportError}
             range={omSidebarRange}
             onRangeChange={setOmSidebarRange}
             paper={omSidebarPaper}
@@ -1488,19 +1497,16 @@ export default function ReportApp() {
             editingMode={!!editingReportId}
           />
 
-          {/* 우측 1px 구분선 — top-8(=32px) 아래로만 그어 타이틀바가 가로질러 흐름.
-              메인 Sidebar.tsx 와 동일 패턴. */}
+          {/* 우측 1px 구분선 — top-8(=32px) 아래로만 그어 (이제 사실상 사이드바와 프리뷰의 경계).
+              상단 32px 는 타이틀바와 사이드바 브랜드 헤더가 하나의 헤더 스트립처럼 흐른다. */}
           <div className="relative w-px shrink-0">
             <div className="absolute left-0 top-8 bottom-0 w-px bg-gray-200" />
           </div>
 
-          {/* 우측: 타이틀바 + 프리뷰 */}
+          {/* 우측: 타이틀바(보더 없이 윈도우 컨트롤만) + 프리뷰.
+              기능(섹션 토글, 상태 chip, PDF 버튼)은 모두 좌측 사이드바로 이관됨. */}
           <div className="relative flex flex-1 flex-col min-w-0">
-            <Titlebar controlsOnly>
-              {sectionTogglePills}
-              <div className="flex-1" />
-              {statusChips}
-            </Titlebar>
+            <Titlebar controlsOnly noBorder />
 
             {omPreparingOverlay}
             {previewBlock}
