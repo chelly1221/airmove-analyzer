@@ -3,7 +3,6 @@ import type { ManualBuilding, RadarSite, LoSProfileData, ElevationPoint } from "
 import type { ObstacleMonthlyResult, LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportPage from "./ReportPage";
-import { haversineKm, bearingDeg } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 
 interface Props {
@@ -18,12 +17,14 @@ interface Props {
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
 
+/** 디스플레이 프레임 곡률 보정량 (m): 실제 지구반경 기준
+ *  → 직선 LoS 가 직선으로, 지형이 거리에 따라 아래로 처져 보임 */
 function curvDrop(dKm: number): number {
   const dM = dKm * 1000;
   return (dM * dM) / (2 * R_EARTH_M);
 }
 
-// ── SVG 차트 상수 (LoSProfilePanel과 동일) ──
+// ── SVG 차트 상수 ──
 const W = 900;
 const H = 280;
 const PAD = { top: 20, right: 30, bottom: 30, left: 65 };
@@ -31,9 +32,6 @@ const cw = W - PAD.left - PAD.right;
 const ch = H - PAD.top - PAD.bottom;
 const M_TO_FT = 3.28084;
 const KM_TO_NM = 1 / 1.852;
-const NM_TO_KM = 1.852;
-const MAX_RANGE_NM = 200;
-const MAX_RANGE_KM = MAX_RANGE_NM * NM_TO_KM; // 370.4km
 
 const LOSS_COLOR: [number, number, number] = [255, 23, 69]; // #ff1745
 
@@ -52,34 +50,35 @@ function interpTerrainElev(profile: ElevationPoint[], d: number): number {
   return 0;
 }
 
-/** 직선 LoS (Running Max Angle) — 선택적으로 건물 장애물 추가 */
+/**
+ * 직선 LoS (Running Max Angle) — 실제 지구 곡률 프레임.
+ *
+ * 핵심: maxAngle 의 바닥은 0(레이더 안테나의 0° 라디오 호라이즌)이다.
+ *   레이더보다 낮은 지형은 가시성을 막지 않으므로 LoS 선을 끌어내리면 안 된다.
+ *
+ * 선택적으로 건물 장애물을 추가해 "장애물 포함" LoS 산출.
+ */
 function computeStraightLoS(
   profile: ElevationPoint[],
   radarHeight: number,
   buildingObstacle?: { distanceKm: number; topElevM: number },
 ) {
-  // 프로파일 distances + 건물 거리를 포함한 샘플링 포인트
   const sampleDists = profile.map((p) => p.distance);
-  if (buildingObstacle) {
-    sampleDists.push(buildingObstacle.distanceKm);
-  }
+  if (buildingObstacle) sampleDists.push(buildingObstacle.distanceKm);
   const uniqueDists = [...new Set(sampleDists)].sort((a, b) => a - b);
 
-  // 건물 포함/미포함에 따른 effective elevation
   const effectiveElevAt = (d: number): number => {
     let elev = interpTerrainElev(profile, d);
     if (buildingObstacle) {
-      const bDist = buildingObstacle.distanceKm;
-      if (Math.abs(d - bDist) < 0.05) {
+      if (Math.abs(d - buildingObstacle.distanceKm) < 0.05) {
         elev = Math.max(elev, buildingObstacle.topElevM);
       }
     }
     return elev;
   };
 
-  let maxAngle = -Infinity;
+  let maxAngle = 0;
   const result: { distance: number; height: number }[] = [];
-
   for (const d of uniqueDists) {
     if (d <= 0) {
       result.push({ distance: d, height: radarHeight });
@@ -93,7 +92,6 @@ function computeStraightLoS(
     const losH = radarHeight + maxAngle * dM;
     result.push({ distance: d, height: losH });
   }
-
   return result;
 }
 
@@ -104,7 +102,7 @@ export interface ChartTrackPoint {
   isLoss: boolean;
 }
 
-/** 단일 LoS 단면도 SVG — 결합 페이지(빌딩별)에서도 import하여 재사용 */
+/** 단일 LoS 단면도 SVG — 결합 페이지(빌딩별)에서도 import 하여 재사용 */
 export function LosCrossSection({
   los, radarName, building, trackPoints, lossPoints,
 }: {
@@ -119,54 +117,41 @@ export function LosCrossSection({
     if (profile.length === 0) return null;
 
     const radarHeight = los.radarHeight;
-    // X축 범위: 프로파일 실제 거리 기반 (TrackMap과 동일 방식)
     const profileEnd = profile[profile.length - 1].distance;
+    // X축은 프로파일 끝(= 레이더↔빌딩 거리)까지. TrackMap 과 동일하게 외삽 없음.
     const maxDistance = profileEnd;
 
-    // 조정 지형 (곡률 보정)
+    // 조정 지형 (실제지구 곡률 보정)
     const adjTerrain = profile.map((p) => ({
       distance: p.distance,
       height: p.elevation - curvDrop(p.distance),
     }));
 
-    // 건물 정보
-    const bDistKm = haversineKm(
-      los.radarLat, los.radarLon,
-      building.latitude, building.longitude,
-    );
+    // 빌딩 좌표 — los.totalDistance/bearing 이 이미 빌딩 좌표 기준
+    const bDistKm = los.totalDistance;
     const bTopElev = building.ground_elev + building.height;
 
-    // 직선 LoS — 장애물 미포함 (지형만)
-    const losWithout = computeStraightLoS(profile, radarHeight);
+    // 직선 LoS — 장애물 미포함 (지형만, 회색 점선 참고용)
+    const losWithout = computeStraightLoS(profile, radarHeight, undefined);
 
-    // 직선 LoS — 장애물 포함
+    // 직선 LoS — 장애물 포함 (메인, 주황 실선)
     const losWith = computeStraightLoS(profile, radarHeight, {
       distanceKm: bDistKm,
       topElevM: bTopElev,
     });
 
-    // 차단 판정
-    const bAdjH = bTopElev - curvDrop(bDistKm);
-    // 건물 포함 LoS에서 건물 위치의 LoS 높이 vs 건물 높이 비교
+    // 차단 판정 — 빌딩 위치에서 "장애물 미포함 LoS" 보다 빌딩 꼭대기가 높으면 차단.
+    //   (장애물 포함 LoS 는 정의상 빌딩을 항상 통과하므로 비교 대상이 아님)
+    const bAdj = bTopElev - curvDrop(bDistKm);
     let blocked = false;
-    for (const pt of losWith) {
-      if (Math.abs(pt.distance - bDistKm) < 0.1) {
-        if (bAdjH >= pt.height - 1) blocked = true;
+    for (const pt of losWithout) {
+      if (Math.abs(pt.distance - bDistKm) < 0.1 || pt.distance >= bDistKm) {
+        if (bAdj > pt.height + 1) blocked = true;
         break;
       }
     }
-    // 건물이 LoS를 실제로 올리는지 확인
-    if (!blocked) {
-      // losWithout에서 건물 위치의 높이와 비교
-      for (const pt of losWithout) {
-        if (Math.abs(pt.distance - bDistKm) < 0.1 || pt.distance > bDistKm) {
-          if (bAdjH > pt.height + 1) blocked = true;
-          break;
-        }
-      }
-    }
 
-    // Y축 범위 (TrackMap LoSProfilePanel과 동일: 지형+LoS선만 기준, 항적은 제외)
+    // Y축 범위
     const allHeights = [
       radarHeight,
       ...adjTerrain.map((p) => p.height),
@@ -179,12 +164,13 @@ export function LosCrossSection({
     let minY = 0;
     for (const p of adjTerrain) if (p.height < minY) minY = p.height;
     minY -= 50;
+    // 0ft 가 차트 40% 이상으로 오지 않도록 maxY 보장
     if (minY < 0) {
       const minMaxYFor40Pct = -minY * 1.5;
       if (maxY < minMaxYFor40Pct) maxY = minMaxYFor40Pct;
     }
 
-    return { adjTerrain, losWithout, losWith, blocked, bDistKm, bTopElev, bAdjH, minY, maxY, maxDistance, radarHeight };
+    return { adjTerrain, losWithout, losWith, blocked, bDistKm, bTopElev, minY, maxY, maxDistance, radarHeight };
   }, [los, building]);
 
   if (!chartData) return null;
@@ -196,20 +182,21 @@ export function LosCrossSection({
   const yScale = (h: number) => PAD.top + ch - ((h - minY) / (maxY - minY)) * ch;
 
   // 지형 채우기
+  const lastTerrainD = adjTerrain[adjTerrain.length - 1]?.distance ?? maxDistance;
   const terrainFill =
     `M ${xScale(0)} ${yScale(minY)} ` +
     adjTerrain.map((p) => `L ${xScale(p.distance)} ${yScale(p.height)}`).join(" ") +
-    ` L ${xScale(adjTerrain[adjTerrain.length - 1]?.distance ?? 0)} ${yScale(minY)} Z`;
+    ` L ${xScale(lastTerrainD)} ${yScale(minY)} Z`;
   const terrainLine = adjTerrain
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
     .join(" ");
 
-  // LoS 선 — 장애물 미포함 (회색 점선)
+  // 직선 LoS (장애물 미포함, 회색 점선)
   const losWithoutPath = losWithout
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
     .join(" ");
 
-  // LoS 선 — 장애물 포함 (실선)
+  // 직선 LoS (장애물 포함, 주황 실선)
   const losWithPath = losWith
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
     .join(" ");
@@ -222,17 +209,19 @@ export function LosCrossSection({
   const maxYft = maxY * M_TO_FT;
   for (let yf = Math.ceil(minYft / yStepFt) * yStepFt; yf <= maxYft; yf += yStepFt) yTicks.push(yf / M_TO_FT);
 
-  // X축 눈금 (프로파일 거리 기반 동적)
+  // X축 눈금 (NM)
   const maxDistNm = maxDistance * KM_TO_NM;
-  const xStepNm = maxDistNm > 150 ? 20 : maxDistNm > 60 ? 10 : maxDistNm > 25 ? 5 : maxDistNm > 10 ? 2 : 1;
+  const xStepNm = maxDistNm > 80 ? 20 : maxDistNm > 40 ? 10 : maxDistNm > 15 ? 5 : maxDistNm > 5 ? 2 : maxDistNm > 2 ? 1 : 0.5;
   const xTicks: number[] = [];
-  for (let xn = xStepNm; xn <= maxDistNm; xn += xStepNm) xTicks.push(xn * NM_TO_KM);
+  for (let xn = xStepNm; xn <= maxDistNm; xn += xStepNm) xTicks.push(xn / KM_TO_NM);
+  const xTickDecimals = xStepNm < 1 ? 1 : 0;
 
   // 건물 표시 데이터
   const bGroundAdj = building.ground_elev - curvDrop(bDistKm);
   const bTopAdj = bTopElev - curvDrop(bDistKm);
 
   const buildingName = building.name || `건물 ${building.id}`;
+  const bDistNm = bDistKm * KM_TO_NM;
 
   return (
     <div className="mb-3">
@@ -240,7 +229,7 @@ export function LosCrossSection({
       <div className="mb-1 flex items-center gap-2">
         <span className="text-[13px] font-bold text-gray-800">{buildingName}</span>
         <span className="text-[11px] text-gray-500">
-          {radarName} → 방위 {los.bearing.toFixed(1)}° / 거리 {(bDistKm * KM_TO_NM).toFixed(1)}NM ({bDistKm.toFixed(1)}km)
+          {radarName} → 방위 {los.bearing.toFixed(1)}° / 거리 {bDistNm.toFixed(1)}NM ({bDistKm.toFixed(1)}km)
           / 높이 {Math.round(bTopElev * M_TO_FT).toLocaleString()}ft ({bTopElev.toFixed(0)}m)
         </span>
         <span className={`ml-auto rounded px-1.5 py-0.5 text-[11px] font-medium ${
@@ -273,9 +262,9 @@ export function LosCrossSection({
         })}
         {/* X축 라벨 */}
         {xTicks.map((x) => (
-          <text key={`xl-${x}`} x={xScale(x)} y={H - PAD.bottom + 14} textAnchor="middle"
+          <text key={`xl-${x.toFixed(3)}`} x={xScale(x)} y={H - PAD.bottom + 14} textAnchor="middle"
             fill="#6b7280" fontSize={9}>
-            {Math.round(x * KM_TO_NM)}NM
+            {(x * KM_TO_NM).toFixed(xTickDecimals)}NM
           </text>
         ))}
 
@@ -295,7 +284,7 @@ export function LosCrossSection({
           })}
           {/* 수직 격자 */}
           {xTicks.map((x) => (
-            <line key={`xg-${x}`} x1={xScale(x)} y1={PAD.top} x2={xScale(x)} y2={H - PAD.bottom}
+            <line key={`xg-${x.toFixed(3)}`} x1={xScale(x)} y1={PAD.top} x2={xScale(x)} y2={H - PAD.bottom}
               stroke="rgba(0,0,0,0.06)" strokeWidth={0.5} />
           ))}
 
@@ -303,7 +292,7 @@ export function LosCrossSection({
           <path d={terrainFill} fill={`url(#tg-${los.id}-${building.id})`} />
           <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
 
-          {/* 건물 실루엣 */}
+          {/* 건물 실루엣 (세로선) */}
           {bTopAdj > bGroundAdj && (
             <line
               x1={xScale(bDistKm)} y1={yScale(bGroundAdj)}
@@ -312,11 +301,11 @@ export function LosCrossSection({
             />
           )}
 
-          {/* 직선 LoS — 장애물 미포함 (회색 실선) */}
+          {/* 직선 LoS — 장애물 미포함 (회색 점선, 참고) */}
           <path d={losWithoutPath} fill="none"
-            stroke="rgba(107,114,128,0.6)" strokeWidth={1.8} />
+            stroke="rgba(107,114,128,0.6)" strokeWidth={1.4} strokeDasharray="5 3" />
 
-          {/* 직선 LoS — 장애물 포함 (주황색 실선) */}
+          {/* 직선 LoS — 장애물 포함 (주황 실선, 메인) */}
           <path d={losWithPath} fill="none"
             stroke="#f59e0b" strokeWidth={1.8} />
 
@@ -388,7 +377,7 @@ export function LosCrossSection({
             직선 LoS (장애물 포함)
           </text>
           <line x1={0} y1={14} x2={20} y2={14}
-            stroke="rgba(107,114,128,0.6)" strokeWidth={1.8} />
+            stroke="rgba(107,114,128,0.6)" strokeWidth={1.4} strokeDasharray="5 3" />
           <text x={24} y={17} fill="#374151" fontSize={8}>
             직선 LoS (장애물 미포함)
           </text>
@@ -406,7 +395,7 @@ export function LosCrossSection({
           </text>
           <circle cx={7} cy={70} r={2.5} fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.85} />
           <text x={24} y={73} fill="#374151" fontSize={8}>
-            소실표적 ({lossPoints.length}건)
+            소실표적 ({lossPoints.length.toLocaleString()}건)
           </text>
         </g>
       </svg>
@@ -414,31 +403,59 @@ export function LosCrossSection({
   );
 }
 
-/** LoS 베어링 ±5° 안 + MAX_RANGE_KM 안 으로 항적/소실표적을 단면도 좌표로 투영 — 결합 페이지에서도 동일 규칙 적용 */
+/**
+ * 레이더→빌딩 직선상 항적/소실표적 투영 — TrackMap LoSProfilePanel 의 `losTrackPoints` 와 동일.
+ *
+ * 절대 수직거리 1km 이내 + along ∈ (0, 빌딩거리] 만 채택.
+ * (이전엔 ±5° 베어링 필터를 썼는데, 빌딩이 1.4NM 처럼 가까우면 ±5° 가 거의 전방향이라
+ *  0NM 근처에 점이 검은 막대처럼 뭉치는 문제가 있었다 — TrackMap 방식으로 통일.)
+ */
 export function projectPointsToLos(
   los: LoSProfileData,
   trackPoints: TrackPointGeo[],
   lossPoints: LossPointGeo[],
 ): { track: ChartTrackPoint[]; loss: ChartTrackPoint[] } {
-  const isInBearing = (lat: number, lon: number): boolean => {
-    const ptBearing = bearingDeg(los.radarLat, los.radarLon, lat, lon);
-    let diff = Math.abs(ptBearing - los.bearing);
-    if (diff > 180) diff = 360 - diff;
-    return diff <= 5;
-  };
+  const DEG2RAD = Math.PI / 180;
+  const cosLat = Math.cos(los.radarLat * DEG2RAD);
+  const mPerDegLat = DEG2RAD * R_EARTH_M;
+  const mPerDegLon = DEG2RAD * R_EARTH_M * cosLat;
+  const lineDxM = (los.targetLat - los.radarLat) * mPerDegLat;
+  const lineDyM = (los.targetLon - los.radarLon) * mPerDegLon;
+  const lineLen = Math.sqrt(lineDxM * lineDxM + lineDyM * lineDyM);
+  if (lineLen < 1e-6) return { track: [], loss: [] };
+  const cosB = lineDxM / lineLen;
+  const sinB = lineDyM / lineLen;
+  const TOLERANCE_M = 1000;
+
   const track: ChartTrackPoint[] = [];
   for (const tp of trackPoints) {
-    if (!isInBearing(tp.lat, tp.lon)) continue;
-    const distKm = haversineKm(los.radarLat, los.radarLon, tp.lat, tp.lon);
-    if (distKm > MAX_RANGE_KM) continue;
-    track.push({ distKm, altM: tp.alt_ft / M_TO_FT, radarType: tp.radar_type, isLoss: false });
+    const dx = (tp.lat - los.radarLat) * mPerDegLat;
+    const dy = (tp.lon - los.radarLon) * mPerDegLon;
+    const along = dx * cosB + dy * sinB;
+    const across = Math.abs(-dx * sinB + dy * cosB);
+    if (across >= TOLERANCE_M) continue;
+    if (along <= 0 || along > lineLen) continue;
+    track.push({
+      distKm: along / 1000,
+      altM: tp.alt_ft / M_TO_FT,
+      radarType: tp.radar_type,
+      isLoss: false,
+    });
   }
   const loss: ChartTrackPoint[] = [];
   for (const lp of lossPoints) {
-    if (!isInBearing(lp.lat, lp.lon)) continue;
-    const distKm = haversineKm(los.radarLat, los.radarLon, lp.lat, lp.lon);
-    if (distKm > MAX_RANGE_KM) continue;
-    loss.push({ distKm, altM: lp.alt_ft / M_TO_FT, radarType: "", isLoss: true });
+    const dx = (lp.lat - los.radarLat) * mPerDegLat;
+    const dy = (lp.lon - los.radarLon) * mPerDegLon;
+    const along = dx * cosB + dy * sinB;
+    const across = Math.abs(-dx * sinB + dy * cosB);
+    if (across >= TOLERANCE_M) continue;
+    if (along <= 0 || along > lineLen) continue;
+    loss.push({
+      distKm: along / 1000,
+      altM: lp.alt_ft / M_TO_FT,
+      radarType: "",
+      isLoss: true,
+    });
   }
   return { track, loss };
 }
@@ -447,11 +464,9 @@ export function projectPointsToLos(
 const CHARTS_PER_PAGE = 2;
 
 function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, losMap, omResult, hideHeader }: Props) {
-  // LoS 방위 기준 ±5° 이내의 Loss 포인트를 해당 단면도에 투영
   const entries = useMemo(() => {
     const result: { building: ManualBuilding; radar: RadarSite; los: LoSProfileData; trackPoints: ChartTrackPoint[]; lossPoints: ChartTrackPoint[] }[] = [];
 
-    // omResult에서 레이더별 loss 좌표 + 항적 좌표 수집
     const lossPointsByRadar = new Map<string, LossPointGeo[]>();
     const trackPointsByRadar = new Map<string, TrackPointGeo[]>();
     if (omResult) {
@@ -474,39 +489,15 @@ function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, lo
         const los = losMap.get(`${r.name}_${b.id}`);
         if (!los || los.elevationProfile.length === 0) continue;
 
-        const bearing = los.bearing;
-        const radarLat = r.latitude;
-        const radarLon = r.longitude;
-
-        // ±5° 이내 필터 헬퍼
-        const isInBearing = (lat: number, lon: number): boolean => {
-          const ptBearing = bearingDeg(radarLat, radarLon, lat, lon);
-          let diff = Math.abs(ptBearing - bearing);
-          if (diff > 180) diff = 360 - diff;
-          return diff <= 5;
-        };
-
-        // 항적 포인트 투영
         const allTrack = trackPointsByRadar.get(r.name) ?? [];
-        const projectedTrack: ChartTrackPoint[] = [];
-        for (const tp of allTrack) {
-          if (!isInBearing(tp.lat, tp.lon)) continue;
-          const distKm = haversineKm(radarLat, radarLon, tp.lat, tp.lon);
-          if (distKm > MAX_RANGE_KM) continue;
-          projectedTrack.push({ distKm, altM: tp.alt_ft / M_TO_FT, radarType: tp.radar_type, isLoss: false });
-        }
-
-        // Loss 포인트 투영
         const allLoss = lossPointsByRadar.get(r.name) ?? [];
-        const projectedLoss: ChartTrackPoint[] = [];
-        for (const lp of allLoss) {
-          if (!isInBearing(lp.lat, lp.lon)) continue;
-          const distKm = haversineKm(radarLat, radarLon, lp.lat, lp.lon);
-          if (distKm > MAX_RANGE_KM) continue;
-          projectedLoss.push({ distKm, altM: lp.alt_ft / M_TO_FT, radarType: "", isLoss: true });
-        }
+        const projected = projectPointsToLos(los, allTrack, allLoss);
 
-        result.push({ building: b, radar: r, los, trackPoints: projectedTrack, lossPoints: projectedLoss });
+        result.push({
+          building: b, radar: r, los,
+          trackPoints: projected.track,
+          lossPoints: projected.loss,
+        });
       }
     }
     return result;
