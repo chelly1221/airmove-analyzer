@@ -128,35 +128,32 @@ interface MapImageResult {
   latMin: number; latMax: number;
 }
 
-/** 레이더 중심 + 범위(km)에 해당하는 정적 지도 배경 이미지 생성 */
+/** 지정한 지리 경계(lon/lat)를 덮는 정적 지도 배경 이미지 생성 */
 function useStaticMapImage(
-  radarLat: number, radarLon: number, maxRangeKm: number,
+  lonMin: number, lonMax: number, latMin: number, latMax: number,
 ): MapImageResult | null {
   const [result, setResult] = useState<MapImageResult | null>(null);
 
   useEffect(() => {
-    if (maxRangeKm <= 0) return;
+    if (!(lonMax > lonMin) || !(latMax > latMin)) return;
     let cancelled = false;
 
-    const dLat = maxRangeKm / 111.32;
-    const dLon = maxRangeKm / (111.32 * Math.cos((radarLat * Math.PI) / 180));
-
-    // 줌 레벨 선택: 가로 4–8 타일
+    // 줌 레벨 선택: 가로 4–8 타일 (확대된 영역일수록 높은 줌 → 선명)
     let zoom = 6;
-    for (let z = 1; z <= 14; z++) {
-      const xTiles = lon2tile(radarLon + dLon, z) - lon2tile(radarLon - dLon, z) + 1;
+    for (let z = 1; z <= 16; z++) {
+      const xTiles = lon2tile(lonMax, z) - lon2tile(lonMin, z) + 1;
       if (xTiles > 8) { zoom = z - 1; break; }
       zoom = z;
     }
-    zoom = Math.max(4, Math.min(zoom, 10));
+    zoom = Math.max(3, Math.min(zoom, 14));
 
-    const xMin = lon2tile(radarLon - dLon, zoom);
-    const xMax = lon2tile(radarLon + dLon, zoom);
-    const yMin = lat2tile(radarLat + dLat, zoom);
-    const yMax = lat2tile(radarLat - dLat, zoom);
+    const xMin = lon2tile(lonMin, zoom);
+    const xMax = lon2tile(lonMax, zoom);
+    const yMin = lat2tile(latMax, zoom);
+    const yMax = lat2tile(latMin, zoom);
     const tilesX = xMax - xMin + 1;
     const tilesY = yMax - yMin + 1;
-    if (tilesX * tilesY > 64) return; // 안전 제한
+    if (tilesX * tilesY > 100) return; // 안전 제한
 
     const TS = 256;
     const canvas = document.createElement("canvas");
@@ -195,13 +192,17 @@ function useStaticMapImage(
     });
 
     return () => { cancelled = true; };
-  }, [radarLat, radarLon, maxRangeKm]);
+  }, [lonMin, lonMax, latMin, latMax]);
 
   return result;
 }
 
 const SECTOR_PAD_DEG = 25;
 const FIXED_ALTS = [1000, 2000, 3000, 5000, 10000, 15000, 20000];
+/** diff 영역 확대(줌) 파라미터 */
+const MIN_FOCUS_HALF_KM = 4;   // 단일 지점 등 작은 diff 의 최소 반경(km)
+const FOCUS_PAD_FRAC = 0.18;   // diff 영역 주변 여백 비율
+const FOCUS_MARGIN_PX = 64;    // 캔버스 가장자리 여백(px, 라벨/축척 공간)
 
 const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function ReportOMCoverageDiff({
   sectionNum,
@@ -234,7 +235,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
   }, [layersWithTargets, layersWithoutTargets]);
 
   // 건물 방위 범위 → 섹터 크롭
-  const { sectorStart, sectorEnd, sectorSpan, hasSector } = useMemo(() => {
+  const { sectorStart, sectorEnd, hasSector } = useMemo(() => {
     if (selectedBuildings.length === 0)
       return { sectorStart: 0, sectorEnd: 360, sectorSpan: 360, hasSector: false };
 
@@ -284,15 +285,83 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
   const fullMaxR = svgSize / 2 - 30;
 
   // globalMaxRange: 루프 기반 최대값 (Math.max spread 콜스택 폭발 방지)
-  const { globalMaxRange, scale } = useMemo(() => {
+  const globalMaxRange = useMemo(() => {
     let maxR = Math.max(radarSite.range_nm * 1.852, 1);
     for (const l of fixedWith) for (const b of l.bearings) { if (b.maxRangeKm > maxR) maxR = b.maxRangeKm; }
     for (const l of fixedWithout) for (const b of l.bearings) { if (b.maxRangeKm > maxR) maxR = b.maxRangeKm; }
-    return { globalMaxRange: maxR, scale: fullMaxR / maxR };
-  }, [fixedWith, fixedWithout, radarSite.range_nm, fullMaxR]);
+    return maxR;
+  }, [fixedWith, fixedWithout, radarSite.range_nm]);
 
-  // 지도 배경 타일 이미지
-  const mapImage = useStaticMapImage(radarSite.latitude, radarSite.longitude, globalMaxRange);
+  // 장애물 영향 차이(diff) 영역의 km 바운딩박스 — 확대(줌) 기준.
+  // diff 세그먼트(제외>포함) + 건물 + 장애물 기인 소실표적을 모두 포함.
+  const focusBboxKm = useMemo(() => {
+    let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+    let any = false;
+    const add = (distKm: number, azDeg: number) => {
+      const rad = (azDeg * Math.PI) / 180;
+      const x = distKm * Math.sin(rad);
+      const y = -distKm * Math.cos(rad);
+      if (x < xMin) xMin = x; if (x > xMax) xMax = x;
+      if (y < yMin) yMin = y; if (y > yMax) yMax = y;
+      any = true;
+    };
+    for (let i = 0; i < fixedWith.length; i++) {
+      const lw = fixedWith[i];
+      const lwo = fixedWithout.find((l) => Math.abs(l.altitudeFt - lw.altitudeFt) < 200);
+      if (!lwo) continue;
+      const withByDeg = new Map<number, number>();
+      for (const wb of lw.bearings) withByDeg.set(Math.round(wb.deg * 100), wb.maxRangeKm);
+      for (const b of lwo.bearings) {
+        const rWith = withByDeg.get(Math.round(b.deg * 100)) ?? b.maxRangeKm;
+        if (b.maxRangeKm - rWith > 0) { add(b.maxRangeKm, b.deg); add(rWith, b.deg); }
+      }
+    }
+    for (const bld of selectedBuildings) {
+      const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, bld.latitude, bld.longitude);
+      add(distKm, azDeg);
+    }
+    for (const pt of filteredLoss) {
+      const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, pt.lat, pt.lon);
+      add(distKm, azDeg);
+    }
+    return any ? { xMin, xMax, yMin, yMax } : null;
+  }, [fixedWith, fixedWithout, selectedBuildings, filteredLoss, radarSite]);
+
+  // 확대 변환: diff 영역이 캔버스를 채우도록 scale/center 계산.
+  // viewBox 는 700×700 고정 → 라벨/마커/범례 크기는 일정 유지, 지오메트리만 확대.
+  const { scale, cx, cy, focused } = useMemo(() => {
+    if (!focusBboxKm) {
+      return { scale: fullMaxR / globalMaxRange, cx: fullCx, cy: fullCy, focused: false };
+    }
+    const cxKm = (focusBboxKm.xMin + focusBboxKm.xMax) / 2;
+    const cyKm = (focusBboxKm.yMin + focusBboxKm.yMax) / 2;
+    let half = Math.max(
+      (focusBboxKm.xMax - focusBboxKm.xMin) / 2,
+      (focusBboxKm.yMax - focusBboxKm.yMin) / 2,
+      MIN_FOCUS_HALF_KM,
+    );
+    half *= 1 + FOCUS_PAD_FRAC;
+    const inner = svgSize - FOCUS_MARGIN_PX * 2;
+    const s = inner / (half * 2);
+    return { scale: s, cx: svgSize / 2 - cxKm * s, cy: svgSize / 2 - cyKm * s, focused: true };
+  }, [focusBboxKm, globalMaxRange, fullMaxR, fullCx, fullCy]);
+
+  // 가시 캔버스에 대응하는 지리 경계 → 줌 수준에 맞는 지도 타일 요청
+  const geoBounds = useMemo(() => {
+    const kmPerDegLat = 111.32;
+    const kmPerDegLon = 111.32 * Math.cos((radarSite.latitude * Math.PI) / 180);
+    const kmLeft = (0 - cx) / scale, kmRight = (svgSize - cx) / scale;
+    const kmTop = (0 - cy) / scale, kmBottom = (svgSize - cy) / scale;
+    return {
+      lonMin: radarSite.longitude + kmLeft / kmPerDegLon,
+      lonMax: radarSite.longitude + kmRight / kmPerDegLon,
+      latMax: radarSite.latitude - kmTop / kmPerDegLat,
+      latMin: radarSite.latitude - kmBottom / kmPerDegLat,
+    };
+  }, [cx, cy, scale, radarSite.latitude, radarSite.longitude]);
+
+  // 지도 배경 타일 이미지 (확대 영역 기준)
+  const mapImage = useStaticMapImage(geoBounds.lonMin, geoBounds.lonMax, geoBounds.latMin, geoBounds.latMax);
 
   // 캡처 readiness — 맵 타일 준비(또는 빈 상태 확정) + 2× RAF(paint) 이후 resolve.
   // capture() 가 await 중인 deferred 를 신호.
@@ -340,45 +409,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
     };
   }, []);
 
-  if (fixedWith.length === 0 && fixedWithout.length === 0) return (
-    <div ref={containerRef} className="flex flex-col items-center py-16 text-gray-400">
-      <p className="text-sm">커버리지 비교 데이터 없음</p>
-    </div>
-  );
-
-  // 섹터 viewBox
-  const { vbX, vbY, vbW, vbH, cx, cy, maxR } = useMemo(() => {
-    if (!hasSector)
-      return { vbX: 0, vbY: 0, vbW: svgSize, vbH: svgSize, cx: fullCx, cy: fullCy, maxR: fullMaxR };
-
-    const pts: { x: number; y: number }[] = [{ x: fullCx, y: fullCy }];
-    const outerR = fullMaxR + 20;
-    for (let i = 0; i <= sectorSpan; i += 1) {
-      const deg = (sectorStart + i) % 360;
-      const rad = (deg * Math.PI) / 180;
-      pts.push({ x: fullCx + outerR * Math.sin(rad), y: fullCy - outerR * Math.cos(rad) });
-    }
-    let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
-    for (const p of pts) {
-      if (p.x < xMin) xMin = p.x; if (p.x > xMax) xMax = p.x;
-      if (p.y < yMin) yMin = p.y; if (p.y > yMax) yMax = p.y;
-    }
-    const pad = 25;
-    xMin -= pad; yMin -= pad; xMax += pad; yMax += pad;
-    const side = Math.max(xMax - xMin, yMax - yMin);
-    const cx2 = (xMin + xMax) / 2;
-    const cy2 = (yMin + yMax) / 2;
-    return { vbX: cx2 - side / 2, vbY: cy2 - side / 2, vbW: side, vbH: side, cx: fullCx, cy: fullCy, maxR: fullMaxR };
-  }, [hasSector, sectorStart, sectorSpan, fullCx, fullCy, fullMaxR, svgSize]);
-
-  // 거리 링
-  const ringIntervalKm = 20 * 1.852;
-  const rings: { km: number; nm: number }[] = [];
-  for (let km = ringIntervalKm; km <= globalMaxRange; km += ringIntervalKm) {
-    rings.push({ km, nm: km / 1.852 });
-  }
-
-  // 각 레이어별 diff path (분석 대상 건물 영향 차이)
+  // 각 고도별 diff path (분석 대상 건물 영향 차이) — diff 영역만 그림
   const diffPaths = useMemo(() => {
     const result: { altFt: number; color: string; path: string }[] = [];
     for (let i = 0; i < fixedWith.length; i++) {
@@ -394,13 +425,47 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         });
       }
     }
-    return result;
+    // 낮은 고도(큰 영역) → 높은 고도(작은 영역) 순. 작은 영역이 위에 그려짐.
+    return result.sort((a, b) => a.altFt - b.altFt);
   }, [fixedWith, fixedWithout, scale, cx, cy]);
 
-  // 섹터 경계선
+  if (fixedWith.length === 0 && fixedWithout.length === 0) return (
+    <div ref={containerRef} className="flex flex-col items-center py-16 text-gray-400">
+      <p className="text-sm">커버리지 비교 데이터 없음</p>
+    </div>
+  );
+
+  // viewBox 700×700 고정 (diff 영역 확대는 scale/cx/cy 로 처리)
+  const vbX = 0, vbY = 0, vbW = svgSize, vbH = svgSize;
+  const coverageR = globalMaxRange * scale; // 커버리지 최대 반경(SVG 단위)
+
+  // 거리 링 라벨 방위 — 확대 시 focus 중심 방향, 아니면 NE(45°)
+  const focusBearingDeg = focused && focusBboxKm
+    ? ((Math.atan2((focusBboxKm.xMin + focusBboxKm.xMax) / 2, -((focusBboxKm.yMin + focusBboxKm.yMax) / 2)) * 180) / Math.PI + 360) % 360
+    : 45;
+
+  // 축척 바 — 캔버스 폭 ~1/5 에 해당하는 nice km
+  const scaleBar = (() => {
+    const targetKm = (svgSize * 0.2) / scale;
+    const pow = Math.pow(10, Math.floor(Math.log10(targetKm)));
+    let niceKm = pow;
+    for (const m of [1, 2, 5, 10]) {
+      if (Math.abs(m * pow - targetKm) < Math.abs(niceKm - targetKm)) niceKm = m * pow;
+    }
+    return { km: niceKm, px: niceKm * scale };
+  })();
+
+  // 거리 링
+  const ringIntervalKm = 20 * 1.852;
+  const rings: { km: number; nm: number }[] = [];
+  for (let km = ringIntervalKm; km <= globalMaxRange; km += ringIntervalKm) {
+    rings.push({ km, nm: km / 1.852 });
+  }
+
+  // 섹터 경계선 (전체 보기에서만 사용)
   const sectorLines = hasSector ? [sectorStart, sectorEnd].map((deg) => {
     const rad = (deg * Math.PI) / 180;
-    return { x2: cx + (maxR + 15) * Math.sin(rad), y2: cy - (maxR + 15) * Math.cos(rad) };
+    return { x2: cx + (coverageR + 15) * Math.sin(rad), y2: cy - (coverageR + 15) * Math.cos(rad) };
   }) : [];
 
   // 방위 라벨
@@ -410,32 +475,6 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
     { deg: 270, label: "W" }, { deg: 315, label: "NW" },
   ].filter(({ deg }) => !hasSector || inSector(deg));
 
-  // 레이어 SVG 경로 메모이제이션 (렌더마다 재계산 방지)
-  const layerPathCache = useMemo(() => {
-    const cache = new Map<CoverageLayer, string>();
-    const buildPath = (layer: CoverageLayer) => {
-      const bearings = layer.bearings;
-      const every = Math.max(1, Math.floor(bearings.length / 360));
-      const pts: string[] = [];
-      for (let i = 0; i < bearings.length; i += every) {
-        const b = bearings[i];
-        const r = b.maxRangeKm * scale;
-        const rad = (b.deg * Math.PI) / 180;
-        pts.push(`${(cx + r * Math.sin(rad)).toFixed(1)} ${(cy - r * Math.cos(rad)).toFixed(1)}`);
-      }
-      return `M ${pts[0]} L ${pts.slice(1).join(" L ")} Z`;
-    };
-    for (const l of fixedWith) cache.set(l, buildPath(l));
-    for (const l of fixedWithout) cache.set(l, buildPath(l));
-    return cache;
-  }, [fixedWith, fixedWithout, scale, cx, cy]);
-
-  const layerPath = (layer: CoverageLayer) => layerPathCache.get(layer) ?? "";
-
-  // 높은 고도 먼저 → 낮은 고도가 위에
-  const drawOrderWith = useMemo(() => [...fixedWith].sort((a, b) => b.altitudeFt - a.altitudeFt), [fixedWith]);
-  const drawOrderWithout = useMemo(() => [...fixedWithout].sort((a, b) => b.altitudeFt - a.altitudeFt), [fixedWithout]);
-
   return (
     <div ref={containerRef} className="mb-8">
       {!hideHeader && <ReportOMSectionHeader sectionNum={sectionNum} title="커버리지 비교맵" />}
@@ -444,7 +483,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
       <div className="mb-2 flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] text-gray-500">
         <span>분석 고도: {MIN_ALT.toLocaleString()} — {MAX_ALT.toLocaleString()} ft ({fixedWith.length}레이어)</span>
         <span>
-          장애물 기인 Loss {filteredLoss.length}건 / 전체 {lossPoints.length}건
+          장애물 기인 소실표적 {filteredLoss.length}건
           {hasSector && <> · 섹터 {sectorStart.toFixed(0)}°–{sectorEnd.toFixed(0)}°</>}
         </span>
       </div>
@@ -457,7 +496,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         <svg ref={svgRef} viewBox={`${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}`} className="w-full">
           <defs>
             <clipPath id="om-map-clip">
-              <circle cx={cx} cy={cy} r={maxR + 2} />
+              <circle cx={cx} cy={cy} r={coverageR + 2} />
             </clipPath>
           </defs>
 
@@ -489,74 +528,52 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
               fill="#fafafa" stroke="#9ca3af" strokeWidth={0.5} strokeDasharray="2,2" />
           )}
 
-          {/* 분석 대상 제외 — 스펙트럼 (높은 고도 먼저, 불투명, 점선 stroke) */}
-          {drawOrderWithout.map((layer, idx) => {
-            const color = altToColor(layer.altitudeFt, MIN_ALT, MAX_ALT);
-            return (
-              <path key={`wo-${idx}`} d={layerPath(layer)}
-                fill={color} fillOpacity={1}
-                stroke={color} strokeWidth={0.5} strokeDasharray="3,3" />
-            );
-          })}
-
-          {/* 분석 대상 포함 — 스펙트럼 (높은 고도 먼저, 불투명, 실선 stroke) */}
-          {drawOrderWith.map((layer, idx) => {
-            const color = altToColor(layer.altitudeFt, MIN_ALT, MAX_ALT);
-            return (
-              <path key={`cw-${idx}`} d={layerPath(layer)}
-                fill={color} fillOpacity={1}
-                stroke={color} strokeWidth={0.6} />
-            );
-          })}
-
-          {/* 각 고도별 장애물 영향 차이 */}
+          {/* 장애물 영향 차이(diff) 영역만 표시 — 고도별 스펙트럼 색상 (낮은 고도 아래, 높은 고도 위) */}
           {diffPaths.map((dp, i) => (
             <path key={`diff-${i}`} d={dp.path}
-              fill="none" stroke="#ffffff" strokeWidth={1.2} strokeDasharray="4,2" />
-          ))}
-          {diffPaths.map((dp, i) => (
-            <path key={`diffF-${i}`} d={dp.path}
-              fill="#ef4444" fillOpacity={0.5} stroke="#ef4444" strokeWidth={0.4} />
+              fill={dp.color} fillOpacity={1}
+              stroke="#ffffff" strokeWidth={0.5} strokeOpacity={0.6} />
           ))}
 
-          {/* 거리 링 (커버리지 위에 표시) */}
+          {/* 거리 링 (레이더 중심 기준) — focus 방향 라벨, 화면 밖이면 라벨 생략 */}
           {rings.map((ring, i) => {
             const r = ring.km * scale;
-            const labelDeg = hasSector ? (sectorStart + sectorSpan / 2) % 360 : 45;
-            const labelRad = (labelDeg * Math.PI) / 180;
+            const labelRad = (focusBearingDeg * Math.PI) / 180;
+            const lxp = cx + (r + 3) * Math.sin(labelRad);
+            const lyp = cy - (r + 3) * Math.cos(labelRad);
+            const showLabel = lxp >= 6 && lxp <= svgSize - 6 && lyp >= 10 && lyp <= svgSize - 10;
             return (
               <g key={`ring-${i}`}>
                 <circle cx={cx} cy={cy} r={r} fill="none" stroke="#d1d5db" strokeWidth={0.4} strokeDasharray="3,3" />
-                <text
-                  x={cx + (r + 3) * Math.sin(labelRad)}
-                  y={cy - (r + 3) * Math.cos(labelRad)}
-                  fill="#9ca3af" fontSize={hasSector ? 8 : 7} textAnchor="start"
-                  stroke="#ffffff" strokeWidth={2} paintOrder="stroke"
-                >{ring.nm.toFixed(0)}NM</text>
+                {showLabel && (
+                  <text x={lxp} y={lyp} fill="#9ca3af" fontSize={8} textAnchor="start"
+                    stroke="#ffffff" strokeWidth={2} paintOrder="stroke"
+                  >{ring.nm.toFixed(0)}NM</text>
+                )}
               </g>
             );
           })}
 
-          {/* 방위선 + 라벨 (커버리지 위에 표시) */}
-          {compassPoints.map(({ deg, label }) => {
+          {/* 방위선 + 라벨 (전체 보기에서만 — 확대 시엔 북향 표시로 대체) */}
+          {!focused && compassPoints.map(({ deg, label }) => {
             const rad = (deg * Math.PI) / 180;
             return (
               <g key={deg}>
-                <line x1={cx} y1={cy} x2={cx + (maxR + 10) * Math.sin(rad)} y2={cy - (maxR + 10) * Math.cos(rad)}
+                <line x1={cx} y1={cy} x2={cx + (coverageR + 10) * Math.sin(rad)} y2={cy - (coverageR + 10) * Math.cos(rad)}
                   stroke="#c0c0c8" strokeWidth={0.4} />
-                <text x={cx + (maxR + 20) * Math.sin(rad)} y={cy - (maxR + 20) * Math.cos(rad) + 3}
+                <text x={cx + (coverageR + 20) * Math.sin(rad)} y={cy - (coverageR + 20) * Math.cos(rad) + 3}
                   textAnchor="middle" fill="#6b7280" fontSize={9} fontWeight={600}>{label}</text>
               </g>
             );
           })}
 
-          {/* 섹터 경계선 */}
-          {sectorLines.map((sl, i) => (
+          {/* 섹터 경계선 (전체 보기에서만) */}
+          {!focused && sectorLines.map((sl, i) => (
             <line key={`sec-${i}`} x1={cx} y1={cy} x2={sl.x2} y2={sl.y2}
               stroke="#a60739" strokeWidth={0.6} strokeDasharray="4,3" strokeOpacity={0.5} />
           ))}
 
-          {/* Loss 포인트 (장애물 기인 Loss만) */}
+          {/* 소실표적 (장애물 기인만) */}
           {filteredLoss.map((pt, i) => {
             const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, pt.lat, pt.lon);
             if (distKm > globalMaxRange) return null;
@@ -619,6 +636,29 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
               </g>
             );
           })()}
+
+          {/* 북향 표시 (확대 시) — 지도는 항상 북쪽이 위 */}
+          {focused && (
+            <g>
+              <rect x={svgSize - 44} y={12} width={32} height={50} rx={4} fill="#ffffff" fillOpacity={0.75} />
+              <line x1={svgSize - 28} y1={44} x2={svgSize - 28} y2={24} stroke="#374151" strokeWidth={1.4} />
+              <path d={`M ${svgSize - 28} 19 L ${svgSize - 31} 26 L ${svgSize - 25} 26 Z`} fill="#374151" />
+              <text x={svgSize - 28} y={58} textAnchor="middle" fill="#374151" fontSize={9} fontWeight={700}>N</text>
+            </g>
+          )}
+
+          {/* 축척 바 (확대 시) */}
+          {focused && (
+            <g>
+              <line x1={24} y1={svgSize - 24} x2={24 + scaleBar.px} y2={svgSize - 24} stroke="#374151" strokeWidth={1.6} />
+              <line x1={24} y1={svgSize - 28} x2={24} y2={svgSize - 20} stroke="#374151" strokeWidth={1.6} />
+              <line x1={24 + scaleBar.px} y1={svgSize - 28} x2={24 + scaleBar.px} y2={svgSize - 20} stroke="#374151" strokeWidth={1.6} />
+              <text x={24 + scaleBar.px / 2} y={svgSize - 30} textAnchor="middle" fill="#374151" fontSize={8}
+                stroke="#ffffff" strokeWidth={2} paintOrder="stroke">
+                {scaleBar.km}km · {(scaleBar.km / 1.852).toFixed(scaleBar.km / 1.852 < 10 ? 1 : 0)}NM
+              </text>
+            </g>
+          )}
         </svg>
         )}
       </div>
@@ -628,8 +668,8 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         <div className="mt-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-center text-[11px] text-blue-700">
           분석 대상 장애물에 의한 실질적인 커버리지 차이가 발생하지 않았습니다.
           {filteredLoss.length === 0
-            ? " 장애물 기인 Loss 또한 없습니다."
-            : ` (단, 장애물 기인 Loss ${filteredLoss.length}건 존재)`}
+            ? " 장애물 기인 소실표적 또한 없습니다."
+            : ` (단, 장애물 기인 소실표적 ${filteredLoss.length}건 존재)`}
         </div>
       )}
 
@@ -639,22 +679,11 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
           <span className="inline-block h-2.5 w-6 rounded-sm" style={{
             background: "linear-gradient(to right, hsl(0,85%,50%), hsl(120,85%,50%), hsl(240,85%,50%))",
           }} />
-          분석 대상 포함 (실선)
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-2.5 w-6 rounded-sm border border-dashed" style={{
-            background: "linear-gradient(to right, hsl(0,85%,50%,.4), hsl(120,85%,50%,.4), hsl(240,85%,50%,.4))",
-            borderColor: "#9ca3af",
-          }} />
-          분석 대상 제외 (점선)
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block h-2.5 w-4 rounded-sm bg-red-500/50 border border-white border-dashed" />
-          장애물 영향 차이
+          장애물 영향 차이 (고도별 색상)
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block h-2.5 w-2.5 rounded-full bg-red-500 border border-white" />
-          장애물 기인 Loss ({filteredLoss.length}건)
+          장애물 기인 소실표적 ({filteredLoss.length}건)
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block h-2.5 w-2.5 rounded bg-amber-400 border border-white" />
