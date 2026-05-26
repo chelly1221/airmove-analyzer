@@ -31,8 +31,8 @@ export interface ReportSections {
   psAdditionalLoss: boolean;
   psAngleHeight: boolean;
   omSummary: boolean;
-  omDailyPsr: boolean;
-  omDailyLoss: boolean;
+  /** 일별 PSR·표적소실 결합 라인 차트 (페이지 2). 기존 omDailyPsr/omDailyLoss 두 토글을 합친 단일 토글. */
+  omDailyPsrLoss: boolean;
   omWeekly: boolean;
   omCoverageDiff: boolean;
   omAzDistScatter: boolean;
@@ -179,8 +179,7 @@ export const DEFAULT_SECTIONS: ReportSections = {
   psAdditionalLoss: true,
   psAngleHeight: true,
   omSummary: true,
-  omDailyPsr: true,
-  omDailyLoss: true,
+  omDailyPsrLoss: true,
   omWeekly: true,
   omCoverageDiff: true,
   omAzDistScatter: true,

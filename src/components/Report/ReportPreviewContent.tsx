@@ -17,7 +17,7 @@ import ReportFlightProfileSection from "./ReportFlightProfileSection";
 import ReportFlightLossAnalysisSection from "./ReportFlightLossAnalysisSection";
 import ReportPanoramaSection from "./ReportPanoramaSection";
 import ReportOMSummarySection from "./ReportOMSummarySection";
-import ReportOMDailyChart from "./ReportOMDailyChart";
+import ReportOMCombinedDailyChart from "./ReportOMCombinedDailyChart";
 import ReportOMWeeklyChart from "./ReportOMWeeklyChart";
 import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import ReportOMBuildingLoS from "./ReportOMBuildingLoS";
@@ -120,8 +120,7 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
     return [
       { key: "cover", label: "표지" },
       { key: "omSummary", label: "요약" },
-      { key: "omDailyPsr", label: "PSR" },
-      { key: "omDailyLoss", label: "표적소실" },
+      { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
       { key: "omWeekly", label: "주차" },
       { key: "omCoverageDiff", label: "커버리지" },
       { key: "omAzDistScatter", label: "산점도" },
@@ -205,8 +204,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.los && psLosMap.size > 0) nums.los = n++;
     } else if (template === "obstacle_monthly") {
       if (sections.omSummary) nums.omSummary = n++;
-      if (sections.omDailyPsr) nums.omDailyPsr = n++;
-      if (sections.omDailyLoss) nums.omDailyLoss = n++;
+      if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
       if (sections.omWeekly) nums.omWeekly = n++;
       if (sections.omCoverageDiff) nums.omCoverageDiff = n++;
       if (sections.omAzDistScatter) nums.omAzDistScatter = n++;
@@ -441,47 +439,21 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             />
           )}
 
-          {sections.omDailyPsr && omResultTrimmed.radar_results.map((rr) => {
+          {sections.omDailyPsrLoss && omResultTrimmed.radar_results.map((rr) => {
             const info = omRadarConditions.get(rr.radar_name);
-            const imgKey = `psr-${rr.radar_name}`;
             return (
-              <ReportPage key={imgKey}>
-                <ReportOMDailyChart
-                  sectionNum={sectionNumbers.omDailyPsr ?? 2}
-                  mode="psr"
-                  radarName={rr.radar_name}
-                  dailyStats={rr.daily_stats}
-                  analysisMonth={omData.analysisMonth}
-                  conditions={[
-                    `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                    `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                    `• PSR 거리 제한: 레이더 60NM 이내`,
-                    `• PSR율 = PSR 포함 탐지 / 전체 탐지 (SSR+Combined 기준)`,
-                  ]}
-                />
-              </ReportPage>
-            );
-          })}
-
-          {sections.omDailyLoss && omResultTrimmed.radar_results.map((rr) => {
-            const info = omRadarConditions.get(rr.radar_name);
-            const imgKey = `loss-${rr.radar_name}`;
-            return (
-              <ReportPage key={imgKey}>
-                <ReportOMDailyChart
-                  sectionNum={sectionNumbers.omDailyLoss ?? 3}
-                  mode="loss"
-                  radarName={rr.radar_name}
-                  dailyStats={rr.daily_stats}
-                  analysisMonth={omData.analysisMonth}
-                  conditions={[
-                    `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                    `• 영향 방위 구간: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                    `• 표적소실(Signal Loss)만 포함 (범위이탈 Out of Range 제외)`,
-                    `• 표적소실율 = 소실 시간 / 총 항적 시간 × 100`,
-                  ]}
-                />
-              </ReportPage>
+              <ReportOMCombinedDailyChart
+                key={`psrloss-${rr.radar_name}`}
+                sectionNum={sectionNumbers.omDailyPsrLoss ?? 2}
+                radarName={rr.radar_name}
+                dailyStats={rr.daily_stats}
+                analysisMonth={omData.analysisMonth}
+                conditions={[
+                  `• 대상 장애물: ${info?.bldgNames ?? ""}`,
+                  `• 영향 방위: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
+                  `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
+                ]}
+              />
             );
           })}
 
