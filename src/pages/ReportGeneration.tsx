@@ -755,7 +755,7 @@ function TemplateTable({
       type: "obstacle_monthly",
       icon: Mountain,
       title: "장애물 월간 보고서",
-      description: "특정 장애물의 월간 영향을 분석합니다. ASS 파일을 입력하여 일별 PSR 탐지율/표적소실율 추이, 주차별 비교, 커버리지 비교맵을 생성합니다.",
+      description: "특정 장애물의 월간 영향을 분석합니다. ASS 파일을 입력하여 일별 PSR 탐지율/표적소실율 추이, 주차별 비교, 분석 대상 장애물별 LoS 단면 및 양각 분포를 생성합니다.",
       stats: [
         { label: "레이더", value: `${customRadarSites.length}개` },
         { label: "수동 건물", value: "선택식" },

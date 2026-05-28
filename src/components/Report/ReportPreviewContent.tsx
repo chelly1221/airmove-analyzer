@@ -2,7 +2,7 @@
  * 보고서 프리뷰 콘텐츠 — ReportGeneration과 ReportApp 양쪽에서 공유.
  * 툴바는 포함하지 않음. 호출 측에서 previewRef와 상태를 관리.
  */
-import { useMemo, useCallback, useRef } from "react";
+import { useMemo } from "react";
 import { Loader2 } from "lucide-react";
 import ReportPage, { ReportPageHeaderProvider } from "./ReportPage";
 import ReportCoverPage from "./ReportCoverPage";
@@ -22,10 +22,8 @@ import ReportOMWeeklyChart from "./ReportOMWeeklyChart";
 import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import ReportOMBuildingLoS from "./ReportOMBuildingLoS";
 import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
-import ReportOMAltitudeDistribution from "./ReportOMAltitudeDistribution";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
-import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import type { OMSectionCaptureHandle } from "./omCapture";
 import ReportPSSummarySection from "./ReportPSSummarySection";
 import ReportPSAngleHeight from "./ReportPSAngleHeight";
@@ -121,10 +119,8 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
       { key: "omSummary", label: "요약" },
       { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
       { key: "omWeekly", label: "주차" },
-      { key: "omCoverageDiff", label: "커버리지(합산)" },
       { key: "omBuildingLos", label: "LoS" },
       { key: "omLosCrossSection", label: "장애물별 상세" },
-      { key: "omAltitude", label: "고도분포" },
       { key: "omLossEvents", label: "표적소실상세" },
       { key: "omFindings", label: "소견" },
     ];
@@ -165,7 +161,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     onOmDataChange,
     singleFlightChartPoints,
     previewRef,
-    setCaptureRef,
   } = props;
 
   const singleFlight = template === "single" ? reportFlights[0] : null;
@@ -204,10 +199,8 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.omSummary) nums.omSummary = n++;
       if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
       if (sections.omWeekly) nums.omWeekly = n++;
-      if (sections.omCoverageDiff) nums.omCoverageDiff = n++;
       if (sections.omBuildingLos) nums.omBuildingLos = n++;
       if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
-      if (sections.omAltitude) nums.omAltitude = n++;
       if (sections.omLossEvents) nums.omLossEvents = n++;
       if (sections.omFindings) nums.omFindings = n++;
     } else if (template === "single") {
@@ -252,19 +245,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     }
     return map;
   }, [omResultTrimmed, omData.azSectorsByRadar, omData.selectedRadarSites, omData.selectedBuildings]);
-
-  // OM 섹션 capture ref 콜백 — 안정성 보장 (매 렌더 새 콜백 생성 시 React가
-  // ref(null) → ref(new) churn 을 일으켜 오케스트레이터가 잠시 ref 미등록 상태를 봄).
-  // 키별로 메모이즈한 콜백을 재사용.
-  const refCallbackCache = useRef(new Map<string, (h: OMSectionCaptureHandle | null) => void>());
-  const setRef = useCallback((key: string) => {
-    let cb = refCallbackCache.current.get(key);
-    if (!cb) {
-      cb = (h: OMSectionCaptureHandle | null) => setCaptureRef?.(key, h);
-      refCallbackCache.current.set(key, cb);
-    }
-    return cb;
-  }, [setCaptureRef]);
 
   return (
     <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">
@@ -482,51 +462,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             </div>
           )}
 
-          {sections.omCoverageDiff && (
-            <div data-toc-key="omCoverageDiff">
-              {omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? omData.selectedRadarSites.map((rs) => {
-                const rsLayersWith = omData.covLayersWithBuildings.get(rs.name) ?? [];
-                const rsLayersWithout = omData.covLayersWithout.get(rs.name) ?? [];
-                if (rsLayersWith.length === 0 && rsLayersWithout.length === 0) return null;
-                const rr = omResultTrimmed.radar_results.find((r) => r.radar_name === rs.name);
-                const allLoss = rr?.daily_stats.flatMap((d) => d.loss_points_summary) ?? [];
-                const covImgKey = `cov-${rs.name}`;
-                return (
-                  <ReportPage key={covImgKey}>
-                    <ReportOMSectionHeader sectionNum={sectionNumbers.omCoverageDiff ?? 5} title="커버리지 비교맵" radarName={rs.name} />
-                    <ReportOMCoverageDiff
-                      ref={setRef(covImgKey)}
-                      sectionNum={sectionNumbers.omCoverageDiff ?? 5}
-                      radarSite={rs}
-                      layersWithTargets={rsLayersWith}
-                      layersWithoutTargets={rsLayersWithout}
-                      lossPoints={allLoss}
-                      defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
-                      selectedBuildings={omData.selectedBuildings}
-                      buildingGroups={omData.buildingGroups}
-                      preCapturedImage={omData.sectionImages.get(covImgKey)}
-                      hideHeader
-                    />
-                  </ReportPage>
-                );
-              }) : omData.coverageStatus === "error" ? (
-                <ReportPage>
-                  <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                    <p className="text-sm text-red-400">커버리지 계산 실패</p>
-                    <p className="mt-1 text-xs">SRTM 데이터 또는 건물 데이터를 확인하세요</p>
-                  </div>
-                </ReportPage>
-              ) : (
-                <ReportPage>
-                  <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                    <Loader2 size={24} className="mb-3 animate-spin" />
-                    <p className="text-sm">커버리지 비교맵 계산 중...</p>
-                  </div>
-                </ReportPage>
-              )}
-            </div>
-          )}
-
           {sections.omBuildingLos && (
             <div data-toc-key="omBuildingLos">
               <ReportOMBuildingLoS
@@ -540,50 +475,28 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           )}
 
           {/* 장애물별 상세 — (레이더 × 분석 대상 빌딩) 한 쌍당 한 페이지.
-              상단: 빌딩 단독 카운터팩추얼 커버리지 다이프 (그림자 bbox 줌, 영향 0 이면 "영향 없음").
-              하단: 빌딩 LoS 단면도. 기존 omLosCrossSection 의 독립 페이지를 본 결합 페이지로 대체. */}
+              빌딩 메타 + LoS 단면도 + LoS 차단 양각 대비 표적소실 분포 (분석 대상 방위 윈도우). */}
           {sections.omLosCrossSection && omData.losMap.size > 0 && (
             <div data-toc-key="omLosCrossSection">
               {omData.selectedRadarSites.map((rs) => {
-                const rsLayersWith = omData.covLayersWithBuildings.get(rs.name) ?? [];
-                const rsPerBld = omData.covLayersWithoutPerBuilding.get(rs.name);
                 return omData.selectedBuildings.map((b) => {
                   const los = omData.losMap.get(`${rs.name}_${b.id}`);
                   if (!los) return null;
-                  const layersWithoutThis = rsPerBld?.get(b.id) ?? [];
-                  const obsImgKey = `obs-${rs.name}-${b.id}`;
                   return (
                     <ReportOMObstacleDetail
-                      key={obsImgKey}
+                      key={`obs-${rs.name}-${b.id}`}
                       sectionNum={sectionNumbers.omLosCrossSection ?? 8}
                       radarSite={rs}
                       building={b}
                       buildingGroups={omData.buildingGroups}
-                      layersWith={rsLayersWith}
-                      layersWithoutThis={layersWithoutThis}
                       los={los}
-                      captureRef={setRef(obsImgKey)}
-                      preCapturedImage={omData.sectionImages.get(obsImgKey)}
                       omResult={omResultTrimmed}
+                      panoWith={omData.panoWithTargets?.get(rs.name)}
+                      panoWithout={omData.panoWithoutTargets?.get(rs.name)}
                     />
                   );
                 });
               })}
-            </div>
-          )}
-
-          {sections.omAltitude && (
-            <div data-toc-key="omAltitude">
-              <ReportOMAltitudeDistribution
-                sectionNum={sectionNumbers.omAltitude ?? 9}
-                radarResults={omResultTrimmed.radar_results}
-                selectedBuildings={omData.selectedBuildings}
-                buildingGroups={omData.buildingGroups}
-                radarSites={omData.selectedRadarSites}
-                losMap={omData.losMap}
-                panoWithTargets={omData.panoWithTargets}
-                panoWithoutTargets={omData.panoWithoutTargets}
-              />
             </div>
           )}
 

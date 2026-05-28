@@ -450,27 +450,9 @@ export default function ReportApp() {
       const data = omDataRef.current;
       if (!data) { setOrchestratorState("done"); return; }
 
-      // 캡처 대상 섹션 목록 산출
+      // 캡처 대상 섹션 목록 산출 — 현재 OM 보고서는 캡처 대상이 없음
+      // (커버리지 비교맵 / 장애물 상세 다이프 제거됨. 남은 섹션들은 라이브 렌더만 사용)
       const tasks: { key: string; label: string }[] = [];
-      if (data.coverageStatus === "done" && data.covLayersWithBuildings.size > 0) {
-        for (const rs of data.selectedRadarSites) {
-          const w = data.covLayersWithBuildings.get(rs.name) ?? [];
-          const wo = data.covLayersWithout.get(rs.name) ?? [];
-          if (w.length === 0 && wo.length === 0) continue;
-          tasks.push({ key: `cov-${rs.name}`, label: `커버리지 비교맵 (${rs.name})` });
-        }
-        // 장애물별 상세 페이지의 다이프 SVG 캡처
-        for (const rs of data.selectedRadarSites) {
-          const perBld = data.covLayersWithoutPerBuilding.get(rs.name);
-          if (!perBld) continue;
-          for (const b of data.selectedBuildings) {
-            if (!data.losMap.get(`${rs.name}_${b.id}`)) continue;
-            const woThis = perBld.get(b.id) ?? [];
-            if (woThis.length === 0) continue;
-            tasks.push({ key: `obs-${rs.name}-${b.id}`, label: `장애물 상세 (${rs.name} / ${b.name || `B${b.id}`})` });
-          }
-        }
-      }
       // 진행률 표시용 일괄 등록
       for (const t of tasks) trackerRegister(t.key, t.label);
       console.log(`[OMCapture] orchestrator 시작 (${tasks.length}개 섹션)`);
@@ -646,10 +628,8 @@ export default function ReportApp() {
       { key: "omSummary",         name: "분석 요약",         visible: !!activeSections.omSummary },
       { key: "omDailyPsrLoss",    name: "일별 PSR·표적소실", visible: !!activeSections.omDailyPsrLoss },
       { key: "omWeekly",          name: "주차별 추이",       visible: !!activeSections.omWeekly },
-      { key: "omCoverageDiff",    name: "커버리지 비교맵",   visible: !!activeSections.omCoverageDiff },
       { key: "omBuildingLos",     name: "건물별 LoS",        visible: !!activeSections.omBuildingLos },
       { key: "omLosCrossSection", name: "장애물별 상세",     visible: !!activeSections.omLosCrossSection && omData.losMap.size > 0 },
-      { key: "omAltitude",        name: "고도 분포",         visible: !!activeSections.omAltitude },
       { key: "omLossEvents",      name: "표적소실 상세",     visible: !!activeSections.omLossEvents },
       { key: "omFindings",        name: "종합 소견",         visible: !!activeSections.omFindings },
     ];
