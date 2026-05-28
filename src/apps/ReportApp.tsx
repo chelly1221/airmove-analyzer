@@ -471,14 +471,6 @@ export default function ReportApp() {
           }
         }
       }
-      if (data.result) {
-        for (const rr of data.result.radar_results) {
-          const rs = data.selectedRadarSites.find((r) => r.name === rr.radar_name);
-          if (!rs) continue;
-          tasks.push({ key: `azdist-${rr.radar_name}`, label: `방위-거리 산점도 (${rr.radar_name})` });
-        }
-      }
-
       // 진행률 표시용 일괄 등록
       for (const t of tasks) trackerRegister(t.key, t.label);
       console.log(`[OMCapture] orchestrator 시작 (${tasks.length}개 섹션)`);
@@ -655,7 +647,6 @@ export default function ReportApp() {
       { key: "omDailyPsrLoss",    name: "일별 PSR·표적소실", visible: !!activeSections.omDailyPsrLoss },
       { key: "omWeekly",          name: "주차별 추이",       visible: !!activeSections.omWeekly },
       { key: "omCoverageDiff",    name: "커버리지 비교맵",   visible: !!activeSections.omCoverageDiff },
-      { key: "omAzDistScatter",   name: "방위·거리 산점도",  visible: !!activeSections.omAzDistScatter },
       { key: "omBuildingLos",     name: "건물별 LoS",        visible: !!activeSections.omBuildingLos },
       { key: "omLosCrossSection", name: "장애물별 상세",     visible: !!activeSections.omLosCrossSection && omData.losMap.size > 0 },
       { key: "omAltitude",        name: "고도 분포",         visible: !!activeSections.omAltitude },

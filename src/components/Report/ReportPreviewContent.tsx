@@ -25,7 +25,6 @@ import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
 import ReportOMAltitudeDistribution from "./ReportOMAltitudeDistribution";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
-import ReportOMAzDistScatter from "./ReportOMAzDistScatter";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import type { OMSectionCaptureHandle } from "./omCapture";
 import ReportPSSummarySection from "./ReportPSSummarySection";
@@ -123,7 +122,6 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
       { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
       { key: "omWeekly", label: "주차" },
       { key: "omCoverageDiff", label: "커버리지(합산)" },
-      { key: "omAzDistScatter", label: "산점도" },
       { key: "omBuildingLos", label: "LoS" },
       { key: "omLosCrossSection", label: "장애물별 상세" },
       { key: "omAltitude", label: "고도분포" },
@@ -207,7 +205,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
       if (sections.omWeekly) nums.omWeekly = n++;
       if (sections.omCoverageDiff) nums.omCoverageDiff = n++;
-      if (sections.omAzDistScatter) nums.omAzDistScatter = n++;
       if (sections.omBuildingLos) nums.omBuildingLos = n++;
       if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
       if (sections.omAltitude) nums.omAltitude = n++;
@@ -524,33 +521,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                   </div>
                 </ReportPage>
               )}
-            </div>
-          )}
-
-          {sections.omAzDistScatter && (
-            <div data-toc-key="omAzDistScatter">
-              {omResultTrimmed.radar_results.map((rr) => {
-                const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
-                const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
-                if (!rs) return null;
-                const azImgKey = `azdist-${rr.radar_name}`;
-                return (
-                  <ReportPage key={azImgKey}>
-                    <ReportOMSectionHeader sectionNum={sectionNumbers.omAzDistScatter ?? 6} title={`방위-거리 소실표적 산점도${omData.analysisMonth ? ` (${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월)` : ""}`} radarName={rs.name} />
-                    <ReportOMAzDistScatter
-                      ref={setRef(azImgKey)}
-                      sectionNum={sectionNumbers.omAzDistScatter ?? 6}
-                      radarSite={rs}
-                      dailyStats={rr.daily_stats}
-                      selectedBuildings={omData.selectedBuildings}
-                      azSectors={sectors}
-                      analysisMonth={omData.analysisMonth}
-                      preCapturedImage={omData.sectionImages.get(azImgKey)}
-                      hideHeader
-                    />
-                  </ReportPage>
-                );
-              })}
             </div>
           )}
 

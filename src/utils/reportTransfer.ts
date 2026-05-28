@@ -35,7 +35,6 @@ export interface ReportSections {
   omDailyPsrLoss: boolean;
   omWeekly: boolean;
   omCoverageDiff: boolean;
-  omAzDistScatter: boolean;
   omBuildingLos: boolean;
   omLosCrossSection: boolean;
   omAltitude: boolean;
@@ -188,7 +187,6 @@ export const DEFAULT_SECTIONS: ReportSections = {
   omDailyPsrLoss: true,
   omWeekly: true,
   omCoverageDiff: true,
-  omAzDistScatter: true,
   omBuildingLos: true,
   omLosCrossSection: true,
   omAltitude: true,
