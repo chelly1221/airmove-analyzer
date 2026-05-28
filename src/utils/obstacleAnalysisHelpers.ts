@@ -3,7 +3,7 @@
  * ObstacleMonthlyConfigModal / ObstaclePreScreeningModal에서 사용.
  */
 import { invoke } from "@tauri-apps/api/core";
-import type { RadarSite, ManualBuilding, LoSProfileData, AzSector } from "../types";
+import type { RadarSite, ManualBuilding, LoSProfileData, AzSector, BuildingOnPath } from "../types";
 
 /** OM 보고서 LoS 단면도 차트 최소 X축 (km) — 빌딩이 가까워도 이만큼은 terrain 을 샘플링.
  *  100NM = 100 * 1.852 km. ReportOMLosCrossSection 의 MIN_X_NM 과 동일한 값. */
@@ -49,7 +49,7 @@ export async function computeLosBatch(
         }
         const [elevations, pathBuildings] = await Promise.all([
           invoke<number[]>("fetch_elevation", { latitudes: lats, longitudes: lons }),
-          invoke<{ distance_km: number; height_m: number; ground_elev_m: number; total_height_m: number; name: string | null; address: string | null }[]>(
+          invoke<BuildingOnPath[]>(
             "query_buildings_along_path",
             { radarLat: radar.latitude, radarLon: radar.longitude, targetLat: bldg.latitude, targetLon: bldg.longitude, corridorWidthM: 200 },
           ),
@@ -112,6 +112,7 @@ export async function computeLosBatch(
           bearing,
           totalDistance: totalDist,
           elevationProfile: elevProfile,
+          pathBuildings,
           losBlocked: blocked,
           maxBlockingPoint: blocked ? { distance: maxBlockDist, elevation: maxBlockElev, name: maxBlockName } : undefined,
           timestamp: Date.now(),

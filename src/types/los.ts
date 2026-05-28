@@ -1,3 +1,5 @@
+import type { BuildingOnPath } from "./building";
+
 /** Line of Sight 계산 결과 */
 export interface LineOfSightResult {
   in_sight: boolean;
@@ -27,6 +29,9 @@ export interface LoSProfileData {
   bearing: number;
   totalDistance: number;
   elevationProfile: ElevationPoint[];
+  /** 레이더→타겟 경로상 200m 코리도 내 건물 — 단면도에 차폐/비차폐로 표시.
+   *  OM 보고서 LoS 단면도에서 TrackMap 동작과 일관성 위해 추가. */
+  pathBuildings?: BuildingOnPath[];
   losBlocked: boolean;
   maxBlockingPoint?: { distance: number; elevation: number; name?: string };
   mapScreenshot?: string;
