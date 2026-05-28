@@ -61,6 +61,7 @@ export default function ObstacleMonthlyConfigModal({
   onGenerate: (
     result: ObstacleMonthlyResult,
     buildings: ManualBuilding[],
+    groups: BuildingGroup[],
     radars: RadarSite[],
     azMap: Map<string, AzSector[]>,
     losMap: Map<string, LoSProfileData>,
@@ -412,7 +413,7 @@ export default function ObstacleMonthlyConfigModal({
       setProgressPct(95);
       setStage("transfer");
       setStageDetail((prev) => ({ ...prev, transfer: "보고서 창으로 데이터 전송 중" }));
-      await onGenerate(filteredResult, selectedBuildings, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, covWithoutPerBuildingMap, effectiveMonth);
+      await onGenerate(filteredResult, selectedBuildings, buildingGroups, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, covWithoutPerBuildingMap, effectiveMonth);
 
       if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap, covWithoutPerBuildingMap);
 
@@ -433,7 +434,7 @@ export default function ObstacleMonthlyConfigModal({
       // 정상 완료 시 analyzing/stage 는 유지 — prop-driven 단계가 이어진다.
       // 모달 unmount 는 omReady → onComplete 경로로만 발생.
     }
-  }, [analyzing, selectedRadars, selectedBuildings, radarFiles, azSectorsByRadar, aircraft, onGenerate, onCoverageReady, onCoverageError, analysisMonth, filterFilesByMonth]);
+  }, [analyzing, selectedRadars, selectedBuildings, buildingGroups, radarFiles, azSectorsByRadar, aircraft, onGenerate, onCoverageReady, onCoverageError, analysisMonth, filterFilesByMonth]);
 
   const allFilesSelected = selectedRadars.every((r) => (radarFiles.get(r.name)?.length ?? 0) > 0);
   const canAnalyze = selectedRadars.length > 0 && selectedBuildings.length > 0 && allFilesSelected && !analyzing;

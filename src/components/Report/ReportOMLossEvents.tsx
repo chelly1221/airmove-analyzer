@@ -1,15 +1,18 @@
 import React, { useMemo } from "react";
 import { AlertTriangle } from "lucide-react";
-import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
+import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import AutoPaginate from "./AutoPaginate";
+import BuildingGroupBadge from "./BuildingGroupBadge";
 
 interface Props {
   sectionNum: number;
   radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
+  /** 건물 그룹 메타 (인라인 배지 표시용) */
+  buildingGroups: BuildingGroup[];
   radarSites: RadarSite[];
   /** 레이더별 건물 포함 커버리지 레이어 */
   layersWithTargets: Map<string, CoverageLayer[]>;
@@ -83,6 +86,7 @@ function ReportOMLossEvents({
   sectionNum,
   radarResults,
   selectedBuildings,
+  buildingGroups,
   radarSites,
   layersWithTargets,
   layersWithoutTargets,
@@ -238,7 +242,10 @@ function ReportOMLossEvents({
                   const totalDur = nearby.reduce((s, e) => s + e.durationS, 0);
                   return (
                     <tr key={b.id} className={bi % 2 === 0 ? "" : "alt"}>
-                      <td>{b.name || `건물${b.id}`}</td>
+                      <td>
+                        {b.name || `건물${b.id}`}
+                        <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} />
+                      </td>
                       <td className="ta-r mono">{b.height.toFixed(1)}</td>
                       <td className="ta-r mono">{bAz.toFixed(1)}</td>
                       <td className="ta-r mono">{bDist.toFixed(1)}</td>

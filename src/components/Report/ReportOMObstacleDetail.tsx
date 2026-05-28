@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import type { ManualBuilding, RadarSite, LoSProfileData } from "../../types";
+import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData } from "../../types";
 import type { LossPointGeo, TrackPointGeo, ObstacleMonthlyResult } from "../../types/obstacle";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { haversineKm } from "../../utils/geo";
@@ -7,12 +7,15 @@ import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
+import BuildingGroupBadge from "./BuildingGroupBadge";
 import type { OMSectionCaptureHandle } from "./omCapture";
 
 interface Props {
   sectionNum: number;
   radarSite: RadarSite;
   building: ManualBuilding;
+  /** 건물 그룹 메타 (인라인 배지 표시용) */
+  buildingGroups: BuildingGroup[];
   /** 베이스라인(전체 빌딩 포함) 커버리지 — diff 의 "with" */
   layersWith: CoverageLayer[];
   /** 빌딩 단독 제외 카운터팩추얼 — diff 의 "without" */
@@ -29,7 +32,7 @@ interface Props {
 
 /** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. 상단: 빌딩 단독 영향 커버리지 다이프. 하단: 빌딩 LoS 단면도. */
 function ReportOMObstacleDetail({
-  sectionNum, radarSite, building, layersWith, layersWithoutThis, los,
+  sectionNum, radarSite, building, buildingGroups, layersWith, layersWithoutThis, los,
   captureRef, preCapturedImage, omResult,
 }: Props) {
   // 빌딩 위치 메타
@@ -68,11 +71,21 @@ function ReportOMObstacleDetail({
 
   // 카운터팩추얼 데이터가 없거나 다이프 = 0 이면 "영향 없음" 안내.
   // (전수 베어링 max diff 로 미리 한 번 체크 — buildDiffPath 와 동일 기준)
+  // [DEBUG] diff 가 어느 베어링에 어느 양만큼 분포하는지도 같이 수집 — 시각화 누락 원인 추적용.
   const impactSummary = useMemo(() => {
     if (layersWith.length === 0 || layersWithoutThis.length === 0) {
-      return { hasData: false, maxDiffKm: 0 };
+      return {
+        hasData: false, maxDiffKm: 0,
+        diffBearingCount: 0, diffAzCenter: NaN, diffAzSpread: 0,
+        wLen: layersWith.length, woLen: layersWithoutThis.length,
+        unmatched: 0,
+      };
     }
     let maxDiffKm = 0;
+    let diffBearingCount = 0;
+    let azSinSum = 0, azCosSum = 0; // 원형 평균용
+    let azMin = 360, azMax = 0;
+    let unmatched = 0;
     for (let i = 0; i < layersWith.length; i++) {
       const lw = layersWith[i];
       const lwo = layersWithoutThis.find((l) => Math.abs(l.altitudeFt - lw.altitudeFt) < 200);
@@ -80,13 +93,47 @@ function ReportOMObstacleDetail({
       const wByDeg = new Map<number, number>();
       for (const wb of lw.bearings) wByDeg.set(Math.round(wb.deg * 100), wb.maxRangeKm);
       for (const b of lwo.bearings) {
-        const rW = wByDeg.get(Math.round(b.deg * 100)) ?? b.maxRangeKm;
+        const wv = wByDeg.get(Math.round(b.deg * 100));
+        if (wv === undefined) unmatched++;
+        const rW = wv ?? b.maxRangeKm;
         const d = b.maxRangeKm - rW;
+        if (d > 0) {
+          diffBearingCount++;
+          const rad = (b.deg * Math.PI) / 180;
+          azSinSum += Math.sin(rad);
+          azCosSum += Math.cos(rad);
+          if (b.deg < azMin) azMin = b.deg;
+          if (b.deg > azMax) azMax = b.deg;
+        }
         if (d > maxDiffKm) maxDiffKm = d;
       }
     }
-    return { hasData: true, maxDiffKm };
+    const diffAzCenter = diffBearingCount > 0
+      ? ((Math.atan2(azSinSum, azCosSum) * 180) / Math.PI + 360) % 360
+      : NaN;
+    return {
+      hasData: true, maxDiffKm,
+      diffBearingCount, diffAzCenter, diffAzSpread: diffBearingCount > 0 ? azMax - azMin : 0,
+      wLen: layersWith.length, woLen: layersWithoutThis.length,
+      unmatched,
+    };
   }, [layersWith, layersWithoutThis]);
+
+  // [DEBUG] 콘솔 로그 — 빌딩별 진단
+  useMemo(() => {
+    if (typeof console !== "undefined") {
+      console.log(
+        `[OMDetail ${radarSite.name}/${building.id}:${building.name ?? ""}] ` +
+        `bAz=${los.bearing.toFixed(1)}° ` +
+        `maxDiff=${impactSummary.maxDiffKm.toFixed(3)}km ` +
+        `diffBearings=${impactSummary.diffBearingCount} ` +
+        `diffAz=${isNaN(impactSummary.diffAzCenter) ? "—" : impactSummary.diffAzCenter.toFixed(1) + "°"} ` +
+        `unmatched=${impactSummary.unmatched} ` +
+        `layers(w/wo)=${impactSummary.wLen}/${impactSummary.woLen}`,
+      );
+    }
+    return null;
+  }, [impactSummary, radarSite.name, building.id, building.name, los.bearing]);
 
   return (
     <ReportPage>
@@ -98,21 +145,41 @@ function ReportOMObstacleDetail({
 
       {/* 빌딩 메타 정보 */}
       <div className="mb-2 flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] text-gray-600">
-        <span>
-          위치: {building.latitude.toFixed(5)}°, {building.longitude.toFixed(5)}° ·
-          높이: {bTopFt.toLocaleString()}ft ({bTopElevM.toFixed(0)}m) ·
-          레이더 거리: {(bDistKm / 1.852).toFixed(1)}NM ({bDistKm.toFixed(1)}km) · 방위: {los.bearing.toFixed(1)}°
+        <span className="flex items-center gap-2">
+          <BuildingGroupBadge groupId={building.group_id} groups={buildingGroups} />
+          <span>
+            위치: {building.latitude.toFixed(5)}°, {building.longitude.toFixed(5)}° ·
+            높이: {bTopFt.toLocaleString()}ft ({bTopElevM.toFixed(0)}m) ·
+            레이더 거리: {(bDistKm / 1.852).toFixed(1)}NM ({bDistKm.toFixed(1)}km) · 방위: {los.bearing.toFixed(1)}°
+          </span>
         </span>
-        <span className={`rounded px-1.5 py-0.5 font-medium ${
-          impactSummary.hasData && impactSummary.maxDiffKm > 0
-            ? "bg-amber-50 text-amber-700"
-            : "bg-emerald-50 text-emerald-700"
-        }`}>
-          {impactSummary.hasData
-            ? impactSummary.maxDiffKm > 0
-              ? `단독 영향 max ${impactSummary.maxDiffKm.toFixed(2)}km`
-              : "단독 영향 없음"
-            : "데이터 없음"}
+        <span className="flex items-center gap-2">
+          {/* [DEBUG] diff 베어링 분포 진단 — bAz 와 diffAz 가 일치하는지 / 섹터 안인지 확인 */}
+          {impactSummary.hasData && (
+            <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[9px] text-slate-600">
+              diff베어링 {impactSummary.diffBearingCount}개
+              {!isNaN(impactSummary.diffAzCenter) && (
+                <> · 중심 {impactSummary.diffAzCenter.toFixed(1)}°
+                  (bAz±{Math.min(
+                    Math.abs(impactSummary.diffAzCenter - los.bearing),
+                    360 - Math.abs(impactSummary.diffAzCenter - los.bearing),
+                  ).toFixed(1)}°)
+                </>
+              )}
+              {impactSummary.unmatched > 0 && <> · 미매칭 {impactSummary.unmatched}</>}
+            </span>
+          )}
+          <span className={`rounded px-1.5 py-0.5 font-medium ${
+            impactSummary.hasData && impactSummary.maxDiffKm > 0
+              ? "bg-amber-50 text-amber-700"
+              : "bg-emerald-50 text-emerald-700"
+          }`}>
+            {impactSummary.hasData
+              ? impactSummary.maxDiffKm > 0
+                ? `단독 영향 max ${impactSummary.maxDiffKm.toFixed(2)}km`
+                : "단독 영향 없음"
+              : "데이터 없음"}
+          </span>
         </span>
       </div>
 
@@ -128,6 +195,7 @@ function ReportOMObstacleDetail({
             lossPoints={allLossForRadar}
             defaultAltFt={5000}
             selectedBuildings={[building]}
+            buildingGroups={buildingGroups}
             hideHeader
             preCapturedImage={preCapturedImage}
             focusOnDiffOnly
@@ -150,6 +218,7 @@ function ReportOMObstacleDetail({
           los={los}
           radarName={radarSite.name}
           building={building}
+          buildingGroup={buildingGroups.find((g) => g.id === building.group_id) ?? null}
           trackPoints={losChartPts.track}
           lossPoints={losChartPts.loss}
         />

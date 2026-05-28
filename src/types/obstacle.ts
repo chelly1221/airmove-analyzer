@@ -84,6 +84,8 @@ export interface ObstacleMonthlyProgress {
 export interface OMReportData {
   result: ObstacleMonthlyResult | null;
   selectedBuildings: import("./building").ManualBuilding[];
+  /** 건물 그룹 메타 (배지 색·이름 표시용) — 선택된 건물의 group_id 가 참조 */
+  buildingGroups: import("./building").BuildingGroup[];
   selectedRadarSites: import("./radar").RadarSite[];
   azSectorsByRadar: Map<string, AzSector[]>;
   losMap: Map<string, import("./los").LoSProfileData>;

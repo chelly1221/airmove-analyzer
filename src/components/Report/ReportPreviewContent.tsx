@@ -410,6 +410,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                   lossPoints={[]}
                   defaultAltFt={5000}
                   selectedBuildings={psSelectedBuildings}
+                  buildingGroups={omData.buildingGroups}
                 />
               </ReportPage>
             );
@@ -433,6 +434,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 sectionNum={sectionNumbers.omSummary ?? 1}
                 radarResults={omResultTrimmed.radar_results}
                 selectedBuildings={omData.selectedBuildings}
+                buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
                 azimuthSectorsByRadar={omData.azSectorsByRadar}
                 analysisMonth={omData.analysisMonth}
@@ -501,6 +503,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                       lossPoints={allLoss}
                       defaultAltFt={rr?.avg_loss_altitude_ft ?? 5000}
                       selectedBuildings={omData.selectedBuildings}
+                      buildingGroups={omData.buildingGroups}
                       preCapturedImage={omData.sectionImages.get(covImgKey)}
                       hideHeader
                     />
@@ -529,6 +532,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
               <ReportOMBuildingLoS
                 sectionNum={sectionNumbers.omBuildingLos ?? 7}
                 selectedBuildings={omData.selectedBuildings}
+                buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
                 losMap={omData.losMap}
               />
@@ -554,6 +558,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                       sectionNum={sectionNumbers.omLosCrossSection ?? 8}
                       radarSite={rs}
                       building={b}
+                      buildingGroups={omData.buildingGroups}
                       layersWith={rsLayersWith}
                       layersWithoutThis={layersWithoutThis}
                       los={los}
@@ -573,6 +578,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 sectionNum={sectionNumbers.omAltitude ?? 9}
                 radarResults={omResultTrimmed.radar_results}
                 selectedBuildings={omData.selectedBuildings}
+                buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
                 losMap={omData.losMap}
                 panoWithTargets={omData.panoWithTargets}
@@ -588,6 +594,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                   sectionNum={sectionNumbers.omLossEvents ?? 10}
                   radarResults={omResultTrimmed.radar_results}
                   selectedBuildings={omData.selectedBuildings}
+                  buildingGroups={omData.buildingGroups}
                   radarSites={omData.selectedRadarSites}
                   layersWithTargets={omData.covLayersWithBuildings}
                   layersWithoutTargets={omData.covLayersWithout}
@@ -615,6 +622,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 sectionNum={sectionNumbers.omFindings ?? 11}
                 radarResults={omResultTrimmed.radar_results}
                 selectedBuildings={omData.selectedBuildings}
+                buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
                 findingsText={omData.findingsText}
                 onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}

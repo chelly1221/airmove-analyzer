@@ -1,14 +1,17 @@
 import React, { useMemo } from "react";
 import { Building } from "lucide-react";
-import type { ManualBuilding, RadarSite, LoSProfileData } from "../../types";
+import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData } from "../../types";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportPage from "./ReportPage";
+import BuildingGroupBadge from "./BuildingGroupBadge";
 import { PAGE_CONTENT_MM, SECTION_HEADER_MM, ROW_HEIGHT_MD } from "./reportPageConstants";
 
 interface Props {
   sectionNum: number;
   selectedBuildings: ManualBuilding[];
+  /** 건물 그룹 메타 (인라인 배지 표시용) */
+  buildingGroups: BuildingGroup[];
   radarSites: RadarSite[];
   /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) */
   losMap: Map<string, LoSProfileData>;
@@ -29,7 +32,7 @@ const STATS_MM = 20;
  * 스타일은 reportOmStyles.css 의 `.om-table thead tr.sub`, `.badge.ok/.bad`,
  * `.los-stats`, `.cont-label`.
  */
-function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap, hideHeader }: Props) {
+function ReportOMBuildingLoS({ sectionNum, selectedBuildings, buildingGroups, radarSites, losMap, hideHeader }: Props) {
   const buildingRadarInfo = useMemo(() => {
     const info = new Map<string, { az: number; dist: number }>();
     for (const b of selectedBuildings) {
@@ -83,7 +86,10 @@ function ReportOMBuildingLoS({ sectionNum, selectedBuildings, radarSites, losMap
   const renderRow = (b: ManualBuilding, i: number) => (
     <tr key={b.id} className={i % 2 === 0 ? "" : "alt"}>
       <td className="ta-c">{i + 1}</td>
-      <td className="strong">{b.name || `건물 ${b.id}`}</td>
+      <td className="strong">
+        {b.name || `건물 ${b.id}`}
+        <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} />
+      </td>
       <td className="ta-r mono">{b.height.toFixed(0)}</td>
       {radarSites.map((r) => {
         const key = `${r.name}_${b.id}`;

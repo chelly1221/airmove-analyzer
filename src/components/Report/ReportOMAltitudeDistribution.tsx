@@ -1,14 +1,17 @@
 import React, { useMemo, useRef, useEffect, useCallback } from "react";
 import { BarChart3 } from "lucide-react";
-import type { RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
+import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import AutoPaginate from "./AutoPaginate";
+import BuildingGroupBadge from "./BuildingGroupBadge";
 
 interface Props {
   sectionNum: number;
   radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
+  /** 건물 그룹 메타 (인라인 배지 표시용) */
+  buildingGroups: BuildingGroup[];
   radarSites: RadarSite[];
   losMap: Map<string, LoSProfileData>;
   panoWithTargets?: Map<string, import("../../types/panorama").PanoramaMergeResult>;
@@ -68,6 +71,8 @@ interface ClassifiedLoss {
 interface BuildingInfo {
   id: number;
   name: string;
+  /** 소속 그룹 ID (인라인 배지 표시용) */
+  groupId: number | null;
   distKm: number;
   azDeg: number;
   topM: number;
@@ -95,12 +100,13 @@ interface AzElevChartProps {
   radarName: string;
   losses: ClassifiedLoss[];
   buildings: BuildingInfo[];
+  buildingGroups: BuildingGroup[];
   radarSite: RadarSite | null;
   panoWith: PanoramaPoint[];
   panoWithout: PanoramaPoint[];
 }
 
-function AzElevChart({ radarName, losses, buildings, radarSite: rs, panoWith, panoWithout }: AzElevChartProps) {
+function AzElevChart({ radarName, losses, buildings, buildingGroups, radarSite: rs, panoWith, panoWithout }: AzElevChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // 축/스케일 계산
@@ -514,7 +520,10 @@ function AzElevChart({ radarName, losses, buildings, radarSite: rs, panoWith, pa
             const hasBldgEffect = b.angleTotalDeg > b.angleTerrainDeg + 0.005;
             return (
               <tr key={b.name} className="bg-white">
-                <td className="border border-gray-200 px-2 py-1 pl-4">↳ {b.name}</td>
+                <td className="border border-gray-200 px-2 py-1 pl-4">
+                  ↳ {b.name}
+                  <BuildingGroupBadge groupId={b.groupId} groups={buildingGroups} />
+                </td>
                 <td className="border border-gray-200 px-2 py-1 text-right font-mono">
                   {bCaused.length}건 / {bDur.toFixed(1)}초
                 </td>
@@ -555,6 +564,7 @@ function ReportOMAltitudeDistribution({
   sectionNum,
   radarResults,
   selectedBuildings,
+  buildingGroups,
   radarSites,
   losMap,
   panoWithTargets,
@@ -590,6 +600,7 @@ function ReportOMAltitudeDistribution({
         return {
           id: b.id,
           name: b.name || `건물${b.id}`,
+          groupId: b.group_id,
           distKm,
           azDeg: bearingDeg(rs.latitude, rs.longitude, b.latitude, b.longitude),
           topM,
@@ -679,6 +690,7 @@ function ReportOMAltitudeDistribution({
         radarName={radarName}
         losses={losses}
         buildings={buildings}
+        buildingGroups={buildingGroups}
         radarSite={rs}
         panoWith={panoWithTargets?.get(radarName)?.terrain ?? []}
         panoWithout={panoWithoutTargets?.get(radarName)?.terrain ?? []}

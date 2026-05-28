@@ -1,5 +1,5 @@
 import React from "react";
-import type { RadarMonthlyResult, ManualBuilding, RadarSite, AzSector } from "../../types";
+import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, AzSector } from "../../types";
 import {
   weightedLossAvg, weightedLossStdDev,
   weightedPsrAvg, weightedPsrStdDev,
@@ -8,12 +8,15 @@ import {
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import BuildingGroupBadge from "./BuildingGroupBadge";
 import { PAGE_CONTENT_MM } from "./reportPageConstants";
 
 interface Props {
   sectionNum: number;
   radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
+  /** 건물 그룹 메타 (인라인 배지 표시용) */
+  buildingGroups: BuildingGroup[];
   radarSites: RadarSite[];
   /** 레이더별 방위 구간 (레이더 이름 → AzSector[]) */
   azimuthSectorsByRadar: Map<string, AzSector[]>;
@@ -42,6 +45,7 @@ function ReportOMSummarySection({
   sectionNum,
   radarResults,
   selectedBuildings,
+  buildingGroups,
   radarSites,
   azimuthSectorsByRadar,
   analysisMonth,
@@ -80,7 +84,10 @@ function ReportOMSummarySection({
           return (
             <tr key={b.id} className={idx % 2 === 0 ? "" : "alt"}>
               <td className="ta-c">{idx + 1}</td>
-              <td>{b.name || `건물 ${b.id}`}</td>
+              <td>
+                {b.name || `건물 ${b.id}`}
+                <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} />
+              </td>
               <td className="ta-r mono">{b.height.toFixed(0)}</td>
               {radarSites.map((r) => {
                 const az = bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude);

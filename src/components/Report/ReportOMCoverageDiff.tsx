@@ -1,8 +1,9 @@
 import React, { useMemo, useState, useEffect, useRef, forwardRef, useImperativeHandle } from "react";
-import type { RadarSite, LossPointGeo, ManualBuilding } from "../../types";
+import type { RadarSite, LossPointGeo, ManualBuilding, BuildingGroup } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import { groupColorOf } from "./BuildingGroupBadge";
 import { type OMSectionCaptureHandle, createDeferred, svgToPngDataUrl } from "./omCapture";
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
@@ -24,6 +25,8 @@ interface Props {
   /** 기본 고도 (ft) — 미사용, 호환성 유지 */
   defaultAltFt: number;
   selectedBuildings: ManualBuilding[];
+  /** 건물 그룹 메타 — 폴라맵 건물 사각형 + 라벨 색상 반영 (없으면 기본색) */
+  buildingGroups?: BuildingGroup[];
   /** true면 헤더 생략 (외부에서 헤더 렌더) */
   hideHeader?: boolean;
   /** 사전 캡처된 SVG dataUrl. 있으면 라이브 SVG 대신 <img> 표시 */
@@ -253,6 +256,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
   layersWithoutTargets,
   lossPoints,
   selectedBuildings,
+  buildingGroups,
   hideHeader,
   preCapturedImage,
   focusOnDiffOnly,
@@ -479,6 +483,16 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         });
       }
     }
+    // [DEBUG] diffPaths 생성 결과 — impactSummary 와 비교용
+    if (typeof console !== "undefined") {
+      console.log(
+        `[CoverageDiff ${radarSite.name}] focusOnDiffOnly=${!!focusOnDiffOnly} ` +
+        `bldgs=${selectedBuildings.map((b) => b.id).join(",")} ` +
+        `hasSector=${hasSector} sector=[${sectorStart.toFixed(1)}°,${sectorEnd.toFixed(1)}°] ` +
+        `diffPaths=${result.length} totalDiffBearings=${bearingsSum} ` +
+        `layers(w/wo)=${fixedWith.length}/${fixedWithout.length}`,
+      );
+    }
     // 낮은 고도(큰 영역) → 높은 고도(작은 영역) 순. 작은 영역이 위에 그려짐.
     return {
       diffPaths: result.sort((a, b) => a.altFt - b.altFt),
@@ -647,7 +661,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
             );
           })}
 
-          {/* 건물 위치 */}
+          {/* 건물 위치 — 그룹이 있으면 그룹 색으로 사각형·라벨 채색 */}
           {selectedBuildings.map((b, i) => {
             const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, b.latitude, b.longitude);
             if (distKm > globalMaxRange) return null;
@@ -655,10 +669,13 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
             const r = distKm * scale;
             const bx = cx + r * Math.sin(rad);
             const by = cy - r * Math.cos(rad);
+            const gColor = groupColorOf(b.group_id, buildingGroups ?? []);
+            const fillColor = gColor ?? "#f59e0b";
+            const textColor = gColor ?? "#92400e";
             return (
               <g key={`bld-${i}`}>
-                <rect x={bx - 4} y={by - 4} width={8} height={8} fill="#f59e0b" stroke="#ffffff" strokeWidth={0.8} rx={1.5} />
-                <text x={bx + 7} y={by + 3} fill="#92400e" fontSize={7} fontWeight={600}
+                <rect x={bx - 4} y={by - 4} width={8} height={8} fill={fillColor} stroke="#ffffff" strokeWidth={0.8} rx={1.5} />
+                <text x={bx + 7} y={by + 3} fill={textColor} fontSize={7} fontWeight={600}
                   stroke="#ffffff" strokeWidth={2} paintOrder="stroke">{b.name || `B${i + 1}`}</text>
               </g>
             );

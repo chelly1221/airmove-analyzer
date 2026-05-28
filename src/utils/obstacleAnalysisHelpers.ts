@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { RadarSite, ManualBuilding, LoSProfileData, AzSector, BuildingOnPath } from "../types";
 
 /** OM 보고서 LoS 단면도 차트 최소 X축 (km) — 빌딩이 가까워도 이만큼은 terrain 을 샘플링.
- *  100NM = 100 * 1.852 km. ReportOMLosCrossSection 의 MIN_X_NM 과 동일한 값. */
+ *  100NM = 100 * 1.852 km. ReportOMLosCrossSection 의 X 풀 스케일과 일치. */
 const EXTEND_PROFILE_MIN_KM = 100 * 1.852;
 
 /** LoS 분석 — 4개씩 병렬 배치 실행 */

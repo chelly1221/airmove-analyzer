@@ -57,6 +57,7 @@ export default function ReportGeneration() {
   const initialOMData: OMReportData = {
     result: null,
     selectedBuildings: [],
+    buildingGroups: [],
     selectedRadarSites: [],
     azSectorsByRadar: new Map(),
     losMap: new Map(),

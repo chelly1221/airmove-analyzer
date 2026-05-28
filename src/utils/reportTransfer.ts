@@ -5,7 +5,7 @@
  */
 import type {
   Flight, LoSProfileData, Aircraft, RadarSite, ReportMetadata,
-  PanoramaPoint, PanoramaMergeResult, ManualBuilding, AzSector, ObstacleMonthlyResult,
+  PanoramaPoint, PanoramaMergeResult, ManualBuilding, BuildingGroup, AzSector, ObstacleMonthlyResult,
   PreScreeningResult, OMReportData, TrackPoint,
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
@@ -47,6 +47,8 @@ export interface ReportSections {
 export interface SerializedOMData {
   result: ObstacleMonthlyResult | null;
   selectedBuildings: ManualBuilding[];
+  /** 건물 그룹 메타 (배지 색·이름 표시용) */
+  buildingGroups: BuildingGroup[];
   selectedRadarSites: RadarSite[];
   azSectorsByRadar: [string, AzSector[]][];
   losMap: [string, LoSProfileData][];
@@ -113,6 +115,7 @@ export function serializeOMData(om: OMReportData): SerializedOMData {
   return {
     result: om.result,
     selectedBuildings: om.selectedBuildings,
+    buildingGroups: om.buildingGroups,
     selectedRadarSites: om.selectedRadarSites,
     azSectorsByRadar: [...om.azSectorsByRadar],
     losMap: [...om.losMap],
@@ -135,6 +138,7 @@ export function deserializeOMData(s: SerializedOMData): OMReportData {
   return {
     result: s.result,
     selectedBuildings: s.selectedBuildings,
+    buildingGroups: s.buildingGroups ?? [],
     selectedRadarSites: s.selectedRadarSites,
     azSectorsByRadar: new Map(s.azSectorsByRadar),
     losMap: new Map(s.losMap),

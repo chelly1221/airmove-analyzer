@@ -1,6 +1,6 @@
 import React, { useMemo } from "react";
 import EditableText from "./EditableText";
-import type { RadarMonthlyResult, ManualBuilding, RadarSite } from "../../types";
+import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite } from "../../types";
 import {
   weightedLossAvg, weightedLossStdDev,
   weightedPsrAvg, weightedPsrStdDev,
@@ -10,11 +10,14 @@ import {
 import { haversineKm } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import AutoPaginate from "./AutoPaginate";
+import BuildingGroupBadge from "./BuildingGroupBadge";
 
 interface Props {
   sectionNum: number;
   radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
+  /** 건물 그룹 메타 (인라인 배지 표시용) */
+  buildingGroups: BuildingGroup[];
   radarSites: RadarSite[];
   /** 편집 가능 소견 텍스트 */
   findingsText: string;
@@ -35,6 +38,7 @@ function ReportOMFindings({
   sectionNum,
   radarResults,
   selectedBuildings,
+  buildingGroups,
   radarSites,
   findingsText,
   onFindingsChange,
@@ -75,6 +79,7 @@ function ReportOMFindings({
     selectedBuildings.map((b) => ({
       id: b.id,
       name: b.name || `건물${b.id}`,
+      groupId: b.group_id,
       height: b.height,
       dists: radarSites.map((rs) => {
         const km = haversineKm(rs.latitude, rs.longitude, b.latitude, b.longitude);
@@ -155,7 +160,9 @@ function ReportOMFindings({
       <div className="bldg-strip-list">
         {buildingDistTexts.map((bt) => (
           <span key={bt.id}>
-            <span className="strong">{bt.name}</span> ({bt.height}m) — {bt.dists.join(", ")}
+            <span className="strong">{bt.name}</span>
+            <BuildingGroupBadge groupId={bt.groupId} groups={buildingGroups} />
+            {" "}({bt.height}m) — {bt.dists.join(", ")}
           </span>
         ))}
       </div>

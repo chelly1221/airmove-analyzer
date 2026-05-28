@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import type { ManualBuilding, RadarSite, LoSProfileData, ElevationPoint, BuildingOnPath } from "../../types";
+import type { ManualBuilding, RadarSite, LoSProfileData, BuildingOnPath } from "../../types";
 import type { ObstacleMonthlyResult, LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportPage from "./ReportPage";
@@ -24,7 +24,7 @@ function curvDrop(dKm: number): number {
   return (dM * dM) / (2 * R_EARTH_M);
 }
 
-// ── SVG 차트 상수 (TrackMap LoSProfilePanel 과 일치) ──
+// ── SVG 차트 상수 (TrackMap LoSProfilePanel 과 동일) ──
 const W = 900;
 const H = 280;
 const PAD = { top: 20, right: 30, bottom: 30, left: 65 };
@@ -33,26 +33,12 @@ const ch = H - PAD.top - PAD.bottom;
 const M_TO_FT = 3.28084;
 const KM_TO_NM = 1 / 1.852;
 
-/** X축 최소 범위 (NM) — 빌딩이 가까워도 차트는 최소 이 거리까지 그린다.
- *  보고서 내 차트들의 X축 스케일을 통일해서 시각 비교를 쉽게 하기 위함. */
-const MIN_X_NM = 100;
+/** 차트 X축 풀 스케일 (NM) — 보고서 LoS 단면도는 빌딩 거리와 무관하게 100NM 고정.
+ *  obstacleAnalysisHelpers.EXTEND_PROFILE_MIN_KM 와 일치해야 한다 (profile 이 100NM 까지 샘플링). */
+const FULL_X_NM = 100;
+const FULL_X_KM = FULL_X_NM * 1.852;
 
 const LOSS_COLOR: [number, number, number] = [255, 23, 69]; // #ff1745
-
-/** 프로파일 보간 */
-function interpTerrainElev(profile: ElevationPoint[], d: number): number {
-  if (profile.length === 0) return 0;
-  if (d <= profile[0].distance) return profile[0].elevation;
-  if (d >= profile[profile.length - 1].distance) return profile[profile.length - 1].elevation;
-  for (let i = 1; i < profile.length; i++) {
-    if (profile[i].distance >= d) {
-      const denom = profile[i].distance - profile[i - 1].distance;
-      const t = denom > 1e-9 ? (d - profile[i - 1].distance) / denom : 0;
-      return profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
-    }
-  }
-  return 0;
-}
 
 export interface ChartTrackPoint {
   distKm: number;
@@ -61,24 +47,31 @@ export interface ChartTrackPoint {
   isLoss: boolean;
 }
 
-/** 단일 LoS 단면도 SVG — TrackMap LoSProfilePanel 디자인을 보고서용으로 정적 변환.
+/**
+ * LoS 단면도 — TrackMap LoSProfilePanel 의 chartData/렌더링을 보고서용으로 그대로 이식.
  *
- *  TrackMap 과 동일한 시각 요소:
- *   - 단일 LoS 선 (running max angle, 통합 obstacle 배열)
- *   - 경로상 모든 빌딩: 도형은 사다리꼴(곡률 보정으로 양 끝 높이 다름), 점은 세로선
- *   - 빌딩 색상: 차폐 기여(빨강) / 비차단(회색) / 수동(주황)
+ *  TrackMap 과 동일한 요소:
+ *   - 직선 LoS (running max angle, 통합 obstacle 배열) — 주황 실선
+ *   - 지형 (지구곡률 보정) — 녹색 솔리드
+ *   - 경로상 빌딩: polygon 은 사다리꼴, point 는 세로선; 차폐 기여(빨강) / 비차단(회색) / 수동(주황)
  *   - 범례 좌상단 + 빌딩 카운트
- *   - 항적/소실표적은 SVG circles (PDF 캡처 호환)
  *
- *  보고서 한정 추가:
- *   - 타겟 빌딩(분석 대상)은 별도 마커 + ft 라벨로 명시
+ *  보고서 한정 — 정적 렌더링이라 제거:
+ *   - GPU 캔버스 트랙 → SVG circles
+ *   - 호버/툴팁/줌/사용자 각도선
+ *   - peak DB 쿼리 (배치 부담)
+ *   - BRA / CoS / 프레넬 기준선 (단순화)
+ *
+ *  X축은 100NM 고정 (FULL_X_KM). los.elevationProfile 은 obstacleAnalysisHelpers 에서 100NM 까지 샘플링됨.
  */
 export function LosCrossSection({
-  los, radarName, building, trackPoints, lossPoints,
+  los, radarName, building, buildingGroup, trackPoints, lossPoints,
 }: {
   los: LoSProfileData;
   radarName: string;
   building: ManualBuilding;
+  /** 이 빌딩의 소속 그룹 — 제목 옆 인라인 배지 표시용. 없으면 미표시 */
+  buildingGroup?: import("../../types").BuildingGroup | null;
   trackPoints: ChartTrackPoint[];
   lossPoints: ChartTrackPoint[];
 }) {
@@ -87,62 +80,59 @@ export function LosCrossSection({
     if (profile.length === 0) return null;
 
     const radarHeight = los.radarHeight;
-    const profileEnd = profile[profile.length - 1].distance;
+    const D = los.totalDistance;
+    const targetElev = building.ground_elev + building.height;
+    const adjTarget = targetElev - curvDrop(D);
+    const buildings: BuildingOnPath[] = los.pathBuildings ?? [];
 
-    // 빌딩 좌표 — los.totalDistance/bearing 이 이미 빌딩 좌표 기준
-    const bDistKm = los.totalDistance;
-    const bTopElev = building.ground_elev + building.height;
-
-    // X축은 최소 MIN_X_NM 보장 — 빌딩이 가까워도 차트 비교가 가능하도록.
-    const maxDistance = Math.max(profileEnd, MIN_X_NM / KM_TO_NM);
-
-    // 1) 조정 지형 (실제지구 곡률 보정)
+    // 1) 조정 지형 (실제 지구곡률 반영)
     const adjTerrain = profile.map((p) => ({
       distance: p.distance,
       height: p.elevation - curvDrop(p.distance),
     }));
 
-    // 1.5) 통합 장애물 배열: 지형 + 경로상 빌딩 + 타겟 빌딩
-    //   TrackMap 방식 — building 을 정확한 위치의 독립 장애물로 처리.
-    //   bDistKm 너머의 지형은 LoS 누적에서 제외 (빌딩 가시성은 빌딩까지의 지형에만 좌우).
-    const pathBuildings = los.pathBuildings ?? [];
+    // 1.5) 통합 장애물 배열: 지형 + 빌딩 (TrackMap 와 동일)
     interface Obstacle { distance: number; elevation: number; }
     const obstacles: Obstacle[] = [];
     for (const p of profile) {
-      if (p.distance <= bDistKm + 1e-9) {
-        obstacles.push({ distance: p.distance, elevation: p.elevation });
-      }
+      obstacles.push({ distance: p.distance, elevation: p.elevation });
     }
-    for (const b of pathBuildings) {
+    for (const b of buildings) {
+      const bTop = b.ground_elev_m + b.height_m;
       const nearD = b.near_dist_km ?? b.distance_km;
       const farD = b.far_dist_km ?? b.distance_km;
-      const bTop = b.ground_elev_m + b.height_m;
-      if (nearD <= bDistKm + 1e-9) {
-        obstacles.push({ distance: nearD, elevation: bTop });
-      }
-      if (farD - nearD > 0.001 && farD <= bDistKm + 1e-9) {
+      obstacles.push({ distance: nearD, elevation: bTop });
+      if (farD - nearD > 0.001) {
         obstacles.push({ distance: farD, elevation: bTop });
       }
     }
-    // 타겟 빌딩 — pathBuildings 에 동일 좌표 빌딩이 이미 있을 수도 있지만,
-    //   사용자가 입력한 ManualBuilding 의 정확한 높이/위치를 보장하기 위해 항상 추가.
-    obstacles.push({ distance: bDistKm, elevation: bTopElev });
     obstacles.sort((a, b) => a.distance - b.distance);
 
-    // 건물 경계 — 쉐도잉 라인의 수직 전환 보장용
     interface BuildingEdge { nearD: number; farD: number; topElev: number; groundElev: number; }
-    const buildingEdges: BuildingEdge[] = pathBuildings.map((b) => ({
+    const buildingEdges: BuildingEdge[] = buildings.map((b) => ({
       nearD: b.near_dist_km ?? b.distance_km,
       farD: b.far_dist_km ?? b.distance_km,
       topElev: b.ground_elev_m + b.height_m,
       groundElev: b.ground_elev_m,
     }));
 
-    // 통합 샘플 거리 — 프로파일 포인트 + 건물 경계 (LoS 라인이 건물에서 수직으로 오르도록)
-    const sampleDists: number[] = [];
-    for (const p of profile) sampleDists.push(p.distance);
-    const eps = 0.0005; // ~0.5m
+    const interpTerrainElev = (d: number): number => {
+      if (d <= profile[0].distance) return profile[0].elevation;
+      if (d >= profile[profile.length - 1].distance) return profile[profile.length - 1].elevation;
+      for (let i = 1; i < profile.length; i++) {
+        if (profile[i].distance >= d) {
+          const denom = profile[i].distance - profile[i - 1].distance;
+          const t = denom > 1e-9 ? (d - profile[i - 1].distance) / denom : 0;
+          return profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
+        }
+      }
+      return 0;
+    };
+
+    // 통합 샘플 거리 (profile + 건물 경계 ± eps)
+    const sampleDists: number[] = profile.map((p) => p.distance);
     for (const be of buildingEdges) {
+      const eps = 0.0005;
       if (be.nearD > eps) sampleDists.push(be.nearD - eps);
       sampleDists.push(be.nearD);
       if (be.farD - be.nearD > 0.001) {
@@ -152,68 +142,69 @@ export function LosCrossSection({
         sampleDists.push(be.nearD + eps);
       }
     }
-    // 타겟 빌딩 경계도 동일하게 추가
-    if (bDistKm > eps) sampleDists.push(bDistKm - eps);
-    sampleDists.push(bDistKm);
-    sampleDists.push(bDistKm + eps);
     const uniqueDists = [...new Set(sampleDists)].sort((a, b) => a - b);
 
-    // 유효 고도 — 지형 + 건물 포함 (특정 거리에서 가장 높은 장애물)
     const effectiveElevAt = (d: number): number => {
-      let elev = interpTerrainElev(profile, d);
+      let elev = interpTerrainElev(d);
       for (const be of buildingEdges) {
         if (d >= be.nearD && d <= be.farD + 0.0001) {
           if (be.topElev > elev) elev = be.topElev;
         }
       }
-      if (Math.abs(d - bDistKm) < 0.001 && bTopElev > elev) elev = bTopElev;
       return elev;
     };
 
-    // 2) 직선 LoS (running max angle) — TrackMap minDetStraight 와 동일한 로직.
-    //   bDistKm 까지만 maxAngle 누적; 그 너머는 마지막 각도로 외삽.
-    let maxAngle = 0;
-    let obIdx = 0;
-    const losPath: { distance: number; height: number }[] = [];
-    for (const d of uniqueDists) {
-      if (d <= 0) {
-        losPath.push({ distance: d, height: radarHeight });
-        continue;
-      }
+    // 2) 직선 LoS (Running Max Angle) — TrackMap minDetStraight
+    let maxAngleStraight = -Infinity;
+    let obIdxStraight = 0;
+    const minDetStraight = uniqueDists.map((d) => {
+      if (d <= 0) return { distance: d, height: radarHeight };
       const dM = d * 1000;
-      while (obIdx < obstacles.length && obstacles[obIdx].distance <= d + 1e-9) {
-        const ob = obstacles[obIdx];
-        if (ob.distance > 0 && ob.distance <= bDistKm + 1e-9) {
+      while (obIdxStraight < obstacles.length && obstacles[obIdxStraight].distance <= d + 1e-9) {
+        const ob = obstacles[obIdxStraight];
+        if (ob.distance > 0) {
           const adjH = ob.elevation - curvDrop(ob.distance);
           const angle = (adjH - radarHeight) / (ob.distance * 1000);
-          if (angle > maxAngle) maxAngle = angle;
+          if (angle > maxAngleStraight) maxAngleStraight = angle;
         }
-        obIdx++;
+        obIdxStraight++;
       }
-      // 현재 지점의 유효 고도(건물 포함)도 앙각에 반영 (analysisEnd 이내)
-      if (d <= bDistKm + 1e-9) {
-        const elev = effectiveElevAt(d);
-        const adjH = elev - curvDrop(d);
-        const terrAngle = (adjH - radarHeight) / dM;
-        if (terrAngle > maxAngle) maxAngle = terrAngle;
+      const terrElev = effectiveElevAt(d);
+      const adjH = terrElev - curvDrop(d);
+      const terrAngle = (adjH - radarHeight) / dM;
+      if (terrAngle > maxAngleStraight) maxAngleStraight = terrAngle;
+      const losH = radarHeight + maxAngleStraight * dM;
+      return { distance: d, height: Math.max(adjH, losH) };
+    });
+
+    // 차단 판정 (TrackMap 와 동일 — 빌딩까지 직선 LoS 와 통합 장애물 비교)
+    const losStraightH = (d: number) =>
+      radarHeight + (adjTarget - radarHeight) * (d / D);
+    let blocked = false;
+    let maxBlockPoint: { distance: number; adjHeight: number; realElevation: number } | null = null;
+    let maxExcess = 0;
+    for (const ob of obstacles) {
+      if (ob.distance <= 0 || ob.distance >= D) continue;
+      const adjH = ob.elevation - curvDrop(ob.distance);
+      const excess = adjH - losStraightH(ob.distance);
+      if (excess > maxExcess) {
+        maxExcess = excess;
+        blocked = true;
+        maxBlockPoint = {
+          distance: ob.distance,
+          adjHeight: adjH,
+          realElevation: ob.elevation,
+        };
       }
-      const losH = radarHeight + maxAngle * dM;
-      losPath.push({ distance: d, height: losH });
     }
 
-    // 3) 차폐 기여 빌딩 — TrackMap 방식: 지형만 shadow 보다 빌딩 꼭대기가 높으면 차폐 기여.
-    //   타겟 빌딩은 별도 처리 (항상 마커로 표시되므로 significantBuildings 에서는 분리).
-    type SigBuilding = BuildingOnPath & { isBlocking: boolean; isTarget: boolean };
-    const significantBuildings: SigBuilding[] = [];
-    const targetEpsDeg = 1e-4;
-    let targetInPath = false;
-    for (const b of pathBuildings) {
+    // 5) 차폐 기여 빌딩 — 지형만 shadow 보다 빌딩 꼭대기가 높으면 실질 차폐 기여
+    const significantBuildings: (BuildingOnPath & { isBlocking: boolean })[] = [];
+    for (const b of buildings) {
       const bDist = b.distance_km;
-      if (bDist <= 0 || bDist > bDistKm + 0.01) continue;
+      if (bDist <= 0 || bDist >= D) continue;
       const bTop = b.ground_elev_m + b.height_m;
       const bAdj = bTop - curvDrop(bDist);
-
-      // 지형만으로 생성된 shadow
       let terrainShadow = radarHeight;
       for (const p of profile) {
         if (p.distance <= 0 || p.distance >= bDist) continue;
@@ -221,63 +212,25 @@ export function LosCrossSection({
         const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
         if (shadow > terrainShadow) terrainShadow = shadow;
       }
-      const isTarget =
-        Math.abs(b.lat - building.latitude) < targetEpsDeg &&
-        Math.abs(b.lon - building.longitude) < targetEpsDeg;
-      if (isTarget) targetInPath = true;
-      const isBlocking = bAdj > terrainShadow;
-      if (isBlocking || isTarget) {
-        significantBuildings.push({ ...b, isBlocking, isTarget });
+      if (bAdj > terrainShadow) {
+        const isBlk = !!(maxBlockPoint &&
+          Math.abs(bDist - maxBlockPoint.distance) < 0.1 &&
+          bAdj > maxBlockPoint.adjHeight - 5);
+        significantBuildings.push({ ...b, isBlocking: isBlk });
       }
     }
-    // 타겟 빌딩이 pathBuildings 에 없으면 사용자 입력 좌표/높이로 별도 추가.
-    if (!targetInPath) {
-      const bTop = bTopElev;
-      const bAdj = bTop - curvDrop(bDistKm);
-      let terrainShadow = radarHeight;
-      for (const p of profile) {
-        if (p.distance <= 0 || p.distance >= bDistKm) continue;
-        const adjH = p.elevation - curvDrop(p.distance);
-        const shadow = radarHeight + (adjH - radarHeight) * (bDistKm / p.distance);
-        if (shadow > terrainShadow) terrainShadow = shadow;
-      }
-      significantBuildings.push({
-        distance_km: bDistKm,
-        near_dist_km: bDistKm,
-        far_dist_km: bDistKm,
-        height_m: building.height,
-        ground_elev_m: building.ground_elev,
-        total_height_m: bTopElev,
-        name: building.name,
-        address: null,
-        usage: null,
-        lat: building.latitude,
-        lon: building.longitude,
-        is_manual: true,
-        isBlocking: bAdj > terrainShadow,
-        isTarget: true,
-      });
-    }
 
-    // 타겟 빌딩 차단 여부 (제목 chip 용)
-    const blocked = significantBuildings.find((b) => b.isTarget)?.isBlocking ?? false;
-
-    // 4) Y축 범위 — 빌딩 거리 + 20% 버퍼 안의 데이터만 사용 (TrackMap 와 동일한 의도).
-    //   100NM 까지 확장된 profile 의 먼 지점은 curvDrop 이 수천 m 로 커서
-    //   Y 범위를 잡으면 정작 빌딩 부근의 디테일이 압축돼 보이지 않게 됨.
-    const yWindowEndKm = bDistKm * 1.2;
-    const inYWindow = (d: number) => d <= yWindowEndKm;
-    const allHeights: number[] = [radarHeight];
-    for (const p of adjTerrain) if (inYWindow(p.distance)) allHeights.push(p.height);
-    for (const p of losPath) if (inYWindow(p.distance)) allHeights.push(p.height);
-    for (const b of significantBuildings) {
-      allHeights.push((b.ground_elev_m + b.height_m) - curvDrop(b.distance_km));
-    }
+    // Y축 범위
+    const allHeights = [
+      radarHeight,
+      ...adjTerrain.map((p) => p.height),
+      ...minDetStraight.map((p) => p.height),
+    ];
     let maxY = -Infinity;
     for (const h of allHeights) if (h > maxY) maxY = h;
     maxY += 100;
     let minY = 0;
-    for (const p of adjTerrain) if (inYWindow(p.distance) && p.height < minY) minY = p.height;
+    for (const p of adjTerrain) if (p.height < minY) minY = p.height;
     minY -= 50;
     if (minY < 0) {
       const minMaxYFor40Pct = -minY * 1.5;
@@ -285,22 +238,24 @@ export function LosCrossSection({
     }
 
     return {
-      adjTerrain, losPath, significantBuildings, blocked,
-      bDistKm, bTopElev, minY, maxY, maxDistance, radarHeight,
+      adjTerrain, minDetStraight,
+      blocked, maxBlockPoint, significantBuildings,
+      minY, maxY, maxDistance: FULL_X_KM,
+      adjTarget, targetElev, radarHeight,
     };
   }, [los, building]);
 
   if (!chartData) return null;
 
   const {
-    adjTerrain, losPath, significantBuildings, blocked,
-    bDistKm, bTopElev, minY, maxY, maxDistance, radarHeight,
+    adjTerrain, minDetStraight,
+    blocked, significantBuildings, minY, maxY, maxDistance, radarHeight,
   } = chartData;
 
   const xScale = (d: number) => PAD.left + (d / maxDistance) * cw;
   const yScale = (h: number) => PAD.top + ch - ((h - minY) / (maxY - minY)) * ch;
 
-  // 지형 채우기
+  // 지형 채우기 (마지막 profile 포인트까지)
   const lastTerrainD = adjTerrain[adjTerrain.length - 1]?.distance ?? maxDistance;
   const terrainFill =
     `M ${xScale(0)} ${yScale(minY)} ` +
@@ -310,8 +265,7 @@ export function LosCrossSection({
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
     .join(" ");
 
-  // 직선 LoS (장애물 포함, 메인 — 주황 실선)
-  const losPathD = losPath
+  const minDetStrPath = minDetStraight
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
     .join(" ");
 
@@ -325,35 +279,51 @@ export function LosCrossSection({
 
   // X축 눈금 (NM)
   const maxDistNm = maxDistance * KM_TO_NM;
-  const xStepNm = maxDistNm > 80 ? 20 : maxDistNm > 40 ? 10 : maxDistNm > 15 ? 5 : maxDistNm > 5 ? 2 : maxDistNm > 2 ? 1 : 0.5;
+  const xStepNm = maxDistNm > 80 ? 20 : maxDistNm > 40 ? 10 : maxDistNm > 15 ? 5 : maxDistNm > 5 ? 2 : 1;
   const xTicks: number[] = [];
   for (let xn = xStepNm; xn <= maxDistNm; xn += xStepNm) xTicks.push(xn / KM_TO_NM);
-  const xTickDecimals = xStepNm < 1 ? 1 : 0;
 
-  // 타겟 빌딩 마커 정보 (꼭대기 동그라미만 사용 — 본체는 significantBuildings 에서 그려짐)
-  const bTopAdj = bTopElev - curvDrop(bDistKm);
+  // 제목용 빌딩 메타
+  const D = los.totalDistance;
+  const targetElev = building.ground_elev + building.height;
   const buildingName = building.name || `건물 ${building.id}`;
-  const bDistNm = bDistKm * KM_TO_NM;
+  const bDistNm = D * KM_TO_NM;
 
-  // 빌딩 카운트 (범례용)
-  const blockingCount = significantBuildings.filter((b) => b.isBlocking && !b.isTarget).length;
-  const nonBlockingCount = significantBuildings.filter((b) => !b.isBlocking && !b.isTarget).length;
-  const manualCount = significantBuildings.filter((b) => b.is_manual && !b.isTarget).length;
-  const legendH = 66 + 14 // 타겟 빌딩 항목 (항상 표시)
-    + (blockingCount > 0 ? 14 : 0)
-    + (nonBlockingCount > 0 ? 14 : 0)
-    + (manualCount > 0 ? 14 : 0)
-    + 14 // 항적
-    + 14; // 소실표적
+  // 빌딩 카운트
+  const blockingCount = significantBuildings.filter((b) => b.isBlocking).length;
+  const manualCount = significantBuildings.filter((b) => b.is_manual).length;
+  const nonBlockingCount = significantBuildings.length - blockingCount;
+
+  // 범례 박스 높이 — LoS + 지형 (2줄, 28px) + 차폐/비차폐/수동 + 항적/소실표적
+  let legendH = 24;
+  if (blockingCount > 0) legendH += 14;
+  if (nonBlockingCount > 0) legendH += 14;
+  if (manualCount > 0) legendH += 14;
+  legendH += 14 + 14; // 항적 + 소실표적
+
+  const idSuffix = `${los.id}-${building.id}`;
 
   return (
     <div className="mb-3">
       {/* 제목 */}
       <div className="mb-1 flex items-center gap-2">
         <span className="text-[13px] font-bold text-gray-800">{buildingName}</span>
+        {buildingGroup && (
+          <span
+            className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[10px] font-semibold"
+            style={{
+              background: `${buildingGroup.color}1a`,
+              border: `1px solid ${buildingGroup.color}55`,
+              color: buildingGroup.color,
+            }}
+          >
+            <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: 1, background: buildingGroup.color }} />
+            {buildingGroup.name}
+          </span>
+        )}
         <span className="text-[11px] text-gray-500">
-          {radarName} → 방위 {los.bearing.toFixed(1)}° / 거리 {bDistNm.toFixed(1)}NM ({bDistKm.toFixed(1)}km)
-          / 높이 {Math.round(bTopElev * M_TO_FT).toLocaleString()}ft ({bTopElev.toFixed(0)}m)
+          {radarName} → 방위 {los.bearing.toFixed(1)}° / 거리 {bDistNm.toFixed(1)}NM ({D.toFixed(1)}km)
+          / 높이 {Math.round(targetElev * M_TO_FT).toLocaleString()}ft ({targetElev.toFixed(0)}m)
         </span>
         <span className={`ml-auto rounded px-1.5 py-0.5 text-[11px] font-medium ${
           blocked ? "bg-red-50 text-red-600" : "bg-green-50 text-green-600"
@@ -364,11 +334,7 @@ export function LosCrossSection({
 
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 230 }}>
         <defs>
-          <linearGradient id={`tg-${los.id}-${building.id}`} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#22c55e" stopOpacity="0.5" />
-            <stop offset="100%" stopColor="#22c55e" stopOpacity="0.05" />
-          </linearGradient>
-          <clipPath id={`cc-${los.id}-${building.id}`}>
+          <clipPath id={`cc-${idSuffix}`}>
             <rect x={PAD.left} y={PAD.top} width={cw} height={ch} />
           </clipPath>
         </defs>
@@ -383,15 +349,15 @@ export function LosCrossSection({
             </text>
           );
         })}
-        {/* X축 라벨 (클립 밖) */}
+        {/* X축 라벨 */}
         {xTicks.map((x) => (
           <text key={`xl-${x.toFixed(3)}`} x={xScale(x)} y={H - PAD.bottom + 14} textAnchor="middle"
             fill="#6b7280" fontSize={9}>
-            {(x * KM_TO_NM).toFixed(xTickDecimals)}NM
+            {(x * KM_TO_NM).toFixed(x * KM_TO_NM >= 10 ? 0 : 1)}NM
           </text>
         ))}
 
-        <g clipPath={`url(#cc-${los.id}-${building.id})`}>
+        <g clipPath={`url(#cc-${idSuffix})`}>
           {/* 수평 격자 (곡률 반영 곡선) */}
           {yTicks.map((y) => {
             const parts: string[] = [];
@@ -411,15 +377,11 @@ export function LosCrossSection({
               stroke="rgba(0,0,0,0.06)" strokeWidth={0.5} />
           ))}
 
-          {/* 지형 */}
-          <path d={terrainFill} fill={`url(#tg-${los.id}-${building.id})`} />
+          {/* 지형 — 솔리드 녹색 (그라데이션 제거: 바닥이 검게 보이는 문제 회피) */}
+          <path d={terrainFill} fill="#22c55e" fillOpacity={0.35} />
           <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
 
-          {/* 건물 실루엣 — TrackMap 방식: 도형 빌딩은 사다리꼴, 점 빌딩은 세로선.
-              isTarget: 분석 대상 (밝은 주황 + 굵은 윤곽)
-              isBlocking: 차폐 기여 (빨강)
-              is_manual: 수동 등록 (주황)
-              그 외: 비차단 (회색) */}
+          {/* 건물 실루엣 — TrackMap 방식 (사다리꼴 / 세로선) */}
           {significantBuildings.map((b, bi) => {
             const nearD = b.near_dist_km ?? b.distance_km;
             const farD = b.far_dist_km ?? b.distance_km;
@@ -437,63 +399,42 @@ export function LosCrossSection({
             const bHeight = byBottomNear - byTopNear;
             if (bHeight < 1) return null;
 
-            // 색상 결정 — TrackMap 과 동일한 우선순위
-            let baseColor: string;
-            let fillColor: string;
-            let strokeW: number;
-            if (b.isTarget) {
-              baseColor = "#f97316"; // 분석 대상 — 주황 (밝은)
-              fillColor = "rgba(249,115,22,0.25)";
-              strokeW = 2;
-            } else if (b.isBlocking) {
-              baseColor = "rgba(239, 68, 68, 0.8)"; // 빨강
-              fillColor = "rgba(239,68,68,0.15)";
-              strokeW = 1;
-            } else if (b.is_manual) {
-              baseColor = "#f97316"; // 수동 — 주황
-              fillColor = "rgba(249,115,22,0.15)";
-              strokeW = 1;
-            } else {
-              baseColor = "rgba(148, 163, 184, 0.5)"; // 비차단 — 회색
-              fillColor = "rgba(148,163,184,0.08)";
-              strokeW = 1;
-            }
+            const baseColor = b.is_manual
+              ? "#f97316"
+              : b.isBlocking
+                ? "rgba(239, 68, 68, 0.8)"
+                : "rgba(148, 163, 184, 0.5)";
+            const fillColor = b.is_manual
+              ? "rgba(249,115,22,0.15)"
+              : b.isBlocking
+                ? "rgba(239,68,68,0.15)"
+                : "rgba(148,163,184,0.08)";
 
             if (hasExtent) {
-              // 도형 건물: 채워진 사다리꼴 (곡률 보정으로 양쪽 높이 다름)
               const pathD = `M ${bxNear} ${byBottomNear} L ${bxNear} ${byTopNear} L ${bxFar} ${byTopFar} L ${bxFar} ${byBottomFar} Z`;
               return (
-                <path key={`bld-${bi}`} d={pathD} fill={fillColor} stroke={baseColor}
-                  strokeWidth={strokeW} />
+                <path key={`bld-${bi}`} d={pathD} fill={fillColor} stroke={baseColor} strokeWidth={1} />
               );
             }
-            // 점 건물: 세로선
             return (
               <line key={`bld-${bi}`}
                 x1={bxNear} y1={byBottomNear}
                 x2={bxNear} y2={byTopNear}
-                stroke={baseColor} strokeWidth={b.isTarget ? 2.5 : 1.5} />
+                stroke={baseColor} strokeWidth={1} />
             );
           })}
 
-          {/* 직선 LoS (장애물 포함, 메인 주황 실선) */}
-          <path d={losPathD} fill="none"
+          {/* 직선 LoS (실제 지구반경, 메인) */}
+          <path d={minDetStrPath} fill="none"
             stroke="#f59e0b" strokeWidth={1.8} />
 
-          {/* 타겟 빌딩 마커 — 분석 대상임을 명시 (꼭대기 동그라미 + ft 라벨) */}
-          <circle
-            cx={xScale(bDistKm)}
-            cy={yScale(bTopAdj)}
-            r={4}
-            fill="#f97316" stroke="white" strokeWidth={1} />
-          <text
-            x={xScale(bDistKm)}
-            y={yScale(bTopAdj) - 8}
-            textAnchor="middle" fill="#374151" fontSize={8} fontWeight="bold">
-            {Math.round(bTopElev * M_TO_FT).toLocaleString()}ft
+          {/* 레이더 위치 라벨 */}
+          <text x={xScale(0) + 4} y={PAD.top + 12}
+            fill="#6b7280" fontSize={8}>
+            {radarName} ({Math.round(radarHeight * M_TO_FT).toLocaleString()}ft)
           </text>
 
-          {/* 항적 포인트 (일반) */}
+          {/* 항적 포인트 */}
           {trackPoints.map((tp, i) => {
             const adjAlt = tp.altM - curvDrop(tp.distKm);
             const px = xScale(tp.distKm);
@@ -501,72 +442,46 @@ export function LosCrossSection({
             const col = detectionTypeColor(tp.radarType);
             const hasPsr = PSR_TYPES.has(tp.radarType);
             return (
-              <circle
-                key={`tp-${i}`}
-                cx={px}
-                cy={py}
-                r={1.2}
-                fill={`rgb(${col[0]},${col[1]},${col[2]})`}
-                fillOpacity={0.6}
-                stroke={hasPsr ? "rgba(255,255,255,0.5)" : "none"}
-                strokeWidth={hasPsr ? 0.5 : 0}
-              />
+              <circle key={`tp-${i}`} cx={px} cy={py} r={1.5}
+                fill={`rgb(${col[0]},${col[1]},${col[2]})`} fillOpacity={0.7}
+                stroke={hasPsr ? "rgba(255,255,255,0.6)" : "none"}
+                strokeWidth={hasPsr ? 1 : 0} />
             );
           })}
-          {/* 소실표적 포인트 (Loss — 일반 항적 위에 표시) */}
+          {/* 소실표적 포인트 */}
           {lossPoints.map((lp, i) => {
             const adjAlt = lp.altM - curvDrop(lp.distKm);
             const px = xScale(lp.distKm);
             const py = yScale(adjAlt);
             return (
-              <circle
-                key={`lp-${i}`}
-                cx={px}
-                cy={py}
-                r={2}
-                fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`}
-                fillOpacity={0.85}
-                stroke={`rgba(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]},0.4)`}
-                strokeWidth={0.5}
-              />
+              <circle key={`lp-${i}`} cx={px} cy={py} r={2.5}
+                fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.9}
+                stroke={`rgba(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]},0.5)`}
+                strokeWidth={0.5} />
             );
           })}
-
-          {/* 레이더 위치 라벨 */}
-          <text x={xScale(0) + 4} y={PAD.top + 12}
-            fill="#6b7280" fontSize={8}>
-            {radarName} ({Math.round(radarHeight * M_TO_FT).toLocaleString()}ft)
-          </text>
         </g>
 
         {/* 범례 (좌상단 — TrackMap 방식) */}
         <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5})`}>
-          <rect x={-4} y={-6} width={270} height={legendH} rx={4}
+          <rect x={-4} y={-6} width={200} height={legendH} rx={4}
             fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
-          {/* LoS 선 */}
-          <line x1={0} y1={0} x2={20} y2={0}
-            stroke="#f59e0b" strokeWidth={1.8} />
+          <line x1={0} y1={0} x2={20} y2={0} stroke="#f59e0b" strokeWidth={1.8} />
           <text x={24} y={3} fill="#374151" fontSize={8}>
-            직선 LoS (장애물 포함)
+            최저 탐지가능 높이 (직선 LoS)
           </text>
-          {/* 지형 */}
           <line x1={0} y1={14} x2={20} y2={14} stroke="#22c55e" strokeWidth={1.5} />
           <text x={24} y={17} fill="#374151" fontSize={8}>
             지형 (지구곡률 보정)
           </text>
-          {/* 타겟 빌딩 */}
-          <rect x={2} y={28 - 4} width={16} height={8} fill="rgba(249,115,22,0.25)" stroke="#f97316" strokeWidth={2} />
-          <text x={24} y={31} fill="#374151" fontSize={8}>
-            분석 대상 ({buildingName})
-          </text>
-          {/* 빌딩 카운트 (조건부) */}
           {(() => {
-            let legendY = 42;
+            let legendY = 24;
             const items: React.ReactNode[] = [];
             if (blockingCount > 0) {
               items.push(
                 <g key="leg-blk">
-                  <rect x={2} y={legendY - 4} width={16} height={8} fill="rgba(239,68,68,0.15)" stroke="rgba(239,68,68,0.8)" strokeWidth={0.5} />
+                  <rect x={2} y={legendY - 4} width={16} height={8}
+                    fill="rgba(239,68,68,0.15)" stroke="rgba(239,68,68,0.8)" strokeWidth={0.5} />
                   <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
                     LoS 차단 건물 ({blockingCount}동)
                   </text>
@@ -577,7 +492,8 @@ export function LosCrossSection({
             if (nonBlockingCount > 0) {
               items.push(
                 <g key="leg-nb">
-                  <rect x={2} y={legendY - 4} width={16} height={8} fill="rgba(148,163,184,0.08)" stroke="rgba(148,163,184,0.5)" strokeWidth={0.5} />
+                  <rect x={2} y={legendY - 4} width={16} height={8}
+                    fill="rgba(148,163,184,0.08)" stroke="rgba(148,163,184,0.5)" strokeWidth={0.5} />
                   <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
                     비차단 건물 ({nonBlockingCount}동)
                   </text>
@@ -588,7 +504,8 @@ export function LosCrossSection({
             if (manualCount > 0) {
               items.push(
                 <g key="leg-mn">
-                  <rect x={2} y={legendY - 4} width={16} height={8} fill="rgba(249,115,22,0.15)" stroke="#f97316" strokeWidth={0.5} />
+                  <rect x={2} y={legendY - 4} width={16} height={8}
+                    fill="rgba(249,115,22,0.15)" stroke="#f97316" strokeWidth={0.5} />
                   <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
                     수동 등록 건물 ({manualCount}동)
                   </text>
@@ -596,7 +513,6 @@ export function LosCrossSection({
               );
               legendY += 14;
             }
-            // 항적/소실표적
             items.push(
               <g key="leg-tp">
                 <circle cx={9} cy={legendY} r={1.5} fill="rgb(34,197,94)" fillOpacity={0.7} />
@@ -609,7 +525,7 @@ export function LosCrossSection({
             items.push(
               <g key="leg-loss">
                 <circle cx={9} cy={legendY} r={2.5}
-                  fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.85} />
+                  fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.9} />
                 <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
                   소실표적 ({lossPoints.length.toLocaleString()}건)
                 </text>
@@ -627,8 +543,6 @@ export function LosCrossSection({
  * 레이더→빌딩 직선상 항적/소실표적 투영 — TrackMap LoSProfilePanel 의 `losTrackPoints` 와 동일.
  *
  * 절대 수직거리 1km 이내 + along ∈ (0, 빌딩거리] 만 채택.
- * (이전엔 ±5° 베어링 필터를 썼는데, 빌딩이 1.4NM 처럼 가까우면 ±5° 가 거의 전방향이라
- *  0NM 근처에 점이 검은 막대처럼 뭉치는 문제가 있었다 — TrackMap 방식으로 통일.)
  */
 export function projectPointsToLos(
   los: LoSProfileData,
@@ -680,7 +594,7 @@ export function projectPointsToLos(
   return { track, loss };
 }
 
-/** 페이지당 차트 수 (각 차트 ≈ 80mm) */
+/** 페이지당 차트 수 */
 const CHARTS_PER_PAGE = 2;
 
 function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, losMap, omResult, hideHeader }: Props) {
@@ -725,7 +639,6 @@ function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, lo
 
   if (entries.length === 0) return null;
 
-  // 페이지 분할
   const pages: React.ReactNode[] = [];
   for (let offset = 0; offset < entries.length; offset += CHARTS_PER_PAGE) {
     const chunk = entries.slice(offset, offset + CHARTS_PER_PAGE);

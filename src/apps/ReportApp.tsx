@@ -26,7 +26,7 @@ import {
 } from "../utils/reportTransfer";
 import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
-  PanoramaPoint, PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, RadarSite, TrackPoint, AzSector,
+  PanoramaPoint, PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, TrackPoint, AzSector,
   ObstacleMonthlyResult, PreScreeningResult, OMReportData, SavedReportSummary,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
@@ -795,6 +795,7 @@ export default function ReportApp() {
   const handleOMGenerate = useCallback(async (
     result: ObstacleMonthlyResult,
     buildings: ManualBuilding[],
+    groups: BuildingGroup[],
     radars: RadarSite[],
     azMap: Map<string, AzSector[]>,
     losMap: Map<string, LoSProfileData>,
@@ -806,6 +807,7 @@ export default function ReportApp() {
     const newOmData: OMReportData = {
       result,
       selectedBuildings: buildings,
+      buildingGroups: groups,
       selectedRadarSites: radars,
       azSectorsByRadar: azMap,
       losMap,
