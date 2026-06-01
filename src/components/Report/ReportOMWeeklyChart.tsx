@@ -8,8 +8,6 @@ interface Props {
   sectionNum: number;
   radarName: string;
   dailyStats: DailyStats[];
-  /** 분석 대상 월 (YYYY-MM) */
-  analysisMonth?: string;
   /** true면 헤더 생략 (OMSectionImage 래핑 시 외부에서 헤더 렌더) */
   hideHeader?: boolean;
 }
@@ -26,17 +24,13 @@ interface WeekSummary {
   baselineLoss: number;
 }
 
-function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth, hideHeader }: Props) {
-  const monthLabel = analysisMonth
-    ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
-    : "";
-
+function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, hideHeader }: Props) {
   if (dailyStats.length === 0) return (
     <div className="mb-8">
       {!hideHeader && (
         <ReportOMSectionHeader
           sectionNum={sectionNum}
-          title={`${monthLabel ? `${monthLabel} ` : ""}주차별 비교`}
+          title="주차별 비교"
           radarName={radarName}
         />
       )}
@@ -89,7 +83,7 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, analysisMonth,
       {!hideHeader && (
         <ReportOMSectionHeader
           sectionNum={sectionNum}
-          title={`${monthLabel ? `${monthLabel} ` : ""}주차별 비교`}
+          title="주차별 비교"
           radarName={radarName}
         />
       )}

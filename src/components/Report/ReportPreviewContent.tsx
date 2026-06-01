@@ -417,7 +417,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
                 azimuthSectorsByRadar={omData.azSectorsByRadar}
-                analysisMonth={omData.analysisMonth}
               />
             </div>
           )}
@@ -454,7 +453,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                       sectionNum={sectionNumbers.omWeekly ?? 4}
                       radarName={rr.radar_name}
                       dailyStats={rr.daily_stats}
-                      analysisMonth={omData.analysisMonth}
                     />
                   </ReportPage>
                 );

@@ -243,8 +243,8 @@ function ReportOMLossEvents({
                   return (
                     <tr key={b.id} className={bi % 2 === 0 ? "" : "alt"}>
                       <td>
+                        <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} placement="before" />
                         {b.name || `건물${b.id}`}
-                        <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} />
                       </td>
                       <td className="ta-r mono">{b.height.toFixed(1)}</td>
                       <td className="ta-r mono">{bAz.toFixed(1)}</td>

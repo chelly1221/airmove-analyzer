@@ -91,7 +91,7 @@ function ReportOMFindings({
   const sectionHeader = (
     <ReportOMSectionHeader
       sectionNum={sectionNum}
-      title={`종합 소견${monthLabel ? ` (${monthLabel})` : ""}`}
+      title="종합 소견"
     />
   );
 
@@ -160,8 +160,8 @@ function ReportOMFindings({
       <div className="bldg-strip-list">
         {buildingDistTexts.map((bt) => (
           <span key={bt.id}>
+            <BuildingGroupBadge groupId={bt.groupId} groups={buildingGroups} placement="before" />
             <span className="strong">{bt.name}</span>
-            <BuildingGroupBadge groupId={bt.groupId} groups={buildingGroups} />
             {" "}({bt.height}m) — {bt.dists.join(", ")}
           </span>
         ))}

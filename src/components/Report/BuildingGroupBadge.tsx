@@ -12,6 +12,8 @@ interface Props {
   groups: BuildingGroup[];
   /** "inline" (기본) — 점+이름 / "dot" — 점만 / "name" — 이름만 (색상 적용) */
   variant?: "inline" | "dot" | "name";
+  /** "after" (기본) — 대상 뒤(오른쪽) 여백 / "before" — 대상 앞(왼쪽), 여백 방향 반전 */
+  placement?: "after" | "before";
   /** 추가 className */
   className?: string;
 }
@@ -27,9 +29,12 @@ export function groupColorOf(groupId: number | null | undefined, groups: Buildin
   return findGroup(groupId, groups)?.color;
 }
 
-export default function BuildingGroupBadge({ groupId, groups, variant = "inline", className }: Props) {
+export default function BuildingGroupBadge({ groupId, groups, variant = "inline", placement = "after", className }: Props) {
   const g = findGroup(groupId, groups);
   if (!g) return null;
+
+  // placement 에 따라 여백을 대상 앞/뒤로 분기 (앞이면 오른쪽 여백)
+  const marginKey = placement === "before" ? "marginRight" : "marginLeft";
 
   const dot = (
     <span
@@ -47,11 +52,11 @@ export default function BuildingGroupBadge({ groupId, groups, variant = "inline"
   );
 
   if (variant === "dot") {
-    return <span className={className} title={g.name} style={{ display: "inline-flex", marginLeft: 4, verticalAlign: "middle" }}>{dot}</span>;
+    return <span className={className} title={g.name} style={{ display: "inline-flex", [marginKey]: 4, verticalAlign: "middle" }}>{dot}</span>;
   }
   if (variant === "name") {
     return (
-      <span className={className} style={{ color: g.color, fontWeight: 600, fontSize: "0.85em", marginLeft: 4 }}>
+      <span className={className} style={{ color: g.color, fontWeight: 600, fontSize: "0.85em", [marginKey]: 4 }}>
         {g.name}
       </span>
     );
@@ -63,7 +68,7 @@ export default function BuildingGroupBadge({ groupId, groups, variant = "inline"
         display: "inline-flex",
         alignItems: "center",
         gap: 3,
-        marginLeft: 6,
+        [marginKey]: 6,
         padding: "0 5px",
         borderRadius: 3,
         background: `${g.color}1a`, // 10% alpha

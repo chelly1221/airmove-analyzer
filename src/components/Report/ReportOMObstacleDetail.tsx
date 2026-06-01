@@ -16,7 +16,7 @@ interface Props {
   buildingGroups: BuildingGroup[];
   /** 이 빌딩 LoS 단면 */
   los: LoSProfileData;
-  /** OM 분석 결과 — 빌딩 베어링 ±5° 안의 항적/소실표적 투영용 */
+  /** OM 분석 결과 — 건물 노출면 방위각 윈도우 안의 항적/소실표적 투영용 */
   omResult: ObstacleMonthlyResult | null;
   /** 이 레이더의 분석 대상 포함 파노라마 (Az×Elev 차트용) */
   panoWith?: PanoramaMergeResult;
@@ -48,10 +48,10 @@ function ReportOMObstacleDetail({
       if (ds.track_points_geo) for (const tp of ds.track_points_geo) allTrack.push(tp);
     }
     return {
-      losChartPts: projectPointsToLos(los, allTrack, allLoss),
+      losChartPts: projectPointsToLos(los, allTrack, allLoss, building),
       allLossThisRadar: allLoss,
     };
-  }, [omResult, radarSite.name, los]);
+  }, [omResult, radarSite.name, los, building]);
 
   return (
     <ReportPage>

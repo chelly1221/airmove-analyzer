@@ -4,6 +4,8 @@ import type { ObstacleMonthlyResult, LossPointGeo, TrackPointGeo } from "../../t
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportPage from "./ReportPage";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
+import { bearingDeg, haversineKm } from "../../utils/geo";
+import { calcBuildingAzExtent } from "../../utils/obstacleAnalysisHelpers";
 
 interface Props {
   sectionNum: number;
@@ -16,12 +18,21 @@ interface Props {
 
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
+const R_EFF_M = (R_EARTH_M * 4) / 3; // 4/3 유효지구반경 (표준 대기 굴절 k=4/3)
 
 /** 디스플레이 프레임 곡률 보정량 (m): 실제 지구반경 기준
  *  → 직선 LoS 가 직선으로, 지형이 거리에 따라 아래로 처져 보임 */
 function curvDrop(dKm: number): number {
   const dM = dKm * 1000;
   return (dM * dM) / (2 * R_EARTH_M);
+}
+
+/** 4/3 유효지구 곡률 보정량 (m): 표준 대기 굴절 적용 시 레이더 빔이 직선이 되는 프레임.
+ *  최저 탐지가능 높이(레이더 빔)를 이 프레임에서 직선 전파 후
+ *  디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d) */
+function curvDrop43(dKm: number): number {
+  const dM = dKm * 1000;
+  return (dM * dM) / (2 * R_EFF_M);
 }
 
 // ── SVG 차트 상수 (TrackMap LoSProfilePanel 과 동일) ──
@@ -51,7 +62,7 @@ export interface ChartTrackPoint {
  * LoS 단면도 — TrackMap LoSProfilePanel 의 chartData/렌더링을 보고서용으로 그대로 이식.
  *
  *  TrackMap 과 동일한 요소:
- *   - 직선 LoS (running max angle, 통합 obstacle 배열) — 주황 실선
+ *   - LoS (4/3 유효지구 굴절, running max angle, 통합 obstacle 배열) — 주황 실선
  *   - 지형 (지구곡률 보정) — 녹색 솔리드
  *   - 경로상 빌딩: polygon 은 사다리꼴, point 는 세로선; 차폐 기여(빨강) / 비차단(회색) / 수동(주황)
  *   - 범례 좌상단 + 빌딩 카운트
@@ -154,8 +165,10 @@ export function LosCrossSection({
       return elev;
     };
 
-    // 2) 직선 LoS (Running Max Angle) — TrackMap minDetStraight
-    let maxAngleStraight = -Infinity;
+    // 2) LoS (4/3 유효지구 굴절 적용, Running Max Angle) — TrackMap minDetStraight 와 동일
+    //    레이더 빔은 4/3 프레임에서 직선 → 앙각을 4/3 프레임에서 계산 후
+    //    디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d)
+    let maxAngle43 = -Infinity;
     let obIdxStraight = 0;
     const minDetStraight = uniqueDists.map((d) => {
       if (d <= 0) return { distance: d, height: radarHeight };
@@ -163,18 +176,19 @@ export function LosCrossSection({
       while (obIdxStraight < obstacles.length && obstacles[obIdxStraight].distance <= d + 1e-9) {
         const ob = obstacles[obIdxStraight];
         if (ob.distance > 0) {
-          const adjH = ob.elevation - curvDrop(ob.distance);
-          const angle = (adjH - radarHeight) / (ob.distance * 1000);
-          if (angle > maxAngleStraight) maxAngleStraight = angle;
+          const adjH43 = ob.elevation - curvDrop43(ob.distance);
+          const angle = (adjH43 - radarHeight) / (ob.distance * 1000);
+          if (angle > maxAngle43) maxAngle43 = angle;
         }
         obIdxStraight++;
       }
       const terrElev = effectiveElevAt(d);
-      const adjH = terrElev - curvDrop(d);
-      const terrAngle = (adjH - radarHeight) / dM;
-      if (terrAngle > maxAngleStraight) maxAngleStraight = terrAngle;
-      const losH = radarHeight + maxAngleStraight * dM;
-      return { distance: d, height: Math.max(adjH, losH) };
+      const terrAngle = (terrElev - curvDrop43(d) - radarHeight) / dM;
+      if (terrAngle > maxAngle43) maxAngle43 = terrAngle;
+      // 4/3 프레임 빔 높이 → 디스플레이(실제지구) 프레임 변환, 디스플레이 지형을 floor 로
+      const losDisplay = radarHeight + maxAngle43 * dM + curvDrop43(d) - curvDrop(d);
+      const adjTerrainDisplay = terrElev - curvDrop(d);
+      return { distance: d, height: Math.max(adjTerrainDisplay, losDisplay) };
     });
 
     // 차단 판정 (TrackMap 와 동일 — 빌딩까지 직선 LoS 와 통합 장애물 비교)
@@ -307,7 +321,6 @@ export function LosCrossSection({
     <div className="mb-3">
       {/* 제목 */}
       <div className="mb-1 flex items-center gap-2">
-        <span className="text-[13px] font-bold text-gray-800">{buildingName}</span>
         {buildingGroup && (
           <span
             className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[10px] font-semibold"
@@ -321,6 +334,7 @@ export function LosCrossSection({
             {buildingGroup.name}
           </span>
         )}
+        <span className="text-[13px] font-bold text-gray-800">{buildingName}</span>
         <span className="text-[11px] text-gray-500">
           {radarName} → 방위 {los.bearing.toFixed(1)}° / 거리 {bDistNm.toFixed(1)}NM ({D.toFixed(1)}km)
           / 높이 {Math.round(targetElev * M_TO_FT).toLocaleString()}ft ({targetElev.toFixed(0)}m)
@@ -424,7 +438,7 @@ export function LosCrossSection({
             );
           })}
 
-          {/* 직선 LoS (실제 지구반경, 메인) */}
+          {/* LoS (4/3 유효지구 굴절, 메인) */}
           <path d={minDetStrPath} fill="none"
             stroke="#f59e0b" strokeWidth={1.8} />
 
@@ -468,7 +482,7 @@ export function LosCrossSection({
             fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
           <line x1={0} y1={0} x2={20} y2={0} stroke="#f59e0b" strokeWidth={1.8} />
           <text x={24} y={3} fill="#374151" fontSize={8}>
-            최저 탐지가능 높이 (직선 LoS)
+            최저 탐지가능 높이 (LoS, 4/3 굴절)
           </text>
           <line x1={0} y1={14} x2={20} y2={14} stroke="#22c55e" strokeWidth={1.5} />
           <text x={24} y={17} fill="#374151" fontSize={8}>
@@ -540,37 +554,36 @@ export function LosCrossSection({
 }
 
 /**
- * 레이더→빌딩 직선상 항적/소실표적 투영 — TrackMap LoSProfilePanel 의 `losTrackPoints` 와 동일.
+ * 레이더 기준 건물 방위각 윈도우 안의 항적/소실표적 투영.
  *
- * 절대 수직거리 1km 이내 + along ∈ (0, 빌딩거리] 만 채택.
+ * calcBuildingAzExtent 로 건물 폴리곤(점 건물이면 ±2° 기본값)의 레이더 기준 노출면
+ * 방위 구간을 구하고, 양끝에 여유마진 1° 씩 더한 윈도우 안의 포인트를 채택.
+ * 거리는 레이더 기준 지상거리(haversine), X축 풀스케일(100NM)까지 — 건물 후방(음영구역)
+ * 항적도 포함. (track_points_geo 는 백엔드에서 건물 중심 ±5° 로 사전 필터되어 들어오는데
+ * 건물 각폭+마진은 그보다 좁으므로 이 윈도우는 그 부분집합 — 데이터 누락 없음.)
  */
 export function projectPointsToLos(
   los: LoSProfileData,
   trackPoints: TrackPointGeo[],
   lossPoints: LossPointGeo[],
+  building: ManualBuilding,
 ): { track: ChartTrackPoint[]; loss: ChartTrackPoint[] } {
-  const DEG2RAD = Math.PI / 180;
-  const cosLat = Math.cos(los.radarLat * DEG2RAD);
-  const mPerDegLat = DEG2RAD * R_EARTH_M;
-  const mPerDegLon = DEG2RAD * R_EARTH_M * cosLat;
-  const lineDxM = (los.targetLat - los.radarLat) * mPerDegLat;
-  const lineDyM = (los.targetLon - los.radarLon) * mPerDegLon;
-  const lineLen = Math.sqrt(lineDxM * lineDxM + lineDyM * lineDyM);
-  if (lineLen < 1e-6) return { track: [], loss: [] };
-  const cosB = lineDxM / lineLen;
-  const sinB = lineDyM / lineLen;
-  const TOLERANCE_M = 1000;
+  // 건물 노출면 양끝에 여유마진 1° 씩 추가 (정렬 오차/빔폭 흡수)
+  const AZ_MARGIN_DEG = 1;
+  const ext = calcBuildingAzExtent(los.radarLat, los.radarLon, building);
+  const start = (ext.start_deg - AZ_MARGIN_DEG + 360) % 360;
+  const end = (ext.end_deg + AZ_MARGIN_DEG) % 360;
+  // 방위 윈도우 판정 — start > end 면 0°/360° 래핑 구간
+  const inWindow = (az: number) =>
+    start <= end ? az >= start && az <= end : az >= start || az <= end;
 
   const track: ChartTrackPoint[] = [];
   for (const tp of trackPoints) {
-    const dx = (tp.lat - los.radarLat) * mPerDegLat;
-    const dy = (tp.lon - los.radarLon) * mPerDegLon;
-    const along = dx * cosB + dy * sinB;
-    const across = Math.abs(-dx * sinB + dy * cosB);
-    if (across >= TOLERANCE_M) continue;
-    if (along <= 0 || along > lineLen) continue;
+    const distKm = haversineKm(los.radarLat, los.radarLon, tp.lat, tp.lon);
+    if (distKm <= 0.001 || distKm > FULL_X_KM) continue;
+    if (!inWindow(bearingDeg(los.radarLat, los.radarLon, tp.lat, tp.lon))) continue;
     track.push({
-      distKm: along / 1000,
+      distKm,
       altM: tp.alt_ft / M_TO_FT,
       radarType: tp.radar_type,
       isLoss: false,
@@ -578,14 +591,11 @@ export function projectPointsToLos(
   }
   const loss: ChartTrackPoint[] = [];
   for (const lp of lossPoints) {
-    const dx = (lp.lat - los.radarLat) * mPerDegLat;
-    const dy = (lp.lon - los.radarLon) * mPerDegLon;
-    const along = dx * cosB + dy * sinB;
-    const across = Math.abs(-dx * sinB + dy * cosB);
-    if (across >= TOLERANCE_M) continue;
-    if (along <= 0 || along > lineLen) continue;
+    const distKm = haversineKm(los.radarLat, los.radarLon, lp.lat, lp.lon);
+    if (distKm <= 0.001 || distKm > FULL_X_KM) continue;
+    if (!inWindow(bearingDeg(los.radarLat, los.radarLon, lp.lat, lp.lon))) continue;
     loss.push({
-      distKm: along / 1000,
+      distKm,
       altM: lp.alt_ft / M_TO_FT,
       radarType: "",
       isLoss: true,
@@ -625,7 +635,7 @@ function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, lo
 
         const allTrack = trackPointsByRadar.get(r.name) ?? [];
         const allLoss = lossPointsByRadar.get(r.name) ?? [];
-        const projected = projectPointsToLos(los, allTrack, allLoss);
+        const projected = projectPointsToLos(los, allTrack, allLoss, b);
 
         result.push({
           building: b, radar: r, los,

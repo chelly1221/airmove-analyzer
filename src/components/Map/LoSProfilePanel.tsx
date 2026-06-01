@@ -8,6 +8,7 @@ import { haversineKm, bearingDeg } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 
 const R_EARTH_M = 6_371_000;
+const R_EFF_M = (R_EARTH_M * 4) / 3; // 4/3 유효지구반경 (표준 대기 굴절 k=4/3)
 const LAMBDA_M = 0.1071; // S-band 2.8GHz 파장 (m)
 
 interface LoSTrackPoint {
@@ -58,6 +59,14 @@ function interpolate(
 function curvDrop(dKm: number): number {
   const dM = dKm * 1000;
   return (dM * dM) / (2 * R_EARTH_M);
+}
+
+/** 4/3 유효지구 곡률 보정량 (m): 표준 대기 굴절 적용 시 레이더 빔이 직선이 되는 프레임.
+ *  최저 탐지가능 높이(레이더 빔)는 이 프레임에서 직선으로 전파한 뒤
+ *  디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d) */
+function curvDrop43(dKm: number): number {
+  const dM = dKm * 1000;
+  return (dM * dM) / (2 * R_EFF_M);
 }
 
 
@@ -364,57 +373,63 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       return elev;
     };
 
-    // 2) 최저 탐지가능 높이 - 직선 LoS (Running Max Angle: 계곡에서 꺾이지 않음)
-    let maxAngleStraight = -Infinity;
+    // 2) 최저 탐지가능 높이 - LoS (4/3 유효지구 굴절 적용, Running Max Angle: 계곡에서 꺾이지 않음)
+    //    레이더 빔은 4/3 프레임에서 직선 → 앙각을 4/3 프레임에서 계산 후
+    //    디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d)
+    let maxAngle43 = -Infinity;
     let obIdxStraight = 0;
     const minDetStraight = uniqueDists.map((d) => {
       if (d <= 0) return { distance: d, height: radarHeight };
       const dM = d * 1000;
 
-      // 현재 거리까지의 장애물(지형+건물)에서 최대 앙각 갱신
+      // 현재 거리까지의 장애물(지형+건물)에서 4/3 프레임 최대 앙각 갱신
       while (obIdxStraight < obstacles.length && obstacles[obIdxStraight].distance <= d + 1e-9) {
         const ob = obstacles[obIdxStraight];
         if (ob.distance > 0) {
-          const adjH = ob.elevation - curvDrop(ob.distance);
-          const angle = (adjH - radarHeight) / (ob.distance * 1000);
-          if (angle > maxAngleStraight) maxAngleStraight = angle;
+          const adjH43 = ob.elevation - curvDrop43(ob.distance);
+          const angle = (adjH43 - radarHeight) / (ob.distance * 1000);
+          if (angle > maxAngle43) maxAngle43 = angle;
         }
         obIdxStraight++;
       }
 
-      // 현재 지점의 유효 고도(건물 포함)도 앙각에 반영
+      // 현재 지점의 유효 고도(건물 포함)도 4/3 앙각에 반영
       const terrElev = effectiveElevAt(d);
-      const adjH = terrElev - curvDrop(d);
-      const terrAngle = (adjH - radarHeight) / dM;
-      if (terrAngle > maxAngleStraight) maxAngleStraight = terrAngle;
+      const terrAngle = (terrElev - curvDrop43(d) - radarHeight) / dM;
+      if (terrAngle > maxAngle43) maxAngle43 = terrAngle;
 
-      const losH = radarHeight + maxAngleStraight * dM;
-      return { distance: d, height: Math.max(adjH, losH) };
+      // 4/3 프레임 빔 높이 → 디스플레이(실제지구) 프레임 변환, 디스플레이 지형을 floor 로
+      const losDisplay = radarHeight + maxAngle43 * dM + curvDrop43(d) - curvDrop(d);
+      const adjTerrainDisplay = terrElev - curvDrop(d);
+      return { distance: d, height: Math.max(adjTerrainDisplay, losDisplay) };
     });
 
-    // 2.5) 최저 탐지가능 높이 - 직선 LoS + 프레넬존 80% 클리어런스
-    //   프레넬 반경이 평가 거리에 의존하므로 O(n²) 유지, 직선 LoS를 floor로 적용
+    // 2.5) 최저 탐지가능 높이 - LoS (4/3 굴절) + 프레넬존 80% 클리어런스
+    //   프레넬 반경이 평가 거리에 의존하므로 O(n²) 유지. 그림자 외삽을 4/3 프레임에서 수행 후
+    //   디스플레이 프레임으로 변환. 4/3 직선 LoS를 floor로 적용
     const minDetFresnel = uniqueDists.map((d, idx) => {
       if (d <= 0) return { distance: d, height: radarHeight };
       const dM = d * 1000;
 
-      let maxShadow = radarHeight;
+      let maxShadow43 = radarHeight; // 4/3 프레임 그림자 높이
       for (const ob of obstacles) {
         if (ob.distance <= 0 || ob.distance >= d) continue;
         const diM = ob.distance * 1000;
-        const adjH = ob.elevation - curvDrop(ob.distance);
+        const adjH43 = ob.elevation - curvDrop43(ob.distance);
         const f1 = Math.sqrt(LAMBDA_M * diM * (dM - diM) / dM);
-        const adjHFresnel = adjH + 0.8 * f1;
+        const adjHFresnel = adjH43 + 0.8 * f1;
         const shadow = radarHeight + (adjHFresnel - radarHeight) * (d / ob.distance);
-        if (shadow > maxShadow) maxShadow = shadow;
+        if (shadow > maxShadow43) maxShadow43 = shadow;
       }
 
       const terrElev = effectiveElevAt(d);
-      const adjH = terrElev - curvDrop(d);
-      // 직선 LoS(running max angle 적용됨)를 floor로 사용하여 계곡 꺾임 방지
+      const adjTerrainDisplay = terrElev - curvDrop(d);
+      // 4/3 프레임 그림자 → 디스플레이 프레임 변환
+      const maxShadowDisplay = maxShadow43 + curvDrop43(d) - curvDrop(d);
+      // 4/3 직선 LoS(running max angle 적용됨)를 floor로 사용하여 계곡 꺾임 방지
       return {
         distance: d,
-        height: Math.max(adjH, maxShadow, minDetStraight[idx].height),
+        height: Math.max(adjTerrainDisplay, maxShadowDisplay, minDetStraight[idx].height),
       };
     });
 
@@ -1294,7 +1309,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         <path d={minDetFresnelPath} fill="none"
           stroke="#ec4899" strokeWidth={1.2} strokeDasharray="6 3" />
 
-        {/* 최저 탐지가능 높이 - 직선 LoS (실제 지구반경) */}
+        {/* 최저 탐지가능 높이 - LoS (4/3 유효지구 굴절) */}
         <path d={minDetStrPath} fill="none"
           stroke="#f59e0b" strokeWidth={1.8} />
 
@@ -1385,12 +1400,12 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           <line x1={0} y1={0} x2={20} y2={0}
             stroke="#f59e0b" strokeWidth={1.8} />
           <text x={24} y={3} fill="#374151" fontSize={8}>
-            최저 탐지가능 높이 (직선 LoS)
+            최저 탐지가능 높이 (LoS, 4/3 굴절)
           </text>
           <line x1={0} y1={14} x2={20} y2={14}
             stroke="#ec4899" strokeWidth={1.2} strokeDasharray="6 3" />
           <text x={24} y={17} fill="#374151" fontSize={8}>
-            최저 탐지가능 높이 (직선 LoS, 프레넬존 80% 클리어런스)
+            최저 탐지가능 높이 (LoS 4/3, 프레넬존 80% 클리어런스)
           </text>
           <line x1={0} y1={28} x2={20} y2={28}
             stroke="#22d3ee" strokeWidth={1} strokeDasharray="8 4" />
@@ -1501,7 +1516,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 지형고도: <tspan fill="#374151">{Math.round(hoverData.realElev * 3.28084).toLocaleString()}ft AMSL</tspan>
               </text>
               <text x={tooltipX + 8} y={tooltipY + 42} fill="#f59e0b" fontSize={8}>
-                최저탐지(직선LoS): <tspan fill="#374151" fontWeight="bold">{Math.round(hoverData.straightAMSL * 3.28084).toLocaleString()}ft</tspan>
+                최저탐지(LoS 4/3): <tspan fill="#374151" fontWeight="bold">{Math.round(hoverData.straightAMSL * 3.28084).toLocaleString()}ft</tspan>
                 <tspan fill="#6b7280" fontSize={7}> (AGL {Math.round(hoverData.straightAGL * 3.28084).toLocaleString()}ft)</tspan>
               </text>
               <text x={tooltipX + 8} y={tooltipY + 56} fill="#ec4899" fontSize={8}>

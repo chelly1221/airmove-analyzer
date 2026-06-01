@@ -20,8 +20,6 @@ interface Props {
   radarSites: RadarSite[];
   /** 레이더별 방위 구간 (레이더 이름 → AzSector[]) */
   azimuthSectorsByRadar: Map<string, AzSector[]>;
-  /** 분석 대상 월 (YYYY-MM) */
-  analysisMonth?: string;
 }
 
 /**
@@ -48,12 +46,7 @@ function ReportOMSummarySection({
   buildingGroups,
   radarSites,
   azimuthSectorsByRadar,
-  analysisMonth,
 }: Props) {
-  const monthLabel = analysisMonth
-    ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
-    : "";
-
   // 첫 페이지에 들어갈 수 있는 건물 행 수 계산
   const fixedContentMm = HEADER_HEIGHT_MM + TABLE_HEADER_MM + META_MERGED_MM
     + radarResults.length * KPI_BLOCK_MM;
@@ -85,8 +78,8 @@ function ReportOMSummarySection({
             <tr key={b.id} className={idx % 2 === 0 ? "" : "alt"}>
               <td className="ta-c">{idx + 1}</td>
               <td>
+                <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} placement="before" />
                 {b.name || `건물 ${b.id}`}
-                <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} />
               </td>
               <td className="ta-r mono">{b.height.toFixed(0)}</td>
               {radarSites.map((r) => {
@@ -193,7 +186,7 @@ function ReportOMSummarySection({
       <ReportPage>
         <ReportOMSectionHeader
           sectionNum={sectionNum}
-          title={`분석 요약${monthLabel ? ` (${monthLabel})` : ""}`}
+          title="분석 요약"
         />
         <div className="block-h3" style={{ marginTop: 0 }}>분석 대상 장애물</div>
         {renderBuildingTable(selectedBuildings, 0)}
@@ -210,7 +203,7 @@ function ReportOMSummarySection({
     <ReportPage key="summary-0">
       <ReportOMSectionHeader
         sectionNum={sectionNum}
-        title={`분석 요약${monthLabel ? ` (${monthLabel})` : ""}`}
+        title="분석 요약"
       />
       <div className="block-h3" style={{ marginTop: 0 }}>
         분석 대상 장애물 ({totalBuildings}건 중 1–{maxRowsFirstPage})

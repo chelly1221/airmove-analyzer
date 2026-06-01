@@ -190,7 +190,7 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
   const monthLabel = analysisMonth
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
     : "";
-  const title = `${monthLabel ? monthLabel + " " : ""}일별 PSR 탐지율 · 표적소실율`;
+  const title = `일별 PSR 탐지율 · 표적소실율`;
 
   if (dailyStats.length === 0) {
     return (

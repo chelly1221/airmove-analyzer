@@ -87,8 +87,8 @@ function ReportOMBuildingLoS({ sectionNum, selectedBuildings, buildingGroups, ra
     <tr key={b.id} className={i % 2 === 0 ? "" : "alt"}>
       <td className="ta-c">{i + 1}</td>
       <td className="strong">
+        <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} placement="before" />
         {b.name || `건물 ${b.id}`}
-        <BuildingGroupBadge groupId={b.group_id} groups={buildingGroups} />
       </td>
       <td className="ta-r mono">{b.height.toFixed(0)}</td>
       {radarSites.map((r) => {
