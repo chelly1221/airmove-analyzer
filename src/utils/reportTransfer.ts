@@ -34,7 +34,6 @@ export interface ReportSections {
   /** 일별 PSR·표적소실 결합 라인 차트 (페이지 2). 기존 omDailyPsr/omDailyLoss 두 토글을 합친 단일 토글. */
   omDailyPsrLoss: boolean;
   omWeekly: boolean;
-  omBuildingLos: boolean;
   omLosCrossSection: boolean;
   omLossEvents: boolean;
   omFindings: boolean;
@@ -57,6 +56,8 @@ export interface SerializedOMData {
   analysisMonth: string;
   findingsText: string;
   recommendText: string;
+  /** 인라인 편집 텍스트 오버라이드 (편집키 → 사용자 수정 문구) */
+  textOverrides?: Record<string, string>;
   panoWithTargets: [string, PanoramaMergeResult][];
   panoWithoutTargets: [string, PanoramaMergeResult][];
   coverageStatus: "idle" | "loading" | "done" | "error";
@@ -123,6 +124,7 @@ export function serializeOMData(om: OMReportData): SerializedOMData {
     analysisMonth: om.analysisMonth,
     findingsText: om.findingsText,
     recommendText: om.recommendText,
+    textOverrides: om.textOverrides ?? {},
     panoWithTargets: [...om.panoWithTargets],
     panoWithoutTargets: [...om.panoWithoutTargets],
     coverageStatus: om.coverageStatus,
@@ -148,6 +150,7 @@ export function deserializeOMData(s: SerializedOMData): OMReportData {
     analysisMonth: s.analysisMonth,
     findingsText: s.findingsText,
     recommendText: s.recommendText,
+    textOverrides: s.textOverrides ?? {},
     panoWithTargets: new Map(s.panoWithTargets),
     panoWithoutTargets: new Map(s.panoWithoutTargets),
     coverageStatus: s.coverageStatus,
@@ -188,7 +191,6 @@ export const DEFAULT_SECTIONS: ReportSections = {
   omSummary: true,
   omDailyPsrLoss: true,
   omWeekly: true,
-  omBuildingLos: true,
   omLosCrossSection: true,
   omLossEvents: true,
   omFindings: true,

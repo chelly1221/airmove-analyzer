@@ -11,20 +11,13 @@
  * prop 으로 내려준다. 데이터 anchor 는 `[data-toc-key]` (ReportPreviewContent
  * 의 마커 div).
  */
-import { Download, Loader2 } from "lucide-react";
+import { Download, Loader2, SlidersHorizontal } from "lucide-react";
 
 export interface OMSidebarTocItem {
   key: string;
   num: string;       // "01"~"NN" — 가시 섹션 기준 1부터 누적
   name: string;      // 한글 라벨
   page: number;      // 프리뷰 내 해당 anchor 의 1-based 페이지 인덱스 (없으면 0)
-}
-
-export interface OMSidebarSectionToggle {
-  key: string;
-  label: string;
-  active: boolean;
-  onToggle: () => void;
 }
 
 interface ReportOMSidebarProps {
@@ -47,21 +40,15 @@ interface ReportOMSidebarProps {
   totalPages: number;
   /** 목차 클릭 — 해당 섹션으로 점프 */
   onJump: (key: string) => void;
-  /** 표시 섹션 토글 — 기존 타이틀바에서 이관 */
-  sectionToggles?: OMSidebarSectionToggle[];
+  /** "보고서 설정" 모달 열기 (표시 섹션 + 메타데이터) */
+  onOpenSettings: () => void;
   /** 수정 모드 chip 표시 여부 — 기존 타이틀바 statusChips 이관 */
   showEditingModeChip?: boolean;
   /** "분석 데이터 없음" 경고 chip 표시 여부 */
   showNoResultChip?: boolean;
   /** PDF 내보내기 에러 텍스트 — 있으면 빨간 배너로 표시 */
   exportError?: string | null;
-  /** PDF 페이지 범위 */
-  range: "all" | "current" | "custom";
-  onRangeChange: (v: "all" | "current" | "custom") => void;
-  /** PDF 용지 */
-  paper: "A4" | "A3";
-  onPaperChange: (v: "A4" | "A3") => void;
-  /** 저장 버튼 */
+  /** "PDF로 저장" 클릭 — PDF 내보내기 모달 열기 */
   onSave: () => void;
   generating: boolean;
   disabled: boolean;
@@ -76,13 +63,10 @@ interface ReportOMSidebarProps {
 export default function ReportOMSidebar({
   docPeriod, docTitle, docNo, agency, periodIso,
   toc, activeKey, currentPage, totalPages, onJump,
-  sectionToggles, showEditingModeChip, showNoResultChip, exportError,
-  range, onRangeChange, paper, onPaperChange,
+  onOpenSettings, showEditingModeChip, showNoResultChip, exportError,
   onSave, generating, disabled, disabledTitle, elapsedSec, editingMode,
 }: ReportOMSidebarProps) {
-  const pageRangeLabel = totalPages > 0 ? `전체 (1–${totalPages})` : "전체";
   const hasStatus = !!(showEditingModeChip || showNoResultChip || exportError);
-  const hasToggles = !!(sectionToggles && sectionToggles.length > 0);
 
   return (
     <aside className="flex h-full w-48 shrink-0 flex-col bg-white select-none">
@@ -165,30 +149,6 @@ export default function ReportOMSidebar({
         </div>
       )}
 
-      {/* 2.7) 표시 섹션 토글 — 기존 타이틀바 sectionTogglePills 의 사이드바 이관 */}
-      {hasToggles && (
-        <div className="flex flex-col gap-1.5 border-t border-gray-200 px-2.5 py-2.5">
-          <span className="px-1 text-[9.5px] font-bold uppercase tracking-[0.06em] text-gray-400">
-            표시 섹션
-          </span>
-          <div className="flex flex-wrap gap-1 px-0.5">
-            {sectionToggles!.map((s) => (
-              <button
-                key={s.key}
-                onClick={s.onToggle}
-                className={`rounded px-1.5 py-0.5 text-[10.5px] transition-colors ${
-                  s.active
-                    ? "bg-[#a60739]/10 text-[#a60739] font-medium"
-                    : "text-gray-400 hover:bg-gray-100"
-                }`}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
       {/* 3) 목차 — flex:1, 내부 스크롤 */}
       <div className="flex min-h-0 flex-1 flex-col border-t border-gray-200 px-2.5 pb-1.5 pt-2.5">
         <div className="flex items-center justify-between gap-1.5 px-1 pb-1.5 pt-0.5">
@@ -239,64 +199,18 @@ export default function ReportOMSidebar({
         </div>
       </div>
 
-      {/* 4) PDF 내보내기 — 옵션 + CTA */}
-      <div className="border-t border-gray-200 bg-gray-50 px-2.5 py-2.5">
-        <div className="flex items-center justify-between gap-1.5 px-1 pb-1.5 pt-0.5">
-          <span className="text-[9.5px] font-bold uppercase tracking-[0.06em] text-gray-400">
-            PDF 내보내기
-          </span>
-        </div>
+      {/* 4) 액션 — 보고서 설정 + PDF 내보내기 (옵션은 각 모달에서 설정) */}
+      <div className="flex flex-col gap-2 border-t border-gray-200 bg-gray-50 px-2.5 py-3">
+        {/* 표시 섹션 + 메타데이터 설정 모달 */}
+        <button
+          onClick={onOpenSettings}
+          className="flex h-8 w-full items-center justify-center gap-1.5 rounded-[5px] border border-gray-200 bg-white text-[12px] font-medium text-gray-600 transition-colors hover:bg-gray-100"
+        >
+          <SlidersHorizontal size={13} />
+          표시 섹션 · 설정
+        </button>
 
-        <div className="flex flex-col gap-2 px-1 pb-2.5 pt-1">
-          {/* 페이지 범위 — native select 커스터마이즈 */}
-          <label className="flex items-center justify-between gap-2 text-[11px] text-gray-600">
-            <span className="shrink-0">페이지</span>
-            <div className="relative inline-flex items-center">
-              <select
-                value={range}
-                onChange={(e) => onRangeChange(e.target.value as "all" | "current" | "custom")}
-                className="h-6 max-w-[110px] cursor-pointer appearance-none rounded border border-gray-200 bg-white pl-2 pr-[22px] text-[11px] text-gray-800 outline-none focus:border-[#a60739]"
-              >
-                <option value="all">{pageRangeLabel}</option>
-                <option value="current">현재 페이지</option>
-                <option value="custom">사용자 지정</option>
-              </select>
-              <svg
-                viewBox="0 0 24 24" width={11} height={11}
-                fill="none" stroke="currentColor" strokeWidth={2}
-                strokeLinecap="round" strokeLinejoin="round"
-                className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400"
-              >
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-            </div>
-          </label>
-
-          {/* 용지 — A4/A3 segmented pill */}
-          <label className="flex items-center justify-between gap-2 text-[11px] text-gray-600">
-            <span className="shrink-0">용지</span>
-            <div className="inline-flex h-6 items-stretch rounded bg-gray-100 p-0.5">
-              {(["A4", "A3"] as const).map((v) => {
-                const active = paper === v;
-                return (
-                  <button
-                    key={v}
-                    onClick={() => onPaperChange(v)}
-                    className={`rounded-[3px] px-2 text-[10.5px] font-semibold transition-colors ${
-                      active
-                        ? "bg-white text-gray-900 shadow-[0_1px_1px_rgba(0,0,0,0.04)]"
-                        : "text-gray-500 hover:text-gray-700"
-                    }`}
-                  >
-                    {v}
-                  </button>
-                );
-              })}
-            </div>
-          </label>
-        </div>
-
-        {/* Primary CTA */}
+        {/* PDF 내보내기 모달 열기 (생성 중에는 진행 상태 표시) */}
         <button
           onClick={onSave}
           disabled={disabled}

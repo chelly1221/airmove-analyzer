@@ -59,6 +59,7 @@ function ReportOMObstacleDetail({
         sectionNum={sectionNum}
         title={`분석 대상 장애물 상세 — ${building.name || `건물 ${building.id}`}`}
         radarName={radarSite.name}
+        editId={`detail.${radarSite.name}_${building.id}.title`}
       />
 
       {/* 빌딩 메타 정보 */}

@@ -1,6 +1,7 @@
 import { forwardRef, useMemo } from "react";
 import { format } from "date-fns";
 import EditableText from "./EditableText";
+import OMEditable from "./OMEditable";
 import ReportPage from "./ReportPage";
 import type { ReportMetadata } from "../../types";
 
@@ -27,15 +28,6 @@ interface CoverPageProps {
  *  텍스트만 다르며, OM(장애물 월간) 만 분석 월/대상 장애물 행을 추가로
  *  표시한다. 스타일은 reportOmStyles.css `.kac-report .cover-d-*`.
  */
-const templateCodeMap: Record<CoverPageProps["template"], string> = {
-  weekly: "WK",
-  monthly: "MO",
-  flights: "FL",
-  single: "SG",
-  obstacle: "OB",
-  obstacle_monthly: "OM",
-};
-
 const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function ReportCoverPage(
   {
     template, radarName, metadata, editable,
@@ -44,10 +36,8 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
   },
   ref,
 ) {
-  // 최초 마운트 시 고정 — 렌더마다 문서번호 변경 방지
+  // 최초 마운트 시 고정 — 렌더마다 작성일자 변경 방지
   const now = useMemo(() => new Date(), []);
-  const tplCode = templateCodeMap[template] ?? "RPT";
-  const docNum = `${metadata.docPrefix}-${tplCode}-${format(now, "yyMMdd")}-${format(now, "HHmm")}`;
   const issueDate = format(now, "yyyy년 MM월 dd일");
 
   // Eyebrow — 템플릿별 라벨
@@ -65,9 +55,8 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
   // 정보 테이블 값
   const isOM = template === "obstacle_monthly";
   const radarLabel = omRadarNames && omRadarNames.length > 0 ? omRadarNames.join(" · ") : (radarName || "—");
-  const periodLabel = omMonthLabel ? `${omMonthLabel} (1일 ~ 말일)` : (subtitle || "—");
-  // 발행처: "한국공항공사" → "한 국 공 항 공 사" 패턴 (시안의 letter-spacing 강조)
-  const issuerName = useMemo(() => metadata.organization.split("").join(" "), [metadata.organization]);
+  // 분석 기간 — OM 은 월 라벨만 표시(예: "2026년 2월"). 일자 범위는 생략.
+  const periodLabel = omMonthLabel ? omMonthLabel : (subtitle || "—");
   const orgEnSuffix = metadata.organization === "한국공항공사" ? "  ·  KOREA AIRPORTS CORPORATION" : "";
 
   return (
@@ -77,13 +66,19 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
           <div className="cover-d-block-deco" />
           <div className="cover-d-mark">
             <span className="cover-d-mark-square">KAC</span>
-            <span className="cover-d-mark-text">{metadata.organization}{orgEnSuffix}</span>
+            <span className="cover-d-mark-text">
+              <span className="cover-d-mark-org">{metadata.organization}{orgEnSuffix}</span>
+              {metadata.department && <span className="cover-d-mark-dept">{metadata.department}</span>}
+            </span>
           </div>
-          {eyebrow && <div className="cover-d-eyebrow">{eyebrow}</div>}
+          {/* OM 표지는 머리말(eyebrow) 미표시 — 제목이 컬러 블록 하단에 정렬되도록 title 에 margin-top:auto */}
+          {!isOM && eyebrow && (
+            <div className="cover-d-eyebrow">{eyebrow}</div>
+          )}
 
           {isOM ? (
-            // OM 시안은 두 줄 표시("레이더 장애물 / 월간 분석 보고서") — 편집 비활성화.
-            <h1 className="cover-d-title">레이더 장애물<br />월간 분석 보고서</h1>
+            // OM 시안은 두 줄 표시("레이더 장애물 / 월간 분석 보고서").
+            <h1 className="cover-d-title" style={{ marginTop: "auto" }}>레이더 장애물<br />월간 분석 보고서</h1>
           ) : (
             <EditableText
               value={title}
@@ -95,7 +90,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
           )}
 
           {isOM ? (
-            <p className="cover-d-subtitle">{omMonthLabel}</p>
+            <OMEditable id="cover.subtitle" value={omMonthLabel ?? ""} tag="p" className="cover-d-subtitle" />
           ) : (
             <EditableText
               value={subtitle}
@@ -110,11 +105,10 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
         <div className="cover-d-info">
           <table className="cover-d-info-table">
             <tbody>
-              <tr><th>문서번호</th><td>{docNum}</td></tr>
               <tr><th>작성일자</th><td>{issueDate}</td></tr>
               <tr><th>발행기관</th><td>{metadata.organization}{metadata.department ? ` · ${metadata.department}` : ""}{metadata.siteName ? ` · ${metadata.siteName}` : ""}</td></tr>
               <tr><th>대상 레이더</th><td>{radarLabel}</td></tr>
-              <tr><th>분석 기간</th><td>{periodLabel}</td></tr>
+              <tr><th>분석 기간</th><td>{isOM ? <OMEditable id="cover.period" value={periodLabel} tag="span" /> : periodLabel}</td></tr>
               {isOM && omBuildingsCount != null && (
                 <tr><th>대상 장애물</th><td>{omBuildingsCount}건</td></tr>
               )}
@@ -122,7 +116,6 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
           </table>
 
           <div className="cover-d-issuer">
-            <div className="cover-d-issuer-name">{issuerName}</div>
             <div className="cover-d-issuer-sub">{metadata.footer || "본 보고서는 NEC ASTERIX 비행검사기 항적분석체계로 자동 생성됨"}</div>
           </div>
         </div>

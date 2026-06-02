@@ -14,10 +14,9 @@
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
 import type { LossPointGeo } from "../../types/obstacle";
-import { haversineKm, bearingDeg } from "../../utils/geo";
+import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
+import OMEditable from "./OMEditable";
 
-const R_EARTH = 6_371_000;
-const FT_PER_M = 3.28084;
 const KM_PER_NM = 1.852;
 const AZ_TOLERANCE = 10;
 
@@ -32,43 +31,6 @@ const COMPASS_DIRS: Record<number, string> = {
   0: "N", 45: "NE", 90: "E", 135: "SE",
   180: "S", 225: "SW", 270: "W", 315: "NW",
 };
-
-/** elevationProfile 의 running max angle (radians, cutoff 까지) */
-function runningMaxAngle(
-  profile: { distance: number; elevation: number }[],
-  radarHeight: number,
-  cutoffDistKm?: number,
-): number {
-  let maxAngle = -Infinity;
-  for (const pt of profile) {
-    if (pt.distance <= 0) continue;
-    if (cutoffDistKm !== undefined && pt.distance > cutoffDistKm) break;
-    const dM = pt.distance * 1000;
-    const curvDrop = (dM * dM) / (2 * R_EARTH);
-    const adjH = pt.elevation - curvDrop;
-    const angle = (adjH - radarHeight) / dM;
-    if (angle > maxAngle) maxAngle = angle;
-  }
-  return maxAngle === -Infinity ? 0 : maxAngle;
-}
-
-function calcElevAngleDeg(radarH: number, targetAltM: number, distM: number): number {
-  if (distM <= 0) return 0;
-  const curvDrop = (distM * distM) / (2 * R_EARTH);
-  return Math.atan((targetAltM - curvDrop - radarH) / distM) * 180 / Math.PI;
-}
-
-function angleToDeg(tanAngle: number): number {
-  return Math.atan(tanAngle) * 180 / Math.PI;
-}
-
-interface ClassifiedLoss {
-  azDeg: number;
-  elevAngleDeg: number;
-  durationS: number;
-  inShadow: boolean;
-  buildingCaused: boolean;
-}
 
 interface Props {
   radarSite: RadarSite;
@@ -89,95 +51,67 @@ export default function ReportOMObstacleAzElevChart({
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // 건물 메타 + 소실표적 분류
-  const computed = useMemo(() => {
-    const radarH = radarSite.altitude + radarSite.antenna_height;
-    const bDistKm = los.totalDistance > 0
-      ? los.totalDistance
-      : haversineKm(radarSite.latitude, radarSite.longitude, building.latitude, building.longitude);
-    const bAzDeg = los.bearing ?? bearingDeg(radarSite.latitude, radarSite.longitude, building.latitude, building.longitude);
+  // 건물 메타 + 소실표적 분류 — obstacleAnalysisHelpers 의 단일 소스 사용
+  // (요약 표의 '음영 소실' 건수와 이 차트의 빨강 점 분류가 항상 일치)
+  const computed = useMemo(
+    () => classifyObstacleLosses(radarSite, building, los, lossPoints),
+    [radarSite, building, los, lossPoints],
+  );
 
-    let angleTotal = 0;
-    let angleTerrain = 0;
-    if (los.elevationProfile.length > 0) {
-      angleTotal = runningMaxAngle(los.elevationProfile, radarH);
-      angleTerrain = runningMaxAngle(los.elevationProfile, radarH, bDistKm);
-    } else {
-      const bTopM = (building.ground_elev || 0) + building.height;
-      const dM = bDistKm * 1000;
-      const curvDrop = (dM * dM) / (2 * R_EARTH);
-      angleTotal = (bTopM - curvDrop - radarH) / dM;
-    }
-    const angleTotalDeg = angleToDeg(angleTotal);
-    const angleTerrainDeg = angleToDeg(angleTerrain);
-
-    const losses: ClassifiedLoss[] = [];
-    for (const lp of lossPoints) {
-      const lpDistKm = haversineKm(radarSite.latitude, radarSite.longitude, lp.lat, lp.lon);
-      const lpAz = bearingDeg(radarSite.latitude, radarSite.longitude, lp.lat, lp.lon);
-      let azDiff = Math.abs(lpAz - bAzDeg);
-      if (azDiff > 180) azDiff = 360 - azDiff;
-      if (azDiff > AZ_TOLERANCE) continue;
-      if (lpDistKm <= bDistKm + 0.01) continue;
-
-      const lpAltM = lp.alt_ft / FT_PER_M;
-      const lpElevDeg = calcElevAngleDeg(radarH, lpAltM, lpDistKm * 1000);
-
-      const inShadow = lpElevDeg < angleTotalDeg;
-      const buildingCaused = inShadow && lpElevDeg >= angleTerrainDeg;
-
-      losses.push({
-        azDeg: lpAz,
-        elevAngleDeg: lpElevDeg,
-        durationS: lp.duration_s,
-        inShadow,
-        buildingCaused,
-      });
-    }
-
-    return { bDistKm, bAzDeg, angleTotalDeg, angleTerrainDeg, losses };
-  }, [radarSite, building, los, lossPoints]);
-
-  // 축/스케일 — 분석 대상 방위 중심
+  // 축/스케일 — 분석 대상 방위 중심.
+  // 분석 대상으로 인한 추가 차단(빨강, panoWith>panoWithout) + 지형(녹색) 영역이 차트에
+  // 꽉 차도록 축을 그 영역에 맞추고 각 축 10% 여백만 둔다. (멀리 떨어진 무관 소실표적이
+  // 축을 넓히던 동작은 제거 — 음영 내 소실표적까지만 X 범위에 반영.)
   const chartParams = useMemo(() => {
     const azCenter = computed.bAzDeg;
-    // 기본 ±12°. 소실표적이 그 밖에 있으면 그만큼 확장 (AZ_TOLERANCE+5° 까지)
-    let azHalfSpan = 12;
-    for (const l of computed.losses) {
-      let rel = l.azDeg - azCenter;
-      if (rel > 180) rel -= 360;
-      if (rel < -180) rel += 360;
-      const absRel = Math.abs(rel);
-      if (absRel > azHalfSpan) azHalfSpan = absRel;
-    }
-    azHalfSpan = Math.min(azHalfSpan + 1, AZ_TOLERANCE + 5);
-    const azSpan = azHalfSpan * 2;
+    const SEARCH_CAP = AZ_TOLERANCE + 5; // 15° — 탐색·최대 한계
 
-    const azInRange = (az: number) => {
+    const relAz = (az: number) => {
       let rel = az - azCenter;
       if (rel > 180) rel -= 360;
       if (rel < -180) rel += 360;
-      return Math.abs(rel) <= azHalfSpan;
+      return rel;
     };
 
-    // Y 최대 — 윈도우 내 panoWith silhouette + 대상 차단각 + 소실표적 양각
+    // panoWithout(분석 대상 제외 실루엣) 룩업
+    const withoutMap = new Map<number, number>();
+    for (const p of panoWithout) withoutMap.set(Math.round(p.azimuth_deg * 100), Math.max(0, p.elevation_angle_deg));
+    const lookupWithout = (az: number) => withoutMap.get(Math.round(az * 100)) ?? 0;
+
+    // 추가 차단(빨강) 영역 + 음영 내 소실표적의 방위 폭 → 콘텐츠 반폭
+    let contentHalf = 0;
+    for (const p of panoWith) {
+      const rel = relAz(p.azimuth_deg);
+      if (Math.abs(rel) > SEARCH_CAP) continue;
+      const add = Math.max(0, p.elevation_angle_deg) - lookupWithout(p.azimuth_deg);
+      if (add > 0.01 && Math.abs(rel) > contentHalf) contentHalf = Math.abs(rel);
+    }
+    for (const l of computed.losses) {
+      if (!l.inShadow) continue; // 음영(지형/장애물 차단) 내 소실표적만 — 무관 소실표적은 제외
+      const absRel = Math.abs(relAz(l.azDeg));
+      if (absRel <= SEARCH_CAP && absRel > contentHalf) contentHalf = absRel;
+    }
+    // 콘텐츠 폭 + 10% 여백, 문맥 확보용 최소 4°, 최대 15°
+    const azHalfSpan = Math.min(Math.max(contentHalf * 1.1, 4), SEARCH_CAP);
+    const azSpan = azHalfSpan * 2;
+
+    const azInRange = (az: number) => Math.abs(relAz(az)) <= azHalfSpan;
+
+    // Y 최대 — 윈도우 내 panoWith silhouette + 대상 차단각 (소실표적 양각은 Y 확장 제외)
     let panoMax = 0;
     for (const p of panoWith) {
       if (azInRange(p.azimuth_deg) && p.elevation_angle_deg > panoMax) panoMax = p.elevation_angle_deg;
     }
     if (computed.angleTotalDeg > panoMax) panoMax = computed.angleTotalDeg;
-    for (const l of computed.losses) {
-      if (l.elevAngleDeg >= 0 && l.elevAngleDeg > panoMax) panoMax = l.elevAngleDeg;
-    }
-    // "거의 꽉차게" — 분석 대상 silhouette 가 차트 상단 가깝게 오도록 약간만 padding
-    const maxAngle = panoMax > 0.5 ? Math.max(panoMax * 1.05 + 0.05, 0.6) : 1;
+    // 영역이 Y축에도 꽉 차도록 — 상단 10% 여백만
+    const maxAngle = panoMax > 0.05 ? panoMax * 1.1 : 0.6;
 
     const yRange = maxAngle;
     const yStep = yRange > 5 ? 1 : yRange > 2 ? 0.5 : yRange > 1 ? 0.2 : yRange > 0.5 ? 0.1 : 0.05;
     const yTicks: number[] = [];
     for (let v = 0; v <= maxAngle + 0.001; v += yStep) yTicks.push(Math.round(v * 1000) / 1000);
 
-    const azTickStep = azSpan > 30 ? 10 : azSpan > 15 ? 5 : 2;
+    const azTickStep = azSpan >= 24 ? 5 : azSpan >= 10 ? 2 : 1;
     const azStart = azCenter - azHalfSpan;
     const azEnd = azCenter + azHalfSpan;
     const firstTick = Math.ceil(azStart / azTickStep) * azTickStep;
@@ -185,7 +119,7 @@ export default function ReportOMObstacleAzElevChart({
     for (let v = firstTick; v <= azEnd + 0.001; v += azTickStep) xTicks.push(v);
 
     return { azCenter, azHalfSpan, azSpan, yRange, yStep, yTicks, xTicks };
-  }, [computed, panoWith]);
+  }, [computed, panoWith, panoWithout]);
 
   const { azCenter, azHalfSpan, azSpan, yRange, yStep, yTicks, xTicks } = chartParams;
 
@@ -419,19 +353,22 @@ export default function ReportOMObstacleAzElevChart({
 
   // 요약 수치
   const total = computed.losses.length;
-  const shadowCount = computed.losses.filter((l) => l.inShadow).length;
-  const bldgCount = computed.losses.filter((l) => l.buildingCaused).length;
-  const bldgDuration = computed.losses.filter((l) => l.buildingCaused).reduce((s, l) => s + l.durationS, 0);
+  const shadowCount = computed.shadowCount;
+  const bldgCount = computed.buildingCount;
+  const bldgDuration = computed.buildingDurationS;
   const freeCount = total - shadowCount;
   const shadowRatio = total > 0 ? (shadowCount / total) * 100 : 0;
   const bldgRatio = total > 0 ? (bldgCount / total) * 100 : 0;
   const hasBldgEffect = computed.angleTotalDeg > computed.angleTerrainDeg + 0.005;
 
+  // 인라인 편집키 접두사 — (레이더 × 건물) 페이지마다 독립 편집 (detail.* 헤더 키와 동일 스킴)
+  const eid = `azelev.${radarSite.name}_${building.id}`;
+
   return (
     <div className="mt-2">
       {/* 차트 제목 */}
       <div className="mb-1 flex items-center justify-between text-[12px]">
-        <span className="font-semibold text-gray-800">LoS 차단 양각 대비 표적소실 분포</span>
+        <OMEditable id={`${eid}.title`} value="LoS 차단 양각 대비 표적소실 분포" tag="span" className="font-semibold text-gray-800" />
         <span className="text-[10px] text-gray-400">
           분석 대상 방위 {computed.bAzDeg.toFixed(0)}° ± {azHalfSpan.toFixed(0)}°
         </span>
@@ -448,26 +385,26 @@ export default function ReportOMObstacleAzElevChart({
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 justify-center mt-1 text-[10px] text-gray-500">
         <span className="flex items-center gap-1">
           <span className="inline-block w-3 h-2.5 rounded-sm" style={{ backgroundColor: "#86efac", opacity: 0.55 }} />
-          지형 + 기존 지형지물
+          <OMEditable id={`${eid}.legend.terrain`} value="지형 + 기존 지형지물" tag="span" />
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block w-3 h-2.5 rounded-sm" style={{ backgroundColor: "#fca5a5", opacity: 0.65 }} />
-          분석 대상 추가 차단
+          <OMEditable id={`${eid}.legend.added`} value="분석 대상 추가 차단" tag="span" />
         </span>
         <span className="flex items-center gap-1">
           <svg width="10" height="10" viewBox="0 0 10 10" className="inline-block">
             <line x1="2" y1="2" x2="8" y2="8" stroke="#000" strokeWidth="1.4" />
             <line x1="8" y1="2" x2="2" y2="8" stroke="#000" strokeWidth="1.4" />
           </svg>
-          장애물 추가 기인
+          <OMEditable id={`${eid}.legend.bldgCaused`} value="장애물 추가 기인" tag="span" />
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "#6b7280", opacity: 0.7 }} />
-          지형 차단
+          <OMEditable id={`${eid}.legend.terrainBlock`} value="지형 차단" tag="span" />
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block w-2 h-2 rounded-sm" style={{ backgroundColor: "rgba(59,130,246,0.5)" }} />
-          장애물 무관
+          <OMEditable id={`${eid}.legend.free`} value="장애물 무관" tag="span" />
         </span>
       </div>
 
@@ -475,43 +412,43 @@ export default function ReportOMObstacleAzElevChart({
       <table className="mt-2 w-full border-collapse text-[11px]">
         <thead>
           <tr className="bg-[#28283c] text-white">
-            <th className="border border-gray-300 px-2 py-1 font-medium">항목</th>
-            <th className="border border-gray-300 px-2 py-1 font-medium">값</th>
-            <th className="border border-gray-300 px-2 py-1 font-medium">비고</th>
+            <th className="border border-gray-300 px-2 py-1 font-medium"><OMEditable id={`${eid}.tbl.colItem`} value="항목" tag="span" /></th>
+            <th className="border border-gray-300 px-2 py-1 font-medium"><OMEditable id={`${eid}.tbl.colVal`} value="값" tag="span" /></th>
+            <th className="border border-gray-300 px-2 py-1 font-medium"><OMEditable id={`${eid}.tbl.colNote`} value="비고" tag="span" /></th>
           </tr>
         </thead>
         <tbody>
           <tr className="bg-white">
-            <td className="border border-gray-200 px-2 py-1">방위 ±{azHalfSpan.toFixed(0)}° · 후방 소실표적</td>
+            <td className="border border-gray-200 px-2 py-1">방위 ±{azHalfSpan.toFixed(0)}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
             <td className="border border-gray-200 px-2 py-1 text-right font-mono">{total}건</td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500">분석 대상 후방 영역</td>
+            <td className="border border-gray-200 px-2 py-1 text-gray-500"><OMEditable id={`${eid}.tbl.r1.note`} value="분석 대상 후방 영역" tag="span" /></td>
           </tr>
           <tr className="bg-gray-50">
-            <td className="border border-gray-200 px-2 py-1">LoS 차단 영역 내</td>
+            <td className="border border-gray-200 px-2 py-1"><OMEditable id={`${eid}.tbl.r2.label`} value="LoS 차단 영역 내" tag="span" /></td>
             <td className="border border-gray-200 px-2 py-1 text-right font-mono">
               {shadowCount}건 ({shadowRatio.toFixed(1)}%)
             </td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500">지형+장애물 통합 차단</td>
+            <td className="border border-gray-200 px-2 py-1 text-gray-500"><OMEditable id={`${eid}.tbl.r2.note`} value="지형+장애물 통합 차단" tag="span" /></td>
           </tr>
           <tr className="bg-white">
-            <td className="border border-gray-200 px-2 py-1 font-semibold text-[#a60739]">장애물 추가 기인</td>
+            <td className="border border-gray-200 px-2 py-1 font-semibold text-[#a60739]"><OMEditable id={`${eid}.tbl.r3.label`} value="장애물 추가 기인" tag="span" /></td>
             <td className="border border-gray-200 px-2 py-1 text-right font-mono font-bold"
                 style={{ color: bldgRatio > 10 ? "#dc2626" : "#374151" }}>
               {bldgCount}건 ({bldgRatio.toFixed(1)}%) / {bldgDuration.toFixed(1)}초
             </td>
             <td className="border border-gray-200 px-2 py-1 text-gray-500">
-              지형 차단각 초과 ~ 대상 차단각 사이
+              <OMEditable id={`${eid}.tbl.r3.note`} value="지형 차단각 초과 ~ 대상 차단각 사이" tag="span" />
             </td>
           </tr>
           <tr className="bg-gray-50">
-            <td className="border border-gray-200 px-2 py-1 text-blue-600">장애물 무관</td>
+            <td className="border border-gray-200 px-2 py-1 text-blue-600"><OMEditable id={`${eid}.tbl.r4.label`} value="장애물 무관" tag="span" /></td>
             <td className="border border-gray-200 px-2 py-1 text-right font-mono">
               {freeCount}건 ({total > 0 ? ((freeCount / total) * 100).toFixed(1) : "0.0"}%)
             </td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500">차단 영역 외 소실표적</td>
+            <td className="border border-gray-200 px-2 py-1 text-gray-500"><OMEditable id={`${eid}.tbl.r4.note`} value="차단 영역 외 소실표적" tag="span" /></td>
           </tr>
           <tr className="bg-white">
-            <td className="border border-gray-200 px-2 py-1">↳ 대상 차단각</td>
+            <td className="border border-gray-200 px-2 py-1">↳ <OMEditable id={`${eid}.tbl.r5.label`} value="대상 차단각" tag="span" /></td>
             <td className="border border-gray-200 px-2 py-1 text-right font-mono">
               {computed.angleTotalDeg.toFixed(2)}°
               {hasBldgEffect ? ` (지형 ${computed.angleTerrainDeg.toFixed(2)}°)` : " (지형 이하)"}

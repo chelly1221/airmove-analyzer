@@ -3,6 +3,7 @@ import type { DailyStats } from "../../types";
 import { weightedAvg, PSR_DEV_THRESHOLD, LOSS_DEV_THRESHOLD } from "../../utils/omStats";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import OMEditable from "./OMEditable";
 
 interface Props {
   sectionNum: number;
@@ -53,13 +54,23 @@ interface LinePanelProps {
   hasBaseline: boolean;
   /** 데이터가 있는 일자만 집합 (dot 마커/path 점 결정) */
   hasDataSet: Set<number>;
+  /** Y축 최대 고정값 (예: PSR 탐지율 100). 없으면 데이터 기반 자동 스케일 */
+  fixedMax?: number;
+  /** Y축 눈금(격자) 값 직접 지정. 없으면 max 의 0/25/50/75/100% */
+  tickValues?: number[];
+  /** Y축 눈금 라벨 소수 자릿수 */
+  tickDecimals?: number;
+  /** 패널 오른쪽에도 Y축 라벨 표시 */
+  rightLabels?: boolean;
 }
 
 /** 한 라인 차트 패널 (PSR 또는 Loss 1개) */
-function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, unit, hasBaseline, hasDataSet }: LinePanelProps) {
-  const maxV = Math.max(0.001, ...values, ...baselineValues) * 1.18;
+function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, unit, hasBaseline, hasDataSet, fixedMax, tickValues, tickDecimals, rightLabels }: LinePanelProps) {
+  const maxV = fixedMax ?? Math.max(0.001, ...values, ...baselineValues) * 1.18;
   const xs = (day: number) => x + ((day - 1) / Math.max(1, days.length - 1)) * w;
   const ys = (v: number) => y + h - (v / maxV) * h;
+  const fmtTick = (v: number) =>
+    tickDecimals != null ? v.toFixed(tickDecimals) : (v < 1 ? v.toFixed(2) : v.toFixed(1));
 
   const valPts: Pt[] = [];
   for (let i = 0; i < days.length; i++) {
@@ -75,14 +86,14 @@ function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, uni
     ? `${basePath} L${basePts[basePts.length - 1].x},${y + h} L${basePts[0].x},${y + h} Z`
     : "";
 
-  const yTicks = [0, 0.25, 0.5, 0.75, 1.0].map((t) => maxV * t);
+  const yTicks = tickValues ?? [0, 0.25, 0.5, 0.75, 1.0].map((t) => maxV * t);
 
   return (
     <g>
       {/* 패널 배경 */}
       <rect x={x} y={y} width={w} height={h} fill="#fafafa" stroke="#e5e7eb" strokeWidth={0.5} rx={3} />
 
-      {/* Y 그리드 + 라벨 */}
+      {/* Y 그리드 + 라벨 (축 값별 격자) */}
       {yTicks.map((v, i) => (
         <g key={`yt-${i}`}>
           <line
@@ -91,8 +102,13 @@ function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, uni
             strokeDasharray={v === 0 ? undefined : "2,3"}
           />
           <text x={x - 5} y={ys(v) + 3} textAnchor="end" fill="#9ca3af" fontSize={9}>
-            {v < 1 ? v.toFixed(2) : v.toFixed(1)}
+            {fmtTick(v)}
           </text>
+          {rightLabels && (
+            <text x={x + w + 5} y={ys(v) + 3} textAnchor="start" fill="#9ca3af" fontSize={9}>
+              {fmtTick(v)}
+            </text>
+          )}
         </g>
       ))}
 
@@ -144,7 +160,7 @@ interface SummaryTableProps {
 }
 
 /** 결합 차트 하단 요약 표 (지표 / 분석 기간 / 분석 평균 / 기준 평균 / 편차) */
-function CombinedSummaryTable({ hasBaseline, psrAvg, psrBaseAvg, lossAvg, lossBaseAvg, monthLabel, dayCount }: SummaryTableProps) {
+function CombinedSummaryTable({ hasBaseline, psrAvg, psrBaseAvg, lossAvg, lossBaseAvg, monthLabel, dayCount, radarName }: SummaryTableProps & { radarName: string }) {
   const psrDev = psrAvg - psrBaseAvg;
   const lossDev = lossAvg - lossBaseAvg;
   const psrDevColor =
@@ -159,23 +175,23 @@ function CombinedSummaryTable({ hasBaseline, psrAvg, psrBaseAvg, lossAvg, lossBa
     <table className="om-table weekly-table">
       <thead>
         <tr>
-          <th>지표</th>
-          <th className="ta-r">분석 기간</th>
-          <th className="ta-r">분석 평균</th>
-          {hasBaseline && <th className="ta-r">기준 평균</th>}
-          {hasBaseline && <th className="ta-r">편차(%p)</th>}
+          <th><OMEditable id={`daily.${radarName}.col.metric`} value="지표" tag="span" /></th>
+          <th className="ta-r"><OMEditable id={`daily.${radarName}.col.period`} value="분석 기간" tag="span" /></th>
+          <th className="ta-r"><OMEditable id={`daily.${radarName}.col.avg`} value="분석 평균" tag="span" /></th>
+          {hasBaseline && <th className="ta-r"><OMEditable id={`daily.${radarName}.col.base`} value="기준 평균" tag="span" /></th>}
+          {hasBaseline && <th className="ta-r"><OMEditable id={`daily.${radarName}.col.dev`} value="편차(%p)" tag="span" /></th>}
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td className="strong"><span style={dotStyle(PSR_COLOR)} />PSR 탐지율</td>
+          <td className="strong"><span style={dotStyle(PSR_COLOR)} /><OMEditable id={`daily.${radarName}.row.psr`} value="PSR 탐지율" tag="span" /></td>
           <td className="ta-r">{monthLabel} · {dayCount}일</td>
           <td className="ta-r mono strong" style={{ color: PSR_COLOR }}>{psrAvg.toFixed(2)}%</td>
           {hasBaseline && <td className="ta-r mono muted">{psrBaseAvg.toFixed(2)}%</td>}
           {hasBaseline && <td className="ta-r mono strong" style={{ color: psrDevColor }}>{psrDev > 0 ? "+" : ""}{psrDev.toFixed(2)}</td>}
         </tr>
         <tr className="alt">
-          <td className="strong"><span style={dotStyle(LOSS_COLOR)} />표적소실율</td>
+          <td className="strong"><span style={dotStyle(LOSS_COLOR)} /><OMEditable id={`daily.${radarName}.row.loss`} value="표적소실율" tag="span" /></td>
           <td className="ta-r">{monthLabel} · {dayCount}일</td>
           <td className="ta-r mono strong" style={{ color: LOSS_COLOR }}>{lossAvg.toFixed(3)}%</td>
           {hasBaseline && <td className="ta-r mono muted">{lossBaseAvg.toFixed(3)}%</td>}
@@ -195,7 +211,7 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
   if (dailyStats.length === 0) {
     return (
       <ReportPage>
-        <ReportOMSectionHeader sectionNum={sectionNum} title={title} radarName={radarName} />
+        <ReportOMSectionHeader sectionNum={sectionNum} title={title} radarName={radarName} editId={`daily.${radarName}.title`} />
         <div className="empty"><p className="sm">해당 기간 분석 데이터 없음</p></div>
       </ReportPage>
     );
@@ -245,38 +261,37 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
     (d) => d.total_track_time_secs,
   );
 
-  // SVG 레이아웃 — stacked 모드 락-인
+  // SVG 레이아웃 — stacked 모드 락-인 (조건 문구는 SVG 밖 HTML 로 분리해 편집 가능)
   const svgW = 720;
   const panelH = 220;
   const panelGap = 20;
   const panelX = 50;
-  const panelW = svgW - 80; // 좌측 40, 우측 40
-  const condCount = conditions?.length ?? 0;
-  const condH = condCount > 0 ? 14 + condCount * 15 : 0;
-  const top0 = 30 + condH + 18;
+  const panelW = svgW - 80; // 좌측 50, 우측 30 (우측 Y 라벨 여백)
+  const top0 = 22;
   const top1 = top0 + panelH + panelGap;
-  const svgH = 30 + condH + 18 + panelH + panelGap + panelH + 40;
+  const svgH = top0 + panelH + panelGap + panelH + 40;
 
   return (
     <ReportPage>
-      <ReportOMSectionHeader sectionNum={sectionNum} title={title} radarName={radarName} />
-      <svg viewBox={`0 0 ${svgW} ${svgH}`} style={{ width: "100%" }}>
-        {/* 조건 박스 (상단 회색) */}
-        {condH > 0 && conditions && (
-          <g>
-            <rect x={20} y={4} width={svgW - 40} height={condH - 4} fill="#f3f4f6" rx={3} stroke="#e5e7eb" strokeWidth={0.5} />
-            {conditions.map((c, i) => (
-              <text key={i} x={32} y={19 + i * 15} fill="#6b7280" fontSize={10}>{c}</text>
-            ))}
-          </g>
-        )}
+      <ReportOMSectionHeader sectionNum={sectionNum} title={title} radarName={radarName} editId={`daily.${radarName}.title`} />
 
-        {/* 상단 패널: PSR 탐지율 */}
+      {/* 조건 박스 (상단 회색) — 편집 가능 HTML */}
+      {conditions && conditions.length > 0 && (
+        <div className="om-daily-conditions">
+          {conditions.map((c, i) => (
+            <OMEditable key={i} id={`daily.${radarName}.cond.${i}`} value={c} tag="div" />
+          ))}
+        </div>
+      )}
+
+      <svg viewBox={`0 0 ${svgW} ${svgH}`} style={{ width: "100%" }}>
+        {/* 상단 패널: PSR 탐지율 — Y축 0~100% 고정, 축 값별 격자 + 우측 라벨 */}
         <LinePanel
           x={panelX} y={top0} w={panelW} h={panelH}
           days={days} values={psrVals} baselineValues={psrBase}
           color={PSR_COLOR} label="PSR 탐지율" unit="(%)"
           hasBaseline={hasBaseline} hasDataSet={hasDataSet}
+          fixedMax={100} tickValues={[0, 20, 40, 60, 80, 100]} tickDecimals={0} rightLabels
         />
         {/* 하단 패널: 표적소실율 */}
         <LinePanel
@@ -297,6 +312,7 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
         psrAvg={psrAvg} psrBaseAvg={psrBaseAvg}
         lossAvg={lossAvg} lossBaseAvg={lossBaseAvg}
         monthLabel={monthLabel} dayCount={dailyStats.length}
+        radarName={radarName}
       />
     </ReportPage>
   );

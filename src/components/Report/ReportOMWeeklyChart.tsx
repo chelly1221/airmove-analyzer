@@ -32,6 +32,7 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, hideHeader }: 
           sectionNum={sectionNum}
           title="주차별 비교"
           radarName={radarName}
+          editId={`weekly.${radarName}.title`}
         />
       )}
       <div className="flex flex-col items-center py-12 text-gray-400">
@@ -85,6 +86,7 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, hideHeader }: 
           sectionNum={sectionNum}
           title="주차별 비교"
           radarName={radarName}
+          editId={`weekly.${radarName}.title`}
         />
       )}
 

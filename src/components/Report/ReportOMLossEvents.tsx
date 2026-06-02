@@ -4,6 +4,7 @@ import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite } fro
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import OMEditable from "./OMEditable";
 import AutoPaginate from "./AutoPaginate";
 import BuildingGroupBadge from "./BuildingGroupBadge";
 
@@ -137,7 +138,7 @@ function ReportOMLossEvents({
   }, [radarResults, radarSites, layersWithTargets, layersWithoutTargets]);
 
   const sectionHeader = (
-    <ReportOMSectionHeader sectionNum={sectionNum} title="장애물 기인 표적소실 상세" />
+    <ReportOMSectionHeader sectionNum={sectionNum} title="장애물 기인 표적소실 상세" editId="lossEvents.title" />
   );
 
   if (eventsByRadar.length === 0) {
@@ -217,7 +218,7 @@ function ReportOMLossEvents({
         {/* 장애물별 근접 표적소실 요약 — 상위 12개 건물 */}
         {selectedBuildings.length > 0 && rs && (
           <>
-            <div className="block-h3" style={{ marginTop: 12 }}>장애물별 근접 표적소실</div>
+            <OMEditable id="lossEvents.bldgHeader" value="장애물별 근접 표적소실" tag="div" className="block-h3" style={{ marginTop: 12 }} />
             <table className="om-table sm-table">
               <thead>
                 <tr>

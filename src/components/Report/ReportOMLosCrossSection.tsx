@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import type { ManualBuilding, RadarSite, LoSProfileData, BuildingOnPath } from "../../types";
+import type { ManualBuilding, RadarSite, LoSProfileData, BuildingOnPath, ElevationPoint } from "../../types";
 import type { ObstacleMonthlyResult, LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportPage from "./ReportPage";
@@ -102,7 +102,7 @@ export function LosCrossSection({
       height: p.elevation - curvDrop(p.distance),
     }));
 
-    // 1.5) 통합 장애물 배열: 지형 + 빌딩 (TrackMap 와 동일)
+    // 1.5) 통합 장애물 배열: 지형 + 빌딩 — 차단 판정용 (min-det 는 computeMinDet 가 자체 구성)
     interface Obstacle { distance: number; elevation: number; }
     const obstacles: Obstacle[] = [];
     for (const p of profile) {
@@ -119,77 +119,101 @@ export function LosCrossSection({
     }
     obstacles.sort((a, b) => a.distance - b.distance);
 
-    interface BuildingEdge { nearD: number; farD: number; topElev: number; groundElev: number; }
-    const buildingEdges: BuildingEdge[] = buildings.map((b) => ({
-      nearD: b.near_dist_km ?? b.distance_km,
-      farD: b.far_dist_km ?? b.distance_km,
-      topElev: b.ground_elev_m + b.height_m,
-      groundElev: b.ground_elev_m,
-    }));
-
-    const interpTerrainElev = (d: number): number => {
-      if (d <= profile[0].distance) return profile[0].elevation;
-      if (d >= profile[profile.length - 1].distance) return profile[profile.length - 1].elevation;
-      for (let i = 1; i < profile.length; i++) {
-        if (profile[i].distance >= d) {
-          const denom = profile[i].distance - profile[i - 1].distance;
-          const t = denom > 1e-9 ? (d - profile[i - 1].distance) / denom : 0;
-          return profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
-        }
-      }
-      return 0;
-    };
-
-    // 통합 샘플 거리 (profile + 건물 경계 ± eps)
-    const sampleDists: number[] = profile.map((p) => p.distance);
-    for (const be of buildingEdges) {
-      const eps = 0.0005;
-      if (be.nearD > eps) sampleDists.push(be.nearD - eps);
-      sampleDists.push(be.nearD);
-      if (be.farD - be.nearD > 0.001) {
-        sampleDists.push(be.farD);
-        sampleDists.push(be.farD + eps);
-      } else {
-        sampleDists.push(be.nearD + eps);
-      }
-    }
-    const uniqueDists = [...new Set(sampleDists)].sort((a, b) => a - b);
-
-    const effectiveElevAt = (d: number): number => {
-      let elev = interpTerrainElev(d);
-      for (const be of buildingEdges) {
-        if (d >= be.nearD && d <= be.farD + 0.0001) {
-          if (be.topElev > elev) elev = be.topElev;
-        }
-      }
-      return elev;
-    };
-
-    // 2) LoS (4/3 유효지구 굴절 적용, Running Max Angle) — TrackMap minDetStraight 와 동일
+    // 2) 최저 탐지가능선 (4/3 유효지구 굴절, Running Max Angle) — TrackMap minDetStraight 와 동일.
+    //    지형 base(terrainPts) + 건물(blds) 통합 obstacle 에 대해 running-max 앙각 계산.
     //    레이더 빔은 4/3 프레임에서 직선 → 앙각을 4/3 프레임에서 계산 후
-    //    디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d)
-    let maxAngle43 = -Infinity;
-    let obIdxStraight = 0;
-    const minDetStraight = uniqueDists.map((d) => {
-      if (d <= 0) return { distance: d, height: radarHeight };
-      const dM = d * 1000;
-      while (obIdxStraight < obstacles.length && obstacles[obIdxStraight].distance <= d + 1e-9) {
-        const ob = obstacles[obIdxStraight];
-        if (ob.distance > 0) {
-          const adjH43 = ob.elevation - curvDrop43(ob.distance);
-          const angle = (adjH43 - radarHeight) / (ob.distance * 1000);
-          if (angle > maxAngle43) maxAngle43 = angle;
-        }
-        obIdxStraight++;
+    //    디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d).
+    //    동일 알고리즘을 (지형+모든건물) / (순수지형+대상제외건물) 두 입력으로 호출.
+    const computeMinDet = (terrainPts: ElevationPoint[], blds: BuildingOnPath[]) => {
+      if (terrainPts.length === 0) return [] as { distance: number; height: number }[];
+      const edges = blds.map((b) => ({
+        nearD: b.near_dist_km ?? b.distance_km,
+        farD: b.far_dist_km ?? b.distance_km,
+        topElev: b.ground_elev_m + b.height_m,
+      }));
+      const obs: Obstacle[] = [];
+      for (const p of terrainPts) obs.push({ distance: p.distance, elevation: p.elevation });
+      for (const e of edges) {
+        obs.push({ distance: e.nearD, elevation: e.topElev });
+        if (e.farD - e.nearD > 0.001) obs.push({ distance: e.farD, elevation: e.topElev });
       }
-      const terrElev = effectiveElevAt(d);
-      const terrAngle = (terrElev - curvDrop43(d) - radarHeight) / dM;
-      if (terrAngle > maxAngle43) maxAngle43 = terrAngle;
-      // 4/3 프레임 빔 높이 → 디스플레이(실제지구) 프레임 변환, 디스플레이 지형을 floor 로
-      const losDisplay = radarHeight + maxAngle43 * dM + curvDrop43(d) - curvDrop(d);
-      const adjTerrainDisplay = terrElev - curvDrop(d);
-      return { distance: d, height: Math.max(adjTerrainDisplay, losDisplay) };
-    });
+      obs.sort((a, b) => a.distance - b.distance);
+
+      const interpElev = (d: number): number => {
+        if (d <= terrainPts[0].distance) return terrainPts[0].elevation;
+        const last = terrainPts[terrainPts.length - 1];
+        if (d >= last.distance) return last.elevation;
+        for (let i = 1; i < terrainPts.length; i++) {
+          if (terrainPts[i].distance >= d) {
+            const denom = terrainPts[i].distance - terrainPts[i - 1].distance;
+            const t = denom > 1e-9 ? (d - terrainPts[i - 1].distance) / denom : 0;
+            return terrainPts[i - 1].elevation + t * (terrainPts[i].elevation - terrainPts[i - 1].elevation);
+          }
+        }
+        return 0;
+      };
+
+      // 통합 샘플 거리 (지형 샘플 + 건물 경계 ± eps)
+      const sd: number[] = terrainPts.map((p) => p.distance);
+      for (const e of edges) {
+        const eps = 0.0005;
+        if (e.nearD > eps) sd.push(e.nearD - eps);
+        sd.push(e.nearD);
+        if (e.farD - e.nearD > 0.001) { sd.push(e.farD); sd.push(e.farD + eps); }
+        else sd.push(e.nearD + eps);
+      }
+      const dists = [...new Set(sd)].sort((a, b) => a - b);
+
+      const effElevAt = (d: number): number => {
+        let elev = interpElev(d);
+        for (const e of edges) {
+          if (d >= e.nearD && d <= e.farD + 0.0001) { if (e.topElev > elev) elev = e.topElev; }
+        }
+        return elev;
+      };
+
+      let maxAngle43 = -Infinity;
+      let obIdx = 0;
+      return dists.map((d) => {
+        if (d <= 0) return { distance: d, height: radarHeight };
+        const dM = d * 1000;
+        while (obIdx < obs.length && obs[obIdx].distance <= d + 1e-9) {
+          const ob = obs[obIdx];
+          if (ob.distance > 0) {
+            const adjH43 = ob.elevation - curvDrop43(ob.distance);
+            const angle = (adjH43 - radarHeight) / (ob.distance * 1000);
+            if (angle > maxAngle43) maxAngle43 = angle;
+          }
+          obIdx++;
+        }
+        const terrElev = effElevAt(d);
+        const terrAngle = (terrElev - curvDrop43(d) - radarHeight) / dM;
+        if (terrAngle > maxAngle43) maxAngle43 = terrAngle;
+        // 4/3 프레임 빔 높이 → 디스플레이(실제지구) 프레임 변환, 디스플레이 지형을 floor 로
+        const losDisplay = radarHeight + maxAngle43 * dM + curvDrop43(d) - curvDrop(d);
+        const adjTerrainDisplay = terrElev - curvDrop(d);
+        return { distance: d, height: Math.max(adjTerrainDisplay, losDisplay) };
+      });
+    };
+
+    // 2a) 현재 선 (지형+모든 건물, combinedElev base) — 기존과 동일 결과
+    const minDetStraight = computeMinDet(profile, buildings);
+
+    // 2b) 분석 대상 건물 제외 선 (순수지형 base + 대상 외 건물).
+    //     대상 식별: 수동건물 + 치수 일치 + far_dist 가 타겟 거리(D)까지 도달 (코리도 끝 = 대상).
+    //     point 형 대상은 Rust 가 pathBuildings 에서 제외 → 매칭 0 건이면 미표시(두 선 동일).
+    //     terrainProfile(raw) 은 DB 복원 los 엔 없음 → 그 경우도 미표시 (graceful).
+    const isTargetBuilding = (b: BuildingOnPath) =>
+      b.is_manual &&
+      Math.abs(b.ground_elev_m - building.ground_elev) < 1 &&
+      Math.abs(b.height_m - building.height) < 1 &&
+      (b.far_dist_km ?? b.distance_km) >= D - 0.5;
+    const buildingsWithoutTarget = buildings.filter((b) => !isTargetBuilding(b));
+    const rawTerrain = los.terrainProfile;
+    const minDetWithout =
+      rawTerrain && rawTerrain.length > 0 && buildingsWithoutTarget.length < buildings.length
+        ? computeMinDet(rawTerrain, buildingsWithoutTarget)
+        : null;
 
     // 차단 판정 (TrackMap 와 동일 — 빌딩까지 직선 LoS 와 통합 장애물 비교)
     const losStraightH = (d: number) =>
@@ -252,7 +276,7 @@ export function LosCrossSection({
     }
 
     return {
-      adjTerrain, minDetStraight,
+      adjTerrain, minDetStraight, minDetWithout,
       blocked, maxBlockPoint, significantBuildings,
       minY, maxY, maxDistance: FULL_X_KM,
       adjTarget, targetElev, radarHeight,
@@ -262,7 +286,7 @@ export function LosCrossSection({
   if (!chartData) return null;
 
   const {
-    adjTerrain, minDetStraight,
+    adjTerrain, minDetStraight, minDetWithout,
     blocked, significantBuildings, minY, maxY, maxDistance, radarHeight,
   } = chartData;
 
@@ -282,6 +306,13 @@ export function LosCrossSection({
   const minDetStrPath = minDetStraight
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
     .join(" ");
+
+  // 분석 대상 건물 제외 최저탐지선 (청록 점선) — 대상 후방에서 주황선과 벌어짐
+  const minDetWithoutPath = minDetWithout
+    ? minDetWithout
+        .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
+        .join(" ")
+    : null;
 
   // Y축 눈금 (ft)
   const yRangeFt = (maxY - minY) * M_TO_FT;
@@ -308,8 +339,9 @@ export function LosCrossSection({
   const manualCount = significantBuildings.filter((b) => b.is_manual).length;
   const nonBlockingCount = significantBuildings.length - blockingCount;
 
-  // 범례 박스 높이 — LoS + 지형 (2줄, 28px) + 차폐/비차폐/수동 + 항적/소실표적
+  // 범례 박스 높이 — LoS + 지형 (2줄, 28px) [+ 대상제외선] + 차폐/비차폐/수동 + 항적/소실표적
   let legendH = 24;
+  if (minDetWithout) legendH += 14;
   if (blockingCount > 0) legendH += 14;
   if (nonBlockingCount > 0) legendH += 14;
   if (manualCount > 0) legendH += 14;
@@ -438,6 +470,12 @@ export function LosCrossSection({
             );
           })}
 
+          {/* 분석 대상 건물 제외 최저탐지선 (청록 점선) — 대상 후방에서 주황선 아래로 벌어짐 */}
+          {minDetWithoutPath && (
+            <path d={minDetWithoutPath} fill="none"
+              stroke="#14b8a6" strokeWidth={1.5} strokeDasharray="5 3" />
+          )}
+
           {/* LoS (4/3 유효지구 굴절, 메인) */}
           <path d={minDetStrPath} fill="none"
             stroke="#f59e0b" strokeWidth={1.8} />
@@ -488,8 +526,16 @@ export function LosCrossSection({
           <text x={24} y={17} fill="#374151" fontSize={8}>
             지형 (지구곡률 보정)
           </text>
+          {minDetWithout && (
+            <>
+              <line x1={0} y1={28} x2={20} y2={28} stroke="#14b8a6" strokeWidth={1.5} strokeDasharray="5 3" />
+              <text x={24} y={31} fill="#374151" fontSize={8}>
+                최저 탐지가능 (분석 대상 제외)
+              </text>
+            </>
+          )}
           {(() => {
-            let legendY = 24;
+            let legendY = minDetWithout ? 38 : 24;
             const items: React.ReactNode[] = [];
             if (blockingCount > 0) {
               items.push(
@@ -657,7 +703,7 @@ function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, lo
       <ReportPage key={`loscs-${offset}`}>
         <div className="mb-4">
           {isFirst && !hideHeader && (
-            <ReportOMSectionHeader sectionNum={sectionNum} title="건물별 LoS 단면도" />
+            <ReportOMSectionHeader sectionNum={sectionNum} title="건물별 LoS 단면도" editId="losCross.title" />
           )}
           {!isFirst && (
             <div className="mb-2 text-[10px] text-gray-400">

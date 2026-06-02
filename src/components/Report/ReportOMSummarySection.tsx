@@ -1,15 +1,24 @@
-import React from "react";
-import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, AzSector } from "../../types";
+import React, { useMemo } from "react";
+import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, AzSector, LoSProfileData, LossPointGeo } from "../../types";
 import {
   weightedLossAvg, weightedLossStdDev,
   weightedPsrAvg, weightedPsrStdDev,
   gradeWithConfidence,
 } from "../../utils/omStats";
 import { haversineKm, bearingDeg } from "../../utils/geo";
+import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import BuildingGroupBadge from "./BuildingGroupBadge";
+import OMEditable from "./OMEditable";
 import { PAGE_CONTENT_MM } from "./reportPageConstants";
+
+/** 표적소실 산출 로직 + 참고용 안내 기본 문구 (인라인 편집 가능) */
+const LOSS_LOGIC_NOTE =
+  "표적소실율 = (신호소실 누적 시간 ÷ 전체 추적 시간) × 100. 스캔 주기를 자동 추정(중앙값)한 뒤 "
+  + "임계값(주기 × 1.4)을 초과하는 미탐지 구간을 표적소실로 판정하며, 범위이탈(out-of-range) 구간은 "
+  + "제외하고 신호소실(signal loss)만 집계함. 본 수치는 저장 자료(ASTERIX) 기반으로 자동 산출된 "
+  + "추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있으므로 참고 자료로만 활용 바람.";
 
 interface Props {
   sectionNum: number;
@@ -20,6 +29,8 @@ interface Props {
   radarSites: RadarSite[];
   /** 레이더별 방위 구간 (레이더 이름 → AzSector[]) */
   azimuthSectorsByRadar: Map<string, AzSector[]>;
+  /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) — 차단여부·음영소실 열용 */
+  losMap: Map<string, LoSProfileData>;
 }
 
 /**
@@ -34,7 +45,7 @@ interface Props {
  * 분할. 페이지 inner padding 16/18mm + 새 KPI 행 리스트 높이를 반영한 추정치.
  */
 const HEADER_HEIGHT_MM = 14;
-const TABLE_HEADER_MM = 8;
+const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS·음영소실)
 const ROW_HEIGHT_MM = 7;
 const META_MERGED_MM = 30;   // 방위 + 산식 통합 박스 (.meta-merged)
 const KPI_BLOCK_MM = 50;     // h3(6) + 5 행 × 9mm + 보더 = ~50mm
@@ -46,7 +57,35 @@ function ReportOMSummarySection({
   buildingGroups,
   radarSites,
   azimuthSectorsByRadar,
+  losMap,
 }: Props) {
+  // 레이더별 소실표적 (음영소실 분류용) — daily_stats 의 loss_points_summary 집계
+  const lossPointsByRadar = useMemo(() => {
+    const m = new Map<string, LossPointGeo[]>();
+    for (const rr of radarResults) {
+      const all: LossPointGeo[] = [];
+      for (const ds of rr.daily_stats) {
+        for (const lp of ds.loss_points_summary) all.push(lp);
+      }
+      m.set(rr.radar_name, all);
+    }
+    return m;
+  }, [radarResults]);
+
+  // 건물×레이더 음영소실(장애물 추가 기인) 건수 — AzElevChart 와 동일 분류(classifyObstacleLosses)
+  const shadowLossByKey = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const b of selectedBuildings) {
+      for (const r of radarSites) {
+        const los = losMap.get(`${r.name}_${b.id}`);
+        if (!los) continue;
+        const { buildingCount } = classifyObstacleLosses(r, b, los, lossPointsByRadar.get(r.name) ?? []);
+        m.set(`${r.name}_${b.id}`, buildingCount);
+      }
+    }
+    return m;
+  }, [selectedBuildings, radarSites, losMap, lossPointsByRadar]);
+
   // 첫 페이지에 들어갈 수 있는 건물 행 수 계산
   const fixedContentMm = HEADER_HEIGHT_MM + TABLE_HEADER_MM + META_MERGED_MM
     + radarResults.length * KPI_BLOCK_MM;
@@ -58,7 +97,7 @@ function ReportOMSummarySection({
   const totalBuildings = selectedBuildings.length;
   const needsSplit = totalBuildings > maxRowsFirstPage;
 
-  // ── 분석 대상 장애물 표 ────────────────────────────────────────────────
+  // ── 분석 대상 장애물 표 (2단 헤더: 레이더 그룹 × 방위/거리·LoS·음영소실) ──────────
   const renderBuildingTable = (buildings: ManualBuilding[], startIdx: number) => (
     <table className="om-table">
       <thead>
@@ -67,7 +106,19 @@ function ReportOMSummarySection({
           <th className="ta-l">건물명</th>
           <th className="ta-r">높이(m)</th>
           {radarSites.map((r) => (
-            <th key={r.name} className="ta-r">{r.name} 방위/거리</th>
+            <th key={r.name} colSpan={3} className="ta-c">{r.name}</th>
+          ))}
+        </tr>
+        <tr className="sub">
+          <th />
+          <th />
+          <th />
+          {radarSites.map((r) => (
+            <React.Fragment key={`sh-${r.name}`}>
+              <th className="ta-c sm">방위/거리</th>
+              <th className="ta-c sm">LoS</th>
+              <th className="ta-c sm">음영소실</th>
+            </React.Fragment>
           ))}
         </tr>
       </thead>
@@ -85,10 +136,30 @@ function ReportOMSummarySection({
               {radarSites.map((r) => {
                 const az = bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude);
                 const dist = haversineKm(r.latitude, r.longitude, b.latitude, b.longitude);
+                const los = losMap.get(`${r.name}_${b.id}`);
+                const shadowLoss = shadowLossByKey.get(`${r.name}_${b.id}`) ?? 0;
                 return (
-                  <td key={r.name} className="ta-r mono">
-                    {az.toFixed(1)}° / {dist.toFixed(1)}km
-                  </td>
+                  <React.Fragment key={`cell-${r.name}-${b.id}`}>
+                    <td className="ta-c mono sm">{az.toFixed(1)}° / {dist.toFixed(1)}km</td>
+                    <td className="ta-c sm">
+                      {los ? (
+                        <span className={`badge ${los.losBlocked ? "bad" : "ok"}`}>
+                          {los.losBlocked ? "차단" : "양호"}
+                        </span>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                    <td className="ta-c mono sm">
+                      {los ? (
+                        shadowLoss > 0
+                          ? <span style={{ color: "#a60739", fontWeight: 600 }}>{shadowLoss}건</span>
+                          : <span className="muted">0</span>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                  </React.Fragment>
                 );
               })}
             </tr>
@@ -102,7 +173,7 @@ function ReportOMSummarySection({
   const renderMetaMerged = () => (
     <div className="meta-merged">
       <div className="meta-merged-row az">
-        <p className="meta-merged-label">분석 방위 구간</p>
+        <OMEditable id="summary.azLabel" value="분석 방위 구간" tag="p" className="meta-merged-label" />
         <div className="az-grid">
           {radarSites.map((r) => {
             const sectors = azimuthSectorsByRadar.get(r.name) ?? [];
@@ -117,14 +188,20 @@ function ReportOMSummarySection({
         </div>
       </div>
       <div className="meta-merged-row formula">
-        <p className="meta-merged-label">통계 산식</p>
+        <OMEditable id="summary.formulaLabel" value="통계 산식" tag="p" className="meta-merged-label" />
         <div>
           <span className="strong">통계 산식 · </span>
           평균: 관측량 가중 평균 <i>x̄ᵥᵥ = Σ(wᵢ·xᵢ) / Σ(wᵢ)</i>
           {" "}(Loss: w=비행시간, PSR: w=SSR포인트수){" · "}
           <i>±σ</i>: 가중 모표준편차 <i>σᵥᵥ = √(Σ(wᵢ(xᵢ - x̄ᵥᵥ)²) / Σ(wᵢ))</i>{" · "}
           판정: 양호(&lt;0.5%) / 주의(0.5–2%) / 경고(≥2%) / 보류(&lt;7일)
+          {" · "}
+          <span className="strong">음영소실</span>: 분석 대상 장애물이 추가한 차단각(지형 차단각 초과) 음영 구역 내, 대상 후방·방위 ±10° 표적소실 건수
         </div>
+      </div>
+      <div className="meta-merged-row formula" style={{ borderTop: "1px solid var(--om-border)" }}>
+        <OMEditable id="summary.lossLogicLabel" value="표적소실 산출 · 참고" tag="p" className="meta-merged-label" />
+        <OMEditable id="summary.lossLogicNote" value={LOSS_LOGIC_NOTE} tag="div" />
       </div>
     </div>
   );
@@ -187,8 +264,9 @@ function ReportOMSummarySection({
         <ReportOMSectionHeader
           sectionNum={sectionNum}
           title="분석 요약"
+          editId="summary.title"
         />
-        <div className="block-h3" style={{ marginTop: 0 }}>분석 대상 장애물</div>
+        <OMEditable id="summary.bldgHeader" value="분석 대상 장애물" tag="div" className="block-h3" style={{ marginTop: 0 }} />
         {renderBuildingTable(selectedBuildings, 0)}
         {renderMetaMerged()}
         {renderKPIBlocks()}
@@ -204,9 +282,11 @@ function ReportOMSummarySection({
       <ReportOMSectionHeader
         sectionNum={sectionNum}
         title="분석 요약"
+        editId="summary.title"
       />
       <div className="block-h3" style={{ marginTop: 0 }}>
-        분석 대상 장애물 ({totalBuildings}건 중 1–{maxRowsFirstPage})
+        <OMEditable id="summary.bldgHeader" value="분석 대상 장애물" tag="span" />
+        {" "}({totalBuildings}건 중 1–{maxRowsFirstPage})
       </div>
       {renderBuildingTable(firstSlice, 0)}
       {renderMetaMerged()}

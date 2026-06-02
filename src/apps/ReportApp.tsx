@@ -16,6 +16,8 @@ import type { OMSectionCaptureHandle } from "../components/Report/omCapture";
 import TemplateConfigModal from "../components/Report/TemplateConfigModal";
 import ObstacleMonthlyConfigModal from "../components/Report/ObstacleMonthlyConfigModal";
 import ObstaclePreScreeningModal from "../components/Report/ObstaclePreScreeningModal";
+import ReportSettingsModal from "../components/Report/ReportSettingsModal";
+import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
@@ -120,6 +122,14 @@ export default function ReportApp() {
   const [coverSubtitle, setCoverSubtitle] = useState(() => format(new Date(), "yyyy년 MM월"));
   const [commentary, setCommentary] = useState("");
   const [editingReportId, setEditingReportId] = useState<string | null>(null);
+
+  // 편집 가능 보고서 메타데이터 — 설정 모달에서 수정 → 표지/머리말 라이브 반영.
+  // null 이면 state.reportMetadata(원본)를 사용.
+  const [metadata, setMetadata] = useState<ReportMetadata | null>(null);
+
+  // OM 사이드바 모달 open 상태 (표시섹션·설정 / PDF 내보내기)
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
 
   // omData (로컬, 비동기 업데이트 가능)
   const [omData, setOmData] = useState<OMReportData | null>(null);
@@ -265,6 +275,7 @@ export default function ReportApp() {
         setCoverSubtitle(s.coverSubtitle);
         setCommentary(s.commentary);
         setEditingReportId(s.editingReportId);
+        setMetadata(s.reportMetadata);
         setOmData(s.omData);
         setLoading(false);
         setPrepPhase(null);
@@ -628,7 +639,6 @@ export default function ReportApp() {
       { key: "omSummary",         name: "분석 요약",         visible: !!activeSections.omSummary },
       { key: "omDailyPsrLoss",    name: "일별 PSR·표적소실", visible: !!activeSections.omDailyPsrLoss },
       { key: "omWeekly",          name: "주차별 추이",       visible: !!activeSections.omWeekly },
-      { key: "omBuildingLos",     name: "건물별 LoS",        visible: !!activeSections.omBuildingLos },
       { key: "omLosCrossSection", name: "장애물별 상세",     visible: !!activeSections.omLosCrossSection && omData.losMap.size > 0 },
       { key: "omLossEvents",      name: "표적소실 상세",     visible: !!activeSections.omLossEvents },
       { key: "omFindings",        name: "종합 소견",         visible: !!activeSections.omFindings },
@@ -703,6 +713,7 @@ export default function ReportApp() {
         commentary,
         omFindingsText: omData?.findingsText ?? "",
         omRecommendText: omData?.recommendText ?? "",
+        omTextOverrides: omData?.textOverrides ?? {},
         mapImage: state.mapImage,
       });
       const reportMeta: ReportSaveMeta = {
@@ -711,7 +722,7 @@ export default function ReportApp() {
         template: activeTemplate,
         radarName: state.radarSite?.name ?? "",
         reportConfigJson: configJson,
-        metadataJson: JSON.stringify(state.reportMetadata),
+        metadataJson: JSON.stringify(metadata ?? state.reportMetadata),
       };
 
       const result = await exportPDF(previewRef, filename, reportMeta);
@@ -749,7 +760,7 @@ export default function ReportApp() {
         queued();
       }
     }
-  }, [state, activeTemplate, activeSections, exportPDF, coverTitle, coverSubtitle, commentary, omData, editingReportId]);
+  }, [state, activeTemplate, activeSections, exportPDF, coverTitle, coverSubtitle, commentary, omData, editingReportId, metadata]);
 
   // ── 모달에서 생성 요청 → IDB + emit ──
   const handleModalGenerate = useCallback(async (
@@ -805,6 +816,7 @@ export default function ReportApp() {
         analysisMonth: monthStr ?? "",
       }),
       recommendText: "",
+      textOverrides: {},
       coverageStatus: covWith.size > 0 ? "done" : "loading",
       panoramaStatus: "deferred",
       sectionImages: new Map(),
@@ -1167,6 +1179,17 @@ export default function ReportApp() {
     );
   }
 
+  // 표지·머리말에 적용할 메타데이터 — 설정 모달 편집본(metadata)이 있으면 우선.
+  const effectiveMetadata = metadata ?? state.reportMetadata;
+
+  // 설정 모달용 표시 섹션 토글 목록
+  const settingsToggles = toggles.map((s) => ({
+    key: s.key as string,
+    label: s.label,
+    active: !!activeSections[s.key],
+    onToggle: () => setSections((prev) => prev ? { ...prev, [s.key]: !prev[s.key] } : prev),
+  }));
+
   // ── 공통 토글/상태 chip (타이틀바 children 으로 사용) ──
   // OM 사이드바 분기에서는 PDF 버튼이 사이드바에 있으므로 타이틀바에서는 제외.
   const sectionTogglePills = (
@@ -1399,7 +1422,7 @@ export default function ReportApp() {
         losResults={state.losResults}
         aircraft={state.aircraft}
         radarSite={state.radarSite}
-        reportMetadata={state.reportMetadata}
+        reportMetadata={effectiveMetadata}
         panoramaData={state.panoramaData}
         panoramaPeakNames={state.panoramaPeakNames}
         coverageLayers={state.coverageLayers}
@@ -1442,27 +1465,18 @@ export default function ReportApp() {
             docPeriod={omSidebarPeriod}
             docTitle={coverTitle || "장애물 월간 분석 보고서"}
             docNo={omSidebarDocNo}
-            agency={state.reportMetadata?.organization || undefined}
+            agency={effectiveMetadata?.organization || undefined}
             periodIso={omData?.analysisMonth || undefined}
             toc={omTocList}
             activeKey={omActiveTocKey}
             currentPage={omCurrentPage}
             totalPages={omTotalPages}
             onJump={handleTocJump}
-            sectionToggles={toggles.map((s) => ({
-              key: s.key,
-              label: s.label,
-              active: !!activeSections?.[s.key],
-              onToggle: () => setSections((prev) => prev ? { ...prev, [s.key]: !prev[s.key] } : prev),
-            }))}
+            onOpenSettings={() => setSettingsOpen(true)}
             showEditingModeChip={!!editingReportId}
             showNoResultChip={activeTemplate === "obstacle_monthly" && !omData?.result && !!editingReportId}
             exportError={exportError}
-            range={omSidebarRange}
-            onRangeChange={setOmSidebarRange}
-            paper={omSidebarPaper}
-            onPaperChange={setOmSidebarPaper}
-            onSave={handleExportPDF}
+            onSave={() => setExportOpen(true)}
             generating={generating}
             disabled={generating || omPreparing}
             disabledTitle={omPreparing ? "섹션 준비 중..." : undefined}
@@ -1486,6 +1500,32 @@ export default function ReportApp() {
           </div>
 
           {closeConfirmModal}
+
+          {/* 표시 섹션 + 메타데이터 설정 모달 */}
+          <ReportSettingsModal
+            open={settingsOpen}
+            onClose={() => setSettingsOpen(false)}
+            sectionToggles={settingsToggles}
+            metadata={effectiveMetadata}
+            onMetadataChange={(patch) =>
+              setMetadata((prev) => ({ ...(prev ?? state.reportMetadata), ...patch }))
+            }
+          />
+
+          {/* PDF 내보내기 옵션 모달 — 확인 시 실제 내보내기 트리거 */}
+          <ReportPdfExportModal
+            open={exportOpen}
+            onClose={() => setExportOpen(false)}
+            range={omSidebarRange}
+            onRangeChange={setOmSidebarRange}
+            paper={omSidebarPaper}
+            onPaperChange={setOmSidebarPaper}
+            totalPages={omTotalPages}
+            editingMode={!!editingReportId}
+            exportError={exportError}
+            generating={generating}
+            onConfirm={() => { setExportOpen(false); handleExportPDF(); }}
+          />
         </div>
         {/* 통합 OM 모달 — fragment 의 두 번째 자식 위치에 고정. 모든 분기에서 같은 트리
             위치에 마운트되어 step/analyzing 등 로컬 state 가 분기 전환 시 보존된다. */}

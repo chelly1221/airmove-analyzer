@@ -5,6 +5,7 @@
 import { useMemo } from "react";
 import { Loader2 } from "lucide-react";
 import ReportPage, { ReportPageHeaderProvider } from "./ReportPage";
+import { OMEditProvider } from "./OMEditable";
 import ReportCoverPage from "./ReportCoverPage";
 import ReportSummarySection from "./ReportSummarySection";
 import ReportMapSection from "./ReportMapSection";
@@ -20,7 +21,6 @@ import ReportOMSummarySection from "./ReportOMSummarySection";
 import ReportOMCombinedDailyChart from "./ReportOMCombinedDailyChart";
 import ReportOMWeeklyChart from "./ReportOMWeeklyChart";
 import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
-import ReportOMBuildingLoS from "./ReportOMBuildingLoS";
 import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
@@ -119,7 +119,6 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
       { key: "omSummary", label: "요약" },
       { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
       { key: "omWeekly", label: "주차" },
-      { key: "omBuildingLos", label: "LoS" },
       { key: "omLosCrossSection", label: "장애물별 상세" },
       { key: "omLossEvents", label: "표적소실상세" },
       { key: "omFindings", label: "소견" },
@@ -165,6 +164,20 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
 
   const singleFlight = template === "single" ? reportFlights[0] : null;
 
+  // OM 보고서 인라인 편집 컨텍스트 — 모든 문구를 textOverrides 로 덮어쓴다.
+  const omEditCtx = useMemo(() => ({
+    editable: template === "obstacle_monthly",
+    overrides: omData?.textOverrides ?? {},
+    onOverride: (key: string, value: string | null) => {
+      onOmDataChange((prev) => {
+        const next = { ...(prev.textOverrides ?? {}) };
+        if (value == null) delete next[key];
+        else next[key] = value;
+        return { ...prev, textOverrides: next };
+      });
+    },
+  }), [template, omData?.textOverrides, onOmDataChange]);
+
   // 페이지 상단 머리띠 — 발행기관(metadata.organization) + 템플릿별 보고서 제목
   const pageHeaderText = useMemo(() => {
     const titles: Record<string, string> = {
@@ -199,7 +212,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.omSummary) nums.omSummary = n++;
       if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
       if (sections.omWeekly) nums.omWeekly = n++;
-      if (sections.omBuildingLos) nums.omBuildingLos = n++;
       if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
       if (sections.omLossEvents) nums.omLossEvents = n++;
       if (sections.omFindings) nums.omFindings = n++;
@@ -249,6 +261,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
   return (
     <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">
       <ReportPageHeaderProvider value={pageHeaderText}>
+      <OMEditProvider value={omEditCtx}>
       <div className="kac-report">
       {/* 표지 (공통) */}
       {sections.cover && (
@@ -417,6 +430,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
                 azimuthSectorsByRadar={omData.azSectorsByRadar}
+                losMap={omData.losMap}
               />
             </div>
           )}
@@ -450,25 +464,13 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 return (
                   <ReportPage key={imgKey}>
                     <ReportOMWeeklyChart
-                      sectionNum={sectionNumbers.omWeekly ?? 4}
+                      sectionNum={sectionNumbers.omWeekly ?? 3}
                       radarName={rr.radar_name}
                       dailyStats={rr.daily_stats}
                     />
                   </ReportPage>
                 );
               })}
-            </div>
-          )}
-
-          {sections.omBuildingLos && (
-            <div data-toc-key="omBuildingLos">
-              <ReportOMBuildingLoS
-                sectionNum={sectionNumbers.omBuildingLos ?? 7}
-                selectedBuildings={omData.selectedBuildings}
-                buildingGroups={omData.buildingGroups}
-                radarSites={omData.selectedRadarSites}
-                losMap={omData.losMap}
-              />
             </div>
           )}
 
@@ -483,7 +485,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                   return (
                     <ReportOMObstacleDetail
                       key={`obs-${rs.name}-${b.id}`}
-                      sectionNum={sectionNumbers.omLosCrossSection ?? 8}
+                      sectionNum={sectionNumbers.omLosCrossSection ?? 4}
                       radarSite={rs}
                       building={b}
                       buildingGroups={omData.buildingGroups}
@@ -502,7 +504,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             <div data-toc-key="omLossEvents">
               {omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? (
                 <ReportOMLossEvents
-                  sectionNum={sectionNumbers.omLossEvents ?? 10}
+                  sectionNum={sectionNumbers.omLossEvents ?? 5}
                   radarResults={omResultTrimmed.radar_results}
                   selectedBuildings={omData.selectedBuildings}
                   buildingGroups={omData.buildingGroups}
@@ -530,7 +532,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
           {sections.omFindings && (
             <div data-toc-key="omFindings">
               <ReportOMFindings
-                sectionNum={sectionNumbers.omFindings ?? 11}
+                sectionNum={sectionNumbers.omFindings ?? 6}
                 radarResults={omResultTrimmed.radar_results}
                 selectedBuildings={omData.selectedBuildings}
                 buildingGroups={omData.buildingGroups}
@@ -641,6 +643,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
         </>
       )}
       </div>{/* /.kac-report */}
+      </OMEditProvider>
       </ReportPageHeaderProvider>
     </div>
   );

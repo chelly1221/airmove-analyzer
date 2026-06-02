@@ -98,6 +98,8 @@ export interface OMReportData {
   analysisMonth: string;
   findingsText: string;
   recommendText: string;
+  /** 인라인 편집 텍스트 오버라이드 (편집키 → 사용자 수정 문구). 기본 자동 문구를 덮어씀. */
+  textOverrides?: Record<string, string>;
   panoWithTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   panoWithoutTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   coverageStatus: "idle" | "loading" | "done" | "error";

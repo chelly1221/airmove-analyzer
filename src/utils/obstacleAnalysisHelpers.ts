@@ -4,6 +4,8 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import type { RadarSite, ManualBuilding, LoSProfileData, AzSector, BuildingOnPath } from "../types";
+import type { LossPointGeo } from "../types/obstacle";
+import { haversineKm, bearingDeg } from "./geo";
 
 /** OM 보고서 LoS 단면도 차트 최소 X축 (km) — 빌딩이 가까워도 이만큼은 terrain 을 샘플링.
  *  100NM = 100 * 1.852 km. ReportOMLosCrossSection 의 X 풀 스케일과 일치. */
@@ -100,6 +102,13 @@ export async function computeLosBatch(
           latitude: lats[idx],
           longitude: lons[idx],
         }));
+        // 순수 지형 프로파일 (건물 병합 전 raw SRTM) — 단면도 '분석 대상 제외' 선 계산용
+        const terrainProf = elevations.map((elev, idx) => ({
+          distance: (idx / samples) * profileEndKm,
+          elevation: elev,
+          latitude: lats[idx],
+          longitude: lons[idx],
+        }));
         const key = `${radar.name}_${bldg.id}`;
         const data: LoSProfileData = {
           id: `${prefix}_${radar.name}_${bldg.id}`,
@@ -112,6 +121,7 @@ export async function computeLosBatch(
           bearing,
           totalDistance: totalDist,
           elevationProfile: elevProfile,
+          terrainProfile: terrainProf,
           pathBuildings,
           losBlocked: blocked,
           maxBlockingPoint: blocked ? { distance: maxBlockDist, elevation: maxBlockElev, name: maxBlockName } : undefined,
@@ -224,4 +234,117 @@ export function mergeAzSectors(sectors: AzSector[]): AzSector[] {
     start_deg: m.s >= 360 ? m.s - 360 : m.s,
     end_deg: m.e >= 360 ? m.e - 360 : m.e,
   }));
+}
+
+// ─── 장애물 음영 표적소실 분류 ─────────────────────────────────────────────
+// ReportOMObstacleAzElevChart 와 ReportOMSummarySection 이 공유하는 단일 소스.
+//   inShadow:       소실표적 양각 < 전체 차단각(지형+장애물)  → 음영구역 내
+//   buildingCaused: inShadow && 양각 ≥ 지형 차단각            → 분석 대상 장애물 추가 기인
+// 차트(빨강 점)와 요약 표(음영 소실 건수)가 항상 일치하도록 동일 로직 사용.
+
+const R_EARTH_M_LOSS = 6_371_000;
+const FT_PER_M_LOSS = 3.28084;
+const AZ_TOLERANCE_DEG = 10;
+
+export interface ClassifiedLoss {
+  azDeg: number;
+  elevAngleDeg: number;
+  durationS: number;
+  inShadow: boolean;
+  buildingCaused: boolean;
+}
+
+/** elevationProfile 의 running max 차단각(tan, rad 근사), cutoff 거리(km)까지 */
+function runningMaxAngleRad(
+  profile: { distance: number; elevation: number }[],
+  radarHeight: number,
+  cutoffDistKm?: number,
+): number {
+  let maxAngle = -Infinity;
+  for (const pt of profile) {
+    if (pt.distance <= 0) continue;
+    if (cutoffDistKm !== undefined && pt.distance > cutoffDistKm) break;
+    const dM = pt.distance * 1000;
+    const adjH = pt.elevation - (dM * dM) / (2 * R_EARTH_M_LOSS);
+    const angle = (adjH - radarHeight) / dM;
+    if (angle > maxAngle) maxAngle = angle;
+  }
+  return maxAngle === -Infinity ? 0 : maxAngle;
+}
+
+/** 소실표적 양각(°) — 곡률 보정 후 */
+function lossElevAngleDeg(radarH: number, targetAltM: number, distM: number): number {
+  if (distM <= 0) return 0;
+  const curvDrop = (distM * distM) / (2 * R_EARTH_M_LOSS);
+  return (Math.atan((targetAltM - curvDrop - radarH) / distM) * 180) / Math.PI;
+}
+
+/**
+ * (레이더 × 분석 대상 장애물) 의 LoS 차단각 대비 후방 소실표적 분류.
+ * 방위 윈도우(±10°) + 대상 후방(거리 > bDistKm) 소실표적만 채택.
+ * @returns 차단각(°) + 분류된 소실 배열 + 집계(음영/장애물기인 건수, 장애물기인 소실시간)
+ */
+export function classifyObstacleLosses(
+  radar: RadarSite,
+  building: ManualBuilding,
+  los: LoSProfileData,
+  lossPoints: LossPointGeo[],
+): {
+  bDistKm: number;
+  bAzDeg: number;
+  angleTotalDeg: number;
+  angleTerrainDeg: number;
+  losses: ClassifiedLoss[];
+  shadowCount: number;
+  buildingCount: number;
+  buildingDurationS: number;
+} {
+  const radarH = radar.altitude + radar.antenna_height;
+  const bDistKm = los.totalDistance > 0
+    ? los.totalDistance
+    : haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  const bAzDeg = los.bearing ?? bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
+
+  let angleTotal = 0;
+  let angleTerrain = 0;
+  if (los.elevationProfile.length > 0) {
+    angleTotal = runningMaxAngleRad(los.elevationProfile, radarH);
+    angleTerrain = runningMaxAngleRad(los.elevationProfile, radarH, bDistKm);
+  } else {
+    const bTopM = (building.ground_elev || 0) + building.height;
+    const dM = bDistKm * 1000;
+    const curvDrop = (dM * dM) / (2 * R_EARTH_M_LOSS);
+    angleTotal = (bTopM - curvDrop - radarH) / dM;
+  }
+  const angleTotalDeg = (Math.atan(angleTotal) * 180) / Math.PI;
+  const angleTerrainDeg = (Math.atan(angleTerrain) * 180) / Math.PI;
+
+  const losses: ClassifiedLoss[] = [];
+  for (const lp of lossPoints) {
+    const lpDistKm = haversineKm(radar.latitude, radar.longitude, lp.lat, lp.lon);
+    const lpAz = bearingDeg(radar.latitude, radar.longitude, lp.lat, lp.lon);
+    let azDiff = Math.abs(lpAz - bAzDeg);
+    if (azDiff > 180) azDiff = 360 - azDiff;
+    if (azDiff > AZ_TOLERANCE_DEG) continue;
+    if (lpDistKm <= bDistKm + 0.01) continue;
+
+    const lpAltM = lp.alt_ft / FT_PER_M_LOSS;
+    const lpElevDeg = lossElevAngleDeg(radarH, lpAltM, lpDistKm * 1000);
+    const inShadow = lpElevDeg < angleTotalDeg;
+    const buildingCaused = inShadow && lpElevDeg >= angleTerrainDeg;
+    losses.push({ azDeg: lpAz, elevAngleDeg: lpElevDeg, durationS: lp.duration_s, inShadow, buildingCaused });
+  }
+
+  let shadowCount = 0;
+  let buildingCount = 0;
+  let buildingDurationS = 0;
+  for (const l of losses) {
+    if (l.inShadow) shadowCount++;
+    if (l.buildingCaused) {
+      buildingCount++;
+      buildingDurationS += l.durationS;
+    }
+  }
+
+  return { bDistKm, bAzDeg, angleTotalDeg, angleTerrainDeg, losses, shadowCount, buildingCount, buildingDurationS };
 }
