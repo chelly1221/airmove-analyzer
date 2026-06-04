@@ -118,6 +118,53 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
+/* Drawer 채움 슬라이더 (accent 채움 트랙 + var 색상) — drawerPrimitives DsSlider */
+.ds-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 16px;
+  background: transparent;
+  cursor: pointer;
+}
+.ds-range::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 3px;
+  background: linear-gradient(to right, var(--ds-col) var(--ds-pct), #e5e7eb var(--ds-pct));
+}
+.ds-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--ds-col);
+  margin-top: -4px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.ds-range::-moz-range-track {
+  height: 5px;
+  border-radius: 3px;
+  background: #e5e7eb;
+}
+.ds-range::-moz-range-progress {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--ds-col);
+}
+.ds-range::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--ds-col);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.ds-range:disabled {
+  opacity: 0.5;
+}
+
 /* Coverage dual range slider: hide default track since we render our own */
 input.coverage-range-thumb {
   background: transparent !important;

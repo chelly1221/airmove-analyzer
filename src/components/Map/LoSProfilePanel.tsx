@@ -45,6 +45,23 @@ interface Props {
   onBuildingDetail?: (building: BuildingOnPath & { isBlocking?: boolean }) => void;
   /** 주소 검색으로 LoS 분석 시작한 경우, 해당 좌표에 해당하는 건물을 단면도에서 자동 선택 */
   searchedAddress?: { lat: number; lon: number } | null;
+  /** 단면도 레이어 표시 (드로어에서 제어). 미지정 시 모두 표시 */
+  layers?: { terrain: boolean; los43: boolean; fresnel: boolean; bra: boolean; cos: boolean };
+  /** 프레넬 클리어런스 비율 0~1 (기본 0.8 = 80%) */
+  fresnelClearance?: number;
+  /** 건물 표시 (제어형). 미지정 시 내부 상태 사용 */
+  showBuildings?: boolean;
+  onToggleBuildings?: () => void;
+  /** 사용자 각도선 표시 (제어형) */
+  showCustomAngle?: boolean;
+  onToggleCustomAngle?: () => void;
+  /** 사용자 각도(°) (제어형) */
+  customAngleDeg?: number;
+  onCustomAngleChange?: (deg: number) => void;
+  /** 차트 내 범례 표시 (드로어가 범례 역할을 하면 false) */
+  showLegend?: boolean;
+  /** 차단 여부 + 건물 차단/비차단 수 보고 (드로어 헤더/건물 행 갱신용) */
+  onStats?: (s: { blocked: boolean; blocking: number; nonBlocking: number }) => void;
 }
 
 
@@ -70,14 +87,25 @@ function curvDrop43(dKm: number): number {
 }
 
 
-export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail, searchedAddress }: Props) {
+export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail, searchedAddress,
+  layers = { terrain: true, los43: true, fresnel: true, bra: true, cos: true },
+  fresnelClearance = 0.8,
+  showBuildings: showBuildingsProp, onToggleBuildings,
+  showCustomAngle: showCustomAngleProp, onToggleCustomAngle,
+  customAngleDeg: customAngleDegProp, onCustomAngleChange,
+  showLegend = true, onStats }: Props) {
   const manualBuildings = useAppStore((s) => s.manualBuildings);
   const buildingGroups = useAppStore((s) => s.buildingGroups);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
   const [peakNames, setPeakNames] = useState<Map<number, string>>(new Map());
   const [buildings, setBuildings] = useState<BuildingOnPath[]>([]);
-  const [showBuildings, setShowBuildings] = useState(true);
+  const [showBuildingsInternal, setShowBuildingsInternal] = useState(true);
+  const showBuildings = showBuildingsProp ?? showBuildingsInternal;
+  const setShowBuildings = useCallback((v: boolean) => {
+    if (onToggleBuildings) onToggleBuildings();
+    else setShowBuildingsInternal(v);
+  }, [onToggleBuildings]);
   const [hoverX, setHoverX] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   // X축 줌: [시작%, 끝%] (0~100)
@@ -94,8 +122,18 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const [hoveredBldgIdx, setHoveredBldgIdx] = useState<number | null>(null);
   const [clickedBldgIdx, setClickedBldgIdx] = useState<number | null>(null);
   // 사용자 조절 각도선
-  const [customAngleDeg, setCustomAngleDeg] = useState(0.5);
-  const [showCustomAngle, setShowCustomAngle] = useState(false);
+  const [customAngleDegInternal, setCustomAngleDegInternal] = useState(0.5);
+  const [showCustomAngleInternal, setShowCustomAngleInternal] = useState(false);
+  const customAngleDeg = customAngleDegProp ?? customAngleDegInternal;
+  const showCustomAngle = showCustomAngleProp ?? showCustomAngleInternal;
+  const setCustomAngleDeg = useCallback((v: number) => {
+    if (onCustomAngleChange) onCustomAngleChange(v);
+    else setCustomAngleDegInternal(v);
+  }, [onCustomAngleChange]);
+  const setShowCustomAngle = useCallback((v: boolean) => {
+    if (onToggleCustomAngle) onToggleCustomAngle();
+    else setShowCustomAngleInternal(v);
+  }, [onToggleCustomAngle]);
   const customAngleDegRef = useRef(0.5);
   const showCustomAngleRef = useRef(false);
   const isAngleDragging = useRef(false);
@@ -414,7 +452,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         const diM = ob.distance * 1000;
         const adjH43 = ob.elevation - curvDrop43(ob.distance);
         const f1 = Math.sqrt(LAMBDA_M * diM * (dM - diM) / dM);
-        const adjHFresnel = adjH43 + 0.8 * f1;
+        const adjHFresnel = adjH43 + fresnelClearance * f1;
         const shadow = radarHeight + (adjHFresnel - radarHeight) * (d / ob.distance);
         if (shadow > maxShadow43) maxShadow43 = shadow;
       }
@@ -581,7 +619,16 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       adjTarget,
       targetElev,
     };
-  }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings, searchedAddress]);
+  }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings, searchedAddress, fresnelClearance]);
+
+  // 차단 여부 + 건물 차단/비차단 수를 상위(드로어)로 보고
+  useEffect(() => {
+    if (!onStats) return;
+    if (!chartData) { onStats({ blocked: false, blocking: 0, nonBlocking: 0 }); return; }
+    const blocking = chartData.significantBuildings.filter((b) => b.isBlocking).length;
+    const nonBlocking = chartData.significantBuildings.length - blocking;
+    onStats({ blocked: chartData.blocked, blocking, nonBlocking });
+  }, [chartData, onStats]);
 
   // 주소 검색 결과 건물을 단면도에서 자동 선택
   const autoSelectedSearchedRef = useRef<number | null>(null);
@@ -1104,11 +1151,13 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           <line key={`xg-${x}`} x1={xScale(x)} y1={PAD.top} x2={xScale(x)} y2={H - PAD.bottom}
             stroke="rgba(0,0,0,0.06)" strokeWidth={0.5} />
         ))}
-        {/* 지형 채우기 */}
-        <path d={terrainFill} fill="url(#terrainGrad)" />
-
-        {/* 지형 윤곽선 */}
-        <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
+        {/* 지형 채우기 + 윤곽선 */}
+        {layers.terrain && (
+          <>
+            <path d={terrainFill} fill="url(#terrainGrad)" />
+            <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
+          </>
+        )}
 
         {/* 건물 실루엣 (차폐 기여 건물만) — 점 건물: 세로선, 도형 건물: 채워진 사각형 */}
         {showBuildings && chartData.significantBuildings.map((b, bi) => {
@@ -1196,27 +1245,37 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           );
         })}
 
-        {/* 최저 탐지가능 높이 - 직선 LoS + 프레넬존 80% 클리어런스 */}
-        <path d={minDetFresnelPath} fill="none"
-          stroke="#ec4899" strokeWidth={1.2} strokeDasharray="6 3" />
+        {/* 최저 탐지가능 높이 - 직선 LoS + 프레넬존 클리어런스 */}
+        {layers.fresnel && (
+          <path d={minDetFresnelPath} fill="none"
+            stroke="#ec4899" strokeWidth={1.2} strokeDasharray="6 3" />
+        )}
 
         {/* 최저 탐지가능 높이 - LoS (4/3 유효지구 굴절) */}
-        <path d={minDetStrPath} fill="none"
-          stroke="#f59e0b" strokeWidth={1.8} />
+        {layers.los43 && (
+          <path d={minDetStrPath} fill="none"
+            stroke="#f59e0b" strokeWidth={1.8} />
+        )}
 
         {/* 0.25° BRA 기준선 */}
-        <path d={braPath} fill="none"
-          stroke="#22d3ee" strokeWidth={1} strokeDasharray="8 4" />
-        <text
-          x={xScale(maxDistance) - 4}
-          y={yScale(braLine[braLine.length - 1].height) - 5}
-          textAnchor="end" fill="#22d3ee" fontSize={9} fontWeight="bold">
-          BRA
-        </text>
+        {layers.bra && (
+          <>
+            <path d={braPath} fill="none"
+              stroke="#22d3ee" strokeWidth={1} strokeDasharray="8 4" />
+            <text
+              x={xScale(maxDistance) - 4}
+              y={yScale(braLine[braLine.length - 1].height) - 5}
+              textAnchor="end" fill="#22d3ee" fontSize={9} fontWeight="bold">
+              BRA
+            </text>
+          </>
+        )}
 
         {/* CoS 70° 기준선 */}
-        <path d={cosPath} fill="none"
-          stroke="#a855f7" strokeWidth={1} strokeDasharray="4 3" />
+        {layers.cos && (
+          <path d={cosPath} fill="none"
+            stroke="#a855f7" strokeWidth={1} strokeDasharray="4 3" />
+        )}
 
         {/* 레이더 위치 라벨 (Y축 상단) */}
         <text x={xScale(0) + 4} y={PAD.top + 12}
@@ -1273,7 +1332,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
         </g>{/* /chart-clip */}
 
-        {/* 범례 (왼쪽 위) */}
+        {/* 범례 (왼쪽 위) — 드로어가 범례 역할을 하면 숨김 */}
+        {showLegend && (
         <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5})`}>
           <rect x={-4} y={-6} width={270} height={(() => {
             let h = 66;
@@ -1366,6 +1426,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
             );
           })()}
         </g>
+        )}
 
         {/* 인터랙티브 크로스헤어 + 호버 툴팁 */}
         {hoverData && hoveredTrackIdx === null && externalHoverIdx == null && pinnedTrackIdx === null && hoveredBldgIdx === null && (() => {

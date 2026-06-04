@@ -1,9 +1,13 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { Radar, Loader2, ChevronDown } from "lucide-react";
+import { Radar, Loader2, RefreshCw, X } from "lucide-react";
 import type { MapRef } from "react-map-gl/maplibre";
 import { useAppStore } from "../../store";
 import type { RadarSite } from "../../types";
 import { computeMainCoverage, isGPUCacheValidFor, invalidateGPUCache, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../../utils/radarCoverage";
+import { Toggle, DsSlider, ACCENT, G } from "./drawerPrimitives";
+
+/** 최고 탐지고도 기준각 (CoS) */
+const MAX_ELEV_DEG = 70;
 
 interface Props {
   radarSite: RadarSite;
@@ -15,25 +19,26 @@ interface Props {
   setCoverageAltMin: (v: number) => void;
   coverageOpacity: number;
   setCoverageOpacity: (v: number) => void;
-  coverageExpanded: boolean;
-  setCoverageExpanded: (v: boolean) => void;
   coverageRendering: boolean;
   mapRef: React.RefObject<MapRef | null>;
+  /** 드로어 닫기 (X) */
+  onClose: () => void;
 }
 
 export default function CoveragePanel({
   radarSite, gpuCacheReady, setGpuCacheReady,
   coverageAlt, setCoverageAlt, coverageAltMin, setCoverageAltMin,
   coverageOpacity, setCoverageOpacity,
-  coverageExpanded, setCoverageExpanded,
   coverageRendering,
-  mapRef,
+  mapRef, onClose,
 }: Props) {
   const coverageVisible = useAppStore((s) => s.coverageVisible);
   const setCoverageVisible = useAppStore((s) => s.setCoverageVisible);
   const coverageLoading = useAppStore((s) => s.coverageLoading);
   const setCoverageLoading = useAppStore((s) => s.setCoverageLoading);
+  const coverageProgress = useAppStore((s) => s.coverageProgress);
   const setCoverageProgress = useAppStore((s) => s.setCoverageProgress);
+  const coverageProgressPct = useAppStore((s) => s.coverageProgressPct);
   const setCoverageProgressPct = useAppStore((s) => s.setCoverageProgressPct);
   const coverageError = useAppStore((s) => s.coverageError);
   const setCoverageError = useAppStore((s) => s.setCoverageError);
@@ -44,6 +49,10 @@ export default function CoveragePanel({
   const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageAltMinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageComputeAbortRef = useRef(0);
+
+  // 외부(슬라이더 리셋 등)에서 alt 값이 바뀌면 입력 동기화
+  useEffect(() => { setCoverageAltInput(coverageAlt); }, [coverageAlt]);
+  useEffect(() => { setCoverageAltMinInput(coverageAltMin); }, [coverageAltMin]);
 
   useEffect(() => {
     return () => {
@@ -134,116 +143,147 @@ export default function CoveragePanel({
 
   const cacheValid = gpuCacheReady && isGPUCacheValidFor(radarSite);
   const isActive = coverageVisible && cacheValid;
+  const status: "on" | "off" | "loading" = coverageLoading ? "loading" : (isActive ? "on" : "off");
+  const dim = !isActive;
+  const transparencyPct = Math.round((1 - coverageOpacity) * 100);
+
+  const micro: React.CSSProperties = { fontSize: 8.5, fontWeight: 700, letterSpacing: ".06em", color: G[400], textTransform: "uppercase" };
+  const num: React.CSSProperties = { fontFamily: "ui-monospace, monospace", fontVariantNumeric: "tabular-nums", fontWeight: 700 };
+
+  const chip = {
+    on: { t: "표시중", c: ACCENT, bg: "rgba(166,7,57,.10)" },
+    off: { t: "꺼짐", c: G[500], bg: G[100] },
+    loading: { t: "계산중", c: "#2563eb", bg: "rgba(37,99,235,.10)" },
+  }[status];
 
   return (
-    <div className={`rounded-lg border transition-colors ${isActive ? "border-[#a60739]/30 bg-[#a60739]/5" : "border-gray-200 bg-gray-50"}`}>
-      {/* 헤더: 접기/펼치기 */}
-      <button
-        onClick={() => setCoverageExpanded(!coverageExpanded)}
-        className="flex w-full items-center justify-between px-3 py-2.5"
-      >
-        <div className="flex items-center gap-2">
-          <Radar size={14} className={isActive ? "text-[#a60739]" : "text-gray-400"} />
-          <span className={`text-xs font-medium ${isActive ? "text-[#a60739]" : "text-gray-600"}`}>커버리지 맵</span>
-          {(coverageLoading || coverageRendering) && <>
-            <Loader2 size={12} className="animate-spin text-[#a60739]" />
-            <span className="text-[10px] text-[#a60739]/70">계산중</span>
-          </>}
+    <>
+      {/* 헤더 */}
+      <div style={{ padding: "10px 12px", borderBottom: `1px solid ${G[200]}`, flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: G[800], lineHeight: 1.15 }}>커버리지 맵</span>
+            <span style={{ fontSize: 9.5, color: G[400], lineHeight: 1.2 }}>
+              {radarSite.name} · {Math.round(radarSite.range_nm)}NM · 안테나 {Math.round(radarSite.antenna_height)}m
+            </span>
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9.5, fontWeight: 700, padding: "3px 7px", borderRadius: 5, flexShrink: 0, color: chip.c, background: chip.bg }}>
+            {status === "loading" && <Loader2 size={10} color={chip.c} className="animate-spin" />}
+            {chip.t}
+          </span>
+          <button
+            onClick={onClose} title="닫기"
+            style={{ width: 24, height: 24, borderRadius: 6, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, color: G[400] }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = G[100]; e.currentTarget.style.color = G[600]; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = G[400]; }}
+          >
+            <X size={14} />
+          </button>
         </div>
-        <ChevronDown size={14} className={`transition-transform text-gray-400 ${coverageExpanded ? "rotate-180" : ""}`} />
-      </button>
+      </div>
 
-      {/* 펼친 내용: 토글 + 슬라이더 등 */}
-      {coverageExpanded && (
-        <div className="px-3 pb-2.5 space-y-3">
-          {/* 토글 */}
-          <div className="flex items-center justify-between">
-            <span className="text-[11px] text-gray-500">표시</span>
-            <button
-              onClick={handleToggle}
-              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${isActive ? "bg-[#a60739]" : "bg-gray-300"}`}
-              role="switch"
-              aria-checked={isActive}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
+        {/* 계측 스트립 */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", borderBottom: `1px solid ${G[200]}` }}>
+          {([["사거리", Math.round(radarSite.range_nm), "NM"], ["안테나고", Math.round(radarSite.antenna_height), "m"], ["최고탐지", MAX_ELEV_DEG, "°"]] as const).map(([k, v, u], i) => (
+            <div key={k} style={{ padding: "7px 9px", borderRight: i < 2 ? `1px solid ${G[200]}` : "none" }}>
+              <div style={micro}>{k}</div>
+              <div style={{ ...num, fontSize: 14, color: G[800], marginTop: 1 }}>{v}<span style={{ fontSize: 8, color: G[400], marginLeft: 1 }}>{u}</span></div>
+            </div>
+          ))}
+        </div>
 
-            >
-              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${isActive ? "translate-x-4.5" : "translate-x-0.5"}`} />
-            </button>
+        {/* 표시 + 재계산 */}
+        <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}` }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: coverageLoading ? 8 : 0 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <Radar size={14} color={!dim ? ACCENT : G[400]} />
+              <span style={{ fontSize: 12, color: G[600] }}>커버리지 표시</span>
+              {coverageRendering && !coverageLoading && <Loader2 size={11} color={ACCENT} className="animate-spin" />}
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button
+                onClick={() => startCoverageCompute(true)} title="GPU 재계산" disabled={coverageLoading}
+                style={{ display: "flex", alignItems: "center", gap: 4, height: 24, padding: "0 8px", borderRadius: 6, border: `1px solid ${G[200]}`, background: "#fff", color: coverageLoading ? G[300] : G[600], fontSize: 10, fontWeight: 600, cursor: coverageLoading ? "default" : "pointer" }}
+                onMouseEnter={(e) => { if (!coverageLoading) e.currentTarget.style.borderColor = G[300]; }}
+                onMouseLeave={(e) => { e.currentTarget.style.borderColor = G[200]; }}
+              >
+                <RefreshCw size={11} color={coverageLoading ? G[300] : G[500]} className={coverageLoading ? "animate-spin" : ""} />
+                재계산
+              </button>
+              <Toggle on={!dim} onClick={handleToggle} />
+            </span>
           </div>
+          {coverageLoading && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={{ height: 5, borderRadius: 3, background: G[200], overflow: "hidden" }}>
+                <div style={{ height: "100%", width: coverageProgressPct + "%", background: ACCENT, borderRadius: 3, transition: "width .12s linear" }} />
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 9.5, fontWeight: 500, color: G[500] }}>{coverageProgress || "GPU 음영분석 중…"}</span>
+                <span style={{ ...num, fontSize: 9.5, color: "#2563eb" }}>{coverageProgressPct}%</span>
+              </div>
+            </div>
+          )}
           {coverageError && (
-            <div className="rounded-md bg-red-50 px-2.5 py-1.5 text-[11px] text-red-600">
+            <div style={{ marginTop: 8, borderRadius: 6, background: "#fef2f2", padding: "6px 10px", fontSize: 11, color: "#dc2626" }}>
               {coverageError}
             </div>
           )}
+        </div>
 
-          {cacheValid ? (
-            <div className="space-y-2.5">
-              {/* 투명도 */}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] text-gray-500">투명도</span>
-                  <span className="text-[10px] font-medium text-[#a60739]">
-                    {Math.round((1 - coverageOpacity) * 100)}%
-                  </span>
-                </div>
+        {/* 투명도 */}
+        <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}`, opacity: dim ? 0.5 : 1, pointerEvents: dim ? "none" : "auto" }}>
+          <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontSize: 11, color: G[500] }}>투명도</span>
+            <span style={{ ...num, fontSize: 10.5, color: ACCENT }}>{transparencyPct}%</span>
+          </div>
+          <DsSlider value={Math.min(1, Math.max(0.1, 1.1 - coverageOpacity))} min={0.1} max={1} step={0.05} onChange={(v) => setCoverageOpacity(1.1 - v)} />
+        </div>
+
+        {/* 고도 범위 */}
+        <div style={{ padding: "9px 11px 11px", borderBottom: `1px solid ${G[200]}`, opacity: dim ? 0.5 : 1, pointerEvents: dim ? "none" : "auto" }}>
+          <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontSize: 11, color: G[500] }}>고도 범위</span>
+            <span style={{ ...num, fontSize: 10.5, color: ACCENT }}>{coverageAltMinInput.toLocaleString()}~{coverageAltInput.toLocaleString()}ft</span>
+          </div>
+          {(() => {
+            const totalRange = COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT;
+            const pctMin = ((Math.min(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
+            const pctMax = ((Math.max(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
+            const loTop = coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2;
+            return (
+              <div className="relative h-[22px]">
+                <div className="absolute top-1/2 left-[8px] right-[8px] h-[5px] -translate-y-1/2 rounded-full" style={{ background: G[200] }} />
+                <div
+                  className="absolute top-1/2 h-[5px] -translate-y-1/2 rounded-full"
+                  style={{ background: ACCENT, left: `calc(8px + (100% - 16px) * ${pctMin / 100})`, right: `calc(8px + (100% - 16px) * ${(100 - pctMax) / 100})` }}
+                />
                 <input
-                  type="range" min={0.1} max={1} step={0.05}
-                  value={1.1 - coverageOpacity}
-                  onChange={(e) => setCoverageOpacity(1.1 - Number(e.target.value))}
-                  className="w-full accent-[#a60739]"
+                  type="range" min={COVERAGE_MIN_ALT_FT} max={COVERAGE_MAX_ALT_FT} step={COVERAGE_ALT_STEP_FT}
+                  value={coverageAltMinInput}
+                  onChange={(e) => { const v = Number(e.target.value); handleCoverageAltMinChange(Math.min(v, coverageAltInput)); }}
+                  style={{ zIndex: loTop ? 30 : 20 }}
+                  className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
+                  aria-label="최소 고도"
+                />
+                <input
+                  type="range" min={COVERAGE_MIN_ALT_FT} max={COVERAGE_MAX_ALT_FT} step={COVERAGE_ALT_STEP_FT}
+                  value={coverageAltInput}
+                  onChange={(e) => { const v = Number(e.target.value); handleCoverageAltChange(Math.max(v, coverageAltMinInput)); }}
+                  style={{ zIndex: loTop ? 20 : 30 }}
+                  className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
+                  aria-label="최대 고도"
                 />
               </div>
-
-              {/* 고도 범위 */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] text-gray-500">고도</span>
-                  <span className="text-[10px] font-medium text-[#a60739]">
-                    {coverageAltMinInput.toLocaleString()}~{coverageAltInput.toLocaleString()}ft
-                  </span>
-                </div>
-                {(() => {
-                  const totalRange = COVERAGE_MAX_ALT_FT - COVERAGE_MIN_ALT_FT;
-                  const pctMin = ((Math.min(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
-                  const pctMax = ((Math.max(coverageAltMinInput, coverageAltInput) - COVERAGE_MIN_ALT_FT) / totalRange) * 100;
-                  return (
-                    <div className="relative h-6">
-                      <div className="absolute top-1/2 left-[8px] right-[8px] h-1.5 -translate-y-1/2 rounded-full bg-gray-200" />
-                      <div
-                        className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[#a60739]"
-                        style={{ left: `calc(8px + (100% - 16px) * ${pctMin / 100})`, right: `calc(8px + (100% - 16px) * ${(100 - pctMax) / 100})` }}
-                      />
-                      <input
-                        type="range" min={COVERAGE_MIN_ALT_FT} max={COVERAGE_MAX_ALT_FT} step={COVERAGE_ALT_STEP_FT}
-                        value={coverageAltMinInput}
-                        onChange={(e) => { const v = Number(e.target.value); handleCoverageAltMinChange(Math.min(v, coverageAltInput)); }}
-                        style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 30 : 20 }}
-                        className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
-                        aria-label="최소 고도"
-                      />
-                      <input
-                        type="range" min={COVERAGE_MIN_ALT_FT} max={COVERAGE_MAX_ALT_FT} step={COVERAGE_ALT_STEP_FT}
-                        value={coverageAltInput}
-                        onChange={(e) => { const v = Number(e.target.value); handleCoverageAltChange(Math.max(v, coverageAltMinInput)); }}
-                        style={{ zIndex: coverageAltMinInput > (COVERAGE_MAX_ALT_FT + COVERAGE_MIN_ALT_FT) / 2 ? 20 : 30 }}
-                        className="coverage-range-thumb absolute left-0 right-0 top-1/2 -translate-y-1/2 w-full appearance-none bg-transparent cursor-pointer pointer-events-none"
-                        aria-label="최대 고도"
-                      />
-                    </div>
-                  );
-                })()}
-                <div className="flex justify-between text-[9px] text-gray-400">
-                  <span>{COVERAGE_MIN_ALT_FT.toLocaleString()}ft</span>
-                  <span>{COVERAGE_MAX_ALT_FT.toLocaleString()}ft</span>
-                </div>
-              </div>
-            </div>
-          ) : !coverageLoading ? (
-            <div className="text-[10px] text-gray-500 text-center py-1">
-              토글을 켜면 커버리지를 자동 계산합니다
-            </div>
-          ) : null}
+            );
+          })()}
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8.5, color: G[400], marginTop: 1 }}>
+            <span>{COVERAGE_MIN_ALT_FT.toLocaleString()}ft</span>
+            <span>{COVERAGE_MAX_ALT_FT.toLocaleString()}ft</span>
+          </div>
         </div>
-      )}
-    </div>
+      </div>
+    </>
   );
 }

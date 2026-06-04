@@ -16,8 +16,31 @@ import {
   Search,
   MapPin,
   CloudRain,
+  Settings,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { ToolButton, HeadingTape, Toggle as DsToggle, Check, Swatch, DsSlider } from "../components/Map/drawerPrimitives";
+
+/** 표시 행 설정 톱니 버튼 (우측 설정 드로어 토글) */
+const GearButton = ({ active, onClick }: { active: boolean; onClick: () => void }) => (
+  <button
+    onClick={onClick} title="설정"
+    className={`flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md transition-colors ${
+      active ? "bg-[#a60739]/5 text-[#a60739]" : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+    }`}
+  >
+    <Settings size={14} />
+  </button>
+);
+
+/** LoS 단면도 레이어 정의 (LoSProfilePanel 범례와 동일 색/의미) */
+const LOS_LAYERS = [
+  { key: "terrain", label: "지형", sub: "지구곡률 보정", color: "#22c55e", dash: false },
+  { key: "los43", label: "최저탐지 LoS", sub: "4/3 유효지구 굴절", color: "#f59e0b", dash: false },
+  { key: "fresnel", label: "프레넬존", sub: "80% 클리어런스", color: "#ec4899", dash: true },
+  { key: "bra", label: "BRA", sub: "0.25° 기준선", color: "#22d3ee", dash: true },
+  { key: "cos", label: "CoS", sub: "70° 최고탐지고도", color: "#a855f7", dash: true },
+] as const;
 
 /** 항적선 아이콘 (꺾인 경로선) */
 const TrackLineIcon = ({ size = 16 }: { size?: number }) => (
@@ -85,63 +108,6 @@ const WEATHER_COLORS: [number, number, number][] = [
 ];
 /** 기상 강도 범례 라벨 */
 const WEATHER_LEVEL_LABELS = ["", "약", "", "중", "", "강", "매우강"];
-
-/** 방위 선택 원형 컨트롤 */
-function AzimuthCircle({ azimuth, onChange, disabled }: { azimuth: number; onChange: (az: number) => void; disabled?: boolean }) {
-  const svgRef = useRef<SVGSVGElement>(null);
-  const size = 72;
-  const cx = size / 2;
-  const cy = size / 2;
-  const r = size / 2 - 8;
-
-  const calcAngle = useCallback((e: React.MouseEvent | MouseEvent) => {
-    const svg = svgRef.current;
-    if (!svg) return;
-    const rect = svg.getBoundingClientRect();
-    const x = e.clientX - rect.left - cx;
-    const y = e.clientY - rect.top - cy;
-    return ((Math.atan2(x, -y) * 180 / Math.PI) + 360) % 360;
-  }, [cx, cy]);
-
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (disabled) return;
-    const a = calcAngle(e);
-    if (a !== undefined) onChange(Math.round(a));
-    const onMove = (ev: MouseEvent) => {
-      const a2 = calcAngle(ev);
-      if (a2 !== undefined) onChange(Math.round(a2));
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  }, [calcAngle, onChange, disabled]);
-
-  const azRad = azimuth * Math.PI / 180;
-  const nx = cx + Math.sin(azRad) * r * 0.78;
-  const ny = cy - Math.cos(azRad) * r * 0.78;
-
-  return (
-    <svg ref={svgRef} width={size} height={size} className={`shrink-0 ${disabled ? "opacity-40" : "cursor-pointer"}`} onMouseDown={handleMouseDown}>
-      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#d1d5db" strokeWidth="1" />
-      {/* 눈금 (30° 간격) */}
-      {Array.from({ length: 12 }, (_, i) => {
-        const a = i * 30 * Math.PI / 180;
-        const inner = r - 3;
-        return <line key={i} x1={cx + Math.sin(a) * inner} y1={cy - Math.cos(a) * inner} x2={cx + Math.sin(a) * r} y2={cy - Math.cos(a) * r} stroke="#d1d5db" strokeWidth="0.8" />;
-      })}
-      <text x={cx} y={9} textAnchor="middle" className="text-[7px] fill-gray-400 select-none font-medium">N</text>
-      <text x={size - 4} y={cy + 2.5} textAnchor="middle" className="text-[7px] fill-gray-400 select-none font-medium">E</text>
-      <text x={cx} y={size - 2} textAnchor="middle" className="text-[7px] fill-gray-400 select-none font-medium">S</text>
-      <text x={5} y={cy + 2.5} textAnchor="middle" className="text-[7px] fill-gray-400 select-none font-medium">W</text>
-      <circle cx={cx} cy={cy} r="1.5" fill="#a60739" />
-      <line x1={cx} y1={cy} x2={nx} y2={ny} stroke="#a60739" strokeWidth="1.5" strokeLinecap="round" />
-      <circle cx={nx} cy={ny} r="3" fill="#a60739" />
-    </svg>
-  );
-}
 
 /** LoS 분석용 인라인 주소 검색 */
 function LosAddressSearch({ onSelect }: { onSelect: (lat: number, lon: number) => void }) {
@@ -506,9 +472,28 @@ export default function TrackMap() {
   const savedPitchRef = useRef(45);
   const savedBearingRef = useRef(0);
   const losPointClickedRef = useRef(false); // deck.gl LoS 포인트 클릭 여부 (빈 영역 클릭 구분용)
-  const [losExpanded, setLosExpanded] = useState(false);
   const [losCursorPicking, setLosCursorPicking] = useState(false);
-  const [coverageExpanded, setCoverageExpanded] = useState(false);
+  // ── 도구 드로어 (좌측 도킹) — LoS 분석 / 커버리지 맵 택1 ──
+  const [activeTool, setActiveTool] = useState<"los" | "coverage" | null>(null);
+  const lastToolRef = useRef<"los" | "coverage">("los");
+  if (activeTool) lastToolRef.current = activeTool;
+  // ── 표시 설정 드로어 (우측 도킹) — 건물 / 기상 ──
+  const [settingsDrawer, setSettingsDrawer] = useState<"building" | "weather" | null>(null);
+  const lastSettingsRef = useRef<"building" | "weather">("building");
+  if (settingsDrawer) lastSettingsRef.current = settingsDrawer;
+  // LoS 단면도 레이어 표시 / 프레넬 클리어런스 / 사용자 각도선 (드로어에서 제어)
+  const [losLayers, setLosLayers] = useState({ terrain: true, los43: true, fresnel: true, bra: false, cos: false });
+  const [fresnelPct, setFresnelPct] = useState(80);
+  const [losShowBuildings, setLosShowBuildings] = useState(true);
+  const [showCustomAngle, setShowCustomAngle] = useState(false);
+  const [customAngleDeg, setCustomAngleDeg] = useState(0.5);
+  const [losPrecise, setLosPrecise] = useState(false);
+  // LoSProfilePanel → 드로어 보고 (차단 여부 + 건물 차단/비차단 수)
+  const [losStats, setLosStats] = useState<{ blocked: boolean; blocking: number; nonBlocking: number }>({ blocked: false, blocking: 0, nonBlocking: 0 });
+  const handleLosStats = useCallback((s: { blocked: boolean; blocking: number; nonBlocking: number }) => setLosStats(s), []);
+  // 건물 채움 투명도 (3D fill-extrusion + 2D 점 alpha) / 3D 입체 허용 (줌 15+)
+  const [buildingOpacity, setBuildingOpacity] = useState(0.85);
+  const [allow3d, setAllow3d] = useState(true);
 
   const mapRef = useRef<MapRef>(null);
   const terrainAdded = useRef(false);
@@ -1103,13 +1088,14 @@ export default function TrackMap() {
             // AMSL 옥상 높이 = 지반 표고 + 건물 높이
             "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
             "fill-extrusion-base": ["get", "base"],
-            "fill-extrusion-opacity": 1.0,
+            "fill-extrusion-opacity": buildingOpacity,
           },
         });
       }
-      // 레이어 표시
+      // 레이어 표시 + 채움 투명도 반영
       if (map.getLayer(layerId)) {
         map.setLayoutProperty(layerId, "visibility", "visible");
+        map.setPaintProperty(layerId, "fill-extrusion-opacity", buildingOpacity);
       }
     } else {
       // 3D 모드 아닐 때 레이어 숨김
@@ -1117,7 +1103,7 @@ export default function TrackMap() {
         map.setLayoutProperty(layerId, "visibility", "none");
       }
     }
-  }, [buildings3dGeoJSON, buildings3dMode]);
+  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity]);
 
   // showBuildings=false 시 fill-extrusion 레이어 제거
   useEffect(() => {
@@ -1825,10 +1811,40 @@ export default function TrackMap() {
     setLosCursorPicking(false);
   }, [radarSite.latitude, radarSite.longitude, radarSite.range_nm, setLosFromAzDist]);
 
-  // LoS 패널 열 때 등록 장애물/그룹 최신화 (자료관리에서 추가/수정된 내용 반영)
+  // LoS 도구 드로어 열 때 등록 장애물/그룹 최신화 (자료관리에서 추가/수정된 내용 반영)
   useEffect(() => {
-    if (losExpanded) { loadManualBuildings(); loadBuildingGroups(); }
-  }, [losExpanded, loadManualBuildings, loadBuildingGroups]);
+    if (activeTool === "los") { loadManualBuildings(); loadBuildingGroups(); }
+  }, [activeTool, loadManualBuildings, loadBuildingGroups]);
+
+  // LoS 모드 완전 해제 (드로어 닫힘 / 다른 도구로 전환 시) — 카메라 복원
+  const teardownLoS = useCallback(() => {
+    setLosMode(false);
+    setLosTarget(null);
+    setLosCursor(null);
+    setLosHighlightIdx(null);
+    setLosCursorPicking(false);
+    setLosBuildingHighlight(null);
+    setDetailBuilding(null);
+    setLosSearchedAddress(null);
+    setLosSelectedBuilding(null);
+    const map = mapRef.current?.getMap();
+    if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
+  }, []);
+
+  // 도구 버튼 클릭 — 같은 도구 재클릭 시 닫힘, LoS 떠날 때 정리
+  const handleToolClick = useCallback((tool: "los" | "coverage") => {
+    const next = activeTool === tool ? null : tool;
+    if (activeTool === "los" && next !== "los") teardownLoS();
+    setActiveTool(next);
+  }, [activeTool, teardownLoS]);
+
+  // 3D 입체 허용 토글 ↔ 현재 줌에 맞춰 buildings3dMode 재조정
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    const z = map ? map.getZoom() : 0;
+    const want = allow3d && z >= 14;
+    setBuildings3dMode((prev) => (prev !== want ? want : prev));
+  }, [allow3d]);
 
   // LoS 선상 항적/Loss 포인트 전체 (단면도 전달용)
   const losTrackPoints = useMemo(() => {
@@ -2104,12 +2120,13 @@ export default function TrackMap() {
     };
     const isHighlighted = (d: Building3D) =>
       losBuildingHighlight && Math.abs(d.lat - losBuildingHighlight.lat) < 0.0001 && Math.abs(d.lon - losBuildingHighlight.lon) < 0.0001;
+    const a = (base: number) => Math.round(base * buildingOpacity);
     const fillColor = (d: Building3D): [number, number, number, number] => {
-      if (isHighlighted(d)) return [249, 115, 22, 255]; // 주황색 하이라이트
-      if (d.group_color) { const c = hexToRgb(d.group_color); return [c[0], c[1], c[2], 200]; }
-      return d.source === "fac" ? [229, 231, 235, 220]
-        : d.source === "manual" ? [239, 68, 68, 220]
-        : [209, 213, 219, 220];
+      if (isHighlighted(d)) return [249, 115, 22, 255]; // 주황색 하이라이트 (전체 불투명)
+      if (d.group_color) { const c = hexToRgb(d.group_color); return [c[0], c[1], c[2], a(200)]; }
+      return d.source === "fac" ? [229, 231, 235, a(220)]
+        : d.source === "manual" ? [239, 68, 68, a(220)]
+        : [209, 213, 219, a(220)];
     };
     const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
       if (info.object) {
@@ -2130,7 +2147,7 @@ export default function TrackMap() {
         getRadius: (d: Building3D) => isHighlighted(d) ? 6 : 3,
         radiusUnits: "pixels" as const,
         getFillColor: fillColor,
-        updateTriggers: { getFillColor: [losBuildingHighlight], getRadius: [losBuildingHighlight] },
+        updateTriggers: { getFillColor: [losBuildingHighlight, buildingOpacity], getRadius: [losBuildingHighlight] },
         pickable: true,
         onClick: (info: { object?: Building3D; x: number; y: number }) => {
           if (losTarget) losPointClickedRef.current = true;
@@ -2155,7 +2172,7 @@ export default function TrackMap() {
         onHover: buildingHover,
       }),
     ];
-  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight]);
+  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity]);
 
   // CAT008 기상 극좌표 벡터 → 부채꼴 폴리곤 레이어.
   // 시간은 NEC 프레임 분 단위로 양자화 → 재생 시점(visibleMaxTs) 이하의 최신 1분 스냅샷만 표시.
@@ -2871,6 +2888,269 @@ export default function TrackMap() {
     gpu.flush();
   }, [timelineBands, tlLossMarkers, zoomVStart, zoomRange]);
 
+  // ── 좌측 도구 드로어 본문: LoS 분석 ──
+  const renderLoSToolBody = () => {
+    const micro: React.CSSProperties = { fontSize: 8.5, fontWeight: 700, letterSpacing: ".06em", color: "#9ca3af", textTransform: "uppercase" };
+    const num: React.CSSProperties = { fontFamily: "ui-monospace, monospace", fontVariantNumeric: "tabular-nums", fontWeight: 700 };
+    const card: React.CSSProperties = { borderRadius: 9, border: "1px solid #e5e7eb", background: "#fff", padding: "9px 10px" };
+    const head: React.CSSProperties = { fontSize: 11, fontWeight: 700, color: "#374151" };
+    const big: React.CSSProperties = { ...num, fontSize: 16, color: "#a60739", lineHeight: 1 };
+    const unit: React.CSSProperties = { fontSize: 9, color: "#9ca3af", fontWeight: 700, marginLeft: 1 };
+    const distNM = losDistanceKm / 1.852;
+    const rangeNm = Math.round(radarSite.range_nm);
+    const status = !losTarget ? { t: "대기중", c: "#6b7280", bg: "#f3f4f6" }
+      : losStats.blocked ? { t: "LoS 차단", c: "#a60739", bg: "rgba(166,7,57,.10)" }
+      : { t: "LoS 양호", c: "#059669", bg: "rgba(5,150,105,.10)" };
+    return (
+      <>
+        {/* 헤더 */}
+        <div style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: "#1f2937", lineHeight: 1.15 }}>LoS 단면도</span>
+              <span style={{ fontSize: 9.5, color: "#9ca3af", lineHeight: 1.2 }}>{distNM.toFixed(1)}NM · 방위 {losAzimuth.toFixed(0)}° · {radarSite.name}</span>
+            </span>
+            <span style={{ fontSize: 9.5, fontWeight: 700, padding: "3px 7px", borderRadius: 5, flexShrink: 0, color: status.c, background: status.bg }}>{status.t}</span>
+            <button onClick={() => handleToolClick("los")} title="닫기"
+              style={{ width: 24, height: 24, borderRadius: 6, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, color: "#9ca3af" }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "#f3f4f6"; e.currentTarget.style.color = "#4b5563"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#9ca3af"; }}>
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
+          {/* 분석 대상 */}
+          <div style={{ padding: "9px 11px", borderBottom: "1px solid #e5e7eb" }}>
+            <div style={{ ...micro, marginBottom: 7 }}>Target · 분석 대상</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+              {/* 지점 선택 + 주소 검색 */}
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <button
+                  onClick={() => {
+                    const entering = !losCursorPicking;
+                    setLosCursorPicking(entering);
+                    if (entering && !losMode) {
+                      setLosMode(true);
+                      savedPitchRef.current = viewState.pitch ?? 45;
+                      savedBearingRef.current = viewState.bearing ?? 0;
+                      const map = mapRef.current?.getMap();
+                      if (map) map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
+                    }
+                  }}
+                  style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 9px", borderRadius: 6, whiteSpace: "nowrap", flexShrink: 0, fontSize: 10.5, fontWeight: 600, cursor: "pointer",
+                    border: losCursorPicking ? "1px solid #a60739" : "1px solid rgba(166,7,57,.30)",
+                    background: losCursorPicking ? "#a60739" : "rgba(166,7,57,.06)", color: losCursorPicking ? "#fff" : "#a60739" }}>
+                  <Crosshair size={12} color={losCursorPicking ? "#fff" : "#a60739"} /> 지점 선택
+                </button>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <LosAddressSearch onSelect={(lat, lon) => {
+                    if (lat !== 0 && lon !== 0) {
+                      const dLat = lat - radarSite.latitude;
+                      const dLon = lon - radarSite.longitude;
+                      const cosLat = Math.cos(radarSite.latitude * Math.PI / 180);
+                      const az = ((Math.atan2(dLon * cosLat, dLat) * 180 / Math.PI) + 360) % 360;
+                      setLosFromAzDist(az, 30 * 1.852);
+                      setLosSearchedAddress({ lat, lon });
+                      setLosSelectedBuilding(null);
+                      setLosCursorPicking(false);
+                    }
+                  }} />
+                </div>
+              </div>
+              {/* 등록 장애물 선택 */}
+              <LosObstaclePicker buildings={manualBuildings} groups={buildingGroups} onSelect={setLosToObstacle} />
+              {/* 방위 카드 */}
+              <div style={card}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={head}>방위</span>
+                    <button onClick={() => setLosPrecise((p) => !p)} title="정밀 조정"
+                      style={{ padding: "3px 9px", borderRadius: 6, cursor: "pointer", fontSize: 9.5, fontWeight: 700, letterSpacing: ".02em", lineHeight: 1.4,
+                        border: losPrecise ? "1px solid #a60739" : "1px solid #d1d5db", background: losPrecise ? "#a60739" : "#fff", color: losPrecise ? "#fff" : "#6b7280" }}>정밀</button>
+                  </div>
+                  <span style={big}>{losAzimuth.toFixed(losPrecise ? 2 : 1)}<span style={unit}>°</span></span>
+                </div>
+                <HeadingTape azimuth={losAzimuth} precise={losPrecise}
+                  onChange={(v) => { setLosFromAzDist(+v.toFixed(losPrecise ? 2 : 1), losDistanceKm); setLosSearchedAddress(null); setLosSelectedBuilding(null); setLosAzFineCenter(v); }} />
+              </div>
+              {/* 거리 카드 */}
+              <div style={card}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+                  <span style={head}>거리</span>
+                  <span style={big}>{distNM.toFixed(1)}<span style={unit}>NM</span></span>
+                </div>
+                <DsSlider value={Math.min(rangeNm, Math.max(1, distNM))} min={1} max={rangeNm} step={0.5}
+                  onChange={(v) => { setLosFromAzDist(losAzimuth, v * 1.852); setLosSearchedAddress(null); setLosSelectedBuilding(null); }} />
+                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 5, fontSize: 8.5, color: "#9ca3af" }}>
+                  <span>1 NM</span><span>{rangeNm} NM</span>
+                </div>
+              </div>
+              <div style={{ ...num, fontSize: 8.5, color: "#9ca3af", textAlign: "center" }}>
+                {losTarget ? `${losTarget.lat.toFixed(4)}°N · ${losTarget.lon.toFixed(4)}°E` : "지점 미선택"}
+              </div>
+            </div>
+          </div>
+
+          {/* 레이어 */}
+          <div style={{ padding: "9px 11px", borderBottom: "1px solid #e5e7eb" }}>
+            <div style={{ ...micro, marginBottom: 6 }}>Layers</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+              {LOS_LAYERS.map((L) => {
+                const on = losLayers[L.key];
+                return (
+                  <div key={L.key}>
+                    <button onClick={() => setLosLayers((s) => ({ ...s, [L.key]: !s[L.key] }))}
+                      style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 5px", border: "none", background: "transparent", cursor: "pointer", width: "100%", borderRadius: 4 }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "#f9fafb")}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                      <Check on={on} color={L.color} />
+                      <Swatch color={on ? L.color : "#d1d5db"} dash={L.dash} w={18} />
+                      <span style={{ fontSize: 11, fontWeight: 500, color: on ? "#374151" : "#9ca3af", flex: 1, textAlign: "left" }}>{L.label}</span>
+                      <span style={{ fontSize: 8, fontWeight: 700, color: on ? L.color : "#d1d5db", letterSpacing: ".04em" }}>{on ? "ON" : "OFF"}</span>
+                    </button>
+                    {L.key === "fresnel" && on && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "2px 0 4px", paddingLeft: 28 }}>
+                        <DsSlider value={fresnelPct} min={0} max={100} step={5} onChange={setFresnelPct} color="#ec4899" />
+                        <span style={{ ...num, fontSize: 10, color: "#ec4899", width: 30, textAlign: "right" }}>{fresnelPct}%</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {/* 커스텀 각도선 */}
+              <button onClick={() => setShowCustomAngle((v) => !v)}
+                style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 5px", border: "none", background: "transparent", cursor: "pointer", width: "100%", borderRadius: 4 }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "#f9fafb")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                <Check on={showCustomAngle} color="#f43f5e" />
+                <Swatch color={showCustomAngle ? "#f43f5e" : "#d1d5db"} dash w={18} />
+                <span style={{ fontSize: 11, fontWeight: 500, color: showCustomAngle ? "#374151" : "#9ca3af", flex: 1, textAlign: "left" }}>커스텀 각도선</span>
+                <span style={{ fontSize: 8, fontWeight: 700, color: showCustomAngle ? "#f43f5e" : "#d1d5db", letterSpacing: ".04em" }}>{showCustomAngle ? "ON" : "OFF"}</span>
+              </button>
+              {showCustomAngle && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "2px 0 4px", paddingLeft: 28 }}>
+                  <DsSlider value={customAngleDeg} min={-1} max={5} step={0.05} onChange={(v) => setCustomAngleDeg(+v.toFixed(2))} color="#f43f5e" />
+                  <span style={{ ...num, fontSize: 10, color: "#f43f5e", width: 34, textAlign: "right" }}>{customAngleDeg.toFixed(2)}°</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 건물 */}
+          <div style={{ padding: "9px 11px", borderBottom: "1px solid #e5e7eb" }}>
+            <button onClick={() => setLosShowBuildings((v) => !v)}
+              style={{ display: "flex", alignItems: "center", gap: 8, border: "none", background: "transparent", cursor: "pointer", width: "100%", padding: 0 }}>
+              <Check on={losShowBuildings} color="#a60739" />
+              <Building2 size={13} color={losShowBuildings ? "#a60739" : "#9ca3af"} />
+              <span style={{ ...micro, color: "#4b5563", flex: 1, textAlign: "left" }}>건물 표시</span>
+              <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>차단 {losStats.blocking}</span>
+              <span style={{ ...num, fontSize: 9.5, color: "#9ca3af" }}>비차단 {losStats.nonBlocking}</span>
+            </button>
+          </div>
+        </div>
+      </>
+    );
+  };
+
+  // ── 우측 표시 설정 드로어 본문: 건물 / 기상 ──
+  const renderSettingsBody = () => {
+    const kind = settingsDrawer ?? lastSettingsRef.current;
+    const micro: React.CSSProperties = { fontSize: 8.5, fontWeight: 700, letterSpacing: ".06em", color: "#9ca3af", textTransform: "uppercase" };
+    const num: React.CSSProperties = { fontFamily: "ui-monospace, monospace", fontVariantNumeric: "tabular-nums", fontWeight: 700 };
+    const header = (title: string, sub: string) => (
+      <div style={{ padding: "12px 13px", borderBottom: "1px solid #e5e7eb", flexShrink: 0, display: "flex", alignItems: "center", gap: 8 }}>
+        <Settings size={15} color="#a60739" />
+        <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#1f2937", lineHeight: 1.15 }}>{title}</span>
+          <span style={{ fontSize: 9.5, color: "#9ca3af", lineHeight: 1.2 }}>{sub}</span>
+        </span>
+        <button onClick={() => setSettingsDrawer(null)} title="닫기"
+          style={{ width: 24, height: 24, borderRadius: 6, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, color: "#9ca3af" }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = "#f3f4f6"; e.currentTarget.style.color = "#4b5563"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#9ca3af"; }}>
+          <X size={14} />
+        </button>
+      </div>
+    );
+    const toggleSource = (src: string) => setHiddenBuildingSources((prev) => {
+      const next = new Set(prev);
+      if (next.has(src)) next.delete(src); else next.add(src);
+      return next;
+    });
+    const srcRow = (label: string, note: string, on: boolean, onClick: () => void) => (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 12, color: "#4b5563" }}>{label}</span>
+          <span style={{ fontSize: 9, color: "#d1d5db" }}>{note}</span>
+        </span>
+        <DsToggle on={on} onClick={onClick} size={0.9} />
+      </div>
+    );
+
+    if (kind === "building") {
+      return (
+        <>
+          {header("건물 설정", "3D 건물 오버레이")}
+          <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+            <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb", display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={micro}>건물 출처</div>
+              {srcRow("건물통합정보", "GIS", !hiddenBuildingSources.has("fac"), () => toggleSource("fac"))}
+              {srcRow("수동 건물", "등록", !hiddenBuildingSources.has("manual"), () => toggleSource("manual"))}
+            </div>
+            <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb", display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={micro}>표현 방식</div>
+              {srcRow("3D 입체", "줌 15+", allow3d, () => setAllow3d((v) => !v))}
+            </div>
+            <div style={{ padding: "11px 13px" }}>
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 5 }}>
+                <span style={{ fontSize: 11, color: "#6b7280" }}>채움 투명도</span>
+                <span style={{ ...num, fontSize: 10.5, color: "#a60739" }}>{Math.round(buildingOpacity * 100)}%</span>
+              </div>
+              <DsSlider value={buildingOpacity} min={0.1} max={1} step={0.05} onChange={setBuildingOpacity} />
+            </div>
+          </div>
+        </>
+      );
+    }
+    // 기상
+    const maxRange = (123 * weatherNmPerBin).toFixed(0);
+    return (
+      <>
+        {header("기상 설정", "CAT008 강수 표시")}
+        <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+          <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb" }}>
+            <div style={{ ...micro, marginBottom: 8 }}>강도 범례</div>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 4 }}>
+              {[1, 2, 3, 4, 5, 6].map((lv) => (
+                <div key={lv} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+                  <div style={{ height: 10, width: "100%", borderRadius: 2, background: `rgb(${WEATHER_COLORS[lv][0]},${WEATHER_COLORS[lv][1]},${WEATHER_COLORS[lv][2]})` }} />
+                  <span style={{ fontSize: 8, color: "#9ca3af" }}>{WEATHER_LEVEL_LABELS[lv] || lv}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb" }}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 5 }}>
+              <span style={{ fontSize: 11, color: "#6b7280" }}>거리 스케일</span>
+              <span style={{ ...num, fontSize: 10.5, color: "#374151" }}>{weatherNmPerBin.toFixed(2)} NM/bin</span>
+            </div>
+            <DsSlider value={weatherNmPerBin} min={0.25} max={2} step={0.25} onChange={setWeatherNmPerBin} />
+            <div style={{ marginTop: 4, fontSize: 8.5, color: "#9ca3af" }}>최대 {maxRange} NM · SOP f 미전송 추정값</div>
+          </div>
+          <div style={{ padding: "11px 13px" }}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 5 }}>
+              <span style={{ fontSize: 11, color: "#6b7280" }}>투명도</span>
+              <span style={{ ...num, fontSize: 10.5, color: "#a60739" }}>{Math.round(weatherOpacity * 100)}%</span>
+            </div>
+            <DsSlider value={weatherOpacity} min={0.1} max={1} step={0.05} onChange={setWeatherOpacity} />
+          </div>
+        </div>
+      </>
+    );
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* 타이틀바 포탈: 왼쪽 (드롭다운+토글+재생) */}
@@ -3035,6 +3315,7 @@ export default function TrackMap() {
           <div className="flex items-center gap-2">
             <Building2 size={14} className={showBuildings && buildings3dData.length > 0 ? "text-[#a60739]" : "text-gray-400"} />
             <span className="text-xs text-gray-600">건물</span>
+            <GearButton active={settingsDrawer === "building"} onClick={() => { setSettingsDrawer(settingsDrawer === "building" ? null : "building"); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
           </div>
           {buildingsLoading ? (
             <Loader2 size={16} className="animate-spin text-[#a60739]" />
@@ -3078,6 +3359,7 @@ export default function TrackMap() {
             <CloudRain size={14} className={weatherVisible && weatherVectors.length > 0 ? "text-[#a60739]" : "text-gray-400"} />
             <span className="text-xs text-gray-600">기상</span>
             {weatherVectors.length === 0 && <span className="text-[9px] text-gray-300">데이터 없음</span>}
+            <GearButton active={settingsDrawer === "weather"} onClick={() => { setSettingsDrawer(settingsDrawer === "weather" ? null : "weather"); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
           </div>
           <button
             onClick={() => setWeatherVisible(!weatherVisible)}
@@ -3090,211 +3372,15 @@ export default function TrackMap() {
           </button>
         </div>
 
-        {/* 기상 컨트롤 (토글 ON + 데이터 있을 때) */}
-        {weatherVisible && weatherVectors.length > 0 && (
-          <div className="ml-1 space-y-2 rounded-md bg-gray-50 p-2">
-            {/* 강도 범례 */}
-            <div className="flex items-center gap-1">
-              {[1, 2, 3, 4, 5, 6].map((lv) => (
-                <div key={lv} className="flex flex-1 flex-col items-center gap-0.5">
-                  <div
-                    className="h-2.5 w-full rounded-sm"
-                    style={{ backgroundColor: `rgb(${WEATHER_COLORS[lv][0]},${WEATHER_COLORS[lv][1]},${WEATHER_COLORS[lv][2]})` }}
-                  />
-                  <span className="text-[8px] text-gray-400">{WEATHER_LEVEL_LABELS[lv] || lv}</span>
-                </div>
-              ))}
-            </div>
-            {/* 거리 스케일 (NM/bin) */}
-            <div>
-              <div className="mb-0.5 flex items-center justify-between">
-                <span className="text-[10px] text-gray-500">거리 스케일</span>
-                <span className="text-[10px] font-medium tabular-nums text-gray-700">{weatherNmPerBin.toFixed(2)} NM/bin</span>
-              </div>
-              <input
-                type="range" min={0.25} max={2} step={0.25}
-                value={weatherNmPerBin}
-                onChange={(e) => setWeatherNmPerBin(Number(e.target.value))}
-                className="h-1 w-full cursor-pointer accent-[#a60739]"
-              />
-              <div className="mt-0.5 text-[8.5px] text-gray-400">최대 {(123 * weatherNmPerBin).toFixed(0)} NM (SOP f 미전송 → 추정값)</div>
-            </div>
-            {/* 투명도 */}
-            <div>
-              <div className="mb-0.5 flex items-center justify-between">
-                <span className="text-[10px] text-gray-500">투명도</span>
-                <span className="text-[10px] font-medium tabular-nums text-gray-700">{Math.round(weatherOpacity * 100)}%</span>
-              </div>
-              <input
-                type="range" min={0.1} max={1} step={0.05}
-                value={weatherOpacity}
-                onChange={(e) => setWeatherOpacity(Number(e.target.value))}
-                className="h-1 w-full cursor-pointer accent-[#a60739]"
-              />
-            </div>
-          </div>
-        )}
-
           </div>
         </div>
 
         {/* ── 도구 ────────────────── */}
         <div>
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-gray-400">도구</div>
-          <div className="space-y-2">
-
-          {/* LoS 분석 — Collapsible */}
-          <div className={`rounded-lg border transition-colors ${losExpanded ? "border-[#a60739]/30 bg-[#a60739]/5" : "border-gray-200 bg-gray-50"}`}>
-            <button
-              onClick={() => {
-                const entering = !losExpanded;
-                setLosExpanded(entering);
-                if (!entering) {
-                  // 패널 닫기 → LoS 모드 해제
-                  setLosMode(false);
-                  setLosTarget(null);
-                  setLosCursor(null);
-                  setLosHighlightIdx(null);
-                  setLosCursorPicking(false);
-                  setLosBuildingHighlight(null);
-                  setDetailBuilding(null);
-                  setLosSearchedAddress(null);
-                  setLosSelectedBuilding(null);
-                  const map = mapRef.current?.getMap();
-                  if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
-                }
-              }}
-              className="flex w-full items-center justify-between px-3 py-2.5"
-            >
-              <div className="flex items-center gap-2">
-                <Mountain size={14} className={losExpanded ? "text-[#a60739]" : "text-gray-400"} />
-                <span className={`text-xs font-medium ${losExpanded ? "text-[#a60739]" : "text-gray-600"}`}>LoS 분석</span>
-              </div>
-              <ChevronDown size={14} className={`transition-transform text-gray-400 ${losExpanded ? "rotate-180" : ""}`} />
-            </button>
-
-            {losExpanded && (
-              <div className="px-3 pb-2.5 space-y-3">
-                {/* 지점 선택 버튼 + 주소 검색 */}
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => {
-                      const entering = !losCursorPicking;
-                      setLosCursorPicking(entering);
-                      if (entering && !losMode) {
-                        // LoS 모드 진입: 카메라 수직 뷰로 전환
-                        setLosMode(true);
-                        savedPitchRef.current = viewState.pitch ?? 45;
-                        savedBearingRef.current = viewState.bearing ?? 0;
-                        const map = mapRef.current?.getMap();
-                        if (map) map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
-                      }
-                    }}
-                    className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-colors ${losCursorPicking ? "border-[#a60739] bg-[#a60739] text-white" : "border-gray-300 text-gray-500 hover:border-gray-400"}`}
-                    title="지도에서 지점 선택"
-                  >
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                      <circle cx="8" cy="8" r="5" />
-                      <line x1="8" y1="1" x2="8" y2="4" />
-                      <line x1="8" y1="12" x2="8" y2="15" />
-                      <line x1="1" y1="8" x2="4" y2="8" />
-                      <line x1="12" y1="8" x2="15" y2="8" />
-                    </svg>
-                  </button>
-                  <LosAddressSearch onSelect={(lat, lon) => {
-                    if (lat !== 0 && lon !== 0) {
-                      // 주소 방향으로 30NM 지점을 기본 타겟으로 설정
-                      const dLat = lat - radarSite.latitude;
-                      const dLon = lon - radarSite.longitude;
-                      const cosLat = Math.cos(radarSite.latitude * Math.PI / 180);
-                      const az = ((Math.atan2(dLon * cosLat, dLat) * 180 / Math.PI) + 360) % 360;
-                      const defaultDistKm = 30 * 1.852; // 30NM
-                      setLosFromAzDist(az, defaultDistKm);
-                      setLosSearchedAddress({ lat, lon });
-                      setLosSelectedBuilding(null);
-                      setLosCursorPicking(false);
-                    }
-                  }} />
-                </div>
-
-                {/* 등록 장애물(수동 건물) 선택 */}
-                <LosObstaclePicker
-                  buildings={manualBuildings}
-                  groups={buildingGroups}
-                  onSelect={setLosToObstacle}
-                />
-
-                {/* 방위 선택 원 + 정보 */}
-                <div className="flex items-center gap-3">
-                  <AzimuthCircle
-                    azimuth={losAzimuth}
-                    disabled={false}
-                    onChange={(az) => { setLosFromAzDist(az, losDistanceKm); setLosSearchedAddress(null); setLosSelectedBuilding(null); setLosAzFineCenter(az); }}
-                  />
-                  <div className="flex-1 space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] text-gray-500">방위</span>
-                      <span className="text-[10px] font-medium text-[#a60739]">{losAzimuth.toFixed(3)}°</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] text-gray-500">거리</span>
-                      <span className="text-[10px] font-medium text-[#a60739]">{(losDistanceKm / 1.852).toFixed(1)}NM</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 초정밀 방위 슬라이더 (±2°, 0.001° step) */}
-                <div className="space-y-1">
-                  <input
-                    type="range"
-                    min={losAzFineCenter - 2} max={losAzFineCenter + 2} step={0.001}
-                    value={Math.min(losAzFineCenter + 2, Math.max(losAzFineCenter - 2, losAzimuth))}
-                    onChange={(e) => { setLosFromAzDist(Number(e.target.value), losDistanceKm); setLosSearchedAddress(null); setLosSelectedBuilding(null); }}
-                    className="w-full accent-[#a60739]"
-                  />
-                  <div className="flex justify-between text-[9px] text-gray-400">
-                    <span>{(losAzFineCenter - 2).toFixed(3)}°</span>
-                    <span className="text-[#a60739]/60">초정밀 ±2° (0.001°)</span>
-                    <span>{(losAzFineCenter + 2).toFixed(3)}°</span>
-                  </div>
-                </div>
-
-                {/* 거리 슬라이더 (NM) */}
-                <div className="space-y-1">
-                  <input
-                    type="range" min={1} max={Math.round(radarSite.range_nm)} step={1}
-                    value={Math.min(Math.round(losDistanceKm / 1.852), Math.round(radarSite.range_nm))}
-                    onChange={(e) => { setLosFromAzDist(losAzimuth, Number(e.target.value) * 1.852); setLosSearchedAddress(null); setLosSelectedBuilding(null); }}
-                    disabled={false}
-                    className="w-full accent-[#a60739] disabled:opacity-40"
-                  />
-                  <div className="flex justify-between text-[9px] text-gray-400">
-                    <span>1NM</span>
-                    <span>{Math.round(radarSite.range_nm)}NM</span>
-                  </div>
-                </div>
-
-                {losCursorPicking && !losTarget && (
-                  <div className="text-[10px] text-[#a60739]/70">
-                    지도에서 분석할 지점을 클릭하세요
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* 레이더 커버리지 — Collapsible */}
-          <CoveragePanel
-            radarSite={radarSite}
-            gpuCacheReady={gpuCacheReady} setGpuCacheReady={setGpuCacheReady}
-            coverageAlt={coverageAlt} setCoverageAlt={setCoverageAlt}
-            coverageAltMin={coverageAltMin} setCoverageAltMin={setCoverageAltMin}
-            coverageOpacity={coverageOpacity} setCoverageOpacity={setCoverageOpacity}
-            coverageExpanded={coverageExpanded} setCoverageExpanded={setCoverageExpanded}
-            coverageRendering={coverageRendering}
-            mapRef={mapRef}
-          />
-
+          <div className="space-y-1.5">
+            <ToolButton icon={Mountain} label="LoS 분석" active={activeTool === "los"} onClick={() => handleToolClick("los")} />
+            <ToolButton icon={Radar} label="커버리지 맵" active={activeTool === "coverage"} onClick={() => handleToolClick("coverage")} />
           </div>
         </div>
         </div>,
@@ -3337,7 +3423,7 @@ export default function TrackMap() {
           {...viewState}
           onMove={(evt) => {
             setViewState(evt.viewState);
-            const is3d = evt.viewState.zoom >= 14;
+            const is3d = allow3d && evt.viewState.zoom >= 14;
             if (is3d !== buildings3dMode) setBuildings3dMode(is3d);
           }}
           onLoad={onMapLoad}
@@ -3708,6 +3794,46 @@ export default function TrackMap() {
             </div>
           ) : null
         )}
+
+        {/* ── 좌측 도구 드로어 (LoS / 커버리지) — 지도 위 오버레이 ── */}
+        <div
+          className="absolute top-0 bottom-0 left-0 z-[700] flex flex-col bg-white"
+          style={{
+            width: 300, borderRight: "1px solid #e5e7eb",
+            boxShadow: activeTool ? "6px 0 28px rgba(0,0,0,.13)" : "none",
+            transform: activeTool ? "translateX(0)" : "translateX(-314px)",
+            transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
+            pointerEvents: activeTool ? "auto" : "none",
+          }}
+        >
+          {activeTool === "los" && renderLoSToolBody()}
+          {activeTool === "coverage" && (
+            <CoveragePanel
+              radarSite={radarSite}
+              gpuCacheReady={gpuCacheReady} setGpuCacheReady={setGpuCacheReady}
+              coverageAlt={coverageAlt} setCoverageAlt={setCoverageAlt}
+              coverageAltMin={coverageAltMin} setCoverageAltMin={setCoverageAltMin}
+              coverageOpacity={coverageOpacity} setCoverageOpacity={setCoverageOpacity}
+              coverageRendering={coverageRendering}
+              mapRef={mapRef}
+              onClose={() => handleToolClick("coverage")}
+            />
+          )}
+        </div>
+
+        {/* ── 우측 표시 설정 드로어 (건물 / 기상) ── */}
+        <div
+          className="absolute top-0 bottom-0 right-0 z-[750] flex flex-col bg-white"
+          style={{
+            width: 224, borderLeft: "1px solid #e5e7eb",
+            boxShadow: settingsDrawer ? "-6px 0 28px rgba(0,0,0,.14)" : "none",
+            transform: settingsDrawer ? "translateX(0)" : "translateX(240px)",
+            transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
+            pointerEvents: settingsDrawer ? "auto" : "none",
+          }}
+        >
+          {renderSettingsBody()}
+        </div>
         </div>
 
       {/* LoS Profile Panel */}
@@ -3727,6 +3853,16 @@ export default function TrackMap() {
           externalHoverIdx={losHoverIdx}
           onBuildingHover={setLosBuildingHighlight}
           onBuildingDetail={setDetailBuilding}
+          layers={losLayers}
+          fresnelClearance={fresnelPct / 100}
+          showBuildings={losShowBuildings}
+          onToggleBuildings={() => setLosShowBuildings((v) => !v)}
+          showCustomAngle={showCustomAngle}
+          onToggleCustomAngle={() => setShowCustomAngle((v) => !v)}
+          customAngleDeg={customAngleDeg}
+          onCustomAngleChange={setCustomAngleDeg}
+          showLegend={false}
+          onStats={handleLosStats}
         />
       )}
       </div>
