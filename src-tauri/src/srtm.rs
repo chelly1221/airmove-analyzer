@@ -149,19 +149,6 @@ impl SrtmReader {
             .collect()
     }
 
-    /// 특정 타일 존재 여부 (DB 또는 파일)
-    pub fn has_tile(&self, lat: i32, lon: i32) -> bool {
-        let name = Self::tile_name(lat, lon);
-        // DB 확인
-        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
-            if crate::db::has_srtm_tile(&conn, &name) {
-                return true;
-            }
-        }
-        // 파일 폴백
-        self.tile_path(&name).exists()
-    }
-
     /// 데이터 디렉토리 경로
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
@@ -188,19 +175,6 @@ impl SrtmReader {
     /// Read-only access to loaded tiles (for parallel processing)
     pub fn tiles_ref(&self) -> &HashMap<String, Option<Vec<i16>>> {
         &self.tiles
-    }
-
-
-
-    /// raw bytes를 DB에 직접 저장
-    pub fn save_tile_to_db(&self, name: &str, hgt_bytes: &[u8]) -> Result<(), String> {
-        if hgt_bytes.len() != TILE_BYTES {
-            return Err(format!("Invalid tile size: {} (expected {})", hgt_bytes.len(), TILE_BYTES));
-        }
-        let conn = rusqlite::Connection::open(&self.db_path)
-            .map_err(|e| format!("DB open: {}", e))?;
-        crate::db::save_srtm_tile(&conn, name, hgt_bytes)
-            .map_err(|e| format!("DB save: {}", e))
     }
 }
 

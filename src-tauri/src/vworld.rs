@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 const VWORLD: &str = "https://www.vworld.kr";
-const DS_ID: &str = "18";
-pub const LANDUSE_DS_ID: &str = "14";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct VworldFile {
@@ -152,81 +150,6 @@ pub async fn login(id: &str, pw: &str) -> Result<Client, String> {
     }
 }
 
-/// 지역코드 목록으로 파일 목록 수집 (sidoCd별 쿼리)
-pub async fn list_files_by_regions(
-    client: &Client,
-    region_codes: &[String],
-) -> Result<Vec<VworldFile>, String> {
-    let mut all = Vec::new();
-
-    // 날짜 범위: 1년 전 ~ 오늘
-    let now = time::OffsetDateTime::now_utc();
-    let ago = now - time::Duration::days(365);
-    let today = format!(
-        "{}-{:02}-{:02}",
-        now.year(),
-        now.month() as u8,
-        now.day()
-    );
-    let one_year_ago = format!(
-        "{}-{:02}-{:02}",
-        ago.year(),
-        ago.month() as u8,
-        ago.day()
-    );
-
-    for sido in region_codes {
-        info!("vworld: sidoCd={sido} 최신 파일 조회");
-        let url = format!(
-            "{VWORLD}/dtmk/dtmk_ntads_s002.do\
-             ?dsId={DS_ID}&dataSetSeq={DS_ID}&svcCde=NA\
-             &pageSize=100&pageUnit=100\
-             &pageIndex=1&datPageIndex=1&datPageSize=100\
-             &listPageIndex=1\
-             &startDate={start}&endDate={end}\
-             &sidoCd={sido}&fileGbnCd=AL\
-             &sortType=00",
-            start = one_year_ago,
-            end = today,
-        );
-        let html = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("파일 목록 로드 실패 (sidoCd={sido}): {e}"))?
-            .text()
-            .await
-            .map_err(|e| format!("파일 목록 읽기 실패: {e}"))?;
-
-        // 로그인 세션 만료 체크
-        if (html.contains("usrlogin") || html.contains("로그인"))
-            && html.contains("form")
-            && !html.contains("chkDs")
-            && !html.contains("download(")
-        {
-            return Err("세션 만료: 로그인이 필요합니다".into());
-        }
-
-        let mut files = parse_file_list(&html);
-        for f in &mut files {
-            if f.region_code.is_empty() {
-                f.region_code = sido.clone();
-            }
-        }
-        info!("vworld: sidoCd={sido} → {}개 파일 중 최신 1개 선택", files.len());
-
-        // 최신 1개만 (첫 번째 = 최신순 정렬)
-        if let Some(first) = files.into_iter().next() {
-            all.push(first);
-        } else {
-            info!("vworld: sidoCd={sido} 파일 없음. HTML 크기={}B", html.len());
-        }
-    }
-
-    info!("vworld: 총 {}개 파일 수집", all.len());
-    Ok(all)
-}
-
 /// 단일 파일 다운로드 → 바이트 반환
 pub async fn download_file(client: &Client, ds_id: &str, file_no: &str) -> Result<Vec<u8>, String> {
     // 다운로드 전 데이터셋 페이지 방문 (세션 워밍업 + Referer 체인)
@@ -297,39 +220,6 @@ pub async fn download_file(client: &Client, ds_id: &str, file_no: &str) -> Resul
     Ok(bytes.to_vec())
 }
 
-/// 지역코드로 파일 필터링
-pub fn filter_by_region(files: &[VworldFile], codes: &[String]) -> Vec<VworldFile> {
-    files
-        .iter()
-        .filter(|f| codes.iter().any(|c| f.region_code == *c))
-        .cloned()
-        .collect()
-}
-
-/// 지역코드 → 앱 내부 region key
-pub fn region_code_to_key(code: &str) -> &str {
-    match code {
-        "11" => "seoul",
-        "26" => "busan",
-        "27" => "daegu",
-        "28" => "incheon",
-        "29" => "gwangju",
-        "30" => "daejeon",
-        "31" => "ulsan",
-        "36" => "sejong",
-        "41" => "gyeonggi",
-        "42" => "gangwon",
-        "43" => "chungbuk",
-        "44" => "chungnam",
-        "45" => "jeonbuk",
-        "46" => "jeonnam",
-        "47" => "gyeongbuk",
-        "48" => "gyeongnam",
-        "50" => "jeju",
-        other => other,
-    }
-}
-
 // ── HTML 파싱 유틸 ──────────────────────────────────────
 
 fn attr_val(tag: &str, name: &str) -> Option<String> {
@@ -353,80 +243,6 @@ fn html_decode(s: &str) -> String {
         .replace("&#39;", "'")
 }
 
-/// download(dsId, fileNo, fileSize) + chkDs 체크박스에서 파일 목록 추출
-fn parse_file_list(html: &str) -> Vec<VworldFile> {
-    let mut files = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut from = 0;
-
-    // 전략 1: download() onclick 패턴
-    while let Some(pos) = html[from..].find("download(") {
-        let abs = from + pos;
-        let Some(paren) = html[abs..].find(')') else {
-            break;
-        };
-        let args = &html[abs + 9..abs + paren];
-        let parts: Vec<&str> = args
-            .split(',')
-            .map(|s| {
-                s.trim()
-                    .trim_matches(|c: char| c == '\'' || c == '"' || c.is_whitespace())
-            })
-            .collect();
-
-        if parts.len() >= 3 {
-            let ds_id = parts[0].to_string();
-            let file_no = parts[1].to_string();
-            let file_size: u64 = parts[2].parse().unwrap_or(0);
-
-            if seen.insert(file_no.clone()) {
-                let ctx_start = abs.saturating_sub(800);
-                let ctx_end = (abs + 800).min(html.len());
-                let ctx = &html[ctx_start..ctx_end];
-
-                files.push(VworldFile {
-                    ds_id,
-                    file_no,
-                    file_name: detect_filename(ctx),
-                    region_code: detect_region(ctx),
-                    file_size,
-                });
-            }
-        }
-        from = abs + paren;
-    }
-
-    // 전략 2: chkDs 체크박스 fallback
-    if files.is_empty() {
-        from = 0;
-        while let Some(pos) = html[from..].to_lowercase().find("name=\"chkds\"") {
-            let abs = from + pos;
-            let tag_start = html[..abs].rfind('<').unwrap_or(abs);
-            let tag_end = html[abs..].find('>').map(|e| abs + e).unwrap_or(abs);
-            let tag = &html[tag_start..=tag_end];
-
-            if let Some(file_no) = attr_val(tag, "value") {
-                if seen.insert(file_no.clone()) {
-                    let ctx_start = abs.saturating_sub(800);
-                    let ctx_end = (abs + 1200).min(html.len());
-                    let ctx = &html[ctx_start..ctx_end];
-
-                    files.push(VworldFile {
-                        ds_id: DS_ID.to_string(),
-                        file_no,
-                        file_name: detect_filename(ctx),
-                        region_code: detect_region(ctx),
-                        file_size: 0,
-                    });
-                }
-            }
-            from = abs + 1;
-        }
-    }
-
-    files
-}
-
 const REGION_CODES: &[(&str, &str)] = &[
     ("11", "서울"),
     ("26", "부산"),
@@ -446,32 +262,6 @@ const REGION_CODES: &[(&str, &str)] = &[
     ("48", "경남"),
     ("50", "제주"),
 ];
-
-fn detect_region(ctx: &str) -> String {
-    // _XX_ 패턴 우선 (파일명에서)
-    for &(code, _) in REGION_CODES {
-        if ctx.contains(&format!("_{code}_")) {
-            return code.to_string();
-        }
-    }
-    // 지역명 fallback
-    for &(code, name) in REGION_CODES {
-        if ctx.contains(name) {
-            return code.to_string();
-        }
-    }
-    String::new()
-}
-
-fn detect_filename(ctx: &str) -> String {
-    let text = strip_tags(ctx);
-    for word in text.split_whitespace() {
-        if word.to_lowercase().ends_with(".zip") {
-            return word.to_string();
-        }
-    }
-    "건물통합정보.zip".to_string()
-}
 
 /// 주변 텍스트에서 파일명 감지 (다중 확장자, 기본값 없음)
 fn detect_filename_any(ctx: &str) -> String {
@@ -588,77 +378,6 @@ pub async fn list_fac_building_files(
     }
 
     info!("vworld: 건물통합정보 필터 후 {}개 파일", all.len());
-    Ok(all)
-}
-
-// ── 토지이용계획정보 (dsId=14) ────────────────────────────────
-
-/// 토지이용계획정보 파일 목록 수집 (sidoCd별 쿼리)
-pub async fn list_landuse_files(
-    client: &Client,
-    region_codes: &[String],
-) -> Result<Vec<VworldFile>, String> {
-    let mut all = Vec::new();
-
-    let now = time::OffsetDateTime::now_utc();
-    let ago = now - time::Duration::days(365 * 3); // 토지이용계획은 업데이트 주기 길어 3년 범위
-    let today = format!("{}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
-    let one_year_ago = format!("{}-{:02}-{:02}", ago.year(), ago.month() as u8, ago.day());
-
-    for sido in region_codes {
-        info!("vworld: 토지이용계획 sidoCd={sido} 파일 조회");
-        let url = format!(
-            "{VWORLD}/dtmk/dtmk_ntads_s002.do\
-             ?dsId={LANDUSE_DS_ID}&dataSetSeq={LANDUSE_DS_ID}&svcCde=NA\
-             &pageSize=100&pageUnit=100\
-             &pageIndex=1&datPageIndex=1&datPageSize=100\
-             &listPageIndex=1\
-             &startDate={start}&endDate={end}\
-             &sidoCd={sido}&fileGbnCd=AL\
-             &sortType=00",
-            start = one_year_ago,
-            end = today,
-        );
-        let html = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("토지이용계획 파일 목록 로드 실패 (sidoCd={sido}): {e}"))?
-            .text()
-            .await
-            .map_err(|e| format!("파일 목록 읽기 실패: {e}"))?;
-
-        // 로그인 세션 만료 체크
-        if (html.contains("usrlogin") || html.contains("로그인"))
-            && html.contains("form")
-            && !html.contains("chkDs")
-            && !html.contains("download(")
-        {
-            return Err("세션 만료: 로그인이 필요합니다".into());
-        }
-
-        let mut files = parse_file_list_with_ds_id(&html, LANDUSE_DS_ID);
-        for f in &mut files {
-            if f.region_code.is_empty() {
-                f.region_code = sido.clone();
-            }
-        }
-
-        // ZIP 파일만 필터
-        let zips: Vec<_> = files.into_iter().filter(|f| {
-            f.file_name.to_lowercase().ends_with(".zip") || f.file_name.is_empty()
-        }).collect();
-
-        info!("vworld: 토지이용계획 sidoCd={sido} → {}개 파일 중 최신 1개 선택", zips.len());
-
-        if let Some(first) = zips.into_iter().next() {
-            all.push(first);
-        } else {
-            info!("vworld: 토지이용계획 sidoCd={sido} 파일 없음");
-        }
-    }
-
-    info!("vworld: 토지이용계획 총 {}개 파일 수집", all.len());
     Ok(all)
 }
 

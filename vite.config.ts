@@ -61,12 +61,6 @@ export default defineConfig({
           if (id.includes("@deck.gl")) return "vendor-deck";
           // 보조 지도 라이브러리
           if (id.includes("react-map-gl")) return "vendor-mapgl";
-          if (id.includes("leaflet")) return "vendor-leaflet";
-          // PDF / 캡처
-          if (id.includes("html2canvas-pro")) return "vendor-pdf";
-          if (id.includes("jspdf")) return "vendor-pdf";
-          // 수식 렌더링
-          if (id.includes("katex")) return "vendor-katex";
           // Tauri API
           if (id.includes("@tauri-apps")) return "vendor-tauri";
           // React 런타임 (react, react-dom, react-router, scheduler)

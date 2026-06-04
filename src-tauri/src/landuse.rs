@@ -9,17 +9,6 @@ use serde::Serialize;
 use crate::building::{extract_zip_entry, get_field_as_string, parse_dbf_euckr_field};
 use crate::coord::epsg5186_to_wgs84;
 
-/// 토지이용계획 존 (프론트엔드 반환)
-#[derive(Serialize, Clone, Debug)]
-pub struct LandUseZone {
-    pub zone_type_code: String,
-    pub zone_type_name: String,
-    pub polygon_json: String,
-    pub centroid_lat: f64,
-    pub centroid_lon: f64,
-    pub area_sqm: Option<f64>,
-}
-
 /// 임포트 상태
 #[derive(Serialize, Clone, Debug)]
 pub struct LandUseImportStatus {
@@ -439,41 +428,6 @@ fn save_import_log(
     });
 
     Ok(())
-}
-
-/// 뷰포트(bbox) 내 토지이용계획 존 조회
-pub fn query_in_bbox(
-    conn: &Connection,
-    min_lat: f64,
-    max_lat: f64,
-    min_lon: f64,
-    max_lon: f64,
-    max_count: usize,
-) -> Result<Vec<LandUseZone>, String> {
-    let mut stmt = conn.prepare(
-        "SELECT zone_type_code, zone_type_name, polygon_json, centroid_lat, centroid_lon, area_sqm
-         FROM landuse_zones
-         WHERE bbox_max_lat >= ?1 AND bbox_min_lat <= ?2
-           AND bbox_max_lon >= ?3 AND bbox_min_lon <= ?4
-         LIMIT ?5"
-    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
-
-    let rows = stmt.query_map(
-        params![min_lat, max_lat, min_lon, max_lon, max_count as i64],
-        |row| {
-            Ok(LandUseZone {
-                zone_type_code: row.get(0)?,
-                zone_type_name: row.get(1)?,
-                polygon_json: row.get(2)?,
-                centroid_lat: row.get(3)?,
-                centroid_lon: row.get(4)?,
-                area_sqm: row.get(5)?,
-            })
-        },
-    ).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("결과 수집 실패: {}", e))
 }
 
 /// 임포트 현황 조회

@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::building::{
     compute_polygon_bbox_centroid, compute_polygon_z_bbox_centroid,
     extract_polygon_wgs84, extract_zip_entry, get_field_as_f64, get_field_as_string,
-    parse_dbf_euckr_field, today_yyyymm, Building3D,
+    parse_dbf_euckr_field, today_yyyymm,
 };
 use crate::coord::epsg5186_to_wgs84;
 use crate::srtm::SrtmReader;
@@ -265,72 +265,6 @@ pub fn import_from_zip(
     });
 
     Ok(inserted)
-}
-
-/// 뷰포트 내 건물통합정보 3D 건물 조회 (폴리곤 포함, 높은 건물 우선)
-pub fn query_fac_buildings_3d(
-    conn: &Connection,
-    min_lat: f64,
-    max_lat: f64,
-    min_lon: f64,
-    max_lon: f64,
-    min_height_m: f64,
-    max_count: usize,
-) -> Result<Vec<Building3D>, String> {
-    let mut stmt = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, building_name, usability, polygon_json, COALESCE(ground_elev, 0)
-         FROM fac_buildings
-         WHERE centroid_lat BETWEEN ?1 AND ?2
-           AND centroid_lon BETWEEN ?3 AND ?4
-           AND height >= ?5
-           AND height <= ?6
-         ORDER BY height DESC
-         LIMIT ?7"
-    ).map_err(|e| format!("건물통합정보 3D 쿼리 준비 실패: {}", e))?;
-
-    let rows = stmt.query_map(
-        params![min_lat, max_lat, min_lon, max_lon, min_height_m, MAX_HEIGHT_M, max_count as i64],
-        |row| {
-            Ok((
-                row.get::<_, f64>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, f64>(6)?,
-            ))
-        },
-    ).map_err(|e| format!("건물통합정보 3D 쿼리 실행 실패: {}", e))?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        let (lat, lon, height, name, usage, poly_json, ground_elev) =
-            row.map_err(|e| format!("건물통합정보 3D 행 읽기 실패: {}", e))?;
-
-        let polygon: Vec<[f64; 2]> = match serde_json::from_str(&poly_json) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        if polygon.len() < 3 {
-            continue;
-        }
-
-        result.push(Building3D {
-            lat,
-            lon,
-            height_m: height,
-            ground_elev_m: ground_elev,
-            polygon,
-            name,
-            usage,
-            source: "fac".to_string(),
-            group_color: None,
-        });
-    }
-
-    Ok(result)
 }
 
 /// 기존 fac_buildings 중 ground_elev가 NULL인 행에 SRTM 표고 일괄 채우기

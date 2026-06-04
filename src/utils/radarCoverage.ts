@@ -38,14 +38,8 @@ export {
   computeMainCoverage,
   isGPUCacheValidFor,
   invalidateGPUCache,
-  hasCoverageCache,
   renderCoverageImageAsync,
   queryMinDetectionAlt,
 } from "./gpuCoverage";
 
 export type { CoverageImageResult } from "./gpuCoverage";
-
-/** DB storage key (per-radar) */
-export function coverageMapKey(radarName: string): string {
-  return `coverage_map_${radarName}`;
-}

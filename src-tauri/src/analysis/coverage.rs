@@ -25,7 +25,6 @@ static PROFILE_CACHE_EXCLUDED: Mutex<Option<CoverageProfile>> = Mutex::new(None)
 
 /// Cached terrain profile (stored in Rust, never sent to frontend)
 struct CoverageProfile {
-    radar_name: String,
     radar_lat: f64,
     radar_lon: f64,
     radar_height: f64,
@@ -167,7 +166,6 @@ pub fn compute_terrain_profile(
 
     // 5. Store in cache
     let profile = CoverageProfile {
-        radar_name: radar_name.to_string(),
         radar_lat, radar_lon, radar_height, max_range_km,
         bearing_step_deg,
         adj_terrains, max_angles, num_rays,
@@ -277,25 +275,6 @@ pub fn compute_layers_batch(alt_fts: &[f64], bearing_step: usize) -> Vec<Coverag
     alt_fts.iter()
         .filter_map(|&alt_ft| compute_layer(alt_ft, bearing_step))
         .collect()
-}
-
-/// Check if cache is valid for given radar params
-pub fn is_cache_valid(radar_name: &str, radar_lat: f64, radar_lon: f64, radar_height: f64) -> bool {
-    let cache = PROFILE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    match cache.as_ref() {
-        Some(p) => {
-            p.radar_name == radar_name
-                && p.radar_lat == radar_lat
-                && p.radar_lon == radar_lon
-                && (p.radar_height - radar_height).abs() < 0.01
-        }
-        None => false,
-    }
-}
-
-/// Invalidate the cached profile
-pub fn invalidate_cache() {
-    *PROFILE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Query buildings for coverage computation (returns (lat, lon, height) tuples)
@@ -565,7 +544,6 @@ pub fn compute_terrain_profile_excluding(
     }
 
     let profile = CoverageProfile {
-        radar_name: radar_name.to_string(),
         radar_lat, radar_lon, radar_height, max_range_km,
         bearing_step_deg,
         adj_terrains, max_angles, num_rays,
@@ -723,7 +701,6 @@ pub fn presample_elevations_batch(
 static PIXEL_STATE: Mutex<Option<PixelCoverageState>> = Mutex::new(None);
 
 struct PixelCoverageState {
-    radar_key: String,
     radar_lat: f64,
     radar_lon: f64,
     radar_height: f64,
@@ -814,27 +791,11 @@ pub fn init_pixel_coverage(
         building_map[slot].push((si as usize, bheight as f32));
     }
 
-    let key = format!("{radar_lat}_{radar_lon}_{radar_height}");
     *PIXEL_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PixelCoverageState {
-        radar_key: key,
         radar_lat, radar_lon, radar_height, max_range_km,
         cos_radar_lat, inv_deg_lat, inv_deg_lon,
         building_map, bearing_quant_deg, num_bearing_slots,
     });
-}
-
-/// Per-pixel 캐시 유효성 확인
-pub fn is_pixel_cache_valid(radar_lat: f64, radar_lon: f64, radar_height: f64) -> bool {
-    let cache = PIXEL_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    match cache.as_ref() {
-        Some(s) => s.radar_key == format!("{radar_lat}_{radar_lon}_{radar_height}"),
-        None => false,
-    }
-}
-
-/// Per-pixel 캐시 무효화
-pub fn invalidate_pixel_cache() {
-    *PIXEL_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 특정 좌표의 최저 탐지고도(ft) 조회

@@ -34,9 +34,3 @@ export interface Flight {
   /** 60NM 이내 PSR 통계 (buildFlight에서 사전 계산) */
   within_60nm_stats?: { total: number; psr: number };
 }
-
-/** 수동 병합 기록 */
-export interface ManualMergeRecord {
-  source_flight_ids: string[];
-  mode_s: string;
-}

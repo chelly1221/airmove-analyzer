@@ -1,14 +1,5 @@
 import type { BuildingOnPath } from "./building";
 
-/** Line of Sight 계산 결과 */
-export interface LineOfSightResult {
-  in_sight: boolean;
-  slant_range_km: number;
-  elevation_deg: number;
-  max_range_km: number;
-  target_altitude: number;
-}
-
 /** 단면도 고도 샘플 포인트 */
 export interface ElevationPoint {
   distance: number;

@@ -35,10 +35,6 @@ impl RadarDetectionType {
         matches!(self, RadarDetectionType::ModeACPsr | RadarDetectionType::ModeSAllCallPsr | RadarDetectionType::ModeSRollCallPsr)
     }
 
-    pub fn has_modes(&self) -> bool {
-        matches!(self, RadarDetectionType::ModeSAllCall | RadarDetectionType::ModeSRollCall | RadarDetectionType::ModeSAllCallPsr | RadarDetectionType::ModeSRollCallPsr)
-    }
-
     pub fn is_atcrbs(&self) -> bool {
         matches!(self, RadarDetectionType::ModeAC | RadarDetectionType::ModeACPsr)
     }

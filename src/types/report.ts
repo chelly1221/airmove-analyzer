@@ -21,15 +21,3 @@ export interface SavedReportSummary {
   created_at: number;
   has_pdf: boolean;
 }
-
-/** 저장된 보고서 상세 */
-export interface SavedReportDetail {
-  id: string;
-  title: string;
-  template: string;
-  radar_name: string;
-  created_at: number;
-  report_config_json: string;
-  pdf_base64?: string;
-  metadata_json?: string;
-}

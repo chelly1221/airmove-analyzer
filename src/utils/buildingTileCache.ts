@@ -103,11 +103,6 @@ export function invalidateBuildingCache(): void {
   _cacheZoomLevel = -1;
 }
 
-/** 캐시된 타일 수 */
-export function getCacheSize(): number {
-  return _cache.size;
-}
-
 // ── 뷰포트 타일 쿼리 ──────────────────────────────────────────
 
 interface ViewportBounds {
@@ -310,17 +305,4 @@ export function buildingsToGeoJSON(buildings: Building3D[]): GeoJSON.FeatureColl
     });
   }
   return { type: "FeatureCollection", features };
-}
-
-/**
- * 캐시 GC: 최근 사용되지 않은 타일 제거
- * @param maxAge 최대 유지 시간 (ms), 기본 5분
- */
-export function pruneBuildingCache(maxAge = 300_000): void {
-  const now = Date.now();
-  for (const [key, entry] of _cache) {
-    if (now - entry.timestamp > maxAge) {
-      _cache.delete(key);
-    }
-  }
 }

@@ -129,26 +129,6 @@ function workerSend(msg: Record<string, unknown>): Promise<any> {
 // ─── Public API ─────────────────────────────────────
 
 /**
- * 포인트를 Worker에 직접 전송 (메인에 축적하지 않음).
- * DB에서 파일 로드 → 즉시 이 함수로 Worker에 전달 → 로컬 참조 해제.
- *
- * 구조화 복제 OOM 방지를 위해 100K 단위 청크로 분할 전송.
- * Worker는 ADD_POINTS에 ACK를 보내지 않음 — fire-and-forget.
- */
-const ADD_POINTS_CHUNK_SIZE = 100_000;
-export async function sendPointsToWorker(points: TrackPoint[]): Promise<void> {
-  if (points.length <= ADD_POINTS_CHUNK_SIZE) {
-    getWorker().postMessage({ type: "ADD_POINTS", points });
-    return;
-  }
-  for (let i = 0; i < points.length; i += ADD_POINTS_CHUNK_SIZE) {
-    const end = Math.min(i + ADD_POINTS_CHUNK_SIZE, points.length);
-    const chunk = points.slice(i, end);
-    getWorker().postMessage({ type: "ADD_POINTS", points: chunk });
-  }
-}
-
-/**
  * Fire-and-forget — listener에서 직접 호출. Promise chain capture 없이 즉시 반환.
  * 메인 메모리에 청크 closure가 누적되지 않도록 한다.
  */
@@ -181,19 +161,6 @@ export async function startConsolidate(
   });
 }
 
-/**
- * Worker 버퍼 재사용하여 재통합 (flightHistory 변경 시).
- * _pointBuffer는 항상 보존되므로 startConsolidate와 동일하게 동작.
- */
-export const reconsolidate = startConsolidate;
-
-/**
- * Worker 포인트 버퍼 전체 삭제
- */
-export async function clearWorkerPoints(): Promise<void> {
-  await workerSend({ type: "CLEAR_POINTS" });
-}
-
 export interface PointSummaryEntry {
   modeS: string;
   count: number;
@@ -210,25 +177,6 @@ export async function getPointSummary(): Promise<{
 }> {
   const result = await workerSend({ type: "GET_POINT_SUMMARY" });
   return { totalPoints: result.totalPoints, entries: result.entries };
-}
-
-/**
- * Worker에서 수동 비행 병합 실행.
- * Worker가 _flightIndex에서 포인트를 수집하므로 ID만 전달.
- * selectedFlights는 메타데이터(이름, callsign 등) 참조용.
- */
-export async function manualMergeFlightsAsync(
-  selectedFlights: Flight[],
-  radarSite: RadarSite,
-): Promise<Flight> {
-  const flightIds = selectedFlights.map((f) => f.id);
-  const result = await workerSend({
-    type: "MANUAL_MERGE",
-    selectedFlights,
-    flightIds,
-    radarSite,
-  });
-  return result.flight;
 }
 
 // ─── Throttled Chunk Handler ────────────────────────
@@ -305,8 +253,3 @@ export async function queryFlightPoints(flightId: string): Promise<TrackPoint[]>
   return result.points;
 }
 
-/** 다중 비행 포인트 일괄 쿼리 (timestamp 정렬) */
-export async function queryFlightPointsBatch(flightIds: string[]): Promise<TrackPoint[]> {
-  const result = await workerSend({ type: "QUERY_FLIGHT_POINTS_BATCH", flightIds });
-  return result.points;
-}

@@ -11,17 +11,14 @@ import type {
   ManualBuilding,
   PageId,
   PanoramaPoint, BuildingObstacle,
-  ParseStatistics,
   PlanImageBounds,
   RadarSite,
   ReportMetadata,
   SavedReportSummary,
-  UploadedFile,
 } from "../types";
 import type { MultiCoverageResult } from "../utils/radarCoverage";
 import type { TcasReport, WeatherVector } from "../types/track";
 import type { AsterixStats } from "../types/asterix";
-import { manualMergeFlightsAsync, clearWorkerPoints } from "../utils/flightConsolidationWorker";
 
 /** 설정을 DB에 비동기 저장 (fire-and-forget) */
 function persistSetting(key: string, value: unknown) {
@@ -37,41 +34,22 @@ interface AppState {
   updateAircraft: (id: string, a: Partial<Aircraft>) => void;
   removeAircraft: (id: string) => void;
 
-  // 업로드 파일
-  uploadedFiles: UploadedFile[];
-  addUploadedFile: (f: UploadedFile) => void;
-  updateUploadedFile: (path: string, update: Partial<UploadedFile>) => void;
-  removeUploadedFile: (path: string) => void;
-  removeUploadedFiles: (paths: string[]) => void;
-  clearUploadedFiles: () => void;
-
   // Worker 포인트 요약 (실제 데이터는 Worker 소유)
   workerPointCount: number;
-  setWorkerPointCount: (n: number) => void;
   workerPointSummary: { modeS: string; count: number; minTs: number; maxTs: number }[] | null;
-  setWorkerPointSummary: (s: { modeS: string; count: number; minTs: number; maxTs: number }[] | null) => void;
-
-  // 파싱 통계 (FileUpload 표시용)
-  parseStatsList: { filename: string; stats: ParseStatistics; totalRecords: number }[];
-  addParseStats: (filename: string, stats: ParseStatistics, totalRecords: number) => void;
-  clearParseStats: () => void;
 
   // 비행 (핵심 분석 단위)
   flights: Flight[];
-  setFlights: (flights: Flight[]) => void;
   /** 비행 점진 추가 (Worker 스트리밍용) */
   appendFlights: (newFlights: Flight[]) => void;
   /** consolidating 완료 후 최종 정렬 */
   finalizeFlights: () => void;
-  clearFlights: () => void;
   /** 통합 진행 중 플래그 — true일 때 비싼 useEffect/useMemo 계산 스킵 */
   consolidating: boolean;
   setConsolidating: (v: boolean) => void;
   /** 통합 진행률 (Worker에서 수신, 복원 시 loading 단계 포함) */
   consolidationProgress: { stage: "loading" | "history" | "grouping" | "building" | "done"; current: number; total: number; flightsBuilt: number } | null;
   setConsolidationProgress: (p: { stage: "loading" | "history" | "grouping" | "building" | "done"; current: number; total: number; flightsBuilt: number } | null) => void;
-  /** 선택된 비행들을 하나로 수동 병합 */
-  mergeFlights: (ids: string[]) => void;
 
   // CAT008 기상 (극좌표 강수 에코) — 트랙맵 오버레이
   /** 전체 기상 벡터 (시간순 정렬, ~0.5M로 메인 보관) */
@@ -106,8 +84,6 @@ interface AppState {
   // LoS 분석
   losResults: LoSProfileData[];
   addLoSResult: (r: LoSProfileData) => void;
-  removeLoSResult: (id: string) => void;
-  clearLoSResults: () => void;
 
   // 파노라마 (전파 장애물) 뷰
   panoramaViewActive: boolean;
@@ -116,11 +92,6 @@ interface AppState {
   setPanoramaActivePoint: (pt: PanoramaPoint | BuildingObstacle | null) => void;
   panoramaPinned: boolean;
   setPanoramaPinned: (v: boolean) => void;
-  // 파노라마 맵 오버레이 (장애물 경계 폴리곤)
-  panoramaOverlayData: PanoramaPoint[] | null;
-  setPanoramaOverlayData: (data: PanoramaPoint[] | null) => void;
-  panoramaOverlayVisible: boolean;
-  setPanoramaOverlayVisible: (v: boolean) => void;
 
   // 레이더 커버리지 (다중 고도 레이어)
   coverageData: MultiCoverageResult | null;
@@ -147,7 +118,6 @@ interface AppState {
   asterixStats: AsterixStats | null;
   asterixFilePaths: string[];
   setAsterixResult: (stats: AsterixStats, paths: string[]) => void;
-  clearAsterix: () => void;
 
 
   // 보고서 메타데이터
@@ -156,7 +126,6 @@ interface AppState {
 
   // 저장된 보고서
   savedReports: SavedReportSummary[];
-  setSavedReports: (reports: SavedReportSummary[]) => void;
   addSavedReport: (report: SavedReportSummary) => void;
   removeSavedReport: (id: string) => void;
 
@@ -177,15 +146,12 @@ interface AppState {
     updater: BuildingModalDraft | null | ((d: BuildingModalDraft | null) => BuildingModalDraft | null),
   ) => void;
   activePlanOverlays: Map<number, { imageDataUrl: string; bounds: PlanImageBounds; opacity: number; rotation: number }>;
-  setActivePlanOverlay: (groupId: number, data: { imageDataUrl: string; bounds: PlanImageBounds; opacity: number; rotation?: number } | null) => void;
-  updatePlanOverlayProps: (groupId: number, props: { opacity?: number; rotation?: number }) => void;
   // UI
   activePage: PageId;
   setActivePage: (page: PageId) => void;
   loading: boolean;
   setLoading: (loading: boolean) => void;
   loadingMessage: string;
-  setLoadingMessage: (msg: string) => void;
 
   // 개발자 모드
   devMode: boolean;
@@ -282,68 +248,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
-  // 업로드 파일
-  uploadedFiles: [],
-  addUploadedFile: (f) =>
-    set((state) => ({ uploadedFiles: [...state.uploadedFiles, f] })),
-  updateUploadedFile: (path, update) =>
-    set((state) => ({
-      uploadedFiles: state.uploadedFiles.map((f) =>
-        f.path === path ? { ...f, ...update } : f
-      ),
-    })),
-  removeUploadedFile: (path) => {
-    const file = get().uploadedFiles.find((f) => f.path === path);
-    set((s) => ({
-      uploadedFiles: s.uploadedFiles.filter((f) => f.path !== path),
-      parseStatsList: s.parseStatsList.filter((ps) => ps.filename !== file?.name),
-    }));
-  },
-  removeUploadedFiles: (paths) => {
-    const pathSet = new Set(paths);
-    set((s) => ({
-      uploadedFiles: s.uploadedFiles.filter((f) => !pathSet.has(f.path)),
-      parseStatsList: s.parseStatsList.filter((ps) => {
-        const file = s.uploadedFiles.find((f) => f.name === ps.filename);
-        return !file || !pathSet.has(file.path);
-      }),
-    }));
-  },
-  clearUploadedFiles: () => {
-    invoke("clear_manual_merges").catch(() => {});
-    clearWorkerPoints().catch(() => {}); // Worker 포인트 버퍼도 해제
-    set({
-      uploadedFiles: [],
-      workerPointCount: 0,
-      workerPointSummary: null,
-      parseStatsList: [],
-      flights: [],
-      selectedModeS: "__ALL__",
-      selectedFlightId: null,
-      coverageData: null,
-      coverageVisible: false,
-      coverageCacheAvailable: false,
-      losResults: [],
-    });
-  },
-
   // Worker 포인트 요약
   workerPointCount: 0,
-  setWorkerPointCount: (n) => set({ workerPointCount: n }),
   workerPointSummary: null,
-  setWorkerPointSummary: (s) => set({ workerPointSummary: s }),
-
-  // 파싱 통계
-  parseStatsList: [],
-  addParseStats: (filename, stats, totalRecords) =>
-    set((state) => ({
-      parseStatsList: [...state.parseStatsList, { filename, stats, totalRecords }],
-    })),
-  clearParseStats: () => set({ parseStatsList: [] }),
 
   // 비행
   flights: [],
-  setFlights: (flights) => set({ flights }),
   appendFlights: (newFlights) =>
     set((state) => {
       const flights = state.flights.concat(newFlights);
@@ -360,35 +270,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       flights.sort((a, b) => a.start_time - b.start_time);
       return { flights };
     }),
-  clearFlights: () => set({ flights: [] }),
   consolidating: false,
   setConsolidating: (v) => set({ consolidating: v }),
   consolidationProgress: null,
   setConsolidationProgress: (p) => set({ consolidationProgress: p }),
-  mergeFlights: (ids) => {
-    const state = get();
-    if (ids.length < 2) return;
-    const selected = state.flights.filter((f) => ids.includes(f.id));
-    if (selected.length < 2) return;
-    const modeS = selected[0].mode_s.toUpperCase();
-    if (!selected.every((f) => f.mode_s.toUpperCase() === modeS)) return;
-    manualMergeFlightsAsync(selected, state.radarSite).then((merged) => {
-      // set((s) => ...) 패턴으로 최신 상태를 원자적으로 읽고 업데이트
-      set((s) => {
-        const remaining = s.flights.filter((f) => !ids.includes(f.id));
-        const flights = [...remaining, merged].sort((a, b) => a.start_time - b.start_time);
-        return { flights };
-      });
-      invoke("save_manual_merge", {
-        sourceFlightIdsJson: JSON.stringify(ids),
-        modeS,
-      }).catch((e) => {
-        console.warn("[Merge] DB 저장 실패:", e);
-        useToastStore.getState().addToast("비행 병합 저장에 실패했습니다");
-      });
-    });
-  },
-
   // CAT008 기상
   weatherVectors: [],
   setWeatherVectors: (v) => set({ weatherVectors: v }),
@@ -486,27 +371,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       chartScreenshot: r.chartScreenshot ?? null,
     }).catch((e) => console.warn("[LoS] DB 저장 실패:", e));
   },
-  removeLoSResult: (id) => {
-    const prev = get().losResults;
-    set((state) => ({
-      losResults: state.losResults.filter((r) => r.id !== id),
-    }));
-    invoke("delete_los_result", { id }).catch((e) => {
-      console.warn("[LoS] DB 삭제 실패:", e);
-      useToastStore.getState().addToast("LoS 결과 삭제에 실패했습니다");
-      set({ losResults: prev }); // 롤백
-    });
-  },
-  clearLoSResults: () => {
-    const prev = get().losResults;
-    set({ losResults: [] });
-    invoke("clear_los_results").catch((e) => {
-      console.warn("[LoS] DB 초기화 실패:", e);
-      useToastStore.getState().addToast("LoS 결과 초기화에 실패했습니다");
-      set({ losResults: prev }); // 롤백
-    });
-  },
-
   // 파노라마 (전파 장애물) 뷰
   panoramaViewActive: false,
   setPanoramaViewActive: (v) => set({ panoramaViewActive: v }),
@@ -514,10 +378,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   setPanoramaActivePoint: (pt) => set({ panoramaActivePoint: pt }),
   panoramaPinned: false,
   setPanoramaPinned: (v) => set({ panoramaPinned: v }),
-  panoramaOverlayData: null,
-  setPanoramaOverlayData: (data) => set({ panoramaOverlayData: data }),
-  panoramaOverlayVisible: false,
-  setPanoramaOverlayVisible: (v) => set({ panoramaOverlayVisible: v }),
 
   // 레이더 커버리지 (다중 고도 레이어)
   coverageData: null,
@@ -579,7 +439,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   asterixStats: null,
   asterixFilePaths: [],
   setAsterixResult: (stats, paths) => set({ asterixStats: stats, asterixFilePaths: paths }),
-  clearAsterix: () => set({ asterixStats: null, asterixFilePaths: [] }),
 
 
   // 보고서 메타데이터
@@ -599,7 +458,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   // 저장된 보고서
   savedReports: [],
-  setSavedReports: (reports) => set({ savedReports: reports }),
   addSavedReport: (report) =>
     set((state) => ({ savedReports: [report, ...state.savedReports] })),
   removeSavedReport: (id) => {
@@ -653,42 +511,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     buildingModalDraft: typeof updater === "function" ? updater(state.buildingModalDraft) : updater,
   })),
   activePlanOverlays: new Map(),
-  setActivePlanOverlay: (groupId, data) =>
-    set((state) => {
-      const next = new Map(state.activePlanOverlays);
-      if (data) {
-        next.set(groupId, { ...data, rotation: data.rotation ?? 0 });
-      } else {
-        next.delete(groupId);
-      }
-      return { activePlanOverlays: next };
-    }),
-  updatePlanOverlayProps: (groupId, props) =>
-    set((state) => {
-      const existing = state.activePlanOverlays.get(groupId);
-      if (!existing) return state;
-      const next = new Map(state.activePlanOverlays);
-      const updated = {
-        ...existing,
-        opacity: props.opacity ?? existing.opacity,
-        rotation: props.rotation ?? existing.rotation,
-      };
-      next.set(groupId, updated);
-      // DB 영속화 (fire-and-forget)
-      invoke("update_plan_overlay_props", {
-        groupId,
-        opacity: props.opacity ?? null,
-        rotation: props.rotation ?? null,
-      }).catch(() => {});
-      return { activePlanOverlays: next };
-    }),
   // UI
   activePage: "upload",
   setActivePage: (page) => set({ activePage: page }),
   loading: false,
   setLoading: (loading) => set({ loading }),
   loadingMessage: "",
-  setLoadingMessage: (msg) => set({ loadingMessage: msg }),
 
   // 개발자 모드
   devMode: false,

@@ -3,11 +3,10 @@
 //! 레이더 안테나 위치에서 전방위(0°~360°)로 ray를 쏘아
 //! 지형(SRTM) + 건물통합정보 + 수동건물 중 가장 높은 앙각의 장애물을 찾는다.
 
-use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-use crate::srtm::{self, SrtmReader};
+use crate::srtm::SrtmReader;
 
 /// 실제 지구반경 (m)
 const R_EARTH: f64 = 6_371_000.0;
@@ -172,12 +171,6 @@ fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
     ((dh - curv_drop) / d).atan().to_degrees()
 }
 
-/// 레이더→방위/거리 지점의 WGS84 좌표 계산 (공개: presample에서도 사용)
-/// geo::destination_point_m으로의 호환 래퍼
-pub fn destination_point_pub(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
-    crate::geo::destination_point_m(lat, lon, bearing_deg, distance_m)
-}
-
 /// GPU 파노라마 지형 결과 (프론트엔드에서 전달)
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct TerrainResult {
@@ -316,79 +309,6 @@ fn query_building_polygons(
     }
 
     (polygons, point_buildings)
-}
-
-/// 360° LoS 파노라마 계산
-pub fn calculate_panorama(
-    srtm: &mut SrtmReader,
-    conn: &Connection,
-    radar_lat: f64,
-    radar_lon: f64,
-    radar_height_m: f64,
-    max_range_km: f64,
-    azimuth_step_deg: f64,
-    range_step_m: f64,
-    exclude_manual_ids: &[i64],
-) -> PanoramaMergeResult {
-    let max_range_m = max_range_km * 1000.0;
-    let num_azimuths = (360.0 / azimuth_step_deg).round() as usize;
-
-    // Pre-load SRTM tiles for the radar range
-    let range_deg = (max_range_m / 111_000.0).ceil() as i32 + 1;
-    let min_lat_tile = radar_lat.floor() as i32 - range_deg;
-    let max_lat_tile = radar_lat.floor() as i32 + range_deg;
-    let min_lon_tile = radar_lon.floor() as i32 - range_deg;
-    let max_lon_tile = radar_lon.floor() as i32 + range_deg;
-    srtm.preload_tiles(min_lat_tile, max_lat_tile, min_lon_tile, max_lon_tile);
-    let tiles = srtm.tiles_ref();
-
-    // Phase 1: 지형 스캔 (SRTM) — rayon 병렬 처리
-    let terrain_results: Vec<PanoramaPoint> = (0..num_azimuths)
-        .into_par_iter()
-        .map(|idx| {
-            let az = idx as f64 * azimuth_step_deg;
-            let mut best = PanoramaPoint {
-                azimuth_deg: az,
-                elevation_angle_deg: -90.0,
-                distance_km: 0.0,
-                obstacle_height_m: 0.0,
-                ground_elev_m: 0.0,
-                obstacle_type: "terrain".to_string(),
-                name: None, address: None, usage: None,
-                lat: radar_lat, lon: radar_lon,
-                polygon: None,
-            };
-
-            let mut d = range_step_m;
-            while d <= max_range_m {
-                let (lat, lon) = crate::geo::destination_point_m(radar_lat, radar_lon, az, d);
-                let elev = srtm::elevation_from_tiles(tiles, lat, lon);
-                let angle = elevation_angle_deg(d, elev, radar_height_m);
-                if angle > best.elevation_angle_deg {
-                    best.elevation_angle_deg = angle;
-                    best.distance_km = d / 1000.0;
-                    best.obstacle_height_m = elev;
-                    best.ground_elev_m = elev;
-                    best.lat = lat;
-                    best.lon = lon;
-                }
-                d += range_step_m;
-            }
-
-            if best.elevation_angle_deg < -89.0 {
-                best.elevation_angle_deg = 0.0;
-            }
-            best
-        })
-        .collect();
-
-    let all_buildings = collect_building_obstacles(srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, exclude_manual_ids);
-    let buildings = filter_visible_buildings(all_buildings, &terrain_results);
-
-    PanoramaMergeResult {
-        terrain: terrain_results,
-        buildings,
-    }
 }
 
 /// GPU 지형 결과 + 건물 장애물 수집 → PanoramaMergeResult 반환

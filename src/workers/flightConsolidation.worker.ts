@@ -14,7 +14,7 @@
 import {
   type PointBatch, type FlightPointsSoA,
   batchFromObjects, pointAt, modeSOf, radarNameOf,
-  unpackBatch, clearGlobalTables,
+  unpackBatch,
 } from "./pointSoA";
 
 // ─── 타입 (Worker 내 로컬 재선언) ───────────────────
@@ -813,20 +813,6 @@ async function consolidateAndStream(
   self.postMessage({ type: "CONSOLIDATE_DONE", id: requestId, totalFlights });
 }
 
-// ─── manualMergeFlights ─────────────────────────────
-
-function manualMergeFlights(selectedFlights: Flight[], radarLat: number, radarLon: number): Flight {
-  const sorted = [...selectedFlights].sort((a, b) => a.start_time - b.start_time);
-  const allPoints = sorted.flatMap((f) => f.track_points);
-  const modeS = sorted[0].mode_s;
-  const aircraftName = sorted.find((f) => f.aircraft_name)?.aircraft_name;
-  const callsign = sorted.find((f) => f.callsign)?.callsign;
-  const departure = sorted.find((f) => f.departure_airport)?.departure_airport;
-  const arrival = [...sorted].reverse().find((f) => f.arrival_airport)?.arrival_airport;
-  const radarNameVal = sorted.find((f) => f.radar_name)?.radar_name;
-  return buildFlight(modeS, allPoints, radarLat, radarLon, "manual", aircraftName, callsign, departure, arrival, radarNameVal);
-}
-
 // ─── Worker 메시지 핸들러 ───────────────────────────
 
 self.onmessage = async (e: MessageEvent) => {
@@ -869,55 +855,6 @@ self.onmessage = async (e: MessageEvent) => {
         const { modeS, points, radarLat, radarLon, matchType, aircraftName, callsign, departure, arrival, radarName } = e.data;
         const flight = buildFlight(modeS, points, radarLat, radarLon, matchType, aircraftName, callsign, departure, arrival, radarName);
         self.postMessage({ type: "BUILD_FLIGHT_RESULT", id, flight });
-        break;
-      }
-
-      case "MANUAL_MERGE": {
-        const { selectedFlights, flightIds, radarSite } = e.data;
-        let flight: Flight;
-        if (flightIds && flightIds.length > 0) {
-          // 새 방식: ID로 _flightIndex에서 포인트 수집 (SoA → 객체)
-          const allPts: TrackPoint[] = [];
-          const metas: Flight[] = selectedFlights ?? [];
-          for (const fid of flightIds as string[]) {
-            const entry = _flightIndex.get(fid);
-            if (entry) {
-              for (let i = 0; i < entry.points.count; i++) {
-                allPts.push(pointAt(entry.points, i) as TrackPoint);
-              }
-            }
-          }
-          const sorted = [...metas].sort((a: Flight, b: Flight) => a.start_time - b.start_time);
-          const modeS = sorted[0]?.mode_s ?? (allPts[0]?.mode_s ?? "");
-          const acName = sorted.find((f: Flight) => f.aircraft_name)?.aircraft_name;
-          const cs = sorted.find((f: Flight) => f.callsign)?.callsign;
-          const dep = sorted.find((f: Flight) => f.departure_airport)?.departure_airport;
-          const arr = [...sorted].reverse().find((f: Flight) => f.arrival_airport)?.arrival_airport;
-          const rn = sorted.find((f: Flight) => f.radar_name)?.radar_name;
-          flight = buildFlight(modeS, allPts, radarSite.latitude, radarSite.longitude, "manual", acName, cs, dep, arr, rn);
-          // 인덱스 업데이트: 기존 삭제 + 새 항목 추가 (SoA로 저장)
-          for (const fid of flightIds as string[]) _flightIndex.delete(fid);
-          _flightIndex.set(flight.id, {
-            flightId: flight.id, modeS: flight.mode_s, radarName: flight.radar_name ?? "",
-            startTime: flight.start_time, endTime: flight.end_time,
-            points: batchFromObjects(flight.track_points),
-          });
-        } else {
-          // 레거시 방식: 전체 Flight 객체 전달 (호환)
-          flight = manualMergeFlights(selectedFlights, radarSite.latitude, radarSite.longitude);
-        }
-        // 메인에는 track_points 제거한 메타 반환
-        const { track_points: _, ...meta } = flight;
-        self.postMessage({ type: "MANUAL_MERGE_RESULT", id, flight: { ...meta, track_points: [] } });
-        break;
-      }
-
-      case "CLEAR_POINTS": {
-        _pointBatches.length = 0;
-        _pointBatches = [];
-        _flightIndex.clear();
-        clearGlobalTables();
-        self.postMessage({ type: "CLEAR_POINTS_ACK", id });
         break;
       }
 
@@ -1024,22 +961,6 @@ self.onmessage = async (e: MessageEvent) => {
         const entry = _flightIndex.get(e.data.flightId as string);
         const points: TrackPoint[] = entry ? pointsArrayOf(entry) : [];
         self.postMessage({ type: "QUERY_FLIGHT_POINTS_RESULT", id, points });
-        break;
-      }
-
-      case "QUERY_FLIGHT_POINTS_BATCH": {
-        const batchIds = e.data.flightIds as string[];
-        const allPts: TrackPoint[] = [];
-        for (const fid of batchIds) {
-          const entry = _flightIndex.get(fid);
-          if (entry) {
-            for (let i = 0; i < entry.points.count; i++) {
-              allPts.push(pointAt(entry.points, i) as TrackPoint);
-            }
-          }
-        }
-        allPts.sort((a, b) => a.timestamp - b.timestamp);
-        self.postMessage({ type: "QUERY_FLIGHT_POINTS_BATCH_RESULT", id, points: allPts });
         break;
       }
 

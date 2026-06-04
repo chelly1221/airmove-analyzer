@@ -452,57 +452,6 @@ pub fn get_setting(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
 }
 
 
-// ========== 고도 프로파일 캐시 ==========
-
-/// 캐시에서 고도 조회 (lat/lon을 소수점 4자리 문자열 키로 사용)
-pub fn get_cached_elevations(
-    conn: &Connection,
-    lats: &[f64],
-    lons: &[f64],
-) -> SqlResult<Vec<Option<f64>>> {
-    let mut results = vec![None; lats.len()];
-    let mut stmt = conn.prepare(
-        "SELECT elevation FROM elevation_cache WHERE lat_key = ?1 AND lon_key = ?2",
-    )?;
-    for (i, (lat, lon)) in lats.iter().zip(lons.iter()).enumerate() {
-        let lat_key = format!("{:.2}", lat);
-        let lon_key = format!("{:.2}", lon);
-        if let Ok(elev) = stmt.query_row(params![lat_key, lon_key], |row| row.get::<_, f64>(0)) {
-            results[i] = Some(elev);
-        }
-    }
-    Ok(results)
-}
-
-/// 고도 데이터를 캐시에 저장
-pub fn save_elevations_to_cache(
-    conn: &Connection,
-    lats: &[f64],
-    lons: &[f64],
-    elevations: &[f64],
-) -> SqlResult<()> {
-    conn.execute_batch("BEGIN")?;
-    let insert_result = (|| -> SqlResult<()> {
-        let mut stmt = conn.prepare(
-            "INSERT OR REPLACE INTO elevation_cache (lat_key, lon_key, elevation) VALUES (?1, ?2, ?3)",
-        )?;
-        for i in 0..lats.len() {
-            let lat_key = format!("{:.2}", lats[i]);
-            let lon_key = format!("{:.2}", lons[i]);
-            stmt.execute(params![lat_key, lon_key, elevations[i]])?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = insert_result {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(e);
-    }
-    conn.execute_batch("COMMIT")?;
-    Ok(())
-}
-
-
-
 // ========== LoS 파노라마 캐시 ==========
 
 /// 파노라마 데이터 저장
@@ -623,52 +572,6 @@ pub fn load_all_los_results(conn: &Connection) -> SqlResult<Vec<(String, String,
     Ok(rows)
 }
 
-/// LoS 결과 삭제
-pub fn delete_los_result(conn: &Connection, id: &str) -> SqlResult<()> {
-    conn.execute("DELETE FROM los_results WHERE id = ?1", params![id])?;
-    Ok(())
-}
-
-/// LoS 결과 전체 삭제
-pub fn clear_all_los_results(conn: &Connection) -> SqlResult<()> {
-    conn.execute("DELETE FROM los_results", [])?;
-    Ok(())
-}
-
-// ========== 수동 병합 이력 ==========
-
-/// 수동 병합 저장
-pub fn save_manual_merge(conn: &Connection, source_flight_ids_json: &str, mode_s: &str) -> SqlResult<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    conn.execute(
-        "INSERT INTO manual_merge_history (source_flight_ids_json, mode_s, created_at) VALUES (?1, ?2, ?3)",
-        params![source_flight_ids_json, mode_s, now],
-    )?;
-    Ok(())
-}
-
-/// 수동 병합 이력 전체 로드
-pub fn load_manual_merges(conn: &Connection) -> SqlResult<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT source_flight_ids_json, mode_s FROM manual_merge_history ORDER BY created_at",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<SqlResult<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// 수동 병합 이력 전체 삭제
-pub fn clear_manual_merges(conn: &Connection) -> SqlResult<()> {
-    conn.execute("DELETE FROM manual_merge_history", [])?;
-    Ok(())
-}
-
 // ========== 커버리지 캐시 ==========
 
 /// 커버리지 캐시 저장
@@ -715,12 +618,6 @@ pub fn has_coverage_cache(conn: &Connection, radar_name: &str) -> SqlResult<bool
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
         Err(e) => Err(e),
     }
-}
-
-/// 커버리지 캐시 삭제
-pub fn clear_coverage_cache(conn: &Connection, radar_name: &str) -> SqlResult<()> {
-    conn.execute("DELETE FROM coverage_cache WHERE radar_name = ?1", params![radar_name])?;
-    Ok(())
 }
 
 // ========== 저장된 보고서 ==========
@@ -855,15 +752,6 @@ pub fn has_srtm_tile(conn: &Connection, name: &str) -> bool {
         params![name],
         |_| Ok(()),
     ).is_ok()
-}
-
-/// 저장된 SRTM 타일 이름 목록
-pub fn list_srtm_tiles(conn: &Connection) -> SqlResult<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT name FROM srtm_tiles ORDER BY name")?;
-    let names = stmt.query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(names)
 }
 
 /// SRTM 타일 상태 (타일 수 + 최신 다운로드 일시)

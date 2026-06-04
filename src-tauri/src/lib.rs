@@ -159,32 +159,6 @@ async fn delete_aircraft(id: String, app_handle: tauri::AppHandle) -> Result<(),
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-/// Parse an ASS file and immediately analyze it.
-#[tauri::command]
-async fn parse_and_analyze(
-    app_handle: tauri::AppHandle,
-    file_path: String,
-    radar_lat: f64,
-    radar_lon: f64,
-    mode_s_include: Vec<String>,
-    mode_s_exclude: Vec<String>,
-    mode3a_include: Vec<u16>,
-    mode3a_exclude: Vec<u16>,
-) -> Result<AnalysisResult, String> {
-    info!("Command: parse_and_analyze({}, radar={},{}, include={:?}, exclude={:?})", file_path, radar_lat, radar_lon, mode_s_include, mode_s_exclude);
-    let mag_dec = resolve_declination(&app_handle, &file_path, radar_lat, radar_lon).await;
-    let fp = file_path.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let parsed = parser::ass::parse_ass_file(&fp, radar_lat, radar_lon, &mode_s_include, &mode_s_exclude, &mode3a_include, &mode3a_exclude, mag_dec, |_| {})
-            .map_err(|e| e.to_string())?;
-        let analysis = analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS);
-
-        Ok(analysis)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
-}
-
 /// 배치 파싱 결과 이벤트 페이로드 (파일 하나 완료 시 emit, track_points는 청크로 별도 전송)
 #[derive(Clone, serde::Serialize)]
 struct BatchResultEvent {
@@ -390,18 +364,6 @@ async fn query_asterix_frames(
 }
 
 /// Filter track points by Mode-S code (case-insensitive match).
-
-/// 파일을 읽어 base64로 반환 (한글 폰트 등)
-#[tauri::command]
-async fn read_file_base64(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))?;
-        Ok(STANDARD.encode(&bytes))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
 
 /// base64 데이터를 파일로 저장 (PDF 등)
 #[tauri::command]
@@ -665,38 +627,6 @@ async fn import_database(
 
         info!("Database imported from: {}", src_path);
         Ok(())
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-/// 360° LoS 파노라마 계산 (지형 + 건물통합정보 + 수동건물)
-#[tauri::command]
-async fn calculate_los_panorama(
-    app_handle: tauri::AppHandle,
-    radar_lat: f64,
-    radar_lon: f64,
-    radar_height_m: f64,
-    max_range_km: Option<f64>,
-    azimuth_step_deg: Option<f64>,
-    range_step_m: Option<f64>,
-    exclude_manual_ids: Option<Vec<i64>>,
-) -> Result<analysis::panorama::PanoramaMergeResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let max_range = max_range_km.unwrap_or(100.0);
-        let az_step = azimuth_step_deg.unwrap_or(0.5);
-        let r_step = range_step_m.unwrap_or(200.0);
-        let exclude_ids = exclude_manual_ids.unwrap_or_default();
-
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-
-        Ok(analysis::panorama::calculate_panorama(
-            &mut srtm, &conn,
-            radar_lat, radar_lon, radar_height_m,
-            max_range, az_step, r_step, &exclude_ids,
-        ))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1228,84 +1158,6 @@ async fn set_building_group_enabled(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-#[tauri::command]
-async fn save_group_plan_image(
-    app_handle: tauri::AppHandle,
-    group_id: i64,
-    image_base64: String,
-    bounds_json: String,
-    opacity: f64,
-    rotation: f64,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        use base64::Engine;
-        let image_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&image_base64)
-            .map_err(|e| format!("base64 디코드 실패: {}", e))?;
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        building::save_group_plan_image(&conn, group_id, &image_bytes, &bounds_json, opacity, rotation)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn load_group_plan_image(
-    app_handle: tauri::AppHandle,
-    group_id: i64,
-) -> Result<Option<serde_json::Value>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        match building::load_group_plan_image(&conn, group_id)? {
-            Some((image_bytes, bounds_json, opacity, rotation)) => {
-                use base64::Engine;
-                let image_base64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
-                Ok(Some(serde_json::json!({
-                    "image_base64": image_base64,
-                    "bounds_json": bounds_json,
-                    "opacity": opacity,
-                    "rotation": rotation,
-                })))
-            }
-            None => Ok(None),
-        }
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn update_plan_overlay_props(
-    app_handle: tauri::AppHandle,
-    group_id: i64,
-    opacity: Option<f64>,
-    rotation: Option<f64>,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        building::update_plan_overlay_props(&conn, group_id, opacity, rotation)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn delete_group_plan_image(
-    app_handle: tauri::AppHandle,
-    group_id: i64,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        building::delete_group_plan_image(&conn, group_id)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
 // ---------- 수동 등록 건물 ----------
 
 #[tauri::command]
@@ -1454,65 +1306,6 @@ async fn load_los_results(
         }).collect();
 
         serde_json::to_string(&results).map_err(|e| format!("JSON error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn delete_los_result(
-    app_handle: tauri::AppHandle,
-    id: String,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::delete_los_result(&conn, &id).map_err(|e| format!("DB error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn clear_los_results(
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::clear_all_los_results(&conn).map_err(|e| format!("DB error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-// ========== 수동 병합 이력 ==========
-
-#[tauri::command]
-async fn save_manual_merge(
-    app_handle: tauri::AppHandle,
-    source_flight_ids_json: String,
-    mode_s: String,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::save_manual_merge(&conn, &source_flight_ids_json, &mode_s)
-            .map_err(|e| format!("DB error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-
-#[tauri::command]
-async fn clear_manual_merges(
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::clear_manual_merges(&conn).map_err(|e| format!("DB error: {}", e))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -2539,20 +2332,17 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            parse_and_analyze,
             parse_and_analyze_batch,
             scan_asterix_batch,
             query_asterix_frames,
             get_aircraft_list,
             save_aircraft,
             delete_aircraft,
-            read_file_base64,
             write_file_base64,
             load_setting,
             save_setting,
             export_database,
             import_database,
-            calculate_los_panorama,
             build_heightmap,
             panorama_merge_buildings,
             panorama_merge_buildings_dual,
@@ -2577,10 +2367,6 @@ pub fn run() {
             update_building_group,
             delete_building_group,
             set_building_group_enabled,
-            save_group_plan_image,
-            load_group_plan_image,
-            update_plan_overlay_props,
-            delete_group_plan_image,
             list_manual_buildings,
             add_manual_building,
             update_manual_building,
@@ -2588,11 +2374,6 @@ pub fn run() {
             // LoS 결과 영속화
             save_los_result,
             load_los_results,
-            delete_los_result,
-            clear_los_results,
-            // 수동 병합 이력
-            save_manual_merge,
-            clear_manual_merges,
             // 커버리지 캐시
             save_coverage_cache,
             load_coverage_cache,

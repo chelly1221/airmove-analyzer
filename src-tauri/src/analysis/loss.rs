@@ -237,25 +237,6 @@ pub fn analyze_tracks(parsed: ParsedFile, threshold_secs: f64) -> AnalysisResult
     }
 }
 
-/// 레이더 최대 탐지거리 추정 (전체 포인트의 95th percentile 거리)
-#[allow(dead_code)]
-fn estimate_max_radar_range(points: &[TrackPoint], radar_lat: f64, radar_lon: f64) -> f64 {
-    if points.is_empty() {
-        return 150.0; // 기본값 150km
-    }
-
-    let mut distances: Vec<f64> = points
-        .iter()
-        .map(|p| calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude))
-        .collect();
-    distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 95th percentile
-    let idx = (distances.len() as f64 * 0.95) as usize;
-    let idx = idx.min(distances.len() - 1);
-    distances[idx].max(50.0) // 최소 50km
-}
-
 /// 레이더 최대 탐지거리 추정 (참조 슬라이스용)
 fn estimate_max_radar_range_refs(points: &[&TrackPoint], radar_lat: f64, radar_lon: f64) -> f64 {
     if points.is_empty() {

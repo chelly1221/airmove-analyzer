@@ -113,40 +113,6 @@ pub fn epsg5179_to_wgs84(easting: f64, northing: f64) -> (f64, f64) {
     tm_inverse_grs80(easting, northing, LAM0, PHI0, K0, FE, FN)
 }
 
-// ── ECEF → WGS84 변환 ──────────────────────────────────────
-
-/// WGS84 타원체 파라미터
-const WGS84_A: f64 = 6_378_137.0;
-const WGS84_F: f64 = 1.0 / 298.257223563;
-
-/// ECEF (Earth-Centered Earth-Fixed) 좌표를 WGS84 (lat°, lon°, height_m)로 변환
-///
-/// Bowring 반복법 사용 (3~4회 수렴, 서브밀리미터 정밀도)
-pub fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
-    let e2 = 2.0 * WGS84_F - WGS84_F * WGS84_F;
-    let lon = y.atan2(x);
-    let p = (x * x + y * y).sqrt();
-
-    // 초기 추정
-    let mut lat = z.atan2(p * (1.0 - e2));
-    for _ in 0..5 {
-        let sin_lat = lat.sin();
-        let n = WGS84_A / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-        lat = (z + e2 * n * sin_lat).atan2(p);
-    }
-
-    let sin_lat = lat.sin();
-    let n = WGS84_A / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-    let cos_lat = lat.cos();
-    let h = if cos_lat.abs() > 1e-10 {
-        p / cos_lat - n
-    } else {
-        z.abs() / sin_lat.abs() - n * (1.0 - e2)
-    };
-
-    (lat * 180.0 / PI, lon * 180.0 / PI, h)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

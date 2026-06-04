@@ -4,19 +4,6 @@ export interface AzSector {
   end_deg: number;
 }
 
-/** 레이더별 파일 묶음 (IPC 입력) */
-export interface RadarFileSet {
-  radar_name: string;
-  radar_lat: number;
-  radar_lon: number;
-  radar_altitude: number;
-  antenna_height: number;
-  file_paths: string[];
-  azimuth_sectors: AzSector[];
-  /** LoS 단면도 표시용 건물 방위각 목록 (±5° 이내만 track_points_geo에 포함) */
-  building_bearings_deg?: number[];
-}
-
 /** Loss 발생 좌표 요약 */
 export interface LossPointGeo {
   lat: number;

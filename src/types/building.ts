@@ -53,9 +53,6 @@ export interface PeakImportStatus {
   record_count: number;
 }
 
-/** SRTM 타일 상태 [타일 수, 최신 다운로드 일시(epoch)] */
-export type SrtmStatus = [number, number] | null;
-
 /** 도형 유형 */
 export type GeometryType = "polygon" | "multi";
 

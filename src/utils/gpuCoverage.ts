@@ -171,10 +171,6 @@ export function invalidateGPUCache(): void {
   _currentRadarKey = "";
 }
 
-export function hasCoverageCache(): boolean {
-  return _pixelCacheReady;
-}
-
 /** 특정 좌표의 최저 탐지고도(ft) 조회 — Rust PIXEL_STATE 캐시 사용 */
 export async function queryMinDetectionAlt(lat: number, lon: number): Promise<number | null> {
   if (!_pixelCacheReady) return null;

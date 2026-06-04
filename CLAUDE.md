@@ -37,7 +37,7 @@ cmd.exe /c "set PATH=%USERPROFILE%\.cargo\bin;C:\nvm4w\nodejs;%PATH% && cd /d C:
 ### 비행(Flight) 기반 분석
 분석 단위는 파일이 아닌 **비행(Flight)**. 데이터 흐름:
 1. ASS 파싱 → DB 저장 + `radar_name` 태깅
-2. `sendPointsToWorker()` → Worker에 전송 (메인에 축적 안 함)
+2. `postPointsToWorker()` → Worker에 전송 (메인에 축적 안 함)
 3. `startConsolidate()` → Worker에서 mode_s+radar_name 그룹핑 + gap 분리
 4. Worker가 `FLIGHT_CHUNK`로 1개씩 스트리밍 → `appendFlights()` → UI 즉시 반영
 5. 각 페이지에서 `queryViewportPoints()`로 Worker에 포인트 쿼리 (포인트는 Worker 소유)
