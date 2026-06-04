@@ -40,7 +40,6 @@ import type {
 export default function ReportGeneration() {
   const allFlights = useAppStore((s) => s.flights);
   const aircraft = useAppStore((s) => s.aircraft);
-  const losResults = useAppStore((s) => s.losResults);
   const radarSite = useAppStore((s) => s.radarSite);
   const flights = useMemo(
     () => allFlights.filter((f) => !f.radar_name || f.radar_name === radarSite.name),
@@ -375,7 +374,6 @@ export default function ReportGeneration() {
       const isObstacle = tpl === "obstacle" || tpl === "obstacle_monthly";
       const needsFlights = !isObstacle;
       const needsPanorama = !isObstacle && sects.panorama;
-      const needsLoS = (tpl === "weekly" || tpl === "monthly" || tpl === "flights" || tpl === "single") && sects.los;
       const needsOm = tpl === "obstacle_monthly";
       const needsPs = tpl === "obstacle";
 
@@ -408,7 +406,6 @@ export default function ReportGeneration() {
         commentary: comm,
         flights: needsFlights ? reportFlights : [],
         reportFlights: needsFlights ? reportFlights : [],
-        losResults: needsLoS ? losResults : [],
         aircraft: needsFlights ? aircraft : [],
         radarSite,
         reportMetadata,
@@ -435,7 +432,7 @@ export default function ReportGeneration() {
       setPrepState({ active: false, message: "" });
     }
   }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite,
-      omData, reportMetadata, panoramaData, panoramaPeakNames, coverageLayers, losResults,
+      omData, reportMetadata, panoramaData, panoramaPeakNames, coverageLayers,
       psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap, psCovLayersWith, psCovLayersWithout,
       psAnalysisMonth, editingReportId]);
 
@@ -446,7 +443,6 @@ export default function ReportGeneration() {
       await writeReportConfig({
         template: tpl,
         flights,
-        losResults,
         aircraft,
         metadata: reportMetadata,
         radarSite,
@@ -459,7 +455,7 @@ export default function ReportGeneration() {
     } finally {
       setPrepState({ active: false, message: "" });
     }
-  }, [flights, losResults, aircraft, reportMetadata, radarSite, panoramaData, panoramaPeakNames, coverageLayers, customRadarSites, openReportWindow]);
+  }, [flights, aircraft, reportMetadata, radarSite, panoramaData, panoramaPeakNames, coverageLayers, customRadarSites, openReportWindow]);
 
   // ref로 최신 handleGenerate 참조 — 리스너 재등록 없이 항상 최신 클로저 사용
   const handleGenerateRef = useRef(handleGenerate);
@@ -561,7 +557,6 @@ export default function ReportGeneration() {
       const isObstacle = tpl === "obstacle" || tpl === "obstacle_monthly";
       const needsFlights = !isObstacle;
       const needsPanorama = !isObstacle && sects.panorama;
-      const needsLoS = (tpl === "weekly" || tpl === "monthly" || tpl === "flights" || tpl === "single") && sects.los;
       const needsOm = tpl === "obstacle_monthly";
       const needsPs = tpl === "obstacle";
 
@@ -582,7 +577,6 @@ export default function ReportGeneration() {
         commentary: config.commentary ?? "",
         flights: needsFlights ? reportFlights : [],
         reportFlights: needsFlights ? reportFlights : [],
-        losResults: needsLoS ? losResults : [],
         aircraft: needsFlights ? aircraft : [],
         radarSite,
         reportMetadata,
@@ -608,7 +602,7 @@ export default function ReportGeneration() {
     } finally {
       setPrepState({ active: false, message: "" });
     }
-  }, [flights, losResults, aircraft, radarSite, reportMetadata, panoramaData, panoramaPeakNames,
+  }, [flights, aircraft, radarSite, reportMetadata, panoramaData, panoramaPeakNames,
       coverageLayers, omData, psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap,
       psCovLayersWith, psCovLayersWithout, psAnalysisMonth, openReportWindow]);
 
@@ -643,7 +637,6 @@ export default function ReportGeneration() {
             flights={flights}
             totalLoss={totalLoss}
             avgLossPercent={avgLossPercent}
-            losResults={losResults}
             panoramaData={panoramaData}
             coverageLayers={coverageLayers}
             customRadarSites={customRadarSites}
@@ -676,7 +669,6 @@ function TemplateTable({
   flights,
   totalLoss,
   avgLossPercent,
-  losResults,
   panoramaData: _panoramaData,
   coverageLayers: _coverageLayers,
   customRadarSites,
@@ -686,7 +678,6 @@ function TemplateTable({
   flights: Flight[];
   totalLoss: number;
   avgLossPercent: number;
-  losResults: LoSProfileData[];
   panoramaData: PanoramaPoint[];
   coverageLayers: CoverageLayer[];
   customRadarSites: RadarSite[];
@@ -715,7 +706,6 @@ function TemplateTable({
       description: "월간 요약 통계와 주요 소실 사항을 보고합니다. 추이 분석 차트와 종합 판정이 포함됩니다.",
       stats: [
         { label: "평균 소실율", value: `${avgLossPercent.toFixed(1)}%` },
-        { label: "LoS 분석", value: `${losResults.length}건` },
       ],
       disabled: true,
       wip: true,

@@ -194,10 +194,29 @@ export function LosCrossSection({
     //     point 형 대상은 Rust 가 pathBuildings 에서 제외 → 매칭 0 건이면 미표시(두 선 동일).
     //     terrainProfile(raw) 은 DB 복원 los 엔 없음 → 그 경우도 미표시 (graceful).
     const buildingsWithoutTarget = buildings.filter((b) => !isTargetBuildingOnPath(b, building, D));
+    const targetBuildings = buildings.filter((b) => isTargetBuildingOnPath(b, building, D));
     const rawTerrain = los.terrainProfile;
+    // 분석 대상 제외선의 지형 base: 순수 SRTM(rawTerrain)에 '대상 건물이 깔고 앉은 지반고(ground_elev)'를
+    //   footprint(near~far) 구간에 max 병합한다. 구조물 height 만 제거하고, 그 지반이 표현하는 언덕은 유지 —
+    //   중앙선 SRTM 이 언덕 옆을 스쳐 낮게 샘플링돼 대상 제외 시 언덕째 사라지던 누락을 보정.
+    let dashedTerrain: ElevationPoint[] | undefined = rawTerrain;
+    if (rawTerrain && rawTerrain.length > 0 && targetBuildings.length > 0) {
+      const merged = rawTerrain.map((p) => ({ ...p }));
+      for (const tb of targetBuildings) {
+        const near = tb.near_dist_km ?? tb.distance_km;
+        const far = tb.far_dist_km ?? tb.distance_km;
+        const grnd = tb.ground_elev_m;
+        for (const p of merged) {
+          if (p.distance >= near - 1e-9 && p.distance <= far + 1e-9 && grnd > p.elevation) {
+            p.elevation = grnd;
+          }
+        }
+      }
+      dashedTerrain = merged;
+    }
     const minDetWithout =
-      rawTerrain && rawTerrain.length > 0 && buildingsWithoutTarget.length < buildings.length
-        ? computeMinDet(rawTerrain, buildingsWithoutTarget)
+      dashedTerrain && dashedTerrain.length > 0 && buildingsWithoutTarget.length < buildings.length
+        ? computeMinDet(dashedTerrain, buildingsWithoutTarget)
         : null;
 
     // 차단 판정 (TrackMap 와 동일 — 빌딩까지 직선 LoS 와 통합 장애물 비교)
@@ -221,11 +240,13 @@ export function LosCrossSection({
       }
     }
 
-    // 5) 차폐 기여 빌딩 — 지형만 shadow 보다 빌딩 꼭대기가 높으면 실질 차폐 기여
-    const significantBuildings: (BuildingOnPath & { isBlocking: boolean })[] = [];
+    // 5) 차폐 기여 빌딩 — 지형만 shadow 보다 빌딩 꼭대기가 높으면 실질 차폐 기여.
+    //    단, 분석 대상 건물은 음영 여부와 무관하게 항상 포함(앞쪽 지형에 가려도 표시) — isTarget 표시.
+    const significantBuildings: (BuildingOnPath & { isBlocking: boolean; isTarget: boolean })[] = [];
     for (const b of buildings) {
       const bDist = b.distance_km;
       if (bDist <= 0 || bDist >= D) continue;
+      const isTarget = isTargetBuildingOnPath(b, building, D);
       const bTop = b.ground_elev_m + b.height_m;
       const bAdj = bTop - curvDrop(bDist);
       let terrainShadow = radarHeight;
@@ -235,13 +256,15 @@ export function LosCrossSection({
         const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
         if (shadow > terrainShadow) terrainShadow = shadow;
       }
-      if (bAdj > terrainShadow) {
+      if (bAdj > terrainShadow || isTarget) {
         const isBlk = !!(maxBlockPoint &&
           Math.abs(bDist - maxBlockPoint.distance) < 0.1 &&
           bAdj > maxBlockPoint.adjHeight - 5);
-        significantBuildings.push({ ...b, isBlocking: isBlk });
+        significantBuildings.push({ ...b, isBlocking: isBlk, isTarget });
       }
     }
+    // 분석 대상 건물을 마지막에 그려 다른 건물·지형 위로(높은 z-index) 올린다. (Array.sort 는 안정 정렬)
+    significantBuildings.sort((a, b) => Number(a.isTarget) - Number(b.isTarget));
 
     // Y축 범위
     const allHeights = [
@@ -499,20 +522,26 @@ export function LosCrossSection({
   const buildingName = building.name || `건물 ${building.id}`;
   const bDistNm = D * KM_TO_NM;
 
-  // 빌딩 카운트
-  const blockingCount = significantBuildings.filter((b) => b.isBlocking).length;
-  const manualCount = significantBuildings.filter((b) => b.is_manual).length;
-  const nonBlockingCount = significantBuildings.length - blockingCount;
+  // 빌딩 카운트 — 분석 대상은 별도 집계(다른 범주서 제외해 중복 라벨 방지)
+  const targetCount = significantBuildings.filter((b) => b.isTarget).length;
+  const nonTargetBuildings = significantBuildings.filter((b) => !b.isTarget);
+  const blockingCount = nonTargetBuildings.filter((b) => b.isBlocking).length;
+  const manualCount = nonTargetBuildings.filter((b) => b.is_manual).length;
+  const nonBlockingCount = nonTargetBuildings.length - blockingCount;
 
-  // 범례 박스 높이 — LoS + 지형 (2줄, 28px) [+ 대상제외선] + 차폐/비차폐/수동 + 항적/소실표적
+  // 범례 박스 높이 — LoS + 지형 (2줄, 28px) [+ 대상제외선] + 대상/차폐/비차폐/수동 + 항적/소실표적
   let legendH = 24;
   if (minDetWithout) legendH += 14;
+  if (targetCount > 0) legendH += 14;
   if (blockingCount > 0) legendH += 14;
   if (nonBlockingCount > 0) legendH += 14;
   if (manualCount > 0) legendH += 14;
   legendH += 14 + 14; // 항적 + 소실표적
 
-  const idSuffix = `${los.id}-${building.id}`;
+  // clipPath id 안전화 — los.id(레이더명 포함)에 공백·괄호·한글 등이 있으면 url(#id) 참조가 깨져
+  //   클리핑이 무력화되고, 줌 시 윈도우 밖 지형·LoS·항적이 차트 축 영역(plot rect)을 넘어 그려진다.
+  //   영숫자/_/- 외 문자는 _ 로 치환(클립 rect 는 모든 차트가 동일하므로 충돌해도 무해).
+  const idSuffix = `${los.id}-${building.id}`.replace(/[^A-Za-z0-9_-]/g, "_");
 
   return (
     <div className="mb-3">
@@ -662,30 +691,36 @@ export function LosCrossSection({
             const byBottomFar = hasExtent ? yScale(farGroundAdj) : byBottomNear;
             const byTopFar = hasExtent ? yScale(farTopAdj) : byTopNear;
             const bHeight = byBottomNear - byTopNear;
-            if (bHeight < 1) return null;
+            // 분석 대상은 1px 미만이라도 항상 표시 (분석 주체이므로 누락 금지)
+            if (bHeight < 1 && !b.isTarget) return null;
 
-            const baseColor = b.is_manual
-              ? "#f97316"
-              : b.isBlocking
-                ? "rgba(239, 68, 68, 0.8)"
-                : "rgba(148, 163, 184, 0.5)";
-            const fillColor = b.is_manual
-              ? "rgba(249,115,22,0.15)"
-              : b.isBlocking
-                ? "rgba(239,68,68,0.15)"
-                : "rgba(148,163,184,0.08)";
+            const baseColor = b.isTarget
+              ? "#ea580c"
+              : b.is_manual
+                ? "#f97316"
+                : b.isBlocking
+                  ? "rgba(239, 68, 68, 0.8)"
+                  : "rgba(148, 163, 184, 0.5)";
+            const fillColor = b.isTarget
+              ? "rgba(249,115,22,0.35)"
+              : b.is_manual
+                ? "rgba(249,115,22,0.15)"
+                : b.isBlocking
+                  ? "rgba(239,68,68,0.15)"
+                  : "rgba(148,163,184,0.08)";
+            const bStrokeW = b.isTarget ? 1.6 : 1;
 
             if (hasExtent) {
               const pathD = `M ${bxNear} ${byBottomNear} L ${bxNear} ${byTopNear} L ${bxFar} ${byTopFar} L ${bxFar} ${byBottomFar} Z`;
               return (
-                <path key={`bld-${bi}`} d={pathD} fill={fillColor} stroke={baseColor} strokeWidth={1} />
+                <path key={`bld-${bi}`} d={pathD} fill={fillColor} stroke={baseColor} strokeWidth={bStrokeW} />
               );
             }
             return (
               <line key={`bld-${bi}`}
                 x1={bxNear} y1={byBottomNear}
                 x2={bxNear} y2={byTopNear}
-                stroke={baseColor} strokeWidth={1} />
+                stroke={baseColor} strokeWidth={bStrokeW} />
             );
           })}
 
@@ -742,6 +777,18 @@ export function LosCrossSection({
           {(() => {
             let legendY = minDetWithout ? 38 : 24;
             const items: React.ReactNode[] = [];
+            if (targetCount > 0) {
+              items.push(
+                <g key="leg-tgt">
+                  <rect x={2} y={legendY - 4} width={16} height={8}
+                    fill="rgba(249,115,22,0.35)" stroke="#ea580c" strokeWidth={0.6} />
+                  <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
+                    분석 대상 건물 ({targetCount}동)
+                  </text>
+                </g>,
+              );
+              legendY += 14;
+            }
             if (blockingCount > 0) {
               items.push(
                 <g key="leg-blk">

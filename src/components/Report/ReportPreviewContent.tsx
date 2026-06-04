@@ -11,7 +11,6 @@ import ReportSummarySection from "./ReportSummarySection";
 import ReportMapSection from "./ReportMapSection";
 import ReportStatsSection from "./ReportStatsSection";
 import ReportLossSection from "./ReportLossSection";
-import ReportLoSSection from "./ReportLoSSection";
 import ReportAircraftSection from "./ReportAircraftSection";
 import ReportFlightComparisonSection from "./ReportFlightComparisonSection";
 import ReportFlightProfileSection from "./ReportFlightProfileSection";
@@ -44,7 +43,6 @@ export interface ReportPreviewContentProps {
   // 데이터
   flights: Flight[];
   reportFlights: Flight[];
-  losResults: LoSProfileData[];
   aircraft: AircraftType[];
   radarSite: RadarSite;
   reportMetadata: ReportMetadata;
@@ -147,10 +145,10 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
 export default function ReportPreviewContent(props: ReportPreviewContentProps) {
   const {
     template, sections,
-    flights, reportFlights, losResults, aircraft, radarSite, reportMetadata,
+    flights, reportFlights, aircraft, radarSite, reportMetadata,
     panoramaData, panoramaPeakNames, mapImage,
     omData, omResultTrimmed,
-    psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap, psCovLayersWith, psCovLayersWithout, psAnalysisMonth,
+    psResult, psSelectedBuildings, psSelectedRadarSites, psCovLayersWith, psCovLayersWithout, psAnalysisMonth,
     coverTitle, onCoverTitleChange, coverSubtitle, onCoverSubtitleChange,
     commentary, onCommentaryChange,
     forceAllVisible: _forceAllVisible,
@@ -206,14 +204,12 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.flightComparison) nums.flightComparison = n++;
       if (sections.trackMap) nums.trackMap = n++;
       if (sections.lossDetail) nums.lossDetail = n++;
-      if (sections.los && losResults.length > 0) nums.los = n++;
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else if (template === "obstacle") {
       if (sections.obstacleSummary) nums.obstacleSummary = n++;
       if (sections.psAngleHeight && psResult) nums.psAngleHeight = n++;
       if (sections.psAdditionalLoss && psResult) nums.psAdditionalLoss = n++;
       if (sections.coverageMap && (psCovLayersWith.size > 0 || psCovLayersWithout.size > 0)) nums.coverageMap = n++;
-      if (sections.los && psLosMap.size > 0) nums.los = n++;
     } else if (template === "obstacle_monthly") {
       if (sections.omSummary) nums.omSummary = n++;
       if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
@@ -225,18 +221,16 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       if (sections.flightProfile) nums.flightProfile = n++;
       if (sections.trackMap) nums.trackMap = n++;
       if (sections.flightLossAnalysis) nums.flightLossAnalysis = n++;
-      if (sections.los && losResults.length > 0) nums.los = n++;
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
     } else {
       if (sections.summary) nums.summary = n++;
       if (sections.trackMap) nums.trackMap = n++;
       if (sections.stats && flights.length > 0) nums.stats = n++;
-      if (sections.los && losResults.length > 0) nums.los = n++;
       if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
       if (sections.aircraft && aircraft.length > 0) nums.aircraft = n++;
     }
     return nums;
-  }, [template, sections, losResults, flights, aircraft, panoramaData, psResult, psCovLayersWith, psCovLayersWithout, psLosMap, omData?.losMap]);
+  }, [template, sections, flights, aircraft, panoramaData, psResult, psCovLayersWith, psCovLayersWithout, omData?.losMap]);
 
   // OM 레이더별 조건 텍스트
   const omRadarConditions = useMemo(() => {
@@ -303,7 +297,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 <ReportSummarySection
                   sectionNum={sectionNumbers.summary ?? 1}
                   flights={flights}
-                  losResults={losResults}
                   aircraftCount={aircraft.filter((a) => a.active).length}
                   editable
                   commentary={commentary}
@@ -327,13 +320,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 template={template}
               />
             </ReportPage>
-          )}
-
-          {sections.los && losResults.length > 0 && (
-            <ReportLoSSection
-              sectionNum={sectionNumbers.los ?? 5}
-              losResults={losResults}
-            />
           )}
 
           {sections.panorama && panoramaData.length > 0 && radarSite && (
@@ -414,13 +400,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
               </ReportPage>
             );
           })}
-
-          {sections.los && psLosMap.size > 0 && (
-            <ReportLoSSection
-              sectionNum={sectionNumbers.los ?? 5}
-              losResults={[...psLosMap.values()]}
-            />
-          )}
         </>
       )}
 
@@ -585,13 +564,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             </ReportPage>
           )}
 
-          {sections.los && losResults.length > 0 && (
-            <ReportLoSSection
-              sectionNum={sectionNumbers.los ?? 5}
-              losResults={losResults}
-            />
-          )}
-
           {sections.panorama && panoramaData.length > 0 && radarSite && (
             <ReportPanoramaSection
               sectionNum={sectionNumbers.panorama ?? 6}
@@ -632,13 +604,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 flight={singleFlight}
               />
             </ReportPage>
-          )}
-
-          {sections.los && losResults.length > 0 && (
-            <ReportLoSSection
-              sectionNum={sectionNumbers.los ?? 5}
-              losResults={losResults}
-            />
           )}
 
           {sections.panorama && panoramaData.length > 0 && radarSite && (

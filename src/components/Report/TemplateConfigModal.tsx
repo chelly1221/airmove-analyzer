@@ -15,7 +15,7 @@ import {
   templateDisplayLabel, DEFAULT_SECTIONS,
   type ReportTemplate, type ReportSections,
 } from "../../utils/reportTransfer";
-import type { Flight, LoSProfileData, Aircraft as AircraftType, PanoramaPoint, ReportMetadata, RadarSite } from "../../types";
+import type { Flight, Aircraft as AircraftType, PanoramaPoint, ReportMetadata, RadarSite } from "../../types";
 
 function SummaryPill({ label, value, accent }: { label: string; value: string | number; accent?: boolean }) {
   return (
@@ -29,7 +29,6 @@ function SummaryPill({ label, value, accent }: { label: string; value: string | 
 export default function TemplateConfigModal({
   template,
   flights,
-  losResults,
   aircraft,
   metadata,
   radarSite,
@@ -39,7 +38,6 @@ export default function TemplateConfigModal({
 }: {
   template: ReportTemplate;
   flights: Flight[];
-  losResults: LoSProfileData[];
   aircraft: AircraftType[];
   metadata: ReportMetadata;
   radarSite: RadarSite;
@@ -70,7 +68,6 @@ export default function TemplateConfigModal({
         { key: "flightComparison", label: "비행 비교", icon: BarChart3, desc: "선택 비행 비교 테이블 및 차트", available: true },
         { key: "trackMap", label: "항적 지도", icon: MapIcon, desc: "선택 비행 항적 경로 시각화", available: true },
         { key: "lossDetail", label: "소실 상세", icon: Crosshair, desc: "소실 포인트 상세 목록", available: true },
-        { key: "los", label: "LoS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
         { key: "panorama", label: "전파 장애물", icon: Mountain, desc: "360° 파노라마 장애물 분석", available: panoramaData.length > 0 },
       ];
     }
@@ -78,9 +75,8 @@ export default function TemplateConfigModal({
       const hasCoverage = isGPUCacheValidFor(radarSite);
       return [
         { key: "cover", label: "표지", icon: FileText, desc: "문서번호, 시행일자, 레이더명", available: true },
-        { key: "obstacleSummary", label: "장애물 종합 요약", icon: Radio, desc: "LoS·파노라마 통합 KPI, 주요 장애물 TOP 5", available: losResults.length > 0 || panoramaData.length > 0 },
+        { key: "obstacleSummary", label: "장애물 종합 요약", icon: Radio, desc: "LoS·파노라마 통합 KPI, 주요 장애물 TOP 5", available: panoramaData.length > 0 },
         { key: "coverageMap", label: "커버리지 맵", icon: Radio, desc: "고도별 스펙트럼 커버리지 극좌표 시각화", available: hasCoverage },
-        { key: "los", label: "LoS 분석", icon: Crosshair, desc: "전파 가시선 차단/양호 상세 결과", available: losResults.length > 0 },
         { key: "panorama", label: "360° 파노라마", icon: Mountain, desc: "방위별 최대 앙각 장애물 및 건물 목록", available: panoramaData.length > 0 },
       ];
     }
@@ -90,7 +86,6 @@ export default function TemplateConfigModal({
         { key: "flightProfile", label: "비행 프로파일", icon: Plane, desc: "기본정보, KPI, 고도 추이 차트", available: true },
         { key: "trackMap", label: "항적 지도", icon: MapIcon, desc: "해당 비행 항적 경로 시각화", available: true },
         { key: "flightLossAnalysis", label: "소실 구간 분석", icon: BarChart3, desc: "구간별 상세, 분포 분석 차트", available: true },
-        { key: "los", label: "LoS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
         { key: "panorama", label: "전파 장애물", icon: Mountain, desc: "360° 파노라마 장애물 분석", available: panoramaData.length > 0 },
       ];
     }
@@ -99,7 +94,6 @@ export default function TemplateConfigModal({
       { key: "summary", label: "분석 요약", icon: BarChart3, desc: "KPI 그리드, 종합 판정, 소견", available: true },
       { key: "trackMap", label: "항적 지도", icon: MapIcon, desc: "항적 경로 및 Loss 구간 시각화", available: true },
       { key: "stats", label: "분석 통계", icon: BarChart3, desc: `비행별 상세 ${template === "weekly" ? "통계" : "추이 차트"}`, available: flights.length > 0 },
-      { key: "los", label: "LoS 분석", icon: Crosshair, desc: "전파 가시선 차단 분석", available: losResults.length > 0 },
       { key: "panorama", label: "전파 장애물", icon: Mountain, desc: "360° 파노라마 장애물 분석", available: panoramaData.length > 0 },
       { key: "aircraft", label: "검사기 현황", icon: Plane, desc: "비행검사기 운용 현황", available: aircraft.length > 0 },
     ];
@@ -141,7 +135,6 @@ export default function TemplateConfigModal({
           <SummaryPill label="분석 비행" value={flights.length} />
           <SummaryPill label="소실 건수" value={totalLoss} accent />
           <SummaryPill label="평균 소실율" value={`${avgLossPercent.toFixed(1)}%`} accent />
-          <SummaryPill label="LoS" value={`${losResults.length}건`} />
         </div>
 
         {/* 비행 선택 영역 */}

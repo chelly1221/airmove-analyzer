@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { X, Save, Loader2 } from "lucide-react";
+import { X, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../../store";
-import type { ElevationPoint, LoSProfileData, RadarSite, BuildingOnPath, NearbyPeak } from "../../types";
+import type { ElevationPoint, RadarSite, BuildingOnPath, NearbyPeak } from "../../types";
 import { GPU2D, type CircleData } from "../../utils/gpu2d";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
@@ -71,13 +71,11 @@ function curvDrop43(dKm: number): number {
 
 
 export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClose, onHoverDistance, losTrackPoints, onLoaded, onTrackPointHighlight, externalHighlightIdx, onTrackPointHover, externalHoverIdx, onBuildingHover, onBuildingDetail, searchedAddress }: Props) {
-  const addLoSResult = useAppStore((s) => s.addLoSResult);
   const manualBuildings = useAppStore((s) => s.manualBuildings);
   const buildingGroups = useAppStore((s) => s.buildingGroups);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
   const [peakNames, setPeakNames] = useState<Map<number, string>>(new Map());
-  const [saved, setSaved] = useState(false);
   const [buildings, setBuildings] = useState<BuildingOnPath[]>([]);
   const [showBuildings, setShowBuildings] = useState(true);
   const [hoverX, setHoverX] = useState<number | null>(null);
@@ -152,7 +150,6 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       setPeakNames(new Map());
       setBuildings([]);
       setLoading(true);
-      setSaved(false);
       setPinnedTrackIdx(null);
       setHoveredTrackIdx(null);
       setHoveredBldgIdx(null);
@@ -734,112 +731,6 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     gpu.noScissor();
     gpu.flush();
   }, [trackPointPositions, losTrackPoints, hoveredTrackIdx, pinnedTrackIdx, externalHoverIdx, chartData]);
-
-  const handleSave = async () => {
-    if (!chartData) return;
-
-    // 맵 스크린샷 캡처 (MapLibre 네이티브 캔버스 + deck.gl 오버레이 합성)
-    let mapScreenshot: string | undefined;
-    try {
-      const map = (window as any).__maplibreInstance;
-      if (map) {
-        // MapLibre 강제 리페인트 후 캔버스 캡처 (preserveDrawingBuffer 불필요)
-        map.triggerRepaint();
-        await new Promise<void>((resolve) => {
-          map.once("render", () => resolve());
-        });
-        const mapCanvas = map.getCanvas() as HTMLCanvasElement;
-        const w = mapCanvas.width;
-        const h = mapCanvas.height;
-        const offscreen = document.createElement("canvas");
-        offscreen.width = w;
-        offscreen.height = h;
-        const ctx = offscreen.getContext("2d");
-        if (ctx) {
-          // MapLibre 기본 캔버스 (타일)
-          ctx.drawImage(mapCanvas, 0, 0);
-          // deck.gl 오버레이 캔버스 합성
-          const mapContainer = document.querySelector(".maplibregl-map");
-          if (mapContainer) {
-            const canvases = mapContainer.querySelectorAll("canvas");
-            for (const c of canvases) {
-              if (c !== mapCanvas) ctx.drawImage(c, 0, 0);
-            }
-          }
-          mapScreenshot = offscreen.toDataURL("image/jpeg", 0.7);
-        }
-      }
-    } catch (e) {
-      console.warn("[LoS] 맵 스크린샷 실패:", e);
-    }
-
-    // SVG 차트 스크린샷 캡처
-    let chartScreenshot: string | undefined;
-    try {
-      const svg = svgRef.current;
-      if (svg) {
-        const serializer = new XMLSerializer();
-        const svgStr = serializer.serializeToString(svg);
-        const svgBlob = new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" });
-        const url = URL.createObjectURL(svgBlob);
-        const img = new Image();
-        chartScreenshot = await new Promise<string | undefined>((resolve) => {
-          img.onload = () => {
-            const canvas = document.createElement("canvas");
-            canvas.width = W * 2;
-            canvas.height = H * 2;
-            const ctx = canvas.getContext("2d");
-            if (ctx) {
-              ctx.fillStyle = "#fafafa";
-              ctx.fillRect(0, 0, canvas.width, canvas.height);
-              // GPU 캔버스 (항적 포인트) — SVG 아래에 합성
-              const trackCvs = trackCanvasRef.current;
-              if (trackCvs && trackCvs.width > 0) {
-                ctx.drawImage(trackCvs, 0, 0, canvas.width, canvas.height);
-              }
-              // SVG (범례/툴팁 포함) — 위에 합성
-              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-              resolve(canvas.toDataURL("image/png"));
-            } else {
-              resolve(undefined);
-            }
-            URL.revokeObjectURL(url);
-          };
-          img.onerror = () => { URL.revokeObjectURL(url); resolve(undefined); };
-          img.src = url;
-        });
-      }
-    } catch (e) {
-      console.warn("[LoS] 차트 스크린샷 실패:", e);
-    }
-
-    const result: LoSProfileData = {
-      id: `los-${Date.now()}`,
-      radarSiteName: radarSite.name,
-      radarLat: radarSite.latitude,
-      radarLon: radarSite.longitude,
-      radarHeight,
-      targetLat,
-      targetLon,
-      bearing,
-      totalDistance: totalDist,
-      elevationProfile: profile,
-      losBlocked: chartData.blocked,
-      maxBlockingPoint: chartData.maxBlockPoint
-        ? {
-            distance: chartData.maxBlockPoint.distance,
-            elevation: chartData.maxBlockPoint.realElevation,
-            name: chartData.maxBlockPoint.name,
-          }
-        : undefined,
-      mapScreenshot,
-      chartScreenshot,
-      timestamp: Date.now(),
-    };
-    addLoSResult(result);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-  };
 
   // X축 줌 네이티브 휠 핸들러 (passive: false 필수)
   useEffect(() => {
@@ -1726,12 +1617,6 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
             </span>
           )}
         </div>
-        <button onClick={handleSave} disabled={loading || saved}
-          className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-800 disabled:opacity-50"
-          title="보고서에 저장">
-          <Save size={12} />
-          {saved ? "저장됨" : "저장"}
-        </button>
         <button onClick={onClose}
           className="rounded p-1 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-800">
           <X size={14} />

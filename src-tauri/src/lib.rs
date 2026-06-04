@@ -1236,81 +1236,6 @@ async fn delete_manual_building(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-// ========== LoS 분석 결과 영속화 ==========
-
-#[tauri::command]
-async fn save_los_result(
-    app_handle: tauri::AppHandle,
-    id: String,
-    radar_site_name: String,
-    radar_lat: f64,
-    radar_lon: f64,
-    radar_height: f64,
-    target_lat: f64,
-    target_lon: f64,
-    bearing: f64,
-    total_distance: f64,
-    elevation_profile_json: String,
-    los_blocked: bool,
-    max_blocking_json: Option<String>,
-    map_screenshot: Option<String>,
-    chart_screenshot: Option<String>,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::save_los_result(
-            &conn, &id, &radar_site_name, radar_lat, radar_lon, radar_height,
-            target_lat, target_lon, bearing, total_distance,
-            &elevation_profile_json, los_blocked, max_blocking_json.as_deref(),
-            map_screenshot.as_deref(), chart_screenshot.as_deref(),
-        ).map_err(|e| format!("DB error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn load_los_results(
-    app_handle: tauri::AppHandle,
-) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        let rows = db::load_all_los_results(&conn).map_err(|e| format!("DB error: {}", e))?;
-
-        #[derive(serde::Serialize)]
-        struct LOSResult {
-            id: String,
-            radar_site_name: String,
-            radar_lat: f64,
-            radar_lon: f64,
-            radar_height: f64,
-            target_lat: f64,
-            target_lon: f64,
-            bearing: f64,
-            total_distance: f64,
-            elevation_profile_json: String,
-            los_blocked: bool,
-            max_blocking_json: Option<String>,
-            map_screenshot: Option<String>,
-            chart_screenshot: Option<String>,
-            created_at: i64,
-        }
-
-        let results: Vec<LOSResult> = rows.into_iter().map(|r| LOSResult {
-            id: r.0, radar_site_name: r.1, radar_lat: r.2, radar_lon: r.3,
-            radar_height: r.4, target_lat: r.5, target_lon: r.6, bearing: r.7,
-            total_distance: r.8, elevation_profile_json: r.9, los_blocked: r.10,
-            max_blocking_json: r.11, map_screenshot: r.12, chart_screenshot: r.13, created_at: r.14,
-        }).collect();
-
-        serde_json::to_string(&results).map_err(|e| format!("JSON error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
 // ========== 커버리지 캐시 ==========
 
 #[tauri::command]
@@ -2371,9 +2296,6 @@ pub fn run() {
             add_manual_building,
             update_manual_building,
             delete_manual_building,
-            // LoS 결과 영속화
-            save_los_result,
-            load_los_results,
             // 커버리지 캐시
             save_coverage_cache,
             load_coverage_cache,

@@ -47,7 +47,6 @@ interface LoadedState {
   commentary: string;
   flights: Flight[];
   reportFlights: Flight[];
-  losResults: LoSProfileData[];
   aircraft: AircraftType[];
   radarSite: RadarSite;
   reportMetadata: ReportMetadata;
@@ -78,7 +77,6 @@ function payloadToState(p: ReportWindowPayload): LoadedState {
     commentary: p.commentary,
     flights: p.flights,
     reportFlights: p.reportFlights,
-    losResults: p.losResults,
     aircraft: p.aircraft,
     radarSite: p.radarSite,
     reportMetadata: p.reportMetadata,
@@ -980,7 +978,6 @@ export default function ReportApp() {
               <TemplateConfigModal
                 template={tpl}
                 flights={configPayload.flights}
-                losResults={configPayload.losResults}
                 aircraft={configPayload.aircraft}
                 metadata={configPayload.metadata}
                 radarSite={configPayload.radarSite}
@@ -1230,7 +1227,6 @@ export default function ReportApp() {
         sections={activeSections}
         flights={state.flights}
         reportFlights={state.reportFlights}
-        losResults={state.losResults}
         aircraft={state.aircraft}
         radarSite={state.radarSite}
         reportMetadata={effectiveMetadata}

@@ -55,25 +55,6 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             memo TEXT NOT NULL DEFAULT ''
         );
 
-        -- LoS 분석 결과 영속화
-        CREATE TABLE IF NOT EXISTS los_results (
-            id TEXT PRIMARY KEY,
-            radar_site_name TEXT NOT NULL,
-            radar_lat REAL NOT NULL,
-            radar_lon REAL NOT NULL,
-            radar_height REAL NOT NULL,
-            target_lat REAL NOT NULL,
-            target_lon REAL NOT NULL,
-            bearing REAL NOT NULL,
-            total_distance REAL NOT NULL,
-            elevation_profile_json TEXT NOT NULL,
-            los_blocked INTEGER NOT NULL,
-            max_blocking_json TEXT,
-            map_screenshot TEXT,
-            chart_screenshot TEXT,
-            created_at INTEGER NOT NULL
-        );
-
         -- 수동 비행 병합 이력
         CREATE TABLE IF NOT EXISTS manual_merge_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,10 +261,6 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_bounds_json TEXT", []);
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_opacity REAL NOT NULL DEFAULT 0.5", []);
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_rotation REAL NOT NULL DEFAULT 0", []);
-
-    // LoS 결과에 스크린샷 컬럼 추가
-    let _ = conn.execute("ALTER TABLE los_results ADD COLUMN map_screenshot TEXT", []);
-    let _ = conn.execute("ALTER TABLE los_results ADD COLUMN chart_screenshot TEXT", []);
 
     // 건물 그룹에 영역 바운드 컬럼 추가
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN area_bounds_json TEXT", []);
@@ -507,69 +484,6 @@ pub fn clear_panorama_cache(
         params![lat_key, lon_key],
     )?;
     Ok(())
-}
-
-// ========== LoS 분석 결과 영속화 ==========
-
-/// LoS 결과 저장
-pub fn save_los_result(
-    conn: &Connection,
-    id: &str,
-    radar_site_name: &str,
-    radar_lat: f64,
-    radar_lon: f64,
-    radar_height: f64,
-    target_lat: f64,
-    target_lon: f64,
-    bearing: f64,
-    total_distance: f64,
-    elevation_profile_json: &str,
-    los_blocked: bool,
-    max_blocking_json: Option<&str>,
-    map_screenshot: Option<&str>,
-    chart_screenshot: Option<&str>,
-) -> SqlResult<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    conn.execute(
-        "INSERT OR REPLACE INTO los_results (id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, map_screenshot, chart_screenshot, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked as i32, max_blocking_json, map_screenshot, chart_screenshot, now],
-    )?;
-    Ok(())
-}
-
-/// LoS 결과 전체 로드
-#[allow(clippy::type_complexity)]
-pub fn load_all_los_results(conn: &Connection) -> SqlResult<Vec<(String, String, f64, f64, f64, f64, f64, f64, f64, String, bool, Option<String>, Option<String>, Option<String>, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, radar_site_name, radar_lat, radar_lon, radar_height, target_lat, target_lon, bearing, total_distance, elevation_profile_json, los_blocked, max_blocking_json, map_screenshot, chart_screenshot, created_at
-         FROM los_results ORDER BY created_at",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, f64>(4)?,
-                row.get::<_, f64>(5)?,
-                row.get::<_, f64>(6)?,
-                row.get::<_, f64>(7)?,
-                row.get::<_, f64>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, i32>(10)? != 0,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, Option<String>>(13)?,
-                row.get::<_, i64>(14)?,
-            ))
-        })?
-        .collect::<SqlResult<Vec<_>>>()?;
-    Ok(rows)
 }
 
 // ========== 커버리지 캐시 ==========

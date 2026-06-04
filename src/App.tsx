@@ -18,7 +18,7 @@ import { useAppStore } from "./store";
 import SourceOverlay from "./dev/SourceOverlay";
 import { ToastContainer } from "./components/common/Toast";
 import { Loader2 } from "lucide-react";
-import type { Aircraft, ElevationPoint, LoSProfileData, RadarSite, SavedReportSummary } from "./types";
+import type { Aircraft, RadarSite, SavedReportSummary } from "./types";
 
 /** 앱 시작 시 DB에서 설정/분석결과 복원 */
 function useRestoreSettings() {
@@ -66,50 +66,6 @@ function useRestoreSettings() {
         }
       } catch (e) {
         console.log("[Restore] 설정 복원 실패:", e);
-      }
-
-      // LoS 분석 결과 복원
-      try {
-        const losJson = await invoke<string>("load_los_results");
-        const losRows: Array<{
-          id: string;
-          radar_site_name: string;
-          radar_lat: number;
-          radar_lon: number;
-          radar_height: number;
-          target_lat: number;
-          target_lon: number;
-          bearing: number;
-          total_distance: number;
-          elevation_profile_json: string;
-          los_blocked: boolean;
-          max_blocking_json: string | null;
-          map_screenshot: string | null;
-          chart_screenshot: string | null;
-          created_at: number;
-        }> = JSON.parse(losJson);
-        if (losRows.length > 0) {
-          const restored: LoSProfileData[] = losRows.map((r) => ({
-            id: r.id,
-            radarSiteName: r.radar_site_name,
-            radarLat: r.radar_lat,
-            radarLon: r.radar_lon,
-            radarHeight: r.radar_height,
-            targetLat: r.target_lat,
-            targetLon: r.target_lon,
-            bearing: r.bearing,
-            totalDistance: r.total_distance,
-            elevationProfile: JSON.parse(r.elevation_profile_json) as ElevationPoint[],
-            losBlocked: r.los_blocked,
-            maxBlockingPoint: r.max_blocking_json ? JSON.parse(r.max_blocking_json) : undefined,
-            mapScreenshot: r.map_screenshot ?? undefined,
-            chartScreenshot: r.chart_screenshot ?? undefined,
-            timestamp: r.created_at,
-          }));
-          useAppStore.setState({ losResults: restored });
-        }
-      } catch (e) {
-        console.log("[Restore] LoS 결과 복원 실패:", e);
       }
 
       // 저장된 보고서 목록 복원

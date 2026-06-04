@@ -7,7 +7,6 @@ import type {
   BuildingGroup,
   BuildingModalDraft,
   Flight,
-  LoSProfileData,
   ManualBuilding,
   PageId,
   PanoramaPoint, BuildingObstacle,
@@ -80,10 +79,6 @@ interface AppState {
   setSelectedModeS: (modeS: string | null) => void;
   selectedFlightId: string | null;
   setSelectedFlightId: (id: string | null) => void;
-
-  // LoS 분석
-  losResults: LoSProfileData[];
-  addLoSResult: (r: LoSProfileData) => void;
 
   // 파노라마 (전파 장애물) 뷰
   panoramaViewActive: boolean;
@@ -350,27 +345,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedFlightId: null,
   setSelectedFlightId: (id) => set({ selectedFlightId: id }),
 
-  // LoS 분석 (DB 영속화)
-  losResults: [],
-  addLoSResult: (r) => {
-    set((state) => ({ losResults: [...state.losResults, r] }));
-    invoke("save_los_result", {
-      id: r.id,
-      radarSiteName: r.radarSiteName,
-      radarLat: r.radarLat,
-      radarLon: r.radarLon,
-      radarHeight: r.radarHeight,
-      targetLat: r.targetLat,
-      targetLon: r.targetLon,
-      bearing: r.bearing,
-      totalDistance: r.totalDistance,
-      elevationProfileJson: JSON.stringify(r.elevationProfile),
-      losBlocked: r.losBlocked,
-      maxBlockingJson: r.maxBlockingPoint ? JSON.stringify(r.maxBlockingPoint) : null,
-      mapScreenshot: r.mapScreenshot ?? null,
-      chartScreenshot: r.chartScreenshot ?? null,
-    }).catch((e) => console.warn("[LoS] DB 저장 실패:", e));
-  },
   // 파노라마 (전파 장애물) 뷰
   panoramaViewActive: false,
   setPanoramaViewActive: (v) => set({ panoramaViewActive: v }),

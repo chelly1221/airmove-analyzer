@@ -81,7 +81,6 @@ export interface ReportWindowPayload {
   // 데이터
   flights: Flight[];
   reportFlights: Flight[];
-  losResults: LoSProfileData[];
   aircraft: Aircraft[];
   radarSite: RadarSite;
   reportMetadata: ReportMetadata;
@@ -192,7 +191,6 @@ export const DEFAULT_SECTIONS: ReportSections = {
 export interface ReportConfigPayload {
   template: ReportTemplate;
   flights: Flight[];
-  losResults: LoSProfileData[];
   aircraft: Aircraft[];
   metadata: ReportMetadata;
   radarSite: RadarSite;
