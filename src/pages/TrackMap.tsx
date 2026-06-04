@@ -44,6 +44,25 @@ import CoveragePanel from "../components/Map/CoveragePanel";
 /** 전체 항적 표시 시 최대 선택 가능 윈도우 (초) = 24시간 */
 const MAX_WINDOW_SECS = 86400;
 
+/** 등록 건물의 footprint 꼭짓점 [[lat,lon],...] 추출 (polygon/multi 도형 모두 평탄화). 도형이 없으면 빈 배열. */
+function buildingFootprintVertices(b: ManualBuilding): [number, number][] {
+  if (!b.geometry_json) return [];
+  try {
+    if (b.geometry_type === "multi") {
+      const subs: { type: string; json: string }[] = JSON.parse(b.geometry_json);
+      const verts: [number, number][] = [];
+      for (const s of subs) {
+        const pts: [number, number][] = JSON.parse(s.json);
+        for (const p of pts) verts.push(p);
+      }
+      return verts;
+    }
+    return JSON.parse(b.geometry_json) as [number, number][];
+  } catch {
+    return [];
+  }
+}
+
 /** CAT008 기상 강도(1~6) → 색상 (NWS 스타일 강수 램프). 인덱스 0 미사용. */
 const WEATHER_COLORS: [number, number, number][] = [
   [0, 0, 0],
@@ -348,7 +367,8 @@ export default function TrackMap() {
   const [sliderValue, setSliderValue] = useState(100);
   const [playing, setPlaying] = useState(false);
   const altScale = 1;
-  const [trackLine, setTrackLine] = useState(true);
+  /** 항적 표시 모드: 항적선 / 항적점 / 끄기 */
+  const [trackDisplay, setTrackDisplay] = useState<"line" | "points" | "off">("line");
   const [hiddenLegendItems, setHiddenLegendItems] = useState<Set<string>>(new Set());
   const [showBuildings, setShowBuildings] = useState(false);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
@@ -471,6 +491,8 @@ export default function TrackMap() {
   const [losHoverIdx, setLosHoverIdx] = useState<number | null>(null);
   // 주소 검색으로 LoS 분석 시작한 경우, 해당 좌표를 단면도에 전달해 건물 선택 표시
   const [losSearchedAddress, setLosSearchedAddress] = useState<{ lat: number; lon: number } | null>(null);
+  // 등록 건물 선택으로 LoS 분석 시작한 경우, 해당 건물(도형 포함)을 보관 → 단면도 항적을 건물 실측 방위폭으로 한정
+  const [losSelectedBuilding, setLosSelectedBuilding] = useState<ManualBuilding | null>(null);
   const savedPitchRef = useRef(45);
   const savedBearingRef = useRef(0);
   const losPointClickedRef = useRef(false); // deck.gl LoS 포인트 클릭 여부 (빈 영역 클릭 구분용)
@@ -1570,13 +1592,13 @@ export default function TrackMap() {
     return result;
   }, [allPointsByModeS, visibleMinTs, visibleMaxTs, sliderValue]);
 
-  // 원시 탐지점 (항적선 OFF 시 표시)
+  // 원시 탐지점 (항적점 모드에서만 표시)
   const dotPoints = useMemo(() => {
-    if (trackLine) return [];
+    if (trackDisplay !== "points") return [];
     return allPoints.filter(
       (p) => p.timestamp >= visibleMinTs && p.timestamp <= visibleMaxTs
     );
-  }, [trackLine, allPoints, visibleMinTs, visibleMaxTs]);
+  }, [trackDisplay, allPoints, visibleMinTs, visibleMaxTs]);
 
   // 레이더 동심원 + 귀치도 (MapLibre 네이티브 레이어 - 지형에 밀착)
   useEffect(() => {
@@ -1696,6 +1718,7 @@ export default function TrackMap() {
       }
       setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
       setLosSearchedAddress(null);
+      setLosSelectedBuilding(null);
       setLosCursorPicking(false);
     },
     [losMode, losCursorPicking, losTarget]
@@ -1787,6 +1810,7 @@ export default function TrackMap() {
     const targetKm = Math.min(distKm * 1.08 + 1, rangeKm);
     setLosFromAzDist(az, targetKm);
     setLosSearchedAddress({ lat: b.latitude, lon: b.longitude });
+    setLosSelectedBuilding(b); // 단면도 항적을 건물 실측 방위폭으로 한정
     setLosAzFineCenter(az);
     setLosCursorPicking(false);
   }, [radarSite.latitude, radarSite.longitude, radarSite.range_nm, setLosFromAzDist]);
@@ -1813,9 +1837,40 @@ export default function TrackMap() {
     const lineDxM = (tLat - rLat) * mPerDegLat;
     const lineDyM = (tLon - rLon) * mPerDegLon;
     const lineLen = Math.sqrt(lineDxM ** 2 + lineDyM ** 2);
+    if (lineLen === 0) return []; // 타겟=레이더 동일좌표 → 0 나눗셈(NaN) 방지
     const cosB = lineDxM / lineLen;
     const sinB = lineDyM / lineLen;
-    const TOLERANCE_M = 1000; // 수직 1km
+    const TOLERANCE_M = 1000; // 일반 모드: 수직 1km 여유 코리도
+
+    // 건물 기반 분석이면 건물 footprint의 실측 좌우(방위) 범위로 한정.
+    // 레이더→타겟 축(=건물 중심 방위)을 기준으로 각 꼭짓점의 좌우 각도 편차[rad] min/max를 구한다.
+    // (losTarget은 setLosToObstacle에서 건물 중심 방위로 설정되므로 이 축이 곧 건물 중심 방위)
+    let angMin = Infinity;
+    let angMax = -Infinity;
+    if (losSelectedBuilding) {
+      const verts = buildingFootprintVertices(losSelectedBuilding);
+      for (const [vLat, vLon] of verts) {
+        const dx = (vLat - rLat) * mPerDegLat;
+        const dy = (vLon - rLon) * mPerDegLon;
+        const along = dx * cosB + dy * sinB;
+        if (along <= 0) continue; // 레이더 뒤쪽 꼭짓점 무시
+        const across = -dx * sinB + dy * cosB;
+        const ang = Math.atan2(across, along); // 축 기준 좌우 각도(rad)
+        if (ang < angMin) angMin = ang;
+        if (ang > angMax) angMax = ang;
+      }
+    }
+    // 유효한 방위 윈도우가 잡혔을 때만 건물폭 모드 사용 (수치오차 방지용 극소 epsilon만 가산)
+    const useAzWindow = angMin <= angMax && Number.isFinite(angMin);
+    const ANG_EPS = 1e-5; // ≈0.0006°, 경계 꼭짓점 부동소수 손실 방지
+    const loMin = angMin - ANG_EPS;
+    const loMax = angMax + ANG_EPS;
+    // 코리도 판정 함수를 루프 밖에서 1회 선택 (전수 포인트 핫루프 — 호출당 클로저 생성 회피).
+    // 꼭짓점·항적점 모두 along>0로 한정되므로 atan2 각도는 (-π/2, +π/2)에 갇혀 ±π 경계 wrap 불가 → 단순 [loMin,loMax] 비교로 충분.
+    const inCorridor = useAzWindow
+      ? (along: number, across: number): boolean => { const a = Math.atan2(across, along); return a >= loMin && a <= loMax; }
+      : (_along: number, across: number): boolean => Math.abs(across) < TOLERANCE_M;
+
     const pts: { distRatio: number; altitude: number; mode_s: string; timestamp: number; radar_type: string; isLoss: boolean; latitude: number; longitude: number }[] = [];
     // 항적 포인트 (타임라인 슬라이더 범위 적용)
     for (const p of allPoints) {
@@ -1823,8 +1878,8 @@ export default function TrackMap() {
       const dx = (p.latitude - rLat) * mPerDegLat;
       const dy = (p.longitude - rLon) * mPerDegLon;
       const along = dx * cosB + dy * sinB;
-      const across = Math.abs(-dx * sinB + dy * cosB);
-      if (across < TOLERANCE_M && along > 0 && along <= lineLen) {
+      const across = -dx * sinB + dy * cosB;
+      if (along > 0 && along <= lineLen && inCorridor(along, across)) {
         pts.push({ distRatio: along / lineLen, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false, latitude: p.latitude, longitude: p.longitude });
       }
     }
@@ -1833,13 +1888,13 @@ export default function TrackMap() {
       const dx = (lp.latitude - rLat) * mPerDegLat;
       const dy = (lp.longitude - rLon) * mPerDegLon;
       const along = dx * cosB + dy * sinB;
-      const across = Math.abs(-dx * sinB + dy * cosB);
-      if (across < TOLERANCE_M && along > 0 && along <= lineLen) {
+      const across = -dx * sinB + dy * cosB;
+      if (along > 0 && along <= lineLen && inCorridor(along, across)) {
         pts.push({ distRatio: along / lineLen, altitude: lp.altitude, mode_s: lp.mode_s, timestamp: lp.timestamp, radar_type: "loss", isLoss: true, latitude: lp.latitude, longitude: lp.longitude });
       }
     }
     return pts;
-  }, [losTarget, radarSite, allPoints, signalLossPoints, visibleMinTs, visibleMaxTs]);
+  }, [losTarget, radarSite, allPoints, signalLossPoints, visibleMinTs, visibleMaxTs, losSelectedBuilding]);
 
   // 커버리지 전용 deck.gl 레이어 — BitmapLayer (이미지 텍스처 1장, tessellation 없음)
   const coverageDeckLayers = useMemo(() => {
@@ -2288,8 +2343,8 @@ export default function TrackMap() {
     // 기상 레이어 (항적 아래에 깔리도록 가장 먼저 합성)
     layers.push(...weatherDeckLayers);
 
-    // 항적선 또는 원시 탐지점
-    if (!trackLine) {
+    // 항적 표시 모드: 항적점(원시 탐지점) / 항적선 / 끄기
+    if (trackDisplay === "points") {
       // 수직선 (지면 → 고도)
       layers.push(
         new LineLayer<TrackPoint>({
@@ -2350,7 +2405,7 @@ export default function TrackMap() {
           },
         })
       );
-    } else {
+    } else if (trackDisplay === "line") {
       layers.push(
         new PathLayer<TrackPath>({
           id: "track-paths",
@@ -2411,8 +2466,8 @@ export default function TrackMap() {
       );
     }
 
-    // 1포인트 항적 (ScatterplotLayer)
-    if (filteredSinglePoints.length > 0) {
+    // 1포인트 항적 (ScatterplotLayer) — 끄기 모드에서는 숨김
+    if (trackDisplay !== "off" && filteredSinglePoints.length > 0) {
       layers.push(
         new ScatterplotLayer({
           id: "track-single-points",
@@ -2576,7 +2631,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackLine, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -2942,20 +2997,27 @@ export default function TrackMap() {
           <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">표시</div>
           <div className="space-y-2.5">
 
-        {/* 항적선 */}
+        {/* 항적 표시: 항적선 / 항적점 / 끄기 */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <span className={trackLine ? "text-[#a60739]" : "text-gray-400"}><TrackLineIcon size={14} /></span>
-            <span className="text-xs text-gray-600">항적선</span>
+            <span className={trackDisplay !== "off" ? "text-[#a60739]" : "text-gray-400"}><TrackLineIcon size={14} /></span>
+            <span className="text-xs text-gray-600">항적</span>
           </div>
-          <button
-            onClick={() => setTrackLine(!trackLine)}
-            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${trackLine ? "bg-[#a60739]" : "bg-gray-300"}`}
-            role="switch"
-            aria-checked={trackLine}
-          >
-            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${trackLine ? "translate-x-4.5" : "translate-x-0.5"}`} />
-          </button>
+          <div className="inline-flex items-center gap-0.5 rounded-md bg-gray-100 p-0.5" role="radiogroup" aria-label="항적 표시 모드">
+            {([["line", "선"], ["points", "점"], ["off", "끄기"]] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                onClick={() => setTrackDisplay(mode)}
+                role="radio"
+                aria-checked={trackDisplay === mode}
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                  trackDisplay === mode ? "bg-[#a60739] text-white shadow-sm" : "text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* 건물 */}
@@ -3086,6 +3148,8 @@ export default function TrackMap() {
                   setLosCursorPicking(false);
                   setLosBuildingHighlight(null);
                   setDetailBuilding(null);
+                  setLosSearchedAddress(null);
+                  setLosSelectedBuilding(null);
                   const map = mapRef.current?.getMap();
                   if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
                 }
@@ -3137,6 +3201,7 @@ export default function TrackMap() {
                       const defaultDistKm = 30 * 1.852; // 30NM
                       setLosFromAzDist(az, defaultDistKm);
                       setLosSearchedAddress({ lat, lon });
+                      setLosSelectedBuilding(null);
                       setLosCursorPicking(false);
                     }
                   }} />
@@ -3154,7 +3219,7 @@ export default function TrackMap() {
                   <AzimuthCircle
                     azimuth={losAzimuth}
                     disabled={false}
-                    onChange={(az) => { setLosFromAzDist(az, losDistanceKm); setLosSearchedAddress(null); setLosAzFineCenter(az); }}
+                    onChange={(az) => { setLosFromAzDist(az, losDistanceKm); setLosSearchedAddress(null); setLosSelectedBuilding(null); setLosAzFineCenter(az); }}
                   />
                   <div className="flex-1 space-y-1.5">
                     <div className="flex items-center justify-between">
@@ -3174,7 +3239,7 @@ export default function TrackMap() {
                     type="range"
                     min={losAzFineCenter - 2} max={losAzFineCenter + 2} step={0.001}
                     value={Math.min(losAzFineCenter + 2, Math.max(losAzFineCenter - 2, losAzimuth))}
-                    onChange={(e) => { setLosFromAzDist(Number(e.target.value), losDistanceKm); setLosSearchedAddress(null); }}
+                    onChange={(e) => { setLosFromAzDist(Number(e.target.value), losDistanceKm); setLosSearchedAddress(null); setLosSelectedBuilding(null); }}
                     className="w-full accent-[#a60739]"
                   />
                   <div className="flex justify-between text-[9px] text-gray-400">
@@ -3189,7 +3254,7 @@ export default function TrackMap() {
                   <input
                     type="range" min={1} max={Math.round(radarSite.range_nm)} step={1}
                     value={Math.min(Math.round(losDistanceKm / 1.852), Math.round(radarSite.range_nm))}
-                    onChange={(e) => { setLosFromAzDist(losAzimuth, Number(e.target.value) * 1.852); setLosSearchedAddress(null); }}
+                    onChange={(e) => { setLosFromAzDist(losAzimuth, Number(e.target.value) * 1.852); setLosSearchedAddress(null); setLosSelectedBuilding(null); }}
                     disabled={false}
                     className="w-full accent-[#a60739] disabled:opacity-40"
                   />
@@ -3641,7 +3706,7 @@ export default function TrackMap() {
           radarSite={radarSite}
           targetLat={losTarget.lat}
           targetLon={losTarget.lon}
-          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosCursorPicking(true); }}
+          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosSelectedBuilding(null); setLosCursorPicking(true); }}
           searchedAddress={losSearchedAddress}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
