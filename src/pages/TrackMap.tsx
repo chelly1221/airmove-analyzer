@@ -26,6 +26,16 @@ const TrackLineIcon = ({ size = 16 }: { size?: number }) => (
   </svg>
 );
 
+/** 항적점 아이콘 (경로상 점들) */
+const TrackPointIcon = ({ size = 16 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor" stroke="none">
+    <circle cx="2" cy="12" r="1.6" />
+    <circle cx="6" cy="5" r="1.6" />
+    <circle cx="10" cy="9" r="1.6" />
+    <circle cx="14" cy="3" r="1.6" />
+  </svg>
+);
+
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
@@ -3000,7 +3010,7 @@ export default function TrackMap() {
         {/* 항적 표시: 항적선 / 항적점 / 끄기 */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <span className={trackDisplay !== "off" ? "text-[#a60739]" : "text-gray-400"}><TrackLineIcon size={14} /></span>
+            <span className={trackDisplay !== "off" ? "text-[#a60739]" : "text-gray-400"}>{trackDisplay === "points" ? <TrackPointIcon size={14} /> : <TrackLineIcon size={14} />}</span>
             <span className="text-xs text-gray-600">항적</span>
           </div>
           <div className="inline-flex items-center gap-0.5 rounded-md bg-gray-100 p-0.5" role="radiogroup" aria-label="항적 표시 모드">
