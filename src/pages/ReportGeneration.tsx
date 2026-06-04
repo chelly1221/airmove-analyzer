@@ -68,6 +68,7 @@ export default function ReportGeneration() {
     findingsText: "",
     recommendText: "",
     textOverrides: {},
+    chartZooms: {},
     panoWithTargets: new Map(),
     panoWithoutTargets: new Map(),
     coverageStatus: "idle",
@@ -527,6 +528,7 @@ export default function ReportGeneration() {
         omFindingsText?: string;
         omRecommendText?: string;
         omTextOverrides?: Record<string, string>;
+        omChartZooms?: Record<string, [number, number]>;
         mapImage?: string | null;
       };
 
@@ -540,6 +542,7 @@ export default function ReportGeneration() {
         findingsText: config.omFindingsText ?? omData.findingsText,
         recommendText: config.omRecommendText ?? omData.recommendText,
         textOverrides: config.omTextOverrides ?? omData.textOverrides ?? {},
+        chartZooms: config.omChartZooms ?? omData.chartZooms ?? {},
       };
       if (tpl === "obstacle_monthly" && !hasOmResult) {
         console.warn("[Report] OM 분석 데이터 없음 — 소견/추천 텍스트만 복원됨. 재분석 필요.");

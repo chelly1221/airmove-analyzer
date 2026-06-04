@@ -4,20 +4,24 @@
  * 분석 대상 장애물 주변 방위 윈도우만 보여주는 컴팩트 버전. (기존 전체 방위 버전인
  * ReportOMAltitudeDistribution 을 대체해서 ReportOMObstacleDetail 에 인라인으로 들어감.)
  *
- *  - 베이스(연두): 지형 + 기존 지형지물 = panoWithout 의 silhouette 아래 영역
- *  - 추가(빨강): 분석 대상 장애물로 인해 추가된 차단 영역 = panoWith − panoWithout
+ *  - 베이스(연두): 지형 + 기존 지형지물 = without 윗변 아래 영역
+ *  - 추가(빨강): 분석 대상 장애물로 인해 추가된 차단 영역 = with 윗변 − without 윗변
+ *    · 윗변 = 지형 + 건물 실루엣을 방위별 max 로 합성. 건물 실루엣은 레이더 시점에서 본
+ *      압출 폴리곤의 가변 윗변(방위별 양각, panorama.rs build_building_silhouette).
  *  - 소실표적: 이 방위 윈도우 + 분석 대상 후방만, 분류별로 점 색 구분
  *      · 검은 ×  — 장애물 추가 기인 (지형 차단각 ≤ 양각 < 대상 차단각)
  *      · 회색 ○  — 지형 차단 (양각 < 지형 차단각)
  *      · 파란 ▫  — 장애물 무관 (양각 ≥ 대상 차단각, 차단 영역 밖)
  */
 import { useMemo, useRef, useEffect, useCallback } from "react";
-import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaPoint } from "../../types";
+import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult, BuildingObstacle } from "../../types";
 import type { LossPointGeo } from "../../types/obstacle";
-import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, calcBuildingAzExtent } from "../../utils/obstacleAnalysisHelpers";
 import OMEditable from "./OMEditable";
 
 const KM_PER_NM = 1.852;
+/** 소실표적 분류 방위 허용오차(°) — classifyObstacleLosses 의 AZ_TOLERANCE_DEG 와 동일.
+ *  (후방 소실표적 집계 윈도우. 차트 표시 윈도우(azHalfSpan, 빌딩 각폭)와는 별개) */
 const AZ_TOLERANCE = 10;
 
 const CHART_W = 720;
@@ -32,16 +36,131 @@ const COMPASS_DIRS: Record<number, string> = {
   180: "S", 225: "SW", 270: "W", 315: "NW",
 };
 
+interface SilPoint { rel: number; elev: number; }
+interface SilLines { withoutLine: SilPoint[]; withLine: SilPoint[]; peak: number; }
+
+const EMPTY_MERGE: PanoramaMergeResult = { terrain: [], buildings: [] };
+
+/**
+ * 윈도우 내 방위별 실루엣 윗변 합성.
+ * 지형(공유 terrain) + 건물(방위별 실루엣 폴리라인 or 단순 밴드)을 방위별 max 로 합쳐
+ * with(분석 대상 포함) / without(제외) 두 윗변 폴리라인 + 피크 양각을 반환.
+ *   빨강(추가 차단) = with − without, 녹색 base = without 아래.
+ * 건물 silhouette = 레이더 시점에서 본 압출 폴리곤의 가변 윗변(panorama.rs build_building_silhouette).
+ */
+function buildSilhouetteLines(
+  pWith: PanoramaMergeResult,
+  pWithout: PanoramaMergeResult,
+  azCenter: number,
+  azHalfSpan: number,
+  azSpan: number,
+): SilLines {
+  const REL = (az: number) => {
+    let r = az - azCenter;
+    if (r > 180) r -= 360;
+    if (r < -180) r += 360;
+    return r;
+  };
+
+  // 선형 보간 (rel 오름차순 배열)
+  const interp = (arr: SilPoint[], rel: number): number => {
+    const m = arr.length;
+    if (m === 0) return -Infinity;
+    if (rel <= arr[0].rel) return arr[0].elev;
+    if (rel >= arr[m - 1].rel) return arr[m - 1].elev;
+    let lo = 0, hi = m - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].rel <= rel) lo = mid; else hi = mid;
+    }
+    const a = arr[lo], b = arr[hi];
+    const s = b.rel - a.rel;
+    const t = s > 1e-12 ? (rel - a.rel) / s : 0;
+    return a.elev + (b.elev - a.elev) * t;
+  };
+
+  // 지형 점 → rel 정렬 (윈도우 약간 확장)
+  const tPts: SilPoint[] = (pWith.terrain ?? [])
+    .map((p) => ({ rel: REL(p.azimuth_deg), elev: Math.max(0, p.elevation_angle_deg) }))
+    .filter((p) => Math.abs(p.rel) <= azHalfSpan + 1)
+    .sort((a, b) => a.rel - b.rel);
+  const terrainAt = (rel: number) => {
+    const v = interp(tPts, rel);
+    return v === -Infinity ? 0 : v;
+  };
+
+  // 건물 → rel 전처리 (방위별 실루엣 폴리라인 or 단순 밴드)
+  type Prep =
+    | { kind: "sil"; pts: SilPoint[] }
+    | { kind: "band"; rs: number; re: number; elev: number };
+  const inWindow = (b: BuildingObstacle): boolean => {
+    if (b.silhouette && b.silhouette.length) {
+      for (const [az] of b.silhouette) if (Math.abs(REL(az)) <= azHalfSpan + 0.5) return true;
+      return false;
+    }
+    const rs = REL(b.azimuth_start_deg), re = REL(b.azimuth_end_deg);
+    return Math.max(rs, re) + 0.1 >= -azHalfSpan && Math.min(rs, re) - 0.1 <= azHalfSpan;
+  };
+  const prep = (b: BuildingObstacle): Prep => {
+    if (b.silhouette && b.silhouette.length >= 2) {
+      const pts = b.silhouette
+        .map(([az, el]) => ({ rel: REL(az), elev: Math.max(0, el) }))
+        .sort((a, c) => a.rel - c.rel);
+      return { kind: "sil", pts };
+    }
+    let rs = REL(b.azimuth_start_deg);
+    let re = REL(b.azimuth_end_deg);
+    if (rs > re) { const t = rs; rs = re; re = t; }
+    if (Math.abs(re - rs) < 1e-6) { rs -= 0.05; re += 0.05; } // 점 건물 → 미세 밴드
+    return { kind: "band", rs, re, elev: Math.max(0, b.elevation_angle_deg) };
+  };
+  const prepWith = (pWith.buildings ?? []).filter(inWindow).map(prep);
+  const prepWithout = (pWithout.buildings ?? []).filter(inWindow).map(prep);
+
+  const bTop = (rel: number, pb: Prep): number => {
+    if (pb.kind === "band") return rel >= pb.rs && rel <= pb.re ? pb.elev : -Infinity;
+    const pts = pb.pts;
+    if (rel < pts[0].rel - 1e-9 || rel > pts[pts.length - 1].rel + 1e-9) return -Infinity;
+    return interp(pts, rel);
+  };
+  const maxOver = (rel: number, arr: Prep[]) => {
+    let m = -Infinity;
+    for (const pb of arr) { const v = bTop(rel, pb); if (v > m) m = v; }
+    return m;
+  };
+  const withoutTop = (rel: number) => Math.max(terrainAt(rel), maxOver(rel, prepWithout));
+  const withTop = (rel: number) => Math.max(terrainAt(rel), maxOver(rel, prepWith));
+
+  // 샘플 rel 집합 — 균일 그리드 + 건물 코너/밴드 경계 (윗변 코너 보존)
+  const relSet = new Set<number>();
+  const N = 320;
+  for (let i = 0; i <= N; i++) relSet.add(-azHalfSpan + (azSpan * i) / N);
+  const pushIn = (rel: number) => {
+    if (rel >= -azHalfSpan - 1e-9 && rel <= azHalfSpan + 1e-9) relSet.add(rel);
+  };
+  for (const pb of [...prepWith, ...prepWithout]) {
+    if (pb.kind === "sil") for (const p of pb.pts) pushIn(p.rel);
+    else { pushIn(pb.rs); pushIn(pb.re); }
+  }
+  const rels = [...relSet].sort((a, b) => a - b);
+
+  const withoutLine: SilPoint[] = rels.map((rel) => ({ rel, elev: withoutTop(rel) }));
+  const withLine: SilPoint[] = rels.map((rel) => ({ rel, elev: withTop(rel) }));
+  let peak = 0;
+  for (const p of withLine) if (p.elev > peak) peak = p.elev;
+  return { withoutLine, withLine, peak };
+}
+
 interface Props {
   radarSite: RadarSite;
   building: ManualBuilding;
   /** 그룹 메타 (현재는 미사용, 향후 색 라벨용) */
   buildingGroups?: BuildingGroup[];
   los: LoSProfileData;
-  /** panoWithTargets[radar].terrain — 분석 대상 포함 silhouette */
-  panoWith: PanoramaPoint[];
-  /** panoWithoutTargets[radar].terrain — 분석 대상 제외 silhouette */
-  panoWithout: PanoramaPoint[];
+  /** 분석 대상 포함 파노라마 (terrain 공유 + buildings = 전체) */
+  panoWith?: PanoramaMergeResult;
+  /** 분석 대상 제외 파노라마 (terrain 공유 + buildings = 대상 제외) */
+  panoWithout?: PanoramaMergeResult;
   /** 이 레이더의 모든 소실표적 (방위 윈도우 + 대상 후방 필터링은 내부에서) */
   lossPoints: LossPointGeo[];
 }
@@ -58,58 +177,27 @@ export default function ReportOMObstacleAzElevChart({
     [radarSite, building, los, lossPoints],
   );
 
-  // 축/스케일 — 분석 대상 방위 중심.
-  // 분석 대상으로 인한 추가 차단(빨강, panoWith>panoWithout) + 지형(녹색) 영역이 차트에
-  // 꽉 차도록 축을 그 영역에 맞추고 각 축 10% 여백만 둔다. (멀리 떨어진 무관 소실표적이
-  // 축을 넓히던 동작은 제거 — 음영 내 소실표적까지만 X 범위에 반영.)
-  const chartParams = useMemo(() => {
-    const azCenter = computed.bAzDeg;
-    const SEARCH_CAP = AZ_TOLERANCE + 5; // 15° — 탐색·최대 한계
+  // 분석 대상 포함/제외 파노라마 (terrain 공유 + buildings 배열만 다름)
+  const pWith = panoWith ?? EMPTY_MERGE;
+  const pWithout = panoWithout ?? EMPTY_MERGE;
 
+  // 1) 방위 윈도우 (기하 전용) — 분석 대상 건물의 노출면 방위 각폭.
+  //    calcBuildingAzExtent 로 건물 폴리곤의 레이더 방향 방위 구간을 구하고, 중심(대상 방위)
+  //    기준 좌우 최대 편차 + 정렬오차 흡수용 1° 마진. (LoS 단면도 항적 윈도우와 동일 스킴)
+  const azParams = useMemo(() => {
+    const azCenter = computed.bAzDeg;
     const relAz = (az: number) => {
       let rel = az - azCenter;
       if (rel > 180) rel -= 360;
       if (rel < -180) rel += 360;
       return rel;
     };
-
-    // panoWithout(분석 대상 제외 실루엣) 룩업
-    const withoutMap = new Map<number, number>();
-    for (const p of panoWithout) withoutMap.set(Math.round(p.azimuth_deg * 100), Math.max(0, p.elevation_angle_deg));
-    const lookupWithout = (az: number) => withoutMap.get(Math.round(az * 100)) ?? 0;
-
-    // 추가 차단(빨강) 영역 + 음영 내 소실표적의 방위 폭 → 콘텐츠 반폭
-    let contentHalf = 0;
-    for (const p of panoWith) {
-      const rel = relAz(p.azimuth_deg);
-      if (Math.abs(rel) > SEARCH_CAP) continue;
-      const add = Math.max(0, p.elevation_angle_deg) - lookupWithout(p.azimuth_deg);
-      if (add > 0.01 && Math.abs(rel) > contentHalf) contentHalf = Math.abs(rel);
-    }
-    for (const l of computed.losses) {
-      if (!l.inShadow) continue; // 음영(지형/장애물 차단) 내 소실표적만 — 무관 소실표적은 제외
-      const absRel = Math.abs(relAz(l.azDeg));
-      if (absRel <= SEARCH_CAP && absRel > contentHalf) contentHalf = absRel;
-    }
-    // 콘텐츠 폭 + 10% 여백, 문맥 확보용 최소 4°, 최대 15°
-    const azHalfSpan = Math.min(Math.max(contentHalf * 1.1, 4), SEARCH_CAP);
+    const ext = calcBuildingAzExtent(radarSite.latitude, radarSite.longitude, building);
+    const AZ_MARGIN = 1; // 정렬오차/빔폭 흡수 마진
+    const halfFromExtent = Math.max(Math.abs(relAz(ext.start_deg)), Math.abs(relAz(ext.end_deg)));
+    // 빌딩 각폭 + 마진, 최소 가독 폭 2° (점 건물 기본 ±2° 와 정합)
+    const azHalfSpan = Math.max(halfFromExtent + AZ_MARGIN, 2);
     const azSpan = azHalfSpan * 2;
-
-    const azInRange = (az: number) => Math.abs(relAz(az)) <= azHalfSpan;
-
-    // Y 최대 — 윈도우 내 panoWith silhouette + 대상 차단각 (소실표적 양각은 Y 확장 제외)
-    let panoMax = 0;
-    for (const p of panoWith) {
-      if (azInRange(p.azimuth_deg) && p.elevation_angle_deg > panoMax) panoMax = p.elevation_angle_deg;
-    }
-    if (computed.angleTotalDeg > panoMax) panoMax = computed.angleTotalDeg;
-    // 영역이 Y축에도 꽉 차도록 — 상단 10% 여백만
-    const maxAngle = panoMax > 0.05 ? panoMax * 1.1 : 0.6;
-
-    const yRange = maxAngle;
-    const yStep = yRange > 5 ? 1 : yRange > 2 ? 0.5 : yRange > 1 ? 0.2 : yRange > 0.5 ? 0.1 : 0.05;
-    const yTicks: number[] = [];
-    for (let v = 0; v <= maxAngle + 0.001; v += yStep) yTicks.push(Math.round(v * 1000) / 1000);
 
     const azTickStep = azSpan >= 24 ? 5 : azSpan >= 10 ? 2 : 1;
     const azStart = azCenter - azHalfSpan;
@@ -117,18 +205,43 @@ export default function ReportOMObstacleAzElevChart({
     const firstTick = Math.ceil(azStart / azTickStep) * azTickStep;
     const xTicks: number[] = [];
     for (let v = firstTick; v <= azEnd + 0.001; v += azTickStep) xTicks.push(v);
+    return { azCenter, azHalfSpan, azSpan, xTicks };
+  }, [computed.bAzDeg, radarSite.latitude, radarSite.longitude, building]);
 
-    return { azCenter, azHalfSpan, azSpan, yRange, yStep, yTicks, xTicks };
-  }, [computed, panoWith, panoWithout]);
+  const { azCenter, azHalfSpan, azSpan, xTicks } = azParams;
 
-  const { azCenter, azHalfSpan, azSpan, yRange, yStep, yTicks, xTicks } = chartParams;
+  // 2) 방위별 실루엣 합성 — 지형 + 건물(실루엣/밴드)을 방위별 max 로 합쳐 with/without 윗변 폴리라인.
+  const sil = useMemo(
+    () => buildSilhouetteLines(pWith, pWithout, azCenter, azHalfSpan, azSpan),
+    [pWith, pWithout, azCenter, azHalfSpan, azSpan],
+  );
 
-  const xScale = useCallback((az: number) => {
+  // 3) Y 스케일 — with 윗변 피크 + 대상 차단각 (소실표적 양각은 Y 확장 제외)
+  const yParams = useMemo(() => {
+    let panoMax = sil.peak;
+    if (computed.angleTotalDeg > panoMax) panoMax = computed.angleTotalDeg;
+    // 영역이 Y축에도 꽉 차도록 — 상단 10% 여백만
+    const maxAngle = panoMax > 0.05 ? panoMax * 1.1 : 0.6;
+    const yRange = maxAngle;
+    const yStep = yRange > 5 ? 1 : yRange > 2 ? 0.5 : yRange > 1 ? 0.2 : yRange > 0.5 ? 0.1 : 0.05;
+    const yTicks: number[] = [];
+    for (let v = 0; v <= maxAngle + 0.001; v += yStep) yTicks.push(Math.round(v * 1000) / 1000);
+    return { yRange, yStep, yTicks };
+  }, [sil.peak, computed.angleTotalDeg]);
+  const { yRange, yStep, yTicks } = yParams;
+
+  const relOf = useCallback((az: number) => {
     let rel = az - azCenter;
     if (rel > 180) rel -= 360;
     if (rel < -180) rel += 360;
-    return MARGIN.left + ((rel + azHalfSpan) / azSpan) * INNER_W;
-  }, [azCenter, azHalfSpan, azSpan]);
+    return rel;
+  }, [azCenter]);
+
+  const xScaleRel = useCallback(
+    (rel: number) => MARGIN.left + ((rel + azHalfSpan) / azSpan) * INNER_W,
+    [azHalfSpan, azSpan],
+  );
+  const xScale = useCallback((az: number) => xScaleRel(relOf(az)), [xScaleRel, relOf]);
 
   const yScale = useCallback((a: number) => {
     return MARGIN.top + INNER_H - (a / yRange) * INNER_H;
@@ -190,93 +303,55 @@ export default function ReportOMObstacleAzElevChart({
     ctx.lineTo(MARGIN.left + INNER_W, yScale(0));
     ctx.stroke();
 
-    // 파노라마 윈도우 필터+정렬
-    const filterSort = (pts: PanoramaPoint[]) =>
-      pts
-        .filter((p) => {
-          let rel = p.azimuth_deg - azCenter;
-          if (rel > 180) rel -= 360;
-          if (rel < -180) rel += 360;
-          return Math.abs(rel) <= azHalfSpan;
-        })
-        .sort((a, b) => {
-          let ra = a.azimuth_deg - azCenter;
-          if (ra > 180) ra -= 360; if (ra < -180) ra += 360;
-          let rb = b.azimuth_deg - azCenter;
-          if (rb > 180) rb -= 360; if (rb < -180) rb += 360;
-          return ra - rb;
-        });
-    const withVis = filterSort(panoWith);
-    const withoutVis = filterSort(panoWithout);
+    // 방위별 실루엣 윗변 — without(녹색 base) / with(분석 대상 포함). 동일 rel 격자.
+    const { withoutLine, withLine } = sil;
+    const clamp0 = (e: number) => (e < 0 ? 0 : e);
 
-    const withoutMap = new Map<number, number>();
-    for (const p of withoutVis) withoutMap.set(Math.round(p.azimuth_deg * 100), Math.max(0, p.elevation_angle_deg));
-    const lookupWithout = (az: number) => withoutMap.get(Math.round(az * 100)) ?? 0;
-
-    const fillArea = (
-      pts: PanoramaPoint[],
-      topFn: (p: PanoramaPoint) => number,
-      bottomFn: (p: PanoramaPoint) => number,
-      color: string,
-    ) => {
-      if (pts.length < 2) return;
+    if (withoutLine.length >= 2) {
+      // 1) 베이스: 지형 + 기존 지형지물 (without 윗변 아래, 연두)
       ctx.beginPath();
-      for (let i = 0; i < pts.length; i++) {
-        const x = xScale(pts[i].azimuth_deg);
-        const y = yScale(topFn(pts[i]));
+      for (let i = 0; i < withoutLine.length; i++) {
+        const x = xScaleRel(withoutLine[i].rel);
+        const y = yScale(clamp0(withoutLine[i].elev));
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
-      for (let i = pts.length - 1; i >= 0; i--) {
-        ctx.lineTo(xScale(pts[i].azimuth_deg), yScale(bottomFn(pts[i])));
+      ctx.lineTo(xScaleRel(withoutLine[withoutLine.length - 1].rel), yScale(0));
+      ctx.lineTo(xScaleRel(withoutLine[0].rel), yScale(0));
+      ctx.closePath();
+      ctx.fillStyle = "rgba(134,239,172,0.55)";
+      ctx.fill();
+
+      // 2) 분석 대상 추가 차단 = with − without (빨강). 위(with) 따라가고 아래(without) 역순.
+      ctx.beginPath();
+      for (let i = 0; i < withLine.length; i++) {
+        const x = xScaleRel(withLine[i].rel);
+        const y = yScale(clamp0(withLine[i].elev));
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      for (let i = withoutLine.length - 1; i >= 0; i--) {
+        ctx.lineTo(xScaleRel(withoutLine[i].rel), yScale(clamp0(withoutLine[i].elev)));
       }
       ctx.closePath();
-      ctx.fillStyle = color;
+      ctx.fillStyle = "rgba(252,165,165,0.65)";
       ctx.fill();
-    };
 
-    const drawContour = (pts: PanoramaPoint[], color: string, width: number) => {
-      if (pts.length < 2) return;
-      ctx.beginPath();
-      for (let i = 0; i < pts.length; i++) {
-        const x = xScale(pts[i].azimuth_deg);
-        const y = yScale(Math.max(0, pts[i].elevation_angle_deg));
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.strokeStyle = color;
-      ctx.lineWidth = width;
-      ctx.stroke();
-    };
-
-    if (withoutVis.length >= 2 || withVis.length >= 2) {
-      // 1) 베이스: 지형 + 기존 지형지물 = panoWithout silhouette 아래 (연두)
-      fillArea(withoutVis, (p) => Math.max(0, p.elevation_angle_deg), () => 0, "rgba(134,239,172,0.55)");
-      // 2) 분석 대상 추가 차단 = panoWith silhouette 와 without 사이 (빨강)
-      fillArea(withVis, (p) => Math.max(0, p.elevation_angle_deg), (p) => lookupWithout(p.azimuth_deg), "rgba(252,165,165,0.65)");
-      drawContour(withoutVis, "#166534", 0.8);
-      drawContour(withVis, "#dc2626", 1);
+      // 3) 외곽선 — without(짙은 녹색) / with(밝은 녹색, LoS 단면 지형선과 동일)
+      const drawLine = (line: SilPoint[], color: string, width: number) => {
+        ctx.beginPath();
+        for (let i = 0; i < line.length; i++) {
+          const x = xScaleRel(line[i].rel);
+          const y = yScale(clamp0(line[i].elev));
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.stroke();
+      };
+      drawLine(withoutLine, "#166534", 0.8);
+      drawLine(withLine, "#22c55e", 1);
     }
 
-    // 분석 대상 방위 마커
-    {
-      const bx = xScale(computed.bAzDeg);
-      const byTop = yScale(computed.angleTotalDeg);
-      const byBase = yScale(0);
-      ctx.beginPath();
-      ctx.setLineDash([2, 1]);
-      ctx.strokeStyle = "#ef4444";
-      ctx.lineWidth = 1.5;
-      ctx.moveTo(bx, byBase);
-      ctx.lineTo(bx, byTop);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.arc(bx, byTop, 2.8, 0, Math.PI * 2);
-      ctx.fillStyle = "#ef4444";
-      ctx.fill();
-      ctx.strokeStyle = "#fff";
-      ctx.lineWidth = 0.6;
-      ctx.stroke();
-    }
+    // (분석 대상 방위 마커 제거 — 대상 차단각 높이는 연홍색 '추가 차단' 영역이 표현)
 
     // 소실표적
     // 1) 장애물 무관 (파란점)
@@ -349,7 +424,7 @@ export default function ReportOMObstacleAzElevChart({
     ctx.rotate(-Math.PI / 2);
     ctx.fillText("양각 (°)", 0, 0);
     ctx.restore();
-  }, [computed, panoWith, panoWithout, xTicks, yTicks, yStep, azCenter, azHalfSpan, xScale, yScale, yRange]);
+  }, [computed, sil, xTicks, yTicks, yStep, azCenter, azHalfSpan, xScale, xScaleRel, yScale, yRange]);
 
   // 요약 수치
   const total = computed.losses.length;
@@ -370,7 +445,7 @@ export default function ReportOMObstacleAzElevChart({
       <div className="mb-1 flex items-center justify-between text-[12px]">
         <OMEditable id={`${eid}.title`} value="LoS 차단 양각 대비 표적소실 분포" tag="span" className="font-semibold text-gray-800" />
         <span className="text-[10px] text-gray-400">
-          분석 대상 방위 {computed.bAzDeg.toFixed(0)}° ± {azHalfSpan.toFixed(0)}°
+          분석 대상 방위 {computed.bAzDeg.toFixed(0)}° · 건물 각폭 ±{azHalfSpan.toFixed(1)}°
         </span>
       </div>
 
@@ -419,7 +494,7 @@ export default function ReportOMObstacleAzElevChart({
         </thead>
         <tbody>
           <tr className="bg-white">
-            <td className="border border-gray-200 px-2 py-1">방위 ±{azHalfSpan.toFixed(0)}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
+            <td className="border border-gray-200 px-2 py-1">방위 ±{AZ_TOLERANCE}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
             <td className="border border-gray-200 px-2 py-1 text-right font-mono">{total}건</td>
             <td className="border border-gray-200 px-2 py-1 text-gray-500"><OMEditable id={`${eid}.tbl.r1.note`} value="분석 대상 후방 영역" tag="span" /></td>
           </tr>

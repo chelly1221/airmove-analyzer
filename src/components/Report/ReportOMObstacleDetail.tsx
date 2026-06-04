@@ -92,8 +92,8 @@ function ReportOMObstacleDetail({
         building={building}
         buildingGroups={buildingGroups}
         los={los}
-        panoWith={panoWith?.terrain ?? []}
-        panoWithout={panoWithout?.terrain ?? []}
+        panoWith={panoWith}
+        panoWithout={panoWithout}
         lossPoints={allLossThisRadar}
       />
     </ReportPage>

@@ -72,6 +72,10 @@ pub struct BuildingObstacle {
     /// 건물 폴리곤 [[lat, lon], ...]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub polygon: Option<Vec<[f64; 2]>>,
+    /// 방위별 상단 양각 실루엣 [[az_deg, elev_deg], ...] — 레이더 시점에서 본
+    /// 압출 폴리곤의 가변 윗변. 폴리곤 건물만 존재(점 건물은 None).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silhouette: Option<Vec<[f64; 2]>>,
 }
 
 /// 파노라마 병합 결과 (지형 + 건물 분리)
@@ -642,6 +646,10 @@ fn collect_building_obstacles(
 
             if best_angle <= f64::NEG_INFINITY { continue; }
 
+            // 방위별 상단 양각 실루엣 (레이더 시점에서 본 압출 폴리곤의 가변 윗변)
+            let sil = build_building_silhouette(&enu, az_start, az_span, total_h, radar_height_m);
+            let silhouette = if sil.is_empty() { None } else { Some(sil) };
+
             let obs_type = if bld.is_manual { "manual_building" } else { "gis_building" };
             let az_end = (az_start + az_span) % 360.0;
 
@@ -661,6 +669,7 @@ fn collect_building_obstacles(
                 lat: bld.centroid_lat,
                 lon: bld.centroid_lon,
                 polygon: Some(bld.polygon.clone()),
+                silhouette,
             });
         }
 
@@ -693,11 +702,70 @@ fn collect_building_obstacles(
                 lat: bld.lat,
                 lon: bld.lon,
                 polygon: None,
+                silhouette: None,
             });
         }
     }
 
     results
+}
+
+/// 레이더 시점에서 본 압출 폴리곤의 방위별 상단 양각 실루엣.
+/// 건물 방위 구간 [az_start, az_start+az_span]을 미세 스텝으로 훑으며, 각 방위 ray가
+/// 폴리곤에 처음 닿는 거리(근접면)에서 건물 옥상(total_h)의 양각을 계산한다.
+/// (근접면이 가장 큰 양각 → 레이더가 보는 실루엣 윗변).
+/// 반환: [[az_deg, elev_deg], ...] (방위 오름차순). 코너 포착을 위해 꼭짓점 방위도 샘플에 포함.
+fn build_building_silhouette(
+    enu: &[(f64, f64)],
+    az_start_deg: f64,
+    az_span_deg: f64,
+    total_h: f64,
+    radar_height_m: f64,
+) -> Vec<[f64; 2]> {
+    let n = enu.len();
+    if n < 3 || az_span_deg <= 0.0 {
+        return Vec::new();
+    }
+
+    // 샘플 방위(구간 시작 기준 상대 오프셋 0..=az_span) — 균일 스텝 + 꼭짓점 방위(코너)
+    let step = (az_span_deg / 48.0).clamp(0.01, 0.25);
+    let mut offsets: Vec<f64> = Vec::new();
+    let mut a = 0.0;
+    while a <= az_span_deg + 1e-9 {
+        offsets.push(a);
+        a += step;
+    }
+    for &(e, nn) in enu {
+        let az = e.atan2(nn).to_degrees().rem_euclid(360.0);
+        let mut rel = az - az_start_deg;
+        if rel < -180.0 { rel += 360.0; }
+        if rel > 180.0 { rel -= 360.0; }
+        if rel >= -1e-6 && rel <= az_span_deg + 1e-6 {
+            offsets.push(rel.clamp(0.0, az_span_deg));
+        }
+    }
+    offsets.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    offsets.dedup_by(|x, y| (*x - *y).abs() < 1e-6);
+
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(offsets.len());
+    for off in offsets {
+        let az = (az_start_deg + off).rem_euclid(360.0);
+        let az_rad = az.to_radians();
+        let rdx = az_rad.sin();
+        let rdy = az_rad.cos();
+        let mut nd = f64::INFINITY;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            if let Some(d) = ray_segment_intersection(rdx, rdy, enu[i].0, enu[i].1, enu[j].0, enu[j].1) {
+                if d < nd { nd = d; }
+            }
+        }
+        if nd.is_finite() && nd >= 1.0 {
+            let angle = elevation_angle_deg(nd, total_h, radar_height_m);
+            out.push([az, angle]);
+        }
+    }
+    out
 }
 
 /// 방위각 목록에서 실제 건물이 차지하는 (시작각, 각도폭) 계산

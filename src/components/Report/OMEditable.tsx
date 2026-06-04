@@ -11,14 +11,27 @@
  */
 import { createContext, useContext, useRef, useCallback } from "react";
 
+/** 차트 X축 줌 상태 — [시작%, 끝%] (0~100). [0,100] 이면 전체(줌 없음). */
+export type ChartZoom = [number, number];
+
 interface OMEditContextValue {
   editable: boolean;
   overrides: Record<string, string>;
   /** value=null 이면 해당 키 override 제거(기본값 복원) */
   onOverride: (key: string, value: string | null) => void;
+  /** 차트 줌 상태 (편집키 → [시작%, 끝%]) */
+  chartZooms: Record<string, ChartZoom>;
+  /** zoom=null 이면 해당 키 줌 제거(전체 복원) */
+  onChartZoom: (key: string, zoom: ChartZoom | null) => void;
 }
 
-const NOOP_CTX: OMEditContextValue = { editable: false, overrides: {}, onOverride: () => {} };
+const NOOP_CTX: OMEditContextValue = {
+  editable: false,
+  overrides: {},
+  onOverride: () => {},
+  chartZooms: {},
+  onChartZoom: () => {},
+};
 
 const OMEditContext = createContext<OMEditContextValue>(NOOP_CTX);
 
@@ -78,4 +91,19 @@ export default function OMEditable({ id, value, tag: Tag = "span", className = "
       {display}
     </Tag>
   );
+}
+
+/**
+ * 차트 줌 편집 훅 — 편집키로 식별되는 차트(예: LoS 단면도)의 X축 줌 상태를 read/write.
+ * editable=false(Provider 없음 또는 비편집 템플릿)면 항상 전체([0,100]) + no-op setter.
+ */
+export function useOMChartZoom(key: string): {
+  editable: boolean;
+  zoom: ChartZoom;
+  setZoom: (zoom: ChartZoom | null) => void;
+} {
+  const { editable, chartZooms, onChartZoom } = useContext(OMEditContext);
+  const zoom = chartZooms[key] ?? [0, 100];
+  const setZoom = useCallback((z: ChartZoom | null) => onChartZoom(key, z), [key, onChartZoom]);
+  return { editable, zoom, setZoom };
 }

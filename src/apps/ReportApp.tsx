@@ -714,6 +714,7 @@ export default function ReportApp() {
         omFindingsText: omData?.findingsText ?? "",
         omRecommendText: omData?.recommendText ?? "",
         omTextOverrides: omData?.textOverrides ?? {},
+        omChartZooms: omData?.chartZooms ?? {},
         mapImage: state.mapImage,
       });
       const reportMeta: ReportSaveMeta = {
@@ -817,6 +818,7 @@ export default function ReportApp() {
       }),
       recommendText: "",
       textOverrides: {},
+      chartZooms: {},
       coverageStatus: covWith.size > 0 ? "done" : "loading",
       panoramaStatus: "deferred",
       sectionImages: new Map(),

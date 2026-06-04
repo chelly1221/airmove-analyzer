@@ -31,6 +31,9 @@ export interface BuildingObstacle {
   lat: number;
   lon: number;
   polygon?: [number, number][];
+  /** 방위별 상단 양각 실루엣 [[az_deg, elev_deg], ...] — 레이더 시점에서 본
+   *  압출 폴리곤의 가변 윗변. 폴리곤 건물만 존재(점 건물은 undefined). */
+  silhouette?: [number, number][];
 }
 
 /** 파노라마 병합 결과 (지형 + 건물 분리) */

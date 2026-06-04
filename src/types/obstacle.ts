@@ -100,6 +100,8 @@ export interface OMReportData {
   recommendText: string;
   /** 인라인 편집 텍스트 오버라이드 (편집키 → 사용자 수정 문구). 기본 자동 문구를 덮어씀. */
   textOverrides?: Record<string, string>;
+  /** 차트 줌 상태 (편집키 → [시작%, 끝%], 0~100). LoS 단면도 X축 줌 등. PDF·재로딩에 반영. */
+  chartZooms?: Record<string, [number, number]>;
   panoWithTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   panoWithoutTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   coverageStatus: "idle" | "loading" | "done" | "error";

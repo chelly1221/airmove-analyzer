@@ -1,8 +1,9 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useRef, useState, useEffect, useCallback } from "react";
 import type { ManualBuilding, RadarSite, LoSProfileData, BuildingOnPath, ElevationPoint } from "../../types";
 import type { ObstacleMonthlyResult, LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportPage from "./ReportPage";
+import { useOMChartZoom, type ChartZoom } from "./OMEditable";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import { bearingDeg, haversineKm } from "../../utils/geo";
 import { calcBuildingAzExtent } from "../../utils/obstacleAnalysisHelpers";
@@ -283,6 +284,130 @@ export function LosCrossSection({
     };
   }, [los, building]);
 
+  // ── 줌 편집 (클릭 → 줌모드, 휠 확대/축소 + 드래그 패닝). obstacle_monthly 편집 컨텍스트에서만 활성 ──
+  const svgRef = useRef<SVGSVGElement>(null);
+  const zoomKey = `loscs.${radarName}_${building.id}`;
+  const { editable, zoom, setZoom } = useOMChartZoom(zoomKey);
+  const [zoomMode, setZoomMode] = useState(false);
+  // 라이브 줌(로컬) — 드래그/휠 중 전역 omData 갱신에 따른 전체 트리 리렌더 방지.
+  //   상호작용이 끝나면(또는 휠 정지 200ms 후) persist(setZoom) 로 1회 커밋한다.
+  const [liveZoom, setLiveZoom] = useState<ChartZoom>(zoom);
+  const liveZoomRef = useRef<ChartZoom>(liveZoom);
+  liveZoomRef.current = liveZoom;
+  const interactingRef = useRef(false);
+  const setZoomRef = useRef(setZoom);
+  setZoomRef.current = setZoom;
+
+  // 외부(초기화·재로딩)로 persist 값이 바뀌면 로컬 동기화 (상호작용 중에는 무시)
+  useEffect(() => {
+    if (interactingRef.current) return;
+    setLiveZoom(zoom);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoom[0], zoom[1]]);
+
+  const resetZoom = useCallback(() => {
+    interactingRef.current = false;
+    liveZoomRef.current = [0, 100];
+    setLiveZoom([0, 100]);
+    setZoomRef.current(null);
+  }, []);
+  const exitZoomMode = useCallback(() => {
+    const [s, e] = liveZoomRef.current;
+    setZoomRef.current(s === 0 && e === 100 ? null : [s, e]);
+    interactingRef.current = false;
+    setZoomMode(false);
+  }, []);
+
+  // 휠 줌 + 드래그 패닝 — 줌모드에서만 네이티브 리스너 부착 (wheel preventDefault 위해 passive:false)
+  useEffect(() => {
+    if (!editable || !zoomMode) return;
+    const svg = svgRef.current;
+    if (!svg) return;
+    let commitTimer: ReturnType<typeof setTimeout> | null = null;
+    const commit = () => {
+      const [s, e] = liveZoomRef.current;
+      setZoomRef.current(s === 0 && e === 100 ? null : [s, e]);
+      interactingRef.current = false;
+    };
+    const scheduleCommit = () => {
+      if (commitTimer) clearTimeout(commitTimer);
+      commitTimer = setTimeout(commit, 200);
+    };
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const svgX = ((ev.clientX - rect.left) / rect.width) * W;
+      if (svgX < PAD.left || svgX > W - PAD.right) return;
+      const cursorRatio = (svgX - PAD.left) / cw;
+      const [s, e] = liveZoomRef.current;
+      const range = e - s;
+      const pivot = s + cursorRatio * range;
+      const factor = ev.deltaY > 0 ? 1.2 : 1 / 1.2;
+      const newRange = Math.min(100, Math.max(1, range * factor));
+      let ns = pivot - cursorRatio * newRange;
+      let ne = pivot + (1 - cursorRatio) * newRange;
+      if (ns < 0) { ne -= ns; ns = 0; }
+      if (ne > 100) { ns -= ne - 100; ne = 100; }
+      ns = Math.max(0, ns); ne = Math.min(100, ne);
+      interactingRef.current = true;
+      const next: ChartZoom = [ns, ne];
+      liveZoomRef.current = next;
+      setLiveZoom(next);
+      scheduleCommit();
+    };
+    let dragging = false;
+    let dragStartClientX = 0;
+    let dragStartZoom: ChartZoom = [0, 100];
+    const onMouseDown = (ev: MouseEvent) => {
+      const [s, e] = liveZoomRef.current;
+      if (s === 0 && e === 100) return; // 줌 안 됨 → 패닝 불필요
+      const rect = svg.getBoundingClientRect();
+      const svgX = ((ev.clientX - rect.left) / rect.width) * W;
+      if (svgX < PAD.left || svgX > W - PAD.right) return;
+      dragging = true;
+      interactingRef.current = true;
+      dragStartClientX = ev.clientX;
+      dragStartZoom = [...liveZoomRef.current];
+      svg.style.cursor = "grabbing";
+      ev.preventDefault();
+    };
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!dragging) return;
+      const rect = svg.getBoundingClientRect();
+      const dx = ev.clientX - dragStartClientX;
+      const [origS, origE] = dragStartZoom;
+      const range = origE - origS;
+      const chartPxWidth = rect.width * (cw / W);
+      const shift = -(dx / chartPxWidth) * range;
+      let ns = origS + shift, ne = origE + shift;
+      if (ns < 0) { ne -= ns; ns = 0; }
+      if (ne > 100) { ns -= ne - 100; ne = 100; }
+      ns = Math.max(0, ns); ne = Math.min(100, ne);
+      const next: ChartZoom = [ns, ne];
+      liveZoomRef.current = next;
+      setLiveZoom(next);
+    };
+    const onMouseUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      svg.style.cursor = "";
+      if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
+      commit();
+    };
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    svg.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+    return () => {
+      if (commitTimer) clearTimeout(commitTimer);
+      svg.removeEventListener("wheel", onWheel);
+      svg.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+      svg.style.cursor = "";
+    };
+  }, [editable, zoomMode]);
+
   if (!chartData) return null;
 
   const {
@@ -290,7 +415,11 @@ export function LosCrossSection({
     blocked, significantBuildings, minY, maxY, maxDistance, radarHeight,
   } = chartData;
 
-  const xScale = (d: number) => PAD.left + (d / maxDistance) * cw;
+  // X축 줌 윈도우 (liveZoom: [시작%, 끝%]). [0,100] 이면 전체.
+  const zoomStartKm = (liveZoom[0] / 100) * maxDistance;
+  const zoomEndKm = (liveZoom[1] / 100) * maxDistance;
+  const zoomRangeKm = Math.max(1e-6, zoomEndKm - zoomStartKm);
+  const xScale = (d: number) => PAD.left + ((d - zoomStartKm) / zoomRangeKm) * cw;
   const yScale = (h: number) => PAD.top + ch - ((h - minY) / (maxY - minY)) * ch;
 
   // 지형 채우기 (마지막 profile 포인트까지)
@@ -322,11 +451,15 @@ export function LosCrossSection({
   const maxYft = maxY * M_TO_FT;
   for (let yf = Math.ceil(minYft / yStepFt) * yStepFt; yf <= maxYft; yf += yStepFt) yTicks.push(yf / M_TO_FT);
 
-  // X축 눈금 (NM)
-  const maxDistNm = maxDistance * KM_TO_NM;
-  const xStepNm = maxDistNm > 80 ? 20 : maxDistNm > 40 ? 10 : maxDistNm > 15 ? 5 : maxDistNm > 5 ? 2 : 1;
+  // X축 눈금 (NM) — 줌 윈도우 기준
+  const zoomStartNm = zoomStartKm * KM_TO_NM;
+  const zoomEndNm = zoomEndKm * KM_TO_NM;
+  const visNm = zoomEndNm - zoomStartNm;
+  const xStepNm = visNm > 80 ? 20 : visNm > 40 ? 10 : visNm > 15 ? 5 : visNm > 5 ? 2 : visNm > 2 ? 1 : 0.5;
   const xTicks: number[] = [];
-  for (let xn = xStepNm; xn <= maxDistNm; xn += xStepNm) xTicks.push(xn / KM_TO_NM);
+  for (let xn = Math.ceil(zoomStartNm / xStepNm) * xStepNm; xn <= zoomEndNm + 1e-9; xn += xStepNm) {
+    if (xn >= zoomStartNm - 1e-9) xTicks.push(xn / KM_TO_NM);
+  }
 
   // 제목용 빌딩 메타
   const D = los.totalDistance;
@@ -378,7 +511,46 @@ export function LosCrossSection({
         </span>
       </div>
 
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 230 }}>
+      <div className="relative group">
+        {editable && (
+          <div className="absolute right-1 top-1 z-10 flex items-center gap-1 print:hidden">
+            {zoomMode ? (
+              <>
+                <span className="rounded bg-blue-500/90 px-1.5 py-0.5 text-[9px] font-medium text-white">
+                  휠 확대/축소 · 드래그 이동
+                </span>
+                <button type="button" onClick={resetZoom}
+                  className="rounded border border-gray-300 bg-white px-1.5 py-0.5 text-[9px] text-gray-600 hover:bg-gray-100">
+                  초기화
+                </button>
+                <button type="button" onClick={exitZoomMode}
+                  className="rounded border border-blue-400 bg-blue-50 px-1.5 py-0.5 text-[9px] font-medium text-blue-600 hover:bg-blue-100">
+                  완료
+                </button>
+              </>
+            ) : (
+              <button type="button" onClick={() => setZoomMode(true)}
+                className="rounded bg-black/40 px-1.5 py-0.5 text-[9px] text-white opacity-0 transition-opacity group-hover:opacity-100">
+                클릭하여 줌 편집
+              </button>
+            )}
+          </div>
+        )}
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${W} ${H}`}
+        className={`w-full ${zoomMode ? "rounded ring-2 ring-blue-400" : ""}`}
+        style={{
+          maxHeight: 230,
+          cursor: editable
+            ? (zoomMode
+                ? (liveZoom[0] !== 0 || liveZoom[1] !== 100 ? "grab" : "crosshair")
+                : "zoom-in")
+            : undefined,
+          touchAction: zoomMode ? "none" : undefined,
+        }}
+        onClick={editable && !zoomMode ? () => setZoomMode(true) : undefined}
+      >
         <defs>
           <clipPath id={`cc-${idSuffix}`}>
             <rect x={PAD.left} y={PAD.top} width={cw} height={ch} />
@@ -387,7 +559,7 @@ export function LosCrossSection({
 
         {/* Y축 라벨 (클립 밖) */}
         {yTicks.map((y) => {
-          const labelY = yScale(y - curvDrop(0));
+          const labelY = yScale(y - curvDrop(zoomStartKm));
           return (
             <text key={`yl-${y}`} x={PAD.left - 5} y={labelY + 3} textAnchor="end"
               fill="#6b7280" fontSize={9}>
@@ -408,7 +580,7 @@ export function LosCrossSection({
           {yTicks.map((y) => {
             const parts: string[] = [];
             for (let s = 0; s <= 50; s++) {
-              const dist = (s / 50) * maxDistance;
+              const dist = zoomStartKm + (s / 50) * zoomRangeKm;
               parts.push(`${s === 0 ? "M" : "L"} ${xScale(dist)} ${yScale(y - curvDrop(dist))}`);
             }
             return (
@@ -426,6 +598,21 @@ export function LosCrossSection({
           {/* 지형 — 솔리드 녹색 (그라데이션 제거: 바닥이 검게 보이는 문제 회피) */}
           <path d={terrainFill} fill="#22c55e" fillOpacity={0.35} />
           <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
+
+          {/* 항적 포인트 — 지형 위·LoS선/건물/소실표적 아래로 그려 다른 요소를 가리지 않게 함 */}
+          {trackPoints.map((tp, i) => {
+            const adjAlt = tp.altM - curvDrop(tp.distKm);
+            const px = xScale(tp.distKm);
+            const py = yScale(adjAlt);
+            const col = detectionTypeColor(tp.radarType);
+            const hasPsr = PSR_TYPES.has(tp.radarType);
+            return (
+              <circle key={`tp-${i}`} cx={px} cy={py} r={1.5}
+                fill={`rgb(${col[0]},${col[1]},${col[2]})`} fillOpacity={0.7}
+                stroke={hasPsr ? "rgba(255,255,255,0.6)" : "none"}
+                strokeWidth={hasPsr ? 1 : 0} />
+            );
+          })}
 
           {/* 건물 실루엣 — TrackMap 방식 (사다리꼴 / 세로선) */}
           {significantBuildings.map((b, bi) => {
@@ -486,20 +673,6 @@ export function LosCrossSection({
             {radarName} ({Math.round(radarHeight * M_TO_FT).toLocaleString()}ft)
           </text>
 
-          {/* 항적 포인트 */}
-          {trackPoints.map((tp, i) => {
-            const adjAlt = tp.altM - curvDrop(tp.distKm);
-            const px = xScale(tp.distKm);
-            const py = yScale(adjAlt);
-            const col = detectionTypeColor(tp.radarType);
-            const hasPsr = PSR_TYPES.has(tp.radarType);
-            return (
-              <circle key={`tp-${i}`} cx={px} cy={py} r={1.5}
-                fill={`rgb(${col[0]},${col[1]},${col[2]})`} fillOpacity={0.7}
-                stroke={hasPsr ? "rgba(255,255,255,0.6)" : "none"}
-                strokeWidth={hasPsr ? 1 : 0} />
-            );
-          })}
           {/* 소실표적 포인트 */}
           {lossPoints.map((lp, i) => {
             const adjAlt = lp.altM - curvDrop(lp.distKm);
@@ -595,6 +768,7 @@ export function LosCrossSection({
           })()}
         </g>
       </svg>
+      </div>
     </div>
   );
 }

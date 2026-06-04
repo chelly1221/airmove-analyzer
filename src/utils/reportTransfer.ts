@@ -58,6 +58,8 @@ export interface SerializedOMData {
   recommendText: string;
   /** 인라인 편집 텍스트 오버라이드 (편집키 → 사용자 수정 문구) */
   textOverrides?: Record<string, string>;
+  /** 차트 줌 상태 (편집키 → [시작%, 끝%]) */
+  chartZooms?: Record<string, [number, number]>;
   panoWithTargets: [string, PanoramaMergeResult][];
   panoWithoutTargets: [string, PanoramaMergeResult][];
   coverageStatus: "idle" | "loading" | "done" | "error";
@@ -125,6 +127,7 @@ export function serializeOMData(om: OMReportData): SerializedOMData {
     findingsText: om.findingsText,
     recommendText: om.recommendText,
     textOverrides: om.textOverrides ?? {},
+    chartZooms: om.chartZooms ?? {},
     panoWithTargets: [...om.panoWithTargets],
     panoWithoutTargets: [...om.panoWithoutTargets],
     coverageStatus: om.coverageStatus,
@@ -151,6 +154,7 @@ export function deserializeOMData(s: SerializedOMData): OMReportData {
     findingsText: s.findingsText,
     recommendText: s.recommendText,
     textOverrides: s.textOverrides ?? {},
+    chartZooms: s.chartZooms ?? {},
     panoWithTargets: new Map(s.panoWithTargets),
     panoWithoutTargets: new Map(s.panoWithoutTargets),
     coverageStatus: s.coverageStatus,

@@ -176,7 +176,16 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
         return { ...prev, textOverrides: next };
       });
     },
-  }), [template, omData?.textOverrides, onOmDataChange]);
+    chartZooms: omData?.chartZooms ?? {},
+    onChartZoom: (key: string, zoom: [number, number] | null) => {
+      onOmDataChange((prev) => {
+        const next = { ...(prev.chartZooms ?? {}) };
+        if (zoom == null) delete next[key];
+        else next[key] = zoom;
+        return { ...prev, chartZooms: next };
+      });
+    },
+  }), [template, omData?.textOverrides, omData?.chartZooms, onOmDataChange]);
 
   // 페이지 상단 머리띠 — 발행기관(metadata.organization) + 템플릿별 보고서 제목
   const pageHeaderText = useMemo(() => {
