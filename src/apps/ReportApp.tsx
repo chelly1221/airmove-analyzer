@@ -12,7 +12,6 @@ import Titlebar from "../components/Layout/Titlebar";
 import ReportPreviewContent, { getSectionToggles } from "../components/Report/ReportPreviewContent";
 import ReportOMSidebar, { type OMSidebarTocItem } from "../components/Report/ReportOMSidebar";
 import { useReportExport, type ReportSaveMeta } from "../components/Report/useReportExport";
-import type { OMSectionCaptureHandle } from "../components/Report/omCapture";
 import TemplateConfigModal from "../components/Report/TemplateConfigModal";
 import ObstacleMonthlyConfigModal from "../components/Report/ObstacleMonthlyConfigModal";
 import ObstaclePreScreeningModal from "../components/Report/ObstaclePreScreeningModal";
@@ -161,17 +160,6 @@ export default function ReportApp() {
   const previewRef = useRef<HTMLDivElement>(null);
   const { exportPDF } = useReportExport();
 
-  // ── OM 프리뷰 staging 동기화 ──
-  // 명령형 ref 기반 캡처 오케스트레이터:
-  //   1) coverage+panorama 완료 후 자식들이 mount → 각 자식이 setCaptureRef 로 핸들 등록
-  //   2) 오케스트레이터가 sequential 하게 handle.capture() 호출 → dataUrl 을 sectionImages 에 저장
-  //   3) 모든 섹션 처리 완료 시 omReady=true → 프리뷰 표시 + PDF 버튼 활성화
-  // captureMap 은 진행률 표시용. 외부 라이브러리/이벤트 의존 없음.
-  type CaptureEntry = { label: string; status: "pending" | "done" };
-  const [captureMap, setCaptureMap] = useState<Map<string, CaptureEntry>>(new Map());
-  const captureRefsRef = useRef<Map<string, OMSectionCaptureHandle>>(new Map());
-  const [orchestratorState, setOrchestratorState] = useState<"idle" | "running" | "done">("idle");
-
   // 파노라마 하위 단계 진행 상태 (레이더별 heightmap → GPU → merge)
   type PanoramaPhase = "heightmap" | "gpu" | "merge";
   type PanoramaProgress = {
@@ -193,14 +181,6 @@ export default function ReportApp() {
     }, 250);
     return () => clearInterval(id);
   }, [panoramaActive]);
-  // 자식 mount 시 capture handle 등록, unmount 시 해제
-  const setCaptureRef = useCallback((key: string, handle: OMSectionCaptureHandle | null) => {
-    if (handle) {
-      captureRefsRef.current.set(key, handle);
-    } else {
-      captureRefsRef.current.delete(key);
-    }
-  }, []);
 
   // ── OM 사이드바 상태 ──
   // 디자인 핸드오프 OM 사이드바: PDF 옵션(범위·용지) UI 상태 + 목차 active/페이지 추적.
@@ -212,24 +192,6 @@ export default function ReportApp() {
   const [omTotalPages, setOmTotalPages] = useState(0);
   // tocKey → 1-based 첫 페이지 인덱스 (DOM 측정 결과)
   const [omTocPageMap, setOmTocPageMap] = useState<Map<string, number>>(new Map());
-
-  // 진행률 표시용 — 오케스트레이터가 호출
-  const trackerRegister = useCallback((key: string, label: string) => {
-    setCaptureMap((m) => {
-      const next = new Map(m);
-      next.set(key, { label, status: "pending" });
-      return next;
-    });
-  }, []);
-  const trackerComplete = useCallback((key: string) => {
-    setCaptureMap((m) => {
-      const entry = m.get(key);
-      if (!entry || entry.status === "done") return m;
-      const next = new Map(m);
-      next.set(key, { ...entry, status: "done" });
-      return next;
-    });
-  }, []);
 
   /** IDB에서 페이로드 읽기 → state 적용 */
   const loadingRef = useRef(false);
@@ -361,8 +323,6 @@ export default function ReportApp() {
     const unlistenCov = listen<{
       covLayersWithBuildings: [string, CoverageLayer[]][];
       covLayersWithout: [string, CoverageLayer[]][];
-      /** 빌딩별 카운터팩추얼: radarName → [buildingId, layers][] */
-      covLayersWithoutPerBuilding: [string, [number, CoverageLayer[]][]][];
       coverageStatus: string;
     }>(
       "report:coverage-update",
@@ -370,21 +330,11 @@ export default function ReportApp() {
         const apply = () => {
           setOmData((prev) => {
             if (!prev) return prev;
-            const nextImages = new Map(prev.sectionImages);
-            for (const key of nextImages.keys()) {
-              if (key.startsWith("cov-") || key.startsWith("loss-ev") || key.startsWith("obs-")) nextImages.delete(key);
-            }
-            const perBld = new Map<string, Map<number, CoverageLayer[]>>();
-            for (const [rname, entries] of event.payload.covLayersWithoutPerBuilding ?? []) {
-              perBld.set(rname, new Map(entries));
-            }
             return {
               ...prev,
               covLayersWithBuildings: new Map(event.payload.covLayersWithBuildings),
               covLayersWithout: new Map(event.payload.covLayersWithout),
-              covLayersWithoutPerBuilding: perBld,
               coverageStatus: event.payload.coverageStatus as OMReportData["coverageStatus"],
-              sectionImages: nextImages,
             };
           });
         };
@@ -439,101 +389,15 @@ export default function ReportApp() {
     return covReady && panoReady;
   }, [activeTemplate, omData]);
 
-  // ── 캡처 오케스트레이터 ──
-  // coverage + panorama 가 done 이고 preview 가 mount 가능한 시점에 시작.
-  // omData.result identity 가 변경되면 새 작업 사이클로 간주 (편집 reload 등).
-  const omDataRef = useRef(omData);
-  omDataRef.current = omData;
-  useEffect(() => {
-    if (activeTemplate !== "obstacle_monthly" || !omData || !previewMountable) {
-      setOrchestratorState("idle");
-      setCaptureMap(new Map());
-      return;
-    }
-    let cancelled = false;
-    setOrchestratorState("running");
-    setCaptureMap(new Map());
-
-    // 자식 mount 가 완료되어 ref 가 등록될 시간을 약간 확보.
-    // (자식 useEffect 실행 → setCaptureRef 호출은 mount cycle 직후 이루어짐)
-    const startTimer = setTimeout(async () => {
-      if (cancelled) return;
-      const data = omDataRef.current;
-      if (!data) { setOrchestratorState("done"); return; }
-
-      // 캡처 대상 섹션 목록 산출 — 현재 OM 보고서는 캡처 대상이 없음
-      // (커버리지 비교맵 / 장애물 상세 다이프 제거됨. 남은 섹션들은 라이브 렌더만 사용)
-      const tasks: { key: string; label: string }[] = [];
-      // 진행률 표시용 일괄 등록
-      for (const t of tasks) trackerRegister(t.key, t.label);
-      console.log(`[OMCapture] orchestrator 시작 (${tasks.length}개 섹션)`);
-
-      // 직렬 처리 — 동시 캡처가 메인 스레드 경합을 일으킬 수 있어 직렬이 안전
-      for (const t of tasks) {
-        if (cancelled) return;
-        // 이미 캡처된 항목은 건너뛰기
-        const cached = omDataRef.current?.sectionImages.get(t.key);
-        if (cached) {
-          trackerComplete(t.key);
-          continue;
-        }
-        const handle = captureRefsRef.current.get(t.key);
-        if (!handle) {
-          console.warn(`[OMCapture] ${t.key} ref 미등록 — skip`);
-          trackerComplete(t.key);
-          continue;
-        }
-        const t0 = performance.now();
-        try {
-          const url = await handle.capture();
-          if (cancelled) return;
-          if (url) {
-            setOmData((prev) => {
-              if (!prev) return prev;
-              const next = new Map(prev.sectionImages);
-              next.set(t.key, url);
-              return { ...prev, sectionImages: next };
-            });
-          }
-          console.log(`[OMCapture] ${t.key} 완료 (${(performance.now() - t0).toFixed(0)}ms${url ? "" : ", null"})`);
-        } catch (err) {
-          console.warn(`[OMCapture] ${t.key} 실패 (${(performance.now() - t0).toFixed(0)}ms):`, err);
-        }
-        trackerComplete(t.key);
-      }
-
-      if (!cancelled) {
-        console.log("[OMCapture] orchestrator 완료");
-        setOrchestratorState("done");
-      }
-    }, 100);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(startTimer);
-    };
-  }, [activeTemplate, omData?.result, omData?.coverageStatus, omData?.panoramaStatus, previewMountable, trackerRegister, trackerComplete]);
-
-  // captureMap 기반 카운트 파생
-  const { captureTotal, captureDone } = useMemo(() => {
-    let total = 0, done = 0;
-    for (const v of captureMap.values()) {
-      total++;
-      if (v.status === "done") done++;
-    }
-    return { captureTotal: total, captureDone: done };
-  }, [captureMap]);
-
   // ── OM 준비 완료 여부 ──
-  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료 (3) 오케스트레이터 done
+  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료
   const omReady = useMemo(() => {
     if (activeTemplate !== "obstacle_monthly") return true;
     if (!omData) return false;
     const covReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
     const panoReady = omData.panoramaStatus === "done";
-    if (!covReady || !panoReady) return false;
-    return orchestratorState === "done";
-  }, [activeTemplate, omData, orchestratorState]);
+    return covReady && panoReady;
+  }, [activeTemplate, omData]);
   const omPreparing = activeTemplate === "obstacle_monthly" && !omReady;
 
   // ── OM 사이드바: 페이지/활성 섹션 측정 ──
@@ -693,7 +557,7 @@ export default function ReportApp() {
     exportTimerRef.current = setInterval(() => setExportElapsed((p) => p + 1), 1000);
 
     // 프리뷰가 이미 ready 상태일 때만 이 함수에 도달 (버튼 disabled 가드).
-    // 모든 OMSectionImage가 <img>로 치환된 정적 DOM을 PrintToPdf가 스냅샷한다.
+    // 라이브 렌더된 정적 DOM을 PrintToPdf가 스냅샷한다.
     // 마지막 paint 동기화로 overlay 해제 직후 레이아웃 확정.
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     try {
@@ -712,7 +576,6 @@ export default function ReportApp() {
         coverSubtitle,
         commentary,
         omFindingsText: omData?.findingsText ?? "",
-        omRecommendText: omData?.recommendText ?? "",
         omTextOverrides: omData?.textOverrides ?? {},
         omChartZooms: omData?.chartZooms ?? {},
         mapImage: state.mapImage,
@@ -793,7 +656,6 @@ export default function ReportApp() {
     losMap: Map<string, LoSProfileData>,
     covWith: Map<string, CoverageLayer[]>,
     covWithout: Map<string, CoverageLayer[]>,
-    covWithoutPerBuilding: Map<string, Map<number, CoverageLayer[]>>,
     monthStr?: string,
   ) => {
     const newOmData: OMReportData = {
@@ -805,7 +667,6 @@ export default function ReportApp() {
       losMap,
       covLayersWithBuildings: covWith,
       covLayersWithout: covWithout,
-      covLayersWithoutPerBuilding: covWithoutPerBuilding,
       analysisMonth: monthStr ?? "",
       findingsText: generateOMFindingsText({
         radarResults: result.radar_results,
@@ -816,12 +677,10 @@ export default function ReportApp() {
         covLayersWithout: covWithout,
         analysisMonth: monthStr ?? "",
       }),
-      recommendText: "",
       textOverrides: {},
       chartZooms: {},
       coverageStatus: covWith.size > 0 ? "done" : "loading",
       panoramaStatus: "deferred",
-      sectionImages: new Map(),
       panoWithTargets: new Map(),
       panoWithoutTargets: new Map(),
     };
@@ -842,10 +701,9 @@ export default function ReportApp() {
     const lightOmData: OMReportData = {
       ...newOmData,
       result: lightResult,
-      // 커버리지 레이어(베이스라인·합산·빌딩별)는 IDB에 저장하여 새로고침 시에도 복원
+      // 커버리지 레이어(베이스라인·합산)는 IDB에 저장하여 새로고침 시에도 복원
       covLayersWithBuildings: covWith,
       covLayersWithout: covWithout,
-      covLayersWithoutPerBuilding: covWithoutPerBuilding,
       coverageStatus: covWith.size > 0 ? "done" : "idle",
     };
 
@@ -896,26 +754,18 @@ export default function ReportApp() {
   }, []);
 
   // ── 커버리지 콜백 (모달 언마운트 후에도 동작) ──
-  // PS(사전검토) 모달은 빌딩별 데이터를 보내지 않으므로 3번째 인자는 선택적.
   const handleCoverageReady = useCallback((
     covWith: Map<string, CoverageLayer[]>,
     covWithout: Map<string, CoverageLayer[]>,
-    covWithoutPerBuilding?: Map<string, Map<number, CoverageLayer[]>>,
   ) => {
     // 보고서 창 내부에서 직접 omData 업데이트
     setOmData((prev) => {
       if (!prev) return prev;
-      const nextImages = new Map(prev.sectionImages);
-      for (const key of nextImages.keys()) {
-        if (key.startsWith("cov-") || key.startsWith("loss-ev") || key.startsWith("obs-")) nextImages.delete(key);
-      }
       return {
         ...prev,
         covLayersWithBuildings: covWith,
         covLayersWithout: covWithout,
-        covLayersWithoutPerBuilding: covWithoutPerBuilding ?? prev.covLayersWithoutPerBuilding,
         coverageStatus: "done",
-        sectionImages: nextImages,
       };
     });
   }, []);
@@ -1092,10 +942,6 @@ export default function ReportApp() {
       panoramaProgress={panoramaProgress}
       panoramaElapsedMs={panoramaElapsedMs}
       panoramaLastError={panoramaLastError}
-      captureMap={captureMap}
-      captureDone={captureDone}
-      captureTotal={captureTotal}
-      orchestratorState={orchestratorState}
       omReady={omReady}
       onComplete={() => setConfigPayload(null)}
     />
@@ -1279,19 +1125,11 @@ export default function ReportApp() {
           : omData.coverageStatus !== "done" && omData.coverageStatus !== "error" ? "waiting"
           : omData.panoramaStatus === "loading" ? "active"
           : "waiting";
-        const captureStage: StageStatus =
-          coverageStage !== "done" && coverageStage !== "error" ? "waiting"
-          : panoramaStage !== "done" ? "waiting"
-          : orchestratorState === "running" && captureTotal === 0 ? "active"
-          : captureTotal === 0 ? "waiting"
-          : captureDone === captureTotal ? "done"
-          : "active";
 
-        const totalSteps = 2 + Math.max(1, captureTotal);
+        const totalSteps = 2;
         const doneSteps =
           (coverageStage === "done" || coverageStage === "error" ? 1 : 0)
-          + (panoramaStage === "done" ? 1 : 0)
-          + captureDone;
+          + (panoramaStage === "done" ? 1 : 0);
         const percent = Math.round((doneSteps / totalSteps) * 100);
 
         const StageIcon = ({ status }: { status: StageStatus }) => {
@@ -1326,12 +1164,6 @@ export default function ReportApp() {
           : omData.panoramaStatus === "loading"
             ? `${omData.panoWithTargets.size}/${omData.selectedRadarSites.length} 레이더 계산 중 — 진행 상세 대기`
           : "초기화 중";
-        const captureDetail =
-          coverageBlocking ? "커버리지 대기 중"
-          : omData.panoramaStatus !== "done" ? "파노라마 대기 중"
-          : orchestratorState === "running" && captureTotal === 0 ? "섹션 컴포넌트 마운트 중"
-          : captureTotal === 0 ? "오케스트레이터 시작 대기"
-          : `${captureDone}/${captureTotal} 섹션 캡처 진행`;
 
         return (
           <div className="absolute inset-0 top-[44px] z-30 flex items-center justify-center bg-white/95 backdrop-blur-sm">
@@ -1368,29 +1200,6 @@ export default function ReportApp() {
                     <p className={`text-xs ${stalled ? "text-amber-600" : "text-gray-400"}`}>{panoramaDetail}</p>
                     {panoramaLastError && (
                       <p className="mt-1 text-[11px] text-red-500">오류: {panoramaLastError}</p>
-                    )}
-                  </div>
-                </div>
-
-                {/* Stage 3: 섹션 캡처 */}
-                <div className="flex items-start gap-2.5">
-                  <div className="mt-0.5"><StageIcon status={captureStage} /></div>
-                  <div className="flex-1">
-                    <p className={`text-sm ${stageTextClass(captureStage)}`}>섹션 이미지 캡처</p>
-                    <p className="text-xs text-gray-400">{captureDetail}</p>
-                    {captureTotal > 0 && (
-                      <div className="mt-2 flex flex-col gap-1">
-                        {[...captureMap.entries()].map(([key, entry]) => (
-                          <div key={key} className="flex items-center gap-2 text-[11px]">
-                            {entry.status === "done"
-                              ? <Check size={11} className="text-emerald-500" strokeWidth={3} />
-                              : <Loader2 size={11} className="animate-spin text-[#a60739]" />}
-                            <span className={entry.status === "done" ? "text-gray-400" : "text-gray-700"}>
-                              {entry.label}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
                     )}
                   </div>
                 </div>
@@ -1447,7 +1256,6 @@ export default function ReportApp() {
         forceAllVisible={forceAllVisible}
         onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
         singleFlightChartPoints={state.singleFlightChartPoints}
-        setCaptureRef={setCaptureRef}
         previewRef={previewRef}
       />
     </div>

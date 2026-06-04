@@ -101,11 +101,6 @@ export function weightedBaselineLossStdDev(stats: DailyStats[]): number {
   return weightedStdDev(stats, (d) => d.baseline_loss_rate, (d) => d.total_track_time_secs);
 }
 
-/** 기준선 PSR율 가중 평균 — 가중치: ssr_combined_points, 결과 0–1 */
-export function weightedBaselinePsrAvg(stats: DailyStats[]): number {
-  return weightedAvg(stats, (d) => d.baseline_psr_rate, (d) => d.ssr_combined_points);
-}
-
 /**
  * 판정 등급 (관측일수 < 7이면 판정 보류)
  *

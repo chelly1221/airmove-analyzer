@@ -44,3 +44,4 @@ downloads/
 
 # Claude Code 로컬 상태
 .claude/scheduled_tasks.lock
+.claude/settings.json

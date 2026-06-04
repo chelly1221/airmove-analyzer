@@ -82,21 +82,16 @@ pub struct DailyStats {
     pub date: String,        // "2024-01-15"
     pub day_of_month: u8,
     pub week_num: u8,        // 1~5
-    pub total_points: u32,
     pub ssr_combined_points: u32,  // SSR + combined (분모)
-    pub psr_combined_points: u32,  // PSR + combined (분자)
     pub psr_rate: f64,
     pub total_track_time_secs: f64,
     pub total_loss_time_secs: f64,
     pub loss_rate: f64,
     pub loss_points_summary: Vec<LossPointGeo>,
-    /// 나머지 방위(분석 구간 제외) 베이스라인 Loss 포인트 좌표
-    #[serde(default)]
-    pub baseline_loss_points: Vec<LossPointGeo>,
-    /// 나머지 방위(분석 구간 제외) 베이스라인 Loss율 (%)
+    /// 전체 방위(분석 구간 포함) 기준 Loss율 (%)
     #[serde(default)]
     pub baseline_loss_rate: f64,
-    /// 나머지 방위 베이스라인 PSR율 (0~1)
+    /// 전체 방위(분석 구간 포함) 기준 PSR율 (0~1)
     #[serde(default)]
     pub baseline_psr_rate: f64,
     /// 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용)
@@ -166,7 +161,6 @@ impl LightPoint {
 struct BaselineDayResult {
     psr_rate: f64,
     loss_rate: f64,
-    loss_points: Vec<LossPointGeo>,
 }
 
 /// 기존 알고리즘 그대로: 하루치 베이스라인 포인트를 mode_s별 그룹핑하여
@@ -177,7 +171,7 @@ fn process_baseline_day(
     radar_lon: f64,
 ) -> BaselineDayResult {
     if bl_points.is_empty() {
-        return BaselineDayResult { psr_rate: 0.0, loss_rate: 0.0, loss_points: Vec::new() };
+        return BaselineDayResult { psr_rate: 0.0, loss_rate: 0.0 };
     }
 
     // PSR 베이스라인
@@ -198,7 +192,6 @@ fn process_baseline_day(
     }
     let mut bl_track_time = 0.0f64;
     let mut bl_loss_time = 0.0f64;
-    let mut loss_points: Vec<LossPointGeo> = Vec::new();
 
     for (_ms, mut pts) in bl_ms_groups {
         if pts.len() < 2 { continue; }
@@ -240,22 +233,12 @@ fn process_baseline_day(
                     || speed_change > OM_SPEED_CHANGE_RATIO;
                 if !is_oor {
                     bl_loss_time += gap;
-                    let total_missed = ((gap / bl_scan).round() as u32).saturating_sub(1).max(1);
-                    for si in 1..=total_missed {
-                        let t = si as f64 / (total_missed as f64 + 1.0);
-                        loss_points.push(LossPointGeo {
-                            lat: prev.latitude + (next.latitude - prev.latitude) * t,
-                            lon: prev.longitude + (next.longitude - prev.longitude) * t,
-                            alt_ft: (prev.altitude + (next.altitude - prev.altitude) * t) * 3.28084,
-                            duration_s: gap,
-                        });
-                    }
                 }
             }
         }
     }
     let loss_rate = if bl_track_time > 0.0 { (bl_loss_time / bl_track_time) * 100.0 } else { 0.0 };
-    BaselineDayResult { psr_rate, loss_rate, loss_points }
+    BaselineDayResult { psr_rate, loss_rate }
 }
 
 /// track_points_geo 포함 여부: 건물 방위 ±5° 이내인지 확인
@@ -435,39 +418,34 @@ pub fn analyze_radar_monthly(
                 continue;
             }
 
+            // 장애물 후방 필터: 장애물보다 먼 항적만 포함
+            // (분석 대상 + 전체 방위 베이스라인에 공통 적용)
+            if radar.min_obstacle_distance_km > 0.0 {
+                let dist = calculate_haversine_distance(
+                    radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude,
+                );
+                if dist < radar.min_obstacle_distance_km {
+                    continue;
+                }
+            }
+
             // 방위 필터링
             let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude);
             let in_sector = in_any_sector(az, &radar.azimuth_sectors);
+            let date = timestamp_to_date(tp.timestamp);
 
+            // 분석 대상: 방위 구간 내 항적
             if in_sector {
-                // 장애물 후방 필터: 장애물보다 먼 항적만 포함
-                if radar.min_obstacle_distance_km > 0.0 {
-                    let dist = calculate_haversine_distance(
-                        radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude,
-                    );
-                    if dist < radar.min_obstacle_distance_km {
-                        continue;
-                    }
-                }
-
-                let date = timestamp_to_date(tp.timestamp);
                 daily_points
-                    .entry(date)
+                    .entry(date.clone())
                     .or_default()
                     .push(LightPoint::from_track_point(tp));
                 total_filtered += 1;
-            } else if has_sectors {
-                // 나머지 방위 → 베이스라인 버킷 (거리 필터 동일 적용)
-                if radar.min_obstacle_distance_km > 0.0 {
-                    let dist = calculate_haversine_distance(
-                        radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude,
-                    );
-                    if dist < radar.min_obstacle_distance_km {
-                        continue;
-                    }
-                }
+            }
 
-                let date = timestamp_to_date(tp.timestamp);
+            // 비교기준(베이스라인) = 전체 방위 (분석 구간 포함).
+            // 나머지 방위만이 아니라 전 방위 항적을 기준선으로 삼는다.
+            if has_sectors {
                 if date > latest_date_seen {
                     latest_date_seen = date.clone();
                 }
@@ -596,7 +574,6 @@ pub fn analyze_radar_monthly(
         };
 
         // PSR 통계 (60NM 이내만)
-        let total_pts = points.len() as u32;
         let ssr_combined = points.iter().filter(|p| {
             let dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
             dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
@@ -718,15 +695,15 @@ pub fn analyze_radar_monthly(
             0.0
         };
 
-        // ── 베이스라인 (나머지 방위) 일별 통계 — 플러시 결과 사용 ──
-        let (baseline_loss_rate, baseline_psr_rate, day_baseline_loss_points) = if has_sectors {
+        // ── 베이스라인 (전체 방위) 일별 통계 — 플러시 결과 사용 ──
+        let (baseline_loss_rate, baseline_psr_rate) = if has_sectors {
             if let Some(bl) = baseline_results.remove(date) {
-                (bl.loss_rate, bl.psr_rate, bl.loss_points)
+                (bl.loss_rate, bl.psr_rate)
             } else {
-                (0.0, 0.0, Vec::new())
+                (0.0, 0.0)
             }
         } else {
-            (0.0, 0.0, Vec::new())
+            (0.0, 0.0)
         };
 
         // 날짜에서 day_of_month 추출
@@ -736,15 +713,12 @@ pub fn analyze_radar_monthly(
             date: date.clone(),
             day_of_month: dom,
             week_num: week_num(dom),
-            total_points: total_pts,
             ssr_combined_points: ssr_combined,
-            psr_combined_points: psr_combined,
             psr_rate,
             total_track_time_secs: day_track_time,
             total_loss_time_secs: day_loss_time,
             loss_rate,
             loss_points_summary: day_loss_points,
-            baseline_loss_points: day_baseline_loss_points,
             baseline_loss_rate,
             baseline_psr_rate,
             track_points_geo: day_track_geo,

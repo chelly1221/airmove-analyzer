@@ -16,7 +16,7 @@
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult, BuildingObstacle } from "../../types";
 import type { LossPointGeo } from "../../types/obstacle";
-import { classifyObstacleLosses, calcBuildingAzExtent } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, calcBuildingAzExtent, makeTerrainSampler, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import OMEditable from "./OMEditable";
 
 const KM_PER_NM = 1.852;
@@ -79,15 +79,10 @@ function buildSilhouetteLines(
     return a.elev + (b.elev - a.elev) * t;
   };
 
-  // 지형 점 → rel 정렬 (윈도우 약간 확장)
-  const tPts: SilPoint[] = (pWith.terrain ?? [])
-    .map((p) => ({ rel: REL(p.azimuth_deg), elev: Math.max(0, p.elevation_angle_deg) }))
-    .filter((p) => Math.abs(p.rel) <= azHalfSpan + 1)
-    .sort((a, b) => a.rel - b.rel);
-  const terrainAt = (rel: number) => {
-    const v = interp(tPts, rel);
-    return v === -Infinity ? 0 : v;
-  };
+  // 지형 차단각 — 분류(makePanoramaSampler)와 동일한 전역 원형 보간 샘플러 공유 → 검은×↔빨강영역 픽셀 일치.
+  //   (rel → 절대 방위 = azCenter + rel; 샘플러가 내부에서 360° 정규화·래핑 처리)
+  const terrainSampler = makeTerrainSampler(pWith.terrain);
+  const terrainAt = (rel: number) => terrainSampler(azCenter + rel);
 
   // 건물 → rel 전처리 (방위별 실루엣 폴리라인 or 단순 밴드)
   type Prep =
@@ -163,18 +158,21 @@ interface Props {
   panoWithout?: PanoramaMergeResult;
   /** 이 레이더의 모든 소실표적 (방위 윈도우 + 대상 후방 필터링은 내부에서) */
   lossPoints: LossPointGeo[];
+  /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적 오귀속 방지용 (분류 내부에서 사용) */
+  siblings?: SiblingBuilding[];
 }
 
 export default function ReportOMObstacleAzElevChart({
-  radarSite, building, los, panoWith, panoWithout, lossPoints,
+  radarSite, building, los, panoWith, panoWithout, lossPoints, siblings,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // 건물 메타 + 소실표적 분류 — obstacleAnalysisHelpers 의 단일 소스 사용
-  // (요약 표의 '음영 소실' 건수와 이 차트의 빨강 점 분류가 항상 일치)
+  // 건물 메타 + 소실표적 분류 — obstacleAnalysisHelpers 의 단일 소스 사용.
+  //  panoWith/panoWithout 제공 시 차단각을 panorama(빨강영역과 동일 소스)에서 산출 → 검은× 점이 빨강영역과 픽셀 일치.
+  //  (요약 표의 '음영 소실' 건수와 이 차트의 빨강 점 분류가 항상 일치 — 양쪽 동일 panorama·sibling 인자)
   const computed = useMemo(
-    () => classifyObstacleLosses(radarSite, building, los, lossPoints),
-    [radarSite, building, los, lossPoints],
+    () => classifyObstacleLosses(radarSite, building, los, lossPoints, { panoWith, panoWithout, siblings }),
+    [radarSite, building, los, lossPoints, panoWith, panoWithout, siblings],
   );
 
   // 분석 대상 포함/제외 파노라마 (terrain 공유 + buildings 배열만 다름)
@@ -303,10 +301,47 @@ export default function ReportOMObstacleAzElevChart({
     ctx.lineTo(MARGIN.left + INNER_W, yScale(0));
     ctx.stroke();
 
-    // 방위별 실루엣 윗변 — without(녹색 base) / with(분석 대상 포함). 동일 rel 격자.
     const { withoutLine, withLine } = sil;
     const clamp0 = (e: number) => (e < 0 ? 0 : e);
 
+    // 소실표적 — 먼저 그려서 실루엣 영역 아래로 깔린다.
+    // (지형/추가차단 영역을 점 위에 겹쳐 그려야 영역이 분포에 묻히지 않고 잘 보임)
+    // 1) 장애물 무관 (파란점)
+    ctx.fillStyle = "rgba(59,130,246,0.3)";
+    for (const l of computed.losses) {
+      if (l.inShadow || l.elevAngleDeg < 0) continue;
+      const x = xScale(l.azDeg);
+      const y = yScale(l.elevAngleDeg);
+      ctx.fillRect(x - 0.75, y - 0.75, 1.5, 1.5);
+    }
+    // 2) 지형 차단 (회색 원)
+    ctx.fillStyle = "rgba(107,114,128,0.7)";
+    for (const l of computed.losses) {
+      if (!l.inShadow || l.buildingCaused || l.elevAngleDeg < 0) continue;
+      const x = xScale(l.azDeg);
+      const y = yScale(l.elevAngleDeg);
+      ctx.beginPath();
+      ctx.arc(x, y, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // 3) 장애물 추가 기인 (검은 ×)
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 1.4;
+    for (const l of computed.losses) {
+      if (!l.buildingCaused || l.elevAngleDeg < 0) continue;
+      const x = xScale(l.azDeg);
+      const y = yScale(l.elevAngleDeg);
+      const s = 2.8;
+      ctx.beginPath();
+      ctx.moveTo(x - s, y - s);
+      ctx.lineTo(x + s, y + s);
+      ctx.moveTo(x + s, y - s);
+      ctx.lineTo(x - s, y + s);
+      ctx.stroke();
+    }
+
+    // 방위별 실루엣 윗변 — 소실표적 위에 겹쳐 그림 (반투명 영역이 분포 위로 올라와 잘 보임).
+    // without(녹색 base) / with(분석 대상 포함). 동일 rel 격자.
     if (withoutLine.length >= 2) {
       // 1) 베이스: 지형 + 기존 지형지물 (without 윗변 아래, 연두)
       ctx.beginPath();
@@ -352,41 +387,6 @@ export default function ReportOMObstacleAzElevChart({
     }
 
     // (분석 대상 방위 마커 제거 — 대상 차단각 높이는 연홍색 '추가 차단' 영역이 표현)
-
-    // 소실표적
-    // 1) 장애물 무관 (파란점)
-    ctx.fillStyle = "rgba(59,130,246,0.3)";
-    for (const l of computed.losses) {
-      if (l.inShadow || l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      ctx.fillRect(x - 0.75, y - 0.75, 1.5, 1.5);
-    }
-    // 2) 지형 차단 (회색 원)
-    ctx.fillStyle = "rgba(107,114,128,0.7)";
-    for (const l of computed.losses) {
-      if (!l.inShadow || l.buildingCaused || l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      ctx.beginPath();
-      ctx.arc(x, y, 1.8, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    // 3) 장애물 추가 기인 (검은 ×)
-    ctx.strokeStyle = "#000";
-    ctx.lineWidth = 1.4;
-    for (const l of computed.losses) {
-      if (!l.buildingCaused || l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      const s = 2.8;
-      ctx.beginPath();
-      ctx.moveTo(x - s, y - s);
-      ctx.lineTo(x + s, y + s);
-      ctx.moveTo(x + s, y - s);
-      ctx.lineTo(x - s, y + s);
-      ctx.stroke();
-    }
 
     ctx.restore();
 

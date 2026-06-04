@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, AzSector, LoSProfileData, LossPointGeo } from "../../types";
+import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, AzSector, LoSProfileData, LossPointGeo, PanoramaMergeResult } from "../../types";
 import {
   weightedLossAvg, weightedLossStdDev,
   weightedPsrAvg, weightedPsrStdDev,
@@ -31,6 +31,9 @@ interface Props {
   azimuthSectorsByRadar: Map<string, AzSector[]>;
   /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) — 차단여부·음영소실 열용 */
   losMap: Map<string, LoSProfileData>;
+  /** 레이더별 분석대상 포함/제외 파노라마 — 음영소실 분류를 AzElev 차트와 동일 소스(빨강영역)로 산출 */
+  panoWithByRadar?: Map<string, PanoramaMergeResult>;
+  panoWithoutByRadar?: Map<string, PanoramaMergeResult>;
 }
 
 /**
@@ -58,6 +61,8 @@ function ReportOMSummarySection({
   radarSites,
   azimuthSectorsByRadar,
   losMap,
+  panoWithByRadar,
+  panoWithoutByRadar,
 }: Props) {
   // 레이더별 소실표적 (음영소실 분류용) — daily_stats 의 loss_points_summary 집계
   const lossPointsByRadar = useMemo(() => {
@@ -72,19 +77,35 @@ function ReportOMSummarySection({
     return m;
   }, [radarResults]);
 
+  // radar 좌표 시그니처 — radarSites 객체가 in-place 변경(참조 유지)돼도 재계산 트리거.
+  //   Detail.siblings 가 [radarSite.latitude, radarSite.longitude] 에 의존 → 동일 민감도로 동기화(sibling 오귀속 일치).
+  const radarGeoKey = radarSites.map((r) => `${r.latitude},${r.longitude},${r.name}`).join(";");
+
   // 건물×레이더 음영소실(장애물 추가 기인) 건수 — AzElevChart 와 동일 분류(classifyObstacleLosses)
   const shadowLossByKey = useMemo(() => {
     const m = new Map<string, number>();
-    for (const b of selectedBuildings) {
-      for (const r of radarSites) {
+    for (const r of radarSites) {
+      // 같은 레이더의 건물별 방위 (sibling 오귀속 방지용 — 가장 가까운 방위 건물에 귀속)
+      const azByBldg = selectedBuildings.map((b) => ({
+        id: b.id,
+        azDeg: bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude),
+        distKm: haversineKm(r.latitude, r.longitude, b.latitude, b.longitude),
+      }));
+      for (const b of selectedBuildings) {
         const los = losMap.get(`${r.name}_${b.id}`);
         if (!los) continue;
-        const { buildingCount } = classifyObstacleLosses(r, b, los, lossPointsByRadar.get(r.name) ?? []);
+        const siblings = azByBldg.filter((x) => x.id !== b.id).map((x) => ({ id: x.id, azDeg: x.azDeg, distKm: x.distKm }));
+        const { buildingCount } = classifyObstacleLosses(r, b, los, lossPointsByRadar.get(r.name) ?? [], {
+          panoWith: panoWithByRadar?.get(r.name),
+          panoWithout: panoWithoutByRadar?.get(r.name),
+          siblings,
+        });
         m.set(`${r.name}_${b.id}`, buildingCount);
       }
     }
     return m;
-  }, [selectedBuildings, radarSites, losMap, lossPointsByRadar]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- radarGeoKey 는 radarSites 가 참조 유지된 채 좌표만 in-place 변경돼도 재계산시키기 위함(rule 이 루프 내 r.latitude/longitude 접근을 추적 못해 'unnecessary' 로 오판). Detail.siblings 와 동기화 보장.
+  }, [selectedBuildings, radarSites, radarGeoKey, losMap, lossPointsByRadar, panoWithByRadar, panoWithoutByRadar]);
 
   // 첫 페이지에 들어갈 수 있는 건물 행 수 계산
   const fixedContentMm = HEADER_HEIGHT_MM + TABLE_HEADER_MM + META_MERGED_MM

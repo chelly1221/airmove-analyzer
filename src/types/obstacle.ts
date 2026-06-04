@@ -38,19 +38,15 @@ export interface DailyStats {
   date: string;
   day_of_month: number;
   week_num: number;
-  total_points: number;
   ssr_combined_points: number;
-  psr_combined_points: number;
   psr_rate: number;
   total_track_time_secs: number;
   total_loss_time_secs: number;
   loss_rate: number;
   loss_points_summary: LossPointGeo[];
-  /** 나머지 방위(분석 구간 제외) 베이스라인 Loss 포인트 좌표 */
-  baseline_loss_points: LossPointGeo[];
-  /** 나머지 방위(분석 구간 제외) 베이스라인 Loss율 (%) */
+  /** 전체 방위(분석 구간 포함) 기준 Loss율 (%) */
   baseline_loss_rate: number;
-  /** 나머지 방위 베이스라인 PSR율 (0~1) */
+  /** 전체 방위(분석 구간 포함) 기준 PSR율 (0~1) */
   baseline_psr_rate: number;
   /** 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용) */
   track_points_geo?: TrackPointGeo[];
@@ -92,12 +88,8 @@ export interface OMReportData {
   /** 레이더별 커버리지 레이어 (key: radarName) */
   covLayersWithBuildings: Map<string, import("../utils/radarCoverage").CoverageLayer[]>;
   covLayersWithout: Map<string, import("../utils/radarCoverage").CoverageLayer[]>;
-  /** 빌딩별 카운터팩추얼 레이어 — 빌딩 한 채만 제외했을 때의 커버리지.
-   *  반환: radarName → buildingId → layers. 빌딩의 한계 영향 분석용. */
-  covLayersWithoutPerBuilding: Map<string, Map<number, import("../utils/radarCoverage").CoverageLayer[]>>;
   analysisMonth: string;
   findingsText: string;
-  recommendText: string;
   /** 인라인 편집 텍스트 오버라이드 (편집키 → 사용자 수정 문구). 기본 자동 문구를 덮어씀. */
   textOverrides?: Record<string, string>;
   /** 차트 줌 상태 (편집키 → [시작%, 끝%], 0~100). LoS 단면도 X축 줌 등. PDF·재로딩에 반영. */
@@ -106,6 +98,4 @@ export interface OMReportData {
   panoWithoutTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   coverageStatus: "idle" | "loading" | "done" | "error";
   panoramaStatus: "idle" | "deferred" | "loading" | "done" | "error";
-  /** 차트 섹션 사전 캡처 이미지 (key: sectionId, value: WebP data URL) */
-  sectionImages: Map<string, string>;
 }

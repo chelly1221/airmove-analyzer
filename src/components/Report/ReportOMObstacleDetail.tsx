@@ -1,7 +1,7 @@
 import React, { useMemo } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult } from "../../types";
 import type { LossPointGeo, TrackPointGeo, ObstacleMonthlyResult } from "../../types/obstacle";
-import { haversineKm } from "../../utils/geo";
+import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
@@ -22,12 +22,25 @@ interface Props {
   panoWith?: PanoramaMergeResult;
   /** 이 레이더의 분석 대상 제외 파노라마 (Az×Elev 차트용) */
   panoWithout?: PanoramaMergeResult;
+  /** 선택된 전체 분석 대상 건물 — 소실표적 오귀속 방지(가장 가까운 방위 건물에 귀속)용 sibling 방위 계산 */
+  allBuildings: ManualBuilding[];
 }
 
 /** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. 빌딩 메타 + LoS 단면도 + Az×Elev 차트. */
 function ReportOMObstacleDetail({
-  sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout,
+  sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout, allBuildings,
 }: Props) {
+  // 같은 레이더의 '다른' 분석 대상 건물(방위+거리) — 소실표적을 더 강하게 소유하는 건물 있으면 본 건물 집계서 제외
+  const siblings = useMemo(
+    () => allBuildings
+      .filter((b) => b.id !== building.id)
+      .map((b) => ({
+        id: b.id,
+        azDeg: bearingDeg(radarSite.latitude, radarSite.longitude, b.latitude, b.longitude),
+        distKm: haversineKm(radarSite.latitude, radarSite.longitude, b.latitude, b.longitude),
+      })),
+    [allBuildings, building.id, radarSite.latitude, radarSite.longitude],
+  );
   // 빌딩 위치 메타
   const bDistKm = useMemo(
     () => haversineKm(radarSite.latitude, radarSite.longitude, building.latitude, building.longitude),
@@ -95,6 +108,7 @@ function ReportOMObstacleDetail({
         panoWith={panoWith}
         panoWithout={panoWithout}
         lossPoints={allLossThisRadar}
+        siblings={siblings}
       />
     </ReportPage>
   );

@@ -245,7 +245,7 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, hideHeader }: 
           {hasBaseline && (
             <>
               <line x1={140} y1={5} x2={162} y2={5} stroke="#9ca3af" strokeWidth={1.2} strokeDasharray="3,2" />
-              <text x={165} y={8} fill="#6b7280" fontSize={9}>기준(나머지 방위)</text>
+              <text x={165} y={8} fill="#6b7280" fontSize={9}>기준(전체 방위)</text>
             </>
           )}
         </g>

@@ -22,7 +22,7 @@ interface Props {
  *  결합 표시. 시안 락-인 옵션:
  *    combine="stacked"  curve="linear"  markers="dots"  baseband="area"
  *
- *  X 축은 1~maxDay 일자, Y 축은 0~max% 자동 스케일. baseline(나머지 방위
+ *  X 축은 1~maxDay 일자, Y 축은 0~max% 자동 스케일. baseline(전체 방위
  *  평균)이 있으면 옅은 영역(area) + 선으로 함께 표시.
  *
  *  스타일은 reportOmStyles.css 의 `.om-table.weekly-table` (요약표 전용)만

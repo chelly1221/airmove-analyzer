@@ -1,10 +1,9 @@
-import React, { useMemo, useState, useEffect, useRef, forwardRef, useImperativeHandle } from "react";
+import React, { useMemo, useState, useEffect, useRef } from "react";
 import type { RadarSite, LossPointGeo, ManualBuilding, BuildingGroup } from "../../types";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import { azimuthAndDist } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { groupColorOf } from "./BuildingGroupBadge";
-import { type OMSectionCaptureHandle, createDeferred, svgToPngDataUrl } from "./omCapture";
 
 /** 고도(ft) → 스펙트럼 HSL 색상 (빨강→파랑) */
 function altToColor(altFt: number, minAlt: number, maxAlt: number): string {
@@ -29,11 +28,6 @@ interface Props {
   buildingGroups?: BuildingGroup[];
   /** true면 헤더 생략 (외부에서 헤더 렌더) */
   hideHeader?: boolean;
-  /** 사전 캡처된 SVG dataUrl. 있으면 라이브 SVG 대신 <img> 표시 */
-  preCapturedImage?: string;
-  /** true면 focus bbox 를 diff 영역만으로 구성 (빌딩·소실표적 제외, 더 타이트한 줌).
-   *  레이더·장애물이 viewBox 밖이어도 OK — 빌딩 단독 영향이 미세할 때 가시성↑ */
-  focusOnDiffOnly?: boolean;
 }
 
 /** 방위별 커버리지 범위(km) lookup — O(1) 인덱스 기반 */
@@ -249,7 +243,7 @@ const MIN_FOCUS_HALF_KM = 1.5; // 단일 지점 등 작은 diff 의 최소 반�
 const FOCUS_PAD_FRAC = 0.06;   // diff 영역 주변 여백 비율
 const FOCUS_MARGIN_PX = 28;    // 캔버스 가장자리 여백(px, 축척 바/북향 표시 공간만 확보)
 
-const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function ReportOMCoverageDiff({
+function ReportOMCoverageDiff({
   sectionNum,
   radarSite,
   layersWithTargets,
@@ -258,12 +252,9 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
   selectedBuildings,
   buildingGroups,
   hideHeader,
-  preCapturedImage,
-  focusOnDiffOnly,
-}: Props, ref) {
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
-  const readyDeferredRef = useRef(createDeferred<void>());
   const MIN_ALT = 1000;
   const MAX_ALT = 20000;
 
@@ -340,8 +331,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
   }, [fixedWith, fixedWithout, radarSite.range_nm]);
 
   // 장애물 영향 차이(diff) 영역의 km 바운딩박스 — 확대(줌) 기준.
-  // focusOnDiffOnly=false: diff 세그먼트 + 건물 + 장애물 기인 소실표적 모두 포함 (합산 페이지).
-  // focusOnDiffOnly=true:  diff 세그먼트만 포함 → 레이더·장애물이 viewBox 밖이어도 무관 (단독 영향 페이지).
+  // diff 세그먼트 + 건물 + 장애물 기인 소실표적을 모두 포함.
   const focusBboxKm = useMemo(() => {
     let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
     let any = false;
@@ -364,31 +354,28 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         if (b.maxRangeKm - rWith > 0) { add(b.maxRangeKm, b.deg); add(rWith, b.deg); }
       }
     }
-    if (!focusOnDiffOnly) {
-      for (const bld of selectedBuildings) {
-        const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, bld.latitude, bld.longitude);
-        add(distKm, azDeg);
-      }
-      for (const pt of filteredLoss) {
-        const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, pt.lat, pt.lon);
-        add(distKm, azDeg);
-      }
+    for (const bld of selectedBuildings) {
+      const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, bld.latitude, bld.longitude);
+      add(distKm, azDeg);
+    }
+    for (const pt of filteredLoss) {
+      const { azDeg, distKm } = azimuthAndDist(radarSite.latitude, radarSite.longitude, pt.lat, pt.lon);
+      add(distKm, azDeg);
     }
     return any ? { xMin, xMax, yMin, yMax } : null;
-  }, [fixedWith, fixedWithout, selectedBuildings, filteredLoss, radarSite, focusOnDiffOnly]);
+  }, [fixedWith, fixedWithout, selectedBuildings, filteredLoss, radarSite]);
 
   // 확대 변환: diff 영역이 캔버스를 채우도록 scale/center 계산.
   // viewBox 는 700×700 고정 → 라벨/마커/범례 크기는 일정 유지, 지오메트리만 확대.
-  // focusOnDiffOnly=true: 더 작은 최소 반경/패딩/캔버스 마진으로 극단적 확대.
   const { scale, cx, cy, focused } = useMemo(() => {
     if (!focusBboxKm) {
       return { scale: fullMaxR / globalMaxRange, cx: fullCx, cy: fullCy, focused: false };
     }
     const cxKm = (focusBboxKm.xMin + focusBboxKm.xMax) / 2;
     const cyKm = (focusBboxKm.yMin + focusBboxKm.yMax) / 2;
-    const minHalfKm = focusOnDiffOnly ? 0.25 : MIN_FOCUS_HALF_KM;
-    const padFrac = focusOnDiffOnly ? 0.02 : FOCUS_PAD_FRAC;
-    const marginPx = focusOnDiffOnly ? 12 : FOCUS_MARGIN_PX;
+    const minHalfKm = MIN_FOCUS_HALF_KM;
+    const padFrac = FOCUS_PAD_FRAC;
+    const marginPx = FOCUS_MARGIN_PX;
     let half = Math.max(
       (focusBboxKm.xMax - focusBboxKm.xMin) / 2,
       (focusBboxKm.yMax - focusBboxKm.yMin) / 2,
@@ -398,7 +385,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
     const inner = svgSize - marginPx * 2;
     const s = inner / (half * 2);
     return { scale: s, cx: svgSize / 2 - cxKm * s, cy: svgSize / 2 - cyKm * s, focused: true };
-  }, [focusBboxKm, globalMaxRange, fullMaxR, fullCx, fullCy, focusOnDiffOnly]);
+  }, [focusBboxKm, globalMaxRange, fullMaxR, fullCx, fullCy]);
 
   // 가시 캔버스에 대응하는 지리 경계 → 줌 수준에 맞는 지도 타일 요청
   const geoBounds = useMemo(() => {
@@ -416,52 +403,6 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
 
   // 지도 배경 타일 이미지 (확대 영역 기준)
   const mapImage = useStaticMapImage(geoBounds.lonMin, geoBounds.lonMax, geoBounds.latMin, geoBounds.latMax);
-
-  // 캡처 readiness — 맵 타일 준비(또는 빈 상태 확정) + 2× RAF(paint) 이후 resolve.
-  // capture() 가 await 중인 deferred 를 신호.
-  const readyFiredRef = useRef(false);
-  useEffect(() => {
-    if (readyFiredRef.current) return;
-    const hasData = fixedWith.length > 0 || fixedWithout.length > 0;
-    // 데이터가 있는 경우 맵 타일 로드까지 대기 (빈 데이터는 즉시 준비 인정)
-    if (hasData && mapImage === null) return;
-
-    let cancelled = false;
-    let raf2Id = 0;
-    const raf1Id = requestAnimationFrame(() => {
-      raf2Id = requestAnimationFrame(() => {
-        if (cancelled || readyFiredRef.current) return;
-        readyFiredRef.current = true;
-        readyDeferredRef.current.resolve();
-      });
-    });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf1Id);
-      if (raf2Id) cancelAnimationFrame(raf2Id);
-    };
-  }, [mapImage, fixedWith.length, fixedWithout.length]);
-
-  // 명령형 capture 핸들 — SVG 직렬화 → PNG dataUrl
-  useImperativeHandle(ref, () => ({
-    async capture(): Promise<string | null> {
-      // 데이터 없으면 캡처 불필요 (라이브 빈 상태 메시지를 PDF 에 그대로 인쇄)
-      if (fixedWith.length === 0 && fixedWithout.length === 0) return null;
-      // 맵 타일 + paint 완료 대기
-      await readyDeferredRef.current.promise;
-      const svg = svgRef.current;
-      if (!svg) throw new Error("ReportOMCoverageDiff: svg not mounted");
-      return await svgToPngDataUrl(svg, 2, "#ffffff");
-    },
-  }), [fixedWith.length, fixedWithout.length]);
-
-  // unmount 시 readiness 미해결이면 reject
-  useEffect(() => {
-    const deferred = readyDeferredRef.current;
-    return () => {
-      deferred.reject(new Error("ReportOMCoverageDiff unmounted before ready"));
-    };
-  }, []);
 
   // 각 고도별 diff path (분석 대상 건물 영향 차이) — diff 영역만 그림.
   // totalDiffBearings: 폴리곤 미폐합(협소 1샘플) 케이스도 검출하려고 누적 — 메시지 분기용.
@@ -486,7 +427,7 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
     // [DEBUG] diffPaths 생성 결과 — impactSummary 와 비교용
     if (typeof console !== "undefined") {
       console.log(
-        `[CoverageDiff ${radarSite.name}] focusOnDiffOnly=${!!focusOnDiffOnly} ` +
+        `[CoverageDiff ${radarSite.name}] ` +
         `bldgs=${selectedBuildings.map((b) => b.id).join(",")} ` +
         `hasSector=${hasSector} sector=[${sectorStart.toFixed(1)}°,${sectorEnd.toFixed(1)}°] ` +
         `diffPaths=${result.length} totalDiffBearings=${bearingsSum} ` +
@@ -560,11 +501,8 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
         </span>
       </div>
 
-      {/* 커버리지 비교맵 — preCapturedImage 가 있으면 정적 이미지로 표시 */}
+      {/* 커버리지 비교맵 */}
       <div className="rounded-md border border-gray-200 p-2">
-        {preCapturedImage ? (
-          <img src={preCapturedImage} alt="" className="w-full" />
-        ) : (
         <svg ref={svgRef} viewBox={`${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}`} className="w-full">
           <defs>
             <clipPath id="om-map-clip">
@@ -735,7 +673,6 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
             </g>
           )}
         </svg>
-        )}
       </div>
 
       {/* 장애물 영향 차이 없음 / 협소 안내 */}
@@ -783,6 +720,6 @@ const ReportOMCoverageDiff = forwardRef<OMSectionCaptureHandle, Props>(function 
       </div>
     </div>
   );
-});
+}
 
 export default React.memo(ReportOMCoverageDiff);

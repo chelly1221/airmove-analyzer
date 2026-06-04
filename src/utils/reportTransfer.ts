@@ -51,11 +51,8 @@ export interface SerializedOMData {
   losMap: [string, LoSProfileData][];
   covLayersWithBuildings: [string, CoverageLayer[]][];
   covLayersWithout: [string, CoverageLayer[]][];
-  /** 빌딩별 카운터팩추얼: [radarName, [buildingId, layers][]][] */
-  covLayersWithoutPerBuilding: [string, [number, CoverageLayer[]][]][];
   analysisMonth: string;
   findingsText: string;
-  recommendText: string;
   /** 인라인 편집 텍스트 오버라이드 (편집키 → 사용자 수정 문구) */
   textOverrides?: Record<string, string>;
   /** 차트 줌 상태 (편집키 → [시작%, 끝%]) */
@@ -64,7 +61,6 @@ export interface SerializedOMData {
   panoWithoutTargets: [string, PanoramaMergeResult][];
   coverageStatus: "idle" | "loading" | "done" | "error";
   panoramaStatus: "idle" | "deferred" | "loading" | "done" | "error";
-  sectionImages: [string, string][];
 }
 
 // ── 전달 페이로드 ──
@@ -122,18 +118,14 @@ export function serializeOMData(om: OMReportData): SerializedOMData {
     losMap: [...om.losMap],
     covLayersWithBuildings: [...om.covLayersWithBuildings],
     covLayersWithout: [...om.covLayersWithout],
-    covLayersWithoutPerBuilding: [...om.covLayersWithoutPerBuilding].map(([rname, bm]) => [rname, [...bm]]),
     analysisMonth: om.analysisMonth,
     findingsText: om.findingsText,
-    recommendText: om.recommendText,
     textOverrides: om.textOverrides ?? {},
     chartZooms: om.chartZooms ?? {},
     panoWithTargets: [...om.panoWithTargets],
     panoWithoutTargets: [...om.panoWithoutTargets],
     coverageStatus: om.coverageStatus,
     panoramaStatus: om.panoramaStatus,
-    // IDB 전송 시 sectionImages 제외 — 보고서 윈도우에서 자체 캡처
-    sectionImages: [],
   };
 }
 
@@ -147,19 +139,14 @@ export function deserializeOMData(s: SerializedOMData): OMReportData {
     losMap: new Map(s.losMap),
     covLayersWithBuildings: new Map(s.covLayersWithBuildings),
     covLayersWithout: new Map(s.covLayersWithout),
-    covLayersWithoutPerBuilding: new Map(
-      (s.covLayersWithoutPerBuilding ?? []).map(([rname, bm]) => [rname, new Map(bm)]),
-    ),
     analysisMonth: s.analysisMonth,
     findingsText: s.findingsText,
-    recommendText: s.recommendText,
     textOverrides: s.textOverrides ?? {},
     chartZooms: s.chartZooms ?? {},
     panoWithTargets: new Map(s.panoWithTargets),
     panoWithoutTargets: new Map(s.panoWithoutTargets),
     coverageStatus: s.coverageStatus,
     panoramaStatus: s.panoramaStatus,
-    sectionImages: new Map(s.sectionImages),
   };
 }
 

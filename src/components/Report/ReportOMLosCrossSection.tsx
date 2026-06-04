@@ -1,21 +1,10 @@
 import React, { useMemo, useRef, useState, useEffect, useCallback } from "react";
-import type { ManualBuilding, RadarSite, LoSProfileData, BuildingOnPath, ElevationPoint } from "../../types";
-import type { ObstacleMonthlyResult, LossPointGeo, TrackPointGeo } from "../../types/obstacle";
-import ReportOMSectionHeader from "./ReportOMSectionHeader";
-import ReportPage from "./ReportPage";
+import type { ManualBuilding, LoSProfileData, BuildingOnPath, ElevationPoint } from "../../types";
+import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import { useOMChartZoom, type ChartZoom } from "./OMEditable";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import { bearingDeg, haversineKm } from "../../utils/geo";
-import { calcBuildingAzExtent } from "../../utils/obstacleAnalysisHelpers";
-
-interface Props {
-  sectionNum: number;
-  selectedBuildings: ManualBuilding[];
-  radarSites: RadarSite[];
-  losMap: Map<string, LoSProfileData>;
-  omResult: ObstacleMonthlyResult | null;
-  hideHeader?: boolean;
-}
+import { calcBuildingAzExtent, isTargetBuildingOnPath } from "../../utils/obstacleAnalysisHelpers";
 
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
@@ -204,12 +193,7 @@ export function LosCrossSection({
     //     대상 식별: 수동건물 + 치수 일치 + far_dist 가 타겟 거리(D)까지 도달 (코리도 끝 = 대상).
     //     point 형 대상은 Rust 가 pathBuildings 에서 제외 → 매칭 0 건이면 미표시(두 선 동일).
     //     terrainProfile(raw) 은 DB 복원 los 엔 없음 → 그 경우도 미표시 (graceful).
-    const isTargetBuilding = (b: BuildingOnPath) =>
-      b.is_manual &&
-      Math.abs(b.ground_elev_m - building.ground_elev) < 1 &&
-      Math.abs(b.height_m - building.height) < 1 &&
-      (b.far_dist_km ?? b.distance_km) >= D - 0.5;
-    const buildingsWithoutTarget = buildings.filter((b) => !isTargetBuilding(b));
+    const buildingsWithoutTarget = buildings.filter((b) => !isTargetBuildingOnPath(b, building, D));
     const rawTerrain = los.terrainProfile;
     const minDetWithout =
       rawTerrain && rawTerrain.length > 0 && buildingsWithoutTarget.length < buildings.length
@@ -408,12 +392,60 @@ export function LosCrossSection({
     };
   }, [editable, zoomMode]);
 
+  // ── Y축 가시 범위 — X 줌 윈도우에 맞춰 세로도 자동 맞춤 (TrackMap LoSProfilePanel 과 동일) ──
+  //    줌인 시 보이는 구간(지형·LoS·대상제외선·건물)의 데이터만으로 minY/maxY 재계산.
+  //    전체 줌([0,100])이면 chartData 의 전체 범위를 그대로 사용 → 줌 진입/이탈 시 점프 없음.
+  const visibleYRange = useMemo(() => {
+    if (!chartData) return null;
+    const { adjTerrain, minDetStraight, minDetWithout, significantBuildings,
+            maxDistance, minY: fullMinY, maxY: fullMaxY, radarHeight } = chartData;
+    if (liveZoom[0] === 0 && liveZoom[1] === 100) return { minY: fullMinY, maxY: fullMaxY };
+
+    const zoomStart = (liveZoom[0] / 100) * maxDistance;
+    const zoomEnd = (liveZoom[1] / 100) * maxDistance;
+    const inRange = (d: number) => d >= zoomStart && d <= zoomEnd;
+
+    // 보이는 구간 내 높이값 수집 (곡률 보정 후 디스플레이 높이)
+    const heights: number[] = [];
+    for (const p of adjTerrain) if (inRange(p.distance)) heights.push(p.height);
+    for (const p of minDetStraight) if (inRange(p.distance)) heights.push(p.height);
+    if (minDetWithout) for (const p of minDetWithout) if (inRange(p.distance)) heights.push(p.height);
+    // 건물 꼭대기·바닥 (윈도우에 걸치는 건물 포함)
+    for (const b of significantBuildings) {
+      const nearD = b.near_dist_km ?? b.distance_km;
+      const farD = b.far_dist_km ?? b.distance_km;
+      if (inRange(nearD) || inRange(farD) || (nearD <= zoomStart && farD >= zoomEnd)) {
+        heights.push((b.ground_elev_m + b.height_m) - curvDrop(b.distance_km));
+        heights.push(b.ground_elev_m - curvDrop(b.distance_km));
+      }
+    }
+    // 레이더 높이 (시작점이 보일 때만)
+    if (zoomStart <= 0.1) heights.push(radarHeight);
+
+    if (heights.length === 0) return { minY: fullMinY, maxY: fullMaxY };
+
+    let rawMin = Infinity, rawMax = -Infinity;
+    for (const h of heights) { if (h < rawMin) rawMin = h; if (h > rawMax) rawMax = h; }
+    const range = rawMax - rawMin;
+    const padding = Math.max(range * 0.12, 50); // 최소 50m 여유
+    const visMinY = rawMin - padding;
+    let visMaxY = rawMax + padding;
+    // 0ft 가 차트 40% 이하에 오도록 보장 (chartData 전체범위 로직과 동일)
+    if (visMinY < 0) {
+      const minMaxYFor40Pct = -visMinY * 1.5;
+      if (visMaxY < minMaxYFor40Pct) visMaxY = minMaxYFor40Pct;
+    }
+    return { minY: visMinY, maxY: visMaxY };
+  }, [chartData, liveZoom]);
+
   if (!chartData) return null;
 
   const {
     adjTerrain, minDetStraight, minDetWithout,
-    blocked, significantBuildings, minY, maxY, maxDistance, radarHeight,
+    blocked, significantBuildings, maxDistance, radarHeight,
   } = chartData;
+  // X 줌 윈도우에 맞춰 자동조정된 세로 범위 (전체 줌이면 chartData 전체범위와 동일)
+  const { minY, maxY } = visibleYRange ?? chartData;
 
   // X축 줌 윈도우 (liveZoom: [시작%, 끝%]). [0,100] 이면 전체.
   const zoomStartKm = (liveZoom[0] / 100) * maxDistance;
@@ -824,82 +856,3 @@ export function projectPointsToLos(
   return { track, loss };
 }
 
-/** 페이지당 차트 수 */
-const CHARTS_PER_PAGE = 2;
-
-function ReportOMLosCrossSection({ sectionNum, selectedBuildings, radarSites, losMap, omResult, hideHeader }: Props) {
-  const entries = useMemo(() => {
-    const result: { building: ManualBuilding; radar: RadarSite; los: LoSProfileData; trackPoints: ChartTrackPoint[]; lossPoints: ChartTrackPoint[] }[] = [];
-
-    const lossPointsByRadar = new Map<string, LossPointGeo[]>();
-    const trackPointsByRadar = new Map<string, TrackPointGeo[]>();
-    if (omResult) {
-      for (const rr of omResult.radar_results) {
-        const allLoss: LossPointGeo[] = [];
-        const allTrack: TrackPointGeo[] = [];
-        for (const ds of rr.daily_stats) {
-          for (const lp of ds.loss_points_summary) allLoss.push(lp);
-          if (ds.track_points_geo) {
-            for (const tp of ds.track_points_geo) allTrack.push(tp);
-          }
-        }
-        lossPointsByRadar.set(rr.radar_name, allLoss);
-        trackPointsByRadar.set(rr.radar_name, allTrack);
-      }
-    }
-
-    for (const b of selectedBuildings) {
-      for (const r of radarSites) {
-        const los = losMap.get(`${r.name}_${b.id}`);
-        if (!los || los.elevationProfile.length === 0) continue;
-
-        const allTrack = trackPointsByRadar.get(r.name) ?? [];
-        const allLoss = lossPointsByRadar.get(r.name) ?? [];
-        const projected = projectPointsToLos(los, allTrack, allLoss, b);
-
-        result.push({
-          building: b, radar: r, los,
-          trackPoints: projected.track,
-          lossPoints: projected.loss,
-        });
-      }
-    }
-    return result;
-  }, [selectedBuildings, radarSites, losMap, omResult]);
-
-  if (entries.length === 0) return null;
-
-  const pages: React.ReactNode[] = [];
-  for (let offset = 0; offset < entries.length; offset += CHARTS_PER_PAGE) {
-    const chunk = entries.slice(offset, offset + CHARTS_PER_PAGE);
-    const isFirst = offset === 0;
-    pages.push(
-      <ReportPage key={`loscs-${offset}`}>
-        <div className="mb-4">
-          {isFirst && !hideHeader && (
-            <ReportOMSectionHeader sectionNum={sectionNum} title="건물별 LoS 단면도" editId="losCross.title" />
-          )}
-          {!isFirst && (
-            <div className="mb-2 text-[10px] text-gray-400">
-              건물별 LoS 단면도 (계속 — {offset + 1}~{Math.min(offset + CHARTS_PER_PAGE, entries.length)}/{entries.length})
-            </div>
-          )}
-          {chunk.map((e) => (
-            <LosCrossSection
-              key={`${e.radar.name}_${e.building.id}`}
-              los={e.los}
-              radarName={e.radar.name}
-              building={e.building}
-              trackPoints={e.trackPoints}
-              lossPoints={e.lossPoints}
-            />
-          ))}
-        </div>
-      </ReportPage>
-    );
-  }
-
-  return <>{pages}</>;
-}
-
-export default React.memo(ReportOMLosCrossSection);

@@ -1,7 +1,7 @@
 /**
  * 장애물 월간 보고서 설정 + 준비 통합 모달
- * 보고서 창에서 렌더링됨. 설정(분석월 → 레이더 → 건물 → 파일) → 분석(파싱→LoS→커버리지→파노라마→캡처)
- * 까지 단일 모달로 처리한다. 부모(ReportApp)는 panorama/capture 상태를 props 로 전달하고,
+ * 보고서 창에서 렌더링됨. 설정(분석월 → 레이더 → 건물 → 파일) → 분석(파싱→LoS→커버리지→파노라마)
+ * 까지 단일 모달로 처리한다. 부모(ReportApp)는 panorama 상태를 props 로 전달하고,
  * `omReady` 가 true 가 되면 모달이 자동으로 onComplete 를 호출해 닫힌다.
  */
 import { useState, useRef, useCallback, useMemo, useEffect } from "react";
@@ -30,9 +30,6 @@ export type PanoramaProgress = {
   currentRadarName: string;
   phase: PanoramaPhase;
 };
-export type CaptureEntry = { label: string; status: "pending" | "done" };
-type OrchestratorState = "idle" | "running" | "done";
-
 export default function ObstacleMonthlyConfigModal({
   customRadarSites,
   aircraft,
@@ -47,10 +44,6 @@ export default function ObstacleMonthlyConfigModal({
   panoramaProgress,
   panoramaElapsedMs,
   panoramaLastError,
-  captureMap,
-  captureDone,
-  captureTotal,
-  orchestratorState,
   omReady,
   onComplete,
 }: {
@@ -67,13 +60,11 @@ export default function ObstacleMonthlyConfigModal({
     losMap: Map<string, LoSProfileData>,
     covWith: Map<string, CoverageLayer[]>,
     covWithout: Map<string, CoverageLayer[]>,
-    covWithoutPerBuilding: Map<string, Map<number, CoverageLayer[]>>,
     analysisMonth?: string,
   ) => void;
   onCoverageReady: (
     covWith: Map<string, CoverageLayer[]>,
     covWithout: Map<string, CoverageLayer[]>,
-    covWithoutPerBuilding: Map<string, Map<number, CoverageLayer[]>>,
   ) => void;
   onCoverageError?: () => void;
   coverageStatus?: CoverageStatus;
@@ -81,10 +72,6 @@ export default function ObstacleMonthlyConfigModal({
   panoramaProgress?: PanoramaProgress | null;
   panoramaElapsedMs?: number;
   panoramaLastError?: string | null;
-  captureMap?: Map<string, CaptureEntry>;
-  captureDone?: number;
-  captureTotal?: number;
-  orchestratorState?: OrchestratorState;
   omReady?: boolean;
   onComplete?: () => void;
 }) {
@@ -100,9 +87,9 @@ export default function ObstacleMonthlyConfigModal({
   const [progress, setProgress] = useState("");
   const [progressPct, setProgressPct] = useState(0);
   const [error, setError] = useState("");
-  // 통합 모달 — 6단계 스테이지로 진행 표시 (parsing → los → coverage → transfer → panorama → capture → done)
-  // parsing/los/coverage/transfer 는 모달 로컬 작업, panorama/capture 는 부모 props 로 모니터링
-  type AnalyzeStage = "parsing" | "los" | "coverage" | "transfer" | "panorama" | "capture" | "done";
+  // 통합 모달 — 5단계 스테이지로 진행 표시 (parsing → los → coverage → transfer → panorama → done)
+  // parsing/los/coverage/transfer 는 모달 로컬 작업, panorama 는 부모 props 로 모니터링
+  type AnalyzeStage = "parsing" | "los" | "coverage" | "transfer" | "panorama" | "done";
   const [stage, setStage] = useState<AnalyzeStage | null>(null);
   const [stageDetail, setStageDetail] = useState<{ parsing: string; los: string; coverage: string; transfer: string }>({
     parsing: "", los: "", coverage: "", transfer: "",
@@ -114,16 +101,14 @@ export default function ObstacleMonthlyConfigModal({
   }, []);
 
   // ── prop-driven 스테이지 전환 ──
-  // 로컬 작업(transfer 까지) 후 부모 상태에 따라 panorama → capture → done 자동 진행.
+  // 로컬 작업(transfer 까지) 후 부모 상태에 따라 panorama → done 자동 진행.
   // panorama "deferred" 는 부모 effect 가 아직 안 돈 상태이므로 transfer 에 머무름.
   useEffect(() => {
     if (!stage || stage === "done") return;
     if (stage === "transfer") {
       if (panoramaStatus === "loading" || panoramaStatus === "error") setStage("panorama");
-      else if (panoramaStatus === "done") setStage("capture");
     }
-    if (stage === "panorama" && panoramaStatus === "done") setStage("capture");
-    if ((stage === "panorama" || stage === "capture") && omReady) setStage("done");
+    if ((stage === "transfer" || stage === "panorama") && omReady) setStage("done");
   }, [stage, panoramaStatus, omReady]);
 
   // stage 가 "done" 이 되면 onComplete 호출.
@@ -364,7 +349,6 @@ export default function ObstacleMonthlyConfigModal({
       // 커버리지 계산 — 전체 레이더 순회 (실패해도 보고서는 생성)
       const covWithMap = new Map<string, CoverageLayer[]>();
       const covWithoutMap = new Map<string, CoverageLayer[]>();
-      const covWithoutPerBuildingMap = new Map<string, Map<number, CoverageLayer[]>>();
       if (selectedRadars.length > 0) {
         setStage("coverage");
         setStageDetail((prev) => ({ ...prev, coverage: `0/${selectedRadars.length} 레이더 시작` }));
@@ -389,9 +373,8 @@ export default function ObstacleMonthlyConfigModal({
             );
             covWithMap.set(r.name, covResult.layersWith);
             covWithoutMap.set(r.name, covResult.layersWithout);
-            covWithoutPerBuildingMap.set(r.name, covResult.layersWithoutPerBuilding);
           }
-          setStageDetail((prev) => ({ ...prev, coverage: `${covWithMap.size}개 레이더 완료 (빌딩별 카운터팩추얼 포함)` }));
+          setStageDetail((prev) => ({ ...prev, coverage: `${covWithMap.size}개 레이더 완료` }));
         } catch (err) {
           setStageDetail((prev) => ({ ...prev, coverage: "계산 실패 — 커버리지 없이 진행" }));
           console.warn("GPU 커버리지 계산 실패:", err);
@@ -413,14 +396,14 @@ export default function ObstacleMonthlyConfigModal({
       setProgressPct(95);
       setStage("transfer");
       setStageDetail((prev) => ({ ...prev, transfer: "보고서 창으로 데이터 전송 중" }));
-      await onGenerate(filteredResult, selectedBuildings, buildingGroups, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, covWithoutPerBuildingMap, effectiveMonth);
+      await onGenerate(filteredResult, selectedBuildings, buildingGroups, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, effectiveMonth);
 
-      if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap, covWithoutPerBuildingMap);
+      if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap);
 
       setProgress("보고서 로딩 완료");
       setProgressPct(100);
       setStageDetail((prev) => ({ ...prev, transfer: "전송 완료 — 파노라마 대기 중" }));
-      // 모달은 닫지 않고 stage 그대로 "transfer" 유지 → prop-driven useEffect 가 panorama/capture 로 진행
+      // 모달은 닫지 않고 stage 그대로 "transfer" 유지 → prop-driven useEffect 가 panorama 로 진행
     } catch (err) {
       if (!cancelledRef.current) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -641,9 +624,9 @@ export default function ObstacleMonthlyConfigModal({
               </div>
 
               {analyzing && (() => {
-                // 통합 진행 카드 — 6단계 (parsing → los → coverage → transfer → panorama → capture)
+                // 통합 진행 카드 — 5단계 (parsing → los → coverage → transfer → panorama)
                 type StageStatus = "waiting" | "active" | "done" | "error";
-                const order: AnalyzeStage[] = ["parsing", "los", "coverage", "transfer", "panorama", "capture"];
+                const order: AnalyzeStage[] = ["parsing", "los", "coverage", "transfer", "panorama"];
                 const currentIdx = stage && stage !== "done" ? order.indexOf(stage) : (stage === "done" ? order.length : -1);
                 const statusOf = (key: AnalyzeStage): StageStatus => {
                   const idx = order.indexOf(key);
@@ -680,15 +663,6 @@ export default function ObstacleMonthlyConfigModal({
                   : panoramaStatus === "loading" ? "진행 상세 대기"
                   : "대기 중";
 
-                // 캡처 디테일
-                const cTotal = captureTotal ?? 0;
-                const cDone = captureDone ?? 0;
-                const captureDetailText =
-                  orchestratorState === "running" && cTotal === 0 ? "섹션 컴포넌트 마운트 중"
-                  : cTotal === 0 ? "준비 대기"
-                  : cDone === cTotal ? "완료"
-                  : `${cDone}/${cTotal} 섹션 캡처 진행`;
-
                 // 통합 진행률 — 단계별 가중치
                 const baseFor = (s: AnalyzeStage): number =>
                   s === "parsing" ? 0
@@ -696,15 +670,13 @@ export default function ObstacleMonthlyConfigModal({
                   : s === "coverage" ? 30
                   : s === "transfer" ? 55
                   : s === "panorama" ? 60
-                  : s === "capture" ? 85
                   : 100;
                 const spanFor = (s: AnalyzeStage): number =>
                   s === "parsing" ? 15
                   : s === "los" ? 15
                   : s === "coverage" ? 25
                   : s === "transfer" ? 5
-                  : s === "panorama" ? 25
-                  : s === "capture" ? 15
+                  : s === "panorama" ? 40
                   : 0;
                 const overallPct = (() => {
                   if (!stage || stage === "done") return stage === "done" ? 100 : 0;
@@ -718,8 +690,6 @@ export default function ObstacleMonthlyConfigModal({
                     else if (panoramaProgress && panoramaProgress.totalRadars > 0) {
                       frac = (panoramaProgress.currentIndex - 1) / panoramaProgress.totalRadars;
                     }
-                  } else if (stage === "capture") {
-                    frac = cTotal > 0 ? cDone / cTotal : 0;
                   }
                   return Math.min(100, Math.round(base + span * Math.max(0, Math.min(1, frac))));
                 })();
@@ -730,7 +700,6 @@ export default function ObstacleMonthlyConfigModal({
                   { key: "coverage", label: "커버리지 계산", detail: stageDetail.coverage || "대기 중" },
                   { key: "transfer", label: "보고서 창 전송", detail: stageDetail.transfer || "대기 중" },
                   { key: "panorama", label: "파노라마 LoS 계산", detail: panoramaDetailText },
-                  { key: "capture", label: "섹션 이미지 캡처", detail: captureDetailText },
                 ];
 
                 // 로컬 단계(취소 가능) vs 원격 단계(닫기로만)
@@ -773,18 +742,6 @@ export default function ObstacleMonthlyConfigModal({
                             <div className="flex-1">
                               <p className={`text-[12px] ${stageTextClass(status)}`}>{label}</p>
                               <p className={`text-[11px] ${stalled && key === "panorama" ? "text-amber-600" : "text-gray-400"}`}>{detail}</p>
-                              {key === "capture" && status === "active" && captureMap && captureMap.size > 0 && (
-                                <div className="mt-1.5 flex flex-col gap-0.5">
-                                  {[...captureMap.entries()].map(([k, v]) => (
-                                    <div key={k} className="flex items-center gap-1.5 text-[10px]">
-                                      {v.status === "done"
-                                        ? <Check size={10} className="text-emerald-500" strokeWidth={3} />
-                                        : <Loader2 size={10} className="animate-spin text-[#a60739]" />}
-                                      <span className={v.status === "done" ? "text-gray-400" : "text-gray-700"}>{v.label}</span>
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
                             </div>
                           </div>
                         );

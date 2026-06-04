@@ -24,7 +24,6 @@ import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
-import type { OMSectionCaptureHandle } from "./omCapture";
 import ReportPSSummarySection from "./ReportPSSummarySection";
 import ReportPSAngleHeight from "./ReportPSAngleHeight";
 import ReportPSAdditionalLoss from "./ReportPSAdditionalLoss";
@@ -86,8 +85,6 @@ export interface ReportPreviewContentProps {
 
   // ref
   previewRef: React.RefObject<HTMLDivElement | null>;
-  /** OM 캡처 가능 섹션의 ref 등록 콜백. 마운트 시 handle 전달, unmount 시 null. */
-  setCaptureRef?: (key: string, handle: OMSectionCaptureHandle | null) => void;
 }
 
 // ── 섹션 토글 정의 ──
@@ -440,6 +437,8 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 radarSites={omData.selectedRadarSites}
                 azimuthSectorsByRadar={omData.azSectorsByRadar}
                 losMap={omData.losMap}
+                panoWithByRadar={omData.panoWithTargets}
+                panoWithoutByRadar={omData.panoWithoutTargets}
               />
             </div>
           )}
@@ -502,6 +501,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                       omResult={omResultTrimmed}
                       panoWith={omData.panoWithTargets?.get(rs.name)}
                       panoWithout={omData.panoWithoutTargets?.get(rs.name)}
+                      allBuildings={omData.selectedBuildings}
                     />
                   );
                 });
