@@ -7,6 +7,7 @@ export type { ElevationPoint, LoSProfileData } from "./los";
 export type {
   BuildingOnPath,
   Building3D,
+  FacBuildingDetail,
   NearbyPeak,
   PeakImportStatus,
   GeometryType,

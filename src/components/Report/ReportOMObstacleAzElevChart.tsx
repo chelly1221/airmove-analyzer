@@ -8,10 +8,9 @@
  *  - 추가(빨강): 분석 대상 장애물로 인해 추가된 차단 영역 = with 윗변 − without 윗변
  *    · 윗변 = 지형 + 건물 실루엣을 방위별 max 로 합성. 건물 실루엣은 레이더 시점에서 본
  *      압출 폴리곤의 가변 윗변(방위별 양각, panorama.rs build_building_silhouette).
- *  - 소실표적: 이 방위 윈도우 + 분석 대상 후방만, 분류별로 점 색 구분
- *      · 검은 ×  — 장애물 추가 기인 (지형 차단각 ≤ 양각 < 대상 차단각)
- *      · 회색 ○  — 지형 차단 (양각 < 지형 차단각)
- *      · 파란 ▫  — 장애물 무관 (양각 ≥ 대상 차단각, 차단 영역 밖)
+ *  - 소실표적: 이 방위 윈도우 + 분석 대상 후방의 모든 소실표적을 빨간 점으로 통일 표시
+ *      (LoS 단면도와 동일 #ff1745). 분류별 건수(장애물 추가 기인 / 지형 차단 / 장애물 무관)는
+ *      하단 요약 표에서 제공.
  */
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult, BuildingObstacle } from "../../types";
@@ -79,7 +78,7 @@ function buildSilhouetteLines(
     return a.elev + (b.elev - a.elev) * t;
   };
 
-  // 지형 차단각 — 분류(makePanoramaSampler)와 동일한 전역 원형 보간 샘플러 공유 → 검은×↔빨강영역 픽셀 일치.
+  // 지형 차단각 — 분류(makePanoramaSampler)와 동일한 전역 원형 보간 샘플러 공유 → 장애물 추가 기인 분류(요약 표)↔빨강영역 픽셀 일치.
   //   (rel → 절대 방위 = azCenter + rel; 샘플러가 내부에서 360° 정규화·래핑 처리)
   const terrainSampler = makeTerrainSampler(pWith.terrain);
   const terrainAt = (rel: number) => terrainSampler(azCenter + rel);
@@ -168,8 +167,9 @@ export default function ReportOMObstacleAzElevChart({
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // 건물 메타 + 소실표적 분류 — obstacleAnalysisHelpers 의 단일 소스 사용.
-  //  panoWith/panoWithout 제공 시 차단각을 panorama(빨강영역과 동일 소스)에서 산출 → 검은× 점이 빨강영역과 픽셀 일치.
-  //  (요약 표의 '음영 소실' 건수와 이 차트의 빨강 점 분류가 항상 일치 — 양쪽 동일 panorama·sibling 인자)
+  //  panoWith/panoWithout 제공 시 차단각을 panorama(빨강영역과 동일 소스)에서 산출 → 장애물 추가 기인 분류가 빨강영역과 픽셀 일치.
+  //  (요약 표의 '음영 소실'(장애물 추가 기인) 건수가 빨강 영역과 항상 일치 — 양쪽 동일 panorama·sibling 인자.
+  //   소실표적 점은 분류와 무관하게 모두 빨간 점으로 표시)
   const computed = useMemo(
     () => classifyObstacleLosses(radarSite, building, los, lossPoints, { panoWith, panoWithout, siblings }),
     [radarSite, building, los, lossPoints, panoWith, panoWithout, siblings],
@@ -254,7 +254,7 @@ export default function ReportOMObstacleAzElevChart({
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.clearRect(0, 0, CHART_W, CHART_H);
 
-    ctx.fillStyle = "#fafafa";
+    ctx.fillStyle = "#ffffff";
     ctx.fillRect(MARGIN.left, MARGIN.top, INNER_W, INNER_H);
     ctx.strokeStyle = "#e5e7eb";
     ctx.lineWidth = 0.5;
@@ -304,40 +304,17 @@ export default function ReportOMObstacleAzElevChart({
     const { withoutLine, withLine } = sil;
     const clamp0 = (e: number) => (e < 0 ? 0 : e);
 
-    // 소실표적 — 먼저 그려서 실루엣 영역 아래로 깔린다.
-    // (지형/추가차단 영역을 점 위에 겹쳐 그려야 영역이 분포에 묻히지 않고 잘 보임)
-    // 1) 장애물 무관 (파란점)
-    ctx.fillStyle = "rgba(59,130,246,0.3)";
+    // 소실표적 — 모든 소실표적을 빨간 점으로 통일 (LoS 단면도와 동일 #ff1745).
+    //   먼저 그려서 실루엣 영역(지형/추가차단) 아래로 깔린다.
+    //   (분류별 건수는 하단 요약 표에서 제공)
+    ctx.fillStyle = "rgba(255,23,69,0.9)";
     for (const l of computed.losses) {
-      if (l.inShadow || l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      ctx.fillRect(x - 0.75, y - 0.75, 1.5, 1.5);
-    }
-    // 2) 지형 차단 (회색 원)
-    ctx.fillStyle = "rgba(107,114,128,0.7)";
-    for (const l of computed.losses) {
-      if (!l.inShadow || l.buildingCaused || l.elevAngleDeg < 0) continue;
+      if (l.elevAngleDeg < 0) continue;
       const x = xScale(l.azDeg);
       const y = yScale(l.elevAngleDeg);
       ctx.beginPath();
-      ctx.arc(x, y, 1.8, 0, Math.PI * 2);
+      ctx.arc(x, y, 2, 0, Math.PI * 2);
       ctx.fill();
-    }
-    // 3) 장애물 추가 기인 (검은 ×)
-    ctx.strokeStyle = "#000";
-    ctx.lineWidth = 1.4;
-    for (const l of computed.losses) {
-      if (!l.buildingCaused || l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      const s = 2.8;
-      ctx.beginPath();
-      ctx.moveTo(x - s, y - s);
-      ctx.lineTo(x + s, y + s);
-      ctx.moveTo(x + s, y - s);
-      ctx.lineTo(x - s, y + s);
-      ctx.stroke();
     }
 
     // 방위별 실루엣 윗변 — 소실표적 위에 겹쳐 그림 (반투명 영역이 분포 위로 올라와 잘 보임).
@@ -467,75 +444,63 @@ export default function ReportOMObstacleAzElevChart({
           <OMEditable id={`${eid}.legend.added`} value="분석 대상 추가 차단" tag="span" />
         </span>
         <span className="flex items-center gap-1">
-          <svg width="10" height="10" viewBox="0 0 10 10" className="inline-block">
-            <line x1="2" y1="2" x2="8" y2="8" stroke="#000" strokeWidth="1.4" />
-            <line x1="8" y1="2" x2="2" y2="8" stroke="#000" strokeWidth="1.4" />
-          </svg>
-          <OMEditable id={`${eid}.legend.bldgCaused`} value="장애물 추가 기인" tag="span" />
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "#6b7280", opacity: 0.7 }} />
-          <OMEditable id={`${eid}.legend.terrainBlock`} value="지형 차단" tag="span" />
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-2 h-2 rounded-sm" style={{ backgroundColor: "rgba(59,130,246,0.5)" }} />
-          <OMEditable id={`${eid}.legend.free`} value="장애물 무관" tag="span" />
+          <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "rgba(255,23,69,0.9)" }} />
+          <OMEditable id={`${eid}.legend.loss`} value="소실표적" tag="span" />
         </span>
       </div>
 
-      {/* 요약 테이블 */}
-      <table className="mt-2 w-full border-collapse text-[11px]">
+      {/* 요약 테이블 — 분석요약 표(.om-table)와 동일 색·스타일로 통일 */}
+      <table className="om-table sm-table mt-2">
         <thead>
-          <tr className="bg-[#28283c] text-white">
-            <th className="border border-gray-300 px-2 py-1 font-medium"><OMEditable id={`${eid}.tbl.colItem`} value="항목" tag="span" /></th>
-            <th className="border border-gray-300 px-2 py-1 font-medium"><OMEditable id={`${eid}.tbl.colVal`} value="값" tag="span" /></th>
-            <th className="border border-gray-300 px-2 py-1 font-medium"><OMEditable id={`${eid}.tbl.colNote`} value="비고" tag="span" /></th>
+          <tr>
+            <th><OMEditable id={`${eid}.tbl.colItem`} value="항목" tag="span" /></th>
+            <th><OMEditable id={`${eid}.tbl.colVal`} value="값" tag="span" /></th>
+            <th><OMEditable id={`${eid}.tbl.colNote`} value="비고" tag="span" /></th>
           </tr>
         </thead>
         <tbody>
-          <tr className="bg-white">
-            <td className="border border-gray-200 px-2 py-1">방위 ±{AZ_TOLERANCE}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
-            <td className="border border-gray-200 px-2 py-1 text-right font-mono">{total}건</td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500"><OMEditable id={`${eid}.tbl.r1.note`} value="분석 대상 후방 영역" tag="span" /></td>
+          <tr>
+            <td>방위 ±{AZ_TOLERANCE}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
+            <td className="ta-r mono">{total}건</td>
+            <td className="muted"><OMEditable id={`${eid}.tbl.r1.note`} value="분석 대상 후방 영역" tag="span" /></td>
           </tr>
-          <tr className="bg-gray-50">
-            <td className="border border-gray-200 px-2 py-1"><OMEditable id={`${eid}.tbl.r2.label`} value="LoS 차단 영역 내" tag="span" /></td>
-            <td className="border border-gray-200 px-2 py-1 text-right font-mono">
+          <tr className="alt">
+            <td><OMEditable id={`${eid}.tbl.r2.label`} value="LoS 차단 영역 내" tag="span" /></td>
+            <td className="ta-r mono">
               {shadowCount}건 ({shadowRatio.toFixed(1)}%)
             </td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500"><OMEditable id={`${eid}.tbl.r2.note`} value="지형+장애물 통합 차단" tag="span" /></td>
+            <td className="muted"><OMEditable id={`${eid}.tbl.r2.note`} value="지형+장애물 통합 차단" tag="span" /></td>
           </tr>
-          <tr className="bg-white">
-            <td className="border border-gray-200 px-2 py-1 font-semibold text-[#a60739]"><OMEditable id={`${eid}.tbl.r3.label`} value="장애물 추가 기인" tag="span" /></td>
-            <td className="border border-gray-200 px-2 py-1 text-right font-mono font-bold"
-                style={{ color: bldgRatio > 10 ? "#dc2626" : "#374151" }}>
+          <tr>
+            <td className="strong" style={{ color: "#a60739" }}><OMEditable id={`${eid}.tbl.r3.label`} value="장애물 추가 기인" tag="span" /></td>
+            <td className="ta-r mono strong" style={{ color: bldgRatio > 10 ? "#dc2626" : "#374151" }}>
               {bldgCount}건 ({bldgRatio.toFixed(1)}%) / {bldgDuration.toFixed(1)}초
             </td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500">
+            <td className="muted">
               <OMEditable id={`${eid}.tbl.r3.note`} value="지형 차단각 초과 ~ 대상 차단각 사이" tag="span" />
             </td>
           </tr>
-          <tr className="bg-gray-50">
-            <td className="border border-gray-200 px-2 py-1 text-blue-600"><OMEditable id={`${eid}.tbl.r4.label`} value="장애물 무관" tag="span" /></td>
-            <td className="border border-gray-200 px-2 py-1 text-right font-mono">
+          <tr className="alt">
+            <td style={{ color: "#2563eb" }}><OMEditable id={`${eid}.tbl.r4.label`} value="장애물 무관" tag="span" /></td>
+            <td className="ta-r mono">
               {freeCount}건 ({total > 0 ? ((freeCount / total) * 100).toFixed(1) : "0.0"}%)
             </td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500"><OMEditable id={`${eid}.tbl.r4.note`} value="차단 영역 외 소실표적" tag="span" /></td>
+            <td className="muted"><OMEditable id={`${eid}.tbl.r4.note`} value="차단 영역 외 소실표적" tag="span" /></td>
           </tr>
-          <tr className="bg-white">
-            <td className="border border-gray-200 px-2 py-1">↳ <OMEditable id={`${eid}.tbl.r5.label`} value="대상 차단각" tag="span" /></td>
-            <td className="border border-gray-200 px-2 py-1 text-right font-mono">
+          <tr>
+            <td>↳ <OMEditable id={`${eid}.tbl.r5.label`} value="대상 차단각" tag="span" /></td>
+            <td className="ta-r mono">
               {computed.angleTotalDeg.toFixed(2)}°
               {hasBldgEffect ? ` (지형 ${computed.angleTerrainDeg.toFixed(2)}°)` : " (지형 이하)"}
             </td>
-            <td className="border border-gray-200 px-2 py-1 text-gray-500">
+            <td className="muted">
               {(computed.bDistKm / KM_PER_NM).toFixed(1)}NM · 추가 기인 판정:
               {" "}
               {bldgRatio > 20
-                ? <span className="font-bold text-red-600">유의미</span>
+                ? <span className="strong" style={{ color: "#dc2626" }}>유의미</span>
                 : bldgRatio > 5
-                  ? <span className="font-bold text-amber-600">부분 영향</span>
-                  : <span className="font-bold text-green-600">영향 미미</span>}
+                  ? <span className="strong" style={{ color: "#d97706" }}>부분 영향</span>
+                  : <span className="strong" style={{ color: "#16a34a" }}>영향 미미</span>}
             </td>
           </tr>
         </tbody>

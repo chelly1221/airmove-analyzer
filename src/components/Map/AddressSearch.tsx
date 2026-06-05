@@ -13,6 +13,8 @@ interface AddressResult {
 
 interface Props {
   onSelect: (lat: number, lon: number, label: string) => void;
+  /** 좌측 오프셋(px) — 좌측 도구 드로어 열림 시 드로어 폭만큼 밀어내 가림 방지 (기본 8) */
+  offsetLeft?: number;
 }
 
 /** 주소 마커 (MapGL 내부에 렌더링) */
@@ -37,7 +39,7 @@ export function AddressMarker({ marker, onClose }: { marker: { lat: number; lon:
 }
 
 /** 주소 검색 오버레이 (맵 위에 absolute 배치) */
-export default function AddressSearch({ onSelect }: Props) {
+export default function AddressSearch({ onSelect, offsetLeft = 8 }: Props) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<AddressResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -108,7 +110,7 @@ export default function AddressSearch({ onSelect }: Props) {
   }, []);
 
   return (
-    <div ref={ref} className="absolute top-2 left-2 z-[800]" style={{ width: 280 }}>
+    <div ref={ref} className="absolute top-2 z-[800]" style={{ width: 280, left: offsetLeft, transition: "left .4s cubic-bezier(.4,0,.2,1)" }}>
       <div className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white/95 px-2.5 py-1.5 shadow-lg backdrop-blur-sm">
         <Search size={14} className="shrink-0 text-gray-400" />
         <input

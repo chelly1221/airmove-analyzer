@@ -88,9 +88,12 @@ interface TileCacheEntry {
   timestamp: number;
 }
 
-/** 타일 키 (그리드 인덱스) */
-function tileKey(latIdx: number, lonIdx: number, size: number): string {
-  return `${size}_${latIdx}_${lonIdx}`;
+/** 타일 키 (출처 시그니처 + 그리드 인덱스).
+ * srcSig를 포함해야 출처 토글 직후, 이전 출처로 진행 중이던 fetch가
+ * 캐시 무효화 후 늦게 _cache.set 하더라도 새 출처 로드가 그 타일을 히트로
+ * 오인하지 않는다 (출처 교차 오염 방지). */
+function tileKey(latIdx: number, lonIdx: number, size: number, srcSig: string): string {
+  return `${srcSig}_${size}_${latIdx}_${lonIdx}`;
 }
 
 // 글로벌 캐시
@@ -138,6 +141,8 @@ export async function fetchBuildingsForViewport(
   const { south, north, west, east, zoom } = bounds;
   const size = tileSize(zoom);
   const minH = minHeight(zoom);
+  // 출처 시그니처 — 캐시 키에 포함하여 출처별 타일을 분리 (정렬로 순서 무관)
+  const srcSig = excludeSources.length ? [...excludeSources].sort().join(",") : "all";
 
   // 줌 레벨에 따른 타일 크기가 변경되면 캐시 무효화
   if (_cacheZoomLevel !== -1 && tileSize(_cacheZoomLevel) !== size) {
@@ -156,7 +161,7 @@ export async function fetchBuildingsForViewport(
 
   for (let li = latStart; li <= latEnd; li++) {
     for (let lj = lonStart; lj <= lonEnd; lj++) {
-      const key = tileKey(li, lj, size);
+      const key = tileKey(li, lj, size, srcSig);
       const entry = _cache.get(key);
       if (entry && entry.minHeight <= minH) {
         cachedTiles.push(key);
@@ -172,7 +177,7 @@ export async function fetchBuildingsForViewport(
     // 뷰포트 범위 내 캐시된 타일
     for (let li = latStart; li <= latEnd; li++) {
       for (let lj = lonStart; lj <= lonEnd; lj++) {
-        const key = tileKey(li, lj, size);
+        const key = tileKey(li, lj, size, srcSig);
         const entry = _cache.get(key);
         if (entry) {
           for (const b of entry.buildings) {

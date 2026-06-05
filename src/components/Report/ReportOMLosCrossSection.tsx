@@ -189,35 +189,38 @@ export function LosCrossSection({
     // 2a) 현재 선 (지형+모든 건물, combinedElev base) — 기존과 동일 결과
     const minDetStraight = computeMinDet(profile, buildings);
 
-    // 2b) 분석 대상 건물 제외 선 (순수지형 base + 대상 외 건물).
+    // 2b) 분석 대상 건물 제외 선 — base 를 실선과 동일한 profile(combinedElev: 지형+모든건물)에서 출발시키고,
+    //     대상 건물 footprint 구간만 구조물 height 를 제거(지반/언덕은 유지)한다. → 점선 base = 실선 base,
+    //     유일한 차이 = 대상 구조물뿐이라 두 선은 대상 전까지 완전히 동일하고 대상 후방서만 벌어진다.
+    //     (이전엔 raw SRTM 에서 출발 → 녹색 지형에 묻혀 실루엣 없이 보이는 비대상 건물 봉우리(combinedElev 스파이크)가
+    //      점선 base 에서 빠져, 실선·녹색지형은 그 위를 타고 넘는데 점선만 봉우리를 '무시'하던 시각 불일치가 있었음.
+    //      비대상 건물은 엣지로만 들어가 interpElev 보간 봉우리를 만들지 못해 floor 가 raw SRTM 으로 가라앉던 게 원인.)
     //     대상 식별: 수동건물 + 치수 일치 + far_dist 가 타겟 거리(D)까지 도달 (코리도 끝 = 대상).
     //     point 형 대상은 Rust 가 pathBuildings 에서 제외 → 매칭 0 건이면 미표시(두 선 동일).
-    //     terrainProfile(raw) 은 DB 복원 los 엔 없음 → 그 경우도 미표시 (graceful).
     const buildingsWithoutTarget = buildings.filter((b) => !isTargetBuildingOnPath(b, building, D));
     const targetBuildings = buildings.filter((b) => isTargetBuildingOnPath(b, building, D));
-    const rawTerrain = los.terrainProfile;
-    // 분석 대상 제외선의 지형 base: 순수 SRTM(rawTerrain)에 '대상 건물이 깔고 앉은 지반고(ground_elev)'를
-    //   footprint(near~far) 구간에 max 병합한다. 구조물 height 만 제거하고, 그 지반이 표현하는 언덕은 유지 —
-    //   중앙선 SRTM 이 언덕 옆을 스쳐 낮게 샘플링돼 대상 제외 시 언덕째 사라지던 누락을 보정.
-    let dashedTerrain: ElevationPoint[] | undefined = rawTerrain;
-    if (rawTerrain && rawTerrain.length > 0 && targetBuildings.length > 0) {
-      const merged = rawTerrain.map((p) => ({ ...p }));
+    const rawTerrain = los.terrainProfile; // 순수 SRTM — 대상 footprint 의 지반 복원용 (index 는 profile 과 정렬)
+    let dashedTerrain: ElevationPoint[] | undefined;
+    if (targetBuildings.length > 0) {
+      const merged = profile.map((p) => ({ ...p }));
       for (const tb of targetBuildings) {
         const near = tb.near_dist_km ?? tb.distance_km;
         const far = tb.far_dist_km ?? tb.distance_km;
         const grnd = tb.ground_elev_m;
-        for (const p of merged) {
-          if (p.distance >= near - 1e-9 && p.distance <= far + 1e-9 && grnd > p.elevation) {
-            p.elevation = grnd;
-          }
+        for (let i = 0; i < merged.length; i++) {
+          const p = merged[i];
+          if (p.distance < near - 1e-9 || p.distance > far + 1e-9) continue;
+          // 대상 구조물 height 제거: 순수지형과 대상 지반고 중 높은 값으로 내림(rawTerrain 없으면 지반고로 폴백).
+          //   중앙선 SRTM 이 언덕 옆을 스쳐 낮게 샘플링된 경우는 ground_elev 가 언덕을 복원.
+          const floorElev = Math.max(rawTerrain?.[i]?.elevation ?? grnd, grnd);
+          if (floorElev < p.elevation) p.elevation = floorElev;
         }
       }
       dashedTerrain = merged;
     }
-    const minDetWithout =
-      dashedTerrain && dashedTerrain.length > 0 && buildingsWithoutTarget.length < buildings.length
-        ? computeMinDet(dashedTerrain, buildingsWithoutTarget)
-        : null;
+    const minDetWithout = dashedTerrain
+      ? computeMinDet(dashedTerrain, buildingsWithoutTarget)
+      : null;
 
     // 차단 판정 (TrackMap 와 동일 — 빌딩까지 직선 LoS 와 통합 장애물 비교)
     const losStraightH = (d: number) =>

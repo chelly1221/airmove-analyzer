@@ -147,6 +147,99 @@ pub struct BuildingOnPath {
     pub is_manual: bool,
 }
 
+/// 건물통합정보(FAC) 단건 상세 — 클릭 좌표 인근 건물의 대장성 필드 (오프라인 로컬 DB)
+#[derive(Serialize, Clone, Debug)]
+pub struct FacBuildingDetail {
+    pub name: Option<String>,
+    pub dong_name: Option<String>,
+    pub usage: Option<String>,
+    pub pnu: Option<String>,
+    pub bd_mgt_sn: Option<String>,
+    pub height_m: f64,
+    pub ground_elev_m: f64,
+    pub region: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// 주어진 좌표를 포함(또는 최근접)하는 FAC 건물 1건 조회.
+/// 1) bbox 후보 중 폴리곤 내부 포함 건물 우선,
+/// 2) 없으면 centroid 최근접(반경 radius_m 이내).
+pub fn query_fac_building_detail(
+    conn: &Connection,
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+) -> Result<Option<FacBuildingDetail>, String> {
+    let eff_radius = radius_m.max(40.0);
+    let buf = eff_radius / 111_000.0;
+    let mut stmt = conn.prepare(
+        "SELECT building_name, dong_name, usability, pnu, bd_mgt_sn, height, COALESCE(ground_elev, 0), region, centroid_lat, centroid_lon, polygon_json
+         FROM fac_buildings
+         WHERE centroid_lat BETWEEN ?1 AND ?2
+           AND centroid_lon BETWEEN ?3 AND ?4"
+    ).map_err(|e| format!("FAC 상세 쿼리 준비 실패: {}", e))?;
+
+    let rows = stmt.query_map(
+        params![lat - buf, lat + buf, lon - buf, lon + buf],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, f64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, f64>(8)?,
+                row.get::<_, f64>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        },
+    ).map_err(|e| format!("FAC 상세 쿼리 실행 실패: {}", e))?;
+
+    let mut contained: Option<FacBuildingDetail> = None;
+    let mut best: Option<(f64, FacBuildingDetail)> = None; // (거리 km, 상세)
+
+    for row in rows {
+        let (name, dong_name, usage, pnu, bd_mgt_sn, height, ground_elev, region, clat, clon, polygon_json) =
+            row.map_err(|e| format!("FAC 상세 행 읽기 실패: {}", e))?;
+        let detail = FacBuildingDetail {
+            name, dong_name, usage, pnu, bd_mgt_sn,
+            height_m: height, ground_elev_m: ground_elev,
+            region, lat: clat, lon: clon,
+        };
+        // 1) 폴리곤 내부 포함 건물 우선 (정확)
+        if contained.is_none() {
+            if let Some(s) = polygon_json.as_deref() {
+                if let Ok(poly) = serde_json::from_str::<Vec<[f64; 2]>>(s) {
+                    let ring: Vec<(f64, f64)> = poly.iter().map(|p| (p[1], p[0])).collect();
+                    if point_in_polygon_2d(lon, lat, &ring) {
+                        contained = Some(detail);
+                        continue;
+                    }
+                }
+            }
+        }
+        // 2) centroid 최근접 후보 누적
+        let d = crate::geo::haversine_km(lat, lon, clat, clon);
+        if best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+            best = Some((d, detail));
+        }
+    }
+
+    if let Some(c) = contained {
+        return Ok(Some(c));
+    }
+    if let Some((d, detail)) = best {
+        if d * 1000.0 <= eff_radius {
+            return Ok(Some(detail));
+        }
+    }
+    Ok(None)
+}
+
 /// LoS 경로(레이더→타겟) 상의 건물 조회
 pub fn query_buildings_along_path(
     conn: &Connection,

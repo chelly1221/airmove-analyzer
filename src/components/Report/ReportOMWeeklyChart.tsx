@@ -251,24 +251,24 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, hideHeader }: 
         </g>
       </svg>
 
-      {/* 주차별 요약 테이블 */}
-      <table className="mt-2 w-full border-collapse text-[12px]">
+      {/* 주차별 요약 테이블 — 분석요약 표(.om-table)와 동일 색·스타일로 통일 */}
+      <table className="om-table sm-table weekly-table">
         <thead>
-          <tr className="bg-[#28283c] text-white">
-            <th className="border border-gray-300 px-2 py-1 font-medium">주차</th>
-            <th className="border border-gray-300 px-2 py-1 text-right font-medium">분석일수</th>
-            <th className="border border-gray-300 px-2 py-1 text-right font-medium">평균 PSR율(%)</th>
+          <tr>
+            <th>주차</th>
+            <th className="ta-r">분석일수</th>
+            <th className="ta-r">평균 PSR율(%)</th>
             {hasBaseline && (
               <>
-                <th className="border border-gray-300 px-2 py-1 text-right font-medium">기준 PSR율(%)</th>
-                <th className="border border-gray-300 px-2 py-1 text-right font-medium">PSR 편차(%p)</th>
+                <th className="ta-r">기준 PSR율(%)</th>
+                <th className="ta-r">PSR 편차(%p)</th>
               </>
             )}
-            <th className="border border-gray-300 px-2 py-1 text-right font-medium">평균 표적소실율(%)</th>
+            <th className="ta-r">평균 표적소실율(%)</th>
             {hasBaseline && (
               <>
-                <th className="border border-gray-300 px-2 py-1 text-right font-medium">기준 표적소실율(%)</th>
-                <th className="border border-gray-300 px-2 py-1 text-right font-medium">편차(%p)</th>
+                <th className="ta-r">기준 표적소실율(%)</th>
+                <th className="ta-r">편차(%p)</th>
               </>
             )}
           </tr>
@@ -278,29 +278,27 @@ function ReportOMWeeklyChart({ sectionNum, radarName, dailyStats, hideHeader }: 
             const lossDev = w.avgLoss - w.baselineLoss;
             const psrDev = w.avgPsr - w.baselinePsr;
             return (
-              <tr key={w.week} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
-                <td className="border border-gray-200 px-2 py-1 text-center font-semibold text-gray-700">
-                  {w.label}
-                </td>
-                <td className="border border-gray-200 px-2 py-1 text-right">{w.days}일</td>
-                <td className="border border-gray-200 px-2 py-1 text-right font-mono text-blue-600">{w.avgPsr.toFixed(2)}</td>
+              <tr key={w.week} className={i % 2 === 0 ? "" : "alt"}>
+                <td className="ta-c strong">{w.label}</td>
+                <td className="ta-r">{w.days}일</td>
+                <td className="ta-r mono" style={{ color: "#2563eb" }}>{w.avgPsr.toFixed(2)}</td>
                 {hasBaseline && (
                   <>
-                    <td className="border border-gray-200 px-2 py-1 text-right font-mono text-gray-500">{w.baselinePsr.toFixed(2)}</td>
-                    <td className={`border border-gray-200 px-2 py-1 text-right font-mono font-semibold ${
-                      psrDev < -PSR_DEV_THRESHOLD ? "text-red-600" : psrDev > PSR_DEV_THRESHOLD ? "text-green-600" : "text-gray-500"
-                    }`}>
+                    <td className="ta-r mono muted">{w.baselinePsr.toFixed(2)}</td>
+                    <td className="ta-r mono strong" style={{
+                      color: psrDev < -PSR_DEV_THRESHOLD ? "#dc2626" : psrDev > PSR_DEV_THRESHOLD ? "#16a34a" : "#6b7280",
+                    }}>
                       {psrDev > 0 ? "+" : ""}{psrDev.toFixed(2)}
                     </td>
                   </>
                 )}
-                <td className="border border-gray-200 px-2 py-1 text-right font-mono text-red-600">{w.avgLoss.toFixed(3)}</td>
+                <td className="ta-r mono" style={{ color: "#dc2626" }}>{w.avgLoss.toFixed(3)}</td>
                 {hasBaseline && (
                   <>
-                    <td className="border border-gray-200 px-2 py-1 text-right font-mono text-gray-500">{w.baselineLoss.toFixed(3)}</td>
-                    <td className={`border border-gray-200 px-2 py-1 text-right font-mono font-semibold ${
-                      lossDev > LOSS_DEV_THRESHOLD ? "text-red-600" : lossDev < -LOSS_DEV_THRESHOLD ? "text-green-600" : "text-gray-500"
-                    }`}>
+                    <td className="ta-r mono muted">{w.baselineLoss.toFixed(3)}</td>
+                    <td className="ta-r mono strong" style={{
+                      color: lossDev > LOSS_DEV_THRESHOLD ? "#dc2626" : lossDev < -LOSS_DEV_THRESHOLD ? "#16a34a" : "#6b7280",
+                    }}>
                       {lossDev > 0 ? "+" : ""}{lossDev.toFixed(3)}
                     </td>
                   </>

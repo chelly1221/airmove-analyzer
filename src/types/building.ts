@@ -37,6 +37,20 @@ export interface Building3D {
   group_color?: string;
 }
 
+/** 건물통합정보(FAC) 단건 상세 — get_fac_building_detail 결과 (로컬 DB, 오프라인) */
+export interface FacBuildingDetail {
+  name: string | null;
+  dong_name: string | null;
+  usage: string | null;
+  pnu: string | null;
+  bd_mgt_sn: string | null;
+  height_m: number;
+  ground_elev_m: number;
+  region: string;
+  lat: number;
+  lon: number;
+}
+
 /** 인근 산봉우리 (query_nearby_peaks 결과) */
 export interface NearbyPeak {
   name: string;

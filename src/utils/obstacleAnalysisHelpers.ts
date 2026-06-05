@@ -240,18 +240,15 @@ export function mergeAzSectors(sectors: AzSector[]): AzSector[] {
 // ReportOMObstacleAzElevChart 와 ReportOMSummarySection 이 공유하는 단일 소스.
 //   inShadow:       소실표적 양각 < with 차단각(지형+기존지물+분석대상)  → 통합 음영구역 내
 //   buildingCaused: inShadow && 양각 ≥ without 차단각(분석대상 제외)      → 분석 대상 건물 추가분에 의해서만 차단
-// with/without 두 프로파일의 유일한 차이 = 분석 대상 건물 → [without, with] 밴드 = '대상 추가 차단'.
+// with/without 두 실루엣의 유일한 차이 = 분석 대상 건물 → [without, with] 밴드 = '대상 추가 차단'.
 //   이는 panorama 빨강영역(panoWith−panoWithout)과 동일 정의 → 차트의 빨강 영역과 검은× 점이 by-construction 일치.
-// 차단각 조회 방식은 두 경로가 다름:
-//   • option B(panorama 제공): 방위별 silhouette max(전 거리, 실제지구) → 차트와 동일 소스라 픽셀 일치.
-//     파노라마는 거리축이 없어 max-over-distance 가 본질 — 표적 너머 지형도 silhouette 에 포함되나,
-//     buildingCount(=with−without 차분)는 공통 원거리 장애물이 상쇄돼 거리 오염 없음.
-//   • option A(panorama 없음, 복원/요약 폴백): 각 표적 '자기 거리까지'의 prefix-max(4/3) → 표적 너머 지형 차폐 오판 제거.
+// 차단각 = panorama 실루엣 방위별 max(전 거리, 실제지구) → 차트와 동일 소스라 픽셀 일치.
+//   파노라마는 거리축이 없어 max-over-distance 가 본질 — 표적 너머 지형도 silhouette 에 포함되나,
+//   buildingCount(=with−without 차분)는 공통 원거리 장애물이 상쇄돼 거리 오염 없음.
 
+/** 소실표적 양각·차단각 곡률 보정 지구반경 — 실제지구. panorama 실루엣(빨강영역)이 실제지구 프레임이라
+ *  점·영역을 같은 프레임에 두어 검은×↔빨강영역 픽셀 일치(단면도 표시 곡률 curvDrop 과도 동일 반경). */
 const R_EARTH_M_LOSS = 6_371_000;
-/** 4/3 유효지구반경 — 표준 대기 굴절(k=4/3). LoS 단면도(curvDrop43)·computeLosBatch·도메인 표준과 통일.
- *  (실제지구 곡률 사용 시 단면도 '정답' 차단 판정과 경계 케이스 불일치 → 4/3 으로 일원화) */
-const R_EFF_M_LOSS = (R_EARTH_M_LOSS * 4) / 3;
 const FT_PER_M_LOSS = 3.28084;
 const AZ_TOLERANCE_DEG = 10;
 
@@ -284,65 +281,10 @@ export function isTargetBuildingOnPath(
     && (b.far_dist_km ?? b.distance_km) >= totalDistKm - 0.5;
 }
 
-/** terrain 프로파일에 건물 윗변(지반+높이)을 거리별 max 로 병합한 새 프로파일.
- *  computeLosBatch 의 combinedElev 구성과 동일 — 건물의 near~far 구간 샘플에 max. */
-function mergeBuildingsIntoProfile(
-  terrain: { distance: number; elevation: number }[],
-  buildings: BuildingOnPath[],
-): { distance: number; elevation: number }[] {
-  const prof = terrain.map((p) => ({ distance: p.distance, elevation: p.elevation }));
-  if (prof.length < 2) return prof;
-  const d0 = prof[0].distance;
-  const step = prof[1].distance - prof[0].distance;
-  if (step <= 0) return prof;
-  for (const b of buildings) {
-    const top = b.ground_elev_m + b.height_m;
-    const near = b.near_dist_km ?? b.distance_km;
-    const far = b.far_dist_km ?? b.distance_km;
-    const loIdx = Math.max(0, Math.round((near - d0) / step));
-    const hiIdx = Math.min(prof.length - 1, Math.round((far - d0) / step));
-    for (let i = loIdx; i <= hiIdx; i++) {
-      if (top > prof[i].elevation) prof[i].elevation = top;
-    }
-  }
-  return prof;
-}
-
-/** 거리별 누적 최대 차단각(°) — 4/3 유효지구 곡률 보정 후 running max.
- *  distance 오름차순 프로파일 → prefix max 라 표적별 거리 cutoff 를 angleAtDist 로 O(log n) 조회. */
-function prefixMaxAngleDeg(
-  profile: { distance: number; elevation: number }[],
-  radarHeight: number,
-): { dist: number; maxDeg: number }[] {
-  const out: { dist: number; maxDeg: number }[] = [];
-  let run = -Infinity;
-  for (const pt of profile) {
-    if (pt.distance > 0) {
-      const dM = pt.distance * 1000;
-      const adjH = pt.elevation - (dM * dM) / (2 * R_EFF_M_LOSS);
-      const angle = (adjH - radarHeight) / dM;
-      if (angle > run) run = angle;
-    }
-    out.push({ dist: pt.distance, maxDeg: run === -Infinity ? 0 : (Math.atan(run) * 180) / Math.PI });
-  }
-  return out;
-}
-
-/** prefix-max 차단각 배열에서 distKm 까지의 누적 최대각(°) — 마지막 dist ≤ distKm 항목. */
-function angleAtDist(prefix: { dist: number; maxDeg: number }[], distKm: number): number {
-  if (prefix.length === 0 || prefix[0].dist > distKm) return 0;
-  let lo = 0, hi = prefix.length - 1, ans = 0;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (prefix[mid].dist <= distKm) { ans = mid; lo = mid + 1; } else hi = mid - 1;
-  }
-  return prefix[ans].maxDeg;
-}
-
-/** 소실표적 양각(°) — 곡률 보정 후. earthRadiusM 으로 프레임 선택(4/3 유효지구 기본, panorama 경로는 실제지구). */
-function lossElevAngleDeg(radarH: number, targetAltM: number, distM: number, earthRadiusM = R_EFF_M_LOSS): number {
+/** 소실표적 양각(°) — 실제지구 곡률 보정 후(보고된 고도에서 d²/2R 강하량 차감). panorama 실루엣과 동일 프레임. */
+function lossElevAngleDeg(radarH: number, targetAltM: number, distM: number): number {
   if (distM <= 0) return 0;
-  const curvDrop = (distM * distM) / (2 * earthRadiusM);
+  const curvDrop = (distM * distM) / (2 * R_EARTH_M_LOSS);
   return (Math.atan((targetAltM - curvDrop - radarH) / distM) * 180) / Math.PI;
 }
 
@@ -458,7 +400,9 @@ export function classifyObstacleLosses(
   los: LoSProfileData,
   lossPoints: LossPointGeo[],
   opts?: {
-    /** 차트 빨강영역과 픽셀 일치용 — 제공 시 차단각을 panorama(실제지구)에서 방위별 샘플(option B). 없으면 LoS 프로파일 4/3(option A). */
+    /** 차단각 산출용 panorama(실제지구) — 차트 빨강영역과 동일 소스라 검은×↔빨강영역 픽셀 일치.
+     *  panoWith = 지형+기존지물+분석대상, panoWithout = 분석대상 제외(Rust 가 제외대상 0 이면 null → without==with).
+     *  panoWith 자체가 없으면(해당 레이더 파노라마 계산 실패) 차단각 0 → 음영 분류 생략(보수적). */
     panoWith?: PanoramaMergeResult;
     panoWithout?: PanoramaMergeResult;
     /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적을 더 강하게 소유하는 건물이 있으면 본 건물 집계서 제외(오귀속 방지).
@@ -481,50 +425,17 @@ export function classifyObstacleLosses(
     : haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
   const bAzDeg = los.bearing ?? bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
 
-  // 차단각 산출 — with(지형+기존지물+분석대상) / without(분석대상 제외)의 차이가 곧 '대상 추가 차단'.
-  //  (B) panorama 제공 → 빨강영역(panoWith−panoWithout)과 동일 소스·동일 프레임(실제지구)으로 방위별 샘플 → 픽셀 일치.
-  //  (A) panorama 없음(복원/요약 폴백) → LoS 프로파일 with/without, 표적별 거리 cutoff, 4/3 유효지구.
-  const pW = opts?.panoWith;
-  const pWo = opts?.panoWithout;
-  const usePano = !!(pW && pWo);
-  const earthR = usePano ? R_EARTH_M_LOSS : R_EFF_M_LOSS;
+  // 차단각 = panorama 실루엣 방위별 max(실제지구). with(지형+기존지물+분석대상) − without(분석대상 제외) = '대상 추가 차단'.
+  //   빨강영역(panoWith−panoWithout)과 동일 소스·동일 프레임 → 차트 빨강영역·검은× 점 픽셀 일치.
+  //   panoWithout 가 null(Rust 가 제외대상 0 일 때) → without==with. panoWith 자체가 없으면 차단각 0(음영 분류 생략).
+  const sW = opts?.panoWith ? makePanoramaSampler(opts.panoWith) : null;
+  const sWo = opts?.panoWithout ? makePanoramaSampler(opts.panoWithout) : sW;
+  const angleWithAt = (azDeg: number) => (sW ? sW(azDeg) : 0);
+  const angleWithoutAt = (azDeg: number) => (sWo ? sWo(azDeg) : 0);
 
-  // angleWithAt/angleWithoutAt(방위°, 거리km) — option B 는 방위 의존, option A 는 거리 의존(표적별 cutoff).
-  let angleWithAt: (azDeg: number, distKm: number) => number;
-  let angleWithoutAt: (azDeg: number, distKm: number) => number;
-  if (usePano) {
-    const sW = makePanoramaSampler(pW!);
-    const sWo = makePanoramaSampler(pWo!);
-    angleWithAt = (az) => sW(az);
-    angleWithoutAt = (az) => sWo(az);
-  } else {
-    const terrain = los.terrainProfile && los.terrainProfile.length > 0 ? los.terrainProfile : null;
-    const pathB = los.pathBuildings ?? [];
-    let withPrefix: { dist: number; maxDeg: number }[];
-    let withoutPrefix: { dist: number; maxDeg: number }[];
-    if (terrain) {
-      withPrefix = prefixMaxAngleDeg(mergeBuildingsIntoProfile(terrain, pathB), radarH);
-      withoutPrefix = prefixMaxAngleDeg(
-        mergeBuildingsIntoProfile(terrain, pathB.filter((b) => !isTargetBuildingOnPath(b, building, bDistKm))),
-        radarH,
-      );
-    } else if (los.elevationProfile.length > 0) {
-      // terrainProfile 없는 복원 los — with 만 산출, without=with (대상 효과 0, 보수적: buildingCaused 0)
-      withPrefix = prefixMaxAngleDeg(los.elevationProfile, radarH);
-      withoutPrefix = withPrefix;
-    } else {
-      // 프로파일 전무 — 건물 단일점 각도로 with, without=with (보수적)
-      const bTopM = (building.ground_elev ?? 0) + building.height;
-      withPrefix = prefixMaxAngleDeg([{ distance: bDistKm, elevation: bTopM }], radarH);
-      withoutPrefix = withPrefix;
-    }
-    angleWithAt = (_az, dist) => angleAtDist(withPrefix, dist);
-    angleWithoutAt = (_az, dist) => angleAtDist(withoutPrefix, dist);
-  }
-
-  // 표 표시용 대표 차단각 — angleTotalDeg=with(대상 차단각), angleTerrainDeg=without(지형+기존). 대상 방위·건물 거리 기준.
-  const angleTotalDeg = angleWithAt(bAzDeg, bDistKm);
-  const angleTerrainDeg = angleWithoutAt(bAzDeg, bDistKm);
+  // 표 표시용 대표 차단각 — angleTotalDeg=with(대상 차단각), angleTerrainDeg=without(지형+기존). 대상 방위 기준.
+  const angleTotalDeg = angleWithAt(bAzDeg);
+  const angleTerrainDeg = angleWithoutAt(bAzDeg);
 
   const siblings = opts?.siblings ?? [];
   // sibling 오귀속 비교용 자기 방위 — 호출부가 sibling 을 bearingDeg 로 계산하므로 동일 기준 사용(비대칭 제거).
@@ -560,9 +471,9 @@ export function classifyObstacleLosses(
     if (ownedByOther) continue;
 
     const lpAltM = lp.alt_ft / FT_PER_M_LOSS;
-    const lpElevDeg = lossElevAngleDeg(radarH, lpAltM, lpDistKm * 1000, earthR);
-    const angleWith = angleWithAt(lpAz, lpDistKm);               // 표적 방위/거리 with 차단각
-    const angleWithout = angleWithoutAt(lpAz, lpDistKm);         // 표적 방위/거리 without 차단각
+    const lpElevDeg = lossElevAngleDeg(radarH, lpAltM, lpDistKm * 1000);
+    const angleWith = angleWithAt(lpAz);                         // 표적 방위 with 차단각
+    const angleWithout = angleWithoutAt(lpAz);                   // 표적 방위 without 차단각
     const inShadow = lpElevDeg < angleWith;                      // 지형+장애물 통합 차단 음영
     const buildingCaused = inShadow && lpElevDeg >= angleWithout; // 대상 건물 추가분에 의해서만 차단
     losses.push({ azDeg: lpAz, elevAngleDeg: lpElevDeg, durationS: lp.duration_s, inShadow, buildingCaused });

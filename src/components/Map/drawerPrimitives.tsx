@@ -85,7 +85,9 @@ export function ToolButton({ icon: Icon, label, active, onClick }: {
   icon: LucideIcon; label: string; active: boolean; onClick: () => void;
 }) {
   const [hover, setHover] = useState(false);
-  const tint = active ? "#fff" : (hover ? G[600] : G[400]);
+  // 기본: 흰색 배경/회색 아이콘 · hover: 메인 테마색(붉은) 채움 · active(드로어 열림): 동일 붉은 채움 + 셰브런 180°로 구분
+  const lit = active || hover;
+  const tint = lit ? "#fff" : G[400];
   return (
     <button
       onClick={onClick}
@@ -93,14 +95,14 @@ export function ToolButton({ icon: Icon, label, active, onClick }: {
       style={{
         position: "relative", display: "flex", alignItems: "center", justifyContent: "space-between",
         width: "100%", padding: "9px 12px", cursor: "pointer", borderRadius: 8,
-        border: `1px solid ${active ? ACCENT : (hover ? G[300] : G[200])}`,
-        background: active ? ACCENT : (hover ? "#fff" : G[50]),
+        border: `1px solid ${lit ? ACCENT : G[200]}`,
+        background: lit ? ACCENT : "#fff",
         transition: "background .15s, border-color .15s",
       }}
     >
       <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <Icon size={14} color={tint} />
-        <span style={{ fontSize: 12, fontWeight: active ? 600 : 500, color: active ? "#fff" : G[600] }}>{label}</span>
+        <span style={{ fontSize: 12, fontWeight: lit ? 600 : 500, color: lit ? "#fff" : G[600] }}>{label}</span>
       </span>
       <ChevronRight
         size={13} color={tint} strokeWidth={2.2}

@@ -943,6 +943,22 @@ async fn query_buildings_along_path(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// 건물 클릭 좌표 인근 FAC 건물 1건 상세 (로컬 DB, 오프라인 가능)
+#[tauri::command]
+async fn get_fac_building_detail(
+    app_handle: tauri::AppHandle,
+    lat: f64,
+    lon: f64,
+) -> Result<Option<building::FacBuildingDetail>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        building::query_fac_building_detail(&conn, lat, lon, 40.0)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 // ---------- 건물통합정보 (F_FAC_BUILDING) ----------
 
 #[tauri::command]
@@ -2279,6 +2295,7 @@ pub fn run() {
             download_srtm_korea,
             query_buildings_along_path,
             query_buildings_3d_binary,
+            get_fac_building_detail,
             // 건물통합정보 (F_FAC_BUILDING)
             import_fac_building_data,
             get_fac_building_import_status,
