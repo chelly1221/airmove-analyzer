@@ -1,5 +1,6 @@
 import React, { useMemo } from "react";
 import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, AzSector, LoSProfileData, LossPointGeo, PanoramaMergeResult } from "../../types";
+import type { WedgeMetricResult } from "../../types/obstacle";
 import {
   weightedLossAvg, weightedLossStdDev,
   weightedPsrAvg, weightedPsrStdDev,
@@ -34,6 +35,8 @@ interface Props {
   /** 레이더별 분석대상 포함/제외 파노라마 — 음영소실 분류를 AzElev 차트와 동일 소스(빨강영역)로 산출 */
   panoWithByRadar?: Map<string, PanoramaMergeResult>;
   panoWithoutByRadar?: Map<string, PanoramaMergeResult>;
+  /** 건물별 추가 차단영역(쐐기) 소실율 (key: `${radarName}_${buildingId}`) — 헤드라인 심각도 */
+  wedgeByKey?: Record<string, WedgeMetricResult>;
 }
 
 /**
@@ -63,6 +66,7 @@ function ReportOMSummarySection({
   losMap,
   panoWithByRadar,
   panoWithoutByRadar,
+  wedgeByKey,
 }: Props) {
   // 레이더별 소실표적 (음영소실 분류용) — daily_stats 의 loss_points_summary 집계
   const lossPointsByRadar = useMemo(() => {
@@ -138,7 +142,7 @@ function ReportOMSummarySection({
             <React.Fragment key={`sh-${r.name}`}>
               <th className="ta-c sm">방위/거리</th>
               <th className="ta-c sm">LoS</th>
-              <th className="ta-c sm">음영소실</th>
+              <th className="ta-c sm">추가소실율</th>
             </React.Fragment>
           ))}
         </tr>
@@ -159,6 +163,7 @@ function ReportOMSummarySection({
                 const dist = haversineKm(r.latitude, r.longitude, b.latitude, b.longitude);
                 const los = losMap.get(`${r.name}_${b.id}`);
                 const shadowLoss = shadowLossByKey.get(`${r.name}_${b.id}`) ?? 0;
+                const wedge = wedgeByKey?.[`${r.name}_${b.id}`];
                 return (
                   <React.Fragment key={`cell-${r.name}-${b.id}`}>
                     <td className="ta-c mono sm">{az.toFixed(1)}° / {dist.toFixed(1)}km</td>
@@ -172,12 +177,19 @@ function ReportOMSummarySection({
                       )}
                     </td>
                     <td className="ta-c mono sm">
-                      {los ? (
+                      {!los ? (
+                        <span className="muted">—</span>
+                      ) : wedge ? (
+                        wedge.grade.label === "노출 없음" || wedge.grade.label === "판정 보류"
+                          ? <span className="muted">{wedge.grade.label}</span>
+                          : <span style={{ color: wedge.grade.color, fontWeight: 600 }} title={`음영소실 ${shadowLoss}건`}>
+                              {wedge.wedgeLossRatePct.toFixed(1)}%
+                            </span>
+                      ) : (
+                        // 파노라마/히스토그램 미가용(리로드 등) → 음영소실 건수 폴백
                         shadowLoss > 0
                           ? <span style={{ color: "#a60739", fontWeight: 600 }}>{shadowLoss}건</span>
-                          : <span className="muted">0</span>
-                      ) : (
-                        <span className="muted">—</span>
+                          : <span className="muted">—</span>
                       )}
                     </td>
                   </React.Fragment>
@@ -217,7 +229,7 @@ function ReportOMSummarySection({
           <i>±σ</i>: 가중 모표준편차 <i>σᵥᵥ = √(Σ(wᵢ(xᵢ - x̄ᵥᵥ)²) / Σ(wᵢ))</i>{" · "}
           판정: 양호(&lt;0.5%) / 주의(0.5–2%) / 경고(≥2%) / 보류(&lt;7일)
           {" · "}
-          <span className="strong">음영소실</span>: 분석 대상 장애물이 추가한 차단각(지형 차단각 초과) 음영 구역 내, 대상 후방·방위 ±10° 표적소실 건수
+          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(쐐기 — 지형 차단각~대상 차단각 사이 양각 밴드) 내 <i>노출 추적시간 대비 소실시간</i> 비율(노출 조건부 소실율). 노출 부족 시 "노출 없음". (파노라마 미가용 시 음영소실 건수로 폴백)
         </div>
       </div>
       <div className="meta-merged-row formula" style={{ borderTop: "1px solid var(--om-border)" }}>

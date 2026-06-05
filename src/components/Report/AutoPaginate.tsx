@@ -154,9 +154,13 @@ export default function AutoPaginate({ children, repeatHeader, firstHeader }: Au
     if (el) observerRef.current?.observe(el);
   }, []);
 
-  const totalPages = n === 0 ? 1 : Math.max(...assign) + 1;
+  // 자식 수(n)가 마운트 이후 변하면(예: 파노라마 후 wedge 블록이 null→element 로 추가) assign(useState)이
+  // 한 렌더 늦게 갱신된다. 그 사이 assign[i] 가 undefined 가 되면 pages[undefined].push 로 크래시하므로,
+  // 갱신 전 자식은 일단 0페이지로 안전 배치하고 직후 useLayoutEffect 의 recompute 가 정확히 재배치한다.
+  const pageOf = (i: number) => assign[i] ?? 0;
+  const totalPages = n === 0 ? 1 : Math.max(0, ...Array.from({ length: n }, (_, i) => pageOf(i))) + 1;
   const pages: number[][] = Array.from({ length: totalPages }, () => []);
-  for (let i = 0; i < n; i++) pages[assign[i]].push(i);
+  for (let i = 0; i < n; i++) pages[pageOf(i)].push(i);
 
   return (
     <>

@@ -20,6 +20,21 @@ export interface TrackPointGeo {
   radar_type: string;
 }
 
+/**
+ * 추가 차단영역(쐐기) 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
+ * 건물-무관 원자료 — 프론트가 건물별 angleWith/angleWithout 컷오프로
+ * 쐐기 밴드 셀을 합산해 소실율을 산출한다.
+ * 양각은 실제지구 곡률(R=6,371,000) 기준 — lossElevAngleDeg와 동일 프레임.
+ * 빈 정의(Rust HIST_* 상수와 일치): az_bin = floor(az/0.1) 0..3600,
+ * elev_bin = floor((elev+1.0)/0.05) 0..140 (elev 범위 [-1°, 6°)).
+ */
+export interface AzElevCell {
+  az_bin: number;
+  elev_bin: number;
+  track_time_s: number;
+  loss_time_s: number;
+}
+
 /** 일별 통계 */
 export interface DailyStats {
   date: string;
@@ -37,6 +52,41 @@ export interface DailyStats {
   baseline_psr_rate: number;
   /** 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용) */
   track_points_geo?: TrackPointGeo[];
+  /** 추가 차단영역(쐐기) 분석용 방위×양각 시간 히스토그램 (건물-무관 원자료) */
+  az_elev_histogram?: AzElevCell[];
+}
+
+/** 추가 차단영역(쐐기) 소실율 — 일별 시계열 항목 */
+export interface WedgeDaySeries {
+  /** day_of_month */
+  day: number;
+  /** 그 날 쐐기 소실율 (%) */
+  ratePct: number;
+  /** 그 날 쐐기 노출시간 (추적+소실, 초) */
+  exposureS: number;
+}
+
+/**
+ * 건물별 추가 차단영역(쐐기) 소실율 결과 (헤드라인 심각도 지표).
+ * 노출 조건부 소실율 = Σ(쐐기 내 소실시간) / Σ(쐐기 내 노출시간) × 100%.
+ */
+export interface WedgeMetricResult {
+  /** 월간 쐐기 소실율 (%) */
+  wedgeLossRatePct: number;
+  /** 일별 추세 기울기 (%p/day) */
+  trendSlopePctPerDay: number;
+  /** 추세 방향 */
+  trendDir: "증가" | "감소" | "안정";
+  /** 총 노출시간 (추적+소실, 초) */
+  exposureTrackTimeS: number;
+  /** 관측일수 */
+  dayCount: number;
+  /** 노출>0 인 일수 */
+  daysWithExposure: number;
+  /** 일별 시계열 */
+  series: WedgeDaySeries[];
+  /** 등급 (gradeWedge) */
+  grade: { label: string; color: string };
 }
 
 /** 레이더별 월간 결과 */
@@ -85,4 +135,10 @@ export interface OMReportData {
   panoWithoutTargets: Map<string, import("./panorama").PanoramaMergeResult>;
   coverageStatus: "idle" | "loading" | "done" | "error";
   panoramaStatus: "idle" | "deferred" | "loading" | "done" | "error";
+  /**
+   * 건물별 추가 차단영역(쐐기) 소실율 결과 (key: `${radarName}_${buildingId}`).
+   * 파노라마 준비(panoramaStatus==="done") 후 computeWedgeMetric으로 산출, 영속화 대상.
+   * 파노라마는 DB 미영속이므로 이 계산 스칼라를 저장해 리로드 시 표·프로즈 복원.
+   */
+  wedgeByKey?: Record<string, WedgeMetricResult>;
 }

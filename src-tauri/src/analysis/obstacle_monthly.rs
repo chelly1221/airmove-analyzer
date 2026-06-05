@@ -76,6 +76,22 @@ pub struct TrackPointGeo {
     pub radar_type: String,
 }
 
+/// 추가 차단영역(쐐기) 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
+/// 건물-무관 원자료 — 프론트가 건물별 angleWith/angleWithout 컷오프로
+/// 쐐기 밴드 셀을 합산해 소실율을 산출한다.
+/// 양각은 실제지구 곡률(R=6,371,000) 기준 — 프론트 lossElevAngleDeg와 동일 프레임.
+#[derive(Serialize, Clone, Debug)]
+pub struct AzElevCell {
+    /// floor(normalize(az)/0.1), 0..3600
+    pub az_bin: u16,
+    /// floor((elev + 1.0)/0.05), 0..140
+    pub elev_bin: u16,
+    /// 정상 추적 노출시간 합 (초)
+    pub track_time_s: f64,
+    /// 소실시간 합 (초)
+    pub loss_time_s: f64,
+}
+
 /// 일별 통계
 #[derive(Serialize, Clone, Debug)]
 pub struct DailyStats {
@@ -97,6 +113,10 @@ pub struct DailyStats {
     /// 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용)
     #[serde(default)]
     pub track_points_geo: Vec<TrackPointGeo>,
+    /// 추가 차단영역(쐐기) 분석용 방위×양각 시간 히스토그램 (건물-무관 원자료).
+    /// 프론트가 건물별 컷오프로 쐐기 셀을 합산해 노출 조건부 소실율을 산출.
+    #[serde(default)]
+    pub az_elev_histogram: Vec<AzElevCell>,
 }
 
 /// 레이더별 월간 분석 결과
@@ -271,6 +291,36 @@ const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
 
 /// PSR 통계 계산 범위: 60NM
 const PSR_RANGE_KM: f64 = 60.0 * 1.852;
+
+// ─── 추가 차단영역(쐐기) 히스토그램 상수 ───
+// 방위×양각 시간 히스토그램의 빈 크기·범위. 프론트(omWedgeMetric.ts)와 반드시 일치.
+const HIST_AZ_BIN_DEG: f64 = 0.1;
+const HIST_ELEV_BIN_DEG: f64 = 0.05;
+const HIST_ELEV_MIN_DEG: f64 = -1.0;
+const HIST_ELEV_MAX_DEG: f64 = 6.0;
+
+/// 레이더→표적 양각(°). 실제지구 곡률(R=6,371,000) 보정.
+/// 반드시 프론트 lossElevAngleDeg(obstacleAnalysisHelpers.ts)와 동일 프레임이어야
+/// 쐐기 슬라이스가 AzElev 차트 빨강영역과 정렬된다. los.rs의 4/3 유효지구 사용 금지.
+fn elev_angle_deg(dist_km: f64, alt_m: f64, radar_h_m: f64) -> f64 {
+    let d_m = dist_km * 1000.0;
+    if d_m <= 0.0 {
+        return 0.0;
+    }
+    let curv = (d_m * d_m) / (2.0 * crate::geo::EARTH_RADIUS_M);
+    ((alt_m - curv - radar_h_m) / d_m).atan().to_degrees()
+}
+
+/// (방위, 양각) → 히스토그램 셀 (az_bin, elev_bin). 양각 밴드 밖이면 None.
+fn hist_cell(az: f64, elev: f64) -> Option<(u16, u16)> {
+    if elev < HIST_ELEV_MIN_DEG || elev >= HIST_ELEV_MAX_DEG {
+        return None;
+    }
+    let az_n = ((az % 360.0) + 360.0) % 360.0;
+    let az_bin = (az_n / HIST_AZ_BIN_DEG).floor() as u16;
+    let elev_bin = ((elev - HIST_ELEV_MIN_DEG) / HIST_ELEV_BIN_DEG).floor() as u16;
+    Some((az_bin, elev_bin))
+}
 
 // ─── 핵심 로직 ───
 
@@ -513,6 +563,9 @@ pub fn analyze_radar_monthly(
     let mut all_loss_alt_sum = 0.0f64;
     let mut all_loss_alt_count = 0u32;
 
+    // 안테나 해발고 (양각 계산용) — 쐐기 히스토그램 전반에서 사용
+    let radar_h = radar.radar_altitude + radar.antenna_height;
+
     let mut sorted_dates: Vec<String> = daily_points.keys().cloned().collect();
     sorted_dates.sort();
 
@@ -597,6 +650,8 @@ pub fn analyze_radar_monthly(
         let mut day_track_time = 0.0f64;
         let mut day_loss_time = 0.0f64;
         let mut day_loss_points: Vec<LossPointGeo> = Vec::new();
+        // 추가 차단영역 히스토그램 누적기: key=(az_bin<<16)|elev_bin, val=(track_time, loss_time)
+        let mut day_hist: HashMap<u32, (f64, f64)> = HashMap::new();
 
         for (_ms, mut pts) in mode_s_groups {
             if pts.len() < 2 {
@@ -637,6 +692,16 @@ pub fn analyze_radar_monthly(
                 let next = window[1];
                 let gap = next.timestamp - prev.timestamp;
 
+                // ── 추가 차단영역 히스토그램: 정상 추적 노출시간 (prev 셀) ──
+                // threshold 이하의 연속 스캔만 '추적시간'으로 집계 (손실 gap과 disjoint).
+                if gap > 0.5 && gap <= threshold {
+                    let pa = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
+                    let pd = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
+                    if let Some((ab, eb)) = hist_cell(pa, elev_angle_deg(pd, prev.altitude, radar_h)) {
+                        day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0)).0 += gap;
+                    }
+                }
+
                 if gap > threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
                     let start_dist = calculate_haversine_distance(
                         radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude,
@@ -675,14 +740,25 @@ pub fn analyze_radar_monthly(
                         all_loss_alt_count += 1;
                         // 스캔별 보간 포인트 생성 (TrackMap Worker와 동일)
                         let total_missed = ((gap / scan_interval).round() as u32).saturating_sub(1).max(1);
+                        // 히스토그램 소실시간 분배 (보간점들에 균등 분배 → 합 = gap)
+                        let loss_per_pt = gap / total_missed as f64;
                         for si in 1..=total_missed {
                             let t = si as f64 / (total_missed as f64 + 1.0);
+                            let ilat = prev.latitude + (next.latitude - prev.latitude) * t;
+                            let ilon = prev.longitude + (next.longitude - prev.longitude) * t;
+                            let ialt = prev.altitude + (next.altitude - prev.altitude) * t; // meters
                             day_loss_points.push(LossPointGeo {
-                                lat: prev.latitude + (next.latitude - prev.latitude) * t,
-                                lon: prev.longitude + (next.longitude - prev.longitude) * t,
-                                alt_ft: (prev.altitude + (next.altitude - prev.altitude) * t) * 3.28084,
+                                lat: ilat,
+                                lon: ilon,
+                                alt_ft: ialt * 3.28084,
                                 duration_s: gap,
                             });
+                            // ── 추가 차단영역 히스토그램: 소실시간 (보간점 셀) ──
+                            let la = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, ilat, ilon);
+                            let ld = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, ilat, ilon);
+                            if let Some((ab, eb)) = hist_cell(la, elev_angle_deg(ld, ialt, radar_h)) {
+                                day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0)).1 += loss_per_pt;
+                            }
                         }
                     }
                 }
@@ -709,6 +785,17 @@ pub fn analyze_radar_monthly(
         // 날짜에서 day_of_month 추출
         let dom: u8 = date[8..10].parse().unwrap_or(1);
 
+        // 히스토그램 맵 → 직렬화용 Vec
+        let az_elev_histogram: Vec<AzElevCell> = day_hist
+            .into_iter()
+            .map(|(k, (tt, lt))| AzElevCell {
+                az_bin: (k >> 16) as u16,
+                elev_bin: (k & 0xFFFF) as u16,
+                track_time_s: tt,
+                loss_time_s: lt,
+            })
+            .collect();
+
         daily_stats.push(DailyStats {
             date: date.clone(),
             day_of_month: dom,
@@ -722,6 +809,7 @@ pub fn analyze_radar_monthly(
             baseline_loss_rate,
             baseline_psr_rate,
             track_points_geo: day_track_geo,
+            az_elev_histogram,
         });
     }
 

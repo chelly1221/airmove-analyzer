@@ -15,7 +15,7 @@ import { Download, Loader2, SlidersHorizontal } from "lucide-react";
 
 export interface OMSidebarTocItem {
   key: string;
-  num: string;       // "01"~"NN" — 가시 섹션 기준 1부터 누적
+  num: string;       // 표지="00", 이후 콘텐츠 섹션 "01"~"NN" 누적
   name: string;      // 한글 라벨
   page: number;      // 프리뷰 내 해당 anchor 의 1-based 페이지 인덱스 (없으면 0)
 }

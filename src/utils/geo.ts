@@ -3,6 +3,12 @@
 const R_EARTH = 6371; // km
 const DEG2RAD = Math.PI / 180;
 
+/** LoS 단면도 기본 표시 거리 한계(NM) — 스크롤 줌아웃 최대 범위.
+ *  단면도는 방위를 따라 이 거리까지 지형/항적을 샘플링하고, 차트에서 스크롤로 자유 줌. */
+export const LOS_PROFILE_MAX_NM = 200;
+/** LoS 단면도 기본 표시 거리 한계(km) ≈ 370.4km */
+export const LOS_PROFILE_MAX_KM = LOS_PROFILE_MAX_NM * 1.852;
+
 /** Haversine 대원 거리 (km) */
 export function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const dLat = (lat2 - lat1) * DEG2RAD;

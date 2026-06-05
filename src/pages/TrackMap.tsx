@@ -64,6 +64,7 @@ import { format } from "date-fns";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, BuildingOnPath } from "../types";
 import { queryViewportPoints } from "../utils/flightConsolidationWorker";
+import { LOS_PROFILE_MAX_KM, LOS_PROFILE_MAX_NM } from "../utils/geo";
 import LoSProfileTabs from "../components/Map/LoSProfileTabs";
 import { isGPUCacheValidFor, renderCoverageImageAsync, queryMinDetectionAlt, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
@@ -1996,6 +1997,9 @@ export default function TrackMap() {
     const lineDyM = (tLon - rLon) * mPerDegLon;
     const lineLen = Math.sqrt(lineDxM ** 2 + lineDyM ** 2);
     if (lineLen === 0) return []; // 타겟=레이더 동일좌표 → 0 나눗셈(NaN) 방지
+    // 단면도 x축 도메인(200NM 또는 타겟거리)과 동일한 정규화 — distRatio가 차트 maxDistance와 정합.
+    // 코리도는 타겟 너머 200NM까지 연장(스크롤 줌아웃 시 원거리 항적/Loss도 표시).
+    const profileMaxM = Math.max(LOS_PROFILE_MAX_KM * 1000, lineLen);
     const cosB = lineDxM / lineLen;
     const sinB = lineDyM / lineLen;
     const TOLERANCE_M = 1000; // 일반 모드: 수직 1km 여유 코리도
@@ -2037,8 +2041,8 @@ export default function TrackMap() {
       const dy = (p.longitude - rLon) * mPerDegLon;
       const along = dx * cosB + dy * sinB;
       const across = -dx * sinB + dy * cosB;
-      if (along > 0 && along <= lineLen && inCorridor(along, across)) {
-        pts.push({ distRatio: along / lineLen, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false, latitude: p.latitude, longitude: p.longitude });
+      if (along > 0 && along <= profileMaxM && inCorridor(along, across)) {
+        pts.push({ distRatio: along / profileMaxM, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false, latitude: p.latitude, longitude: p.longitude });
       }
     }
     // Loss 포인트
@@ -2047,8 +2051,8 @@ export default function TrackMap() {
       const dy = (lp.longitude - rLon) * mPerDegLon;
       const along = dx * cosB + dy * sinB;
       const across = -dx * sinB + dy * cosB;
-      if (along > 0 && along <= lineLen && inCorridor(along, across)) {
-        pts.push({ distRatio: along / lineLen, altitude: lp.altitude, mode_s: lp.mode_s, timestamp: lp.timestamp, radar_type: "loss", isLoss: true, latitude: lp.latitude, longitude: lp.longitude });
+      if (along > 0 && along <= profileMaxM && inCorridor(along, across)) {
+        pts.push({ distRatio: along / profileMaxM, altitude: lp.altitude, mode_s: lp.mode_s, timestamp: lp.timestamp, radar_type: "loss", isLoss: true, latitude: lp.latitude, longitude: lp.longitude });
       }
     }
     return pts;
@@ -2090,12 +2094,26 @@ export default function TrackMap() {
         })
       );
 
-      // LoS 단면도 호버 위치 → 지도 위 점
+      // LoS 단면도 호버 위치 → 지도 위 점 (ratio는 타겟 거리 기준 → 타겟 너머(>1)면 방위선상 연장)
       if (losTarget && losHoverRatio !== null) {
         const rLat = radarSite.latitude;
         const rLon = radarSite.longitude;
         const hoverLat = rLat + (losTarget.lat - rLat) * losHoverRatio;
         const hoverLon = rLon + (losTarget.lon - rLon) * losHoverRatio;
+        // 타겟 너머를 호버하면(단면도가 200NM까지 확장) 타겟→호버점 연장선으로 점을 방위선에 연결
+        if (losHoverRatio > 1) {
+          layers.push(
+            new LineLayer({
+              id: "los-hover-extension",
+              data: [{ from: [losTarget.lon, losTarget.lat], to: [hoverLon, hoverLat] }],
+              getSourcePosition: (d: any) => d.from,
+              getTargetPosition: (d: any) => d.to,
+              getColor: [233, 69, 96, 110],
+              getWidth: 1,
+              widthUnits: "pixels" as const,
+            })
+          );
+        }
         layers.push(
           new ScatterplotLayer({
             id: "los-hover-dot",
@@ -3048,7 +3066,6 @@ export default function TrackMap() {
     const big: React.CSSProperties = { ...num, fontSize: 16, color: "#a60739", lineHeight: 1 };
     const unit: React.CSSProperties = { fontSize: 9, color: "#9ca3af", fontWeight: 700, marginLeft: 1 };
     const distNM = losDistanceKm / 1.852;
-    const rangeNm = Math.round(radarSite.range_nm);
     const status = !losTarget ? { t: "대기중", c: "#6b7280", bg: "#f3f4f6" }
       : losStats.blocked ? { t: "LoS 차단", c: "#a60739", bg: "rgba(166,7,57,.10)" }
       : { t: "LoS 양호", c: "#059669", bg: "rgba(5,150,105,.10)" };
@@ -3148,17 +3165,13 @@ export default function TrackMap() {
                 <HeadingTape azimuth={losAzimuth} precise={losPrecise}
                   onChange={(v) => { setLosFromAzDist(+v.toFixed(losPrecise ? 2 : 1), losDistanceKm); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosAzFineCenter(v); }} />
               </div>
-              {/* 거리 카드 */}
-              <div style={card}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
-                  <span style={head}>거리</span>
-                  <span style={big}>{distNM.toFixed(1)}<span style={unit}>NM</span></span>
-                </div>
-                <DsSlider value={Math.min(rangeNm, Math.max(1, distNM))} min={1} max={rangeNm} step={0.5}
-                  onChange={(v) => { setLosFromAzDist(losAzimuth, v * 1.852); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); }} />
-                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 5, fontSize: 8.5, color: "#9ca3af" }}>
-                  <span>1 NM</span><span>{rangeNm} NM</span>
-                </div>
+              {/* 거리: 단면도에서 스크롤로 줌(최대 200NM) — 별도 거리 설정 없음 */}
+              <div style={{ ...card, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <span style={head}>거리</span>
+                <span style={big}>{distNM.toFixed(1)}<span style={unit}>NM</span></span>
+              </div>
+              <div style={{ fontSize: 9, color: "#9ca3af", textAlign: "center", lineHeight: 1.5 }}>
+                단면도에서 스크롤로 확대/축소 (최대 {LOS_PROFILE_MAX_NM}NM)
               </div>
               <div style={{ ...num, fontSize: 8.5, color: "#9ca3af", textAlign: "center" }}>
                 {losTarget ? `${losTarget.lat.toFixed(4)}°N · ${losTarget.lon.toFixed(4)}°E` : "지점 미선택"}
@@ -3486,7 +3499,7 @@ export default function TrackMap() {
         {/* 건물 */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Building2 size={14} className={showBuildings && buildings3dData.length > 0 ? "text-[#a60739]" : "text-gray-400"} />
+            <Building2 size={14} className={showBuildings ? "text-[#a60739]" : "text-gray-400"} />
             <span className="text-xs text-gray-600">건물</span>
             <GearButton active={settingsDrawer === "building"} onClick={() => { setSettingsDrawer(settingsDrawer === "building" ? null : "building"); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
           </div>
@@ -3495,17 +3508,17 @@ export default function TrackMap() {
           ) : (
             <button
               onClick={() => {
-                if (buildings3dData.length > 0) {
-                  setShowBuildings(!showBuildings);
+                if (showBuildings) {
+                  setShowBuildings(false);
                 } else {
                   fetchBuildingOverlay();
                 }
               }}
-              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showBuildings && buildings3dData.length > 0 ? "bg-[#a60739]" : "bg-gray-300"}`}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showBuildings ? "bg-[#a60739]" : "bg-gray-300"}`}
               role="switch"
-              aria-checked={showBuildings && buildings3dData.length > 0}
+              aria-checked={showBuildings}
             >
-              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${showBuildings && buildings3dData.length > 0 ? "translate-x-4.5" : "translate-x-0.5"}`} />
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${showBuildings ? "translate-x-4.5" : "translate-x-0.5"}`} />
             </button>
           )}
         </div>
@@ -3529,19 +3542,18 @@ export default function TrackMap() {
         {/* 기상 (CAT008) */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <CloudRain size={14} className={weatherVisible && weatherVectors.length > 0 ? "text-[#a60739]" : "text-gray-400"} />
+            <CloudRain size={14} className={weatherVisible ? "text-[#a60739]" : "text-gray-400"} />
             <span className="text-xs text-gray-600">기상</span>
             {weatherVectors.length === 0 && <span className="text-[9px] text-gray-300">데이터 없음</span>}
             <GearButton active={settingsDrawer === "weather"} onClick={() => { setSettingsDrawer(settingsDrawer === "weather" ? null : "weather"); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
           </div>
           <button
             onClick={() => setWeatherVisible(!weatherVisible)}
-            disabled={weatherVectors.length === 0}
-            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-40 ${weatherVisible && weatherVectors.length > 0 ? "bg-[#a60739]" : "bg-gray-300"}`}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${weatherVisible ? "bg-[#a60739]" : "bg-gray-300"}`}
             role="switch"
-            aria-checked={weatherVisible && weatherVectors.length > 0}
+            aria-checked={weatherVisible}
           >
-            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${weatherVisible && weatherVectors.length > 0 ? "translate-x-4.5" : "translate-x-0.5"}`} />
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${weatherVisible ? "translate-x-4.5" : "translate-x-0.5"}`} />
           </button>
         </div>
 
@@ -3588,8 +3600,8 @@ export default function TrackMap() {
 
       {/* Map + Building Detail sidebar wrapper */}
       <div className="relative flex flex-1 min-h-0">
-      {/* Map container */}
-      <div className="flex flex-col flex-1 min-w-0">
+      {/* Map container — 드로어를 지도+단면도 전체 높이에 오버레이하기 위해 relative */}
+      <div className="relative flex flex-col flex-1 min-w-0">
         <div className="relative flex-1">
         <MapGL
           ref={mapRef}
@@ -3957,49 +3969,15 @@ export default function TrackMap() {
           ) : null
         )}
 
-        {/* ── 좌측 도구 드로어 (LoS / 커버리지) — 지도 위 오버레이 ── */}
-        <div
-          className="absolute top-0 bottom-0 left-0 z-[700] flex flex-col bg-white"
-          style={{
-            width: 300, borderRight: "1px solid #e5e7eb",
-            boxShadow: activeTool ? "6px 0 28px rgba(0,0,0,.13)" : "none",
-            transform: activeTool ? "translateX(0)" : "translateX(-314px)",
-            transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
-            pointerEvents: activeTool ? "auto" : "none",
-          }}
-        >
-          {activeTool === "los" && renderLoSToolBody()}
-          {activeTool === "coverage" && (
-            <CoveragePanel
-              radarSite={radarSite}
-              gpuCacheReady={gpuCacheReady} setGpuCacheReady={setGpuCacheReady}
-              coverageAlt={coverageAlt} setCoverageAlt={setCoverageAlt}
-              coverageAltMin={coverageAltMin} setCoverageAltMin={setCoverageAltMin}
-              coverageOpacity={coverageOpacity} setCoverageOpacity={setCoverageOpacity}
-              coverageRendering={coverageRendering}
-              mapRef={mapRef}
-              onClose={() => handleToolClick("coverage")}
-            />
-          )}
         </div>
 
-        {/* ── 우측 표시 설정 드로어 (건물 / 기상) ── */}
-        <div
-          className="absolute top-0 bottom-0 right-0 z-[750] flex flex-col bg-white"
-          style={{
-            width: 224, borderLeft: "1px solid #e5e7eb",
-            boxShadow: settingsDrawer ? "-6px 0 28px rgba(0,0,0,.14)" : "none",
-            transform: settingsDrawer ? "translateX(0)" : "translateX(240px)",
-            transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
-            pointerEvents: settingsDrawer ? "auto" : "none",
-          }}
-        >
-          {renderSettingsBody()}
-        </div>
-        </div>
-
-      {/* LoS Profile Panel (건물 분석 시 중앙/좌끝/우끝 3탭) */}
+      {/* LoS Profile Panel (건물 분석 시 중앙/좌끝/우끝 3탭) — 드로어가 열리면 좌/우로 밀려남(드로어 우선) */}
       {losTarget && (
+        <div style={{
+          marginLeft: activeTool ? 300 : 0,
+          marginRight: settingsDrawer ? 224 : 0,
+          transition: "margin .4s cubic-bezier(.4,0,.2,1)",
+        }}>
         <LoSProfileTabs
           views={losAzViews ?? [{ lat: losTarget.lat, lon: losTarget.lon, label: "중앙", az: losAzimuth }]}
           radarSite={radarSite}
@@ -4025,7 +4003,48 @@ export default function TrackMap() {
           showLegend={false}
           onStats={handleLosStats}
         />
+        </div>
       )}
+
+        {/* ── 좌측 도구 드로어 (LoS / 커버리지) — 지도+단면도 전체 높이 오버레이 ── */}
+        <div
+          className="absolute top-0 bottom-0 left-0 z-[700] flex flex-col bg-white"
+          style={{
+            width: 300, borderRight: "1px solid #e5e7eb",
+            boxShadow: activeTool ? "6px 0 28px rgba(0,0,0,.13)" : "none",
+            transform: activeTool ? "translateX(0)" : "translateX(-314px)",
+            transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
+            pointerEvents: activeTool ? "auto" : "none",
+          }}
+        >
+          {activeTool === "los" && renderLoSToolBody()}
+          {activeTool === "coverage" && (
+            <CoveragePanel
+              radarSite={radarSite}
+              gpuCacheReady={gpuCacheReady} setGpuCacheReady={setGpuCacheReady}
+              coverageAlt={coverageAlt} setCoverageAlt={setCoverageAlt}
+              coverageAltMin={coverageAltMin} setCoverageAltMin={setCoverageAltMin}
+              coverageOpacity={coverageOpacity} setCoverageOpacity={setCoverageOpacity}
+              coverageRendering={coverageRendering}
+              mapRef={mapRef}
+              onClose={() => handleToolClick("coverage")}
+            />
+          )}
+        </div>
+
+        {/* ── 우측 표시 설정 드로어 (건물 / 기상) — 전체 높이 오버레이 ── */}
+        <div
+          className="absolute top-0 bottom-0 right-0 z-[750] flex flex-col bg-white"
+          style={{
+            width: 224, borderLeft: "1px solid #e5e7eb",
+            boxShadow: settingsDrawer ? "-6px 0 28px rgba(0,0,0,.14)" : "none",
+            transform: settingsDrawer ? "translateX(0)" : "translateX(240px)",
+            transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
+            pointerEvents: settingsDrawer ? "auto" : "none",
+          }}
+        >
+          {renderSettingsBody()}
+        </div>
       </div>
 
       {/* 건물 상세보기 사이드바 (Google Street View + Maps) */}

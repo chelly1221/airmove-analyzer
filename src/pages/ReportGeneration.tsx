@@ -263,6 +263,7 @@ export default function ReportGeneration() {
         minWidth: 800,
         minHeight: 700,
         decorations: false,
+        shadow: false,
         center: true,
       });
     }

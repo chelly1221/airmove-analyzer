@@ -418,6 +418,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 losMap={omData.losMap}
                 panoWithByRadar={omData.panoWithTargets}
                 panoWithoutByRadar={omData.panoWithoutTargets}
+                wedgeByKey={omData.wedgeByKey}
               />
             </div>
           )}
@@ -434,8 +435,8 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                     dailyStats={rr.daily_stats}
                     analysisMonth={omData.analysisMonth}
                     conditions={[
-                      `• 대상 장애물: ${info?.bldgNames ?? ""}`,
-                      `• 영향 방위: ${info?.azText || "전체"} · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
+                      `• 대상 장애물: ${info?.bldgNames ?? ""} (분석 방위 ${info?.azText || "전체"})`,
+                      `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
                       `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
                     ]}
                   />
@@ -481,6 +482,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                       panoWith={omData.panoWithTargets?.get(rs.name)}
                       panoWithout={omData.panoWithoutTargets?.get(rs.name)}
                       allBuildings={omData.selectedBuildings}
+                      wedge={omData.wedgeByKey?.[`${rs.name}_${b.id}`]}
                     />
                   );
                 });
@@ -529,6 +531,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}
                 editable={true}
                 analysisMonth={omData.analysisMonth}
+                wedgeByKey={omData.wedgeByKey}
               />
             </div>
           )}

@@ -14,7 +14,7 @@
  */
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult, BuildingObstacle } from "../../types";
-import type { LossPointGeo } from "../../types/obstacle";
+import type { LossPointGeo, WedgeMetricResult } from "../../types/obstacle";
 import { classifyObstacleLosses, calcBuildingAzExtent, makeTerrainSampler, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import OMEditable from "./OMEditable";
 
@@ -159,10 +159,12 @@ interface Props {
   lossPoints: LossPointGeo[];
   /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적 오귀속 방지용 (분류 내부에서 사용) */
   siblings?: SiblingBuilding[];
+  /** 추가 차단영역(쐐기) 소실율 — 헤드라인 심각도 지표 (omWedgeMetric, ReportApp 에서 산출) */
+  wedge?: WedgeMetricResult;
 }
 
 export default function ReportOMObstacleAzElevChart({
-  radarSite, building, los, panoWith, panoWithout, lossPoints, siblings,
+  radarSite, building, los, panoWith, panoWithout, lossPoints, siblings, wedge,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -480,6 +482,24 @@ export default function ReportOMObstacleAzElevChart({
               <OMEditable id={`${eid}.tbl.r3.note`} value="지형 차단각 초과 ~ 대상 차단각 사이" tag="span" />
             </td>
           </tr>
+          {wedge && (
+            <tr>
+              <td className="strong" style={{ color: "#a60739" }}>
+                ↳ <OMEditable id={`${eid}.tbl.wedge.label`} value="추가 차단 구간 소실율" tag="span" />
+              </td>
+              <td className="ta-r mono strong" style={{ color: wedge.grade.color }}>
+                {wedge.grade.label === "노출 없음" || wedge.grade.label === "판정 보류"
+                  ? wedge.grade.label
+                  : `${wedge.wedgeLossRatePct.toFixed(2)}% · ${wedge.grade.label}`}
+              </td>
+              <td className="muted">
+                {wedge.grade.label === "노출 없음"
+                  ? <OMEditable id={`${eid}.tbl.wedge.note0`} value="노출 항적 거의 없음 → 영향 없음" tag="span" />
+                  : <>노출 {(wedge.exposureTrackTimeS / 60).toFixed(0)}분·{wedge.daysWithExposure}일 · 추세 {wedge.trendDir}
+                    {wedge.trendDir !== "안정" ? ` (일당 ${wedge.trendSlopePctPerDay > 0 ? "+" : ""}${wedge.trendSlopePctPerDay.toFixed(3)}%p)` : ""}</>}
+              </td>
+            </tr>
+          )}
           <tr className="alt">
             <td style={{ color: "#2563eb" }}><OMEditable id={`${eid}.tbl.r4.label`} value="장애물 무관" tag="span" /></td>
             <td className="ta-r mono">
@@ -496,7 +516,10 @@ export default function ReportOMObstacleAzElevChart({
             <td className="muted">
               {(computed.bDistKm / KM_PER_NM).toFixed(1)}NM · 추가 기인 판정:
               {" "}
-              {bldgRatio > 20
+              {/* 헤드라인은 쐐기 등급으로 정렬 — count 비율(bldgRatio) 폴백은 wedge 미제공 시 */}
+              {wedge
+                ? <span className="strong" style={{ color: wedge.grade.color }}>{wedge.grade.label}</span>
+                : bldgRatio > 20
                 ? <span className="strong" style={{ color: "#dc2626" }}>유의미</span>
                 : bldgRatio > 5
                   ? <span className="strong" style={{ color: "#d97706" }}>부분 영향</span>

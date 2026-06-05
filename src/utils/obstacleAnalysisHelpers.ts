@@ -329,7 +329,7 @@ export function makeTerrainSampler(terrain: PanoramaMergeResult["terrain"]): (az
  * ReportOMObstacleAzElevChart 의 buildSilhouetteLines 와 동일 의미 — terrain 보간 + 건물 실루엣/밴드 max.
  * 빨강영역(panoWith−panoWithout)과 검은× 점 분류를 같은 소스·같은 프레임으로 산출 → 픽셀 단위 일치.
  */
-function makePanoramaSampler(pano: PanoramaMergeResult): (azDeg: number) => number {
+export function makePanoramaSampler(pano: PanoramaMergeResult): (azDeg: number) => number {
   const terrainAt = makeTerrainSampler(pano.terrain);
 
   type Prep =

@@ -129,3 +129,57 @@ export function gradeWithConfidence(
  */
 export const LOSS_DEV_THRESHOLD = 0.1;
 export const PSR_DEV_THRESHOLD = 0.5;
+
+/**
+ * 가중 최소자승 회귀 기울기 (일별 추세 등).
+ * x̄_w·ȳ_w 가중평균 후 slope = Σw(x−x̄)(y−ȳ) / Σw(x−x̄)².
+ * omFindingsGenerator(레이더 일별 추세)·omWedgeMetric(쐐기 시계열)이 공유.
+ */
+export function weightedTrendSlope(
+  points: { x: number; y: number; w: number }[],
+): number {
+  let sumW = 0;
+  for (const p of points) sumW += p.w;
+  if (sumW <= 0) return 0;
+  let xMean = 0, yMean = 0;
+  for (const p of points) { xMean += p.x * p.w; yMean += p.y * p.w; }
+  xMean /= sumW; yMean /= sumW;
+  let num = 0, den = 0;
+  for (const p of points) {
+    num += p.w * (p.x - xMean) * (p.y - yMean);
+    den += p.w * (p.x - xMean) ** 2;
+  }
+  return den > 0 ? num / den : 0;
+}
+
+// ─── 추가 차단영역(쐐기) 소실율 등급 ───
+//
+// 헤드라인 심각도 = 분석 대상 건물의 추가 차단영역(쐐기) 내 노출 조건부 소실율.
+// gradeWithConfidence(전구간 소실율)와 달리, 얇은 쐐기 내부의 조건부 비율이라
+// 스케일이 다르다(전구간 0.5/2.0 재사용 금지).
+//
+// ⚠️ 임계값은 PLACEHOLDER — 실제 쐐기 소실율 분포를 관측한 뒤 반드시 보정할 것.
+export const WEDGE_MIN_DAYS = 7;          // 관측일수 < 7 → 판정 보류 (주간 1주기, gradeWithConfidence 와 동일 규율)
+export const WEDGE_MIN_EXPOSURE_S = 600;  // 누적 노출 < 10분 → "노출 없음"(영향 없음). 쐐기 희소 고분산 1차 방어.
+export const WEDGE_CAUTION_PCT = 2.0;     // 양호/주의 경계 (%)
+export const WEDGE_ALERT_PCT = 10.0;      // 주의/경고 경계 (%)
+
+/**
+ * 쐐기 소실율 등급 — 이중 게이트(관측일수, 노출량) 후 임계 판정.
+ * 노출이 거의 없으면 노이즈% 대신 "노출 없음 → 영향 없음"을 정직하게 표기.
+ */
+export function gradeWedge(
+  wedgeLossRatePct: number,
+  dayCount: number,
+  exposureTrackTimeS: number,
+): { label: string; color: string; bg: string; border: string } {
+  if (dayCount < WEDGE_MIN_DAYS) {
+    return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+  }
+  if (exposureTrackTimeS < WEDGE_MIN_EXPOSURE_S) {
+    return { label: "노출 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+  }
+  if (wedgeLossRatePct < WEDGE_CAUTION_PCT) return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
+  if (wedgeLossRatePct < WEDGE_ALERT_PCT) return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
+  return { label: "경고", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
+}

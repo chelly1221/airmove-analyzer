@@ -1,6 +1,6 @@
 import React from "react";
 import type { DailyStats } from "../../types";
-import { weightedAvg, PSR_DEV_THRESHOLD, LOSS_DEV_THRESHOLD } from "../../utils/omStats";
+import { weightedAvg, weightedTrendSlope } from "../../utils/omStats";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import OMEditable from "./OMEditable";
@@ -16,24 +16,26 @@ interface Props {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- *  결합 일별 라인 차트 (페이지 2)
+ *  결합 일별 라인 차트 (페이지 2) — 전 방위(분석 구간 포함 전체 방위) 기준.
  *
  *  PSR 탐지율(상) / 표적소실율(하) 를 한 페이지에 위·아래 라인 패널 두 개로
  *  결합 표시. 시안 락-인 옵션:
- *    combine="stacked"  curve="linear"  markers="dots"  baseband="area"
+ *    combine="stacked"  curve="linear"  markers="dots"
  *
- *  X 축은 1~maxDay 일자, Y 축은 0~max% 자동 스케일. baseline(전체 방위
- *  평균)이 있으면 옅은 영역(area) + 선으로 함께 표시.
+ *  ※ 본선은 전 방위(baseline_*) 시계열. 대상 방위 vs 전방위 '비교기준선'은 제거
+ *    (방위 비교는 교란요인이 많아 보조 지표로 강등됨 — 이 차트는 전방위 절대값만).
  *
+ *  X 축은 1~maxDay 일자, Y 축은 0~max% 자동 스케일.
  *  스타일은 reportOmStyles.css 의 `.om-table.weekly-table` (요약표 전용)만
- *  사용; SVG 내부 색상은 인라인. PSR=#3b82f6, Loss=#ef4444, baseline=#9ca3af.
+ *  사용; SVG 내부 색상은 인라인. PSR=#3b82f6, Loss=#ef4444.
  * ──────────────────────────────────────────────────────────────────────── */
 
 const PSR_COLOR = "#3b82f6";
 const LOSS_COLOR = "#ef4444";
-const BASELINE_COLOR = "#9ca3af";
-const DEV_POS_COLOR = "#dc2626";
-const DEV_NEG_COLOR = "#16a34a";
+const TREND_UP_COLOR = "#dc2626";   // 추세 부호 강조용 (적색)
+const TREND_DOWN_COLOR = "#16a34a"; // (녹색)
+/** 트렌드 색 중립대 (%p) — 이 미만 변화량은 회색 */
+const TREND_NEUTRAL = 0.05;
 
 interface Pt { x: number; y: number }
 
@@ -47,11 +49,9 @@ interface LinePanelProps {
   x: number; y: number; w: number; h: number;
   days: number[];                 // 1..maxDay
   values: number[];               // days.length 와 동일 길이; 0 = 데이터 없음
-  baselineValues: number[];       // 동일 길이; 0 = 베이스라인 없음
   color: string;
   label: string;
   unit: string;
-  hasBaseline: boolean;
   /** 데이터가 있는 일자만 집합 (dot 마커/path 점 결정) */
   hasDataSet: Set<number>;
   /** Y축 최대 고정값 (예: PSR 탐지율 100). 없으면 데이터 기반 자동 스케일 */
@@ -64,9 +64,9 @@ interface LinePanelProps {
   rightLabels?: boolean;
 }
 
-/** 한 라인 차트 패널 (PSR 또는 Loss 1개) */
-function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, unit, hasBaseline, hasDataSet, fixedMax, tickValues, tickDecimals, rightLabels }: LinePanelProps) {
-  const maxV = fixedMax ?? Math.max(0.001, ...values, ...baselineValues) * 1.18;
+/** 한 라인 차트 패널 (PSR 또는 Loss 1개) — 전 방위 단일 라인 */
+function LinePanel({ x, y, w, h, days, values, color, label, unit, hasDataSet, fixedMax, tickValues, tickDecimals, rightLabels }: LinePanelProps) {
+  const maxV = fixedMax ?? Math.max(0.001, ...values) * 1.18;
   const xs = (day: number) => x + ((day - 1) / Math.max(1, days.length - 1)) * w;
   const ys = (v: number) => y + h - (v / maxV) * h;
   const fmtTick = (v: number) =>
@@ -76,15 +76,7 @@ function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, uni
   for (let i = 0; i < days.length; i++) {
     if (hasDataSet.has(days[i])) valPts.push({ x: xs(days[i]), y: ys(values[i]) });
   }
-  const basePts: Pt[] = [];
-  for (let i = 0; i < days.length; i++) {
-    if (hasBaseline && baselineValues[i] > 0) basePts.push({ x: xs(days[i]), y: ys(baselineValues[i]) });
-  }
   const valPath = buildLinearPath(valPts);
-  const basePath = buildLinearPath(basePts);
-  const baseArea = basePts.length > 1
-    ? `${basePath} L${basePts[basePts.length - 1].x},${y + h} L${basePts[0].x},${y + h} Z`
-    : "";
 
   const yTicks = tickValues ?? [0, 0.25, 0.5, 0.75, 1.0].map((t) => maxV * t);
 
@@ -122,15 +114,7 @@ function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, uni
         </g>
       ))}
 
-      {/* 기준선 영역(baseband="area") + 윗선 */}
-      {hasBaseline && basePts.length > 1 && (
-        <>
-          <path d={baseArea} fill={color} fillOpacity={0.08} stroke="none" />
-          <path d={basePath} fill="none" stroke={BASELINE_COLOR} strokeWidth={1.2} opacity={0.75} />
-        </>
-      )}
-
-      {/* 분석 라인 */}
+      {/* 분석 라인 (전 방위) */}
       <path d={valPath} fill="none" stroke={color} strokeWidth={1.8} />
 
       {/* 마커 (dots) */}
@@ -150,55 +134,60 @@ function LinePanel({ x, y, w, h, days, values, baselineValues, color, label, uni
 }
 
 interface SummaryTableProps {
-  hasBaseline: boolean;
   psrAvg: number;
-  psrBaseAvg: number;
   lossAvg: number;
-  lossBaseAvg: number;
+  /** 트렌드 상승률 = 기간 전체 변화량 (%p) — 전방위 일별 시계열 가중 회귀 기울기 × 관측기간 */
+  psrTrend: number;
+  lossTrend: number;
   monthLabel: string;
   dayCount: number;
 }
 
-/** 결합 차트 하단 요약 표 (지표 / 분석 기간 / 분석 평균 / 기준 평균 / 편차) */
-function CombinedSummaryTable({ hasBaseline, psrAvg, psrBaseAvg, lossAvg, lossBaseAvg, monthLabel, dayCount, radarName }: SummaryTableProps & { radarName: string }) {
-  const psrDev = psrAvg - psrBaseAvg;
-  const lossDev = lossAvg - lossBaseAvg;
-  const psrDevColor =
-    psrDev < -PSR_DEV_THRESHOLD ? DEV_POS_COLOR : psrDev > PSR_DEV_THRESHOLD ? DEV_NEG_COLOR : "#6b7280";
-  const lossDevColor =
-    lossDev > LOSS_DEV_THRESHOLD ? DEV_POS_COLOR : lossDev < -LOSS_DEV_THRESHOLD ? DEV_NEG_COLOR : "#6b7280";
+/** 결합 차트 하단 요약 표 (지표 / 분석 기간 / 분석 평균 / 트렌드 상승률) */
+function CombinedSummaryTable({ psrAvg, lossAvg, psrTrend, lossTrend, monthLabel, dayCount, radarName }: SummaryTableProps & { radarName: string }) {
+  // PSR: 상승=개선(녹색) / Loss: 상승=악화(적색)
+  const psrTrendColor =
+    psrTrend > TREND_NEUTRAL ? TREND_DOWN_COLOR : psrTrend < -TREND_NEUTRAL ? TREND_UP_COLOR : "#6b7280";
+  const lossTrendColor =
+    lossTrend > TREND_NEUTRAL ? TREND_UP_COLOR : lossTrend < -TREND_NEUTRAL ? TREND_DOWN_COLOR : "#6b7280";
   const dotStyle = (color: string): React.CSSProperties => ({
     display: "inline-block", width: 8, height: 8, background: color, borderRadius: 2, marginRight: 6,
   });
 
   return (
-    <table className="om-table weekly-table">
-      <thead>
-        <tr>
-          <th><OMEditable id={`daily.${radarName}.col.metric`} value="지표" tag="span" /></th>
-          <th className="ta-r"><OMEditable id={`daily.${radarName}.col.period`} value="분석 기간" tag="span" /></th>
-          <th className="ta-r"><OMEditable id={`daily.${radarName}.col.avg`} value="분석 평균" tag="span" /></th>
-          {hasBaseline && <th className="ta-r"><OMEditable id={`daily.${radarName}.col.base`} value="기준 평균" tag="span" /></th>}
-          {hasBaseline && <th className="ta-r"><OMEditable id={`daily.${radarName}.col.dev`} value="편차(%p)" tag="span" /></th>}
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td className="strong"><span style={dotStyle(PSR_COLOR)} /><OMEditable id={`daily.${radarName}.row.psr`} value="PSR 탐지율" tag="span" /></td>
-          <td className="ta-r">{monthLabel} · {dayCount}일</td>
-          <td className="ta-r mono strong" style={{ color: PSR_COLOR }}>{psrAvg.toFixed(2)}%</td>
-          {hasBaseline && <td className="ta-r mono muted">{psrBaseAvg.toFixed(2)}%</td>}
-          {hasBaseline && <td className="ta-r mono strong" style={{ color: psrDevColor }}>{psrDev > 0 ? "+" : ""}{psrDev.toFixed(2)}</td>}
-        </tr>
-        <tr className="alt">
-          <td className="strong"><span style={dotStyle(LOSS_COLOR)} /><OMEditable id={`daily.${radarName}.row.loss`} value="표적소실율" tag="span" /></td>
-          <td className="ta-r">{monthLabel} · {dayCount}일</td>
-          <td className="ta-r mono strong" style={{ color: LOSS_COLOR }}>{lossAvg.toFixed(3)}%</td>
-          {hasBaseline && <td className="ta-r mono muted">{lossBaseAvg.toFixed(3)}%</td>}
-          {hasBaseline && <td className="ta-r mono strong" style={{ color: lossDevColor }}>{lossDev > 0 ? "+" : ""}{lossDev.toFixed(3)}</td>}
-        </tr>
-      </tbody>
-    </table>
+    <>
+      <table className="om-table weekly-table">
+        <thead>
+          <tr>
+            <th><OMEditable id={`daily.${radarName}.col.metric`} value="지표" tag="span" /></th>
+            <th className="ta-r"><OMEditable id={`daily.${radarName}.col.period`} value="분석 기간" tag="span" /></th>
+            <th className="ta-r"><OMEditable id={`daily.${radarName}.col.avg`} value="분석 평균(전방위)" tag="span" /></th>
+            <th className="ta-r"><OMEditable id={`daily.${radarName}.col.trend`} value="트렌드 상승률(기간 %p)" tag="span" /></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td className="strong"><span style={dotStyle(PSR_COLOR)} /><OMEditable id={`daily.${radarName}.row.psr`} value="PSR 탐지율" tag="span" /></td>
+            <td className="ta-r">{monthLabel} · {dayCount}일</td>
+            <td className="ta-r mono strong" style={{ color: PSR_COLOR }}>{psrAvg.toFixed(2)}%</td>
+            <td className="ta-r mono strong" style={{ color: psrTrendColor }}>{psrTrend > 0 ? "+" : ""}{psrTrend.toFixed(2)}%p</td>
+          </tr>
+          <tr className="alt">
+            <td className="strong"><span style={dotStyle(LOSS_COLOR)} /><OMEditable id={`daily.${radarName}.row.loss`} value="표적소실율" tag="span" /></td>
+            <td className="ta-r">{monthLabel} · {dayCount}일</td>
+            <td className="ta-r mono strong" style={{ color: LOSS_COLOR }}>{lossAvg.toFixed(3)}%</td>
+            <td className="ta-r mono strong" style={{ color: lossTrendColor }}>{lossTrend > 0 ? "+" : ""}{lossTrend.toFixed(3)}%p</td>
+          </tr>
+        </tbody>
+      </table>
+      <p className="muted" style={{ fontSize: "9px", marginTop: 4 }}>
+        <OMEditable
+          id={`daily.${radarName}.trendNote`}
+          value="트렌드 상승률 = 전 방위 일별값의 관측량 가중 최소자승 회귀 기울기 × 관측기간(시작→끝 추정 변화량, %p). 양수=상승, 음수=하락."
+          tag="span"
+        />
+      </p>
+    </>
   );
 }
 
@@ -206,7 +195,7 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
   const monthLabel = analysisMonth
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
     : "";
-  const title = `일별 PSR 탐지율 · 표적소실율`;
+  const title = `일별 PSR 탐지율 · 표적소실율 (전 방위)`;
 
   if (dailyStats.length === 0) {
     return (
@@ -217,49 +206,47 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
     );
   }
 
-  const hasBaseline = dailyStats.some((d) => d.baseline_loss_rate > 0 || d.baseline_psr_rate > 0);
   const maxDay = Math.max(...dailyStats.map((d) => d.day_of_month), 28);
   const dayDataMap = new Map<number, DailyStats>(dailyStats.map((d) => [d.day_of_month, d]));
   const hasDataSet = new Set<number>(dayDataMap.keys());
   const days = Array.from({ length: maxDay }, (_, i) => i + 1);
+  // 본선 = 전 방위(baseline_*) 시계열
   const psrVals = days.map((d) => {
-    const r = dayDataMap.get(d);
-    return r ? r.psr_rate * 100 : 0;
-  });
-  const psrBase = days.map((d) => {
     const r = dayDataMap.get(d);
     return r ? r.baseline_psr_rate * 100 : 0;
   });
   const lossVals = days.map((d) => {
     const r = dayDataMap.get(d);
-    return r ? r.loss_rate : 0;
-  });
-  const lossBase = days.map((d) => {
-    const r = dayDataMap.get(d);
     return r ? r.baseline_loss_rate : 0;
   });
 
-  // 가중 평균 — 시안과 동일 가중치(PSR: SSR 포인트, Loss: 비행시간)
+  // 가중 평균 (전 방위) — 시안과 동일 가중치(PSR: SSR 포인트, Loss: 비행시간)
   const psrAvg = weightedAvg(
-    dailyStats.filter((d) => d.ssr_combined_points > 0),
-    (d) => d.psr_rate * 100,
-    (d) => d.ssr_combined_points,
-  );
-  const psrBaseAvg = weightedAvg(
     dailyStats.filter((d) => d.ssr_combined_points > 0),
     (d) => d.baseline_psr_rate * 100,
     (d) => d.ssr_combined_points,
   );
   const lossAvg = weightedAvg(
     dailyStats.filter((d) => d.total_track_time_secs > 0),
-    (d) => d.loss_rate,
-    (d) => d.total_track_time_secs,
-  );
-  const lossBaseAvg = weightedAvg(
-    dailyStats.filter((d) => d.total_track_time_secs > 0),
     (d) => d.baseline_loss_rate,
     (d) => d.total_track_time_secs,
   );
+
+  // 트렌드 상승률 = 기간 전체 변화량(%p) = 가중 회귀 기울기(%p/일) × 관측기간(일)
+  const obsDays = dailyStats.map((d) => d.day_of_month);
+  const daySpan = obsDays.length > 1 ? Math.max(...obsDays) - Math.min(...obsDays) : 0;
+  const psrSlope = weightedTrendSlope(
+    dailyStats
+      .filter((d) => d.ssr_combined_points > 0)
+      .map((d) => ({ x: d.day_of_month, y: d.baseline_psr_rate * 100, w: d.ssr_combined_points })),
+  );
+  const lossSlope = weightedTrendSlope(
+    dailyStats
+      .filter((d) => d.total_track_time_secs > 0)
+      .map((d) => ({ x: d.day_of_month, y: d.baseline_loss_rate, w: d.total_track_time_secs })),
+  );
+  const psrTrend = psrSlope * daySpan;
+  const lossTrend = lossSlope * daySpan;
 
   // SVG 레이아웃 — stacked 모드 락-인 (조건 문구는 SVG 밖 HTML 로 분리해 편집 가능)
   const svgW = 720;
@@ -288,17 +275,17 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
         {/* 상단 패널: PSR 탐지율 — Y축 0~100% 고정, 축 값별 격자 + 우측 라벨 */}
         <LinePanel
           x={panelX} y={top0} w={panelW} h={panelH}
-          days={days} values={psrVals} baselineValues={psrBase}
+          days={days} values={psrVals}
           color={PSR_COLOR} label="PSR 탐지율" unit="(%)"
-          hasBaseline={hasBaseline} hasDataSet={hasDataSet}
+          hasDataSet={hasDataSet}
           fixedMax={100} tickValues={[0, 20, 40, 60, 80, 100]} tickDecimals={0} rightLabels
         />
         {/* 하단 패널: 표적소실율 */}
         <LinePanel
           x={panelX} y={top1} w={panelW} h={panelH}
-          days={days} values={lossVals} baselineValues={lossBase}
+          days={days} values={lossVals}
           color={LOSS_COLOR} label="표적소실율" unit="(%)"
-          hasBaseline={hasBaseline} hasDataSet={hasDataSet}
+          hasDataSet={hasDataSet}
         />
 
         {/* X 축 라벨 */}
@@ -308,9 +295,8 @@ function ReportOMCombinedDailyChart({ sectionNum, radarName, dailyStats, analysi
       </svg>
 
       <CombinedSummaryTable
-        hasBaseline={hasBaseline}
-        psrAvg={psrAvg} psrBaseAvg={psrBaseAvg}
-        lossAvg={lossAvg} lossBaseAvg={lossBaseAvg}
+        psrAvg={psrAvg} lossAvg={lossAvg}
+        psrTrend={psrTrend} lossTrend={lossTrend}
         monthLabel={monthLabel} dayCount={dailyStats.length}
         radarName={radarName}
       />

@@ -23,7 +23,10 @@ export type { ReportMetadata, SavedReportSummary } from "./report";
 export type {
   AzSector,
   LossPointGeo,
+  AzElevCell,
   DailyStats,
+  WedgeDaySeries,
+  WedgeMetricResult,
   RadarMonthlyResult,
   ObstacleMonthlyResult,
   ObstacleMonthlyProgress,

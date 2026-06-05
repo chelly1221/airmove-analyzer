@@ -18,6 +18,8 @@ import ObstaclePreScreeningModal from "../components/Report/ObstaclePreScreening
 import ReportSettingsModal from "../components/Report/ReportSettingsModal";
 import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
+import { computeWedgeMetric } from "../utils/omWedgeMetric";
+import { calcBuildingAzExtent } from "../utils/obstacleAnalysisHelpers";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
   readReportConfig, clearReportConfig, writeGenerateRequest,
@@ -29,6 +31,7 @@ import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
   PanoramaPoint, PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, TrackPoint, AzSector,
   ObstacleMonthlyResult, PreScreeningResult, OMReportData, SavedReportSummary,
+  WedgeMetricResult,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
 import SourceOverlay from "../dev/SourceOverlay";
@@ -137,6 +140,8 @@ export default function ReportApp() {
   // OM/PS 데이터 캐시 — IDB 왕복 시 커버리지 등 대용량 데이터 제외하고,
   // 보고서 창 메모리에 직접 보관하여 IDB 병목 방지
   const omDataCacheRef = useRef<OMReportData | null>(null);
+  // 자동 생성된 findingsText 스냅샷 — 쐐기 산출 후 재생성 시 사용자 편집 보호용(미편집일 때만 덮어씀)
+  const autoFindingsRef = useRef<string>("");
   const psDataCacheRef = useRef<{
     result: PreScreeningResult;
     buildings: ManualBuilding[];
@@ -505,9 +510,11 @@ export default function ReportApp() {
       { key: "omLossEvents",      name: "표적소실 상세",     visible: !!activeSections.omLossEvents },
       { key: "omFindings",        name: "종합 소견",         visible: !!activeSections.omFindings },
     ];
-    return candidates.filter((c) => c.visible).map((c, i) => ({
+    // 표지=00, 이후 콘텐츠 섹션은 01 부터 누적 (표지 미표시 시 첫 섹션이 01)
+    let contentNum = 0;
+    return candidates.filter((c) => c.visible).map((c) => ({
       key:  c.key,
-      num:  String(i + 1).padStart(2, "0"),
+      num:  c.key === "cover" ? "00" : String(++contentNum).padStart(2, "0"),
       name: c.name,
       page: omTocPageMap.get(c.key) ?? 0,
     }));
@@ -656,6 +663,18 @@ export default function ReportApp() {
     covWithout: Map<string, CoverageLayer[]>,
     monthStr?: string,
   ) => {
+    // 생성 시점엔 파노라마 미준비 → wedgeByKey 없이 생성(쐐기 프로즈 생략).
+    // 파노라마 done 후 useEffect 에서 wedgeByKey 산출 + (미편집 시) findingsText 재생성.
+    const autoFindings = generateOMFindingsText({
+      radarResults: result.radar_results,
+      selectedBuildings: buildings,
+      radarSites: radars,
+      losMap,
+      covLayersWithBuildings: covWith,
+      covLayersWithout: covWithout,
+      analysisMonth: monthStr ?? "",
+    });
+    autoFindingsRef.current = autoFindings;
     const newOmData: OMReportData = {
       result,
       selectedBuildings: buildings,
@@ -666,15 +685,7 @@ export default function ReportApp() {
       covLayersWithBuildings: covWith,
       covLayersWithout: covWithout,
       analysisMonth: monthStr ?? "",
-      findingsText: generateOMFindingsText({
-        radarResults: result.radar_results,
-        selectedBuildings: buildings,
-        radarSites: radars,
-        losMap,
-        covLayersWithBuildings: covWith,
-        covLayersWithout: covWithout,
-        analysisMonth: monthStr ?? "",
-      }),
+      findingsText: autoFindings,
       textOverrides: {},
       chartZooms: {},
       coverageStatus: covWith.size > 0 ? "done" : "loading",
@@ -693,6 +704,9 @@ export default function ReportApp() {
         daily_stats: rr.daily_stats.map((d) => ({
           ...d,
           track_points_geo: [],
+          // 쐐기 히스토그램(대용량 원자료)도 IDB 경량본에서 제외 — wedge 계산은
+          // omDataCacheRef(풀 버전, 메모리)로 수행되므로 IDB structured-clone 부담만 줄임.
+          az_elev_histogram: [],
         })),
       })),
     };
@@ -921,6 +935,54 @@ export default function ReportApp() {
       setPanoramaProgress(null);
     };
   }, [omData?.result, omData?.coverageStatus]);
+
+  // ── 추가 차단영역(쐐기) 소실율 산출 ──
+  // 파노라마 done 후 1회: Rust az×elev 히스토그램(풀 result)을 건물별 컷오프로 슬라이스해 wedgeByKey 산출.
+  // 미편집 findingsText 는 쐐기 프로즈 포함해 재생성(autoFindingsRef 비교로 사용자 편집 보호).
+  // 리로드(파노라마/히스토그램 미영속) 시엔 산출 불가 → "노출 없음"으로 degrade(기존 음영소실과 동일 한계).
+  useEffect(() => {
+    if (!omData || omData.panoramaStatus !== "done") return;
+    if (omData.wedgeByKey) return; // 이미 산출됨(빈 {} 포함) — 재계산해도 동일 결과라 무한 setOmData 루프 방지
+    const result = omData.result;
+    if (!result) return;
+    const hasHist = result.radar_results.some((rr) =>
+      rr.daily_stats.some((d) => (d.az_elev_histogram?.length ?? 0) > 0));
+    if (!hasHist) return; // 히스토그램 없음(리로드 등) → 계산 불가
+
+    const wedgeByKey: Record<string, WedgeMetricResult> = {};
+    for (const radar of omData.selectedRadarSites) {
+      const rr = result.radar_results.find((r) => r.radar_name === radar.name);
+      if (!rr) continue;
+      const histByDay = rr.daily_stats.map((d) => ({ day: d.day_of_month, cells: d.az_elev_histogram ?? [] }));
+      const pWith = omData.panoWithTargets.get(radar.name);
+      const pWithout = omData.panoWithoutTargets.get(radar.name);
+      for (const b of omData.selectedBuildings) {
+        const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
+        wedgeByKey[`${radar.name}_${b.id}`] = computeWedgeMetric(histByDay, pWith, pWithout, extent);
+      }
+    }
+
+    setOmData((prev) => {
+      if (!prev) return prev;
+      let nextFindings = prev.findingsText;
+      // 사용자 미편집(자동 생성 그대로)일 때만 쐐기 프로즈 포함 재생성
+      if (prev.findingsText === autoFindingsRef.current) {
+        const regen = generateOMFindingsText({
+          radarResults: prev.result?.radar_results ?? [],
+          selectedBuildings: prev.selectedBuildings,
+          radarSites: prev.selectedRadarSites,
+          losMap: prev.losMap,
+          covLayersWithBuildings: prev.covLayersWithBuildings,
+          covLayersWithout: prev.covLayersWithout,
+          analysisMonth: prev.analysisMonth,
+          wedgeByKey,
+        });
+        autoFindingsRef.current = regen;
+        nextFindings = regen;
+      }
+      return { ...prev, wedgeByKey, findingsText: nextFindings };
+    });
+  }, [omData]);
 
   // ── 통합 OM 모달 (전체 prep 라이프사이클을 가로지름) ──
   // configPayload 가 obstacle_monthly 인 동안 항상 마운트되며, 모달이 omReady 시점에

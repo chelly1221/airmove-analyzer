@@ -5,8 +5,9 @@
 import type {
   RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData,
 } from "../types";
+import type { WedgeMetricResult } from "../types/obstacle";
 import type { CoverageLayer } from "./radarCoverage";
-import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg, LOSS_DEV_THRESHOLD } from "./omStats";
+import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg, weightedTrendSlope } from "./omStats";
 import { haversineKm } from "./geo";
 
 function gradeLabel(lossRate: number): string {
@@ -23,12 +24,14 @@ interface GenerateOMFindingsParams {
   covLayersWithBuildings: Map<string, CoverageLayer[]>;
   covLayersWithout: Map<string, CoverageLayer[]>;
   analysisMonth: string;
+  /** 건물별 추가 차단영역(쐐기) 소실율 (key: `${radarName}_${buildingId}`). 파노라마 준비 후 채워짐 — 비면 wedge 프로즈 생략. */
+  wedgeByKey?: Record<string, WedgeMetricResult>;
 }
 
 export function generateOMFindingsText(params: GenerateOMFindingsParams): string {
   const {
     radarResults, selectedBuildings, radarSites,
-    losMap, covLayersWithBuildings, covLayersWithout, analysisMonth,
+    losMap, covLayersWithBuildings, covLayersWithout, analysisMonth, wedgeByKey,
   } = params;
 
   const lines: string[] = [];
@@ -73,36 +76,43 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     lines.push(`  - 분석 기간: ${stats.length}일, 평균 표적소실율: ${avgLoss.toFixed(2)}%(±${lossSigma.toFixed(2)}), 기준선: ${avgBaseline.toFixed(2)}%, 편차: ${deviation > 0 ? "+" : ""}${deviation.toFixed(2)}%p`);
     lines.push(`  - 평균 PSR 탐지율: ${(avgPsr * 100).toFixed(1)}%, 소실 이벤트: ${totalLossEvents}건`);
 
-    // 편차 해석
-    if (Math.abs(deviation) < LOSS_DEV_THRESHOLD) {
-      lines.push(`  → 대상 방위 구간의 소실율이 기준선과 유사하여, 분석 대상 장애물에 의한 추가적인 표적소실 영향은 미미한 것으로 판단된다.`);
-    } else if (deviation > 0) {
-      lines.push(`  → 대상 방위 구간의 소실율이 기준선 대비 ${deviation.toFixed(2)}%p 높아, 분석 대상 장애물이 표적소실에 영향을 미치는 것으로 판단된다.`);
-    } else {
-      lines.push(`  → 대상 방위 구간의 소실율이 기준선 대비 오히려 낮아, 분석 대상 장애물에 의한 표적소실 영향은 확인되지 않는다.`);
+    // ── 건물별 추가 차단 구간(쐐기) 소실율 — 헤드라인 인과 지표 ──
+    //   "이 건물이 새로 가리는 노출 비행시간 중 소실 비율". 방위 비교(아래)보다 우선.
+    if (wedgeByKey) {
+      const wedgeLines: string[] = [];
+      for (const b of selectedBuildings) {
+        const w = wedgeByKey[`${rr.radar_name}_${b.id}`];
+        if (!w) continue;
+        const bn = b.name || `건물${b.id}`;
+        const expMin = (w.exposureTrackTimeS / 60).toFixed(0);
+        if (w.grade.label === "판정 보류") {
+          wedgeLines.push(`    · ${bn}: 추가 차단 구간 — 관측일수 부족으로 판정 보류`);
+        } else if (w.grade.label === "노출 없음") {
+          wedgeLines.push(`    · ${bn}: 추가 차단 구간에 항적 노출이 거의 없어(노출 ${expMin}분) 영향 없음으로 판단`);
+        } else {
+          const tr = w.trendDir === "안정"
+            ? "추세 안정"
+            : `추세 ${w.trendDir}(일당 ${w.trendSlopePctPerDay > 0 ? "+" : ""}${w.trendSlopePctPerDay.toFixed(3)}%p)`;
+          wedgeLines.push(`    · ${bn}: 추가 차단 구간 소실율 ${w.wedgeLossRatePct.toFixed(2)}% (${w.grade.label}), ${tr}, 노출 ${expMin}분/${w.daysWithExposure}일`);
+        }
+      }
+      if (wedgeLines.length > 0) {
+        lines.push(`  → 분석 대상 장애물의 추가 차단영역(지형 차단각 초과~대상 차단각 사이 노출 비행시간 대비 소실율):`);
+        for (const wl of wedgeLines) lines.push(wl);
+      }
     }
 
-    // 일별 추이 분석 (가중 최소자승 회귀, day_of_month 기반 — 비행시간 가중치로 소수 관측일 편향 방지)
+    // 참고(방위 비교) — 교란요인(지형·트래픽) 많아 보조 지표로 강등
+    lines.push(`  · 참고(방위 비교): 대상 방위 구간 소실율 ${avgLoss.toFixed(2)}% vs 전 방위 기준선 ${avgBaseline.toFixed(2)}% (편차 ${deviation > 0 ? "+" : ""}${deviation.toFixed(2)}%p). 방위마다 지형·트래픽이 달라 건물 인과 분리엔 한계가 있어, 위 추가 차단 구간 소실율을 우선 판단 근거로 함.`);
+
+    // 일별 추이 분석 (가중 최소자승 회귀) — 레이더 대상 방위 소실율 추세
     if (stats.length >= 7) {
-      // 가중 최소자승 회귀 — 비행시간 가중치로 소수 관측일 편향 방지
-      const weights = stats.map((d) => d.total_track_time_secs);
-      const sumW = weights.reduce((a, b) => a + b, 0);
-      if (sumW > 0) {
-        const xMeanW = stats.reduce((s, d, i) => s + d.day_of_month * weights[i], 0) / sumW;
-        const yMeanW = stats.reduce((s, d, i) => s + d.loss_rate * weights[i], 0) / sumW;
-        let num = 0, den = 0;
-        stats.forEach((d, i) => {
-          const w = weights[i];
-          num += w * (d.day_of_month - xMeanW) * (d.loss_rate - yMeanW);
-          den += w * (d.day_of_month - xMeanW) ** 2;
-        });
-        const slope = den > 0 ? num / den : 0;
-        if (Math.abs(slope) > 0.02) {
-          const trend = slope > 0 ? "증가" : "감소";
-          lines.push(`  → 분석 기간 중 일별 소실율 ${trend} 추세가 관찰된다 (일당 ${slope > 0 ? "+" : ""}${slope.toFixed(3)}%p).`);
-        } else {
-          lines.push(`  → 분석 기간 중 일별 소실율은 비교적 안정적인 추세를 보인다.`);
-        }
+      const slope = weightedTrendSlope(stats.map((d) => ({ x: d.day_of_month, y: d.loss_rate, w: d.total_track_time_secs })));
+      if (Math.abs(slope) > 0.02) {
+        const trend = slope > 0 ? "증가" : "감소";
+        lines.push(`  → 분석 기간 중 (대상 방위) 일별 소실율 ${trend} 추세 (일당 ${slope > 0 ? "+" : ""}${slope.toFixed(3)}%p).`);
+      } else {
+        lines.push(`  → 분석 기간 중 (대상 방위) 일별 소실율은 비교적 안정적.`);
       }
     }
 
@@ -200,7 +210,29 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     : "양호";
 
   const gradeTexts = allGrades.map((g) => `${g.radar} '${g.grade}'(${g.avg.toFixed(2)}%)`).join(", ");
-  lines.push(`레이더별 판정: ${gradeTexts}`);
+  lines.push(`레이더별 판정(대상 방위 소실율): ${gradeTexts}`);
+
+  // 헤드라인 — 건물별 추가 차단 구간(쐐기) 소실율 최악 등급 롤업
+  if (wedgeByKey) {
+    const order: Record<string, number> = { "경고": 3, "주의": 2, "양호": 1 };
+    let worst = "", worstName = "", worstRate = 0;
+    for (const rr of radarResults) {
+      for (const b of selectedBuildings) {
+        const w = wedgeByKey[`${rr.radar_name}_${b.id}`];
+        if (!w || !(w.grade.label in order)) continue;
+        if ((order[w.grade.label] ?? 0) > (order[worst] ?? 0)) {
+          worst = w.grade.label;
+          worstName = `${b.name || `건물${b.id}`}/${rr.radar_name}`;
+          worstRate = w.wedgeLossRatePct;
+        }
+      }
+    }
+    if (worst) {
+      lines.push(`건물별 추가 차단 구간 소실율 최고 등급: '${worst}' (${worstName}, ${worstRate.toFixed(2)}%) — 분석 대상 장애물 인과 기준 헤드라인 판정.`);
+    } else {
+      lines.push(`건물별 추가 차단 구간: 유효 노출 구간이 거의 없어 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
+    }
+  }
 
   if (worstGrade === "양호") {
     lines.push(`분석 기간 중 모든 레이더에서 표적소실율이 양호 수준으로, 분석 대상 장애물에 의한 유의미한 운용 영향은 확인되지 않았다.`);

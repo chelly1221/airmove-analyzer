@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../../store";
 import type { ElevationPoint, RadarSite, BuildingOnPath, NearbyPeak } from "../../types";
 import { GPU2D, type CircleData } from "../../utils/gpu2d";
-import { haversineKm, bearingDeg } from "../../utils/geo";
+import { haversineKm, bearingDeg, LOS_PROFILE_MAX_KM } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 
 const R_EARTH_M = 6_371_000;
@@ -174,6 +174,13 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const totalDist = haversineKm(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
   const bearing = bearingDeg(radarSite.latitude, radarSite.longitude, targetLat, targetLon);
   const radarHeight = radarSite.altitude + radarSite.antenna_height;
+  // 단면도 x축 도메인: 기본 200NM, 타겟이 더 멀면 타겟까지. 차트는 이 범위 안에서 스크롤 줌.
+  const profileMaxKm = useMemo(() => Math.max(LOS_PROFILE_MAX_KM, totalDist), [totalDist]);
+  // 단면도 진입 시 타겟 부근을 보여주는 기본 줌(스크롤로 profileMaxKm까지 줌아웃)
+  const fitZoom = useMemo<[number, number]>(() => {
+    const fitKm = Math.max(totalDist * 1.15, 5 * 1.852); // 최소 ~5NM 가시
+    return [0, Math.min(100, (fitKm / profileMaxKm) * 100)];
+  }, [totalDist, profileMaxKm]);
 
   // 고도 프로파일 API 호출
   const onLoadedRef = useRef(onLoaded);
@@ -193,15 +200,25 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       setHoveredBldgIdx(null);
       setClickedBldgIdx(null);
       onBuildingHover?.(null);
-      setXZoom([0, 100]);
-      xZoomRef.current = [0, 100];
-      const numSamples = 150;
+      // 방위(레이더→타겟)를 따라 profileMaxKm(기본 200NM)까지 샘플링 → 차트에서 스크롤로 자유 줌.
+      // 평면(등거리) 투영으로 원거리 종점 계산: 항적 코리도(TrackMap)와 동일 축 → distRatio 정합.
+      const DEG2RAD = Math.PI / 180;
+      const mPerDegLat = DEG2RAD * R_EARTH_M;
+      const mPerDegLon = mPerDegLat * Math.cos(radarSite.latitude * DEG2RAD);
+      const dLatM = (targetLat - radarSite.latitude) * mPerDegLat;
+      const dLonM = (targetLon - radarSite.longitude) * mPerDegLon;
+      const dirLen = Math.hypot(dLatM, dLonM) || 1;
+      const farM = profileMaxKm * 1000;
+      const farLat = radarSite.latitude + ((dLatM / dirLen) * farM) / mPerDegLat;
+      const farLon = radarSite.longitude + ((dLonM / dirLen) * farM) / mPerDegLon;
+      // ~0.5km 간격 유지(근거리 해상도 보존) — 전수 샘플 원칙, 다운샘플 금지
+      const numSamples = Math.min(760, Math.max(150, Math.round(profileMaxKm / 0.5)));
       const lats: number[] = [];
       const lons: number[] = [];
       for (let i = 0; i <= numSamples; i++) {
         const t = i / numSamples;
         const [lat, lon] = interpolate(
-          radarSite.latitude, radarSite.longitude, targetLat, targetLon, t
+          radarSite.latitude, radarSite.longitude, farLat, farLon, t
         );
         lats.push(lat);
         lons.push(lon);
@@ -248,6 +265,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         for (let i = 1; i < points.length - 1; i++) {
           const di = points[i].distance;
           if (di <= 0) continue;
+          if (di > totalDist) break; // 산 이름은 타겟까지의 차단 지형만 대상 (원거리 확장 구간 제외)
           // 건물을 포함한 effective elevation 사용
           let elev = points[i].elevation;
           if (showBuildings) {
@@ -264,7 +282,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           if (adjH <= radarHeight) continue;
           // 이 지형점이 만드는 그림자: 뒤쪽 포인트들에서 얼마나 최저선을 올리는지 합산
           let shadowSum = 0;
-          for (let j = i + 1; j < points.length; j++) {
+          for (let j = i + 1; j < points.length && points[j].distance <= totalDist; j++) {
             const dj = points[j].distance;
             const shadow = radarHeight + (adjH - radarHeight) * (dj / di);
             const adjTj = points[j].elevation - curvDrop(dj);
@@ -319,9 +337,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const chartData = useMemo(() => {
     if (profile.length === 0) return null;
 
-    const D = totalDist;
-    const targetElev = profile[profile.length - 1].elevation;
-    const adjTarget = targetElev - curvDrop(D);
+    const D = totalDist; // 타겟(클릭 지점)까지의 거리 — 차단 판정·LoS 직선 기준
+    // targetElev는 interpTerrainElev 정의 후 보간으로 계산 (프로파일이 타겟 너머 200NM까지 확장됨)
 
     // 1) 조정 지형 (실제 지구곡률 반영 → 지형이 거리에 따라 아래로 처짐)
     const adjTerrain = profile.map((p) => ({
@@ -379,6 +396,10 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       }
       return 0;
     };
+
+    // 타겟 거리에서의 지형 고도 — 프로파일이 200NM까지 확장되므로 보간으로 추출 (마지막 포인트≠타겟)
+    const targetElev = interpTerrainElev(D);
+    const adjTarget = targetElev - curvDrop(D);
 
     // 통합 샘플 거리: 프로파일 포인트 + 건물 경계 (쉐도잉 라인이 건물에서 수직으로 오르도록)
     const sampleDists: number[] = profile.map(p => p.distance);
@@ -615,11 +636,11 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       searchedBldgIdx,
       minY,
       maxY,
-      maxDistance: D,
+      maxDistance: profileMaxKm, // 차트 x축 도메인은 200NM(또는 타겟거리) — 스크롤 줌아웃 한계
       adjTarget,
       targetElev,
     };
-  }, [profile, radarHeight, totalDist, peakNames, buildings, showBuildings, searchedAddress, fresnelClearance]);
+  }, [profile, radarHeight, totalDist, profileMaxKm, peakNames, buildings, showBuildings, searchedAddress, fresnelClearance]);
 
   // 차단 여부 + 건물 차단/비차단 수를 상위(드로어)로 보고
   useEffect(() => {
@@ -889,11 +910,11 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     };
   }, [cw, loading]);
 
-  // 줌 리셋 (프로파일 변경 시)
+  // 줌 리셋 (프로파일/타겟 변경 시) → 타겟 부근 기본 줌으로 (스크롤로 200NM까지 줌아웃)
   useEffect(() => {
-    xZoomRef.current = [0, 100];
-    setXZoom([0, 100]);
-  }, [profile]);
+    xZoomRef.current = fitZoom;
+    setXZoom(fitZoom);
+  }, [profile, fitZoom]);
 
   // 마우스 이동 핸들러 (SVG 좌표 → 거리 + 항적 포인트 히트테스트)
   const handleSvgMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
@@ -1263,8 +1284,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
             <path d={braPath} fill="none"
               stroke="#22d3ee" strokeWidth={1} strokeDasharray="8 4" />
             <text
-              x={xScale(maxDistance) - 4}
-              y={yScale(braLine[braLine.length - 1].height) - 5}
+              x={xScale(zoomEnd) - 4}
+              y={yScale(radarHeight + zoomEnd * 1000 * Math.tan((0.25 * Math.PI) / 180)) - 5}
               textAnchor="end" fill="#22d3ee" fontSize={9} fontWeight="bold">
               BRA
             </text>
@@ -1624,10 +1645,11 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
               {chartData.blocked ? "LoS 차단" : "LoS 양호"}
             </span>
           )}
-          {xZoom[0] !== 0 || xZoom[1] !== 100 ? (
+          {(Math.abs(xZoom[0] - fitZoom[0]) > 0.5 || Math.abs(xZoom[1] - fitZoom[1]) > 0.5) ? (
             <button
-              onClick={() => { xZoomRef.current = [0, 100]; setXZoom([0, 100]); }}
+              onClick={() => { xZoomRef.current = fitZoom; setXZoom(fitZoom); }}
               className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500 hover:bg-gray-200 transition-colors"
+              title="타겟 거리로 줌 리셋"
             >
               {Math.round(100 / ((xZoom[1] - xZoom[0]) / 100))}% ✕
             </button>
