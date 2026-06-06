@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use base64::Engine as _;
 use rusqlite::{params, Connection, Result as SqlResult};
 
 use crate::models::Aircraft;
@@ -84,18 +83,6 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             time_range_start REAL NOT NULL,
             time_range_end REAL NOT NULL,
             computed_at INTEGER NOT NULL
-        );
-
-        -- 저장된 보고서 (PDF 포함)
-        CREATE TABLE IF NOT EXISTS saved_reports (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            template TEXT NOT NULL,
-            radar_name TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            report_config_json TEXT NOT NULL,
-            pdf_base64 TEXT,
-            metadata_json TEXT
         );
 
         -- 기상-Garble 상관분석 캐시
@@ -272,36 +259,8 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // NULL = 아직 백필되지 않음, 0 이상 = SRTM 값 계산 완료
     let _ = conn.execute("ALTER TABLE fac_buildings ADD COLUMN ground_elev REAL", []);
 
-    // pdf_blob BLOB 컬럼 추가 (마이그레이션)
-    let has_pdf_blob: bool = conn
-        .prepare("PRAGMA table_info(saved_reports)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .any(|name| name.as_deref() == Ok("pdf_blob"));
-    if !has_pdf_blob {
-        let _ = conn.execute("ALTER TABLE saved_reports ADD COLUMN pdf_blob BLOB", []);
-    }
-
-    // 기존 pdf_base64 → pdf_blob 마이그레이션
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, pdf_base64 FROM saved_reports WHERE pdf_base64 IS NOT NULL AND pdf_blob IS NULL",
-        )?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
-        for (id, b64) in &rows {
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                let _ = conn.execute(
-                    "UPDATE saved_reports SET pdf_blob = ?1, pdf_base64 = NULL WHERE id = ?2",
-                    params![bytes, id],
-                );
-            }
-        }
-        if !rows.is_empty() {
-            log::info!("Migrated {} saved reports from pdf_base64 to pdf_blob", rows.len());
-        }
-    }
+    // 보고서 저장 기능 폐지 — 기존 DB에 남은 미사용 테이블 제거 (idempotent)
+    let _ = conn.execute("DROP TABLE IF EXISTS saved_reports", []);
 
     Ok(conn)
 }
@@ -532,106 +491,6 @@ pub fn has_coverage_cache(conn: &Connection, radar_name: &str) -> SqlResult<bool
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
         Err(e) => Err(e),
     }
-}
-
-// ========== 저장된 보고서 ==========
-
-/// 보고서 저장 (BLOB)
-pub fn save_report(
-    conn: &Connection,
-    id: &str,
-    title: &str,
-    template: &str,
-    radar_name: &str,
-    report_config_json: &str,
-    pdf_bytes: Option<&[u8]>,
-    metadata_json: Option<&str>,
-) -> SqlResult<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    // UPSERT: BLOB 저장, base64 NULL 처리
-    conn.execute(
-        "INSERT INTO saved_reports (id, title, template, radar_name, created_at, report_config_json, pdf_blob, pdf_base64, metadata_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
-         ON CONFLICT(id) DO UPDATE SET
-           title = excluded.title,
-           template = excluded.template,
-           radar_name = excluded.radar_name,
-           report_config_json = excluded.report_config_json,
-           pdf_blob = excluded.pdf_blob,
-           pdf_base64 = NULL,
-           metadata_json = excluded.metadata_json",
-        params![id, title, template, radar_name, now, report_config_json, pdf_bytes, metadata_json],
-    )?;
-    Ok(())
-}
-
-/// 보고서 목록 조회 (PDF 제외 — 경량)
-#[derive(serde::Serialize)]
-pub struct SavedReportSummary {
-    pub id: String,
-    pub title: String,
-    pub template: String,
-    pub radar_name: String,
-    pub created_at: i64,
-    pub has_pdf: bool,
-}
-
-pub fn list_saved_reports(conn: &Connection) -> SqlResult<Vec<SavedReportSummary>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, template, radar_name, created_at, (pdf_blob IS NOT NULL OR pdf_base64 IS NOT NULL) FROM saved_reports ORDER BY created_at DESC",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(SavedReportSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                template: row.get(2)?,
-                radar_name: row.get(3)?,
-                created_at: row.get(4)?,
-                has_pdf: row.get::<_, i32>(5)? != 0,
-            })
-        })?
-        .collect::<SqlResult<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// 보고서 상세 (PDF BLOB 우선, base64 fallback)
-/// 반환: (id, title, template, radar_name, created_at, report_config_json, pdf_base64_string, metadata_json)
-pub fn load_report_detail(conn: &Connection, id: &str) -> SqlResult<Option<(String, String, String, String, i64, String, Option<String>, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, template, radar_name, created_at, report_config_json, pdf_blob, pdf_base64, metadata_json FROM saved_reports WHERE id = ?1",
-    )?;
-    match stmt.query_row(params![id], |row| {
-        let pdf_blob: Option<Vec<u8>> = row.get(6)?;
-        let pdf_base64_legacy: Option<String> = row.get(7)?;
-        // BLOB → base64 encode for frontend, fallback to legacy base64
-        let pdf_b64 = pdf_blob
-            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(&bytes))
-            .or(pdf_base64_legacy);
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
-            pdf_b64,
-            row.get::<_, Option<String>>(8)?,
-        ))
-    }) {
-        Ok(row) => Ok(Some(row)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// 보고서 삭제
-pub fn delete_report(conn: &Connection, id: &str) -> SqlResult<()> {
-    conn.execute("DELETE FROM saved_reports WHERE id = ?1", params![id])?;
-    Ok(())
 }
 
 // ========== SRTM 타일 ==========

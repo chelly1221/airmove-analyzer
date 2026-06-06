@@ -18,7 +18,6 @@ import ReportFlightLossAnalysisSection from "./ReportFlightLossAnalysisSection";
 import ReportPanoramaSection from "./ReportPanoramaSection";
 import ReportOMSummarySection from "./ReportOMSummarySection";
 import ReportOMCombinedDailyChart from "./ReportOMCombinedDailyChart";
-import ReportOMWeeklyChart from "./ReportOMWeeklyChart";
 import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
 import ReportOMFindings from "./ReportOMFindings";
@@ -53,7 +52,7 @@ export interface ReportPreviewContentProps {
 
   // 장애물 월간
   omData: OMReportData;
-  omResultTrimmed: ObstacleMonthlyResult | null;
+  omResult: ObstacleMonthlyResult | null;
 
   // 사전검토
   psResult: PreScreeningResult | null;
@@ -71,9 +70,6 @@ export interface ReportPreviewContentProps {
   onCoverSubtitleChange: (v: string) => void;
   commentary: string;
   onCommentaryChange: (v: string) => void;
-
-  // 상태
-  forceAllVisible: boolean;
 
   // OM 콜백
   onOmDataChange: (updater: (prev: OMReportData) => OMReportData) => void;
@@ -113,7 +109,6 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
       { key: "cover", label: "표지" },
       { key: "omSummary", label: "요약" },
       { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
-      { key: "omWeekly", label: "주차" },
       { key: "omLosCrossSection", label: "장애물별 상세" },
       { key: "omLossEvents", label: "표적소실상세" },
       { key: "omFindings", label: "소견" },
@@ -147,11 +142,10 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     template, sections,
     flights, reportFlights, aircraft, radarSite, reportMetadata,
     panoramaData, panoramaPeakNames, mapImage,
-    omData, omResultTrimmed,
+    omData, omResult,
     psResult, psSelectedBuildings, psSelectedRadarSites, psCovLayersWith, psCovLayersWithout, psAnalysisMonth,
     coverTitle, onCoverTitleChange, coverSubtitle, onCoverSubtitleChange,
     commentary, onCommentaryChange,
-    forceAllVisible: _forceAllVisible,
     onOmDataChange,
     singleFlightChartPoints,
     previewRef,
@@ -213,7 +207,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     } else if (template === "obstacle_monthly") {
       if (sections.omSummary) nums.omSummary = n++;
       if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
-      if (sections.omWeekly) nums.omWeekly = n++;
       if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
       if (sections.omLossEvents) nums.omLossEvents = n++;
       if (sections.omFindings) nums.omFindings = n++;
@@ -234,9 +227,9 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
 
   // OM 레이더별 조건 텍스트
   const omRadarConditions = useMemo(() => {
-    if (!omResultTrimmed) return new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
+    if (!omResult) return new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
     const map = new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
-    for (const rr of omResultTrimmed.radar_results) {
+    for (const rr of omResult.radar_results) {
       const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
       const azText = sectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ");
       const bldgNames = omData.selectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
@@ -256,7 +249,32 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       map.set(rr.radar_name, { azText, bldgNames, minDistNm: (minDistKm / 1.852).toFixed(1) });
     }
     return map;
-  }, [omResultTrimmed, omData.azSectorsByRadar, omData.selectedRadarSites, omData.selectedBuildings]);
+  }, [omResult, omData.azSectorsByRadar, omData.selectedRadarSites, omData.selectedBuildings]);
+
+  // 일별 차트 조건 박스 — 단일 레이더면 기존 3줄, 다중 레이더면 공통 3줄 + 레이더별 방위/거리
+  const dailyConditions = useMemo<string[]>(() => {
+    if (!omResult) return [];
+    const rrs = omResult.radar_results;
+    const bldgNames = omData.selectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
+    if (rrs.length === 1) {
+      const info = omRadarConditions.get(rrs[0].radar_name);
+      return [
+        `• 대상 장애물: ${info?.bldgNames ?? bldgNames} (분석 방위 ${info?.azText || "전체"})`,
+        `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
+        `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
+      ];
+    }
+    const lines = [
+      `• 대상 장애물: ${bldgNames}`,
+      `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방 항적만 포함`,
+      `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
+    ];
+    for (const rr of rrs) {
+      const info = omRadarConditions.get(rr.radar_name);
+      lines.push(`• ${rr.radar_name} — 분석 방위 ${info?.azText || "전체"}, 장애물 후방 ${info?.minDistNm ?? "0"}NM~`);
+    }
+    return lines;
+  }, [omResult, omRadarConditions, omData.selectedBuildings]);
 
   return (
     <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">
@@ -404,13 +422,13 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       )}
 
       {/* ─── 장애물 월간 ─── */}
-      {template === "obstacle_monthly" && omResultTrimmed && (
+      {template === "obstacle_monthly" && omResult && (
         <>
           {sections.omSummary && (
             <div data-toc-key="omSummary">
               <ReportOMSummarySection
                 sectionNum={sectionNumbers.omSummary ?? 1}
-                radarResults={omResultTrimmed.radar_results}
+                radarResults={omResult.radar_results}
                 selectedBuildings={omData.selectedBuildings}
                 buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
@@ -418,47 +436,22 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 losMap={omData.losMap}
                 panoWithByRadar={omData.panoWithTargets}
                 panoWithoutByRadar={omData.panoWithoutTargets}
-                wedgeByKey={omData.wedgeByKey}
+                addedBlockageByKey={omData.addedBlockageByKey}
               />
             </div>
           )}
 
           {sections.omDailyPsrLoss && (
             <div data-toc-key="omDailyPsrLoss">
-              {omResultTrimmed.radar_results.map((rr) => {
-                const info = omRadarConditions.get(rr.radar_name);
-                return (
-                  <ReportOMCombinedDailyChart
-                    key={`psrloss-${rr.radar_name}`}
-                    sectionNum={sectionNumbers.omDailyPsrLoss ?? 2}
-                    radarName={rr.radar_name}
-                    dailyStats={rr.daily_stats}
-                    analysisMonth={omData.analysisMonth}
-                    conditions={[
-                      `• 대상 장애물: ${info?.bldgNames ?? ""} (분석 방위 ${info?.azText || "전체"})`,
-                      `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-                      `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
-                    ]}
-                  />
-                );
-              })}
-            </div>
-          )}
-
-          {sections.omWeekly && (
-            <div data-toc-key="omWeekly">
-              {omResultTrimmed.radar_results.map((rr) => {
-                const imgKey = `wk-${rr.radar_name}`;
-                return (
-                  <ReportPage key={imgKey}>
-                    <ReportOMWeeklyChart
-                      sectionNum={sectionNumbers.omWeekly ?? 3}
-                      radarName={rr.radar_name}
-                      dailyStats={rr.daily_stats}
-                    />
-                  </ReportPage>
-                );
-              })}
+              <ReportOMCombinedDailyChart
+                sectionNum={sectionNumbers.omDailyPsrLoss ?? 2}
+                radars={omResult.radar_results.map((rr) => ({
+                  radarName: rr.radar_name,
+                  dailyStats: rr.daily_stats,
+                }))}
+                analysisMonth={omData.analysisMonth}
+                conditions={dailyConditions}
+              />
             </div>
           )}
 
@@ -478,11 +471,11 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                       building={b}
                       buildingGroups={omData.buildingGroups}
                       los={los}
-                      omResult={omResultTrimmed}
+                      omResult={omResult}
                       panoWith={omData.panoWithTargets?.get(rs.name)}
                       panoWithout={omData.panoWithoutTargets?.get(rs.name)}
                       allBuildings={omData.selectedBuildings}
-                      wedge={omData.wedgeByKey?.[`${rs.name}_${b.id}`]}
+                      blockage={omData.addedBlockageByKey?.[`${rs.name}_${b.id}`]}
                     />
                   );
                 });
@@ -495,7 +488,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
               {omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? (
                 <ReportOMLossEvents
                   sectionNum={sectionNumbers.omLossEvents ?? 5}
-                  radarResults={omResultTrimmed.radar_results}
+                  radarResults={omResult.radar_results}
                   selectedBuildings={omData.selectedBuildings}
                   buildingGroups={omData.buildingGroups}
                   radarSites={omData.selectedRadarSites}
@@ -523,7 +516,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             <div data-toc-key="omFindings">
               <ReportOMFindings
                 sectionNum={sectionNumbers.omFindings ?? 6}
-                radarResults={omResultTrimmed.radar_results}
+                radarResults={omResult.radar_results}
                 selectedBuildings={omData.selectedBuildings}
                 buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
@@ -531,7 +524,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}
                 editable={true}
                 analysisMonth={omData.analysisMonth}
-                wedgeByKey={omData.wedgeByKey}
+                addedBlockageByKey={omData.addedBlockageByKey}
               />
             </div>
           )}

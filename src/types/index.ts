@@ -19,14 +19,14 @@ export type {
 } from "./building";
 export type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult, PanoramaMergeDualResult } from "./panorama";
 export type { Flight } from "./flight";
-export type { ReportMetadata, SavedReportSummary } from "./report";
+export type { ReportMetadata } from "./report";
 export type {
   AzSector,
   LossPointGeo,
   AzElevCell,
   DailyStats,
-  WedgeDaySeries,
-  WedgeMetricResult,
+  AddedBlockageDay,
+  AddedBlockageResult,
   RadarMonthlyResult,
   ObstacleMonthlyResult,
   ObstacleMonthlyProgress,

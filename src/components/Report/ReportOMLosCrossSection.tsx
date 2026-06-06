@@ -296,6 +296,12 @@ export function LosCrossSection({
 
   // ── 줌 편집 (클릭 → 줌모드, 휠 확대/축소 + 드래그 패닝). obstacle_monthly 편집 컨텍스트에서만 활성 ──
   const svgRef = useRef<SVGSVGElement>(null);
+  // 항적/소실 포인트 전용 canvas 오버레이 — 수천~수만 점을 <circle> DOM 노드 없이 래스터로 그려
+  //   PDF 캡처(WebView2 PrintToPdf) 병목을 제거한다. SVG(축/그리드/선/건물/범례)는 그대로 유지.
+  const pointCanvasRef = useRef<HTMLCanvasElement>(null);
+  // canvas 의 실제 렌더 픽셀 크기 — SVG(viewBox 0 0 W H, w-full)가 컨테이너 폭에 맞춰 스케일되므로
+  //   ResizeObserver 로 렌더 박스를 추적해 viewBox→픽셀 스케일을 정확히 재현(1px 정합).
+  const [canvasPx, setCanvasPx] = useState<{ w: number; h: number }>({ w: W, h: H });
   const zoomKey = `loscs.${radarName}_${building.id}`;
   const { editable, zoom, setZoom } = useOMChartZoom(zoomKey);
   const [zoomMode, setZoomMode] = useState(false);
@@ -463,6 +469,104 @@ export function LosCrossSection({
     }
     return { minY: visMinY, maxY: visMaxY };
   }, [chartData, liveZoom]);
+
+  // ── canvas 렌더 픽셀 크기 추적 — SVG 는 viewBox(0 0 W H) + w-full 이라 렌더 폭이 동적.
+  //    SVG 실제 렌더 박스를 ResizeObserver 로 관측해 canvas CSS/픽셀 크기를 일치시킨다(viewBox→px 스케일 보존).
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const update = () => {
+      const r = svg.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        setCanvasPx((prev) =>
+          prev.w === r.width && prev.h === r.height ? prev : { w: r.width, h: r.height },
+        );
+      }
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(svg);
+    return () => ro.disconnect();
+  }, []);
+
+  // ── 항적/소실 포인트 canvas 렌더 ──
+  //    SVG <circle> 전수 렌더를 대체. SVG 와 동일한 좌표계(viewBox 0 0 W H)에서 cx/cy 를 계산한 뒤
+  //    canvas 의 viewBox→픽셀 스케일(sx, sy)·DPR 을 곱해 그린다 → SVG path/축과 1px 정합.
+  //    의존성에 liveZoom·visibleYRange·canvasPx 가 포함되어 줌/패닝/리사이즈 시 자동 재그리기.
+  useEffect(() => {
+    const canvas = pointCanvasRef.current;
+    if (!canvas || !chartData) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const { minY, maxY } = visibleYRange ?? chartData;
+    const { maxDistance } = chartData;
+
+    // SVG 와 동일한 X/Y 스케일 재현 (viewBox 좌표계, 0~W / 0~H)
+    const zoomStartKm = (liveZoom[0] / 100) * maxDistance;
+    const zoomEndKm = (liveZoom[1] / 100) * maxDistance;
+    const zoomRangeKm = Math.max(1e-6, zoomEndKm - zoomStartKm);
+    const xScaleV = (d: number) => PAD.left + ((d - zoomStartKm) / zoomRangeKm) * cw;
+    const yScaleV = (h: number) => PAD.top + ch - ((h - minY) / (maxY - minY)) * ch;
+
+    // viewBox(W×H) → 렌더 픽셀(canvasPx) → 물리 픽셀(DPR) 변환.
+    //   SVG 기본 preserveAspectRatio="xMidYMid meet" 와 동일하게 맞춘다:
+    //   maxHeight(230) 로 높이가 클램프되면 SVG 는 균일 스케일(min) + 중앙 정렬(레터박스)로 그려지므로
+    //   canvas 도 동일 스케일 s = min(boxW/W, boxH/H) 와 중앙 오프셋(ox, oy)을 적용해야 1px 정합.
+    const dpr = window.devicePixelRatio || 1;
+    const s = Math.min(canvasPx.w / W, canvasPx.h / H);
+    const ox = (canvasPx.w - W * s) / 2; // 가로 레터박스 오프셋(px)
+    const oy = (canvasPx.h - H * s) / 2; // 세로 레터박스 오프셋(px)
+    // backing store 픽셀 크기 (DPR 적용) — 멈춤 없이 매 그리기마다 동기화
+    const bw = Math.round(canvasPx.w * dpr);
+    const bh = Math.round(canvasPx.h * dpr);
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+
+    // 이후 좌표는 viewBox(0..W, 0..H) 그대로 사용 — DPR·균일스케일·레터박스 오프셋 합성
+    ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
+    ctx.clearRect(-ox / s, -oy / s, canvasPx.w / s, canvasPx.h / s);
+
+    // SVG clipPath(plot rect)와 동일 클립 — 줌 시 윈도우 밖 포인트가 축 영역을 넘지 않게
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PAD.left, PAD.top, cw, ch);
+    ctx.clip();
+
+    // 항적 포인트 — <circle r=1.5 fillOpacity=0.7> + PSR 흰 테두리. SVG 와 동일 cx/cy.
+    for (const tp of trackPoints) {
+      const adjAlt = tp.altM - curvDrop(tp.distKm);
+      const px = xScaleV(tp.distKm);
+      const py = yScaleV(adjAlt);
+      const col = detectionTypeColor(tp.radarType);
+      ctx.beginPath();
+      ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.7)`;
+      ctx.fill();
+      if (PSR_TYPES.has(tp.radarType)) {
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "rgba(255,255,255,0.6)";
+        ctx.stroke();
+      }
+    }
+
+    // 소실표적 포인트 — <circle r=2.5 fillOpacity=0.9> + 반투명 테두리. SVG 와 동일 cx/cy.
+    const lr = LOSS_COLOR[0], lg = LOSS_COLOR[1], lb = LOSS_COLOR[2];
+    for (const lp of lossPoints) {
+      const adjAlt = lp.altM - curvDrop(lp.distKm);
+      const px = xScaleV(lp.distKm);
+      const py = yScaleV(adjAlt);
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${lr},${lg},${lb},0.9)`;
+      ctx.fill();
+      ctx.lineWidth = 0.5;
+      ctx.strokeStyle = `rgba(${lr},${lg},${lb},0.5)`;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }, [chartData, visibleYRange, liveZoom, canvasPx, trackPoints, lossPoints]);
 
   if (!chartData) return null;
 
@@ -663,20 +767,8 @@ export function LosCrossSection({
           <path d={terrainFill} fill="#22c55e" fillOpacity={0.35} />
           <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
 
-          {/* 항적 포인트 — 지형 위·LoS선/건물/소실표적 아래로 그려 다른 요소를 가리지 않게 함 */}
-          {trackPoints.map((tp, i) => {
-            const adjAlt = tp.altM - curvDrop(tp.distKm);
-            const px = xScale(tp.distKm);
-            const py = yScale(adjAlt);
-            const col = detectionTypeColor(tp.radarType);
-            const hasPsr = PSR_TYPES.has(tp.radarType);
-            return (
-              <circle key={`tp-${i}`} cx={px} cy={py} r={1.5}
-                fill={`rgb(${col[0]},${col[1]},${col[2]})`} fillOpacity={0.7}
-                stroke={hasPsr ? "rgba(255,255,255,0.6)" : "none"}
-                strokeWidth={hasPsr ? 1 : 0} />
-            );
-          })}
+          {/* 항적/소실표적 포인트는 SVG 가 아닌 canvas 오버레이로 렌더(아래 pointCanvasRef).
+              수천~수만 <circle> DOM 노드를 제거해 PDF 캡처(WebView2 PrintToPdf) 병목을 없앤다. */}
 
           {/* 건물 실루엣 — TrackMap 방식 (사다리꼴 / 세로선) */}
           {significantBuildings.map((b, bi) => {
@@ -743,18 +835,7 @@ export function LosCrossSection({
             {radarName} ({Math.round(radarHeight * M_TO_FT).toLocaleString()}ft)
           </text>
 
-          {/* 소실표적 포인트 */}
-          {lossPoints.map((lp, i) => {
-            const adjAlt = lp.altM - curvDrop(lp.distKm);
-            const px = xScale(lp.distKm);
-            const py = yScale(adjAlt);
-            return (
-              <circle key={`lp-${i}`} cx={px} cy={py} r={2.5}
-                fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.9}
-                stroke={`rgba(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]},0.5)`}
-                strokeWidth={0.5} />
-            );
-          })}
+          {/* 소실표적 포인트도 canvas 오버레이(pointCanvasRef)에서 그린다 — 위 항적 포인트와 동일 사유. */}
         </g>
 
         {/* 범례 (좌상단 — TrackMap 방식) */}
@@ -850,6 +931,19 @@ export function LosCrossSection({
           })()}
         </g>
       </svg>
+      {/* 항적/소실표적 포인트 canvas 오버레이 — SVG 플롯 위에 정확히 겹친다(같은 left/top/size·동일 viewBox 스케일).
+          pointer-events:none 으로 SVG 의 줌/패닝 상호작용을 가리지 않는다. */}
+      <canvas
+        ref={pointCanvasRef}
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: canvasPx.w,
+          height: canvasPx.h,
+          pointerEvents: "none",
+        }}
+      />
       </div>
     </div>
   );

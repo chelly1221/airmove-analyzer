@@ -21,9 +21,9 @@ export interface TrackPointGeo {
 }
 
 /**
- * 추가 차단영역(쐐기) 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
+ * 추가 차단영역 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
  * 건물-무관 원자료 — 프론트가 건물별 angleWith/angleWithout 컷오프로
- * 쐐기 밴드 셀을 합산해 소실율을 산출한다.
+ * 추가 차단영역 밴드 셀을 합산해 소실율을 산출한다.
  * 양각은 실제지구 곡률(R=6,371,000) 기준 — lossElevAngleDeg와 동일 프레임.
  * 빈 정의(Rust HIST_* 상수와 일치): az_bin = floor(az/0.1) 0..3600,
  * elev_bin = floor((elev+1.0)/0.05) 0..140 (elev 범위 [-1°, 6°)).
@@ -39,7 +39,6 @@ export interface AzElevCell {
 export interface DailyStats {
   date: string;
   day_of_month: number;
-  week_num: number;
   ssr_combined_points: number;
   psr_rate: number;
   total_track_time_secs: number;
@@ -50,29 +49,32 @@ export interface DailyStats {
   baseline_loss_rate: number;
   /** 전체 방위(분석 구간 포함) 기준 PSR율 (0~1) */
   baseline_psr_rate: number;
+  /** 전방위 기준선 표본량 — 베이스라인 비율의 가중치(섹터 표본량과 모집단 불일치 방지) */
+  baseline_track_time_secs: number;
+  baseline_ssr_points: number;
   /** 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용) */
   track_points_geo?: TrackPointGeo[];
-  /** 추가 차단영역(쐐기) 분석용 방위×양각 시간 히스토그램 (건물-무관 원자료) */
+  /** 추가 차단영역 분석용 방위×양각 시간 히스토그램 (건물-무관 원자료) */
   az_elev_histogram?: AzElevCell[];
 }
 
-/** 추가 차단영역(쐐기) 소실율 — 일별 시계열 항목 */
-export interface WedgeDaySeries {
+/** 추가 차단영역 소실율 — 일별 시계열 항목 */
+export interface AddedBlockageDay {
   /** day_of_month */
   day: number;
-  /** 그 날 쐐기 소실율 (%) */
+  /** 그 날 추가 차단영역 소실율 (%) */
   ratePct: number;
-  /** 그 날 쐐기 노출시간 (추적+소실, 초) */
+  /** 그 날 추가 차단영역 노출시간 (추적+소실, 초) */
   exposureS: number;
 }
 
 /**
- * 건물별 추가 차단영역(쐐기) 소실율 결과 (헤드라인 심각도 지표).
- * 노출 조건부 소실율 = Σ(쐐기 내 소실시간) / Σ(쐐기 내 노출시간) × 100%.
+ * 건물별 추가 차단영역 소실율 결과 (헤드라인 심각도 지표).
+ * 노출 조건부 소실율 = Σ(추가 차단영역 내 소실시간) / Σ(추가 차단영역 내 노출시간) × 100%.
  */
-export interface WedgeMetricResult {
-  /** 월간 쐐기 소실율 (%) */
-  wedgeLossRatePct: number;
+export interface AddedBlockageResult {
+  /** 월간 추가 차단영역 소실율 (%) */
+  lossRatePct: number;
   /** 일별 추세 기울기 (%p/day) */
   trendSlopePctPerDay: number;
   /** 추세 방향 */
@@ -84,8 +86,8 @@ export interface WedgeMetricResult {
   /** 노출>0 인 일수 */
   daysWithExposure: number;
   /** 일별 시계열 */
-  series: WedgeDaySeries[];
-  /** 등급 (gradeWedge) */
+  series: AddedBlockageDay[];
+  /** 등급 (gradeAddedBlockage) */
   grade: { label: string; color: string };
 }
 
@@ -136,9 +138,10 @@ export interface OMReportData {
   coverageStatus: "idle" | "loading" | "done" | "error";
   panoramaStatus: "idle" | "deferred" | "loading" | "done" | "error";
   /**
-   * 건물별 추가 차단영역(쐐기) 소실율 결과 (key: `${radarName}_${buildingId}`).
-   * 파노라마 준비(panoramaStatus==="done") 후 computeWedgeMetric으로 산출, 영속화 대상.
-   * 파노라마는 DB 미영속이므로 이 계산 스칼라를 저장해 리로드 시 표·프로즈 복원.
+   * 건물별 추가 차단영역 소실율 결과 (key: `${radarName}_${buildingId}`).
+   * 파노라마 준비(panoramaStatus==="done") 후 ReportApp 에서 computeAddedBlockage 으로 1회 산출한다.
+   * 라이브 세션 한정 — 저장 기능이 없어 영속/직렬화(SerializedOMData) 대상이 아니며,
+   * 보고서 창에서 파노라마 done 직후 풀 result(omDataCacheRef)로부터 재산출된다.
    */
-  wedgeByKey?: Record<string, WedgeMetricResult>;
+  addedBlockageByKey?: Record<string, AddedBlockageResult>;
 }

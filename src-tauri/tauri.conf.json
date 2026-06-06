@@ -19,7 +19,7 @@
         "minWidth": 1024,
         "minHeight": 768,
         "decorations": false,
-        "shadow": false,
+        "shadow": true,
         "center": true
       }
     ],

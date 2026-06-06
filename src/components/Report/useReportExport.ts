@@ -6,18 +6,6 @@ import { save } from "@tauri-apps/plugin-dialog";
 export interface ExportResult {
   success: boolean;
   error?: string;
-  /** 생성된 PDF base64 (DB 저장용) — 통합 커맨드 사용 시 undefined */
-  pdfBase64?: string;
-}
-
-/** 통합 커맨드에 전달할 보고서 메타데이터 */
-export interface ReportSaveMeta {
-  reportId: string;
-  title: string;
-  template: string;
-  radarName: string;
-  reportConfigJson: string;
-  metadataJson?: string;
 }
 
 /** WebView2 네이티브 PrintToPdf — 벡터 PDF, GPU 가속
@@ -31,7 +19,6 @@ export interface ReportSaveMeta {
 async function exportViaNative(
   containerRef: React.RefObject<HTMLDivElement | null>,
   savePath: string,
-  reportMeta?: ReportSaveMeta,
 ): Promise<ExportResult> {
   if (!containerRef.current) {
     return { success: false, error: "미리보기 컨테이너를 찾을 수 없습니다" };
@@ -167,31 +154,14 @@ async function exportViaNative(
       setTimeout(() => reject(new Error("PDF 생성 시간 초과 (60초)")), PRINT_TIMEOUT_MS),
     );
 
-    if (reportMeta) {
-      await Promise.race([
-        invoke<boolean>("webview_print_and_save_report", {
-          savePath,
-          windowLabel: getCurrentWindow().label,
-          reportId: reportMeta.reportId,
-          title: reportMeta.title,
-          template: reportMeta.template,
-          radarName: reportMeta.radarName,
-          reportConfigJson: reportMeta.reportConfigJson,
-          metadataJson: reportMeta.metadataJson ?? null,
-        }),
-        timeoutPromise,
-      ]);
-      return { success: true };
-    } else {
-      const pdfBase64 = await Promise.race([
-        invoke<string>("webview_print_to_pdf", {
-          path: savePath,
-          windowLabel: getCurrentWindow().label,
-        }),
-        timeoutPromise,
-      ]);
-      return { success: true, pdfBase64 };
-    }
+    await Promise.race([
+      invoke("webview_print_to_pdf", {
+        path: savePath,
+        windowLabel: getCurrentWindow().label,
+      }),
+      timeoutPromise,
+    ]);
+    return { success: true };
   } catch (err) {
     return {
       success: false,
@@ -208,7 +178,6 @@ export function useReportExport() {
     async (
       containerRef: React.RefObject<HTMLDivElement | null>,
       defaultFilename: string,
-      reportMeta?: ReportSaveMeta,
     ): Promise<ExportResult> => {
       // 저장 경로 먼저 선택
       const savePath = await save({
@@ -220,7 +189,7 @@ export function useReportExport() {
         return { success: false, error: "저장이 취소되었습니다" };
       }
 
-      return exportViaNative(containerRef, savePath, reportMeta);
+      return exportViaNative(containerRef, savePath);
     },
     []
   );

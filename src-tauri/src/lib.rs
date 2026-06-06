@@ -380,13 +380,13 @@ async fn write_file_base64(path: String, data: String) -> Result<(), String> {
 
 /// WebView2 네이티브 PrintToPdf — CDP(Chrome DevTools Protocol) Page.printToPDF 사용
 /// 벡터 텍스트 PDF, GPU 가속 렌더링, html2canvas 대비 5-10x 빠름
-/// 반환: PDF base64 (DB 저장용)
+/// PDF 파일을 path 에 직접 저장. 저장 기능이 없어 base64 반환은 제거(대용량 PDF IPC 왕복 낭비 제거).
 #[tauri::command]
 async fn webview_print_to_pdf(
     _app_handle: tauri::AppHandle,
     _path: String,
     _window_label: Option<String>,
-) -> Result<String, String> {
+) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::sync::mpsc;
@@ -476,53 +476,13 @@ async fn webview_print_to_pdf(
         fs::write(&_path, &pdf_bytes)
             .map_err(|e| format!("PDF 파일 저장 실패: {}", e))?;
 
-        // base64 반환 (DB 저장용)
-        Ok(pdf_base64.to_string())
+        Ok(())
     }
 
     #[cfg(not(windows))]
     {
         Err("WebView2 PrintToPdf는 Windows에서만 지원됩니다".to_string())
     }
-}
-
-/// WebView2 PrintToPdf + 파일 저장 + DB BLOB 저장을 Rust 내부에서 일괄 처리
-/// base64 PDF 데이터를 프론트엔드로 전송하지 않아 IPC 오버헤드 제거
-#[tauri::command]
-async fn webview_print_and_save_report(
-    app_handle: tauri::AppHandle,
-    save_path: String,
-    window_label: Option<String>,
-    report_id: String,
-    title: String,
-    template: String,
-    radar_name: String,
-    report_config_json: String,
-    metadata_json: Option<String>,
-) -> Result<bool, String> {
-    // 1. 기존 webview_print_to_pdf 로직으로 base64 획득
-    let pdf_base64 = webview_print_to_pdf(
-        app_handle.clone(),
-        save_path.clone(),
-        window_label,
-    ).await?;
-
-    // 2. base64 → bytes
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    let pdf_bytes = STANDARD.decode(&pdf_base64)
-        .map_err(|e| format!("PDF base64 decode: {}", e))?;
-
-    // 3. 파일은 이미 webview_print_to_pdf에서 저장됨
-
-    // 4. DB에 BLOB 저장
-    let state = app_handle.state::<AppState>();
-    let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-    db::save_report(
-        &conn, &report_id, &title, &template, &radar_name,
-        &report_config_json, Some(&pdf_bytes), metadata_json.as_deref(),
-    ).map_err(|e| format!("DB error: {}", e))?;
-
-    Ok(true)
 }
 
 /// 설정값 로드 (프론트엔드용)
@@ -1297,72 +1257,6 @@ async fn has_coverage_cache(
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
         db::has_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-
-// ========== 저장된 보고서 ==========
-
-
-#[tauri::command]
-async fn list_saved_reports(
-    app_handle: tauri::AppHandle,
-) -> Result<Vec<db::SavedReportSummary>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::list_saved_reports(&conn).map_err(|e| format!("DB error: {}", e))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn load_report_detail(
-    app_handle: tauri::AppHandle,
-    id: String,
-) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        let row = db::load_report_detail(&conn, &id).map_err(|e| format!("DB error: {}", e))?;
-        match row {
-            Some(r) => {
-                #[derive(serde::Serialize)]
-                struct Detail {
-                    id: String,
-                    title: String,
-                    template: String,
-                    radar_name: String,
-                    created_at: i64,
-                    report_config_json: String,
-                    pdf_base64: Option<String>,
-                    metadata_json: Option<String>,
-                }
-                let detail = Detail {
-                    id: r.0, title: r.1, template: r.2, radar_name: r.3,
-                    created_at: r.4, report_config_json: r.5, pdf_base64: r.6, metadata_json: r.7,
-                };
-                serde_json::to_string(&detail).map_err(|e| format!("JSON error: {}", e)).map(Some)
-            }
-            None => Ok(None),
-        }
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
-}
-
-#[tauri::command]
-async fn delete_saved_report(
-    app_handle: tauri::AppHandle,
-    id: String,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::delete_report(&conn, &id).map_err(|e| format!("DB error: {}", e))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -2323,10 +2217,6 @@ pub fn run() {
             init_pixel_coverage,
             render_coverage_bitmap,
             query_min_detection_alt,
-            // 보고서
-            list_saved_reports,
-            load_report_detail,
-            delete_saved_report,
             // 장애물 월간 분석
             analyze_obstacle_monthly,
             cancel_analysis,
@@ -2346,7 +2236,6 @@ pub fn run() {
             vworld_download_n3p,
             // WebView2 네이티브 PDF
             webview_print_to_pdf,
-            webview_print_and_save_report,
             // DevTools
             open_devtools,
         ])

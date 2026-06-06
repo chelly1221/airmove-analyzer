@@ -112,9 +112,10 @@ fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
     ((dh - curv_drop) / d).atan().to_degrees()
 }
 
-/// 타임스탬프 → 날짜 문자열 (UTC)
+/// 타임스탬프 → 날짜 문자열 (KST = UTC+9, OM obstacle_monthly 와 동일 일 경계)
 fn timestamp_to_date(ts: f64) -> String {
-    let secs = ts as i64;
+    const KST_OFFSET: i64 = 9 * 3600;
+    let secs = ts as i64 + KST_OFFSET;
     let days = if secs >= 0 { secs / 86400 } else { (secs - 86399) / 86400 };
     let z = days + 719468;
     let era = (if z >= 0 { z } else { z - 146096 }) / 146097;

@@ -63,8 +63,8 @@ const TrackPointIcon = ({ size = 16 }: { size?: number }) => (
 import { format } from "date-fns";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, BuildingOnPath } from "../types";
-import { queryViewportPoints } from "../utils/flightConsolidationWorker";
-import { LOS_PROFILE_MAX_KM, LOS_PROFILE_MAX_NM } from "../utils/geo";
+import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
+import { LOS_PROFILE_MAX_KM } from "../utils/geo";
 import LoSProfileTabs from "../components/Map/LoSProfileTabs";
 import { isGPUCacheValidFor, renderCoverageImageAsync, queryMinDetectionAlt, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
@@ -675,15 +675,20 @@ export default function TrackMap() {
       // Worker에 뷰포트 포인트 쿼리 (포인트는 Worker 소유)
       const totalPtsEst = radarFilteredFlights.reduce((s, f) => s + f.point_count, 0);
       setRenderProgress({ stage: "query", current: 0, total: totalPtsEst });
-      const { points: pts } = await queryViewportPoints({
+      const queryResult = await queryViewportPoints({
         radarName: radarSite.name,
         selectedModeS: queryModeS,
         registeredModeS: registeredMS,
         timeRange,
         paddingPoints: true,
         onProgress: (loaded) => setRenderProgress({ stage: "query", current: loaded, total: totalPtsEst }),
+      }).catch((err) => {
+        // 새 쿼리로 교체됨 — 정상 취소이므로 조용히 중단
+        if (err instanceof ViewportQuerySuperseded) return null;
+        throw err;
       });
-      if (cancelled) return;
+      if (cancelled || !queryResult) return;
+      const { points: pts } = queryResult;
 
       // 시간 범위 계산 (메타데이터 기반)
       let tsMin = Infinity, tsMax = -Infinity;
@@ -3093,7 +3098,7 @@ export default function TrackMap() {
           <div style={{ padding: "9px 11px", borderBottom: "1px solid #e5e7eb" }}>
             <div style={{ ...micro, marginBottom: 7 }}>Target · 분석 대상</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-              {/* 지점 선택 + 주소 검색 */}
+              {/* 지점 선택 + 주소·건물명 검색 + 등록 장애물 선택 (한 줄) */}
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                 <button
                   onClick={() => {
@@ -3148,9 +3153,10 @@ export default function TrackMap() {
                     }
                   }} />
                 </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <LosObstaclePicker buildings={manualBuildings} groups={buildingGroups} onSelect={setLosToObstacle} />
+                </div>
               </div>
-              {/* 등록 장애물 선택 */}
-              <LosObstaclePicker buildings={manualBuildings} groups={buildingGroups} onSelect={setLosToObstacle} />
               {/* 방위 카드 */}
               <div style={card}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
@@ -3164,17 +3170,6 @@ export default function TrackMap() {
                 </div>
                 <HeadingTape azimuth={losAzimuth} precise={losPrecise}
                   onChange={(v) => { setLosFromAzDist(+v.toFixed(losPrecise ? 2 : 1), losDistanceKm); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosAzFineCenter(v); }} />
-              </div>
-              {/* 거리: 단면도에서 스크롤로 줌(최대 200NM) — 별도 거리 설정 없음 */}
-              <div style={{ ...card, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span style={head}>거리</span>
-                <span style={big}>{distNM.toFixed(1)}<span style={unit}>NM</span></span>
-              </div>
-              <div style={{ fontSize: 9, color: "#9ca3af", textAlign: "center", lineHeight: 1.5 }}>
-                단면도에서 스크롤로 확대/축소 (최대 {LOS_PROFILE_MAX_NM}NM)
-              </div>
-              <div style={{ ...num, fontSize: 8.5, color: "#9ca3af", textAlign: "center" }}>
-                {losTarget ? `${losTarget.lat.toFixed(4)}°N · ${losTarget.lon.toFixed(4)}°E` : "지점 미선택"}
               </div>
             </div>
           </div>
@@ -3544,7 +3539,6 @@ export default function TrackMap() {
           <div className="flex items-center gap-2">
             <CloudRain size={14} className={weatherVisible ? "text-[#a60739]" : "text-gray-400"} />
             <span className="text-xs text-gray-600">기상</span>
-            {weatherVectors.length === 0 && <span className="text-[9px] text-gray-300">데이터 없음</span>}
             <GearButton active={settingsDrawer === "weather"} onClick={() => { setSettingsDrawer(settingsDrawer === "weather" ? null : "weather"); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
           </div>
           <button

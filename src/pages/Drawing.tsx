@@ -5,7 +5,7 @@ import { ScatterplotLayer } from "@deck.gl/layers";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { useAppStore } from "../store";
 import type { TrackPoint } from "../types";
-import { queryViewportPoints, queryFlightPoints } from "../utils/flightConsolidationWorker";
+import { queryViewportPoints, queryFlightPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { GPU2D, type CircleData, type LineData } from "../utils/gpu2d";
 import {
   computeMaxDistanceGPU,
@@ -152,6 +152,10 @@ export default function Drawing() {
         registeredModeS: registeredMS,
       }).then(({ points: pts }) => {
         if (!cancelled) setFilteredPoints(pts);
+      }).catch((err) => {
+        // 새 쿼리로 교체됨 — 정상 취소이므로 무시
+        if (err instanceof ViewportQuerySuperseded) return;
+        console.error("[Drawing] 뷰포트 쿼리 실패:", err);
       });
     };
 

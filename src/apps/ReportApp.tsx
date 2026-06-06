@@ -7,18 +7,18 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { format } from "date-fns";
-import { Download, Loader2, TriangleAlert, Check, Circle } from "lucide-react";
+import { Download, Loader2, TriangleAlert } from "lucide-react";
 import Titlebar from "../components/Layout/Titlebar";
 import ReportPreviewContent, { getSectionToggles } from "../components/Report/ReportPreviewContent";
 import ReportOMSidebar, { type OMSidebarTocItem } from "../components/Report/ReportOMSidebar";
-import { useReportExport, type ReportSaveMeta } from "../components/Report/useReportExport";
+import { useReportExport } from "../components/Report/useReportExport";
 import TemplateConfigModal from "../components/Report/TemplateConfigModal";
 import ObstacleMonthlyConfigModal from "../components/Report/ObstacleMonthlyConfigModal";
 import ObstaclePreScreeningModal from "../components/Report/ObstaclePreScreeningModal";
 import ReportSettingsModal from "../components/Report/ReportSettingsModal";
 import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
-import { computeWedgeMetric } from "../utils/omWedgeMetric";
+import { computeAddedBlockage } from "../utils/omAddedBlockage";
 import { calcBuildingAzExtent } from "../utils/obstacleAnalysisHelpers";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
@@ -30,8 +30,8 @@ import {
 import type {
   Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
   PanoramaPoint, PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, TrackPoint, AzSector,
-  ObstacleMonthlyResult, PreScreeningResult, OMReportData, SavedReportSummary,
-  WedgeMetricResult,
+  ObstacleMonthlyResult, PreScreeningResult, OMReportData,
+  AddedBlockageResult,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
 import SourceOverlay from "../dev/SourceOverlay";
@@ -44,7 +44,6 @@ const appWindow = getCurrentWindow();
 interface LoadedState {
   template: ReportTemplate;
   sections: ReportSections;
-  editingReportId: string | null;
   coverTitle: string;
   coverSubtitle: string;
   commentary: string;
@@ -74,7 +73,6 @@ function payloadToState(p: ReportWindowPayload): LoadedState {
   return {
     template: p.template,
     sections: p.sections,
-    editingReportId: p.editingReportId,
     coverTitle: p.coverTitle,
     coverSubtitle: p.coverSubtitle ?? format(new Date(), "yyyy년 MM월"),
     commentary: p.commentary,
@@ -121,7 +119,6 @@ export default function ReportApp() {
   const [coverTitle, setCoverTitle] = useState("");
   const [coverSubtitle, setCoverSubtitle] = useState(() => format(new Date(), "yyyy년 MM월"));
   const [commentary, setCommentary] = useState("");
-  const [editingReportId, setEditingReportId] = useState<string | null>(null);
 
   // 편집 가능 보고서 메타데이터 — 설정 모달에서 수정 → 표지/머리말 라이브 반영.
   // null 이면 state.reportMetadata(원본)를 사용.
@@ -140,7 +137,7 @@ export default function ReportApp() {
   // OM/PS 데이터 캐시 — IDB 왕복 시 커버리지 등 대용량 데이터 제외하고,
   // 보고서 창 메모리에 직접 보관하여 IDB 병목 방지
   const omDataCacheRef = useRef<OMReportData | null>(null);
-  // 자동 생성된 findingsText 스냅샷 — 쐐기 산출 후 재생성 시 사용자 편집 보호용(미편집일 때만 덮어씀)
+  // 자동 생성된 findingsText 스냅샷 — 추가 차단영역 산출 후 재생성 시 사용자 편집 보호용(미편집일 때만 덮어씀)
   const autoFindingsRef = useRef<string>("");
   const psDataCacheRef = useRef<{
     result: PreScreeningResult;
@@ -156,7 +153,6 @@ export default function ReportApp() {
   const [generating, setGenerating] = useState(false);
   const generatingRef = useRef(false);
   const covQueueRef = useRef<(() => void) | null>(null);
-  const [forceAllVisible, setForceAllVisible] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportElapsed, setExportElapsed] = useState(0);
   const exportTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -186,10 +182,8 @@ export default function ReportApp() {
   }, [panoramaActive]);
 
   // ── OM 사이드바 상태 ──
-  // 디자인 핸드오프 OM 사이드바: PDF 옵션(범위·용지) UI 상태 + 목차 active/페이지 추적.
-  // 페이지 인덱스는 프리뷰 컨테이너의 [data-page] / [data-toc-key] 마커를 측정해 갱신.
-  const [omSidebarPaper, setOmSidebarPaper] = useState<"A4" | "A3">("A4");
-  const [omSidebarRange, setOmSidebarRange] = useState<"all" | "current" | "custom">("all");
+  // 목차 active/페이지 추적. 페이지 인덱스는 프리뷰 컨테이너의 [data-page] / [data-toc-key]
+  // 마커를 측정해 갱신. (PDF 용지/범위 옵션은 A4 고정 레이아웃상 무의미해 제거됨)
   const [omActiveTocKey, setOmActiveTocKey] = useState<string | null>(null);
   const [omCurrentPage, setOmCurrentPage] = useState(1);
   const [omTotalPages, setOmTotalPages] = useState(0);
@@ -239,7 +233,6 @@ export default function ReportApp() {
         setCoverTitle(s.coverTitle);
         setCoverSubtitle(s.coverSubtitle);
         setCommentary(s.commentary);
-        setEditingReportId(s.editingReportId);
         setMetadata(s.reportMetadata);
         setOmData(s.omData);
         setLoading(false);
@@ -270,7 +263,7 @@ export default function ReportApp() {
     return false;
   }, []);
 
-  // 이벤트 리스너: data-written, reload-config, reload-data, coverage-update
+  // 이벤트 리스너: data-written, reload-config, coverage-update
   useEffect(() => {
     // 보고서 창 DevTools 자동 활성화 비활성 — DevTools 가 열려 있으면 panorama-debug
     // 콘솔 로그 부하로 메인 스레드 블로킹/setTimeout throttle 가능. 필요 시 F12 로 직접 열 것.
@@ -302,16 +295,6 @@ export default function ReportApp() {
       setPrepPhase("waiting");
       // 짧은 지연 후 config 읽기 (IDB 쓰기 완료 대기)
       setTimeout(() => loadConfigFromIDB(), 100);
-    });
-
-    // report:reload-data → 기존 창 재사용 시 (편집 모드) 오버레이 표시
-    const unlistenReload = listen("report:reload-data", () => {
-      loadingRef.current = false;
-      omDataCacheRef.current = null;
-      psDataCacheRef.current = null;
-      setConfigPayload(null); // 모달 닫기
-      setPrepPhase("waiting");
-      setLoading(true);
     });
 
     // report:data-error → 메인 창에서 데이터 생성 실패 시 에러 표시
@@ -363,7 +346,6 @@ export default function ReportApp() {
       unlistenData.then((fn) => fn());
       unlistenPanoramaDebug.then((fn) => fn());
       unlistenReloadConfig.then((fn) => fn());
-      unlistenReload.then((fn) => fn());
       unlistenError.then((fn) => fn());
       unlistenCov.then((fn) => fn());
       unlistenClose.then((fn) => fn());
@@ -505,7 +487,6 @@ export default function ReportApp() {
       { key: "cover",             name: "표지",              visible: !!activeSections.cover },
       { key: "omSummary",         name: "분석 요약",         visible: !!activeSections.omSummary },
       { key: "omDailyPsrLoss",    name: "일별 PSR·표적소실", visible: !!activeSections.omDailyPsrLoss },
-      { key: "omWeekly",          name: "주차별 추이",       visible: !!activeSections.omWeekly },
       { key: "omLosCrossSection", name: "장애물별 상세",     visible: !!activeSections.omLosCrossSection && omData.losMap.size > 0 },
       { key: "omLossEvents",      name: "표적소실 상세",     visible: !!activeSections.omLossEvents },
       { key: "omFindings",        name: "종합 소견",         visible: !!activeSections.omFindings },
@@ -529,34 +510,20 @@ export default function ReportApp() {
     return coverSubtitle || undefined;
   }, [omData?.analysisMonth, coverSubtitle]);
 
-  // 문서번호: 편집 모드면 기존 ID 사용, 아니면 분석월 기반 placeholder
+  // 문서번호: 분석월 기반 placeholder
   const omSidebarDocNo = useMemo(() => {
-    if (editingReportId) {
-      // 너무 길면 앞 16자만 표시 (사이드바 폭 192px 제한)
-      return editingReportId.length > 18 ? editingReportId.slice(0, 18) + "…" : editingReportId;
-    }
     const iso = omData?.analysisMonth;
     if (iso && /^\d{4}-\d{2}$/.test(iso)) {
       return `RDR-RPT-${iso.slice(2, 4)}${iso.slice(5, 7)}-NEW`;
     }
     return "RDR-RPT-NEW";
-  }, [editingReportId, omData?.analysisMonth]);
+  }, [omData?.analysisMonth]);
 
-  // PDF 내보내기 + DB 저장
+  // PDF 내보내기 (저장 기능 없음 — 라이브 렌더된 정적 DOM을 PrintToPdf가 스냅샷)
   const handleExportPDF = useCallback(async () => {
     if (!state || !activeSections) return;
-    // 기존 보고서 덮어쓰기 확인
-    if (editingReportId) {
-      const { confirm } = await import("@tauri-apps/plugin-dialog");
-      const yes = await confirm("기존 보고서를 덮어쓰시겠습니까? PDF가 새로 생성됩니다.", {
-        title: "보고서 덮어쓰기",
-        kind: "warning",
-      });
-      if (!yes) return;
-    }
     setGenerating(true);
     generatingRef.current = true;
-    setForceAllVisible(true);
     setExportError(null);
     setExportElapsed(0);
     exportTimerRef.current = setInterval(() => setExportElapsed((p) => p + 1), 1000);
@@ -570,50 +537,9 @@ export default function ReportApp() {
       const tplLabel = templateDisplayLabel(activeTemplate);
       const filename = `비행검사_${tplLabel}_보고서_${dateStr}.pdf`;
 
-      // 보고서 메타데이터 준비 (통합 커맨드: PDF 생성 + DB 저장 일괄 처리)
-      const reportId = editingReportId ?? `rpt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const configJson = JSON.stringify({
-        template: activeTemplate,
-        sections: activeSections,
-        selectedFlightIds: state.selectedFlightIds,
-        singleFlightId: state.singleFlightId,
-        coverTitle,
-        coverSubtitle,
-        commentary,
-        omFindingsText: omData?.findingsText ?? "",
-        omTextOverrides: omData?.textOverrides ?? {},
-        omChartZooms: omData?.chartZooms ?? {},
-        mapImage: state.mapImage,
-      });
-      const reportMeta: ReportSaveMeta = {
-        reportId,
-        title: coverTitle,
-        template: activeTemplate,
-        radarName: state.radarSite?.name ?? "",
-        reportConfigJson: configJson,
-        metadataJson: JSON.stringify(metadata ?? state.reportMetadata),
-      };
-
-      const result = await exportPDF(previewRef, filename, reportMeta);
+      const result = await exportPDF(previewRef, filename);
       if (!result.success && result.error && result.error !== "저장이 취소되었습니다") {
         setExportError(result.error);
-      }
-      // Rust에서 DB 저장 완료 → 메인 창에 알림만 발행
-      if (result.success) {
-        const summary: SavedReportSummary = {
-          id: reportId,
-          title: coverTitle,
-          template: activeTemplate,
-          radar_name: state.radarSite?.name ?? "",
-          created_at: Math.floor(Date.now() / 1000),
-          has_pdf: true,
-        };
-        await emit("report:saved", {
-          summary,
-          isEdit: !!editingReportId,
-        });
-        setEditingReportId(null);
-        console.log(`[ReportApp] 보고서 저장 완료: ${reportId}`);
       }
     } catch (err) {
       setExportError(`PDF 내보내기 실패: ${err instanceof Error ? err.message : String(err)}`);
@@ -621,7 +547,6 @@ export default function ReportApp() {
       if (exportTimerRef.current) { clearInterval(exportTimerRef.current); exportTimerRef.current = null; }
       setGenerating(false);
       generatingRef.current = false;
-      setForceAllVisible(false);
       // 큐에 쌓인 커버리지 업데이트 적용
       const queued = covQueueRef.current;
       if (queued) {
@@ -629,7 +554,7 @@ export default function ReportApp() {
         queued();
       }
     }
-  }, [state, activeTemplate, activeSections, exportPDF, coverTitle, coverSubtitle, commentary, omData, editingReportId, metadata]);
+  }, [state, activeTemplate, activeSections, exportPDF]);
 
   // ── 모달에서 생성 요청 → IDB + emit ──
   const handleModalGenerate = useCallback(async (
@@ -663,8 +588,8 @@ export default function ReportApp() {
     covWithout: Map<string, CoverageLayer[]>,
     monthStr?: string,
   ) => {
-    // 생성 시점엔 파노라마 미준비 → wedgeByKey 없이 생성(쐐기 프로즈 생략).
-    // 파노라마 done 후 useEffect 에서 wedgeByKey 산출 + (미편집 시) findingsText 재생성.
+    // 생성 시점엔 파노라마 미준비 → addedBlockageByKey 없이 생성(추가 차단영역 프로즈 생략).
+    // 파노라마 done 후 useEffect 에서 addedBlockageByKey 산출 + (미편집 시) findingsText 재생성.
     const autoFindings = generateOMFindingsText({
       radarResults: result.radar_results,
       selectedBuildings: buildings,
@@ -694,8 +619,9 @@ export default function ReportApp() {
       panoWithoutTargets: new Map(),
     };
 
-    // 대용량 데이터(커버리지 레이어 + track_points_geo)는 메모리에 캐시하고
-    // IDB에는 경량 버전만 전송하여 직렬화/역직렬화 병목 방지
+    // 풀 데이터(커버리지 레이어 + track_points_geo + az_elev_histogram)는 이 창(report 윈도우)
+    // 메모리에 보관하고, 창 간 전송(IDB)에는 경량본만 실어 structured-clone 병목을 피한다.
+    // 저장 기능이 없으므로 이 캐시는 라이브 세션 한정 — 로드 시 경량본 대신 이 풀버전을 사용한다.
     omDataCacheRef.current = newOmData;
 
     const lightResult: ObstacleMonthlyResult = {
@@ -704,7 +630,7 @@ export default function ReportApp() {
         daily_stats: rr.daily_stats.map((d) => ({
           ...d,
           track_points_geo: [],
-          // 쐐기 히스토그램(대용량 원자료)도 IDB 경량본에서 제외 — wedge 계산은
+          // 추가 차단영역 히스토그램(대용량 원자료)도 IDB 경량본에서 제외 — 추가 차단영역 계산은
           // omDataCacheRef(풀 버전, 메모리)로 수행되므로 IDB structured-clone 부담만 줄임.
           az_elev_histogram: [],
         })),
@@ -713,7 +639,7 @@ export default function ReportApp() {
     const lightOmData: OMReportData = {
       ...newOmData,
       result: lightResult,
-      // 커버리지 레이어(베이스라인·합산)는 IDB에 저장하여 새로고침 시에도 복원
+      // 커버리지 레이어는 경량본에도 실어 창 전송 시 함께 넘긴다(10M 규모 아님).
       covLayersWithBuildings: covWith,
       covLayersWithout: covWithout,
       coverageStatus: covWith.size > 0 ? "done" : "idle",
@@ -936,20 +862,21 @@ export default function ReportApp() {
     };
   }, [omData?.result, omData?.coverageStatus]);
 
-  // ── 추가 차단영역(쐐기) 소실율 산출 ──
-  // 파노라마 done 후 1회: Rust az×elev 히스토그램(풀 result)을 건물별 컷오프로 슬라이스해 wedgeByKey 산출.
-  // 미편집 findingsText 는 쐐기 프로즈 포함해 재생성(autoFindingsRef 비교로 사용자 편집 보호).
-  // 리로드(파노라마/히스토그램 미영속) 시엔 산출 불가 → "노출 없음"으로 degrade(기존 음영소실과 동일 한계).
+  // ── 추가 차단영역 소실율 산출 ──
+  // 파노라마 done 후 1회: Rust az×elev 히스토그램(풀 result)을 건물별 컷오프로 슬라이스해 addedBlockageByKey 산출.
+  // 미편집 findingsText 는 추가 차단영역 프로즈 포함해 재생성(autoFindingsRef 비교로 사용자 편집 보호).
+  // addedBlockageByKey 는 라이브 세션에서만 산출·소비된다(저장/직렬화 대상 아님). 히스토그램이 비면(방어) 계산을
+  // 건너뛰지만, 정상 생성 경로에선 풀 result 가 omDataCacheRef 로 유지되므로 항상 산출된다.
   useEffect(() => {
     if (!omData || omData.panoramaStatus !== "done") return;
-    if (omData.wedgeByKey) return; // 이미 산출됨(빈 {} 포함) — 재계산해도 동일 결과라 무한 setOmData 루프 방지
+    if (omData.addedBlockageByKey) return; // 이미 산출됨(빈 {} 포함) — 재계산해도 동일 결과라 무한 setOmData 루프 방지
     const result = omData.result;
     if (!result) return;
     const hasHist = result.radar_results.some((rr) =>
       rr.daily_stats.some((d) => (d.az_elev_histogram?.length ?? 0) > 0));
     if (!hasHist) return; // 히스토그램 없음(리로드 등) → 계산 불가
 
-    const wedgeByKey: Record<string, WedgeMetricResult> = {};
+    const addedBlockageByKey: Record<string, AddedBlockageResult> = {};
     for (const radar of omData.selectedRadarSites) {
       const rr = result.radar_results.find((r) => r.radar_name === radar.name);
       if (!rr) continue;
@@ -958,14 +885,14 @@ export default function ReportApp() {
       const pWithout = omData.panoWithoutTargets.get(radar.name);
       for (const b of omData.selectedBuildings) {
         const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
-        wedgeByKey[`${radar.name}_${b.id}`] = computeWedgeMetric(histByDay, pWith, pWithout, extent);
+        addedBlockageByKey[`${radar.name}_${b.id}`] = computeAddedBlockage(histByDay, pWith, pWithout, extent);
       }
     }
 
     setOmData((prev) => {
       if (!prev) return prev;
       let nextFindings = prev.findingsText;
-      // 사용자 미편집(자동 생성 그대로)일 때만 쐐기 프로즈 포함 재생성
+      // 사용자 미편집(자동 생성 그대로)일 때만 추가 차단영역 프로즈 포함 재생성
       if (prev.findingsText === autoFindingsRef.current) {
         const regen = generateOMFindingsText({
           radarResults: prev.result?.radar_results ?? [],
@@ -975,12 +902,12 @@ export default function ReportApp() {
           covLayersWithBuildings: prev.covLayersWithBuildings,
           covLayersWithout: prev.covLayersWithout,
           analysisMonth: prev.analysisMonth,
-          wedgeByKey,
+          addedBlockageByKey,
         });
         autoFindingsRef.current = regen;
         nextFindings = regen;
       }
-      return { ...prev, wedgeByKey, findingsText: nextFindings };
+      return { ...prev, addedBlockageByKey, findingsText: nextFindings };
     });
   }, [omData]);
 
@@ -1119,16 +1046,6 @@ export default function ReportApp() {
 
   const statusChips = (
     <>
-      {editingReportId && (
-        <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-[11px] font-medium text-blue-600">
-          수정 모드
-        </span>
-      )}
-      {activeTemplate === "obstacle_monthly" && !omData?.result && editingReportId && (
-        <span className="rounded-full bg-orange-100 px-2.5 py-0.5 text-[11px] font-medium text-orange-600">
-          분석 데이터 없음 — 소견 텍스트만 복원됨 (재분석 필요)
-        </span>
-      )}
       {exportError && (
         <span className="text-xs text-red-500">{exportError}</span>
       )}
@@ -1146,7 +1063,7 @@ export default function ReportApp() {
               <h3 className="text-base font-semibold text-gray-800">보고서 닫기</h3>
               <p className="text-center text-sm text-gray-500">
                 보고서 창을 닫으시겠습니까?<br />
-                저장하지 않은 변경사항은 사라집니다.
+                이 보고서는 저장되지 않으며, 닫으면 편집 내용이 사라집니다.
               </p>
             </div>
             <div className="flex gap-2 border-t border-gray-200 px-6 py-4">
@@ -1167,110 +1084,6 @@ export default function ReportApp() {
         </div>
   );
 
-  // ── OM 섹션 준비 중 상세 진행 오버레이 (공통, 프리뷰 위 absolute) ──
-  // 통합 모달(omFlowActive)이 떠 있는 동안에는 모달이 동일 정보를 표시하므로 숨김.
-  // 이 오버레이는 모달이 없는 시나리오(저장 보고서 재로딩, 레이더 재선택으로 인한
-  // 파노라마 재계산 등)의 안전망으로만 사용됨.
-  const omPreparingOverlay = (!omFlowActive && omPreparing && omData) ? (() => {
-        type StageStatus = "waiting" | "active" | "done" | "error";
-        const coverageStage: StageStatus =
-          omData.coverageStatus === "done" ? "done"
-          : omData.coverageStatus === "error" ? "error"
-          : omData.coverageStatus === "loading" ? "active"
-          : "waiting";
-        const panoramaStage: StageStatus =
-          omData.panoramaStatus === "done" ? "done"
-          // 커버리지 미완료 → 파노라마 대기 (SRTM 락 경합 방지 게이트)
-          : omData.coverageStatus !== "done" && omData.coverageStatus !== "error" ? "waiting"
-          : omData.panoramaStatus === "loading" ? "active"
-          : "waiting";
-
-        const totalSteps = 2;
-        const doneSteps =
-          (coverageStage === "done" || coverageStage === "error" ? 1 : 0)
-          + (panoramaStage === "done" ? 1 : 0);
-        const percent = Math.round((doneSteps / totalSteps) * 100);
-
-        const StageIcon = ({ status }: { status: StageStatus }) => {
-          if (status === "done") return <Check size={16} className="text-emerald-500" strokeWidth={3} />;
-          if (status === "active") return <Loader2 size={16} className="animate-spin text-[#a60739]" />;
-          if (status === "error") return <TriangleAlert size={16} className="text-red-500" />;
-          return <Circle size={14} className="text-gray-300" />;
-        };
-        const stageTextClass = (status: StageStatus) =>
-          status === "done" ? "text-gray-400"
-          : status === "active" ? "text-gray-800 font-medium"
-          : status === "error" ? "text-red-500 font-medium"
-          : "text-gray-400";
-
-        const coverageDetail =
-          omData.coverageStatus === "loading" ? "레이더별 SRTM+건물 프로파일 계산 중"
-          : omData.coverageStatus === "done" ? `${omData.covLayersWithBuildings.size}개 레이더 완료`
-          : omData.coverageStatus === "error" ? "계산 실패 — 커버리지 없이 진행"
-          : "대기 중";
-        const phaseLabel = (p: PanoramaPhase) =>
-          p === "heightmap" ? "지형맵 수신"
-          : p === "gpu" ? "GPU 앙각 계산"
-          : "건물 병합";
-        const elapsedSec = (panoramaElapsedMs / 1000).toFixed(1);
-        const stalled = panoramaElapsedMs > 30_000;
-        const coverageBlocking = coverageStage !== "done" && coverageStage !== "error";
-        const panoramaDetail =
-          omData.panoramaStatus === "done" ? `${omData.panoWithTargets.size}개 레이더 완료`
-          : coverageBlocking ? "커버리지 완료 대기 중 (SRTM 락 경합 방지)"
-          : omData.panoramaStatus === "loading" && panoramaProgress
-            ? `레이더 ${panoramaProgress.currentIndex}/${panoramaProgress.totalRadars} · ${panoramaProgress.currentRadarName} — ${phaseLabel(panoramaProgress.phase)} (${elapsedSec}s)${stalled ? " ⚠ 지연" : ""}`
-          : omData.panoramaStatus === "loading"
-            ? `${omData.panoWithTargets.size}/${omData.selectedRadarSites.length} 레이더 계산 중 — 진행 상세 대기`
-          : "초기화 중";
-
-        return (
-          <div className="absolute inset-0 top-[44px] z-30 flex items-center justify-center bg-white/95 backdrop-blur-sm">
-            <div className="mx-4 flex w-full max-w-md flex-col gap-5 rounded-xl border border-gray-200 bg-white p-6 shadow-lg">
-              <div className="flex items-center gap-2">
-                <Loader2 size={20} className="animate-spin text-[#a60739]" />
-                <h3 className="text-base font-semibold text-gray-800">보고서 준비 중</h3>
-                <div className="flex-1" />
-                <span className="text-xs font-medium text-gray-500">{percent}%</span>
-              </div>
-
-              <div className="h-1 w-full overflow-hidden rounded-full bg-gray-100">
-                <div
-                  className="h-full bg-[#a60739] transition-all duration-300"
-                  style={{ width: `${percent}%` }}
-                />
-              </div>
-
-              <div className="flex flex-col gap-3">
-                {/* Stage 1: 커버리지 */}
-                <div className="flex items-start gap-2.5">
-                  <div className="mt-0.5"><StageIcon status={coverageStage} /></div>
-                  <div className="flex-1">
-                    <p className={`text-sm ${stageTextClass(coverageStage)}`}>커버리지 계산</p>
-                    <p className="text-xs text-gray-400">{coverageDetail}</p>
-                  </div>
-                </div>
-
-                {/* Stage 2: 파노라마 */}
-                <div className="flex items-start gap-2.5">
-                  <div className="mt-0.5"><StageIcon status={panoramaStage} /></div>
-                  <div className="flex-1">
-                    <p className={`text-sm ${stageTextClass(panoramaStage)}`}>파노라마 LoS 계산</p>
-                    <p className={`text-xs ${stalled ? "text-amber-600" : "text-gray-400"}`}>{panoramaDetail}</p>
-                    {panoramaLastError && (
-                      <p className="mt-1 text-[11px] text-red-500">오류: {panoramaLastError}</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <p className="text-center text-[11px] text-gray-400">
-                모든 섹션이 준비되면 자동으로 보고서가 표시됩니다
-              </p>
-            </div>
-          </div>
-        );
-      })() : null;
 
   // ── 보고서 프리뷰 (공통) ──
   // coverage+panorama 완료 전에는 mount 자체를 안 함.
@@ -1297,7 +1110,7 @@ export default function ReportApp() {
         coverageLayers={state.coverageLayers}
         mapImage={state.mapImage}
         omData={omData}
-        omResultTrimmed={omData?.result ?? null}
+        omResult={omData?.result ?? null}
         psResult={state.psResult}
         psSelectedBuildings={state.psSelectedBuildings}
         psSelectedRadarSites={state.psSelectedRadarSites}
@@ -1311,7 +1124,6 @@ export default function ReportApp() {
         onCoverSubtitleChange={setCoverSubtitle}
         commentary={commentary}
         onCommentaryChange={setCommentary}
-        forceAllVisible={forceAllVisible}
         onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
         singleFlightChartPoints={state.singleFlightChartPoints}
         previewRef={previewRef}
@@ -1341,15 +1153,12 @@ export default function ReportApp() {
             totalPages={omTotalPages}
             onJump={handleTocJump}
             onOpenSettings={() => setSettingsOpen(true)}
-            showEditingModeChip={!!editingReportId}
-            showNoResultChip={activeTemplate === "obstacle_monthly" && !omData?.result && !!editingReportId}
             exportError={exportError}
             onSave={() => setExportOpen(true)}
             generating={generating}
             disabled={generating || omPreparing}
             disabledTitle={omPreparing ? "섹션 준비 중..." : undefined}
             elapsedSec={exportElapsed}
-            editingMode={!!editingReportId}
           />
 
           {/* 우측 1px 구분선 — top-8(=32px) 아래로만 그어 (이제 사실상 사이드바와 프리뷰의 경계).
@@ -1358,13 +1167,19 @@ export default function ReportApp() {
             <div className="absolute left-0 top-8 bottom-0 w-px bg-gray-200" />
           </div>
 
-          {/* 우측: 타이틀바(보더 없이 윈도우 컨트롤만) + 프리뷰.
-              기능(섹션 토글, 상태 chip, PDF 버튼)은 모두 좌측 사이드바로 이관됨. */}
+          {/* 우측: 타이틀바(윈도우 컨트롤만) + 프리뷰.
+              기능(섹션 토글, 상태 chip, PDF 버튼)은 모두 좌측 사이드바로 이관됨.
+              타이틀바 자체는 noBorder — 상단 32px 가 사이드바 브랜드 헤더와 하나의
+              헤더 스트립처럼 흐르도록 한다. 그 밑(사이드바와 연결되지 않은 콘텐츠
+              영역)에만 border-t 를 그어, 메인 창(App.tsx 의 <main border-t>)과 동일한
+              헤더 경계선을 만든다. border-t 는 y=32 에 위치해 좌측 세로 구분선(top-8)과
+              모서리에서 정확히 맞물린다. */}
           <div className="relative flex flex-1 flex-col min-w-0">
             <Titlebar controlsOnly noBorder />
 
-            {omPreparingOverlay}
-            {previewBlock}
+            <div className="flex flex-1 flex-col min-h-0 border-t border-gray-200">
+              {previewBlock}
+            </div>
           </div>
 
           {closeConfirmModal}
@@ -1384,14 +1199,7 @@ export default function ReportApp() {
           <ReportPdfExportModal
             open={exportOpen}
             onClose={() => setExportOpen(false)}
-            range={omSidebarRange}
-            onRangeChange={setOmSidebarRange}
-            paper={omSidebarPaper}
-            onPaperChange={setOmSidebarPaper}
             totalPages={omTotalPages}
-            editingMode={!!editingReportId}
-            exportError={exportError}
-            generating={generating}
             onConfirm={() => { setExportOpen(false); handleExportPDF(); }}
           />
         </div>
@@ -1418,12 +1226,11 @@ export default function ReportApp() {
             className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40"
           >
             {generating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-            {generating ? `생성 중... ${exportElapsed}초` : omPreparing ? "섹션 준비 중..." : editingReportId ? "PDF 재저장" : "PDF"}
+            {generating ? `생성 중... ${exportElapsed}초` : omPreparing ? "섹션 준비 중..." : "PDF"}
           </button>
         </Titlebar>
 
         {closeConfirmModal}
-        {omPreparingOverlay}
         {previewBlock}
       </div>
       {omModal}

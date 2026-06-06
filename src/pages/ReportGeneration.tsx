@@ -1,7 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import {
-  FileText,
-  Download,
   Loader2,
   Eye,
   Calendar,
@@ -12,12 +10,8 @@ import {
   Radio,
   ChevronRight,
   ChevronDown,
-  Trash2,
-  Clock,
   FilePlus,
-  Pencil,
 } from "lucide-react";
-import { format } from "date-fns";
 import { useAppStore } from "../store";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -33,7 +27,7 @@ import {
 } from "../utils/reportTransfer";
 import type {
   Flight, LoSProfileData, PanoramaPoint, NearbyPeak,
-  ManualBuilding, RadarSite, SavedReportSummary,
+  ManualBuilding, RadarSite,
   PreScreeningResult, OMReportData,
 } from "../types";
 
@@ -185,9 +179,6 @@ export default function ReportGeneration() {
   const [selectedFlightIds, setSelectedFlightIds] = useState<Set<string>>(new Set());
   const [singleFlightId, setSingleFlightId] = useState<string | null>(null);
 
-  // 저장된 보고서 수정 모드 (보고서 창으로 전달용, 메인에선 항상 null)
-  const editingReportId: string | null = null;
-
   const avgLossPercent =
     flights.length > 0
       ? flights.reduce((s, r) => s + r.loss_percentage, 0) / flights.length
@@ -248,11 +239,11 @@ export default function ReportGeneration() {
   }, []);
 
   /** 보고서 창 열기 헬퍼 */
-  const openReportWindow = useCallback(async (mode: "config" | "data" = "config") => {
+  const openReportWindow = useCallback(async () => {
     const existing = (await getAllWebviewWindows()).find((w) => w.label === "report");
     if (existing) {
-      // 기존 창이 있으면 이벤트로 모드 전환 후 포커스
-      await emit(mode === "config" ? "report:reload-config" : "report:reload-data");
+      // 기존 창이 있으면 설정 모달 다시 표시 후 포커스
+      await emit("report:reload-config");
       await existing.setFocus();
     } else {
       new WebviewWindow("report", {
@@ -263,28 +254,10 @@ export default function ReportGeneration() {
         minWidth: 800,
         minHeight: 700,
         decorations: false,
-        shadow: false,
+        shadow: true,
         center: true,
       });
     }
-  }, []);
-
-  // 보고서 창에서 저장 완료 시 목록 갱신
-  useEffect(() => {
-    const unlisten = listen<{ summary: SavedReportSummary; isEdit: boolean }>(
-      "report:saved",
-      (event) => {
-        const { summary, isEdit } = event.payload;
-        if (isEdit) {
-          useAppStore.setState((state) => ({
-            savedReports: state.savedReports.map((r) => r.id === summary.id ? summary : r),
-          }));
-        } else {
-          useAppStore.getState().addSavedReport(summary);
-        }
-      },
-    );
-    return () => { unlisten.then((fn) => fn()); };
   }, []);
 
   // 보고서 준비 중 — 상세 상태 (오버레이 + 버튼 disable)
@@ -402,7 +375,6 @@ export default function ReportGeneration() {
         sections: sects,
         selectedFlightIds: [...ids],
         singleFlightId: sid ?? null,
-        editingReportId,
         coverTitle: title,
         commentary: comm,
         flights: needsFlights ? reportFlights : [],
@@ -435,7 +407,7 @@ export default function ReportGeneration() {
   }, [avgLossPercent, captureMap, flights, aircraft, selectedFlightIds, singleFlightId, radarSite,
       omData, reportMetadata, panoramaData, panoramaPeakNames, coverageLayers,
       psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap, psCovLayersWith, psCovLayersWithout,
-      psAnalysisMonth, editingReportId]);
+      psAnalysisMonth]);
 
   // 템플릿 클릭 → config 저장 → 보고서 창 열기 (모달은 보고서 창에서 표시)
   const handleTemplateClick = useCallback(async (tpl: ReportTemplate) => {
@@ -499,113 +471,6 @@ export default function ReportGeneration() {
     return () => { unlisten.then((fn) => fn()); };
   }, []); // 안정적 의존성 — ref를 통해 최신 함수 참조
 
-  // 저장된 보고서 수정 → 별도 창에서 열기
-  const handleEditReport = useCallback(async (reportId: string) => {
-    setPrepState({ active: true, message: "보고서 데이터 로딩 중..." });
-    try {
-      const json = await invoke<string | null>("load_report_detail", { id: reportId });
-      if (!json) return;
-      const detail = JSON.parse(json) as {
-        id: string;
-        title: string;
-        template: string;
-        report_config_json: string;
-      };
-      const config = JSON.parse(detail.report_config_json) as {
-        template?: ReportTemplate;
-        sections?: ReportSections;
-        selectedFlightIds?: string[];
-        singleFlightId?: string | null;
-        coverTitle?: string;
-        coverSubtitle?: string;
-        commentary?: string;
-        omFindingsText?: string;
-        omTextOverrides?: Record<string, string>;
-        omChartZooms?: Record<string, [number, number]>;
-        mapImage?: string | null;
-      };
-
-      const tpl = (config.template ?? detail.template) as ReportTemplate;
-      const sects = config.sections ?? { ...DEFAULT_SECTIONS };
-      // OM 분석 데이터 복원: 현재 omData에 분석 결과가 있으면 그대로 사용,
-      // 없으면 저장 텍스트만 복원하고 사용자에게 재분석 필요 알림
-      const hasOmResult = omData.result !== null;
-      const restoredOmData: OMReportData = {
-        ...omData,
-        findingsText: config.omFindingsText ?? omData.findingsText,
-        textOverrides: config.omTextOverrides ?? omData.textOverrides ?? {},
-        chartZooms: config.omChartZooms ?? omData.chartZooms ?? {},
-      };
-      if (tpl === "obstacle_monthly" && !hasOmResult) {
-        console.warn("[Report] OM 분석 데이터 없음 — 소견 텍스트만 복원됨. 재분석 필요.");
-      }
-
-      // reportFlights 계산
-      const ids = config.selectedFlightIds ?? [];
-      const sid = config.singleFlightId ?? null;
-      let reportFlights: Flight[];
-      if (tpl === "flights") {
-        const idSet = new Set(ids);
-        reportFlights = flights.filter((f) => idSet.has(f.id));
-      } else if (tpl === "single") {
-        const found = flights.find((f) => f.id === sid);
-        reportFlights = found ? [found] : [];
-      } else {
-        reportFlights = flights;
-      }
-
-      // 템플릿별 필요 데이터만 선별 (handleGenerate와 동일한 필터)
-      const isObstacle = tpl === "obstacle" || tpl === "obstacle_monthly";
-      const needsFlights = !isObstacle;
-      const needsPanorama = !isObstacle && sects.panorama;
-      const needsOm = tpl === "obstacle_monthly";
-      const needsPs = tpl === "obstacle";
-
-      // 단일비행 차트 포인트 사전 쿼리
-      let editChartPoints: import("../types").TrackPoint[] | undefined;
-      if (tpl === "single" && reportFlights.length > 0) {
-        try { editChartPoints = await queryFlightPoints(reportFlights[0].id); } catch { /* 무시 */ }
-      }
-
-      await writeReportPayload({
-        template: tpl,
-        sections: sects,
-        selectedFlightIds: ids,
-        singleFlightId: sid,
-        editingReportId: reportId,
-        coverTitle: config.coverTitle ?? detail.title,
-        coverSubtitle: config.coverSubtitle,
-        commentary: config.commentary ?? "",
-        flights: needsFlights ? reportFlights : [],
-        reportFlights: needsFlights ? reportFlights : [],
-        aircraft: needsFlights ? aircraft : [],
-        radarSite,
-        reportMetadata,
-        panoramaData: needsPanorama ? panoramaData : [],
-        panoramaPeakNames: needsPanorama ? [...panoramaPeakNames] : [],
-        coverageLayers: [],
-        mapImage: config.mapImage ?? null,
-        omData: needsOm ? serializeOMData(restoredOmData) : serializeOMData(restoredOmData),
-        psResult: needsPs ? psResult : null,
-        psSelectedBuildings: needsPs ? psSelectedBuildings : [],
-        psSelectedRadarSites: needsPs ? psSelectedRadarSites : [],
-        psLosMap: needsPs ? [...psLosMap] : [],
-        psCovLayersWith: needsPs ? [...psCovLayersWith] : [],
-        psCovLayersWithout: needsPs ? [...psCovLayersWithout] : [],
-        psAnalysisMonth: needsPs ? psAnalysisMonth : "",
-        singleFlightChartPoints: editChartPoints,
-      });
-
-      await openReportWindow("data");
-      await emit("report:data-written");
-    } catch (e) {
-      console.warn("[Report] 보고서 로드 실패:", e);
-    } finally {
-      setPrepState({ active: false, message: "" });
-    }
-  }, [flights, aircraft, radarSite, reportMetadata, panoramaData, panoramaPeakNames,
-      coverageLayers, omData, psResult, psSelectedBuildings, psSelectedRadarSites, psLosMap,
-      psCovLayersWith, psCovLayersWithout, psAnalysisMonth, openReportWindow]);
 
   const totalLoss = flights.reduce((s, r) => s + r.loss_points.length, 0);
 
@@ -646,8 +511,6 @@ export default function ReportGeneration() {
           />
         </div>
 
-        {/* Saved reports list */}
-        <SavedReportsList onEdit={handleEditReport} />
 
         {/* 모달은 보고서 창에서 렌더링됨 — handleTemplateClick에서 config 전달 */}
       </div>
@@ -747,7 +610,7 @@ function TemplateTable({
       type: "obstacle_monthly",
       icon: Mountain,
       title: "장애물 월간 보고서",
-      description: "특정 장애물의 월간 영향을 분석합니다. ASS 파일을 입력하여 일별 PSR 탐지율/표적소실율 추이, 주차별 비교, 분석 대상 장애물별 LoS 단면 및 양각 분포를 생성합니다.",
+      description: "특정 장애물의 월간 영향을 분석합니다. ASS 파일을 입력하여 일별 PSR 탐지율/표적소실율 추이, 분석 대상 장애물별 LoS 단면 및 양각 분포를 생성합니다.",
       stats: [
         { label: "레이더", value: `${customRadarSites.length}개` },
         { label: "수동 건물", value: "선택식" },
@@ -821,132 +684,6 @@ function TemplateTable({
           </div>
         );
       })}
-    </div>
-  );
-}
-
-// ── 저장된 보고서 목록 ──
-
-function SavedReportsList({ onEdit }: { onEdit: (id: string) => void }) {
-  const savedReports = useAppStore((s) => s.savedReports);
-  const removeSavedReport = useAppStore((s) => s.removeSavedReport);
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const [downloadingId, setDownloadingId] = useState<string | null>(null);
-
-  const handleDownload = useCallback(async (report: SavedReportSummary) => {
-    if (!report.has_pdf) return;
-    setDownloadingId(report.id);
-    try {
-      const json = await invoke<string | null>("load_report_detail", { id: report.id });
-      const detail = json ? JSON.parse(json) as { pdf_base64?: string } : null;
-      if (detail?.pdf_base64) {
-        const dateStr = format(new Date(report.created_at * 1000), "yyyyMMdd_HHmmss");
-        const filename = `${report.title}_${dateStr}.pdf`;
-        const { save } = await import("@tauri-apps/plugin-dialog");
-        const path = await save({
-          defaultPath: filename,
-          filters: [{ name: "PDF", extensions: ["pdf"] }],
-        });
-        if (!path) return; // 저장 취소
-        await invoke("write_file_base64", {
-          path,
-          data: detail.pdf_base64,
-        });
-      }
-    } catch (e) {
-      if (e !== null && String(e) !== "저장이 취소되었습니다") {
-        console.warn("[Report] PDF 다운로드 실패:", e);
-      }
-    } finally {
-      setDownloadingId(null);
-    }
-  }, []);
-
-  const handleDelete = useCallback((id: string) => {
-    removeSavedReport(id);
-    setConfirmDeleteId(null);
-  }, [removeSavedReport]);
-
-  if (savedReports.length === 0) return null;
-
-  return (
-    <div>
-      <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-700">
-        <Clock size={16} className="text-gray-400" />
-        생성된 보고서
-        <span className="text-[11px] font-normal text-gray-400">{savedReports.length}건</span>
-      </h2>
-      <div className="overflow-hidden rounded-xl border border-gray-200 bg-white">
-        {/* Header */}
-        <div className="grid grid-cols-[1fr_100px_120px_140px_80px] gap-2 border-b border-gray-200 bg-gray-50 px-4 py-2 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
-          <span>제목</span>
-          <span>템플릿</span>
-          <span>레이더</span>
-          <span>생성일시</span>
-          <span className="text-center">관리</span>
-        </div>
-
-        {/* Rows */}
-        <div className="max-h-[320px] overflow-y-auto">
-          {savedReports.map((report, idx) => (
-            <div key={report.id}>
-              {idx > 0 && <div className="border-t border-gray-50" />}
-              <div className="group grid grid-cols-[1fr_100px_120px_140px_80px] items-center gap-2 px-4 py-2.5 transition-colors hover:bg-gray-50">
-                <div className="flex items-center gap-2 truncate">
-                  <FileText size={14} className="shrink-0 text-gray-400" />
-                  <span className="truncate text-[12px] font-medium text-gray-700">{report.title}</span>
-                </div>
-                <span className="rounded-full bg-[#a60739]/10 px-2 py-0.5 text-center text-[10px] font-medium text-[#a60739]">
-                  {templateDisplayLabel(report.template as ReportTemplate)}
-                </span>
-                <span className="truncate text-[11px] text-gray-500">{report.radar_name || "—"}</span>
-                <span className="text-[11px] text-gray-400">
-                  {format(new Date(report.created_at * 1000), "yyyy-MM-dd HH:mm")}
-                </span>
-                <div className="flex items-center justify-center gap-1">
-                  <button
-                    onClick={() => onEdit(report.id)}
-                    title="수정"
-                    className="rounded p-1 text-gray-400 transition-colors hover:bg-blue-50 hover:text-blue-500"
-                  >
-                    <Pencil size={13} />
-                  </button>
-                  {report.has_pdf && (
-                    <button
-                      onClick={() => handleDownload(report)}
-                      disabled={downloadingId === report.id}
-                      title="PDF 다운로드"
-                      className="rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-[#a60739] disabled:opacity-40"
-                    >
-                      {downloadingId === report.id
-                        ? <Loader2 size={13} className="animate-spin" />
-                        : <Download size={13} />
-                      }
-                    </button>
-                  )}
-                  {confirmDeleteId === report.id ? (
-                    <button
-                      onClick={() => handleDelete(report.id)}
-                      title="삭제 확인"
-                      className="rounded bg-red-500 px-1.5 py-0.5 text-[9px] font-medium text-white transition-colors hover:bg-red-600"
-                    >
-                      확인
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => setConfirmDeleteId(report.id)}
-                      title="삭제"
-                      className="rounded p-1 text-gray-300 transition-colors hover:bg-red-50 hover:text-red-500 opacity-0 group-hover:opacity-100"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
     </div>
   );
 }

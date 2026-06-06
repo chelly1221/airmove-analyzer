@@ -18,7 +18,7 @@ import { useAppStore } from "./store";
 import SourceOverlay from "./dev/SourceOverlay";
 import { ToastContainer } from "./components/common/Toast";
 import { Loader2 } from "lucide-react";
-import type { Aircraft, RadarSite, SavedReportSummary } from "./types";
+import type { Aircraft, RadarSite } from "./types";
 
 /** 앱 시작 시 DB에서 설정/분석결과 복원 */
 function useRestoreSettings() {
@@ -67,14 +67,6 @@ function useRestoreSettings() {
       } catch (e) {
         console.log("[Restore] 설정 복원 실패:", e);
       }
-
-      // 저장된 보고서 목록 복원
-      try {
-        const reports = await invoke<SavedReportSummary[]>("list_saved_reports");
-        if (reports.length > 0) {
-          useAppStore.setState({ savedReports: reports });
-        }
-      } catch {}
 
       // 레이더 커버리지 캐시 존재 여부 확인 (lazy load)
       try {

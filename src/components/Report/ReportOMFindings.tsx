@@ -2,7 +2,7 @@ import React, { useMemo } from "react";
 import EditableText from "./EditableText";
 import OMEditable from "./OMEditable";
 import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite } from "../../types";
-import type { WedgeMetricResult } from "../../types/obstacle";
+import type { AddedBlockageResult } from "../../types/obstacle";
 import {
   weightedLossAvg, weightedLossStdDev,
   weightedPsrAvg, weightedPsrStdDev,
@@ -27,8 +27,8 @@ interface Props {
   editable: boolean;
   /** 분석 대상 월 (YYYY-MM) */
   analysisMonth?: string;
-  /** 건물별 추가 차단영역(쐐기) 소실율 (key: `${radarName}_${buildingId}`) — 헤드라인 심각도 */
-  wedgeByKey?: Record<string, WedgeMetricResult>;
+  /** 건물별 추가 차단영역 소실율 (key: `${radarName}_${buildingId}`) — 헤드라인 심각도 */
+  addedBlockageByKey?: Record<string, AddedBlockageResult>;
 }
 
 /**
@@ -48,7 +48,7 @@ function ReportOMFindings({
   onFindingsChange,
   editable,
   analysisMonth,
-  wedgeByKey,
+  addedBlockageByKey,
 }: Props) {
   const monthLabel = analysisMonth
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
@@ -173,11 +173,11 @@ function ReportOMFindings({
     </div>
   );
 
-  // 2.5) 건물별 추가 차단 구간(쐐기) 소실율 — 헤드라인 인과 지표 (파노라마 준비 후 표시)
-  const wedgeRows = wedgeByKey
+  // 2.5) 건물별 추가 차단 구간 소실율 — 헤드라인 인과 지표 (파노라마 준비 후 표시)
+  const blockageRows = addedBlockageByKey
     ? selectedBuildings.flatMap((b) =>
         radarSites.map((rs) => {
-          const w = wedgeByKey[`${rs.name}_${b.id}`];
+          const w = addedBlockageByKey[`${rs.name}_${b.id}`];
           if (!w) return null;
           const graded = w.grade.label !== "노출 없음" && w.grade.label !== "판정 보류";
           return (
@@ -188,7 +188,7 @@ function ReportOMFindings({
               </td>
               <td className="ta-c">{rs.name}</td>
               <td className="ta-c mono strong" style={{ color: w.grade.color }}>
-                {graded ? `${w.wedgeLossRatePct.toFixed(2)}% · ${w.grade.label}` : w.grade.label}
+                {graded ? `${w.lossRatePct.toFixed(2)}% · ${w.grade.label}` : w.grade.label}
               </td>
               <td className="ta-c mono">
                 {graded
@@ -205,20 +205,20 @@ function ReportOMFindings({
         }),
       ).filter(Boolean)
     : [];
-  const wedgeBlock = wedgeRows.length > 0 ? (
+  const blockageBlock = blockageRows.length > 0 ? (
     <div className="bldg-strip">
-      <OMEditable id="findings.wedgeHeader" value="추가 차단 구간(쐐기) 소실율 — 건물 인과 헤드라인" tag="div" className="block-h3" style={{ margin: 0, marginBottom: 6 }} />
+      <OMEditable id="findings.blockageHeader" value="추가 차단 구간 소실율 — 건물 인과 헤드라인" tag="div" className="block-h3" style={{ margin: 0, marginBottom: 6 }} />
       <table className="om-table">
         <thead>
           <tr>
-            <th className="ta-l"><OMEditable id="findings.wedge.colBldg" value="건물" tag="span" /></th>
-            <th className="ta-c"><OMEditable id="findings.wedge.colRadar" value="레이더" tag="span" /></th>
-            <th className="ta-c"><OMEditable id="findings.wedge.colRate" value="추가 차단 구간 소실율" tag="span" /></th>
-            <th className="ta-c"><OMEditable id="findings.wedge.colTrend" value="추세(일당)" tag="span" /></th>
-            <th className="ta-c"><OMEditable id="findings.wedge.colExp" value="노출" tag="span" /></th>
+            <th className="ta-l"><OMEditable id="findings.blockage.colBldg" value="건물" tag="span" /></th>
+            <th className="ta-c"><OMEditable id="findings.blockage.colRadar" value="레이더" tag="span" /></th>
+            <th className="ta-c"><OMEditable id="findings.blockage.colRate" value="추가 차단 구간 소실율" tag="span" /></th>
+            <th className="ta-c"><OMEditable id="findings.blockage.colTrend" value="추세(일당)" tag="span" /></th>
+            <th className="ta-c"><OMEditable id="findings.blockage.colExp" value="노출" tag="span" /></th>
           </tr>
         </thead>
-        <tbody>{wedgeRows}</tbody>
+        <tbody>{blockageRows}</tbody>
       </table>
       <p className="muted" style={{ fontSize: "9px", marginTop: 4 }}>
         추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형 차단각~대상 차단각) 내 노출 추적시간 대비 소실시간. 노출 부족 시 "노출 없음".
@@ -275,7 +275,7 @@ function ReportOMFindings({
   return (
     <AutoPaginate firstHeader={sectionHeader}>
       {summaryCardsBlock}
-      {wedgeBlock}
+      {blockageBlock}
       {buildingsBlock}
       {findingsBlock}
       {formulaBlock}

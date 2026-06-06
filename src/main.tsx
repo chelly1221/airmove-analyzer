@@ -6,7 +6,9 @@ import "./index.css";
 import { useAppStore } from "./store";
 
 // 윈도우 라벨 기반 루트 컴포넌트 선택
-const windowLabel = getCurrentWindow().label;
+const appWindow = getCurrentWindow();
+const windowLabel = appWindow.label;
+
 const App = lazy(() => import("./App"));
 const TrackMapApp = lazy(() => import("./apps/TrackMapApp"));
 const DrawingApp = lazy(() => import("./apps/DrawingApp"));

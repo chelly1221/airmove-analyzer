@@ -384,7 +384,7 @@ export default function Sidebar() {
       } else {
         new WebviewWindow(label, {
           url: "index.html", title, width: 1400, height: 900,
-          minWidth: 1024, minHeight: 768, decorations: false, shadow: false, center: true,
+          minWidth: 1024, minHeight: 768, decorations: false, shadow: true, center: true,
         });
       }
       return;

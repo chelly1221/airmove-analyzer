@@ -13,7 +13,6 @@ import type {
   PlanImageBounds,
   RadarSite,
   ReportMetadata,
-  SavedReportSummary,
 } from "../types";
 import type { MultiCoverageResult } from "../utils/radarCoverage";
 import type { TcasReport, WeatherVector } from "../types/track";
@@ -118,11 +117,6 @@ interface AppState {
   // 보고서 메타데이터
   reportMetadata: ReportMetadata;
   setReportMetadata: (meta: Partial<ReportMetadata>) => void;
-
-  // 저장된 보고서
-  savedReports: SavedReportSummary[];
-  addSavedReport: (report: SavedReportSummary) => void;
-  removeSavedReport: (id: string) => void;
 
   // 건물 그룹 + 수동 건물
   buildingGroups: BuildingGroup[];
@@ -429,20 +423,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       persistSetting("report_metadata", updated);
       return { reportMetadata: updated };
     }),
-
-  // 저장된 보고서
-  savedReports: [],
-  addSavedReport: (report) =>
-    set((state) => ({ savedReports: [report, ...state.savedReports] })),
-  removeSavedReport: (id) => {
-    const prev = get().savedReports;
-    set((state) => ({ savedReports: state.savedReports.filter((r) => r.id !== id) }));
-    invoke("delete_saved_report", { id }).catch((e) => {
-      console.warn("[Report] DB 삭제 실패:", e);
-      useToastStore.getState().addToast("보고서 삭제에 실패했습니다");
-      set({ savedReports: prev }); // 롤백
-    });
-  },
 
   // 건물 그룹 + 수동 건물
   buildingGroups: [],

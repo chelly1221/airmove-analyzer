@@ -42,10 +42,6 @@ interface ReportOMSidebarProps {
   onJump: (key: string) => void;
   /** "보고서 설정" 모달 열기 (표시 섹션 + 메타데이터) */
   onOpenSettings: () => void;
-  /** 수정 모드 chip 표시 여부 — 기존 타이틀바 statusChips 이관 */
-  showEditingModeChip?: boolean;
-  /** "분석 데이터 없음" 경고 chip 표시 여부 */
-  showNoResultChip?: boolean;
   /** PDF 내보내기 에러 텍스트 — 있으면 빨간 배너로 표시 */
   exportError?: string | null;
   /** "PDF로 저장" 클릭 — PDF 내보내기 모달 열기 */
@@ -56,17 +52,15 @@ interface ReportOMSidebarProps {
   disabledTitle?: string;
   /** 생성 중 경과 초 */
   elapsedSec?: number;
-  /** 편집 모드(재저장) 라벨 */
-  editingMode?: boolean;
 }
 
 export default function ReportOMSidebar({
   docPeriod, docTitle, docNo, agency, periodIso,
   toc, activeKey, currentPage, totalPages, onJump,
-  onOpenSettings, showEditingModeChip, showNoResultChip, exportError,
-  onSave, generating, disabled, disabledTitle, elapsedSec, editingMode,
+  onOpenSettings, exportError,
+  onSave, generating, disabled, disabledTitle, elapsedSec,
 }: ReportOMSidebarProps) {
-  const hasStatus = !!(showEditingModeChip || showNoResultChip || exportError);
+  const hasStatus = !!exportError;
 
   return (
     <aside className="flex h-full w-48 shrink-0 flex-col bg-white select-none">
@@ -131,16 +125,6 @@ export default function ReportOMSidebar({
       {/* 2.5) 상태 배지 — 기존 타이틀바 statusChips 의 사이드바 이관 */}
       {hasStatus && (
         <div className="flex flex-col gap-1.5 border-t border-gray-200 px-3 py-2.5">
-          {showEditingModeChip && (
-            <span className="self-start rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-600">
-              수정 모드
-            </span>
-          )}
-          {showNoResultChip && (
-            <span className="rounded-[5px] bg-orange-50 px-2 py-1 text-[10px] font-medium leading-tight text-orange-600">
-              분석 데이터 없음 — 소견 텍스트만 복원됨 (재분석 필요)
-            </span>
-          )}
           {exportError && (
             <span className="rounded-[5px] bg-red-50 px-2 py-1 text-[10px] font-medium leading-tight text-red-600 break-words">
               {exportError}
@@ -222,7 +206,7 @@ export default function ReportOMSidebar({
             : <Download size={14} />}
           {generating
             ? `생성 중 ${elapsedSec ?? 0}s`
-            : editingMode ? "PDF 재저장" : "PDF로 저장"}
+            : "PDF로 저장"}
         </button>
       </div>
     </aside>

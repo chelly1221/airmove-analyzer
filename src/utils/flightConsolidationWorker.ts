@@ -27,6 +27,15 @@ export interface ViewportQueryResult {
   points: TrackPoint[];
 }
 
+/** 진행 중이던 뷰포트 쿼리가 새 쿼리로 교체(취소)될 때 reject되는 마커 에러.
+ *  실제 오류가 아닌 정상적인 취소이므로 호출부에서 조용히 무시한다. */
+export class ViewportQuerySuperseded extends Error {
+  constructor() {
+    super("새 뷰포트 쿼리로 교체됨");
+    this.name = "ViewportQuerySuperseded";
+  }
+}
+
 /** 뷰포트 쿼리 스트리밍 요청 */
 let _viewportReq: {
   id: number;
@@ -237,7 +246,7 @@ export function queryViewportPoints(params: ViewportQueryParams & { onProgress?:
   const { onProgress, ...queryParams } = params;
   // 이전 요청이 있으면 reject하여 Promise 누수 방지
   if (_viewportReq) {
-    _viewportReq.reject(new Error("새 뷰포트 쿼리로 교체됨"));
+    _viewportReq.reject(new ViewportQuerySuperseded());
     _viewportReq = null;
   }
   return new Promise<ViewportQueryResult>((resolve, reject) => {

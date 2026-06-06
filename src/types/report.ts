@@ -11,13 +11,3 @@ export interface ReportMetadata {
   /** 하단 푸터 문구 */
   footer: string;
 }
-
-/** 저장된 보고서 요약 (목록 표시용) */
-export interface SavedReportSummary {
-  id: string;
-  title: string;
-  template: string;
-  radar_name: string;
-  created_at: number;
-  has_pdf: boolean;
-}

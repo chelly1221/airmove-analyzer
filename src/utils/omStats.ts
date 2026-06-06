@@ -91,14 +91,14 @@ export function weightedPsrStdDev(stats: DailyStats[]): number {
   return weightedStdDev(stats, (d) => d.psr_rate, (d) => d.ssr_combined_points);
 }
 
-/** 기준선 Loss율 가중 평균 — 가중치: total_track_time_secs */
+/** 기준선 Loss율 가중 평균 — 가중치: baseline_track_time_secs (전방위 표본량, 모집단 일치) */
 export function weightedBaselineLossAvg(stats: DailyStats[]): number {
-  return weightedAvg(stats, (d) => d.baseline_loss_rate, (d) => d.total_track_time_secs);
+  return weightedAvg(stats, (d) => d.baseline_loss_rate, (d) => d.baseline_track_time_secs);
 }
 
-/** 기준선 Loss율 가중 표준편차 — 가중치: total_track_time_secs */
+/** 기준선 Loss율 가중 표준편차 — 가중치: baseline_track_time_secs (전방위 표본량) */
 export function weightedBaselineLossStdDev(stats: DailyStats[]): number {
-  return weightedStdDev(stats, (d) => d.baseline_loss_rate, (d) => d.total_track_time_secs);
+  return weightedStdDev(stats, (d) => d.baseline_loss_rate, (d) => d.baseline_track_time_secs);
 }
 
 /**
@@ -122,18 +122,9 @@ export function gradeWithConfidence(
 }
 
 /**
- * 편차 해석 임계값 — 이 범위 내이면 "유사 수준" 판정
- *
- * Loss율 (%p): 0.1%p — 통상적 배경 소실율 변동 폭 이내
- * PSR율 (%p): 0.5%p — PSR율은 80–100% 범위로, Loss 대비 변동 스케일이 큼
- */
-export const LOSS_DEV_THRESHOLD = 0.1;
-export const PSR_DEV_THRESHOLD = 0.5;
-
-/**
  * 가중 최소자승 회귀 기울기 (일별 추세 등).
  * x̄_w·ȳ_w 가중평균 후 slope = Σw(x−x̄)(y−ȳ) / Σw(x−x̄)².
- * omFindingsGenerator(레이더 일별 추세)·omWedgeMetric(쐐기 시계열)이 공유.
+ * omFindingsGenerator(레이더 일별 추세)·omAddedBlockage(추가 차단영역 시계열)이 공유.
  */
 export function weightedTrendSlope(
   points: { x: number; y: number; w: number }[],
@@ -152,34 +143,40 @@ export function weightedTrendSlope(
   return den > 0 ? num / den : 0;
 }
 
-// ─── 추가 차단영역(쐐기) 소실율 등급 ───
+// ─── 추가 차단영역 소실율 등급 ───
 //
-// 헤드라인 심각도 = 분석 대상 건물의 추가 차단영역(쐐기) 내 노출 조건부 소실율.
-// gradeWithConfidence(전구간 소실율)와 달리, 얇은 쐐기 내부의 조건부 비율이라
+// 헤드라인 심각도 = 분석 대상 건물의 추가 차단영역 내 노출 조건부 소실율.
+// gradeWithConfidence(전구간 소실율)와 달리, 얇은 추가 차단영역 내부의 조건부 비율이라
 // 스케일이 다르다(전구간 0.5/2.0 재사용 금지).
 //
-// ⚠️ 임계값은 PLACEHOLDER — 실제 쐐기 소실율 분포를 관측한 뒤 반드시 보정할 것.
-export const WEDGE_MIN_DAYS = 7;          // 관측일수 < 7 → 판정 보류 (주간 1주기, gradeWithConfidence 와 동일 규율)
-export const WEDGE_MIN_EXPOSURE_S = 600;  // 누적 노출 < 10분 → "노출 없음"(영향 없음). 쐐기 희소 고분산 1차 방어.
-export const WEDGE_CAUTION_PCT = 2.0;     // 양호/주의 경계 (%)
-export const WEDGE_ALERT_PCT = 10.0;      // 주의/경고 경계 (%)
+// ⚠️ 임계값은 PLACEHOLDER — 실제 추가 차단영역 소실율 분포를 관측한 뒤 반드시 보정할 것.
+export const BLOCKAGE_MIN_DAYS = 7;          // 관측일수 < 7 → 판정 보류 (주간 1주기, gradeWithConfidence 와 동일 규율)
+export const BLOCKAGE_MIN_EXPOSURE_S = 600;  // 누적 노출 < 10분 → "노출 없음"(영향 없음). 추가 차단영역 희소 고분산 1차 방어.
+export const BLOCKAGE_MIN_EXPOSURE_DAYS = 3; // 노출>0 인 날이 3일 미만이면 소수 일자 편중 → 대표성 부족 보류
+export const BLOCKAGE_CAUTION_PCT = 2.0;     // 양호/주의 경계 (%)
+export const BLOCKAGE_ALERT_PCT = 10.0;      // 주의/경고 경계 (%)
 
 /**
- * 쐐기 소실율 등급 — 이중 게이트(관측일수, 노출량) 후 임계 판정.
- * 노출이 거의 없으면 노이즈% 대신 "노출 없음 → 영향 없음"을 정직하게 표기.
+ * 추가 차단영역 소실율 등급 — 삼중 게이트(관측일수·노출총량·노출일수) 후 임계 판정.
+ * 노출이 거의 없거나 소수 일자에 편중되면 노이즈% 대신 "노출 없음/판정 보류"를 정직하게 표기.
  */
-export function gradeWedge(
-  wedgeLossRatePct: number,
+export function gradeAddedBlockage(
+  lossRatePct: number,
   dayCount: number,
   exposureTrackTimeS: number,
+  daysWithExposure: number,
 ): { label: string; color: string; bg: string; border: string } {
-  if (dayCount < WEDGE_MIN_DAYS) {
+  if (dayCount < BLOCKAGE_MIN_DAYS) {
     return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
-  if (exposureTrackTimeS < WEDGE_MIN_EXPOSURE_S) {
+  if (exposureTrackTimeS < BLOCKAGE_MIN_EXPOSURE_S) {
     return { label: "노출 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
-  if (wedgeLossRatePct < WEDGE_CAUTION_PCT) return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
-  if (wedgeLossRatePct < WEDGE_ALERT_PCT) return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
+  if (daysWithExposure < BLOCKAGE_MIN_EXPOSURE_DAYS) {
+    // 노출 총량은 충분하나 소수 일자에 편중 → 추세·대표성 부족으로 보류
+    return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+  }
+  if (lossRatePct < BLOCKAGE_CAUTION_PCT) return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
+  if (lossRatePct < BLOCKAGE_ALERT_PCT) return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
   return { label: "경고", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
 }

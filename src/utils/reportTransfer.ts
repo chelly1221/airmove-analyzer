@@ -33,7 +33,6 @@ export interface ReportSections {
   omSummary: boolean;
   /** 일별 PSR·표적소실 결합 라인 차트 (페이지 2). 기존 omDailyPsr/omDailyLoss 두 토글을 합친 단일 토글. */
   omDailyPsrLoss: boolean;
-  omWeekly: boolean;
   omLosCrossSection: boolean;
   omLossEvents: boolean;
   omFindings: boolean;
@@ -53,6 +52,8 @@ export interface SerializedOMData {
   covLayersWithout: [string, CoverageLayer[]][];
   analysisMonth: string;
   findingsText: string;
+  // 아래 두 필드는 OMReportData 형상 미러일 뿐 — 인라인 편집은 창 전송 후 보고서 창에서
+  // 발생하므로 전송 시점엔 항상 비어 있다. addedBlockageByKey 는 의도적으로 제외(전송 후 라이브 산출).
   /** 인라인 편집 텍스트 오버라이드 (편집키 → 사용자 수정 문구) */
   textOverrides?: Record<string, string>;
   /** 차트 줌 상태 (편집키 → [시작%, 끝%]) */
@@ -71,7 +72,6 @@ export interface ReportWindowPayload {
   sections: ReportSections;
   selectedFlightIds: string[];
   singleFlightId: string | null;
-  editingReportId: string | null;
 
   // 편집 가능 텍스트
   coverTitle: string;
@@ -180,7 +180,6 @@ export const DEFAULT_SECTIONS: ReportSections = {
   psAngleHeight: true,
   omSummary: true,
   omDailyPsrLoss: true,
-  omWeekly: true,
   omLosCrossSection: true,
   omLossEvents: true,
   omFindings: true,
@@ -252,7 +251,7 @@ export async function writeReportPayload(payload: ReportWindowPayload): Promise<
       // DOMException: QuotaExceededError
       const err = req.error;
       if (err?.name === "QuotaExceededError") {
-        reject(new Error("보고서 데이터가 너무 큽니다. 브라우저 저장소 용량을 초과했습니다. 불필요한 저장 보고서를 삭제 후 다시 시도하세요."));
+        reject(new Error("보고서 데이터가 브라우저 저장소 용량을 초과했습니다. 분석 레이더/기간을 줄이거나 앱을 재시작 후 다시 시도하세요."));
       } else {
         reject(err);
       }

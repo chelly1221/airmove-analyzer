@@ -76,9 +76,9 @@ pub struct TrackPointGeo {
     pub radar_type: String,
 }
 
-/// 추가 차단영역(쐐기) 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
+/// 추가 차단영역 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
 /// 건물-무관 원자료 — 프론트가 건물별 angleWith/angleWithout 컷오프로
-/// 쐐기 밴드 셀을 합산해 소실율을 산출한다.
+/// 추가 차단영역 밴드 셀을 합산해 소실율을 산출한다.
 /// 양각은 실제지구 곡률(R=6,371,000) 기준 — 프론트 lossElevAngleDeg와 동일 프레임.
 #[derive(Serialize, Clone, Debug)]
 pub struct AzElevCell {
@@ -97,7 +97,6 @@ pub struct AzElevCell {
 pub struct DailyStats {
     pub date: String,        // "2024-01-15"
     pub day_of_month: u8,
-    pub week_num: u8,        // 1~5
     pub ssr_combined_points: u32,  // SSR + combined (분모)
     pub psr_rate: f64,
     pub total_track_time_secs: f64,
@@ -110,11 +109,16 @@ pub struct DailyStats {
     /// 전체 방위(분석 구간 포함) 기준 PSR율 (0~1)
     #[serde(default)]
     pub baseline_psr_rate: f64,
+    /// 전방위 기준선 표본량 — 베이스라인 비율의 가중치(섹터 표본량과의 모집단 불일치 방지)
+    #[serde(default)]
+    pub baseline_track_time_secs: f64,
+    #[serde(default)]
+    pub baseline_ssr_points: u32,
     /// 필터링된 전체 항적 좌표 (LoS 단면도 오버레이용)
     #[serde(default)]
     pub track_points_geo: Vec<TrackPointGeo>,
-    /// 추가 차단영역(쐐기) 분석용 방위×양각 시간 히스토그램 (건물-무관 원자료).
-    /// 프론트가 건물별 컷오프로 쐐기 셀을 합산해 노출 조건부 소실율을 산출.
+    /// 추가 차단영역 분석용 방위×양각 시간 히스토그램 (건물-무관 원자료).
+    /// 프론트가 건물별 컷오프로 추가 차단영역 셀을 합산해 노출 조건부 소실율을 산출.
     #[serde(default)]
     pub az_elev_histogram: Vec<AzElevCell>,
 }
@@ -181,6 +185,9 @@ impl LightPoint {
 struct BaselineDayResult {
     psr_rate: f64,
     loss_rate: f64,
+    /// 전방위 기준선 표본량 (프론트 베이스라인 가중 평균의 가중치)
+    track_time_secs: f64,
+    ssr_points: u32,
 }
 
 /// 기존 알고리즘 그대로: 하루치 베이스라인 포인트를 mode_s별 그룹핑하여
@@ -191,7 +198,7 @@ fn process_baseline_day(
     radar_lon: f64,
 ) -> BaselineDayResult {
     if bl_points.is_empty() {
-        return BaselineDayResult { psr_rate: 0.0, loss_rate: 0.0 };
+        return BaselineDayResult { psr_rate: 0.0, loss_rate: 0.0, track_time_secs: 0.0, ssr_points: 0 };
     }
 
     // PSR 베이스라인
@@ -258,7 +265,7 @@ fn process_baseline_day(
         }
     }
     let loss_rate = if bl_track_time > 0.0 { (bl_loss_time / bl_track_time) * 100.0 } else { 0.0 };
-    BaselineDayResult { psr_rate, loss_rate }
+    BaselineDayResult { psr_rate, loss_rate, track_time_secs: bl_track_time, ssr_points: bl_ssr }
 }
 
 /// track_points_geo 포함 여부: 건물 방위 ±5° 이내인지 확인
@@ -292,8 +299,8 @@ const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
 /// PSR 통계 계산 범위: 60NM
 const PSR_RANGE_KM: f64 = 60.0 * 1.852;
 
-// ─── 추가 차단영역(쐐기) 히스토그램 상수 ───
-// 방위×양각 시간 히스토그램의 빈 크기·범위. 프론트(omWedgeMetric.ts)와 반드시 일치.
+// ─── 추가 차단영역 히스토그램 상수 ───
+// 방위×양각 시간 히스토그램의 빈 크기·범위. 프론트(omAddedBlockage.ts)와 반드시 일치.
 const HIST_AZ_BIN_DEG: f64 = 0.1;
 const HIST_ELEV_BIN_DEG: f64 = 0.05;
 const HIST_ELEV_MIN_DEG: f64 = -1.0;
@@ -301,7 +308,7 @@ const HIST_ELEV_MAX_DEG: f64 = 6.0;
 
 /// 레이더→표적 양각(°). 실제지구 곡률(R=6,371,000) 보정.
 /// 반드시 프론트 lossElevAngleDeg(obstacleAnalysisHelpers.ts)와 동일 프레임이어야
-/// 쐐기 슬라이스가 AzElev 차트 빨강영역과 정렬된다. los.rs의 4/3 유효지구 사용 금지.
+/// 추가 차단영역 슬라이스가 AzElev 차트 빨강영역과 정렬된다. los.rs의 4/3 유효지구 사용 금지.
 fn elev_angle_deg(dist_km: f64, alt_m: f64, radar_h_m: f64) -> f64 {
     let d_m = dist_km * 1000.0;
     if d_m <= 0.0 {
@@ -356,10 +363,6 @@ fn days_to_ymd(z: i64) -> (i32, u8, u8) {
     (y as i32, m as u8, d as u8)
 }
 
-/// day_of_month → 주차 번호 (1~5)
-fn week_num(day: u8) -> u8 {
-    ((day - 1) / 7 + 1).min(5)
-}
 
 /// PSR 분류: SSR+combined 포인트인지
 fn is_ssr_combined(rt: &RadarDetectionType) -> bool {
@@ -563,7 +566,7 @@ pub fn analyze_radar_monthly(
     let mut all_loss_alt_sum = 0.0f64;
     let mut all_loss_alt_count = 0u32;
 
-    // 안테나 해발고 (양각 계산용) — 쐐기 히스토그램 전반에서 사용
+    // 안테나 해발고 (양각 계산용) — 추가 차단영역 히스토그램 전반에서 사용
     let radar_h = radar.radar_altitude + radar.antenna_height;
 
     let mut sorted_dates: Vec<String> = daily_points.keys().cloned().collect();
@@ -772,14 +775,14 @@ pub fn analyze_radar_monthly(
         };
 
         // ── 베이스라인 (전체 방위) 일별 통계 — 플러시 결과 사용 ──
-        let (baseline_loss_rate, baseline_psr_rate) = if has_sectors {
+        let (baseline_loss_rate, baseline_psr_rate, baseline_track_time_secs, baseline_ssr_points) = if has_sectors {
             if let Some(bl) = baseline_results.remove(date) {
-                (bl.loss_rate, bl.psr_rate)
+                (bl.loss_rate, bl.psr_rate, bl.track_time_secs, bl.ssr_points)
             } else {
-                (0.0, 0.0)
+                (0.0, 0.0, 0.0, 0)
             }
         } else {
-            (0.0, 0.0)
+            (0.0, 0.0, 0.0, 0)
         };
 
         // 날짜에서 day_of_month 추출
@@ -799,7 +802,6 @@ pub fn analyze_radar_monthly(
         daily_stats.push(DailyStats {
             date: date.clone(),
             day_of_month: dom,
-            week_num: week_num(dom),
             ssr_combined_points: ssr_combined,
             psr_rate,
             total_track_time_secs: day_track_time,
@@ -808,6 +810,8 @@ pub fn analyze_radar_monthly(
             loss_points_summary: day_loss_points,
             baseline_loss_rate,
             baseline_psr_rate,
+            baseline_track_time_secs,
+            baseline_ssr_points,
             track_points_geo: day_track_geo,
             az_elev_histogram,
         });

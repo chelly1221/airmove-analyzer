@@ -1,6 +1,6 @@
 import React, { useMemo } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult } from "../../types";
-import type { LossPointGeo, TrackPointGeo, ObstacleMonthlyResult, WedgeMetricResult } from "../../types/obstacle";
+import type { LossPointGeo, TrackPointGeo, ObstacleMonthlyResult, AddedBlockageResult } from "../../types/obstacle";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
@@ -24,13 +24,13 @@ interface Props {
   panoWithout?: PanoramaMergeResult;
   /** 선택된 전체 분석 대상 건물 — 소실표적 오귀속 방지(가장 가까운 방위 건물에 귀속)용 sibling 방위 계산 */
   allBuildings: ManualBuilding[];
-  /** 추가 차단영역(쐐기) 소실율 — 헤드라인 심각도 지표 (ReportApp 에서 산출, 이 건물 키) */
-  wedge?: WedgeMetricResult;
+  /** 추가 차단영역 소실율 — 헤드라인 심각도 지표 (ReportApp 에서 산출, 이 건물 키) */
+  blockage?: AddedBlockageResult;
 }
 
 /** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. 빌딩 메타 + LoS 단면도 + Az×Elev 차트. */
 function ReportOMObstacleDetail({
-  sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout, allBuildings, wedge,
+  sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout, allBuildings, blockage,
 }: Props) {
   // 같은 레이더의 '다른' 분석 대상 건물(방위+거리) — 소실표적을 더 강하게 소유하는 건물 있으면 본 건물 집계서 제외
   const siblings = useMemo(
@@ -111,7 +111,7 @@ function ReportOMObstacleDetail({
         panoWithout={panoWithout}
         lossPoints={allLossThisRadar}
         siblings={siblings}
-        wedge={wedge}
+        blockage={blockage}
       />
     </ReportPage>
   );
