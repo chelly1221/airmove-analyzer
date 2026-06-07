@@ -43,7 +43,7 @@ export interface BlockageDayHist {
 /**
  * 건물별 추가 차단영역 소실율 산출.
  * @param histogramsByDay  레이더의 일별 az×elev 히스토그램 (모든 관측일 포함, 빈 날은 cells=[])
- * @param panoWith         지형+기존지물+분석대상 파노라마 (해당 레이더). 없으면 추가 차단영역 0 → 노출 없음.
+ * @param panoWith         지형+기존지물+분석대상 파노라마 (해당 레이더). 없으면 추가 차단영역 0 → 항적 없음.
  * @param panoWithout      분석대상 제외 파노라마 (없으면 panoWith.terrain 으로 폴백 → without==terrain)
  * @param buildingExtent   대상 건물의 방위 노출 구간 (calcBuildingAzExtent)
  */

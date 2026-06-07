@@ -32,10 +32,4 @@ export type {
   ObstacleMonthlyProgress,
   OMReportData,
 } from "./obstacle";
-export type {
-  AdditionalLossEvent,
-  PreScreeningBuildingResult,
-  PreScreeningRadarResult,
-  PreScreeningResult,
-} from "./prescreening";
 export type { PageId } from "./ui";

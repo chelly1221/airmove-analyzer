@@ -179,7 +179,7 @@ function ReportOMFindings({
         radarSites.map((rs) => {
           const w = addedBlockageByKey[`${rs.name}_${b.id}`];
           if (!w) return null;
-          const graded = w.grade.label !== "노출 없음" && w.grade.label !== "판정 보류";
+          const graded = w.grade.label !== "항적 없음" && w.grade.label !== "판정 보류";
           return (
             <tr key={`${rs.name}-${b.id}`}>
               <td>
@@ -215,13 +215,13 @@ function ReportOMFindings({
             <th className="ta-c"><OMEditable id="findings.blockage.colRadar" value="레이더" tag="span" /></th>
             <th className="ta-c"><OMEditable id="findings.blockage.colRate" value="추가 차단 구간 소실율" tag="span" /></th>
             <th className="ta-c"><OMEditable id="findings.blockage.colTrend" value="추세(일당)" tag="span" /></th>
-            <th className="ta-c"><OMEditable id="findings.blockage.colExp" value="노출" tag="span" /></th>
+            <th className="ta-c"><OMEditable id="findings.blockage.colExp" value="통과 항적" tag="span" /></th>
           </tr>
         </thead>
         <tbody>{blockageRows}</tbody>
       </table>
       <p className="muted" style={{ fontSize: "9px", marginTop: 4 }}>
-        추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형 차단각~대상 차단각) 내 노출 추적시간 대비 소실시간. 노출 부족 시 "노출 없음".
+        추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형·기존지물 차단각~대상 차단각)를 지나는 항적이 그 안에서 소실되는 비율. 차단영역 내 항적이 부족하면 "항적 없음".
       </p>
     </div>
   ) : null;

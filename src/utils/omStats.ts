@@ -151,14 +151,14 @@ export function weightedTrendSlope(
 //
 // ⚠️ 임계값은 PLACEHOLDER — 실제 추가 차단영역 소실율 분포를 관측한 뒤 반드시 보정할 것.
 export const BLOCKAGE_MIN_DAYS = 7;          // 관측일수 < 7 → 판정 보류 (주간 1주기, gradeWithConfidence 와 동일 규율)
-export const BLOCKAGE_MIN_EXPOSURE_S = 600;  // 누적 노출 < 10분 → "노출 없음"(영향 없음). 추가 차단영역 희소 고분산 1차 방어.
+export const BLOCKAGE_MIN_EXPOSURE_S = 600;  // 누적 노출 < 10분 → "항적 없음"(영향 없음). 추가 차단영역 희소 고분산 1차 방어.
 export const BLOCKAGE_MIN_EXPOSURE_DAYS = 3; // 노출>0 인 날이 3일 미만이면 소수 일자 편중 → 대표성 부족 보류
 export const BLOCKAGE_CAUTION_PCT = 2.0;     // 양호/주의 경계 (%)
 export const BLOCKAGE_ALERT_PCT = 10.0;      // 주의/경고 경계 (%)
 
 /**
  * 추가 차단영역 소실율 등급 — 삼중 게이트(관측일수·노출총량·노출일수) 후 임계 판정.
- * 노출이 거의 없거나 소수 일자에 편중되면 노이즈% 대신 "노출 없음/판정 보류"를 정직하게 표기.
+ * 노출이 거의 없거나 소수 일자에 편중되면 노이즈% 대신 "항적 없음/판정 보류"를 정직하게 표기.
  */
 export function gradeAddedBlockage(
   lossRatePct: number,
@@ -170,7 +170,7 @@ export function gradeAddedBlockage(
     return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
   if (exposureTrackTimeS < BLOCKAGE_MIN_EXPOSURE_S) {
-    return { label: "노출 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+    return { label: "항적 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
   if (daysWithExposure < BLOCKAGE_MIN_EXPOSURE_DAYS) {
     // 노출 총량은 충분하나 소수 일자에 편중 → 추세·대표성 부족으로 보류

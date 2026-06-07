@@ -1,6 +1,6 @@
 /**
  * 장애물 분석 공유 헬퍼 — LoS 배치, 방위 구간 계산
- * ObstacleMonthlyConfigModal / ObstaclePreScreeningModal에서 사용.
+ * ObstacleMonthlyConfigModal에서 사용.
  */
 import { invoke } from "@tauri-apps/api/core";
 import type { RadarSite, ManualBuilding, LoSProfileData, AzSector, BuildingOnPath, PanoramaMergeResult } from "../types";
@@ -263,6 +263,10 @@ export interface ClassifiedLoss {
   azDeg: number;
   elevAngleDeg: number;
   durationS: number;
+  /** 레이더↔소실표적 거리(km) — 표/상세 표시용 (내부 lpDistKm) */
+  distKm: number;
+  /** 원본 소실표적 객체 — 좌표·고도·일자(호출부 역참조) 표시용. 입력 배열 요소 참조 그대로. */
+  source: LossPointGeo;
   inShadow: boolean;
   buildingCaused: boolean;
 }
@@ -281,12 +285,16 @@ export function isTargetBuildingOnPath(
     && (b.far_dist_km ?? b.distance_km) >= totalDistKm - 0.5;
 }
 
-/** 소실표적 양각(°) — 실제지구 곡률 보정 후(보고된 고도에서 d²/2R 강하량 차감). panorama 실루엣과 동일 프레임. */
-function lossElevAngleDeg(radarH: number, targetAltM: number, distM: number): number {
+/** 표적 양각(°) — 실제지구 곡률 보정 후(보고된 고도에서 d²/2R 강하량 차감). panorama 실루엣과 동일 프레임.
+ *  소실표적·항적 모두 동일 프레임으로 투영하기 위해 export (ReportOMObstacleAzElevChart 항적 점 공유). */
+export function pointElevAngleDeg(radarH: number, targetAltM: number, distM: number): number {
   if (distM <= 0) return 0;
   const curvDrop = (distM * distM) / (2 * R_EARTH_M_LOSS);
   return (Math.atan((targetAltM - curvDrop - radarH) / distM) * 180) / Math.PI;
 }
+
+/** 고도 단위 변환(ft→m) 상수 — 소실표적·항적 양각 투영 공유 */
+export const FT_PER_M = FT_PER_M_LOSS;
 
 /** 절대 방위차 (−180, 180] — x 를 기준 c 에 대한 상대각으로 */
 function relAngleDeg(x: number, c: number): number {
@@ -438,8 +446,12 @@ export function classifyObstacleLosses(
   const angleTerrainDeg = angleWithoutAt(bAzDeg);
 
   const siblings = opts?.siblings ?? [];
-  // sibling 오귀속 비교용 자기 방위 — 호출부가 sibling 을 bearingDeg 로 계산하므로 동일 기준 사용(비대칭 제거).
+  // sibling 오귀속 비교용 자기 방위·거리 — 호출부가 sibling 을 bearingDeg·haversineKm 로 계산하므로 동일 기준 사용(비대칭 제거).
+  //   ※ 거리 동률/근접 판정에 bDistKm(=los.totalDistance, 등거리근사)을 쓰면 sibling.distKm(haversine)과 메트릭이
+  //     불일치해(등거리>haversine 체계적 편향) 동방위·동일위치 건물쌍에서 전순서가 깨진다 — 양쪽 모두 양보→소실표적 누락,
+  //     id fail-safe 사문화. 자기 거리도 haversine 으로 통일해 antisymmetric 전순서(정확히 한 건물만 소유) 복원.
   const selfAzForSibling = bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  const selfDistForSibling = haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
   const losses: ClassifiedLoss[] = [];
   for (const lp of lossPoints) {
     const lpDistKm = haversineKm(radar.latitude, radar.longitude, lp.lat, lp.lon);
@@ -458,10 +470,10 @@ export function classifyObstacleLosses(
       let sd = Math.abs(lpAz - s.azDeg);
       if (sd > 180) sd = 360 - sd;
       const tieAz = Math.abs(sd - azDiffSelf) <= 1e-9;
-      const tieDist = Math.abs(s.distKm - bDistKm) <= 1e-9;
+      const tieDist = Math.abs(s.distKm - selfDistForSibling) <= 1e-9;
       const tieAzDeg = Math.abs(s.azDeg - selfAzForSibling) <= 1e-9;
       if (sd < azDiffSelf - 1e-9                                      // 방위 근접
-        || (tieAz && s.distKm < bDistKm - 1e-9)                       // 동률 → 거리 근접
+        || (tieAz && s.distKm < selfDistForSibling - 1e-9)            // 동률 → 거리 근접
         || (tieAz && tieDist && s.azDeg < selfAzForSibling - 1e-9)    // +동률 → 작은 방위값
         || (tieAz && tieDist && tieAzDeg && s.id < building.id)) {    // +완전동률(동일 위치) → 작은 id (fail-safe)
         ownedByOther = true;
@@ -471,12 +483,12 @@ export function classifyObstacleLosses(
     if (ownedByOther) continue;
 
     const lpAltM = lp.alt_ft / FT_PER_M_LOSS;
-    const lpElevDeg = lossElevAngleDeg(radarH, lpAltM, lpDistKm * 1000);
+    const lpElevDeg = pointElevAngleDeg(radarH, lpAltM, lpDistKm * 1000);
     const angleWith = angleWithAt(lpAz);                         // 표적 방위 with 차단각
     const angleWithout = angleWithoutAt(lpAz);                   // 표적 방위 without 차단각
     const inShadow = lpElevDeg < angleWith;                      // 지형+장애물 통합 차단 음영
     const buildingCaused = inShadow && lpElevDeg >= angleWithout; // 대상 건물 추가분에 의해서만 차단
-    losses.push({ azDeg: lpAz, elevAngleDeg: lpElevDeg, durationS: lp.duration_s, inShadow, buildingCaused });
+    losses.push({ azDeg: lpAz, elevAngleDeg: lpElevDeg, durationS: lp.duration_s, distKm: lpDistKm, source: lp, inShadow, buildingCaused });
   }
 
   let shadowCount = 0;

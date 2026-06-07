@@ -14,8 +14,10 @@
  */
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult, BuildingObstacle } from "../../types";
-import type { LossPointGeo, AddedBlockageResult } from "../../types/obstacle";
-import { classifyObstacleLosses, calcBuildingAzExtent, makeTerrainSampler, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
+import type { LossPointGeo, TrackPointGeo, AddedBlockageResult } from "../../types/obstacle";
+import { classifyObstacleLosses, calcBuildingAzExtent, makeTerrainSampler, pointElevAngleDeg, FT_PER_M, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
+import { bearingDeg, haversineKm } from "../../utils/geo";
+import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import OMEditable from "./OMEditable";
 
 const KM_PER_NM = 1.852;
@@ -157,6 +159,9 @@ interface Props {
   panoWithout?: PanoramaMergeResult;
   /** 이 레이더의 모든 소실표적 (방위 윈도우 + 대상 후방 필터링은 내부에서) */
   lossPoints: LossPointGeo[];
+  /** 이 레이더의 모든 항적 포인트 — 소실표적과 동일 방위창+대상 후방 영역으로 필터해 배경 점으로 표시
+   *  (LoS 단면도와 동일한 detection type 색·작은 점). 방위/양각 투영은 내부에서. */
+  trackPoints?: TrackPointGeo[];
   /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적 오귀속 방지용 (분류 내부에서 사용) */
   siblings?: SiblingBuilding[];
   /** 추가 차단영역 소실율 — 헤드라인 심각도 지표 (omAddedBlockage, ReportApp 에서 산출) */
@@ -164,7 +169,7 @@ interface Props {
 }
 
 export default function ReportOMObstacleAzElevChart({
-  radarSite, building, los, panoWith, panoWithout, lossPoints, siblings, blockage,
+  radarSite, building, los, panoWith, panoWithout, lossPoints, trackPoints, siblings, blockage,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -209,6 +214,32 @@ export default function ReportOMObstacleAzElevChart({
   }, [computed.bAzDeg, radarSite.latitude, radarSite.longitude, building]);
 
   const { azCenter, azHalfSpan, azSpan, xTicks } = azParams;
+
+  // 1b) 항적 점 투영 — 소실표적과 동일 도메인(차트 방위창 + 대상 후방)으로 필터해 (방위, 양각)으로 투영.
+  //     양각은 소실표적과 동일 헬퍼(pointElevAngleDeg, 실제지구 곡률 프레임)로 산출 → 같은 좌표계에서 겹쳐 표시.
+  //     색은 LoS 단면도와 동일하게 detection type 별. (전수 포인트 — 다운샘플 없음)
+  const trackDots = useMemo(() => {
+    const out: { az: number; elev: number; radarType: string }[] = [];
+    if (!trackPoints || trackPoints.length === 0) return out;
+    const radarH = radarSite.altitude + radarSite.antenna_height;
+    const bDistKm = computed.bDistKm;
+    const rel = (az: number) => {
+      let r = az - azCenter;
+      if (r > 180) r -= 360;
+      if (r < -180) r += 360;
+      return r;
+    };
+    for (const tp of trackPoints) {
+      const distKm = haversineKm(radarSite.latitude, radarSite.longitude, tp.lat, tp.lon);
+      if (distKm <= bDistKm + 0.01) continue;                  // 대상 후방만 (소실표적 분류와 동일)
+      const az = bearingDeg(radarSite.latitude, radarSite.longitude, tp.lat, tp.lon);
+      if (Math.abs(rel(az)) > azHalfSpan + 0.5) continue;      // 차트 방위창 밖 제외
+      const elev = pointElevAngleDeg(radarH, tp.alt_ft / FT_PER_M, distKm * 1000);
+      if (elev < 0) continue;                                  // 0° 미만은 비표시 (소실표적과 동일)
+      out.push({ az, elev, radarType: tp.radar_type });
+    }
+    return out;
+  }, [trackPoints, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, computed.bDistKm, azCenter, azHalfSpan]);
 
   // 2) 방위별 실루엣 합성 — 지형 + 건물(실루엣/밴드)을 방위별 max 로 합쳐 with/without 윗변 폴리라인.
   const sil = useMemo(
@@ -306,8 +337,25 @@ export default function ReportOMObstacleAzElevChart({
     const { withoutLine, withLine } = sil;
     const clamp0 = (e: number) => (e < 0 ? 0 : e);
 
+    // 항적 — 배경 레이어(소실표적/실루엣 아래). LoS 단면도와 동일 detection type 색·작은 점.
+    //   대상 후방·방위창 내 전수 항적을 깔아 소실표적 분포의 모집단(전체 통과 항적)을 시각화.
+    for (const tp of trackDots) {
+      const x = xScale(tp.az);
+      const y = yScale(tp.elev);
+      const col = detectionTypeColor(tp.radarType);
+      ctx.beginPath();
+      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.5)`;
+      ctx.fill();
+      if (PSR_TYPES.has(tp.radarType)) {
+        ctx.lineWidth = 0.6;
+        ctx.strokeStyle = "rgba(255,255,255,0.6)";
+        ctx.stroke();
+      }
+    }
+
     // 소실표적 — 모든 소실표적을 빨간 점으로 통일 (LoS 단면도와 동일 #ff1745).
-    //   먼저 그려서 실루엣 영역(지형/추가차단) 아래로 깔린다.
+    //   항적 위·실루엣 영역(지형/추가차단) 아래로 깔린다.
     //   (분류별 건수는 하단 요약 표에서 제공)
     ctx.fillStyle = "rgba(255,23,69,0.9)";
     for (const l of computed.losses) {
@@ -403,7 +451,7 @@ export default function ReportOMObstacleAzElevChart({
     ctx.rotate(-Math.PI / 2);
     ctx.fillText("양각 (°)", 0, 0);
     ctx.restore();
-  }, [computed, sil, xTicks, yTicks, yStep, azCenter, azHalfSpan, xScale, xScaleRel, yScale, yRange]);
+  }, [computed, sil, trackDots, xTicks, yTicks, yStep, azCenter, azHalfSpan, xScale, xScaleRel, yScale, yRange]);
 
   // 요약 수치
   const total = computed.losses.length;
@@ -445,6 +493,12 @@ export default function ReportOMObstacleAzElevChart({
           <span className="inline-block w-3 h-2.5 rounded-sm" style={{ backgroundColor: "#fca5a5", opacity: 0.65 }} />
           <OMEditable id={`${eid}.legend.added`} value="분석 대상 추가 차단" tag="span" />
         </span>
+        {trackDots.length > 0 && (
+          <span className="flex items-center gap-1">
+            <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: "rgba(34,197,94,0.7)" }} />
+            <OMEditable id={`${eid}.legend.track`} value="항적" tag="span" />
+          </span>
+        )}
         <span className="flex items-center gap-1">
           <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "rgba(255,23,69,0.9)" }} />
           <OMEditable id={`${eid}.legend.loss`} value="소실표적" tag="span" />
@@ -479,7 +533,7 @@ export default function ReportOMObstacleAzElevChart({
               {bldgCount}건 ({bldgRatio.toFixed(1)}%) / {bldgDuration.toFixed(1)}초
             </td>
             <td className="muted">
-              <OMEditable id={`${eid}.tbl.r3.note`} value="지형 차단각 초과 ~ 대상 차단각 사이" tag="span" />
+              <OMEditable id={`${eid}.tbl.r3.note`} value="지형·기존지물 차단각 초과 ~ 대상 차단각 사이" tag="span" />
             </td>
           </tr>
           {blockage && (
@@ -488,14 +542,14 @@ export default function ReportOMObstacleAzElevChart({
                 ↳ <OMEditable id={`${eid}.tbl.blockage.label`} value="추가 차단 구간 소실율" tag="span" />
               </td>
               <td className="ta-r mono strong" style={{ color: blockage.grade.color }}>
-                {blockage.grade.label === "노출 없음" || blockage.grade.label === "판정 보류"
+                {blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류"
                   ? blockage.grade.label
                   : `${blockage.lossRatePct.toFixed(2)}% · ${blockage.grade.label}`}
               </td>
               <td className="muted">
-                {blockage.grade.label === "노출 없음"
-                  ? <OMEditable id={`${eid}.tbl.blockage.note0`} value="노출 항적 거의 없음 → 영향 없음" tag="span" />
-                  : <>노출 {(blockage.exposureTrackTimeS / 60).toFixed(0)}분·{blockage.daysWithExposure}일 · 추세 {blockage.trendDir}
+                {blockage.grade.label === "항적 없음"
+                  ? <OMEditable id={`${eid}.tbl.blockage.note0`} value="통과 항적 거의 없음 → 영향 없음" tag="span" />
+                  : <>통과 항적 {(blockage.exposureTrackTimeS / 60).toFixed(0)}분·{blockage.daysWithExposure}일 · 추세 {blockage.trendDir}
                     {blockage.trendDir !== "안정" ? ` (일당 ${blockage.trendSlopePctPerDay > 0 ? "+" : ""}${blockage.trendSlopePctPerDay.toFixed(3)}%p)` : ""}</>}
               </td>
             </tr>

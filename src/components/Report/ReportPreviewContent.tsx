@@ -1,36 +1,21 @@
 /**
  * 보고서 프리뷰 콘텐츠 — ReportGeneration과 ReportApp 양쪽에서 공유.
  * 툴바는 포함하지 않음. 호출 측에서 previewRef와 상태를 관리.
+ * 장애물 월간(OM) 보고서 단일 템플릿 전용.
  */
 import { useMemo } from "react";
 import { Loader2 } from "lucide-react";
 import ReportPage, { ReportPageHeaderProvider } from "./ReportPage";
 import { OMEditProvider } from "./OMEditable";
 import ReportCoverPage from "./ReportCoverPage";
-import ReportSummarySection from "./ReportSummarySection";
-import ReportMapSection from "./ReportMapSection";
-import ReportStatsSection from "./ReportStatsSection";
-import ReportLossSection from "./ReportLossSection";
-import ReportAircraftSection from "./ReportAircraftSection";
-import ReportFlightComparisonSection from "./ReportFlightComparisonSection";
-import ReportFlightProfileSection from "./ReportFlightProfileSection";
-import ReportFlightLossAnalysisSection from "./ReportFlightLossAnalysisSection";
-import ReportPanoramaSection from "./ReportPanoramaSection";
 import ReportOMSummarySection from "./ReportOMSummarySection";
 import ReportOMCombinedDailyChart from "./ReportOMCombinedDailyChart";
-import ReportOMCoverageDiff from "./ReportOMCoverageDiff";
 import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
-import ReportPSSummarySection from "./ReportPSSummarySection";
-import ReportPSAngleHeight from "./ReportPSAngleHeight";
-import ReportPSAdditionalLoss from "./ReportPSAdditionalLoss";
 import type {
-  Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
-  PanoramaPoint, ManualBuilding, RadarSite, ObstacleMonthlyResult,
-  PreScreeningResult, OMReportData, TrackPoint,
+  RadarSite, ReportMetadata, ObstacleMonthlyResult, OMReportData,
 } from "../../types";
-import type { CoverageLayer } from "../../utils/radarCoverage";
 import type { ReportTemplate, ReportSections } from "../../utils/reportTransfer";
 
 // ── Props ──
@@ -40,42 +25,21 @@ export interface ReportPreviewContentProps {
   sections: ReportSections;
 
   // 데이터
-  flights: Flight[];
-  reportFlights: Flight[];
-  aircraft: AircraftType[];
   radarSite: RadarSite;
   reportMetadata: ReportMetadata;
-  panoramaData: PanoramaPoint[];
-  panoramaPeakNames: Map<number, string>;
-  coverageLayers: CoverageLayer[];
-  mapImage: string | null;
 
   // 장애물 월간
   omData: OMReportData;
   omResult: ObstacleMonthlyResult | null;
-
-  // 사전검토
-  psResult: PreScreeningResult | null;
-  psSelectedBuildings: ManualBuilding[];
-  psSelectedRadarSites: RadarSite[];
-  psLosMap: Map<string, LoSProfileData>;
-  psCovLayersWith: Map<string, CoverageLayer[]>;
-  psCovLayersWithout: Map<string, CoverageLayer[]>;
-  psAnalysisMonth: string;
 
   // 편집 가능 텍스트
   coverTitle: string;
   onCoverTitleChange: (v: string) => void;
   coverSubtitle: string;
   onCoverSubtitleChange: (v: string) => void;
-  commentary: string;
-  onCommentaryChange: (v: string) => void;
 
   // OM 콜백
   onOmDataChange: (updater: (prev: OMReportData) => OMReportData) => void;
-
-  // 단일비행 차트 포인트 (보고서 윈도우용)
-  singleFlightChartPoints?: TrackPoint[];
 
   // ref
   previewRef: React.RefObject<HTMLDivElement | null>;
@@ -83,55 +47,14 @@ export interface ReportPreviewContentProps {
 
 // ── 섹션 토글 정의 ──
 
-export function getSectionToggles(template: ReportTemplate, _sections: ReportSections): { key: keyof ReportSections; label: string }[] {
-  if (template === "flights") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "flightComparison", label: "비교" },
-      { key: "trackMap", label: "지도" },
-      { key: "lossDetail", label: "소실" },
-      { key: "los", label: "LoS" },
-      { key: "panorama", label: "장애물" },
-    ];
-  }
-  if (template === "obstacle") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "obstacleSummary", label: "요약" },
-      { key: "psAngleHeight", label: "앙각/높이" },
-      { key: "psAdditionalLoss", label: "추가Loss" },
-      { key: "coverageMap", label: "커버리지" },
-      { key: "los", label: "LoS" },
-    ];
-  }
-  if (template === "obstacle_monthly") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "omSummary", label: "요약" },
-      { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
-      { key: "omLosCrossSection", label: "장애물별 상세" },
-      { key: "omLossEvents", label: "표적소실상세" },
-      { key: "omFindings", label: "소견" },
-    ];
-  }
-  if (template === "single") {
-    return [
-      { key: "cover", label: "표지" },
-      { key: "flightProfile", label: "프로파일" },
-      { key: "trackMap", label: "지도" },
-      { key: "flightLossAnalysis", label: "소실분석" },
-      { key: "los", label: "LoS" },
-      { key: "panorama", label: "장애물" },
-    ];
-  }
+export function getSectionToggles(_template: ReportTemplate, _sections: ReportSections): { key: keyof ReportSections; label: string }[] {
   return [
     { key: "cover", label: "표지" },
-    { key: "summary", label: "요약" },
-    { key: "trackMap", label: "지도" },
-    { key: "stats", label: "통계" },
-    { key: "los", label: "LoS" },
-    { key: "panorama", label: "장애물" },
-    { key: "aircraft", label: "검사기" },
+    { key: "omSummary", label: "요약" },
+    { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
+    { key: "omLosCrossSection", label: "장애물별 상세" },
+    { key: "omLossEvents", label: "표적소실상세" },
+    { key: "omFindings", label: "소견" },
   ];
 }
 
@@ -140,22 +63,16 @@ export function getSectionToggles(template: ReportTemplate, _sections: ReportSec
 export default function ReportPreviewContent(props: ReportPreviewContentProps) {
   const {
     template, sections,
-    flights, reportFlights, aircraft, radarSite, reportMetadata,
-    panoramaData, panoramaPeakNames, mapImage,
+    radarSite, reportMetadata,
     omData, omResult,
-    psResult, psSelectedBuildings, psSelectedRadarSites, psCovLayersWith, psCovLayersWithout, psAnalysisMonth,
     coverTitle, onCoverTitleChange, coverSubtitle, onCoverSubtitleChange,
-    commentary, onCommentaryChange,
     onOmDataChange,
-    singleFlightChartPoints,
     previewRef,
   } = props;
 
-  const singleFlight = template === "single" ? reportFlights[0] : null;
-
   // OM 보고서 인라인 편집 컨텍스트 — 모든 문구를 textOverrides 로 덮어쓴다.
   const omEditCtx = useMemo(() => ({
-    editable: template === "obstacle_monthly",
+    editable: true,
     overrides: omData?.textOverrides ?? {},
     onOverride: (key: string, value: string | null) => {
       onOmDataChange((prev) => {
@@ -174,56 +91,24 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
         return { ...prev, chartZooms: next };
       });
     },
-  }), [template, omData?.textOverrides, omData?.chartZooms, onOmDataChange]);
+  }), [omData?.textOverrides, omData?.chartZooms, onOmDataChange]);
 
-  // 페이지 상단 머리띠 — 발행기관(metadata.organization) + 템플릿별 보고서 제목
+  // 페이지 상단 머리띠 — 발행기관(metadata.organization) + 보고서 제목
   const pageHeaderText = useMemo(() => {
-    const titles: Record<string, string> = {
-      obstacle_monthly: "레이더 장애물 월간 분석 보고서",
-      monthly: "월간 분석 보고서",
-      weekly: "주간 분석 보고서",
-      flights: "비행 분석 보고서",
-      single: "단일 비행 분석 보고서",
-      obstacle: "장애물 사전검토 보고서",
-    };
-    const title = titles[template] ?? "분석 보고서";
-    return `${reportMetadata.organization}  |  ${title}`;
-  }, [template, reportMetadata.organization]);
+    return `${reportMetadata.organization}  |  레이더 장애물 월간 분석 보고서`;
+  }, [reportMetadata.organization]);
 
   // 활성 섹션 번호 계산
   const sectionNumbers = useMemo(() => {
     const nums: Record<string, number> = {};
     let n = 1;
-    if (template === "flights") {
-      if (sections.flightComparison) nums.flightComparison = n++;
-      if (sections.trackMap) nums.trackMap = n++;
-      if (sections.lossDetail) nums.lossDetail = n++;
-      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
-    } else if (template === "obstacle") {
-      if (sections.obstacleSummary) nums.obstacleSummary = n++;
-      if (sections.psAngleHeight && psResult) nums.psAngleHeight = n++;
-      if (sections.psAdditionalLoss && psResult) nums.psAdditionalLoss = n++;
-      if (sections.coverageMap && (psCovLayersWith.size > 0 || psCovLayersWithout.size > 0)) nums.coverageMap = n++;
-    } else if (template === "obstacle_monthly") {
-      if (sections.omSummary) nums.omSummary = n++;
-      if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
-      if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
-      if (sections.omLossEvents) nums.omLossEvents = n++;
-      if (sections.omFindings) nums.omFindings = n++;
-    } else if (template === "single") {
-      if (sections.flightProfile) nums.flightProfile = n++;
-      if (sections.trackMap) nums.trackMap = n++;
-      if (sections.flightLossAnalysis) nums.flightLossAnalysis = n++;
-      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
-    } else {
-      if (sections.summary) nums.summary = n++;
-      if (sections.trackMap) nums.trackMap = n++;
-      if (sections.stats && flights.length > 0) nums.stats = n++;
-      if (sections.panorama && panoramaData.length > 0) nums.panorama = n++;
-      if (sections.aircraft && aircraft.length > 0) nums.aircraft = n++;
-    }
+    if (sections.omSummary) nums.omSummary = n++;
+    if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
+    if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
+    if (sections.omLossEvents) nums.omLossEvents = n++;
+    if (sections.omFindings) nums.omFindings = n++;
     return nums;
-  }, [template, sections, flights, aircraft, panoramaData, psResult, psCovLayersWith, psCovLayersWithout, omData?.losMap]);
+  }, [sections, omData?.losMap]);
 
   // OM 레이더별 조건 텍스트
   const omRadarConditions = useMemo(() => {
@@ -281,7 +166,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       <ReportPageHeaderProvider value={pageHeaderText}>
       <OMEditProvider value={omEditCtx}>
       <div className="kac-report">
-      {/* 표지 (공통) */}
+      {/* 표지 */}
       {sections.cover && (
         <div data-toc-key="cover">
           <ReportCoverPage
@@ -293,136 +178,17 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             onTitleChange={onCoverTitleChange}
             subtitle={coverSubtitle}
             onSubtitleChange={onCoverSubtitleChange}
-            omMonthLabel={template === "obstacle_monthly" && omData.analysisMonth
+            omMonthLabel={omData.analysisMonth
               ? `${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월`
               : undefined}
-            omRadarNames={template === "obstacle_monthly"
-              ? omData.selectedRadarSites.map((r) => r.name)
-              : undefined}
-            omBuildingsCount={template === "obstacle_monthly"
-              ? omData.selectedBuildings.length
-              : undefined}
+            omRadarNames={omData.selectedRadarSites.map((r) => r.name)}
+            omBuildingsCount={omData.selectedBuildings.length}
           />
         </div>
       )}
 
-      {/* ─── 주간/월간 ─── */}
-      {(template === "weekly" || template === "monthly") && (
-        <>
-          {(sections.summary || sections.trackMap) && (
-            <ReportPage>
-              {sections.summary && (
-                <ReportSummarySection
-                  sectionNum={sectionNumbers.summary ?? 1}
-                  flights={flights}
-                  aircraftCount={aircraft.filter((a) => a.active).length}
-                  editable
-                  commentary={commentary}
-                  onCommentaryChange={onCommentaryChange}
-                />
-              )}
-              {sections.trackMap && (
-                <ReportMapSection
-                  sectionNum={sectionNumbers.trackMap ?? 2}
-                  mapImage={mapImage}
-                />
-              )}
-            </ReportPage>
-          )}
-
-          {sections.stats && flights.length > 0 && (
-            <ReportPage>
-              <ReportStatsSection
-                sectionNum={sectionNumbers.stats ?? 3}
-                flights={flights}
-                template={template}
-              />
-            </ReportPage>
-          )}
-
-          {sections.panorama && panoramaData.length > 0 && radarSite && (
-            <ReportPanoramaSection
-              sectionNum={sectionNumbers.panorama ?? 6}
-              panoramaData={panoramaData}
-              radarSite={radarSite}
-              peakNames={panoramaPeakNames}
-            />
-          )}
-
-          {sections.aircraft && aircraft.length > 0 && (
-            <ReportPage>
-              <ReportAircraftSection
-                sectionNum={sectionNumbers.aircraft ?? 6}
-                aircraft={aircraft}
-              />
-              <div className="absolute bottom-[20mm] left-[20mm] right-[20mm]">
-                <div className="border-t-[2px] border-gray-300" />
-                <p className="mt-2 text-center text-[9px] text-gray-400">
-                  {reportMetadata.footer}
-                </p>
-              </div>
-            </ReportPage>
-          )}
-        </>
-      )}
-
-      {/* ─── 장애물 전파영향 사전검토 ─── */}
-      {template === "obstacle" && psResult && (
-        <>
-          {sections.obstacleSummary && (
-            <ReportPage>
-              <ReportPSSummarySection
-                sectionNum={sectionNumbers.obstacleSummary ?? 1}
-                result={psResult}
-                buildings={psSelectedBuildings}
-                radars={psSelectedRadarSites}
-                analysisMonth={psAnalysisMonth}
-              />
-            </ReportPage>
-          )}
-
-          {sections.psAngleHeight && (
-            <ReportPage>
-              <ReportPSAngleHeight
-                sectionNum={sectionNumbers.psAngleHeight ?? 2}
-                result={psResult}
-              />
-            </ReportPage>
-          )}
-
-          {sections.psAdditionalLoss && (
-            <ReportPage>
-              <ReportPSAdditionalLoss
-                sectionNum={sectionNumbers.psAdditionalLoss ?? 3}
-                result={psResult}
-              />
-            </ReportPage>
-          )}
-
-          {sections.coverageMap && (psCovLayersWith.size > 0 || psCovLayersWithout.size > 0) && psSelectedRadarSites.map((rs) => {
-            const rsLayers = psCovLayersWith.get(rs.name) ?? [];
-            const rsLayersWithout = psCovLayersWithout.get(rs.name) ?? [];
-            if (rsLayers.length === 0 && rsLayersWithout.length === 0) return null;
-            return (
-              <ReportPage key={`ps-cov-${rs.name}`}>
-                <ReportOMCoverageDiff
-                  sectionNum={sectionNumbers.coverageMap ?? 4}
-                  layersWithTargets={rsLayers}
-                  layersWithoutTargets={rsLayersWithout}
-                  radarSite={rs}
-                  lossPoints={[]}
-                  defaultAltFt={5000}
-                  selectedBuildings={psSelectedBuildings}
-                  buildingGroups={omData.buildingGroups}
-                />
-              </ReportPage>
-            );
-          })}
-        </>
-      )}
-
       {/* ─── 장애물 월간 ─── */}
-      {template === "obstacle_monthly" && omResult && (
+      {omResult && (
         <>
           {sections.omSummary && (
             <div data-toc-key="omSummary">
@@ -485,27 +251,27 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
 
           {sections.omLossEvents && (
             <div data-toc-key="omLossEvents">
-              {omData.coverageStatus === "done" && omData.covLayersWithBuildings.size > 0 ? (
+              {omData.panoramaStatus === "done" ? (
                 <ReportOMLossEvents
                   sectionNum={sectionNumbers.omLossEvents ?? 5}
                   radarResults={omResult.radar_results}
-                  selectedBuildings={omData.selectedBuildings}
-                  buildingGroups={omData.buildingGroups}
                   radarSites={omData.selectedRadarSites}
-                  layersWithTargets={omData.covLayersWithBuildings}
-                  layersWithoutTargets={omData.covLayersWithout}
+                  selectedBuildings={omData.selectedBuildings}
+                  losMap={omData.losMap}
+                  panoWithByRadar={omData.panoWithTargets}
+                  panoWithoutByRadar={omData.panoWithoutTargets}
                 />
-              ) : omData.coverageStatus === "error" ? (
+              ) : omData.panoramaStatus === "error" ? (
                 <ReportPage>
                   <div className="flex flex-col items-center justify-center py-20 text-gray-400">
-                    <p className="text-sm text-red-400">커버리지 계산 실패 — Loss 상세 표시 불가</p>
+                    <p className="text-sm text-red-400">파노라마 계산 실패 — 표적소실 상세 표시 불가</p>
                   </div>
                 </ReportPage>
               ) : (
                 <ReportPage>
                   <div className="flex flex-col items-center justify-center py-20 text-gray-400">
                     <Loader2 size={24} className="mb-3 animate-spin" />
-                    <p className="text-sm">Loss 상세 계산 중...</p>
+                    <p className="text-sm">표적소실 상세 계산 중...</p>
                   </div>
                 </ReportPage>
               )}
@@ -527,88 +293,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 addedBlockageByKey={omData.addedBlockageByKey}
               />
             </div>
-          )}
-        </>
-      )}
-
-      {/* ─── 비행 건별 ─── */}
-      {template === "flights" && (
-        <>
-          {sections.flightComparison && (
-            <ReportFlightComparisonSection
-              sectionNum={sectionNumbers.flightComparison ?? 1}
-              flights={reportFlights}
-              radarSite={radarSite}
-            />
-          )}
-          {sections.trackMap && (
-            <ReportPage>
-              <ReportMapSection
-                sectionNum={sectionNumbers.trackMap ?? 2}
-                mapImage={mapImage}
-              />
-            </ReportPage>
-          )}
-
-          {sections.lossDetail && reportFlights.some((f) => f.loss_points.length > 0) && (
-            <ReportPage>
-              <ReportLossSection
-                sectionNum={sectionNumbers.lossDetail ?? 3}
-                flights={reportFlights}
-                template="flights"
-              />
-            </ReportPage>
-          )}
-
-          {sections.panorama && panoramaData.length > 0 && radarSite && (
-            <ReportPanoramaSection
-              sectionNum={sectionNumbers.panorama ?? 6}
-              panoramaData={panoramaData}
-              radarSite={radarSite}
-              peakNames={panoramaPeakNames}
-            />
-          )}
-        </>
-      )}
-
-      {/* ─── 단일비행 상세 ─── */}
-      {template === "single" && singleFlight && (
-        <>
-          {(sections.flightProfile || sections.trackMap) && (
-            <ReportPage>
-              {sections.flightProfile && (
-                <ReportFlightProfileSection
-                  sectionNum={sectionNumbers.flightProfile ?? 1}
-                  flight={singleFlight}
-                  radarSite={radarSite}
-                  preloadedPoints={singleFlightChartPoints}
-                />
-              )}
-              {sections.trackMap && (
-                <ReportMapSection
-                  sectionNum={sectionNumbers.trackMap ?? 2}
-                  mapImage={mapImage}
-                />
-              )}
-            </ReportPage>
-          )}
-
-          {sections.flightLossAnalysis && (
-            <ReportPage>
-              <ReportFlightLossAnalysisSection
-                sectionNum={sectionNumbers.flightLossAnalysis ?? 3}
-                flight={singleFlight}
-              />
-            </ReportPage>
-          )}
-
-          {sections.panorama && panoramaData.length > 0 && radarSite && (
-            <ReportPanoramaSection
-              sectionNum={sectionNumbers.panorama ?? 6}
-              panoramaData={panoramaData}
-              radarSite={radarSite}
-              peakNames={panoramaPeakNames}
-            />
           )}
         </>
       )}

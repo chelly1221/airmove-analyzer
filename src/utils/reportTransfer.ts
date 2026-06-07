@@ -4,32 +4,19 @@
  * Map 객체는 Array<[K,V]>로 직렬화하여 structured clone 호환.
  */
 import type {
-  Flight, LoSProfileData, Aircraft, RadarSite, ReportMetadata,
-  PanoramaPoint, PanoramaMergeResult, ManualBuilding, BuildingGroup, AzSector, ObstacleMonthlyResult,
-  PreScreeningResult, OMReportData, TrackPoint,
+  LoSProfileData, Aircraft, RadarSite, ReportMetadata,
+  PanoramaMergeResult, ManualBuilding, BuildingGroup, AzSector, ObstacleMonthlyResult,
+  OMReportData,
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
 
 // ── 보고서 템플릿/섹션 타입 (ReportGeneration과 공유) ──
+// 장애물 월간(OM) 보고서 단일 템플릿만 제공.
 
-export type ReportTemplate = "weekly" | "monthly" | "flights" | "single" | "obstacle" | "obstacle_monthly";
+export type ReportTemplate = "obstacle_monthly";
 
 export interface ReportSections {
   cover: boolean;
-  summary: boolean;
-  trackMap: boolean;
-  stats: boolean;
-  los: boolean;
-  panorama: boolean;
-  aircraft: boolean;
-  flightComparison: boolean;
-  lossDetail: boolean;
-  flightProfile: boolean;
-  flightLossAnalysis: boolean;
-  obstacleSummary: boolean;
-  coverageMap: boolean;
-  psAdditionalLoss: boolean;
-  psAngleHeight: boolean;
   omSummary: boolean;
   /** 일별 PSR·표적소실 결합 라인 차트 (페이지 2). 기존 omDailyPsr/omDailyLoss 두 토글을 합친 단일 토글. */
   omDailyPsrLoss: boolean;
@@ -70,39 +57,17 @@ export interface ReportWindowPayload {
   // 보고서 설정
   template: ReportTemplate;
   sections: ReportSections;
-  selectedFlightIds: string[];
-  singleFlightId: string | null;
 
   // 편집 가능 텍스트
   coverTitle: string;
   coverSubtitle?: string;
-  commentary: string;
 
   // 데이터
-  flights: Flight[];
-  reportFlights: Flight[];
-  aircraft: Aircraft[];
   radarSite: RadarSite;
   reportMetadata: ReportMetadata;
-  panoramaData: PanoramaPoint[];
-  panoramaPeakNames: [number, string][];
-  coverageLayers: CoverageLayer[];
-  mapImage: string | null;
 
   // 장애물 월간
   omData: SerializedOMData;
-
-  // 사전검토
-  psResult: PreScreeningResult | null;
-  psSelectedBuildings: ManualBuilding[];
-  psSelectedRadarSites: RadarSite[];
-  psLosMap: [string, LoSProfileData][];
-  psCovLayersWith: [string, CoverageLayer[]][];
-  psCovLayersWithout: [string, CoverageLayer[]][];
-  psAnalysisMonth: string;
-
-  // 단일비행 차트 포인트 (보고서 윈도우에서 Worker가 없으므로 사전 전달)
-  singleFlightChartPoints?: TrackPoint[];
 }
 
 // ── Map ↔ Array 변환 ──
@@ -151,33 +116,12 @@ export function deserializeOMData(s: SerializedOMData): OMReportData {
 
 // ── 공유 유틸 ──
 
-export function templateDisplayLabel(tpl: ReportTemplate): string {
-  switch (tpl) {
-    case "weekly": return "주간";
-    case "monthly": return "월간";
-    case "flights": return "건별";
-    case "single": return "상세";
-    case "obstacle": return "사전검토";
-    case "obstacle_monthly": return "장애물월간";
-  }
+export function templateDisplayLabel(_tpl: ReportTemplate): string {
+  return "장애물월간";
 }
 
 export const DEFAULT_SECTIONS: ReportSections = {
   cover: true,
-  summary: true,
-  trackMap: true,
-  stats: true,
-  los: true,
-  panorama: true,
-  aircraft: true,
-  flightComparison: true,
-  lossDetail: true,
-  flightProfile: true,
-  flightLossAnalysis: true,
-  obstacleSummary: true,
-  coverageMap: true,
-  psAdditionalLoss: true,
-  psAngleHeight: true,
   omSummary: true,
   omDailyPsrLoss: true,
   omLosCrossSection: true,
@@ -189,13 +133,8 @@ export const DEFAULT_SECTIONS: ReportSections = {
 
 export interface ReportConfigPayload {
   template: ReportTemplate;
-  flights: Flight[];
   aircraft: Aircraft[];
   metadata: ReportMetadata;
-  radarSite: RadarSite;
-  panoramaData: PanoramaPoint[];
-  panoramaPeakNames: [number, string][];
-  coverageLayers: CoverageLayer[];
   customRadarSites: RadarSite[];
 }
 
@@ -204,18 +143,8 @@ export interface ReportConfigPayload {
 export interface ReportGenerateRequest {
   template: ReportTemplate;
   sections: ReportSections;
-  selectedFlightIds?: string[];
-  singleFlightId?: string | null;
   // 장애물 월간 분석 결과 (serialized)
   omData?: SerializedOMData;
-  // 사전검토 분석 결과
-  psResult?: PreScreeningResult | null;
-  psSelectedBuildings?: ManualBuilding[];
-  psSelectedRadarSites?: RadarSite[];
-  psLosMap?: [string, LoSProfileData][];
-  psCovLayersWith?: [string, CoverageLayer[]][];
-  psCovLayersWithout?: [string, CoverageLayer[]][];
-  psAnalysisMonth?: string;
 }
 
 // ── IndexedDB 헬퍼 ──

@@ -77,7 +77,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     lines.push(`  - 평균 PSR 탐지율: ${(avgPsr * 100).toFixed(1)}%, 소실 이벤트: ${totalLossEvents}건`);
 
     // ── 건물별 추가 차단 구간 소실율 — 헤드라인 인과 지표 ──
-    //   "이 건물이 새로 가리는 노출 비행시간 중 소실 비율". 방위 비교(아래)보다 우선.
+    //   "이 건물이 새로 가리는 차단영역을 지나는 항적이 소실되는 비율". 방위 비교(아래)보다 우선.
     if (addedBlockageByKey) {
       const blockageLines: string[] = [];
       for (const b of selectedBuildings) {
@@ -87,17 +87,17 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
         const expMin = (w.exposureTrackTimeS / 60).toFixed(0);
         if (w.grade.label === "판정 보류") {
           blockageLines.push(`    · ${bn}: 추가 차단 구간 — 관측일수 부족으로 판정 보류`);
-        } else if (w.grade.label === "노출 없음") {
-          blockageLines.push(`    · ${bn}: 추가 차단 구간에 항적 노출이 거의 없어(노출 ${expMin}분) 영향 없음으로 판단`);
+        } else if (w.grade.label === "항적 없음") {
+          blockageLines.push(`    · ${bn}: 추가 차단 구간을 지나는 항적이 거의 없어(통과 항적 ${expMin}분) 영향 없음으로 판단`);
         } else {
           const tr = w.trendDir === "안정"
             ? "추세 안정"
             : `추세 ${w.trendDir}(일당 ${w.trendSlopePctPerDay > 0 ? "+" : ""}${w.trendSlopePctPerDay.toFixed(3)}%p)`;
-          blockageLines.push(`    · ${bn}: 추가 차단 구간 소실율 ${w.lossRatePct.toFixed(2)}% (${w.grade.label}), ${tr}, 노출 ${expMin}분/${w.daysWithExposure}일`);
+          blockageLines.push(`    · ${bn}: 추가 차단 구간 소실율 ${w.lossRatePct.toFixed(2)}% (${w.grade.label}), ${tr}, 통과 항적 ${expMin}분/${w.daysWithExposure}일`);
         }
       }
       if (blockageLines.length > 0) {
-        lines.push(`  → 분석 대상 장애물의 추가 차단영역(지형 차단각 초과~대상 차단각 사이 노출 비행시간 대비 소실율):`);
+        lines.push(`  → 분석 대상 장애물의 추가 차단영역(지형·기존지물 차단각 초과~대상 차단각 사이, 지나는 항적이 소실되는 비율):`);
         for (const wl of blockageLines) lines.push(wl);
       }
     }
@@ -228,7 +228,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     } else if (worst === "경고") {
       lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역 소실율이 경고 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
     } else {
-      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역에 유효 노출이 거의 없어, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
+      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없어, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
     }
     lines.push(`  ※ 추가 차단영역 등급 임계(주의 ${BLOCKAGE_CAUTION_PCT}% / 경고 ${BLOCKAGE_ALERT_PCT}%)는 실측 분포 보정 전 잠정 기준임.`);
     lines.push(`참고(방위 소실율, 보조지표): ${gradeTexts}. 방위마다 지형·트래픽이 달라 위 인과 헤드라인을 우선 판단 근거로 한다.`);

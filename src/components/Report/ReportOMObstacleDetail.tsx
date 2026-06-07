@@ -52,10 +52,11 @@ function ReportOMObstacleDetail({
   const bTopFt = Math.round(bTopElevM * 3.28084);
 
   // 이 레이더 omResult 에서 항적·소실표적 수집
-  const { losChartPts, allLossThisRadar } = useMemo(() => {
-    if (!omResult) return { losChartPts: { track: [], loss: [] }, allLossThisRadar: [] as LossPointGeo[] };
+  const { losChartPts, allLossThisRadar, allTrackThisRadar } = useMemo(() => {
+    const empty = { losChartPts: { track: [], loss: [] }, allLossThisRadar: [] as LossPointGeo[], allTrackThisRadar: [] as TrackPointGeo[] };
+    if (!omResult) return empty;
     const rr = omResult.radar_results.find((r) => r.radar_name === radarSite.name);
-    if (!rr) return { losChartPts: { track: [], loss: [] }, allLossThisRadar: [] as LossPointGeo[] };
+    if (!rr) return empty;
     const allLoss: LossPointGeo[] = [];
     const allTrack: TrackPointGeo[] = [];
     for (const ds of rr.daily_stats) {
@@ -65,6 +66,7 @@ function ReportOMObstacleDetail({
     return {
       losChartPts: projectPointsToLos(los, allTrack, allLoss, building),
       allLossThisRadar: allLoss,
+      allTrackThisRadar: allTrack,
     };
   }, [omResult, radarSite.name, los, building]);
 
@@ -110,6 +112,7 @@ function ReportOMObstacleDetail({
         panoWith={panoWith}
         panoWithout={panoWithout}
         lossPoints={allLossThisRadar}
+        trackPoints={allTrackThisRadar}
         siblings={siblings}
         blockage={blockage}
       />

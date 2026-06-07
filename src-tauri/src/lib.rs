@@ -1400,76 +1400,6 @@ async fn analyze_obstacle_monthly(
     Ok(result)
 }
 
-/// 장애물 전파영향 사전검토 IPC 커맨드
-#[tauri::command]
-async fn analyze_pre_screening(
-    app_handle: tauri::AppHandle,
-    radar_file_sets: Vec<analysis::obstacle_monthly::RadarFileSet>,
-    proposed_buildings: Vec<analysis::pre_screening::ProposedBuilding>,
-    exclude_mode_s: Vec<String>,
-) -> Result<analysis::pre_screening::PreScreeningResult, String> {
-    use analysis::obstacle_monthly::ObstacleMonthlyProgress;
-    use analysis::pre_screening as ps;
-
-    info!(
-        "Command: analyze_pre_screening({} radars, {} buildings, exclude={:?})",
-        radar_file_sets.len(), proposed_buildings.len(), exclude_mode_s
-    );
-
-    let mag_dec = if let Some(rfs) = radar_file_sets.first() {
-        if let Some(first_path) = rfs.file_paths.first() {
-            resolve_declination(&app_handle, first_path, rfs.radar_lat, rfs.radar_lon).await
-        } else {
-            -8.5
-        }
-    } else {
-        -8.5
-    };
-
-    // 취소 토큰 초기화
-    let cancel = {
-        let state = app_handle.state::<AppState>();
-        state.analysis_cancel.store(false, Ordering::Relaxed);
-        Arc::clone(&state.analysis_cancel)
-    };
-
-    let handle = app_handle.clone();
-
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        let mut radar_results = Vec::new();
-
-        for radar in &radar_file_sets {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("분석이 취소되었습니다".to_string());
-            }
-
-            let h = handle.clone();
-            let progress_fn = move |p: ObstacleMonthlyProgress| {
-                let _ = h.emit("pre-screening-progress", p);
-            };
-
-            match ps::analyze_pre_screening(
-                radar, &proposed_buildings, &exclude_mode_s, mag_dec, &state.srtm, &cancel, &progress_fn,
-            ) {
-                Ok(result) => radar_results.push(result),
-                Err(e) if e.contains("취소") => {
-                    return Err(e);
-                }
-                Err(e) => {
-                    info!("[PreScreening] 레이더 '{}' 분석 실패: {}", radar.radar_name, e);
-                }
-            }
-        }
-
-        Ok(ps::PreScreeningResult { radar_results })
-    })
-    .await
-    .map_err(|e| format!("분석 스레드 오류: {}", e))??;
-
-    Ok(result)
-}
-
 /// 건물 제외 커버리지 프로파일 계산 (장애물 월간 보고서용)
 #[tauri::command]
 async fn compute_coverage_terrain_profile_excluding(
@@ -2220,8 +2150,6 @@ pub fn run() {
             // 장애물 월간 분석
             analyze_obstacle_monthly,
             cancel_analysis,
-            // 장애물 사전검토
-            analyze_pre_screening,
             compute_coverage_terrain_profile_excluding,
             compute_coverage_layers_batch_excluded,
             // 토지이용계획도 타일

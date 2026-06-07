@@ -180,7 +180,7 @@ function ReportOMSummarySection({
                       {!los ? (
                         <span className="muted">—</span>
                       ) : blockage ? (
-                        blockage.grade.label === "노출 없음" || blockage.grade.label === "판정 보류"
+                        blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류"
                           ? <span className="muted">{blockage.grade.label}</span>
                           : <span style={{ color: blockage.grade.color, fontWeight: 600 }} title={`음영소실 ${shadowLoss}건`}>
                               {blockage.lossRatePct.toFixed(2)}%
@@ -229,7 +229,7 @@ function ReportOMSummarySection({
           <i>±σ</i>: 가중 모표준편차 <i>σᵥᵥ = √(Σ(wᵢ(xᵢ - x̄ᵥᵥ)²) / Σ(wᵢ))</i>{" · "}
           판정: 양호(&lt;0.5%) / 주의(0.5–2%) / 경고(≥2%) / 보류(&lt;7일)
           {" · "}
-          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형 차단각~대상 차단각 사이 양각 밴드) 내 <i>노출 추적시간 대비 소실시간</i> 비율(노출 조건부 소실율). 노출 부족 시 "노출 없음". (파노라마 미가용 시 음영소실 건수로 폴백)
+          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형·기존지물 차단각~대상 차단각 사이 양각 밴드)을 <i>지나는 항적이 그 안에서 소실되는 비율</i>. 차단영역 내 항적이 부족하면 "항적 없음", 관측 7일 미만 또는 항적 발생일 3일 미만 시 "판정 보류". (파노라마 미가용 시 음영소실 건수로 폴백)
         </div>
       </div>
       <div className="meta-merged-row formula" style={{ borderTop: "1px solid var(--om-border)" }}>

@@ -7,14 +7,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { format } from "date-fns";
-import { Download, Loader2, TriangleAlert } from "lucide-react";
+import { Loader2, TriangleAlert } from "lucide-react";
 import Titlebar from "../components/Layout/Titlebar";
 import ReportPreviewContent, { getSectionToggles } from "../components/Report/ReportPreviewContent";
 import ReportOMSidebar, { type OMSidebarTocItem } from "../components/Report/ReportOMSidebar";
 import { useReportExport } from "../components/Report/useReportExport";
-import TemplateConfigModal from "../components/Report/TemplateConfigModal";
 import ObstacleMonthlyConfigModal from "../components/Report/ObstacleMonthlyConfigModal";
-import ObstaclePreScreeningModal from "../components/Report/ObstaclePreScreeningModal";
 import ReportSettingsModal from "../components/Report/ReportSettingsModal";
 import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
@@ -28,9 +26,9 @@ import {
   type ReportConfigPayload,
 } from "../utils/reportTransfer";
 import type {
-  Flight, LoSProfileData, Aircraft as AircraftType, ReportMetadata,
-  PanoramaPoint, PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, TrackPoint, AzSector,
-  ObstacleMonthlyResult, PreScreeningResult, OMReportData,
+  LoSProfileData, ReportMetadata,
+  PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, AzSector,
+  ObstacleMonthlyResult, OMReportData,
   AddedBlockageResult,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
@@ -46,27 +44,9 @@ interface LoadedState {
   sections: ReportSections;
   coverTitle: string;
   coverSubtitle: string;
-  commentary: string;
-  flights: Flight[];
-  reportFlights: Flight[];
-  aircraft: AircraftType[];
   radarSite: RadarSite;
   reportMetadata: ReportMetadata;
-  panoramaData: PanoramaPoint[];
-  panoramaPeakNames: Map<number, string>;
-  coverageLayers: CoverageLayer[];
-  mapImage: string | null;
   omData: OMReportData;
-  psResult: PreScreeningResult | null;
-  psSelectedBuildings: ManualBuilding[];
-  psSelectedRadarSites: RadarSite[];
-  psLosMap: Map<string, LoSProfileData>;
-  psCovLayersWith: Map<string, CoverageLayer[]>;
-  psCovLayersWithout: Map<string, CoverageLayer[]>;
-  psAnalysisMonth: string;
-  selectedFlightIds: string[];
-  singleFlightId: string | null;
-  singleFlightChartPoints?: TrackPoint[];
 }
 
 function payloadToState(p: ReportWindowPayload): LoadedState {
@@ -75,27 +55,9 @@ function payloadToState(p: ReportWindowPayload): LoadedState {
     sections: p.sections,
     coverTitle: p.coverTitle,
     coverSubtitle: p.coverSubtitle ?? format(new Date(), "yyyy년 MM월"),
-    commentary: p.commentary,
-    flights: p.flights,
-    reportFlights: p.reportFlights,
-    aircraft: p.aircraft,
     radarSite: p.radarSite,
     reportMetadata: p.reportMetadata,
-    panoramaData: p.panoramaData,
-    panoramaPeakNames: new Map(p.panoramaPeakNames),
-    coverageLayers: p.coverageLayers,
-    mapImage: p.mapImage,
     omData: deserializeOMData(p.omData),
-    psResult: p.psResult,
-    psSelectedBuildings: p.psSelectedBuildings,
-    psSelectedRadarSites: p.psSelectedRadarSites,
-    psLosMap: new Map(p.psLosMap),
-    psCovLayersWith: new Map(p.psCovLayersWith),
-    psCovLayersWithout: new Map(p.psCovLayersWithout),
-    psAnalysisMonth: p.psAnalysisMonth,
-    selectedFlightIds: p.selectedFlightIds,
-    singleFlightId: p.singleFlightId,
-    singleFlightChartPoints: p.singleFlightChartPoints,
   };
 }
 
@@ -118,7 +80,6 @@ export default function ReportApp() {
   // 편집 가능 텍스트
   const [coverTitle, setCoverTitle] = useState("");
   const [coverSubtitle, setCoverSubtitle] = useState(() => format(new Date(), "yyyy년 MM월"));
-  const [commentary, setCommentary] = useState("");
 
   // 편집 가능 보고서 메타데이터 — 설정 모달에서 수정 → 표지/머리말 라이브 반영.
   // null 이면 state.reportMetadata(원본)를 사용.
@@ -134,20 +95,11 @@ export default function ReportApp() {
   // 닫기 확인 모달
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
-  // OM/PS 데이터 캐시 — IDB 왕복 시 커버리지 등 대용량 데이터 제외하고,
+  // OM 데이터 캐시 — IDB 왕복 시 커버리지 등 대용량 데이터 제외하고,
   // 보고서 창 메모리에 직접 보관하여 IDB 병목 방지
   const omDataCacheRef = useRef<OMReportData | null>(null);
   // 자동 생성된 findingsText 스냅샷 — 추가 차단영역 산출 후 재생성 시 사용자 편집 보호용(미편집일 때만 덮어씀)
   const autoFindingsRef = useRef<string>("");
-  const psDataCacheRef = useRef<{
-    result: PreScreeningResult;
-    buildings: ManualBuilding[];
-    radars: RadarSite[];
-    losMap: Map<string, LoSProfileData>;
-    covWith: Map<string, CoverageLayer[]>;
-    covWithout: Map<string, CoverageLayer[]>;
-    monthStr: string;
-  } | null>(null);
 
   // PDF 내보내기
   const [generating, setGenerating] = useState(false);
@@ -214,25 +166,12 @@ export default function ReportApp() {
         // 캐시 즉시 삭제 대신 지연 삭제 — 비동기 로드 타이밍 보호
         setTimeout(() => { omDataCacheRef.current = null; }, 5000);
       }
-      const cachedPs = psDataCacheRef.current;
-      if (cachedPs && s.template === "obstacle") {
-        s.psResult = cachedPs.result;
-        s.psSelectedBuildings = cachedPs.buildings;
-        s.psSelectedRadarSites = cachedPs.radars;
-        s.psLosMap = cachedPs.losMap;
-        s.psCovLayersWith = cachedPs.covWith;
-        s.psCovLayersWithout = cachedPs.covWithout;
-        s.psAnalysisMonth = cachedPs.monthStr;
-        // 캐시 즉시 삭제 대신 지연 삭제 — 비동기 로드 타이밍 보호
-        setTimeout(() => { psDataCacheRef.current = null; }, 5000);
-      }
 
       startTransition(() => {
         setState(s);
         setSections(s.sections);
         setCoverTitle(s.coverTitle);
         setCoverSubtitle(s.coverSubtitle);
-        setCommentary(s.commentary);
         setMetadata(s.reportMetadata);
         setOmData(s.omData);
         setLoading(false);
@@ -289,7 +228,6 @@ export default function ReportApp() {
     const unlistenReloadConfig = listen("report:reload-config", async () => {
       loadingRef.current = false;
       omDataCacheRef.current = null;
-      psDataCacheRef.current = null;
       setState(null);
       setLoading(true);
       setPrepPhase("waiting");
@@ -355,7 +293,7 @@ export default function ReportApp() {
 
   // 현재 활성 sections
   const activeSections = sections ?? state?.sections;
-  const activeTemplate = state?.template ?? "weekly";
+  const activeTemplate: ReportTemplate = state?.template ?? "obstacle_monthly";
 
   // 섹션 토글 목록
   const toggles = useMemo(() => {
@@ -569,26 +507,6 @@ export default function ReportApp() {
     }
   }, [state, activeTemplate, activeSections, exportPDF]);
 
-  // ── 모달에서 생성 요청 → IDB + emit ──
-  const handleModalGenerate = useCallback(async (
-    tpl: ReportTemplate,
-    sects: ReportSections,
-    flightIds?: Set<string>,
-    singleId?: string | null,
-  ) => {
-
-    setConfigPayload(null);
-    setLoading(true);
-    setPrepPhase("waiting");
-    await writeGenerateRequest({
-      template: tpl,
-      sections: sects,
-      selectedFlightIds: flightIds ? [...flightIds] : undefined,
-      singleFlightId: singleId,
-    });
-    await emit("report:generate");
-  }, []);
-
   // ── 장애물 월간 모달 생성 핸들러 ──
   const handleOMGenerate = useCallback(async (
     result: ObstacleMonthlyResult,
@@ -666,40 +584,6 @@ export default function ReportApp() {
       template: "obstacle_monthly",
       sections: { ...DEFAULT_SECTIONS },
       omData: serializeOMData(lightOmData),
-    });
-    await emit("report:generate");
-  }, []);
-
-  // ── 사전검토 모달 생성 핸들러 ──
-  const handlePSGenerate = useCallback(async (
-    result: PreScreeningResult,
-    buildings: ManualBuilding[],
-    radars: RadarSite[],
-    losMap: Map<string, LoSProfileData>,
-    covWith: Map<string, CoverageLayer[]>,
-    covWithout: Map<string, CoverageLayer[]>,
-    monthStr?: string,
-  ) => {
-    // 대용량 데이터(커버리지 레이어 + LoS)는 메모리에 캐시하고
-    // IDB에는 경량 버전만 전송하여 직렬화/역직렬화 병목 방지
-    psDataCacheRef.current = {
-      result, buildings, radars, losMap,
-      covWith, covWithout, monthStr: monthStr ?? "",
-    };
-
-    setConfigPayload(null);
-    setLoading(true);
-    setPrepPhase("waiting");
-    await writeGenerateRequest({
-      template: "obstacle",
-      sections: { ...DEFAULT_SECTIONS },
-      psResult: result,
-      psSelectedBuildings: buildings,
-      psSelectedRadarSites: radars,
-      psLosMap: [...losMap],
-      psCovLayersWith: [],
-      psCovLayersWithout: [],
-      psAnalysisMonth: monthStr,
     });
     await emit("report:generate");
   }, []);
@@ -957,44 +841,6 @@ export default function ReportApp() {
       ? "데이터 로딩 중..."
       : "보고서 데이터 로딩 중...";
 
-  // 설정 모달 단계 (OM 외 — TemplateConfigModal/PreScreening)
-  if (configPayload && !state && !omFlowActive) {
-    const { template: tpl } = configPayload;
-    return (
-      <>
-        <div className="flex h-screen flex-col bg-white">
-          <SourceOverlay />
-          <Titlebar controlsOnly />
-          <div className="flex flex-1 items-center justify-center">
-            {tpl === "obstacle" ? (
-              <ObstaclePreScreeningModal
-                customRadarSites={configPayload.customRadarSites}
-                aircraft={configPayload.aircraft}
-                metadata={configPayload.metadata}
-                onClose={() => appWindow.destroy()}
-                onGenerate={handlePSGenerate}
-                onCoverageReady={handleCoverageReady}
-                onCoverageError={handleCoverageError}
-              />
-            ) : (
-              <TemplateConfigModal
-                template={tpl}
-                flights={configPayload.flights}
-                aircraft={configPayload.aircraft}
-                metadata={configPayload.metadata}
-                radarSite={configPayload.radarSite}
-                panoramaData={configPayload.panoramaData}
-                onClose={() => appWindow.destroy()}
-                onGenerate={handleModalGenerate}
-              />
-            )}
-          </div>
-        </div>
-        {omModal}
-      </>
-    );
-  }
-
   // 로딩/에러 화면 — state/omData 가 아직 없을 때
   if (loading || error || !state || !activeSections || !omData) {
     return (
@@ -1036,34 +882,6 @@ export default function ReportApp() {
     active: !!activeSections[s.key],
     onToggle: () => setSections((prev) => prev ? { ...prev, [s.key]: !prev[s.key] } : prev),
   }));
-
-  // ── 공통 토글/상태 chip (타이틀바 children 으로 사용) ──
-  // OM 사이드바 분기에서는 PDF 버튼이 사이드바에 있으므로 타이틀바에서는 제외.
-  const sectionTogglePills = (
-    <div className="flex items-center gap-1">
-      {toggles.map((s) => (
-        <button
-          key={s.key}
-          onClick={() => setSections((prev) => prev ? { ...prev, [s.key]: !prev[s.key] } : prev)}
-          className={`rounded px-2 py-1 text-[11px] transition-colors ${
-            activeSections[s.key]
-              ? "bg-[#a60739]/10 text-[#a60739] font-medium"
-              : "text-gray-400 hover:bg-gray-100"
-          }`}
-        >
-          {s.label}
-        </button>
-      ))}
-    </div>
-  );
-
-  const statusChips = (
-    <>
-      {exportError && (
-        <span className="text-xs text-red-500">{exportError}</span>
-      )}
-    </>
-  );
 
   // ── 닫기 확인 모달 (공통) ──
   const closeConfirmModal = closeConfirmOpen && (
@@ -1113,42 +931,23 @@ export default function ReportApp() {
       <ReportPreviewContent
         template={activeTemplate}
         sections={activeSections}
-        flights={state.flights}
-        reportFlights={state.reportFlights}
-        aircraft={state.aircraft}
         radarSite={state.radarSite}
         reportMetadata={effectiveMetadata}
-        panoramaData={state.panoramaData}
-        panoramaPeakNames={state.panoramaPeakNames}
-        coverageLayers={state.coverageLayers}
-        mapImage={state.mapImage}
         omData={omData}
         omResult={omData?.result ?? null}
-        psResult={state.psResult}
-        psSelectedBuildings={state.psSelectedBuildings}
-        psSelectedRadarSites={state.psSelectedRadarSites}
-        psLosMap={state.psLosMap}
-        psCovLayersWith={state.psCovLayersWith}
-        psCovLayersWithout={state.psCovLayersWithout}
-        psAnalysisMonth={state.psAnalysisMonth}
         coverTitle={coverTitle}
         onCoverTitleChange={setCoverTitle}
         coverSubtitle={coverSubtitle}
         onCoverSubtitleChange={setCoverSubtitle}
-        commentary={commentary}
-        onCommentaryChange={setCommentary}
         onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
-        singleFlightChartPoints={state.singleFlightChartPoints}
         previewRef={previewRef}
       />
     </div>
   ) : null;
 
-  // ── 최종 셸 분기 ──
-  // OM 템플릿: 좌측 사이드바(192px) + 우측(타이틀바 + 프리뷰).
-  // 그 외 템플릿: 기존 그대로 (타이틀바에 토글 + PDF 버튼 + 프리뷰만).
-  if (activeTemplate === "obstacle_monthly") {
-    return (
+  // ── 최종 셸 ──
+  // OM 보고서: 좌측 사이드바(192px) + 우측(타이틀바 + 프리뷰).
+  return (
       <>
         <div className="relative flex h-screen flex-row bg-white">
           <SourceOverlay />
@@ -1220,33 +1019,5 @@ export default function ReportApp() {
             위치에 마운트되어 step/analyzing 등 로컬 state 가 분기 전환 시 보존된다. */}
         {omModal}
       </>
-    );
-  }
-
-  // 그 외 템플릿 — 사이드바 없음, 기존 셸 그대로
-  return (
-    <>
-      <div className="relative flex h-screen flex-col bg-white">
-        <SourceOverlay />
-        <Titlebar controlsOnly>
-          {sectionTogglePills}
-          <div className="flex-1" />
-          {statusChips}
-          <button
-            onClick={handleExportPDF}
-            disabled={generating || omPreparing}
-            title={omPreparing ? "섹션 준비 중..." : undefined}
-            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40"
-          >
-            {generating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-            {generating ? `생성 중... ${exportElapsed}초` : omPreparing ? "섹션 준비 중..." : "PDF"}
-          </button>
-        </Titlebar>
-
-        {closeConfirmModal}
-        {previewBlock}
-      </div>
-      {omModal}
-    </>
   );
 }

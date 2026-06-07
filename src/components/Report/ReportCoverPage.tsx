@@ -6,7 +6,7 @@ import ReportPage from "./ReportPage";
 import type { ReportMetadata } from "../../types";
 
 interface CoverPageProps {
-  template: "weekly" | "monthly" | "flights" | "single" | "obstacle" | "obstacle_monthly";
+  template: "obstacle_monthly";
   radarName: string;
   metadata: ReportMetadata;
   editable: boolean;
@@ -40,19 +40,7 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
   const now = useMemo(() => new Date(), []);
   const issueDate = format(now, "yyyy년 MM월 dd일");
 
-  // Eyebrow — 템플릿별 라벨
-  const yearOnly = omMonthLabel?.slice(0, 4) ?? format(now, "yyyy");
-  const eyebrowByTemplate: Record<CoverPageProps["template"], string> = {
-    obstacle_monthly: `${yearOnly} 월간 보고서`,
-    monthly: `${yearOnly} 월간 보고서`,
-    weekly: `${yearOnly} 주간 보고서`,
-    flights: "비행 분석 보고서",
-    single: "단일 비행 분석 보고서",
-    obstacle: "장애물 사전검토 보고서",
-  };
-  const eyebrow = eyebrowByTemplate[template];
-
-  // 정보 테이블 값
+  // 정보 테이블 값 — OM(장애물 월간) 단일 템플릿
   const isOM = template === "obstacle_monthly";
   const radarLabel = omRadarNames && omRadarNames.length > 0 ? omRadarNames.join(" · ") : (radarName || "—");
   // 분석 기간 — OM 은 월 라벨만 표시(예: "2026년 2월"). 일자 범위는 생략.
@@ -72,10 +60,6 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
             </span>
           </div>
           {/* OM 표지는 머리말(eyebrow) 미표시 — 제목이 컬러 블록 하단에 정렬되도록 title 에 margin-top:auto */}
-          {!isOM && eyebrow && (
-            <div className="cover-d-eyebrow">{eyebrow}</div>
-          )}
-
           {isOM ? (
             // OM 시안은 두 줄 표시("레이더 장애물 / 월간 분석 보고서").
             <h1 className="cover-d-title" style={{ marginTop: "auto" }}>레이더 장애물<br />월간 분석 보고서</h1>
