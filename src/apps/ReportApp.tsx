@@ -452,17 +452,30 @@ export default function ReportApp() {
       rafId = requestAnimationFrame(measureNow);
     };
 
+    // 창 가장자리 리사이즈 전용 경로 — 컨테이너(flex-1)는 창 폭과 함께 매 프레임
+    // 크기가 바뀌어 ResizeObserver 가 드래그 내내 발화한다. 그러나 페이지는 210mm
+    // 고정폭이라 리사이즈로 페이지수/TOC/현재페이지 값은 변하지 않으므로 드래그 중
+    // 재측정은 무의미한데, measureNow(전체 [data-page] 동기 getBoundingClientRect +
+    // setState)가 매 프레임 메인 스레드를 점유해 WebView2 리페인트가 끊긴다.
+    // → 드래그가 멎은 뒤 1회만 측정하도록 디바운스해 측정 경로를 리사이즈 프레임에서 분리.
+    let resizeSettle: ReturnType<typeof setTimeout> | null = null;
+    const scheduleResize = () => {
+      if (resizeSettle !== null) clearTimeout(resizeSettle);
+      resizeSettle = setTimeout(schedule, 150);
+    };
+
     // 초기 측정 (DOM 안정화 시간 약간 확보)
     const initialTimer = setTimeout(measureNow, 50);
 
     container.addEventListener("scroll", schedule, { passive: true });
     const mo = new MutationObserver(schedule);
     mo.observe(container, { childList: true, subtree: true });
-    const ro = new ResizeObserver(schedule);
+    const ro = new ResizeObserver(scheduleResize);
     ro.observe(container);
 
     return () => {
       clearTimeout(initialTimer);
+      if (resizeSettle !== null) clearTimeout(resizeSettle);
       if (rafId !== null) cancelAnimationFrame(rafId);
       container.removeEventListener("scroll", schedule);
       mo.disconnect();

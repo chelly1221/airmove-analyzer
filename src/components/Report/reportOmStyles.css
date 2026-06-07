@@ -41,6 +41,11 @@
   counter-increment: page;
   margin: 0 auto 16px;
   box-sizing: border-box;
+  /* 각 페이지의 레이아웃·페인트를 격리 — 창 리사이즈/스크롤 시 브라우저(WebView2)가
+     재계산·리페인트할 범위를 페이지 단위로 한정해 끊김을 줄인다. content-visibility
+     는 의도적으로 미사용 — 화면 밖 페이지 렌더를 스킵하면 PrintToPdf/html2canvas
+     캡처가 빈/잘린 페이지를 만들 수 있어 PDF 안전성 위해 layout/paint 격리만 적용. */
+  contain: layout paint;
 }
 .kac-report .report-page-inner {
   padding: 16mm 14mm 18mm;
