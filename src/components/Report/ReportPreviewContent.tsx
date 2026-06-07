@@ -146,13 +146,13 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       return [
         `• 대상 장애물: ${info?.bldgNames ?? bldgNames} (분석 방위 ${info?.azText || "전체"})`,
         `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
-        `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
+        `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈·트랙스왑/속도이상 오탐 제외)`,
       ];
     }
     const lines = [
       `• 대상 장애물: ${bldgNames}`,
       `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방 항적만 포함`,
-      `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈 제외)`,
+      `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈·트랙스왑/속도이상 오탐 제외)`,
     ];
     for (const rr of rrs) {
       const info = omRadarConditions.get(rr.radar_name);

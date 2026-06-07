@@ -17,9 +17,9 @@ import { PAGE_CONTENT_MM } from "./reportPageConstants";
 /** 표적소실 산출 로직 + 참고용 안내 기본 문구 (인라인 편집 가능) */
 const LOSS_LOGIC_NOTE =
   "표적소실율 = (신호소실 누적 시간 ÷ 전체 추적 시간) × 100. 스캔 주기를 자동 추정(중앙값)한 뒤 "
-  + "임계값(주기 × 1.4)을 초과하는 미탐지 구간을 표적소실로 판정하며, 범위이탈(out-of-range) 구간은 "
-  + "제외하고 신호소실(signal loss)만 집계함. 본 수치는 저장 자료(ASTERIX) 기반으로 자동 산출된 "
-  + "추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있으므로 참고 자료로만 활용 바람.";
+  + "임계값(주기 × 1.4) 초과 ~ 5분(300초) 이하의 미탐지 구간을 표적소실 후보로 보되, 범위이탈(out-of-range)과 "
+  + "속도 이상치·트랙 스왑/그룹핑 오류로 추정되는 구간은 오탐으로 제외하고 신호소실(signal loss)만 집계함. "
+  + "본 수치는 저장 자료(ASTERIX) 기반으로 자동 산출된 추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있으므로 참고 자료로만 활용 바람.";
 
 interface Props {
   sectionNum: number;
@@ -51,10 +51,11 @@ interface Props {
  * 분할. 페이지 inner padding 16/18mm + 새 KPI 행 리스트 높이를 반영한 추정치.
  */
 const HEADER_HEIGHT_MM = 14;
-const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS·음영소실)
+const BLOCK_H3_MM = 8;        // "분석 대상 장애물" 제목 블록 (.block-h3, 15px + 하단여백 8px)
+const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS·추가소실율)
 const ROW_HEIGHT_MM = 7;
-const META_MERGED_MM = 30;   // 방위 + 산식 통합 박스 (.meta-merged)
-const KPI_BLOCK_MM = 50;     // h3(6) + 5 행 × 9mm + 보더 = ~50mm
+const META_MERGED_MM = 80;   // 방위 + 통계산식 + 표적소실 산출노트 3행 (.meta-merged, 장문 텍스트 다중 줄)
+const KPI_BLOCK_MM = 60;     // om-h3(~8mm) + 5행 × ~9.5mm + 블록 하단여백 12px ≈ 60mm
 
 function ReportOMSummarySection({
   sectionNum,
@@ -112,7 +113,7 @@ function ReportOMSummarySection({
   }, [selectedBuildings, radarSites, radarGeoKey, losMap, lossPointsByRadar, panoWithByRadar, panoWithoutByRadar]);
 
   // 첫 페이지에 들어갈 수 있는 건물 행 수 계산
-  const fixedContentMm = HEADER_HEIGHT_MM + TABLE_HEADER_MM + META_MERGED_MM
+  const fixedContentMm = HEADER_HEIGHT_MM + BLOCK_H3_MM + TABLE_HEADER_MM + META_MERGED_MM
     + radarResults.length * KPI_BLOCK_MM;
   const availForRows = PAGE_CONTENT_MM - fixedContentMm;
   const maxRowsFirstPage = Math.max(3, Math.floor(availForRows / ROW_HEIGHT_MM));
@@ -122,7 +123,7 @@ function ReportOMSummarySection({
   const totalBuildings = selectedBuildings.length;
   const needsSplit = totalBuildings > maxRowsFirstPage;
 
-  // ── 분석 대상 장애물 표 (2단 헤더: 레이더 그룹 × 방위/거리·LoS·음영소실) ──────────
+  // ── 분석 대상 장애물 표 (2단 헤더: 레이더 그룹 × 방위/거리·LoS·추가소실율) ──────────
   const renderBuildingTable = (buildings: ManualBuilding[], startIdx: number) => (
     <table className="om-table">
       <thead>
@@ -224,10 +225,10 @@ function ReportOMSummarySection({
         <OMEditable id="summary.formulaLabel" value="통계 산식" tag="p" className="meta-merged-label" />
         <div>
           <span className="strong">통계 산식 · </span>
-          평균: 관측량 가중 평균 <i>x̄ᵥᵥ = Σ(wᵢ·xᵢ) / Σ(wᵢ)</i>
+          평균: 관측량 가중 평균 <i>x̄<sub>w</sub> = Σ(wᵢ·xᵢ) / Σ(wᵢ)</i>
           {" "}(Loss: w=비행시간, PSR: w=SSR포인트수){" · "}
-          <i>±σ</i>: 가중 모표준편차 <i>σᵥᵥ = √(Σ(wᵢ(xᵢ - x̄ᵥᵥ)²) / Σ(wᵢ))</i>{" · "}
-          판정: 양호(&lt;0.5%) / 주의(0.5–2%) / 경고(≥2%) / 보류(&lt;7일)
+          <i>±σ</i>: 가중 모표준편차 <i>σ<sub>w</sub> = √(Σ(wᵢ·(xᵢ - x̄<sub>w</sub>)²) / Σ(wᵢ))</i>{" · "}
+          판정: 양호(&lt;0.5%) / 주의(0.5~2% 미만) / 경고(≥2%) / 보류(&lt;7일)
           {" · "}
           <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형·기존지물 차단각~대상 차단각 사이 양각 밴드)을 <i>지나는 항적이 그 안에서 소실되는 비율</i>. 차단영역 내 항적이 부족하면 "항적 없음", 관측 7일 미만 또는 항적 발생일 3일 미만 시 "판정 보류". (파노라마 미가용 시 음영소실 건수로 폴백)
         </div>
@@ -273,12 +274,12 @@ function ReportOMSummarySection({
           <div className="kpi">
             <p className="kpi-label">평균 PSR율</p>
             <p className="kpi-val" style={{ color: "var(--om-accent)" }}>{avgPsr.toFixed(2)}%</p>
-            <p className="kpi-sigma">±{psrSigma.toFixed(2)}</p>
+            <p className="kpi-sigma">±{psrSigma.toFixed(2)}%p</p>
           </div>
           <div className="kpi">
             <p className="kpi-label">평균 표적소실율</p>
             <p className="kpi-val" style={{ color: "#a60739" }}>{avgLoss.toFixed(3)}%</p>
-            <p className="kpi-sigma">±{lossSigma.toFixed(3)}</p>
+            <p className="kpi-sigma">±{lossSigma.toFixed(3)}%p</p>
           </div>
         </div>
         {rr.failed_files.length > 0 && (

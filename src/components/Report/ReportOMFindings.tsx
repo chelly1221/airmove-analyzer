@@ -247,12 +247,12 @@ function ReportOMFindings({
       <div className="formula-grid-inner">
         <div>
           <OMEditable id="findings.formula.h1" value="관측량 가중 평균" tag="p" className="formula-h" />
-          <p className="formula-math"><i>x̄ᵥᵥ = Σᵢ(wᵢ·xᵢ) / Σᵢ(wᵢ)</i></p>
+          <p className="formula-math"><i>x̄<sub>w</sub> = Σᵢ(wᵢ·xᵢ) / Σᵢ(wᵢ)</i></p>
           <p>Loss: <i>w</i> = 비행시간 · PSR: <i>w</i> = SSR 포인트수</p>
         </div>
         <div>
           <OMEditable id="findings.formula.h2" value="가중 모표준편차" tag="p" className="formula-h" />
-          <p className="formula-math"><i>σᵥᵥ = √( Σᵢ(wᵢ(xᵢ - x̄ᵥᵥ)²) / Σᵢ(wᵢ) )</i></p>
+          <p className="formula-math"><i>σ<sub>w</sub> = √( Σᵢ(wᵢ·(xᵢ - x̄<sub>w</sub>)²) / Σᵢ(wᵢ) )</i></p>
         </div>
         <div>
           <OMEditable id="findings.formula.h3" value="Loss 탐지" tag="p" className="formula-h" />
@@ -263,7 +263,7 @@ function ReportOMFindings({
           <OMEditable id="findings.formula.h4" value="판정 기준" tag="p" className="formula-h" />
           <p>
             <span className="pill pill-ok">양호</span> &lt; 0.5% ·{" "}
-            <span className="pill pill-warn">주의</span> 0.5–2% ·{" "}
+            <span className="pill pill-warn">주의</span> 0.5~2% 미만 ·{" "}
             <span className="pill pill-bad">경고</span> ≥ 2% ·{" "}
             <span className="pill pill-hold">보류</span> &lt; 7일
           </p>
