@@ -198,7 +198,6 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                 selectedBuildings={omData.selectedBuildings}
                 buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
-                azimuthSectorsByRadar={omData.azSectorsByRadar}
                 losMap={omData.losMap}
                 panoWithByRadar={omData.panoWithTargets}
                 panoWithoutByRadar={omData.panoWithoutTargets}

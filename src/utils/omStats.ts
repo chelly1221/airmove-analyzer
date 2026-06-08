@@ -20,7 +20,8 @@
  *
  * 표준편차는 **가중 모표준편차(population weighted σ)** 를 사용한다:
  *   σ_w = √( Σ(w_i · (x_i - x̄_w)²) / Σ(w_i) )
- *   - reliability weights(빈도 가중치)이므로 Bessel 보정(N-1) 불필요
+ *   - 관측량 기반 빈도성(frequency) 가중치 + 대표본(관측일수)이라 Bessel 보정(N-1) 영향이
+ *     무시 가능 → 기술통계용 모표준편차(분모 Σw) 채택. (reliability weight 의 불편분산 보정과는 구분)
  *
  * ── 판정 보류 기준 ──
  * 관측일수 < 7일이면 "판정 보류":

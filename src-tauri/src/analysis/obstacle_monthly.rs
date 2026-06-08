@@ -672,7 +672,7 @@ pub fn analyze_radar_monthly(
                 continue;
             }
 
-            // 비행 시간 (gap 유효성 확인 후 누적)
+            // 비행 시간 (gap 유효성 확인 후 누적) — 부재 구간 포함 전체 경과시간(첫~마지막 포인트)
             let track_time = pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
             day_track_time += track_time;
             gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

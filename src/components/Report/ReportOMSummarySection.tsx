@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, AzSector, LoSProfileData, LossPointGeo, PanoramaMergeResult } from "../../types";
+import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, LossPointGeo, PanoramaMergeResult } from "../../types";
 import type { AddedBlockageResult } from "../../types/obstacle";
 import {
   weightedLossAvg, weightedLossStdDev,
@@ -28,8 +28,6 @@ interface Props {
   /** 건물 그룹 메타 (인라인 배지 표시용) */
   buildingGroups: BuildingGroup[];
   radarSites: RadarSite[];
-  /** 레이더별 방위 구간 (레이더 이름 → AzSector[]) */
-  azimuthSectorsByRadar: Map<string, AzSector[]>;
   /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) — 차단여부·음영소실 열용 */
   losMap: Map<string, LoSProfileData>;
   /** 레이더별 분석대상 포함/제외 파노라마 — 음영소실 분류를 AzElev 차트와 동일 소스(빨강영역)로 산출 */
@@ -54,7 +52,7 @@ const HEADER_HEIGHT_MM = 14;
 const BLOCK_H3_MM = 8;        // "분석 대상 장애물" 제목 블록 (.block-h3, 15px + 하단여백 8px)
 const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS·추가소실율)
 const ROW_HEIGHT_MM = 7;
-const META_MERGED_MM = 80;   // 방위 + 통계산식 + 표적소실 산출노트 3행 (.meta-merged, 장문 텍스트 다중 줄)
+const META_MERGED_MM = 58;   // 통계산식 + 표적소실 산출노트 2행 (.meta-merged, 장문 텍스트 다중 줄)
 const KPI_BLOCK_MM = 60;     // om-h3(~8mm) + 5행 × ~9.5mm + 블록 하단여백 12px ≈ 60mm
 
 function ReportOMSummarySection({
@@ -63,7 +61,6 @@ function ReportOMSummarySection({
   selectedBuildings,
   buildingGroups,
   radarSites,
-  azimuthSectorsByRadar,
   losMap,
   panoWithByRadar,
   panoWithoutByRadar,
@@ -86,9 +83,11 @@ function ReportOMSummarySection({
   //   Detail.siblings 가 [radarSite.latitude, radarSite.longitude] 에 의존 → 동일 민감도로 동기화(sibling 오귀속 일치).
   const radarGeoKey = radarSites.map((r) => `${r.latitude},${r.longitude},${r.name}`).join(";");
 
-  // 건물×레이더 음영소실(장애물 추가 기인) 건수 — AzElevChart 와 동일 분류(classifyObstacleLosses)
-  const shadowLossByKey = useMemo(() => {
-    const m = new Map<string, number>();
+  // 건물×레이더: 음영소실(장애물 추가 기인) 건수 + 추가 차단 여부 — AzElevChart 와 동일 분류(classifyObstacleLosses)
+  //   hasBldgEffect = 대상 차단각(with) > 지형·기존지물 차단각(without)+0.005° → 섹션3(AzElevChart)·LoS 단면도와 동일 조건.
+  //   추가 차단 양각이 없으면(지형 이하) LoS 열을 '차단'이 아닌 '양호'로 표기(섹션2,3 통일).
+  const obstacleInfoByKey = useMemo(() => {
+    const m = new Map<string, { shadowLoss: number; hasBldgEffect: boolean }>();
     for (const r of radarSites) {
       // 같은 레이더의 건물별 방위 (sibling 오귀속 방지용 — 가장 가까운 방위 건물에 귀속)
       const azByBldg = selectedBuildings.map((b) => ({
@@ -100,12 +99,14 @@ function ReportOMSummarySection({
         const los = losMap.get(`${r.name}_${b.id}`);
         if (!los) continue;
         const siblings = azByBldg.filter((x) => x.id !== b.id).map((x) => ({ id: x.id, azDeg: x.azDeg, distKm: x.distKm }));
-        const { buildingCount } = classifyObstacleLosses(r, b, los, lossPointsByRadar.get(r.name) ?? [], {
+        const { buildingCount, angleTotalDeg, angleTerrainDeg } = classifyObstacleLosses(r, b, los, lossPointsByRadar.get(r.name) ?? [], {
           panoWith: panoWithByRadar?.get(r.name),
           panoWithout: panoWithoutByRadar?.get(r.name),
           siblings,
         });
-        m.set(`${r.name}_${b.id}`, buildingCount);
+        // 추가 차단 양각 존재 여부 (AzElevChart hasBldgEffect 와 동일 임계 0.005°)
+        const hasBldgEffect = angleTotalDeg > angleTerrainDeg + 0.005;
+        m.set(`${r.name}_${b.id}`, { shadowLoss: buildingCount, hasBldgEffect });
       }
     }
     return m;
@@ -163,15 +164,19 @@ function ReportOMSummarySection({
                 const az = bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude);
                 const dist = haversineKm(r.latitude, r.longitude, b.latitude, b.longitude);
                 const los = losMap.get(`${r.name}_${b.id}`);
-                const shadowLoss = shadowLossByKey.get(`${r.name}_${b.id}`) ?? 0;
+                const info = obstacleInfoByKey.get(`${r.name}_${b.id}`);
+                const shadowLoss = info?.shadowLoss ?? 0;
+                // LoS 차단 = 대상 건물이 기존 지형지물 대비 추가 차단 양각을 만드는 경우만(섹션2,3 동일 조건).
+                //   추가 차단각이 없으면(지형 이하) 직선 LoS 가 지형에 막혀도 '양호'로 표기.
+                const blocked = info?.hasBldgEffect ?? false;
                 const blockage = addedBlockageByKey?.[`${r.name}_${b.id}`];
                 return (
                   <React.Fragment key={`cell-${r.name}-${b.id}`}>
                     <td className="ta-c mono sm">{az.toFixed(1)}° / {dist.toFixed(1)}km</td>
                     <td className="ta-c sm">
                       {los ? (
-                        <span className={`badge ${los.losBlocked ? "bad" : "ok"}`}>
-                          {los.losBlocked ? "차단" : "양호"}
+                        <span className={`badge ${blocked ? "bad" : "ok"}`}>
+                          {blocked ? "차단" : "양호"}
                         </span>
                       ) : (
                         <span className="muted">—</span>
@@ -206,21 +211,6 @@ function ReportOMSummarySection({
   // ── 방위·산식 통합 박스 (.meta-merged) ────────────────────────────────
   const renderMetaMerged = () => (
     <div className="meta-merged">
-      <div className="meta-merged-row az">
-        <OMEditable id="summary.azLabel" value="분석 방위 구간" tag="p" className="meta-merged-label" />
-        <div className="az-grid">
-          {radarSites.map((r) => {
-            const sectors = azimuthSectorsByRadar.get(r.name) ?? [];
-            const sectorText = sectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ") || "—";
-            return (
-              <div key={r.name}>
-                <span className="muted">{r.name}:</span>{" "}
-                <span className="mono strong">{sectorText}</span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
       <div className="meta-merged-row formula">
         <OMEditable id="summary.formulaLabel" value="통계 산식" tag="p" className="meta-merged-label" />
         <div>
@@ -230,7 +220,7 @@ function ReportOMSummarySection({
           <i>±σ</i>: 가중 모표준편차 <i>σ<sub>w</sub> = √(Σ(wᵢ·(xᵢ - x̄<sub>w</sub>)²) / Σ(wᵢ))</i>{" · "}
           판정: 양호(&lt;0.5%) / 주의(0.5~2% 미만) / 경고(≥2%) / 보류(&lt;7일)
           {" · "}
-          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형·기존지물 차단각~대상 차단각 사이 양각 밴드)을 <i>지나는 항적이 그 안에서 소실되는 비율</i>. 차단영역 내 항적이 부족하면 "항적 없음", 관측 7일 미만 또는 항적 발생일 3일 미만 시 "판정 보류". (파노라마 미가용 시 음영소실 건수로 폴백)
+          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형·기존지물 차단각~대상 차단각 사이 양각 밴드)을 <i>지나는 항적이 그 안에서 소실되는 비율</i>. 판정 순서 — 관측 7일 미만이면 "판정 보류", 차단영역 내 누적 노출 10분 미만이면 "항적 없음", 노출 발생일 3일 미만이면 "판정 보류". (파노라마 미가용 시 음영소실 건수로 폴백)
         </div>
       </div>
       <div className="meta-merged-row formula" style={{ borderTop: "1px solid var(--om-border)" }}>
