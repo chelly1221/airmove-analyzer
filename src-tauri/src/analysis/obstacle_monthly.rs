@@ -160,6 +160,9 @@ struct LightPoint {
     altitude: f64,
     speed: f64,
     radar_type: RadarDetectionType,
+    /// 고도 상한(FL200) 초과 여부. 모든 점 단위 통계/표시에서 제외되며,
+    /// 시간창(windows) 소실 탐지에서는 트랙을 끊는 경계로만 사용된다.
+    above_cap: bool,
 }
 
 impl LightPoint {
@@ -172,8 +175,33 @@ impl LightPoint {
             altitude: tp.altitude,
             speed: tp.speed,
             radar_type: tp.radar_type.clone(),
+            above_cap: tp.altitude > OM_MAX_ALTITUDE_M,
         }
     }
+}
+
+/// 시간순 정렬된 단일 mode_s 트랙을, 고도 상한(FL200) 초과 지점에서 끊어
+/// 하위-상한(≤FL200) 연속 구간들로 분할한다. 상한 초과 지점은 어느 구간에도
+/// 포함되지 않으므로, 각 구간의 windows(2) gap이 천장 통과 구간을 가로지르지
+/// 못한다 — FL200 상승/하강 통과로 인한 허위 소실(가짜 신호소실) 방지.
+/// (상한 초과 점을 단순 제거하면 통과 전후 점이 직접 이어져, 거리·속도가
+///  일관된 가짜 gap이 만들어져 is_oor 4개 가드를 모두 통과해 소실로 오판됨.)
+fn split_subcap_segments<'a>(sorted_pts: &[&'a LightPoint]) -> Vec<Vec<&'a LightPoint>> {
+    let mut segments: Vec<Vec<&'a LightPoint>> = Vec::new();
+    let mut current: Vec<&'a LightPoint> = Vec::new();
+    for &p in sorted_pts {
+        if p.above_cap {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(p);
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 // ─── 베이스라인 일 단위 플러시 (메모리 최적화) ───
@@ -201,14 +229,14 @@ fn process_baseline_day(
         return BaselineDayResult { psr_rate: 0.0, loss_rate: 0.0, track_time_secs: 0.0, ssr_points: 0 };
     }
 
-    // PSR 베이스라인
+    // PSR 베이스라인 (FL200 초과 제외)
     let bl_ssr = bl_points.iter().filter(|p| {
         let dist = calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude);
-        dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
+        !p.above_cap && dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
     }).count() as u32;
     let bl_psr = bl_points.iter().filter(|p| {
         let dist = calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude);
-        dist <= PSR_RANGE_KM && is_psr_combined(&p.radar_type)
+        !p.above_cap && dist <= PSR_RANGE_KM && is_psr_combined(&p.radar_type)
     }).count() as u32;
     let psr_rate = if bl_ssr > 0 { bl_psr as f64 / bl_ssr as f64 } else { 0.0 };
 
@@ -220,9 +248,12 @@ fn process_baseline_day(
     let mut bl_track_time = 0.0f64;
     let mut bl_loss_time = 0.0f64;
 
-    for (_ms, mut pts) in bl_ms_groups {
+    for (_ms, mut all_pts) in bl_ms_groups {
+        if all_pts.len() < 2 { continue; }
+        all_pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+        // FL200 초과 지점에서 트랙을 끊어 하위-상한 구간별로 처리 (천장 통과 허위 소실 방지)
+        for pts in split_subcap_segments(&all_pts) {
         if pts.len() < 2 { continue; }
-        pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
         bl_track_time += pts.last().unwrap().timestamp - pts.first().unwrap().timestamp;
         let mut bl_gaps: Vec<f64> = pts.windows(2)
             .map(|w| w[1].timestamp - w[0].timestamp)
@@ -263,6 +294,7 @@ fn process_baseline_day(
                 }
             }
         }
+        } // split_subcap_segments 루프 종료
     }
     let loss_rate = if bl_track_time > 0.0 { (bl_loss_time / bl_track_time) * 100.0 } else { 0.0 };
     BaselineDayResult { psr_rate, loss_rate, track_time_secs: bl_track_time, ssr_points: bl_ssr }
@@ -298,6 +330,12 @@ const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
 
 /// PSR 통계 계산 범위: 60NM
 const PSR_RANGE_KM: f64 = 60.0 * 1.852;
+
+/// OM 분석 고도 상한 — 20,000 FT(FL200) 초과 항적은 모든 분석에서 제외.
+/// TrackPoint/LightPoint.altitude 는 미터 단위(20000ft = 20000×0.3048 = 6096.0 m).
+/// 비교는 strict `>` 로 수행하여 정확히 FL200(6096.0 m) 표적은 포함한다.
+/// 표시용 alt_ft 필드는 미터×3.28084 로 별도 변환됨에 유의(단위 혼동 방지).
+const OM_MAX_ALTITUDE_M: f64 = 6096.0;
 
 // ─── 추가 차단영역 히스토그램 상수 ───
 // 방위×양각 시간 히스토그램의 빈 크기·범위. 프론트(omAddedBlockage.ts)와 반드시 일치.
@@ -487,13 +525,17 @@ pub fn analyze_radar_monthly(
             let in_sector = in_any_sector(az, &radar.azimuth_sectors);
             let date = timestamp_to_date(tp.timestamp);
 
-            // 분석 대상: 방위 구간 내 항적
+            // 분석 대상: 방위 구간 내 항적.
+            // FL200 초과 점도 버킷에는 보관(시간창 소실 탐지의 트랙 분할 경계로만 사용)하되,
+            // '분석 포인트' 카운트(total_filtered)와 점 단위 통계에서는 제외한다.
             if in_sector {
                 daily_points
                     .entry(date.clone())
                     .or_default()
                     .push(LightPoint::from_track_point(tp));
-                total_filtered += 1;
+                if tp.altitude <= OM_MAX_ALTITUDE_M {
+                    total_filtered += 1;
+                }
             }
 
             // 비교기준(베이스라인) = 전체 방위 (분석 구간 포함).
@@ -607,6 +649,7 @@ pub fn analyze_radar_monthly(
         // (기존: 전체 포인트 ~270만개 → 수만 개로 99% 감소)
         let day_track_geo: Vec<TrackPointGeo> = if has_building_bearings {
             points.iter().filter(|p| {
+                if p.above_cap { return false; } // FL200 초과 제외
                 let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
                 in_any_building_bearing(az, &radar.building_bearings_deg)
             }).map(|p| TrackPointGeo {
@@ -629,14 +672,14 @@ pub fn analyze_radar_monthly(
             day_track_geo
         };
 
-        // PSR 통계 (60NM 이내만)
+        // PSR 통계 (60NM 이내, FL200 초과 제외)
         let ssr_combined = points.iter().filter(|p| {
             let dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
-            dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
+            !p.above_cap && dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
         }).count() as u32;
         let psr_combined = points.iter().filter(|p| {
             let dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
-            dist <= PSR_RANGE_KM && is_psr_combined(&p.radar_type)
+            !p.above_cap && dist <= PSR_RANGE_KM && is_psr_combined(&p.radar_type)
         }).count() as u32;
         let psr_rate = if ssr_combined > 0 {
             psr_combined as f64 / ssr_combined as f64
@@ -656,11 +699,18 @@ pub fn analyze_radar_monthly(
         // 추가 차단영역 히스토그램 누적기: key=(az_bin<<16)|elev_bin, val=(track_time, loss_time)
         let mut day_hist: HashMap<u32, (f64, f64)> = HashMap::new();
 
-        for (_ms, mut pts) in mode_s_groups {
+        for (_ms, mut all_pts) in mode_s_groups {
+            if all_pts.len() < 2 {
+                continue;
+            }
+            all_pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+
+            // FL200 초과 지점에서 트랙을 끊어 하위-상한 구간별로 소실 탐지.
+            // (천장 통과 점을 단순 제거하면 통과 전후가 직접 이어져 허위 소실이 생김 — split 으로 방지.)
+            for pts in split_subcap_segments(&all_pts) {
             if pts.len() < 2 {
                 continue;
             }
-            pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
 
             // 스캔 간격 추정 (median)
             let mut gaps: Vec<f64> = pts.windows(2)
@@ -766,6 +816,7 @@ pub fn analyze_radar_monthly(
                     }
                 }
             }
+            } // split_subcap_segments 루프 종료
         }
 
         let loss_rate = if day_track_time > 0.0 {

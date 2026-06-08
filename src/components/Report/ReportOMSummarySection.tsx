@@ -257,7 +257,7 @@ function ReportOMSummarySection({
             <p className="kpi-sigma" />
           </div>
           <div className="kpi">
-            <p className="kpi-label">분석 포인트</p>
+            <p className="kpi-label">분석 포인트(≤FL200)</p>
             <p className="kpi-val">{totalPts.toLocaleString()}</p>
             <p className="kpi-sigma" />
           </div>
