@@ -8,21 +8,12 @@ import { calcBuildingAzExtent, isTargetBuildingOnPath } from "../../utils/obstac
 
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
-const R_EFF_M = (R_EARTH_M * 4) / 3; // 4/3 유효지구반경 (표준 대기 굴절 k=4/3)
 
 /** 디스플레이 프레임 곡률 보정량 (m): 실제 지구반경 기준
  *  → 직선 LoS 가 직선으로, 지형이 거리에 따라 아래로 처져 보임 */
 function curvDrop(dKm: number): number {
   const dM = dKm * 1000;
   return (dM * dM) / (2 * R_EARTH_M);
-}
-
-/** 4/3 유효지구 곡률 보정량 (m): 표준 대기 굴절 적용 시 레이더 빔이 직선이 되는 프레임.
- *  최저 탐지가능 높이(레이더 빔)를 이 프레임에서 직선 전파 후
- *  디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d) */
-function curvDrop43(dKm: number): number {
-  const dM = dKm * 1000;
-  return (dM * dM) / (2 * R_EFF_M);
 }
 
 // ── SVG 차트 상수 (TrackMap LoSProfilePanel 과 동일) ──
@@ -58,7 +49,7 @@ export interface ChartTrackPoint {
  * LoS 단면도 — TrackMap LoSProfilePanel 의 chartData/렌더링을 보고서용으로 그대로 이식.
  *
  *  TrackMap 과 동일한 요소:
- *   - LoS (4/3 유효지구 굴절, running max angle, 통합 obstacle 배열) — 주황 실선
+ *   - LoS (직선/굴절 미적용, running max angle, 통합 obstacle 배열) — 주황 실선
  *   - 지형 (지구곡률 보정) — 녹색 솔리드
  *   - 경로상 빌딩: polygon 은 사다리꼴, point 는 세로선; 차폐 기여(빨강) / 비차단(회색) / 수동(주황)
  *   - 범례 좌상단 + 빌딩 카운트
@@ -116,10 +107,10 @@ export function LosCrossSection({
     }
     obstacles.sort((a, b) => a.distance - b.distance);
 
-    // 2) 최저 탐지가능선 (4/3 유효지구 굴절, Running Max Angle) — TrackMap minDetStraight 와 동일.
+    // 2) 최저 탐지가능선 (직선 LoS, 굴절 미적용, Running Max Angle).
     //    지형 base(terrainPts) + 건물(blds) 통합 obstacle 에 대해 running-max 앙각 계산.
-    //    레이더 빔은 4/3 프레임에서 직선 → 앙각을 4/3 프레임에서 계산 후
-    //    디스플레이(실제지구) 프레임으로 변환: h_display = h43 + curvDrop43(d) - curvDrop(d).
+    //    레이더 빔을 실제지구(디스플레이) 프레임에서 직선으로 전파 — 4/3 유효지구 굴절 미적용.
+    //    앙각·빔 높이 모두 실제지구 곡률 보정(curvDrop)만 사용하므로 추가 프레임 변환 불필요.
     //    동일 알고리즘을 (지형+모든건물) / (순수지형+대상제외건물) 두 입력으로 호출.
     const computeMinDet = (terrainPts: ElevationPoint[], blds: BuildingOnPath[]) => {
       if (terrainPts.length === 0) return [] as { distance: number; height: number }[];
@@ -169,7 +160,7 @@ export function LosCrossSection({
         return elev;
       };
 
-      let maxAngle43 = -Infinity;
+      let maxAngle = -Infinity;
       let obIdx = 0;
       return dists.map((d) => {
         if (d <= 0) return { distance: d, height: radarHeight };
@@ -177,17 +168,17 @@ export function LosCrossSection({
         while (obIdx < obs.length && obs[obIdx].distance <= d + 1e-9) {
           const ob = obs[obIdx];
           if (ob.distance > 0) {
-            const adjH43 = ob.elevation - curvDrop43(ob.distance);
-            const angle = (adjH43 - radarHeight) / (ob.distance * 1000);
-            if (angle > maxAngle43) maxAngle43 = angle;
+            const adjH = ob.elevation - curvDrop(ob.distance);
+            const angle = (adjH - radarHeight) / (ob.distance * 1000);
+            if (angle > maxAngle) maxAngle = angle;
           }
           obIdx++;
         }
         const terrElev = effElevAt(d);
-        const terrAngle = (terrElev - curvDrop43(d) - radarHeight) / dM;
-        if (terrAngle > maxAngle43) maxAngle43 = terrAngle;
-        // 4/3 프레임 빔 높이 → 디스플레이(실제지구) 프레임 변환, 디스플레이 지형을 floor 로
-        const losDisplay = radarHeight + maxAngle43 * dM + curvDrop43(d) - curvDrop(d);
+        const terrAngle = (terrElev - curvDrop(d) - radarHeight) / dM;
+        if (terrAngle > maxAngle) maxAngle = terrAngle;
+        // 직선 빔 높이 — 실제지구(디스플레이) 프레임 그대로, 굴절 보정 없음. 디스플레이 지형을 floor 로
+        const losDisplay = radarHeight + maxAngle * dM;
         const adjTerrainDisplay = terrElev - curvDrop(d);
         return { distance: d, height: Math.max(adjTerrainDisplay, losDisplay) };
       });
@@ -833,7 +824,7 @@ export function LosCrossSection({
               stroke="#14b8a6" strokeWidth={1.5} strokeDasharray="5 3" />
           )}
 
-          {/* LoS (4/3 유효지구 굴절, 메인) */}
+          {/* LoS (직선, 메인) */}
           <path d={minDetStrPath} fill="none"
             stroke="#f59e0b" strokeWidth={1.8} />
 
@@ -852,7 +843,7 @@ export function LosCrossSection({
             fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
           <line x1={0} y1={0} x2={20} y2={0} stroke="#f59e0b" strokeWidth={1.8} />
           <text x={24} y={3} fill="#374151" fontSize={8}>
-            최저 탐지가능 높이 (LoS, 4/3 굴절)
+            최저 탐지가능 높이 (LoS, 직선)
           </text>
           <line x1={0} y1={14} x2={20} y2={14} stroke="#22c55e" strokeWidth={1.5} />
           <text x={24} y={17} fill="#374151" fontSize={8}>

@@ -70,16 +70,17 @@ export async function computeLosBatch(
         }
 
         // 차단 판정: 빌딩 거리까지의 terrain 만 봄 (빌딩 너머 지형은 빌딩 가시성에 무관).
+        //   직선 LoS — 실제지구(R=6,371,000) 곡률만 보정하고 4/3 유효지구 굴절은 적용하지 않는다.
+        //   단면도(ReportOMLosCrossSection) 표시·차단 배지와 동일 프레임이라 los.losBlocked 와 차트 판정이 일치.
         let blocked = false;
         let maxBlockDist = 0, maxBlockElev = -Infinity, maxBlockName = "";
         const R = 6371000;
-        const Reff = R * 4 / 3;
         const targetElev = bldg.ground_elev + bldg.height;
         for (let k = 1; k <= samplesToBuilding && k < combinedElev.length; k++) {
           const d = (k / samples) * profileEndKm * 1000;
           const t = samplesToBuilding > 0 ? k / samplesToBuilding : 0; // radar↔building 보간 (0~1)
           const losHeight = radarHeight * (1 - t) + targetElev * t;
-          const curvDrop = (d * d) / (2 * Reff);
+          const curvDrop = (d * d) / (2 * R);
           const terrainAdjusted = combinedElev[k] + curvDrop;
           if (terrainAdjusted > losHeight) {
             blocked = true;
