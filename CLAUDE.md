@@ -64,7 +64,8 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 - 실제 지구(R=6,371km) 디스플레이 프레임에서 4/3 유효지구(R_eff=8,495km) 굴절 경로 표시
 - `curvDrop(d) = d²/(2R)`, `curvDrop43(d) = d²/(2R_eff)`
 - 4/3 굴절선 디스플레이 변환: `h43 + curvDrop43(d) - curvDrop(d)`
-- 차단 판정은 4/3 프레임에서 수행
+- 차단 판정은 4/3 프레임에서 수행 — 일반 LOS·커버리지(TrackMap `LoSProfilePanel`, Rust `los.rs`/`coverage.rs`)에 적용
+- **예외 — OM 보고서 LoS 단면도**: `ReportOMLosCrossSection` + `computeLosBatch`(obstacleAnalysisHelpers)는 4/3 굴절 미적용, 실제지구 곡률(`curvDrop`)만 쓰는 **직선 LoS**. 차트 표시와 차단 배지(`los.losBlocked`) 프레임을 통일하기 위함 (4/3 ↔ 직선 혼동 주의)
 - 고도: SRTM HGT (로컬), 산 이름: peak DB (N3P SHP, 오프라인)
 
 ### 좌표 변환 (coord.rs)
