@@ -8,6 +8,8 @@ import {
   weightedPsrAvg, weightedPsrStdDev,
   weightedBaselineLossAvg, weightedBaselineLossStdDev,
   gradeWithConfidence,
+  BLOCKAGE_MIN_DAYS, BLOCKAGE_MIN_EXPOSURE_S, BLOCKAGE_MIN_EXPOSURE_DAYS,
+  BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT,
 } from "../../utils/omStats";
 import { haversineKm } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
@@ -221,7 +223,9 @@ function ReportOMFindings({
         <tbody>{blockageRows}</tbody>
       </table>
       <p className="muted" style={{ fontSize: "9px", marginTop: 4 }}>
-        추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형·기존지물 차단각~대상 차단각)를 지나는 항적이 그 안에서 소실되는 비율. 차단영역 내 항적이 부족하면 "항적 없음".
+        추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형·기존지물 차단각~대상 차단각)를 지나는 항적이 그 안에서 소실되는 비율.
+        {" "}판정 순서 — 관측 {BLOCKAGE_MIN_DAYS}일 미만이면 "판정 보류", 차단영역 내 누적 노출 {BLOCKAGE_MIN_EXPOSURE_S / 60}분 미만이면 "항적 없음", 노출 발생일 {BLOCKAGE_MIN_EXPOSURE_DAYS}일 미만이면 "판정 보류".
+        {" "}등급(전구간 평균 소실율 기준과 별도) — 양호 &lt; {BLOCKAGE_CAUTION_PCT.toFixed(1)}% · 주의 {BLOCKAGE_CAUTION_PCT.toFixed(1)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 · 경고 ≥ {BLOCKAGE_ALERT_PCT.toFixed(0)}%.
       </p>
     </div>
   ) : null;
@@ -260,7 +264,7 @@ function ReportOMFindings({
           <p className="formula-math"><i>임계값 = 주기 × 1.4</i></p>
         </div>
         <div>
-          <OMEditable id="findings.formula.h4" value="판정 기준" tag="p" className="formula-h" />
+          <OMEditable id="findings.formula.h4" value="판정 기준 (평균 소실율)" tag="p" className="formula-h" />
           <p>
             <span className="pill pill-ok">양호</span> &lt; 0.5% ·{" "}
             <span className="pill pill-warn">주의</span> 0.5~2% 미만 ·{" "}

@@ -110,14 +110,11 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     return nums;
   }, [sections, omData?.losMap]);
 
-  // OM 레이더별 조건 텍스트
+  // OM 레이더별 조건 텍스트 — 장애물 후방(최근접) 거리만 사용
   const omRadarConditions = useMemo(() => {
-    if (!omResult) return new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
-    const map = new Map<string, { azText: string; bldgNames: string; minDistNm: string }>();
+    if (!omResult) return new Map<string, { minDistNm: string }>();
+    const map = new Map<string, { minDistNm: string }>();
     for (const rr of omResult.radar_results) {
-      const sectors = omData.azSectorsByRadar.get(rr.radar_name) ?? [];
-      const azText = sectors.map((s) => `${s.start_deg.toFixed(1)}°~${s.end_deg.toFixed(1)}°`).join(", ");
-      const bldgNames = omData.selectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
       const rs = omData.selectedRadarSites.find((r) => r.name === rr.radar_name);
       let minDistKm = Infinity;
       if (rs) {
@@ -131,35 +128,33 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
         }
       }
       if (!isFinite(minDistKm)) minDistKm = 0;
-      map.set(rr.radar_name, { azText, bldgNames, minDistNm: (minDistKm / 1.852).toFixed(1) });
+      map.set(rr.radar_name, { minDistNm: (minDistKm / 1.852).toFixed(1) });
     }
     return map;
-  }, [omResult, omData.azSectorsByRadar, omData.selectedRadarSites, omData.selectedBuildings]);
+  }, [omResult, omData.selectedRadarSites, omData.selectedBuildings]);
 
-  // 일별 차트 조건 박스 — 단일 레이더면 기존 3줄, 다중 레이더면 공통 3줄 + 레이더별 방위/거리
+  // 일별 차트 조건 박스 — 단일 레이더면 2줄, 다중 레이더면 공통 2줄 + 레이더별 장애물 후방 거리
+  //   (대상 장애물·분석 방위는 표지·섹션1 표와 중복이고 분석 기준이 '전 방위'라 미표기)
   const dailyConditions = useMemo<string[]>(() => {
     if (!omResult) return [];
     const rrs = omResult.radar_results;
-    const bldgNames = omData.selectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
     if (rrs.length === 1) {
       const info = omRadarConditions.get(rrs[0].radar_name);
       return [
-        `• 대상 장애물: ${info?.bldgNames ?? bldgNames} (분석 방위 ${info?.azText || "전체"})`,
         `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방(${info?.minDistNm ?? "0"}NM~) 항적만 포함`,
         `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈·트랙스왑/속도이상 오탐 제외)`,
       ];
     }
     const lines = [
-      `• 대상 장애물: ${bldgNames}`,
       `• 기준: 전 방위(분석 구간 포함 전체 방위) · 장애물 후방 항적만 포함`,
       `• PSR: 60NM 이내 SSR+Combined 기준, 표적소실: 신호소실만 (범위이탈·트랙스왑/속도이상 오탐 제외)`,
     ];
     for (const rr of rrs) {
       const info = omRadarConditions.get(rr.radar_name);
-      lines.push(`• ${rr.radar_name} — 분석 방위 ${info?.azText || "전체"}, 장애물 후방 ${info?.minDistNm ?? "0"}NM~`);
+      lines.push(`• ${rr.radar_name} — 장애물 후방 ${info?.minDistNm ?? "0"}NM~`);
     }
     return lines;
-  }, [omResult, omRadarConditions, omData.selectedBuildings]);
+  }, [omResult, omRadarConditions]);
 
   return (
     <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">

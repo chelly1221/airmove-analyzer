@@ -355,7 +355,7 @@ export default function ReportOMObstacleAzElevChart({
     }
 
     // 소실표적 — 모든 소실표적을 빨간 점으로 통일 (LoS 단면도와 동일 #ff1745).
-    //   항적 위·실루엣 영역(지형/추가차단) 아래로 깔린다.
+    //   항적 위·실루엣 영역(지형/추가차단) 아래로 깔린다. 크기는 항적점(r=1.3)과 동일.
     //   (분류별 건수는 하단 요약 표에서 제공)
     ctx.fillStyle = "rgba(255,23,69,0.9)";
     for (const l of computed.losses) {
@@ -363,7 +363,7 @@ export default function ReportOMObstacleAzElevChart({
       const x = xScale(l.azDeg);
       const y = yScale(l.elevAngleDeg);
       ctx.beginPath();
-      ctx.arc(x, y, 2, 0, Math.PI * 2);
+      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
       ctx.fill();
     }
 

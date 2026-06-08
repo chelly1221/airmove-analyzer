@@ -34,10 +34,16 @@ const ch = H - PAD.top - PAD.bottom;
 const M_TO_FT = 3.28084;
 const KM_TO_NM = 1 / 1.852;
 
-/** 차트 X축 풀 스케일 (NM) — 보고서 LoS 단면도는 빌딩 거리와 무관하게 100NM 고정.
- *  obstacleAnalysisHelpers.EXTEND_PROFILE_MIN_KM 와 일치해야 한다 (profile 이 100NM 까지 샘플링). */
+/** 차트 X축 기본(리셋) 풀 스케일 (NM) — 보고서 LoS 단면도 기본 뷰는 빌딩 거리와 무관하게 100NM.
+ *  chartData.maxDistance(=줌 % 기준)이자 줌 리셋 타겟. */
 const FULL_X_NM = 100;
 const FULL_X_KM = FULL_X_NM * 1.852;
+/** 편집모드 최대 줌아웃 한계 (NM) — 휠 줌아웃 시 여기까지 확장(200NM). terrain/항적/소실표적 데이터도
+ *  이만큼 샘플링·수집되어야 한다: obstacleAnalysisHelpers.EXTEND_PROFILE_MIN_KM(profile) + projectPointsToLos(점 cap).
+ *  줌 도메인은 % 단위(FULL_X 기준)라 200NM = MAX_ZOOM_PCT(200%). */
+const MAX_X_NM = 200;
+const MAX_X_KM = MAX_X_NM * 1.852;
+const MAX_ZOOM_PCT = (MAX_X_NM / FULL_X_NM) * 100; // 200
 
 const LOSS_COLOR: [number, number, number] = [255, 23, 69]; // #ff1745
 
@@ -63,7 +69,8 @@ export interface ChartTrackPoint {
  *   - peak DB 쿼리 (배치 부담)
  *   - BRA / CoS / 프레넬 기준선 (단순화)
  *
- *  X축은 100NM 고정 (FULL_X_KM). los.elevationProfile 은 obstacleAnalysisHelpers 에서 100NM 까지 샘플링됨.
+ *  X축 기본 100NM(FULL_X_KM), 편집모드 줌아웃 시 최대 200NM(MAX_X_KM). los.elevationProfile 은
+ *  obstacleAnalysisHelpers 에서 200NM 까지 샘플링됨.
  */
 export function LosCrossSection({
   los, radarName, building, buildingGroup, trackPoints, lossPoints,
@@ -269,17 +276,17 @@ export function LosCrossSection({
     // 분석 대상 건물을 마지막에 그려 다른 건물·지형 위로(높은 z-index) 올린다. (Array.sort 는 안정 정렬)
     significantBuildings.sort((a, b) => Number(a.isTarget) - Number(b.isTarget));
 
-    // Y축 범위
-    const allHeights = [
-      radarHeight,
-      ...adjTerrain.map((p) => p.height),
-      ...minDetStraight.map((p) => p.height),
-    ];
+    // Y축 범위 — 기본(리셋) 뷰는 0~FULL_X_KM(100NM)만 보이므로 그 구간 데이터로만 산출.
+    //   (profile 은 줌아웃용으로 200NM 까지 확장되지만, 200NM 의 큰 곡률 처짐/상승 LoS 가 기본 뷰
+    //    Y축을 망가뜨리지 않도록 FULL_X_KM 이내로 제한. 줌아웃 시엔 visibleYRange 가 윈도우로 재계산.)
+    const allHeights = [radarHeight];
+    for (const p of adjTerrain) if (p.distance <= FULL_X_KM) allHeights.push(p.height);
+    for (const p of minDetStraight) if (p.distance <= FULL_X_KM) allHeights.push(p.height);
     let maxY = -Infinity;
     for (const h of allHeights) if (h > maxY) maxY = h;
     maxY += 100;
     let minY = 0;
-    for (const p of adjTerrain) if (p.height < minY) minY = p.height;
+    for (const p of adjTerrain) if (p.distance <= FULL_X_KM && p.height < minY) minY = p.height;
     minY -= 50;
     if (minY < 0) {
       const minMaxYFor40Pct = -minY * 1.5;
@@ -359,12 +366,13 @@ export function LosCrossSection({
       const range = e - s;
       const pivot = s + cursorRatio * range;
       const factor = ev.deltaY > 0 ? 1.2 : 1 / 1.2;
-      const newRange = Math.min(100, Math.max(1, range * factor));
+      // 줌아웃 한계 = MAX_ZOOM_PCT(200% = 200NM). 기본/리셋은 여전히 [0,100](100NM).
+      const newRange = Math.min(MAX_ZOOM_PCT, Math.max(1, range * factor));
       let ns = pivot - cursorRatio * newRange;
       let ne = pivot + (1 - cursorRatio) * newRange;
       if (ns < 0) { ne -= ns; ns = 0; }
-      if (ne > 100) { ns -= ne - 100; ne = 100; }
-      ns = Math.max(0, ns); ne = Math.min(100, ne);
+      if (ne > MAX_ZOOM_PCT) { ns -= ne - MAX_ZOOM_PCT; ne = MAX_ZOOM_PCT; }
+      ns = Math.max(0, ns); ne = Math.min(MAX_ZOOM_PCT, ne);
       interactingRef.current = true;
       const next: ChartZoom = [ns, ne];
       liveZoomRef.current = next;
@@ -397,8 +405,8 @@ export function LosCrossSection({
       const shift = -(dx / chartPxWidth) * range;
       let ns = origS + shift, ne = origE + shift;
       if (ns < 0) { ne -= ns; ns = 0; }
-      if (ne > 100) { ns -= ne - 100; ne = 100; }
-      ns = Math.max(0, ns); ne = Math.min(100, ne);
+      if (ne > MAX_ZOOM_PCT) { ns -= ne - MAX_ZOOM_PCT; ne = MAX_ZOOM_PCT; }
+      ns = Math.max(0, ns); ne = Math.min(MAX_ZOOM_PCT, ne);
       const next: ChartZoom = [ns, ne];
       liveZoomRef.current = next;
       setLiveZoom(next);
@@ -550,14 +558,14 @@ export function LosCrossSection({
       }
     }
 
-    // 소실표적 포인트 — <circle r=2.5 fillOpacity=0.9> + 반투명 테두리. SVG 와 동일 cx/cy.
+    // 소실표적 포인트 — 항적점과 동일 크기(r=1.5) + 반투명 테두리. SVG 와 동일 cx/cy.
     const lr = LOSS_COLOR[0], lg = LOSS_COLOR[1], lb = LOSS_COLOR[2];
     for (const lp of lossPoints) {
       const adjAlt = lp.altM - curvDrop(lp.distKm);
       const px = xScaleV(lp.distKm);
       const py = yScaleV(adjAlt);
       ctx.beginPath();
-      ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+      ctx.arc(px, py, 1.5, 0, Math.PI * 2);
       ctx.fillStyle = `rgba(${lr},${lg},${lb},0.9)`;
       ctx.fill();
       ctx.lineWidth = 0.5;
@@ -954,7 +962,7 @@ export function LosCrossSection({
  *
  * calcBuildingAzExtent 로 건물 폴리곤(점 건물이면 ±2° 기본값)의 레이더 기준 노출면
  * 방위 구간을 구하고, 양끝에 여유마진 1° 씩 더한 윈도우 안의 포인트를 채택.
- * 거리는 레이더 기준 지상거리(haversine), X축 풀스케일(100NM)까지 — 건물 후방(음영구역)
+ * 거리는 레이더 기준 지상거리(haversine), 최대 줌아웃(200NM, MAX_X_KM)까지 — 건물 후방(음영구역)
  * 항적도 포함. (track_points_geo 는 백엔드에서 건물 중심 ±5° 로 사전 필터되어 들어오는데
  * 건물 각폭+마진은 그보다 좁으므로 이 윈도우는 그 부분집합 — 데이터 누락 없음.)
  */
@@ -976,7 +984,7 @@ export function projectPointsToLos(
   const track: ChartTrackPoint[] = [];
   for (const tp of trackPoints) {
     const distKm = haversineKm(los.radarLat, los.radarLon, tp.lat, tp.lon);
-    if (distKm <= 0.001 || distKm > FULL_X_KM) continue;
+    if (distKm <= 0.001 || distKm > MAX_X_KM) continue;
     if (!inWindow(bearingDeg(los.radarLat, los.radarLon, tp.lat, tp.lon))) continue;
     track.push({
       distKm,
@@ -988,7 +996,7 @@ export function projectPointsToLos(
   const loss: ChartTrackPoint[] = [];
   for (const lp of lossPoints) {
     const distKm = haversineKm(los.radarLat, los.radarLon, lp.lat, lp.lon);
-    if (distKm <= 0.001 || distKm > FULL_X_KM) continue;
+    if (distKm <= 0.001 || distKm > MAX_X_KM) continue;
     if (!inWindow(bearingDeg(los.radarLat, los.radarLon, lp.lat, lp.lon))) continue;
     loss.push({
       distKm,

@@ -8,8 +8,9 @@ import type { LossPointGeo } from "../types/obstacle";
 import { haversineKm, bearingDeg } from "./geo";
 
 /** OM 보고서 LoS 단면도 차트 최소 X축 (km) — 빌딩이 가까워도 이만큼은 terrain 을 샘플링.
- *  100NM = 100 * 1.852 km. ReportOMLosCrossSection 의 X 풀 스케일과 일치. */
-const EXTEND_PROFILE_MIN_KM = 100 * 1.852;
+ *  200NM = 200 * 1.852 km. ReportOMLosCrossSection 의 편집모드 최대 줌아웃(MAX_X_KM)과 일치 —
+ *  기본 뷰는 100NM 이지만 줌아웃 시 200NM 까지 보이므로 그만큼 미리 샘플링. */
+const EXTEND_PROFILE_MIN_KM = 200 * 1.852;
 
 /** LoS 분석 — 4개씩 병렬 배치 실행 */
 export async function computeLosBatch(
@@ -32,11 +33,12 @@ export async function computeLosBatch(
           ((bldg.longitude - radar.longitude) * 111320 * Math.cos(radar.latitude * Math.PI / 180)) ** 2,
         ) / 1000;
         // Terrain sampling 종료 거리: 빌딩 거리와 EXTEND_PROFILE_MIN_KM 중 큰 값.
-        //   빌딩이 가까워도 보고서 차트가 100NM 까지 길게 보이도록 — TrackMap 의 동작과 일관.
+        //   빌딩이 가까워도 보고서 차트가 (줌아웃 시) 200NM 까지 길게 보이도록 — TrackMap 의 동작과 일관.
         const profileEndKm = Math.max(totalDist, EXTEND_PROFILE_MIN_KM);
-        // 샘플 밀도: 빌딩까지 최소 150샘플 유지하되, 가까운 빌딩에서 폭주하지 않게 500 으로 상한.
-        //   100NM/500 = 370m 간격 → 차트 가시성 충분, fetch_elevation 1회 호출 부담 합리.
-        const samples = Math.min(500, Math.max(150, Math.round(150 * (profileEndKm / Math.max(totalDist, 1e-6)))));
+        // 샘플 밀도: 빌딩까지 최소 150샘플 유지하되, 가까운 빌딩에서 폭주하지 않게 1000 으로 상한.
+        //   200NM/1000 = 370m 간격 → 차트 가시성 충분, fetch_elevation 1회 호출 부담 합리.
+        //   (상한 500→1000: profile 종료거리 100→200NM 확장에도 빌딩 근역 샘플 밀도·차단 판정 해상도 보존.)
+        const samples = Math.min(1000, Math.max(150, Math.round(150 * (profileEndKm / Math.max(totalDist, 1e-6)))));
         // 빌딩 거리에 해당하는 샘플 인덱스 (블록 판정 루프 종료점)
         const samplesToBuilding = Math.round((totalDist / profileEndKm) * samples);
         // 방향 단위 벡터 (위/경도 변화량 per km) — 빌딩 너머도 같은 베어링 직선상으로 외삽
