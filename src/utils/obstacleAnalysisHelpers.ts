@@ -35,19 +35,32 @@ export async function computeLosBatch(
         // Terrain sampling 종료 거리: 빌딩 거리와 EXTEND_PROFILE_MIN_KM 중 큰 값.
         //   빌딩이 가까워도 보고서 차트가 (줌아웃 시) 200NM 까지 길게 보이도록 — TrackMap 의 동작과 일관.
         const profileEndKm = Math.max(totalDist, EXTEND_PROFILE_MIN_KM);
-        // 샘플 밀도: 빌딩까지 최소 150샘플 유지하되, 가까운 빌딩에서 폭주하지 않게 1000 으로 상한.
-        //   200NM/1000 = 370m 간격 → 차트 가시성 충분, fetch_elevation 1회 호출 부담 합리.
-        //   (상한 500→1000: profile 종료거리 100→200NM 확장에도 빌딩 근역 샘플 밀도·차단 판정 해상도 보존.)
-        const samples = Math.min(1000, Math.max(150, Math.round(150 * (profileEndKm / Math.max(totalDist, 1e-6)))));
-        // 빌딩 거리에 해당하는 샘플 인덱스 (블록 판정 루프 종료점)
-        const samplesToBuilding = Math.round((totalDist / profileEndKm) * samples);
+        // 거리 그리드(km) — 코리도(레이더→빌딩 0..totalDist)는 근거리 지형 봉우리를 잡도록 조밀하게(≈60m),
+        //   빌딩 너머 확장부(totalDist..profileEndKm)는 줌아웃 표시용으로 거칠게(≈370m) 샘플링.
+        //   (종전: 0..profileEndKm 전체를 균일 ≤1000샘플로 깔아 근거리 코리도까지 ~370m 로 과소표집 →
+        //    코리도의 날카로운 봉우리가 지형선·최저탐지선 양쪽에서 누락될 수 있었음. 앙각은 1/d 가중이라
+        //    근거리 손실이 최저탐지선을 가장 크게 들어올렸어야 할 지점에서 가장 큼.)
+        const CORRIDOR_STEP_KM = 0.06;        // ≈60m — SRTM(≈30m) 근접 밀도로 코리도 표집
+        const EXT_STEP_KM = 0.37;             // ≈370m — 확장부(빌딩 너머) 밀도(종전 균일치 유지)
+        const MAX_CORRIDOR_SAMPLES = 1500;    // 원거리 빌딩에서 fetch_elevation 폭주 방지(코리도 상한)
         // 방향 단위 벡터 (위/경도 변화량 per km) — 빌딩 너머도 같은 베어링 직선상으로 외삽
         const dLatPerKm = totalDist > 1e-6 ? (bldg.latitude - radar.latitude) / totalDist : 0;
         const dLonPerKm = totalDist > 1e-6 ? (bldg.longitude - radar.longitude) / totalDist : 0;
+        // 코리도: 0..totalDist 등간격, 마지막 점이 정확히 totalDist (= 빌딩 인덱스 samplesToBuilding)
+        const corridorSamples = Math.min(MAX_CORRIDOR_SAMPLES, Math.max(1, Math.round(totalDist / CORRIDOR_STEP_KM)));
+        const dists: number[] = [];
+        for (let j = 0; j <= corridorSamples; j++) dists.push((j / corridorSamples) * totalDist);
+        // 빌딩 거리에 해당하는 샘플 인덱스 (블록 판정 루프 종료점) — 코리도 마지막 점
+        const samplesToBuilding = corridorSamples;
+        // 확장부: totalDist 초과 ~ profileEndKm 거칠게 (빌딩이 200NM 너머면 profileEndKm==totalDist → 확장 없음)
+        if (profileEndKm > totalDist + 1e-9) {
+          const extSamples = Math.max(1, Math.round((profileEndKm - totalDist) / EXT_STEP_KM));
+          for (let j = 1; j <= extSamples; j++) dists.push(totalDist + (j / extSamples) * (profileEndKm - totalDist));
+        }
         const lats: number[] = [];
         const lons: number[] = [];
-        for (let j = 0; j <= samples; j++) {
-          const d = (j / samples) * profileEndKm;
+        for (let j = 0; j < dists.length; j++) {
+          const d = dists[j];
           lats.push(radar.latitude + dLatPerKm * d);
           lons.push(radar.longitude + dLonPerKm * d);
         }
@@ -55,14 +68,29 @@ export async function computeLosBatch(
           invoke<number[]>("fetch_elevation", { latitudes: lats, longitudes: lons }),
           invoke<BuildingOnPath[]>(
             "query_buildings_along_path",
-            { radarLat: radar.latitude, radarLon: radar.longitude, targetLat: bldg.latitude, targetLon: bldg.longitude, corridorWidthM: 200 },
+            // ignoreGroupEnabled: 보고서는 자료관리 그룹 활성화 상태와 무관하게 선택된 모든 건물(대상+경로상)을
+            //   단면도에 적용한다 — panorama(query_building_polygons)가 이미 enabled 무시라 단면도·음영차트 프레임 통일.
+            { radarLat: radar.latitude, radarLon: radar.longitude, targetLat: bldg.latitude, targetLon: bldg.longitude, corridorWidthM: 200, ignoreGroupEnabled: true },
           ),
         ]);
 
+        // 비균일 거리 그리드(dists 오름차순)에서 d 에 가장 가까운 인덱스 — 이진 탐색
+        const distToNearestIdx = (d: number): number => {
+          if (d <= dists[0]) return 0;
+          const lastI = dists.length - 1;
+          if (d >= dists[lastI]) return lastI;
+          let lo = 0, hi = lastI;
+          while (hi - lo > 1) {
+            const mid = (lo + hi) >> 1;
+            if (dists[mid] <= d) lo = mid; else hi = mid;
+          }
+          return (d - dists[lo]) <= (dists[hi] - d) ? lo : hi;
+        };
+
         const combinedElev = [...elevations];
         for (const pb of pathBuildings) {
-          // 빌딩 거리(0~totalDist)를 확장 profile 인덱스(0~samples)로 변환
-          const sampleIdx = Math.round((pb.distance_km / profileEndKm) * samples);
+          // 빌딩 거리를 가장 가까운 그리드 인덱스로 매핑 (단일 점 스파이크)
+          const sampleIdx = distToNearestIdx(pb.distance_km);
           if (sampleIdx >= 0 && sampleIdx < combinedElev.length) {
             const bldgTop = pb.ground_elev_m + pb.height_m;
             if (bldgTop > combinedElev[sampleIdx]) combinedElev[sampleIdx] = bldgTop;
@@ -77,8 +105,8 @@ export async function computeLosBatch(
         const R = 6371000;
         const targetElev = bldg.ground_elev + bldg.height;
         for (let k = 1; k <= samplesToBuilding && k < combinedElev.length; k++) {
-          const d = (k / samples) * profileEndKm * 1000;
-          const t = samplesToBuilding > 0 ? k / samplesToBuilding : 0; // radar↔building 보간 (0~1)
+          const d = dists[k] * 1000;
+          const t = totalDist > 1e-6 ? dists[k] / totalDist : 0; // radar↔building 보간 (0~1)
           const losHeight = radarHeight * (1 - t) + targetElev * t;
           const curvDrop = (d * d) / (2 * R);
           const terrainAdjusted = combinedElev[k] + curvDrop;
@@ -86,7 +114,7 @@ export async function computeLosBatch(
             blocked = true;
             if (terrainAdjusted > maxBlockElev) {
               maxBlockElev = terrainAdjusted;
-              maxBlockDist = (k / samples) * profileEndKm;
+              maxBlockDist = dists[k];
               const nearBldg = pathBuildings.find((pb) => Math.abs(pb.distance_km - maxBlockDist) < 0.5);
               maxBlockName = nearBldg?.name ?? nearBldg?.address ?? "";
             }
@@ -100,14 +128,14 @@ export async function computeLosBatch(
         ) * 180) / Math.PI + 360) % 360;
 
         const elevProfile = combinedElev.map((elev, idx) => ({
-          distance: (idx / samples) * profileEndKm,
+          distance: dists[idx],
           elevation: elev,
           latitude: lats[idx],
           longitude: lons[idx],
         }));
         // 순수 지형 프로파일 (건물 병합 전 raw SRTM) — 단면도 '분석 대상 제외' 선 계산용
         const terrainProf = elevations.map((elev, idx) => ({
-          distance: (idx / samples) * profileEndKm,
+          distance: dists[idx],
           elevation: elev,
           latitude: lats[idx],
           longitude: lons[idx],

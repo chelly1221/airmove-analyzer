@@ -248,6 +248,9 @@ pub fn query_buildings_along_path(
     target_lat: f64,
     target_lon: f64,
     corridor_width_m: f64,
+    // OM 보고서 전용: 자료관리 그룹 활성화(enabled) 상태와 무관하게 모든 수동 건물 포함.
+    //   라이브 LoS 뷰(TrackMap/LoSProfilePanel)는 false 로 호출해 그룹 토글을 그대로 존중한다.
+    ignore_group_enabled: bool,
 ) -> Result<Vec<BuildingOnPath>, String> {
     // bbox 버퍼: 건물 폴리곤이 centroid에서 벗어날 수 있으므로 넉넉하게 (최소 200m)
     let bbox_buffer_m = corridor_width_m.max(200.0);
@@ -355,13 +358,21 @@ pub fn query_buildings_along_path(
 
     // 수동 등록 건물도 경로 분석에 포함
     let geo_buffer = 0.01; // ~1.1km 버퍼 — 대형 도형 커버
-    let mut stmt2 = conn.prepare(
+    // ignore_group_enabled(OM 보고서)면 그룹 활성화 필터를 빼고 모든 수동 건물 포함.
+    let group_filter = if ignore_group_enabled {
+        ""
+    } else {
+        " AND (group_id IS NULL OR group_id IN (SELECT id FROM building_groups WHERE enabled = 1))"
+    };
+    let manual_sql = format!(
         "SELECT latitude, longitude, height, ground_elev, name, memo, geometry_type, geometry_json
          FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2
-           AND longitude BETWEEN ?3 AND ?4
-           AND (group_id IS NULL OR group_id IN (SELECT id FROM building_groups WHERE enabled = 1))"
-    ).map_err(|e| format!("수동 건물 쿼리 준비 실패: {}", e))?;
+           AND longitude BETWEEN ?3 AND ?4{}",
+        group_filter,
+    );
+    let mut stmt2 = conn.prepare(&manual_sql)
+        .map_err(|e| format!("수동 건물 쿼리 준비 실패: {}", e))?;
 
     let manual_rows = stmt2.query_map(
         params![min_lat - geo_buffer, max_lat + geo_buffer, min_lon - geo_buffer, max_lon + geo_buffer],

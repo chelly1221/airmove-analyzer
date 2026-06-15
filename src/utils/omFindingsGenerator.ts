@@ -7,7 +7,7 @@ import type {
 } from "../types";
 import type { AddedBlockageResult } from "../types/obstacle";
 import type { CoverageLayer } from "./radarCoverage";
-import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg, weightedTrendSlope, BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT } from "./omStats";
+import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg, weightedTrendSlope, BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_NONE_LABEL } from "./omStats";
 import { haversineKm } from "./geo";
 
 function gradeLabel(lossRate: number): string {
@@ -85,16 +85,19 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
         const w = addedBlockageByKey[`${rr.radar_name}_${b.id}`];
         if (!w) continue;
         const bn = b.name || `건물${b.id}`;
-        const expMin = (w.exposureTrackTimeS / 60).toFixed(0);
-        if (w.grade.label === "판정 보류") {
+        const expPt = Math.round(w.exposurePointCount).toLocaleString();
+        const lossPt = Math.round(w.lossPointCount).toLocaleString();
+        if (w.grade.label === BLOCKAGE_NONE_LABEL) {
+          blockageLines.push(`    · ${bn}: 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없어 추가 차단영역 미형성 → 영향 없음으로 판단`);
+        } else if (w.grade.label === "판정 보류") {
           blockageLines.push(`    · ${bn}: 추가 차단 구간 — 관측일수 부족으로 판정 보류`);
         } else if (w.grade.label === "항적 없음") {
-          blockageLines.push(`    · ${bn}: 추가 차단 구간을 지나는 항적이 거의 없어(통과 항적 ${expMin}분) 영향 없음으로 판단`);
+          blockageLines.push(`    · ${bn}: 추가 차단 구간을 지나는 항적이 거의 없어(통과 ${expPt}pt) 영향 없음으로 판단`);
         } else {
           const tr = w.trendDir === "안정"
             ? "추세 안정"
             : `추세 ${w.trendDir}(일당 ${w.trendSlopePctPerDay > 0 ? "+" : ""}${w.trendSlopePctPerDay.toFixed(3)}%p)`;
-          blockageLines.push(`    · ${bn}: 추가 차단 구간 소실율 ${w.lossRatePct.toFixed(2)}% (${w.grade.label}), ${tr}, 통과 항적 ${expMin}분/${w.daysWithExposure}일`);
+          blockageLines.push(`    · ${bn}: 추가 차단 구간 소실율 ${w.lossRatePct.toFixed(2)}% (${w.grade.label}), ${tr}, 통과 ${expPt}pt 중 소실 ${lossPt}pt/${w.daysWithExposure}일`);
         }
       }
       if (blockageLines.length > 0) {
@@ -211,10 +214,14 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   if (addedBlockageByKey) {
     const order: Record<string, number> = { "경고": 3, "주의": 2, "양호": 1 };
     let worst = "", worstName = "", worstRate = 0;
+    let blockageCount = 0, noneCount = 0; // 사유 분리용 — 추가 차단 구간 미형성 전부 여부
     for (const rr of radarResults) {
       for (const b of selectedBuildings) {
         const w = addedBlockageByKey[`${rr.radar_name}_${b.id}`];
-        if (!w || !(w.grade.label in order)) continue;
+        if (!w) continue;
+        blockageCount++;
+        if (w.grade.label === BLOCKAGE_NONE_LABEL) noneCount++;
+        if (!(w.grade.label in order)) continue;
         if ((order[w.grade.label] ?? 0) > (order[worst] ?? 0)) {
           worst = w.grade.label;
           worstName = `${b.name || `건물${b.id}`}/${rr.radar_name}`;
@@ -222,14 +229,17 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
         }
       }
     }
+    const allBandNone = blockageCount > 0 && noneCount === blockageCount;
     if (worst === "양호") {
       lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역 소실율은 양호 수준(최고 ${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 유의미한 탐지 영향은 확인되지 않았다.`);
     } else if (worst === "주의") {
       lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역 소실율이 주의 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 해당 방위·고도 탐지 성능을 지속 모니터링할 필요가 있다.`);
     } else if (worst === "경고") {
       lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역 소실율이 경고 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
+    } else if (allBandNone) {
+      lines.push(`[헤드라인·인과] 분석 대상 장애물이 지형·기존지물 위로 새로 가리는 구간을 형성하지 않아(추가 차단 구간 없음), 장애물에 의한 추가 탐지 영향은 없는 것으로 판단된다.`);
     } else {
-      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없어, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
+      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
     }
     lines.push(`  ※ 추가 차단영역 등급 임계(주의 ${BLOCKAGE_CAUTION_PCT}% / 경고 ${BLOCKAGE_ALERT_PCT}%)는 실측 분포 보정 전 잠정 기준임.`);
     lines.push(`참고(방위 소실율, 보조지표): ${gradeTexts}. 방위마다 지형·트래픽이 달라 위 인과 헤드라인을 우선 판단 근거로 한다.`);

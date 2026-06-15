@@ -892,12 +892,14 @@ async fn query_buildings_along_path(
     target_lat: f64,
     target_lon: f64,
     corridor_width_m: Option<f64>,
+    // OM 보고서 전용: 그룹 활성화 상태와 무관하게 모든 수동 건물 포함 (기본 false).
+    ignore_group_enabled: Option<bool>,
 ) -> Result<Vec<building::BuildingOnPath>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         let width = corridor_width_m.unwrap_or(100.0);
-        building::query_buildings_along_path(&conn, radar_lat, radar_lon, target_lat, target_lon, width)
+        building::query_buildings_along_path(&conn, radar_lat, radar_lon, target_lat, target_lon, width, ignore_group_enabled.unwrap_or(false))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?

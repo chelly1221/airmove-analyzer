@@ -9,7 +9,7 @@ import {
   weightedBaselineLossAvg, weightedBaselineLossStdDev,
   gradeWithConfidence,
   BLOCKAGE_MIN_DAYS, BLOCKAGE_MIN_EXPOSURE_DAYS,
-  BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT,
+  BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_NONE_LABEL,
 } from "../../utils/omStats";
 import { haversineKm } from "../../utils/geo";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
@@ -181,7 +181,7 @@ function ReportOMFindings({
         radarSites.map((rs) => {
           const w = addedBlockageByKey[`${rs.name}_${b.id}`];
           if (!w) return null;
-          const graded = w.grade.label !== "항적 없음" && w.grade.label !== "판정 보류";
+          const graded = w.grade.label !== "항적 없음" && w.grade.label !== "판정 보류" && w.grade.label !== BLOCKAGE_NONE_LABEL;
           return (
             <tr key={`${rs.name}-${b.id}`}>
               <td>
@@ -200,7 +200,7 @@ function ReportOMFindings({
                   : "—"}
               </td>
               <td className="ta-c mono">
-                {graded ? `${(w.exposureTrackTimeS / 60).toFixed(0)}분/${w.daysWithExposure}일` : "—"}
+                {graded ? `${Math.round(w.exposurePointCount).toLocaleString()}pt 중 소실 ${Math.round(w.lossPointCount).toLocaleString()}pt/${w.daysWithExposure}일` : "—"}
               </td>
             </tr>
           );
@@ -224,7 +224,7 @@ function ReportOMFindings({
       </table>
       <p className="muted" style={{ fontSize: "9px", marginTop: 4 }}>
         추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형·기존지물 차단각~대상 차단각)를 지나는 항적이 그 안에서 소실되는 비율.
-        {" "}판정 순서 — 관측 {BLOCKAGE_MIN_DAYS}일 미만이면 "판정 보류", 차단영역 통과 항적이 없으면 "항적 없음", 노출 발생일 {BLOCKAGE_MIN_EXPOSURE_DAYS}일 미만이면 "판정 보류".
+        {" "}판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 "{BLOCKAGE_NONE_LABEL}", 관측 {BLOCKAGE_MIN_DAYS}일 미만이면 "판정 보류", 차단영역 통과 항적이 없으면 "항적 없음", 노출 발생일 {BLOCKAGE_MIN_EXPOSURE_DAYS}일 미만이면 "판정 보류".
         {" "}등급(전구간 평균 소실율 기준과 별도) — 양호 &lt; {BLOCKAGE_CAUTION_PCT.toFixed(1)}% · 주의 {BLOCKAGE_CAUTION_PCT.toFixed(1)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 · 경고 ≥ {BLOCKAGE_ALERT_PCT.toFixed(0)}%.
       </p>
     </div>

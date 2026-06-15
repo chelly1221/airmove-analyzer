@@ -195,8 +195,20 @@ export function LosCrossSection({
     //      비대상 건물은 엣지로만 들어가 interpElev 보간 봉우리를 만들지 못해 floor 가 raw SRTM 으로 가라앉던 게 원인.)
     //     대상 식별: 수동건물 + 치수 일치 + far_dist 가 타겟 거리(D)까지 도달 (코리도 끝 = 대상).
     //     point 형 대상은 Rust 가 pathBuildings 에서 제외 → 매칭 0 건이면 미표시(두 선 동일).
-    const buildingsWithoutTarget = buildings.filter((b) => !isTargetBuildingOnPath(b, building, D));
     const targetBuildings = buildings.filter((b) => isTargetBuildingOnPath(b, building, D));
+    // 대상 footprint 거리구간 — 점선 base 복원과 비대상 엣지 제외에 공용.
+    const targetSpans = targetBuildings.map((tb) => ({
+      near: tb.near_dist_km ?? tb.distance_km,
+      far: tb.far_dist_km ?? tb.distance_km,
+    }));
+    const inTargetSpan = (d: number) => targetSpans.some((s) => d >= s.near - 1e-9 && d <= s.far + 1e-9);
+    // 점선('분석 대상 제외')은 대상 건물뿐 아니라, 대상 footprint 안에 겹쳐 들어온 비대상 건물
+    //   (예: 동일 위치 건물통합정보 폴리곤 — is_manual=false 라 대상매칭 불가)도 제외해야 '대상 제거 시 실제 지반'을
+    //   드러낸다. 제외 안 하면 그 건물이 computeMinDet 의 near/far 엣지로 재투입돼 점선이 footprint 위에서
+    //   안 내려간다. (footprint 밖 비대상 건물은 그대로 유지 — 기존 비대상 실루엣 보존 규칙 불변.)
+    const buildingsWithoutTarget = buildings.filter(
+      (b) => !isTargetBuildingOnPath(b, building, D) && !inTargetSpan(b.distance_km),
+    );
     const rawTerrain = los.terrainProfile; // 순수 SRTM — 대상 footprint 의 지반 복원용 (index 는 profile 과 정렬)
     let dashedTerrain: ElevationPoint[] | undefined;
     if (targetBuildings.length > 0) {
@@ -205,14 +217,30 @@ export function LosCrossSection({
         const near = tb.near_dist_km ?? tb.distance_km;
         const far = tb.far_dist_km ?? tb.distance_km;
         const grnd = tb.ground_elev_m;
-        for (let i = 0; i < merged.length; i++) {
+        // 한 인덱스 i 의 지반 복원: 순수지형(rawTerrain)과 대상 지반고 중 높은 값으로 내림(rawTerrain 없으면 지반고 폴백).
+        //   중앙선 SRTM 이 언덕 옆을 스쳐 낮게 샘플링된 경우는 ground_elev 가 언덕을 복원.
+        const restoreFloor = (i: number) => {
           const p = merged[i];
-          if (p.distance < near - 1e-9 || p.distance > far + 1e-9) continue;
-          // 대상 구조물 height 제거: 순수지형과 대상 지반고 중 높은 값으로 내림(rawTerrain 없으면 지반고로 폴백).
-          //   중앙선 SRTM 이 언덕 옆을 스쳐 낮게 샘플링된 경우는 ground_elev 가 언덕을 복원.
           const floorElev = Math.max(rawTerrain?.[i]?.elevation ?? grnd, grnd);
           if (floorElev < p.elevation) p.elevation = floorElev;
+        };
+        // (a) footprint [near,far] 구간 복원 — 그리드 스텝보다 폭이 넓은 건물 본체.
+        for (let i = 0; i < merged.length; i++) {
+          if (merged[i].distance < near - 1e-9 || merged[i].distance > far + 1e-9) continue;
+          restoreFloor(i);
         }
+        // (b) 병합 스파이크가 박힌 정확한 그리드 인덱스도 강제 복원. computeLosBatch 는 지붕을
+        //   combinedElev[distToNearestIdx(distance_km)] 한 점에만 주입하는데(distance_km=footprint 중심),
+        //   footprint 폭이 그리드 스텝(≈60m)보다 좁은 대상에선 그 최근접 그리드점이 [near,far] 밖으로
+        //   스냅돼 (a) 가 놓친다. 그 구조물 스파이크가 점선 base 에 살아남아 최저탐지선을 들어올리던 게
+        //   '분석 대상 제외' 선이 실제 지반(~0)으로 안 내려가던 원인. distToNearestIdx 와 동일 기준으로 복원.
+        const center = tb.distance_km;
+        let spikeIdx = 0, best = Infinity;
+        for (let i = 0; i < merged.length; i++) {
+          const dd = Math.abs(merged[i].distance - center);
+          if (dd < best) { best = dd; spikeIdx = i; }
+        }
+        restoreFloor(spikeIdx);
       }
       dashedTerrain = merged;
     }

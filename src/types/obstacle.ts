@@ -33,6 +33,10 @@ export interface AzElevCell {
   elev_bin: number;
   track_time_s: number;
   loss_time_s: number;
+  /** 정상 추적 스캔 포인트 수 (gap ≤ threshold 인 연속 스캔 1건 = 1포인트) */
+  track_count: number;
+  /** 보간 소실 포인트 수 (소실 gap의 total_missed 보간점을 셀별로 집계) */
+  loss_count: number;
 }
 
 /** 일별 통계 */
@@ -81,6 +85,10 @@ export interface AddedBlockageResult {
   trendDir: "증가" | "감소" | "안정";
   /** 총 노출시간 (추적+소실, 초) */
   exposureTrackTimeS: number;
+  /** 총 노출 포인트 수 (추적+소실 스캔 포인트, 밴드 겹침비율 frac 가중 합) */
+  exposurePointCount: number;
+  /** 소실 포인트 수 (보간 소실 스캔 포인트, 밴드 겹침비율 frac 가중 합) */
+  lossPointCount: number;
   /** 관측일수 */
   dayCount: number;
   /** 노출>0 인 일수 */

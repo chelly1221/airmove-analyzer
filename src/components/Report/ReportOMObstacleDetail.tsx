@@ -7,6 +7,8 @@ import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
 import BuildingGroupBadge from "./BuildingGroupBadge";
 import ReportOMObstacleAzElevChart from "./ReportOMObstacleAzElevChart";
+import ReportOMObstacleSummaryTable from "./ReportOMObstacleSummaryTable";
+import ReportOMRadarBuildingMap from "./ReportOMRadarBuildingMap";
 
 interface Props {
   sectionNum: number;
@@ -28,7 +30,7 @@ interface Props {
   blockage?: AddedBlockageResult;
 }
 
-/** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. 빌딩 메타 + LoS 단면도 + Az×Elev 차트. */
+/** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. 빌딩 메타 + ①영향범위 도면 + ②분류 요약표 + ③LoS 단면도 + ④Az×Elev 차트. */
 function ReportOMObstacleDetail({
   sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout, allBuildings, blockage,
 }: Props) {
@@ -91,7 +93,28 @@ function ReportOMObstacleDetail({
         </span>
       </div>
 
-      {/* LoS 단면도 */}
+      {/* ① 영향 범위 — 위에서 본 도면 (레이더 → 건물 양끝 부채꼴). §3 최상단 배치 */}
+      <ReportOMRadarBuildingMap
+        radarSite={radarSite}
+        building={building}
+        buildingGroups={buildingGroups}
+        los={los}
+        lossPoints={allLossThisRadar}
+      />
+
+      {/* ② 소실표적 분류 요약표 — 아래 Az×Elev 차트와 동일 분류 결과(동일 classifyObstacleLosses) */}
+      <ReportOMObstacleSummaryTable
+        radarSite={radarSite}
+        building={building}
+        los={los}
+        lossPoints={allLossThisRadar}
+        panoWith={panoWith}
+        panoWithout={panoWithout}
+        siblings={siblings}
+        blockage={blockage}
+      />
+
+      {/* ③ LoS 단면도 */}
       <div>
         <LosCrossSection
           los={los}
@@ -103,7 +126,7 @@ function ReportOMObstacleDetail({
         />
       </div>
 
-      {/* LoS 차단 양각 대비 표적소실 분포 — 분석 대상 방위 윈도우만 */}
+      {/* ④ LoS 차단 양각 대비 표적소실 분포 — 분석 대상 방위 윈도우만 (요약표는 ②로 분리) */}
       <ReportOMObstacleAzElevChart
         radarSite={radarSite}
         building={building}
@@ -114,7 +137,6 @@ function ReportOMObstacleDetail({
         lossPoints={allLossThisRadar}
         trackPoints={allTrackThisRadar}
         siblings={siblings}
-        blockage={blockage}
       />
     </ReportPage>
   );

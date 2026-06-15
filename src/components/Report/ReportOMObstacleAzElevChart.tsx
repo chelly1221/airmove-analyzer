@@ -10,20 +10,15 @@
  *      압출 폴리곤의 가변 윗변(방위별 양각, panorama.rs build_building_silhouette).
  *  - 소실표적: 이 방위 윈도우 + 분석 대상 후방의 모든 소실표적을 빨간 점으로 통일 표시
  *      (LoS 단면도와 동일 #ff1745). 분류별 건수(장애물 추가 기인 / 지형 차단 / 장애물 무관)는
- *      하단 요약 표에서 제공.
+ *      별도 요약표 컴포넌트(ReportOMObstacleSummaryTable)에서 제공 — 동일 classifyObstacleLosses 공유.
  */
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult, BuildingObstacle } from "../../types";
-import type { LossPointGeo, TrackPointGeo, AddedBlockageResult } from "../../types/obstacle";
+import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import { classifyObstacleLosses, calcBuildingAzExtent, makeTerrainSampler, pointElevAngleDeg, FT_PER_M, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import { bearingDeg, haversineKm } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import OMEditable from "./OMEditable";
-
-const KM_PER_NM = 1.852;
-/** 소실표적 분류 방위 허용오차(°) — classifyObstacleLosses 의 AZ_TOLERANCE_DEG 와 동일.
- *  (후방 소실표적 집계 윈도우. 차트 표시 윈도우(azHalfSpan, 빌딩 각폭)와는 별개) */
-const AZ_TOLERANCE = 10;
 
 const CHART_W = 720;
 const CHART_H = 240;
@@ -164,12 +159,10 @@ interface Props {
   trackPoints?: TrackPointGeo[];
   /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적 오귀속 방지용 (분류 내부에서 사용) */
   siblings?: SiblingBuilding[];
-  /** 추가 차단영역 소실율 — 헤드라인 심각도 지표 (omAddedBlockage, ReportApp 에서 산출) */
-  blockage?: AddedBlockageResult;
 }
 
 export default function ReportOMObstacleAzElevChart({
-  radarSite, building, los, panoWith, panoWithout, lossPoints, trackPoints, siblings, blockage,
+  radarSite, building, los, panoWith, panoWithout, lossPoints, trackPoints, siblings,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -356,7 +349,7 @@ export default function ReportOMObstacleAzElevChart({
 
     // 소실표적 — 모든 소실표적을 빨간 점으로 통일 (LoS 단면도와 동일 #ff1745).
     //   항적 위·실루엣 영역(지형/추가차단) 아래로 깔린다. 크기는 항적점(r=1.3)과 동일.
-    //   (분류별 건수는 하단 요약 표에서 제공)
+    //   (분류별 건수는 별도 요약표 컴포넌트에서 제공)
     ctx.fillStyle = "rgba(255,23,69,0.9)";
     for (const l of computed.losses) {
       if (l.elevAngleDeg < 0) continue;
@@ -453,16 +446,6 @@ export default function ReportOMObstacleAzElevChart({
     ctx.restore();
   }, [computed, sil, trackDots, xTicks, yTicks, yStep, azCenter, azHalfSpan, xScale, xScaleRel, yScale, yRange]);
 
-  // 요약 수치
-  const total = computed.losses.length;
-  const shadowCount = computed.shadowCount;
-  const bldgCount = computed.buildingCount;
-  const bldgDuration = computed.buildingDurationS;
-  const freeCount = total - shadowCount;
-  const shadowRatio = total > 0 ? (shadowCount / total) * 100 : 0;
-  const bldgRatio = total > 0 ? (bldgCount / total) * 100 : 0;
-  const hasBldgEffect = computed.angleTotalDeg > computed.angleTerrainDeg + 0.005;
-
   // 인라인 편집키 접두사 — (레이더 × 건물) 페이지마다 독립 편집 (detail.* 헤더 키와 동일 스킴)
   const eid = `azelev.${radarSite.name}_${building.id}`;
 
@@ -504,84 +487,6 @@ export default function ReportOMObstacleAzElevChart({
           <OMEditable id={`${eid}.legend.loss`} value="소실표적" tag="span" />
         </span>
       </div>
-
-      {/* 요약 테이블 — 분석요약 표(.om-table)와 동일 색·스타일로 통일 */}
-      <table className="om-table sm-table mt-2">
-        <thead>
-          <tr>
-            <th><OMEditable id={`${eid}.tbl.colItem`} value="항목" tag="span" /></th>
-            <th><OMEditable id={`${eid}.tbl.colVal`} value="값" tag="span" /></th>
-            <th><OMEditable id={`${eid}.tbl.colNote`} value="비고" tag="span" /></th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>방위 ±{AZ_TOLERANCE}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
-            <td className="ta-r mono">{total}건</td>
-            <td className="muted"><OMEditable id={`${eid}.tbl.r1.note`} value="분석 대상 후방 영역" tag="span" /></td>
-          </tr>
-          <tr className="alt">
-            <td><OMEditable id={`${eid}.tbl.r2.label`} value="LoS 차단 영역 내" tag="span" /></td>
-            <td className="ta-r mono">
-              {shadowCount}건 ({shadowRatio.toFixed(1)}%)
-            </td>
-            <td className="muted"><OMEditable id={`${eid}.tbl.r2.note`} value="지형+장애물 통합 차단" tag="span" /></td>
-          </tr>
-          <tr>
-            <td className="strong" style={{ color: "#a60739" }}><OMEditable id={`${eid}.tbl.r3.label`} value="장애물 추가 기인" tag="span" /></td>
-            <td className="ta-r mono strong" style={{ color: bldgRatio > 10 ? "#dc2626" : "#374151" }}>
-              {bldgCount}건 ({bldgRatio.toFixed(1)}%) / {bldgDuration.toFixed(1)}초
-            </td>
-            <td className="muted">
-              <OMEditable id={`${eid}.tbl.r3.note`} value="지형·기존지물 차단각 초과 ~ 대상 차단각 사이" tag="span" />
-            </td>
-          </tr>
-          {blockage && (
-            <tr>
-              <td className="strong" style={{ color: "#a60739" }}>
-                ↳ <OMEditable id={`${eid}.tbl.blockage.label`} value="추가 차단 구간 소실율" tag="span" />
-              </td>
-              <td className="ta-r mono strong" style={{ color: blockage.grade.color }}>
-                {blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류"
-                  ? blockage.grade.label
-                  : `${blockage.lossRatePct.toFixed(2)}% · ${blockage.grade.label}`}
-              </td>
-              <td className="muted">
-                {blockage.grade.label === "항적 없음"
-                  ? <OMEditable id={`${eid}.tbl.blockage.note0`} value="통과 항적 거의 없음 → 영향 없음" tag="span" />
-                  : <>통과 항적 {(blockage.exposureTrackTimeS / 60).toFixed(0)}분·{blockage.daysWithExposure}일 · 추세 {blockage.trendDir}
-                    {blockage.trendDir !== "안정" ? ` (일당 ${blockage.trendSlopePctPerDay > 0 ? "+" : ""}${blockage.trendSlopePctPerDay.toFixed(3)}%p)` : ""}</>}
-              </td>
-            </tr>
-          )}
-          <tr className="alt">
-            <td style={{ color: "#2563eb" }}><OMEditable id={`${eid}.tbl.r4.label`} value="장애물 무관" tag="span" /></td>
-            <td className="ta-r mono">
-              {freeCount}건 ({total > 0 ? ((freeCount / total) * 100).toFixed(1) : "0.0"}%)
-            </td>
-            <td className="muted"><OMEditable id={`${eid}.tbl.r4.note`} value="차단 영역 외 소실표적" tag="span" /></td>
-          </tr>
-          <tr>
-            <td>↳ <OMEditable id={`${eid}.tbl.r5.label`} value="대상 차단각" tag="span" /></td>
-            <td className="ta-r mono">
-              {computed.angleTotalDeg.toFixed(2)}°
-              {hasBldgEffect ? ` (지형 ${computed.angleTerrainDeg.toFixed(2)}°)` : " (지형 이하)"}
-            </td>
-            <td className="muted">
-              {(computed.bDistKm / KM_PER_NM).toFixed(1)}NM · 추가 기인 판정:
-              {" "}
-              {/* 헤드라인은 추가 차단영역 등급으로 정렬 — count 비율(bldgRatio) 폴백은 추가 차단영역 미제공 시 */}
-              {blockage
-                ? <span className="strong" style={{ color: blockage.grade.color }}>{blockage.grade.label}</span>
-                : bldgRatio > 20
-                ? <span className="strong" style={{ color: "#dc2626" }}>유의미</span>
-                : bldgRatio > 5
-                  ? <span className="strong" style={{ color: "#d97706" }}>부분 영향</span>
-                  : <span className="strong" style={{ color: "#16a34a" }}>영향 미미</span>}
-            </td>
-          </tr>
-        </tbody>
-      </table>
     </div>
   );
 }

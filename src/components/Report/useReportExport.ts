@@ -133,6 +133,18 @@ async function exportViaNative(
   // 렌더링 안정화 대기
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
+  // 지도 도면(ReportOMRadarBuildingMap) 의 비동기 CARTO 타일 렌더 완료 대기.
+  //   canvas 가 data-map-ready="true" 가 될 때까지(또는 4초 타임아웃) 폴링 — 그래야 PrintToPdf 가
+  //   백지/폴백 격자가 아닌 완성된 베이스맵을 스냅샷한다. 오프라인이면 폴백 격자로 즉시 "true" 가 되어 통과.
+  const mapCanvases = Array.from(container.querySelectorAll<HTMLCanvasElement>('canvas[data-map-canvas]'));
+  if (mapCanvases.length > 0) {
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (mapCanvases.every((c) => c.getAttribute("data-map-ready") === "true")) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
   // DOM 복원 함수 (정상 흐름 + 비정상 종료 양쪽에서 사용)
   const restoreDOM = () => {
     styleEl.remove();

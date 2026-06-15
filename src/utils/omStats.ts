@@ -156,8 +156,18 @@ export const BLOCKAGE_MIN_EXPOSURE_DAYS = 3; // 노출>0 인 날이 3일 미만�
 export const BLOCKAGE_CAUTION_PCT = 2.0;     // 양호/주의 경계 (%)
 export const BLOCKAGE_ALERT_PCT = 10.0;      // 주의/경고 경계 (%)
 
+/** 추가 차단영역 자체가 형성되지 않은 경우(지형·기존지물 이하)의 등급 라벨 — 비율 개념이 성립하지 않음. */
+export const BLOCKAGE_NONE_LABEL = "추가 차단 구간 없음";
+
 /**
- * 추가 차단영역 소실율 등급 — 삼중 게이트(관측일수·통과항적유무·노출일수) 후 임계 판정.
+ * 추가 차단영역 소실율 등급 — 밴드 존재 게이트 + 삼중 게이트(관측일수·통과항적유무·노출일수) 후 임계 판정.
+ *
+ * 판정 순서:
+ *   0) 추가 차단 밴드 미형성(분석 대상이 지형·기존지물 위로 올라오지 않음) → "추가 차단 구간 없음"
+ *      — 밴드 기하는 관측일수와 무관하므로 다른 게이트보다 먼저 판정한다(panoWith 없어 판정 불가면 hasBlockageBand=true 로 폴백).
+ *   1) 관측일수 < 7 → "판정 보류"
+ *   2) 통과 항적 전무(노출 0) → "항적 없음"
+ *   3) 노출 발생일 < 3 → "판정 보류"
  * 통과 항적이 전무(노출 0)하거나 소수 일자에 편중되면 노이즈% 대신 "항적 없음/판정 보류"를 정직하게 표기.
  */
 export function gradeAddedBlockage(
@@ -165,7 +175,12 @@ export function gradeAddedBlockage(
   dayCount: number,
   exposureTrackTimeS: number,
   daysWithExposure: number,
+  hasBlockageBand: boolean = true,
 ): { label: string; color: string; bg: string; border: string } {
+  if (!hasBlockageBand) {
+    // 분석 대상 장애물이 지형·기존지물 차단각 위로 추가 차단영역을 형성하지 않음 → 소실율(노출 조건부 비율) 정의 불가.
+    return { label: BLOCKAGE_NONE_LABEL, color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+  }
   if (dayCount < BLOCKAGE_MIN_DAYS) {
     return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }

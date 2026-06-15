@@ -90,6 +90,10 @@ pub struct AzElevCell {
     pub track_time_s: f64,
     /// 소실시간 합 (초)
     pub loss_time_s: f64,
+    /// 정상 추적 스캔 포인트 수 (gap ≤ threshold 인 연속 스캔 1건 = 1포인트)
+    pub track_count: u32,
+    /// 보간 소실 포인트 수 (소실 gap의 total_missed 보간점을 셀별로 집계)
+    pub loss_count: u32,
 }
 
 /// 일별 통계
@@ -696,8 +700,8 @@ pub fn analyze_radar_monthly(
         let mut day_track_time = 0.0f64;
         let mut day_loss_time = 0.0f64;
         let mut day_loss_points: Vec<LossPointGeo> = Vec::new();
-        // 추가 차단영역 히스토그램 누적기: key=(az_bin<<16)|elev_bin, val=(track_time, loss_time)
-        let mut day_hist: HashMap<u32, (f64, f64)> = HashMap::new();
+        // 추가 차단영역 히스토그램 누적기: key=(az_bin<<16)|elev_bin, val=(track_time, loss_time, track_count, loss_count)
+        let mut day_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
 
         for (_ms, mut all_pts) in mode_s_groups {
             if all_pts.len() < 2 {
@@ -751,7 +755,9 @@ pub fn analyze_radar_monthly(
                     let pa = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
                     let pd = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
                     if let Some((ab, eb)) = hist_cell(pa, elev_angle_deg(pd, prev.altitude, radar_h)) {
-                        day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0)).0 += gap;
+                        let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
+                        cell.0 += gap;      // 노출시간
+                        cell.2 += 1;        // 정상 추적 스캔 포인트 1건
                     }
                 }
 
@@ -810,7 +816,9 @@ pub fn analyze_radar_monthly(
                             let la = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, ilat, ilon);
                             let ld = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, ilat, ilon);
                             if let Some((ab, eb)) = hist_cell(la, elev_angle_deg(ld, ialt, radar_h)) {
-                                day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0)).1 += loss_per_pt;
+                                let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
+                                cell.1 += loss_per_pt;  // 소실시간 (균등 분배)
+                                cell.3 += 1;            // 보간 소실 포인트 1건
                             }
                         }
                     }
@@ -842,11 +850,13 @@ pub fn analyze_radar_monthly(
         // 히스토그램 맵 → 직렬화용 Vec
         let az_elev_histogram: Vec<AzElevCell> = day_hist
             .into_iter()
-            .map(|(k, (tt, lt))| AzElevCell {
+            .map(|(k, (tt, lt, tc, lc))| AzElevCell {
                 az_bin: (k >> 16) as u16,
                 elev_bin: (k & 0xFFFF) as u16,
                 track_time_s: tt,
                 loss_time_s: lt,
+                track_count: tc,
+                loss_count: lc,
             })
             .collect();
 
