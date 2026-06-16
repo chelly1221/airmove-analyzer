@@ -87,6 +87,10 @@ export async function computeLosBatch(
           return (d - dists[lo]) <= (dists[hi] - d) ? lo : hi;
         };
 
+        // GIS(건물통합정보) 건물 지반은 Rust query_buildings_along_path 가 centroid SRTM(live)로 재설정해
+        //   내려준다(파노라마·TrackMap LoS 와 동일 소스) → pathBuildings.ground_elev_m 을 그대로 사용. 수동건물은
+        //   사용자 입력 지반고 유지. (종전 단면도는 캐시 컬럼 COALESCE(ground_elev,0) 의존이라 백필 안 된 GIS 건물이
+        //   해수면에 가라앉아 차폐를 못 만들던 버그가 있었음 — Rust 소스 통합으로 해소.)
         const combinedElev = [...elevations];
         for (const pb of pathBuildings) {
           // 빌딩 거리를 가장 가까운 그리드 인덱스로 매핑 (단일 점 스파이크)

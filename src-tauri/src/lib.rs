@@ -898,8 +898,9 @@ async fn query_buildings_along_path(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
         let width = corridor_width_m.unwrap_or(100.0);
-        building::query_buildings_along_path(&conn, radar_lat, radar_lon, target_lat, target_lon, width, ignore_group_enabled.unwrap_or(false))
+        building::query_buildings_along_path(&conn, &mut srtm, radar_lat, radar_lon, target_lat, target_lon, width, ignore_group_enabled.unwrap_or(false))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?

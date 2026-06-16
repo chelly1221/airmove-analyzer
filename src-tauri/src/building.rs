@@ -243,6 +243,8 @@ pub fn query_fac_building_detail(
 /// LoS 경로(레이더→타겟) 상의 건물 조회
 pub fn query_buildings_along_path(
     conn: &Connection,
+    // GIS(건물통합정보) 건물을 centroid SRTM 으로 '지형 위'에 앉히기 위함 — 파노라마(panorama.rs)와 동일 소스.
+    srtm: &mut crate::srtm::SrtmReader,
     radar_lat: f64,
     radar_lon: f64,
     target_lat: f64,
@@ -261,31 +263,6 @@ pub fn query_buildings_along_path(
     let min_lon = radar_lon.min(target_lon) - buffer_deg;
     let max_lon = radar_lon.max(target_lon) + buffer_deg;
 
-    let mut stmt = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json, COALESCE(ground_elev, 0)
-         FROM fac_buildings
-         WHERE centroid_lat BETWEEN ?1 AND ?2
-           AND centroid_lon BETWEEN ?3 AND ?4
-           AND height > 0
-           AND height <= ?5"
-    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
-
-    let rows = stmt.query_map(
-        params![min_lat, max_lat, min_lon, max_lon, MAX_BUILDING_HEIGHT_M],
-        |row| {
-            Ok((
-                row.get::<_, f64>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, f64>(7)?,
-            ))
-        },
-    ).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
-
     let total_dist = crate::geo::haversine_km(radar_lat, radar_lon, target_lat, target_lon);
     if total_dist < 0.001 {
         return Ok(Vec::new());
@@ -293,66 +270,121 @@ pub fn query_buildings_along_path(
 
     let dx = target_lon - radar_lon;
     let dy = target_lat - radar_lat;
-    let _path_len_sq = dx * dx + dy * dy;
 
     let mut buildings = Vec::new();
 
-    for row in rows {
-        let (_blat, _blon, height, name, address, usage, polygon_json_str, ground_elev) = row.map_err(|e| format!("행 읽기 실패: {}", e))?;
+    // GIS(건물통합정보) 건물: 코리도(레이더→타겟)를 세그먼트로 쪼개 각 세그먼트 소형 bbox 로 후보 조회.
+    //   종전엔 레이더~타겟 양끝 단일 bbox 라, 대각·장거리 코리도(단면도가 200NM 까지 연장될 때)에서는
+    //   직선과 무관한 사각형 내부 수십만 동을 전부 폴리곤 파싱/교차해 느렸다(실측: 30NM 대각 47만 후보).
+    //   세그먼트 bbox 는 직선에 밀착해 후보를 수십분의 1 로 줄인다(실측: 200NM 대각 595k→23k). centroid 인덱스 활용,
+    //   인접 세그먼트 buffer 중첩분은 id 로 1회만 처리.
+    let mut stmt = conn.prepare(
+        "SELECT id, centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json
+         FROM fac_buildings
+         WHERE centroid_lat BETWEEN ?1 AND ?2
+           AND centroid_lon BETWEEN ?3 AND ?4
+           AND height > 0
+           AND height <= ?5"
+    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
-        // 폴리곤 좌표 파싱 시도
-        let polygon_coords: Option<Vec<[f64; 2]>> = polygon_json_str.as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
+    // 세그먼트 길이 ~3km — 각 bbox 는 (3km + buffer) 정사각 근방. 짧은 코리도는 1세그먼트(종전과 동일).
+    const SEG_KM: f64 = 3.0;
+    let n_seg = ((total_dist / SEG_KM).ceil() as usize).max(1);
+    let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-        if let Some(ref poly_pts) = polygon_coords {
-            // 정확한 직선-폴리곤 교차 테스트 (복도 근사 대신 기하학적 교차)
-            let poly_lonlat: Vec<(f64, f64)> =
-                poly_pts.iter().map(|p| (p[1], p[0])).collect();
+    for s in 0..n_seg {
+        let t0 = s as f64 / n_seg as f64;
+        let t1 = (s + 1) as f64 / n_seg as f64;
+        let (lat0, lat1) = (radar_lat + t0 * dy, radar_lat + t1 * dy);
+        let (lon0, lon1) = (radar_lon + t0 * dx, radar_lon + t1 * dx);
+        let seg_min_lat = lat0.min(lat1) - buffer_deg;
+        let seg_max_lat = lat0.max(lat1) + buffer_deg;
+        let seg_min_lon = lon0.min(lon1) - buffer_deg;
+        let seg_max_lon = lon0.max(lon1) + buffer_deg;
 
-            let mut hit_distances = line_polygon_intersections(
-                radar_lon, radar_lat, target_lon, target_lat,
-                &poly_lonlat, total_dist,
-            );
+        let rows = stmt.query_map(
+            params![seg_min_lat, seg_max_lat, seg_min_lon, seg_max_lon, MAX_BUILDING_HEIGHT_M],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        ).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
-            // LoS 시작/끝점이 폴리곤 내부인 경우 (건물 안에서 시작/종료)
-            if point_in_polygon_2d(radar_lon, radar_lat, &poly_lonlat) {
-                hit_distances.push(0.0);
-            }
-            if point_in_polygon_2d(target_lon, target_lat, &poly_lonlat) {
-                hit_distances.push(total_dist);
-            }
-
-            if hit_distances.is_empty() {
+        for row in rows {
+            let (id, blat, blon, height, name, address, usage, polygon_json_str) =
+                row.map_err(|e| format!("행 읽기 실패: {}", e))?;
+            // 인접 세그먼트 bbox 가 buffer 만큼 겹치므로 id 로 중복 제거 (한 건물 1회만 처리)
+            if !seen_ids.insert(id) {
                 continue;
             }
 
-            let near_dist = hit_distances.iter().cloned().fold(f64::INFINITY, f64::min);
-            let far_dist = hit_distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let center_dist = (near_dist + far_dist) / 2.0;
+            // 건물통합정보(GIS) 지반 = centroid SRTM(live). fac_buildings.ground_elev 캐시 컬럼은 백필 안 된 행이
+            //   많아(NULL→COALESCE 0) 건물이 해수면에 가라앉아 LoS 차폐를 못 만들었다. 파노라마(panorama.rs:509)와
+            //   동일하게 centroid SRTM 한 점으로 지반을 다시 잡아 단면도·TrackMap LoS·파노라마/소실통계 프레임 통일.
+            let ground_elev = srtm.get_elevation(blat, blon).unwrap_or(0.0);
 
-            // 대표 좌표: 교차 구간 중심점
-            let t_mid = (center_dist / total_dist).clamp(0.0, 1.0);
-            let rep_lon = radar_lon + t_mid * dx;
-            let rep_lat = radar_lat + t_mid * dy;
+            // 폴리곤 좌표 파싱 시도
+            let polygon_coords: Option<Vec<[f64; 2]>> = polygon_json_str.as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
 
-            buildings.push(BuildingOnPath {
-                distance_km: center_dist,
-                near_dist_km: near_dist,
-                far_dist_km: far_dist,
-                height_m: height,
-                ground_elev_m: ground_elev,
-                total_height_m: height + ground_elev,
-                name,
-                address,
-                usage,
-                lat: rep_lat,
-                lon: rep_lon,
-                polygon: Some(poly_pts.clone()),
-                is_manual: false,
-            });
-        } else {
-            // 폴리곤 없는 GIS 건물은 제외
-            continue;
+            if let Some(ref poly_pts) = polygon_coords {
+                // 정확한 직선-폴리곤 교차 테스트 (복도 근사 대신 기하학적 교차)
+                let poly_lonlat: Vec<(f64, f64)> =
+                    poly_pts.iter().map(|p| (p[1], p[0])).collect();
+
+                let mut hit_distances = line_polygon_intersections(
+                    radar_lon, radar_lat, target_lon, target_lat,
+                    &poly_lonlat, total_dist,
+                );
+
+                // LoS 시작/끝점이 폴리곤 내부인 경우 (건물 안에서 시작/종료)
+                if point_in_polygon_2d(radar_lon, radar_lat, &poly_lonlat) {
+                    hit_distances.push(0.0);
+                }
+                if point_in_polygon_2d(target_lon, target_lat, &poly_lonlat) {
+                    hit_distances.push(total_dist);
+                }
+
+                if hit_distances.is_empty() {
+                    continue;
+                }
+
+                let near_dist = hit_distances.iter().cloned().fold(f64::INFINITY, f64::min);
+                let far_dist = hit_distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let center_dist = (near_dist + far_dist) / 2.0;
+
+                // 대표 좌표: 교차 구간 중심점
+                let t_mid = (center_dist / total_dist).clamp(0.0, 1.0);
+                let rep_lon = radar_lon + t_mid * dx;
+                let rep_lat = radar_lat + t_mid * dy;
+
+                buildings.push(BuildingOnPath {
+                    distance_km: center_dist,
+                    near_dist_km: near_dist,
+                    far_dist_km: far_dist,
+                    height_m: height,
+                    ground_elev_m: ground_elev,
+                    total_height_m: height + ground_elev,
+                    name,
+                    address,
+                    usage,
+                    lat: rep_lat,
+                    lon: rep_lon,
+                    polygon: Some(poly_pts.clone()),
+                    is_manual: false,
+                });
+            } else {
+                // 폴리곤 없는 GIS 건물은 제외
+                continue;
+            }
         }
     }
 

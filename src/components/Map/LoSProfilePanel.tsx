@@ -241,17 +241,20 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         }));
         setProfile(points);
 
-        // 건물 데이터 조회 (LoS 경로 ±100m 코리도)
+        // 건물 데이터 조회 — 코리도를 단면도 전체 길이(farLat/farLon = profileMaxKm, 기본 200NM)까지 연장.
+        //   지형/최저탐지선·항적점이 200NM 까지 그려지므로(줌아웃) 건물도 같은 범위로 조회해야 줌 어느 단계에서나
+        //   선과 건물이 함께 보인다. farLat/farLon 은 레이더→타겟 방위선상의 200NM 점(위 프로파일 종점과 동일).
+        //   백엔드가 코리도를 세그먼트 bbox 로 조회하므로 장거리 연장도 빠름.
         try {
           const bldgs: BuildingOnPath[] = await invoke("query_buildings_along_path", {
             radarLat: radarSite.latitude,
             radarLon: radarSite.longitude,
-            targetLat,
-            targetLon,
+            targetLat: farLat,
+            targetLon: farLon,
             corridorWidthM: 100.0,
           });
           if (!cancelled && bldgs.length > 0) {
-            // 백엔드가 fac_buildings.ground_elev (SRTM centroid 캐시) 및 수동 건물 사용자 입력값을 이미 제공함
+            // 백엔드(query_buildings_along_path)가 GIS 건물 지반을 centroid SRTM(live)로, 수동 건물은 사용자 입력값으로 제공함
             setBuildings(bldgs);
           }
         } catch {
@@ -599,7 +602,9 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (showBuildings && buildings.length > 0) {
       for (const b of buildings) {
         const bDist = b.distance_km;
-        if (bDist <= 0 || bDist >= D) continue;
+        // 단면도 전체 길이(profileMaxKm, 기본 200NM)까지 건물 표시 — 줌아웃 시 타겟 너머 건물도 함께.
+        //   차단(isBlocking)은 아래 maxBlockPoint(레이더→타겟 LoS, 거리<D) 기준이라 타겟 너머 건물은 비차단으로만 표시.
+        if (bDist <= 0 || bDist >= profileMaxKm) continue;
         const bTop = b.ground_elev_m + b.height_m;
         const bAdj = bTop - curvDrop(bDist);
 
@@ -1184,6 +1189,9 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         {showBuildings && chartData.significantBuildings.map((b, bi) => {
           const nearD = b.near_dist_km ?? b.distance_km;
           const farD = b.far_dist_km ?? b.distance_km;
+          // 보이는 줌 구간 밖 건물은 렌더 생략 (200NM 연장 시 화면 밖 수백 동이 DOM에 쌓이는 것 방지).
+          //   return null 이므로 bi(=significantBuildings 인덱스)는 그대로 → 호버/클릭/툴팁 인덱스 정합 유지.
+          if (farD < zoomStart || nearD > zoomEnd) return null;
           const hasExtent = (farD - nearD) > 0.001;
           // 도형 건물: 양 끝의 곡률 보정 적용
           const nearGroundAdj = b.ground_elev_m - curvDrop(nearD);
