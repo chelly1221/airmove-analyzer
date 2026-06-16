@@ -84,8 +84,16 @@ export function LosCrossSection({
     const adjTarget = targetElev - curvDrop(D);
     const buildings: BuildingOnPath[] = los.pathBuildings ?? [];
 
-    // 1) 조정 지형 (실제 지구곡률 반영)
-    const adjTerrain = profile.map((p) => ({
+    // 표시용 base 지형 = 순수 SRTM(terrainProfile). combinedElev(=profile)는 건물 꼭대기를 footprint 중심
+    //   1개 그리드점에 spike 로 박는데, interpElev 가 그 spike 까지 ~1셀(≈60m) 미리 올라가는 램프를 만들어
+    //   최저탐지선·녹색지형이 건물 법면 '앞'에서 조기상승했다(특히 그리드 스텝보다 좁은 point 형 건물:
+    //   최근접 그리드점이 nearD 보다 앞쪽으로 스냅). 표시용 지형·최저탐지선은 순수 SRTM 을 base 로 쓰고
+    //   건물은 edges + effElevAt override 로만 주입 → 법면에서 수직상승(TrackMap LoSProfilePanel 과 동일).
+    //   ※ 차단판정(obstacles/blocked)·losBlocked 프레임은 그대로 combinedElev 유지 — 표시 base 만 분리.
+    const baseTerrain = los.terrainProfile ?? profile;
+
+    // 1) 조정 지형 (실제 지구곡률 반영) — 순수 SRTM. 건물은 실루엣(significantBuildings)으로 별도 표시.
+    const adjTerrain = baseTerrain.map((p) => ({
       distance: p.distance,
       height: p.elevation - curvDrop(p.distance),
     }));
@@ -162,8 +170,9 @@ export function LosCrossSection({
 
       let maxAngle = -Infinity;
       let obIdx = 0;
-      return dists.map((d) => {
-        if (d <= 0) return { distance: d, height: radarHeight };
+      // 샘플별 지형 floor(terr)·음영 ray(los)·당시 누적 최대앙각(angle)을 보존 — 아래 교차점 삽입에 사용.
+      const raw = dists.map((d) => {
+        if (d <= 0) return { distance: d, terr: radarHeight, los: radarHeight, angle: -Infinity };
         const dM = d * 1000;
         while (obIdx < obs.length && obs[obIdx].distance <= d + 1e-9) {
           const ob = obs[obIdx];
@@ -180,23 +189,58 @@ export function LosCrossSection({
         // 직선 빔 높이 — 실제지구(디스플레이) 프레임 그대로, 굴절 보정 없음. 디스플레이 지형을 floor 로
         const losDisplay = radarHeight + maxAngle * dM;
         const adjTerrainDisplay = terrElev - curvDrop(d);
-        return { distance: d, height: Math.max(adjTerrainDisplay, losDisplay) };
+        return { distance: d, terr: adjTerrainDisplay, los: losDisplay, angle: maxAngle };
       });
+
+      // 폴리라인 코너컷 제거 — 인접 샘플 사이에서 음영 ray 와 지형 floor 의 상하가 바뀌는 곳(= ray 가 지형
+      //   법면에 닿는 지점)에 정확한 교차점을 정점으로 삽입한다. 종전엔 마지막 'ray 우세' 샘플과 첫 '지형 우세'
+      //   샘플을 직선으로 이어, 한 칸(코리도 ≈60m·확장부 ≈370m) 미리 꺾여 올라간 것처럼 보였다(법면 도달 전 조기상승).
+      //   ray 는 각도 일정한 직선, 지형 floor 는 구간선형 → 교차점은 선형보간으로 정확히 구해진다.
+      const EPS = 1e-6;
+      const out: { distance: number; height: number }[] = [];
+      for (let i = 0; i < raw.length; i++) {
+        const c = raw[i];
+        const p = i > 0 ? raw[i - 1] : null;
+        if (p && p.distance > 0) {
+          const pRay = p.los > p.terr + EPS;
+          const cRay = c.los > c.terr + EPS;
+          if (pRay && !cRay) {
+            // ray → 지형: 들어오던 ray(각도 p.angle)가 상승 지형면에 닿는 지점
+            const f0 = (radarHeight + p.angle * p.distance * 1000) - p.terr;
+            const f1 = (radarHeight + p.angle * c.distance * 1000) - c.terr;
+            if (f0 > 0 && f1 < 0) {
+              const t = f0 / (f0 - f1);
+              const xd = p.distance + t * (c.distance - p.distance);
+              out.push({ distance: xd, height: radarHeight + p.angle * xd * 1000 });
+            }
+          } else if (!pRay && cRay) {
+            // 지형 → ray(능선 너머 음영 시작): 새 ray(각도 c.angle)가 지형면에서 떨어지는 지점
+            const f0 = p.terr - (radarHeight + c.angle * p.distance * 1000);
+            const f1 = c.terr - (radarHeight + c.angle * c.distance * 1000);
+            if (f0 > 0 && f1 < 0) {
+              const t = f0 / (f0 - f1);
+              const xd = p.distance + t * (c.distance - p.distance);
+              out.push({ distance: xd, height: radarHeight + c.angle * xd * 1000 });
+            }
+          }
+        }
+        out.push({ distance: c.distance, height: Math.max(c.terr, c.los) });
+      }
+      return out;
     };
 
-    // 2a) 현재 선 (지형+모든 건물, combinedElev base) — 기존과 동일 결과
-    const minDetStraight = computeMinDet(profile, buildings);
+    // 2a) 현재 선 — 순수 SRTM base(baseTerrain) + 모든 건물 edges. spike 배제로 법면 앞 조기상승 제거.
+    const minDetStraight = computeMinDet(baseTerrain, buildings);
 
-    // 2b) 분석 대상 건물 제외 선 — base 를 실선과 동일한 profile(combinedElev: 지형+모든건물)에서 출발시키고,
-    //     대상 건물 footprint 구간만 구조물 height 를 제거(지반/언덕은 유지)한다. → 점선 base = 실선 base,
-    //     유일한 차이 = 대상 구조물뿐이라 두 선은 대상 전까지 완전히 동일하고 대상 후방서만 벌어진다.
-    //     (이전엔 raw SRTM 에서 출발 → 녹색 지형에 묻혀 실루엣 없이 보이는 비대상 건물 봉우리(combinedElev 스파이크)가
-    //      점선 base 에서 빠져, 실선·녹색지형은 그 위를 타고 넘는데 점선만 봉우리를 '무시'하던 시각 불일치가 있었음.
-    //      비대상 건물은 엣지로만 들어가 interpElev 보간 봉우리를 만들지 못해 floor 가 raw SRTM 으로 가라앉던 게 원인.)
+    // 2b) 분석 대상 건물 제외 선 — 실선과 동일한 순수 SRTM base(baseTerrain)에서 출발하고, 대상 건물만
+    //     edges 에서 제외(buildingsWithoutTarget)한다. 비대상 건물은 실선과 동일하게 edges+effElevAt 로
+    //     들어가 실루엣 유지 → 두 선은 대상 전까지 완전히 동일하고 대상 후방서만 벌어진다.
+    //     (실선·점선이 spike 없는 동일 base 라 비대상 건물 처리도 일치 — 종전 '점선만 봉우리 무시' 불일치 해소.
+    //      대상 건물 top spike 도 base 에 없어 점선이 대상 footprint 에서 실제 지반으로 자연 하강 — 복원 hack 불필요.)
     //     대상 식별: 수동건물 + 치수 일치 + far_dist 가 타겟 거리(D)까지 도달 (코리도 끝 = 대상).
     //     point 형 대상은 Rust 가 pathBuildings 에서 제외 → 매칭 0 건이면 미표시(두 선 동일).
     const targetBuildings = buildings.filter((b) => isTargetBuildingOnPath(b, building, D));
-    // 대상 footprint 거리구간 — 점선 base 복원과 비대상 엣지 제외에 공용.
+    // 대상 footprint 거리구간 — 점선의 비대상(겹침) 엣지 제외 판정용.
     const targetSpans = targetBuildings.map((tb) => ({
       near: tb.near_dist_km ?? tb.distance_km,
       far: tb.far_dist_km ?? tb.distance_km,
@@ -209,41 +253,11 @@ export function LosCrossSection({
     const buildingsWithoutTarget = buildings.filter(
       (b) => !isTargetBuildingOnPath(b, building, D) && !inTargetSpan(b.distance_km),
     );
-    const rawTerrain = los.terrainProfile; // 순수 SRTM — 대상 footprint 의 지반 복원용 (index 는 profile 과 정렬)
-    let dashedTerrain: ElevationPoint[] | undefined;
-    if (targetBuildings.length > 0) {
-      const merged = profile.map((p) => ({ ...p }));
-      for (const tb of targetBuildings) {
-        const near = tb.near_dist_km ?? tb.distance_km;
-        const far = tb.far_dist_km ?? tb.distance_km;
-        const grnd = tb.ground_elev_m;
-        // 한 인덱스 i 의 지반 복원: 순수지형(rawTerrain)과 대상 지반고 중 높은 값으로 내림(rawTerrain 없으면 지반고 폴백).
-        //   중앙선 SRTM 이 언덕 옆을 스쳐 낮게 샘플링된 경우는 ground_elev 가 언덕을 복원.
-        const restoreFloor = (i: number) => {
-          const p = merged[i];
-          const floorElev = Math.max(rawTerrain?.[i]?.elevation ?? grnd, grnd);
-          if (floorElev < p.elevation) p.elevation = floorElev;
-        };
-        // (a) footprint [near,far] 구간 복원 — 그리드 스텝보다 폭이 넓은 건물 본체.
-        for (let i = 0; i < merged.length; i++) {
-          if (merged[i].distance < near - 1e-9 || merged[i].distance > far + 1e-9) continue;
-          restoreFloor(i);
-        }
-        // (b) 병합 스파이크가 박힌 정확한 그리드 인덱스도 강제 복원. computeLosBatch 는 지붕을
-        //   combinedElev[distToNearestIdx(distance_km)] 한 점에만 주입하는데(distance_km=footprint 중심),
-        //   footprint 폭이 그리드 스텝(≈60m)보다 좁은 대상에선 그 최근접 그리드점이 [near,far] 밖으로
-        //   스냅돼 (a) 가 놓친다. 그 구조물 스파이크가 점선 base 에 살아남아 최저탐지선을 들어올리던 게
-        //   '분석 대상 제외' 선이 실제 지반(~0)으로 안 내려가던 원인. distToNearestIdx 와 동일 기준으로 복원.
-        const center = tb.distance_km;
-        let spikeIdx = 0, best = Infinity;
-        for (let i = 0; i < merged.length; i++) {
-          const dd = Math.abs(merged[i].distance - center);
-          if (dd < best) { best = dd; spikeIdx = i; }
-        }
-        restoreFloor(spikeIdx);
-      }
-      dashedTerrain = merged;
-    }
+    // 점선 base 도 실선과 동일한 순수 SRTM(baseTerrain). spike 없는 base 라 대상 footprint 지반 복원·
+    //   spike 강제복원 hack 이 모두 불필요 — 대상은 edges 에서 빠지고(buildingsWithoutTarget) footprint 는
+    //   raw SRTM 지반으로 자연 하강한다.
+    const dashedTerrain: ElevationPoint[] | undefined =
+      targetBuildings.length > 0 ? baseTerrain : undefined;
     const minDetWithout = dashedTerrain
       ? computeMinDet(dashedTerrain, buildingsWithoutTarget)
       : null;
