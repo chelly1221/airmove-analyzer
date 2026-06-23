@@ -6,7 +6,7 @@
  *
  * 추가 차단영역 밴드 = angleWithout(az) ≤ elev < angleWith(az) — classifyObstacleLosses 의 buildingCaused
  * 정의·AzElev 차트 빨강영역(panoWith−panoWithout)과 동일 소스(makePanoramaSampler)·동일 프레임
- * (실제지구 R=6,371,000, lossElevAngleDeg). Rust 히스토그램의 양각 빈도 같은 프레임이라 정렬된다.
+ * (ITU 4/3 유효지구, pointElevAngleDeg). Rust 히스토그램의 양각 빈도 같은 프레임이라 정렬된다.
  *
  *   분모(노출) = Σ(추가 차단영역 셀의 추적시간 + 소실시간),  분자 = Σ(추가 차단영역 셀의 소실시간)
  *   소실율(%) = 분자 / 분모 × 100

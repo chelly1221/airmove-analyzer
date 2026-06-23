@@ -4,16 +4,19 @@ import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import { useOMChartZoom, type ChartZoom } from "./OMEditable";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import { bearingDeg, haversineKm } from "../../utils/geo";
-import { calcBuildingAzExtent, isTargetBuildingOnPath } from "../../utils/obstacleAnalysisHelpers";
+import { calcBuildingAzExtent, isTargetBuildingOnPath, computeLosBlockage } from "../../utils/obstacleAnalysisHelpers";
 
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
+/** ITU-R 표준대기 굴절계수 k=4/3 → 유효지구반경. 단면도(지형/지물 표시·LoS·차단 판정)를 이 단일
+ *  4/3 프레임에서 수행: 지형은 유효지구 곡률만큼 처지고 LoS(레이)는 이 프레임에서 직선(ITU 경로단면법). */
+const R_EFF_M = (R_EARTH_M * 4) / 3;
 
-/** 디스플레이 프레임 곡률 보정량 (m): 실제 지구반경 기준
- *  → 직선 LoS 가 직선으로, 지형이 거리에 따라 아래로 처져 보임 */
-function curvDrop(dKm: number): number {
+/** 디스플레이 프레임 곡률 보정량 (m): ITU 4/3 유효지구반경 기준
+ *  → 직선 LoS 가 (이 4/3 프레임에서) 직선으로, 지형이 거리에 따라 4/3 곡률만큼 아래로 처져 보임 */
+function curvDrop43(dKm: number): number {
   const dM = dKm * 1000;
-  return (dM * dM) / (2 * R_EARTH_M);
+  return (dM * dM) / (2 * R_EFF_M);
 }
 
 // ── SVG 차트 상수 (TrackMap LoSProfilePanel 과 동일) ──
@@ -49,8 +52,8 @@ export interface ChartTrackPoint {
  * LoS 단면도 — TrackMap LoSProfilePanel 의 chartData/렌더링을 보고서용으로 그대로 이식.
  *
  *  TrackMap 과 동일한 요소:
- *   - LoS (직선/굴절 미적용, running max angle, 통합 obstacle 배열) — 주황 실선
- *   - 지형 (지구곡률 보정) — 녹색 솔리드
+ *   - LoS (ITU 4/3 유효지구 프레임, running max angle, 통합 obstacle 배열) — 주황 실선
+ *   - 지형 (4/3 유효지구 곡률 보정) — 녹색 솔리드
  *   - 경로상 빌딩: polygon 은 사다리꼴, point 는 세로선; 차폐 기여(빨강) / 비차단(회색) / 수동(주황)
  *   - 범례 좌상단 + 빌딩 카운트
  *
@@ -81,7 +84,6 @@ export function LosCrossSection({
     const radarHeight = los.radarHeight;
     const D = los.totalDistance;
     const targetElev = building.ground_elev + building.height;
-    const adjTarget = targetElev - curvDrop(D);
     const buildings: BuildingOnPath[] = los.pathBuildings ?? [];
 
     // 표시용 base 지형 = 순수 SRTM(terrainProfile). combinedElev(=profile)는 건물 꼭대기를 footprint 중심
@@ -89,36 +91,22 @@ export function LosCrossSection({
     //   최저탐지선·녹색지형이 건물 법면 '앞'에서 조기상승했다(특히 그리드 스텝보다 좁은 point 형 건물:
     //   최근접 그리드점이 nearD 보다 앞쪽으로 스냅). 표시용 지형·최저탐지선은 순수 SRTM 을 base 로 쓰고
     //   건물은 edges + effElevAt override 로만 주입 → 법면에서 수직상승(TrackMap LoSProfilePanel 과 동일).
-    //   ※ 차단판정(obstacles/blocked)·losBlocked 프레임은 그대로 combinedElev 유지 — 표시 base 만 분리.
+    //   ※ 차단판정(computeLosBlockage)·losBlocked 는 그대로 profile(=combinedElev) 유지 — 표시 base 만 분리.
     const baseTerrain = los.terrainProfile ?? profile;
 
-    // 1) 조정 지형 (실제 지구곡률 반영) — 순수 SRTM. 건물은 실루엣(significantBuildings)으로 별도 표시.
+    // 1) 조정 지형 (4/3 유효지구 곡률 반영) — 순수 SRTM. 건물은 실루엣(significantBuildings)으로 별도 표시.
     const adjTerrain = baseTerrain.map((p) => ({
       distance: p.distance,
-      height: p.elevation - curvDrop(p.distance),
+      height: p.elevation - curvDrop43(p.distance),
     }));
 
-    // 1.5) 통합 장애물 배열: 지형 + 빌딩 — 차단 판정용 (min-det 는 computeMinDet 가 자체 구성)
+    // 통합 장애물 인터페이스 — computeMinDet 가 자체 obstacle 구성에 사용. 차단 판정은 computeLosBlockage(공유 헬퍼)로 일원화.
     interface Obstacle { distance: number; elevation: number; }
-    const obstacles: Obstacle[] = [];
-    for (const p of profile) {
-      obstacles.push({ distance: p.distance, elevation: p.elevation });
-    }
-    for (const b of buildings) {
-      const bTop = b.ground_elev_m + b.height_m;
-      const nearD = b.near_dist_km ?? b.distance_km;
-      const farD = b.far_dist_km ?? b.distance_km;
-      obstacles.push({ distance: nearD, elevation: bTop });
-      if (farD - nearD > 0.001) {
-        obstacles.push({ distance: farD, elevation: bTop });
-      }
-    }
-    obstacles.sort((a, b) => a.distance - b.distance);
 
-    // 2) 최저 탐지가능선 (직선 LoS, 굴절 미적용, Running Max Angle).
+    // 2) 최저 탐지가능선 (직선 LoS, ITU 4/3 유효지구, Running Max Angle).
     //    지형 base(terrainPts) + 건물(blds) 통합 obstacle 에 대해 running-max 앙각 계산.
-    //    레이더 빔을 실제지구(디스플레이) 프레임에서 직선으로 전파 — 4/3 유효지구 굴절 미적용.
-    //    앙각·빔 높이 모두 실제지구 곡률 보정(curvDrop)만 사용하므로 추가 프레임 변환 불필요.
+    //    레이더 빔을 4/3 유효지구(디스플레이) 프레임에서 직선으로 전파 (ITU-R 경로단면법).
+    //    앙각·빔 높이 모두 4/3 곡률 보정(curvDrop43)만 사용하므로 추가 프레임 변환 불필요.
     //    동일 알고리즘을 (지형+모든건물) / (순수지형+대상제외건물) 두 입력으로 호출.
     const computeMinDet = (terrainPts: ElevationPoint[], blds: BuildingOnPath[]) => {
       if (terrainPts.length === 0) return [] as { distance: number; height: number }[];
@@ -177,18 +165,18 @@ export function LosCrossSection({
         while (obIdx < obs.length && obs[obIdx].distance <= d + 1e-9) {
           const ob = obs[obIdx];
           if (ob.distance > 0) {
-            const adjH = ob.elevation - curvDrop(ob.distance);
+            const adjH = ob.elevation - curvDrop43(ob.distance);
             const angle = (adjH - radarHeight) / (ob.distance * 1000);
             if (angle > maxAngle) maxAngle = angle;
           }
           obIdx++;
         }
         const terrElev = effElevAt(d);
-        const terrAngle = (terrElev - curvDrop(d) - radarHeight) / dM;
+        const terrAngle = (terrElev - curvDrop43(d) - radarHeight) / dM;
         if (terrAngle > maxAngle) maxAngle = terrAngle;
-        // 직선 빔 높이 — 실제지구(디스플레이) 프레임 그대로, 굴절 보정 없음. 디스플레이 지형을 floor 로
+        // 직선 빔 높이 — ITU 4/3 유효지구(디스플레이) 프레임에서 직선. 디스플레이 지형을 floor 로
         const losDisplay = radarHeight + maxAngle * dM;
-        const adjTerrainDisplay = terrElev - curvDrop(d);
+        const adjTerrainDisplay = terrElev - curvDrop43(d);
         return { distance: d, terr: adjTerrainDisplay, los: losDisplay, angle: maxAngle };
       });
 
@@ -262,26 +250,8 @@ export function LosCrossSection({
       ? computeMinDet(dashedTerrain, buildingsWithoutTarget)
       : null;
 
-    // 차단 판정 (TrackMap 와 동일 — 빌딩까지 직선 LoS 와 통합 장애물 비교)
-    const losStraightH = (d: number) =>
-      radarHeight + (adjTarget - radarHeight) * (d / D);
-    let blocked = false;
-    let maxBlockPoint: { distance: number; adjHeight: number; realElevation: number } | null = null;
-    let maxExcess = 0;
-    for (const ob of obstacles) {
-      if (ob.distance <= 0 || ob.distance >= D) continue;
-      const adjH = ob.elevation - curvDrop(ob.distance);
-      const excess = adjH - losStraightH(ob.distance);
-      if (excess > maxExcess) {
-        maxExcess = excess;
-        blocked = true;
-        maxBlockPoint = {
-          distance: ob.distance,
-          adjHeight: adjH,
-          realElevation: ob.elevation,
-        };
-      }
-    }
+    // 차단 판정 — 배지(computeLosBatch)와 동일한 computeLosBlockage 단일 소스 (동일 obstacle 집합·동일 4/3 chord 식).
+    const { blocked, maxBlockPoint } = computeLosBlockage(profile, buildings, radarHeight, D, targetElev);
 
     // 5) 차폐 기여 빌딩 — 지형만 shadow 보다 빌딩 꼭대기가 높으면 실질 차폐 기여.
     //    단, 분석 대상 건물은 음영 여부와 무관하게 항상 포함(앞쪽 지형에 가려도 표시) — isTarget 표시.
@@ -291,11 +261,11 @@ export function LosCrossSection({
       if (bDist <= 0 || bDist >= D) continue;
       const isTarget = isTargetBuildingOnPath(b, building, D);
       const bTop = b.ground_elev_m + b.height_m;
-      const bAdj = bTop - curvDrop(bDist);
+      const bAdj = bTop - curvDrop43(bDist);
       let terrainShadow = radarHeight;
       for (const p of profile) {
         if (p.distance <= 0 || p.distance >= bDist) continue;
-        const adjH = p.elevation - curvDrop(p.distance);
+        const adjH = p.elevation - curvDrop43(p.distance);
         const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
         if (shadow > terrainShadow) terrainShadow = shadow;
       }
@@ -330,7 +300,7 @@ export function LosCrossSection({
       adjTerrain, minDetStraight, minDetWithout,
       blocked, maxBlockPoint, significantBuildings,
       minY, maxY, maxDistance: FULL_X_KM,
-      adjTarget, targetElev, radarHeight,
+      targetElev, radarHeight,
     };
   }, [los, building]);
 
@@ -488,8 +458,8 @@ export function LosCrossSection({
       const nearD = b.near_dist_km ?? b.distance_km;
       const farD = b.far_dist_km ?? b.distance_km;
       if (inRange(nearD) || inRange(farD) || (nearD <= zoomStart && farD >= zoomEnd)) {
-        heights.push((b.ground_elev_m + b.height_m) - curvDrop(b.distance_km));
-        heights.push(b.ground_elev_m - curvDrop(b.distance_km));
+        heights.push((b.ground_elev_m + b.height_m) - curvDrop43(b.distance_km));
+        heights.push(b.ground_elev_m - curvDrop43(b.distance_km));
       }
     }
     // 레이더 높이 (시작점이 보일 때만)
@@ -576,7 +546,7 @@ export function LosCrossSection({
 
     // 항적 포인트 — <circle r=1.5 fillOpacity=0.7> + PSR 흰 테두리. SVG 와 동일 cx/cy.
     for (const tp of trackPoints) {
-      const adjAlt = tp.altM - curvDrop(tp.distKm);
+      const adjAlt = tp.altM - curvDrop43(tp.distKm);
       const px = xScaleV(tp.distKm);
       const py = yScaleV(adjAlt);
       const col = detectionTypeColor(tp.radarType);
@@ -594,7 +564,7 @@ export function LosCrossSection({
     // 소실표적 포인트 — 항적점과 동일 크기(r=1.5) + 반투명 테두리. SVG 와 동일 cx/cy.
     const lr = LOSS_COLOR[0], lg = LOSS_COLOR[1], lb = LOSS_COLOR[2];
     for (const lp of lossPoints) {
-      const adjAlt = lp.altM - curvDrop(lp.distKm);
+      const adjAlt = lp.altM - curvDrop43(lp.distKm);
       const px = xScaleV(lp.distKm);
       const py = yScaleV(adjAlt);
       ctx.beginPath();
@@ -768,7 +738,7 @@ export function LosCrossSection({
 
         {/* Y축 라벨 (클립 밖) */}
         {yTicks.map((y) => {
-          const labelY = yScale(y - curvDrop(zoomStartKm));
+          const labelY = yScale(y - curvDrop43(zoomStartKm));
           return (
             <text key={`yl-${y}`} x={PAD.left - 5} y={labelY + 3} textAnchor="end"
               fill="#6b7280" fontSize={9}>
@@ -790,7 +760,7 @@ export function LosCrossSection({
             const parts: string[] = [];
             for (let s = 0; s <= 50; s++) {
               const dist = zoomStartKm + (s / 50) * zoomRangeKm;
-              parts.push(`${s === 0 ? "M" : "L"} ${xScale(dist)} ${yScale(y - curvDrop(dist))}`);
+              parts.push(`${s === 0 ? "M" : "L"} ${xScale(dist)} ${yScale(y - curvDrop43(dist))}`);
             }
             return (
               <path key={`yg-${y}`} d={parts.join(" ")} fill="none"
@@ -816,10 +786,10 @@ export function LosCrossSection({
             const nearD = b.near_dist_km ?? b.distance_km;
             const farD = b.far_dist_km ?? b.distance_km;
             const hasExtent = (farD - nearD) > 0.001;
-            const nearGroundAdj = b.ground_elev_m - curvDrop(nearD);
-            const nearTopAdj = (b.ground_elev_m + b.height_m) - curvDrop(nearD);
-            const farGroundAdj = hasExtent ? (b.ground_elev_m - curvDrop(farD)) : nearGroundAdj;
-            const farTopAdj = hasExtent ? ((b.ground_elev_m + b.height_m) - curvDrop(farD)) : nearTopAdj;
+            const nearGroundAdj = b.ground_elev_m - curvDrop43(nearD);
+            const nearTopAdj = (b.ground_elev_m + b.height_m) - curvDrop43(nearD);
+            const farGroundAdj = hasExtent ? (b.ground_elev_m - curvDrop43(farD)) : nearGroundAdj;
+            const farTopAdj = hasExtent ? ((b.ground_elev_m + b.height_m) - curvDrop43(farD)) : nearTopAdj;
             const bxNear = xScale(nearD);
             const bxFar = hasExtent ? xScale(farD) : bxNear;
             const byBottomNear = yScale(nearGroundAdj);

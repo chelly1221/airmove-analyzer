@@ -12,6 +12,68 @@ import { haversineKm, bearingDeg } from "./geo";
  *  기본 뷰는 100NM 이지만 줌아웃 시 200NM 까지 보이므로 그만큼 미리 샘플링. */
 const EXTEND_PROFILE_MIN_KM = 200 * 1.852;
 
+/** LoS 차단 판정 결과 — 차트(ReportOMLosCrossSection)와 배지(computeLosBatch)가 공유하는 단일 소스. */
+export interface LosBlockageResult {
+  blocked: boolean;
+  /** 최대 초과(차단 기여 최대) 지점. blocked=false 면 null. distance=km, realElevation=실제 표고(m ASL). */
+  maxBlockPoint: { distance: number; adjHeight: number; realElevation: number } | null;
+}
+
+/**
+ * LoS 차단 판정 — ITU 4/3 유효지구 직선 현(chord) 대비 통합 장애물(지형 profile + 건물 near/far 엣지) 비교.
+ * 차트(ReportOMLosCrossSection)·배지(computeLosBatch)가 동일 식·동일 obstacle 집합으로 판정하도록 추출한 단일 소스.
+ *   클리어런스 = 평면현 − d1·d2/(2·R_eff). excess(=adjH − 현높이) 가 최대(>0)인 지점을 차단점으로.
+ * @param profile           지형 프로파일(elevationProfile = 건물 spike 포함 combinedElev). {distance(km), elevation(m ASL)}
+ * @param pathBuildings     경로상 건물 — near/far 엣지를 obstacle 로 추가
+ * @param radarHeight       레이더 안테나 해발고 (m)
+ * @param totalDistanceKm   레이더↔표적 지표거리 (km)
+ * @param targetElev        표적 해발고 (m)
+ */
+export function computeLosBlockage(
+  profile: { distance: number; elevation: number }[],
+  pathBuildings: BuildingOnPath[],
+  radarHeight: number,
+  totalDistanceKm: number,
+  targetElev: number,
+): LosBlockageResult {
+  const R_EFF = (6_371_000 * 4) / 3; // 4/3 유효지구반경 (ITU-R 표준대기 k=4/3)
+  const curvDrop43 = (dKm: number): number => {
+    const dM = dKm * 1000;
+    return (dM * dM) / (2 * R_EFF);
+  };
+  const D = totalDistanceKm;
+  const adjTarget = targetElev - curvDrop43(D); // 표적단 4/3 곡률 강하
+
+  // 통합 장애물: 지형(profile) + 건물 near/far 엣지 (min-det 는 호출부가 자체 구성)
+  const obstacles: { distance: number; elevation: number }[] = [];
+  for (const p of profile) obstacles.push({ distance: p.distance, elevation: p.elevation });
+  for (const b of pathBuildings) {
+    const bTop = b.ground_elev_m + b.height_m;
+    const nearD = b.near_dist_km ?? b.distance_km;
+    const farD = b.far_dist_km ?? b.distance_km;
+    obstacles.push({ distance: nearD, elevation: bTop });
+    if (farD - nearD > 0.001) obstacles.push({ distance: farD, elevation: bTop });
+  }
+  obstacles.sort((a, b) => a.distance - b.distance);
+
+  // 레이더↔표적 직선 현(chord) — 표적단도 4/3 곡률 강하 반영
+  const losStraightH = (d: number) => radarHeight + (adjTarget - radarHeight) * (d / D);
+  let blocked = false;
+  let maxBlockPoint: LosBlockageResult["maxBlockPoint"] = null;
+  let maxExcess = 0;
+  for (const ob of obstacles) {
+    if (ob.distance <= 0 || ob.distance >= D) continue;
+    const adjH = ob.elevation - curvDrop43(ob.distance);
+    const excess = adjH - losStraightH(ob.distance);
+    if (excess > maxExcess) {
+      maxExcess = excess;
+      blocked = true;
+      maxBlockPoint = { distance: ob.distance, adjHeight: adjH, realElevation: ob.elevation };
+    }
+  }
+  return { blocked, maxBlockPoint };
+}
+
 /** LoS 분석 — 4개씩 병렬 배치 실행 */
 export async function computeLosBatch(
   jobs: { radar: RadarSite; bldg: ManualBuilding }[],
@@ -46,12 +108,10 @@ export async function computeLosBatch(
         // 방향 단위 벡터 (위/경도 변화량 per km) — 빌딩 너머도 같은 베어링 직선상으로 외삽
         const dLatPerKm = totalDist > 1e-6 ? (bldg.latitude - radar.latitude) / totalDist : 0;
         const dLonPerKm = totalDist > 1e-6 ? (bldg.longitude - radar.longitude) / totalDist : 0;
-        // 코리도: 0..totalDist 등간격, 마지막 점이 정확히 totalDist (= 빌딩 인덱스 samplesToBuilding)
+        // 코리도: 0..totalDist 등간격, 마지막 점이 정확히 totalDist (코리도 마지막 점 = 빌딩 거리)
         const corridorSamples = Math.min(MAX_CORRIDOR_SAMPLES, Math.max(1, Math.round(totalDist / CORRIDOR_STEP_KM)));
         const dists: number[] = [];
         for (let j = 0; j <= corridorSamples; j++) dists.push((j / corridorSamples) * totalDist);
-        // 빌딩 거리에 해당하는 샘플 인덱스 (블록 판정 루프 종료점) — 코리도 마지막 점
-        const samplesToBuilding = corridorSamples;
         // 확장부: totalDist 초과 ~ profileEndKm 거칠게 (빌딩이 200NM 너머면 profileEndKm==totalDist → 확장 없음)
         if (profileEndKm > totalDist + 1e-9) {
           const extSamples = Math.max(1, Math.round((profileEndKm - totalDist) / EXT_STEP_KM));
@@ -101,30 +161,7 @@ export async function computeLosBatch(
           }
         }
 
-        // 차단 판정: 빌딩 거리까지의 terrain 만 봄 (빌딩 너머 지형은 빌딩 가시성에 무관).
-        //   직선 LoS — 실제지구(R=6,371,000) 곡률만 보정하고 4/3 유효지구 굴절은 적용하지 않는다.
-        //   단면도(ReportOMLosCrossSection) 표시·차단 배지와 동일 프레임이라 los.losBlocked 와 차트 판정이 일치.
-        let blocked = false;
-        let maxBlockDist = 0, maxBlockElev = -Infinity, maxBlockName = "";
-        const R = 6371000;
         const targetElev = bldg.ground_elev + bldg.height;
-        for (let k = 1; k <= samplesToBuilding && k < combinedElev.length; k++) {
-          const d = dists[k] * 1000;
-          const t = totalDist > 1e-6 ? dists[k] / totalDist : 0; // radar↔building 보간 (0~1)
-          const losHeight = radarHeight * (1 - t) + targetElev * t;
-          const curvDrop = (d * d) / (2 * R);
-          const terrainAdjusted = combinedElev[k] + curvDrop;
-          if (terrainAdjusted > losHeight) {
-            blocked = true;
-            if (terrainAdjusted > maxBlockElev) {
-              maxBlockElev = terrainAdjusted;
-              maxBlockDist = dists[k];
-              const nearBldg = pathBuildings.find((pb) => Math.abs(pb.distance_km - maxBlockDist) < 0.5);
-              maxBlockName = nearBldg?.name ?? nearBldg?.address ?? "";
-            }
-          }
-        }
-        if (maxBlockElev === -Infinity) blocked = false;
 
         const bearing = ((Math.atan2(
           (bldg.longitude - radar.longitude) * Math.cos(radar.latitude * Math.PI / 180),
@@ -137,6 +174,18 @@ export async function computeLosBatch(
           latitude: lats[idx],
           longitude: lons[idx],
         }));
+
+        // 차단 판정 — 차트(ReportOMLosCrossSection)와 동일한 computeLosBlockage 단일 소스.
+        //   동일 obstacle 집합(elevProfile + pathBuildings near/far 엣지)·동일 4/3 직선 현(chord) 식이라
+        //   los.losBlocked 와 차트 blocked 가 정확히 일치. (OM 보고서 LoS·장애물 분석 전부 ITU 4/3.)
+        const { blocked, maxBlockPoint } = computeLosBlockage(
+          elevProfile, pathBuildings, radarHeight, totalDist, targetElev,
+        );
+        let maxBlockName = "";
+        if (maxBlockPoint) {
+          const nearBldg = pathBuildings.find((pb) => Math.abs(pb.distance_km - maxBlockPoint.distance) < 0.5);
+          maxBlockName = nearBldg?.name ?? nearBldg?.address ?? "";
+        }
         // 순수 지형 프로파일 (건물 병합 전 raw SRTM) — 단면도 '분석 대상 제외' 선 계산용
         const terrainProf = elevations.map((elev, idx) => ({
           distance: dists[idx],
@@ -159,7 +208,9 @@ export async function computeLosBatch(
           terrainProfile: terrainProf,
           pathBuildings,
           losBlocked: blocked,
-          maxBlockingPoint: blocked ? { distance: maxBlockDist, elevation: maxBlockElev, name: maxBlockName } : undefined,
+          maxBlockingPoint: maxBlockPoint
+            ? { distance: maxBlockPoint.distance, elevation: maxBlockPoint.realElevation, name: maxBlockName }
+            : undefined,
           timestamp: Date.now(),
         };
         return { key, data };
@@ -277,13 +328,14 @@ export function mergeAzSectors(sectors: AzSector[]): AzSector[] {
 //   buildingCaused: inShadow && 양각 ≥ without 차단각(분석대상 제외)      → 분석 대상 건물 추가분에 의해서만 차단
 // with/without 두 실루엣의 유일한 차이 = 분석 대상 건물 → [without, with] 밴드 = '대상 추가 차단'.
 //   이는 panorama 빨강영역(panoWith−panoWithout)과 동일 정의 → 차트의 빨강 영역과 검은× 점이 by-construction 일치.
-// 차단각 = panorama 실루엣 방위별 max(전 거리, 실제지구) → 차트와 동일 소스라 픽셀 일치.
+// 차단각 = panorama 실루엣 방위별 max(전 거리, ITU 4/3 유효지구) → 차트와 동일 소스라 픽셀 일치.
 //   파노라마는 거리축이 없어 max-over-distance 가 본질 — 표적 너머 지형도 silhouette 에 포함되나,
 //   buildingCount(=with−without 차분)는 공통 원거리 장애물이 상쇄돼 거리 오염 없음.
 
-/** 소실표적 양각·차단각 곡률 보정 지구반경 — 실제지구. panorama 실루엣(빨강영역)이 실제지구 프레임이라
- *  점·영역을 같은 프레임에 두어 검은×↔빨강영역 픽셀 일치(단면도 표시 곡률 curvDrop 과도 동일 반경). */
-const R_EARTH_M_LOSS = 6_371_000;
+/** 소실표적 양각·차단각 곡률 보정 지구반경 — ITU 4/3 유효지구(k=4/3). panorama 실루엣(빨강영역)도
+ *  4/3 프레임(Rust panorama.rs·obstacle_monthly.rs elev_angle_deg 동시 이행)이라, 점·영역을 같은
+ *  프레임에 두어 검은×↔빨강영역 픽셀 일치. 단면도·차단 배지(computeLosBatch)와도 동일 4/3 프레임. */
+const R_EFF_M_LOSS = (6_371_000 * 4) / 3;
 const FT_PER_M_LOSS = 3.28084;
 const AZ_TOLERANCE_DEG = 10;
 
@@ -320,11 +372,11 @@ export function isTargetBuildingOnPath(
     && (b.far_dist_km ?? b.distance_km) >= totalDistKm - 0.5;
 }
 
-/** 표적 양각(°) — 실제지구 곡률 보정 후(보고된 고도에서 d²/2R 강하량 차감). panorama 실루엣과 동일 프레임.
+/** 표적 양각(°) — ITU 4/3 유효지구 곡률 보정 후(보고된 고도에서 d²/2R_eff 강하량 차감). panorama 실루엣과 동일 프레임.
  *  소실표적·항적 모두 동일 프레임으로 투영하기 위해 export (ReportOMObstacleAzElevChart 항적 점 공유). */
 export function pointElevAngleDeg(radarH: number, targetAltM: number, distM: number): number {
   if (distM <= 0) return 0;
-  const curvDrop = (distM * distM) / (2 * R_EARTH_M_LOSS);
+  const curvDrop = (distM * distM) / (2 * R_EFF_M_LOSS);
   return (Math.atan((targetAltM - curvDrop - radarH) / distM) * 180) / Math.PI;
 }
 
@@ -337,7 +389,7 @@ function relAngleDeg(x: number, c: number): number {
 }
 
 /**
- * panorama terrain(방위→차단 양각°, 실제지구) 전역 360° 원형 보간 샘플러.
+ * panorama terrain(방위→차단 양각°, ITU 4/3 유효지구) 전역 360° 원형 보간 샘플러.
  * makePanoramaSampler(분류)와 buildSilhouetteLines(차트)가 공유 → terrain 차단각이 두 곳에서 동일.
  *   (윈도우 필터/경계 클램프로 인한 검은×↔빨강영역 불일치 제거 — 양끝은 래핑 보간)
  */
@@ -368,7 +420,7 @@ export function makeTerrainSampler(terrain: PanoramaMergeResult["terrain"]): (az
 }
 
 /**
- * panorama(지형+건물)의 방위별 차단 양각(°, 실제지구) 샘플러.
+ * panorama(지형+건물)의 방위별 차단 양각(°, ITU 4/3 유효지구) 샘플러.
  * ReportOMObstacleAzElevChart 의 buildSilhouetteLines 와 동일 의미 — terrain 보간 + 건물 실루엣/밴드 max.
  * 빨강영역(panoWith−panoWithout)과 검은× 점 분류를 같은 소스·같은 프레임으로 산출 → 픽셀 단위 일치.
  */
@@ -443,7 +495,7 @@ export function classifyObstacleLosses(
   los: LoSProfileData,
   lossPoints: LossPointGeo[],
   opts?: {
-    /** 차단각 산출용 panorama(실제지구) — 차트 빨강영역과 동일 소스라 검은×↔빨강영역 픽셀 일치.
+    /** 차단각 산출용 panorama(ITU 4/3 유효지구) — 차트 빨강영역과 동일 소스라 검은×↔빨강영역 픽셀 일치.
      *  panoWith = 지형+기존지물+분석대상, panoWithout = 분석대상 제외(Rust 가 제외대상 0 이면 null → without==with).
      *  panoWith 자체가 없으면(해당 레이더 파노라마 계산 실패) 차단각 0 → 음영 분류 생략(보수적). */
     panoWith?: PanoramaMergeResult;
@@ -468,7 +520,7 @@ export function classifyObstacleLosses(
     : haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
   const bAzDeg = los.bearing ?? bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
 
-  // 차단각 = panorama 실루엣 방위별 max(실제지구). with(지형+기존지물+분석대상) − without(분석대상 제외) = '대상 추가 차단'.
+  // 차단각 = panorama 실루엣 방위별 max(ITU 4/3 유효지구). with(지형+기존지물+분석대상) − without(분석대상 제외) = '대상 추가 차단'.
   //   빨강영역(panoWith−panoWithout)과 동일 소스·동일 프레임 → 차트 빨강영역·검은× 점 픽셀 일치.
   //   panoWithout 가 null(Rust 가 제외대상 0 일 때) → without==with. panoWith 자체가 없으면 차단각 0(음영 분류 생략).
   const sW = opts?.panoWith ? makePanoramaSampler(opts.panoWith) : null;

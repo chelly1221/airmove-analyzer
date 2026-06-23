@@ -64,8 +64,11 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 - 실제 지구(R=6,371km) 디스플레이 프레임에서 4/3 유효지구(R_eff=8,495km) 굴절 경로 표시
 - `curvDrop(d) = d²/(2R)`, `curvDrop43(d) = d²/(2R_eff)`
 - 4/3 굴절선 디스플레이 변환: `h43 + curvDrop43(d) - curvDrop(d)`
-- 차단 판정은 4/3 프레임에서 수행 — 일반 LOS·커버리지(TrackMap `LoSProfilePanel`, Rust `los.rs`/`coverage.rs`)에 적용
-- **예외 — OM 보고서 LoS 단면도**: `ReportOMLosCrossSection` + `computeLosBatch`(obstacleAnalysisHelpers)는 4/3 굴절 미적용, 실제지구 곡률(`curvDrop`)만 쓰는 **직선 LoS**. 차트 표시와 차단 배지(`los.losBlocked`) 프레임을 통일하기 위함 (4/3 ↔ 직선 혼동 주의)
+- 차단 판정·앙각은 전부 4/3(ITU-R 표준대기 k=4/3) 프레임에서 수행 (2026-06-23 OM 보고서 일괄 4/3 통일):
+  - TrackMap `LoSProfilePanel` · Rust `los.rs`/`coverage.rs`: 실제지구 디스플레이 프레임에 레이를 `h43 + curvDrop43(d) - curvDrop(d)` 로 굽혀 표시
+  - OM 보고서 LoS 단면도(`ReportOMLosCrossSection` + `computeLosBatch`): 4/3 유효지구 프레임에 지형·지물을 `curvDrop43` 로 처지게 그리고 LoS(레이)는 그 프레임에서 직선(ITU 경로단면법). 차트 표시·차트 blocked·차단 배지(`los.losBlocked`) 동일 4/3. 차단판정은 레이더↔표적 직선 현(chord, `평면현 − d1·d2/(2·R_eff)`)으로 차트·배지 식 통일
+  - OM 장애물 음영 손실분류(panorama): `pointElevAngleDeg`(TS) + Rust `panorama.rs::elevation_angle_deg`·`obstacle_monthly.rs::elev_angle_deg` 앙각도 4/3. TS 소실표적 양각 ↔ Rust 차단각/AzElev 히스토그램 픽셀 일치(검은×↔빨강영역) 유지
+- 실제지구(`R=6,371,000`)는 곡률 프레임이 아닌 거리/평면투영(haversine, panorama `wgs84_to_enu` 의 평면 스케일)에만 사용 — 앙각·차단 곡률엔 미사용
 - 고도: SRTM HGT (로컬), 산 이름: peak DB (N3P SHP, 오프라인)
 
 ### 좌표 변환 (coord.rs)

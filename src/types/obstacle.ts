@@ -24,7 +24,7 @@ export interface TrackPointGeo {
  * 추가 차단영역 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
  * 건물-무관 원자료 — 프론트가 건물별 angleWith/angleWithout 컷오프로
  * 추가 차단영역 밴드 셀을 합산해 소실율을 산출한다.
- * 양각은 실제지구 곡률(R=6,371,000) 기준 — lossElevAngleDeg와 동일 프레임.
+ * 양각은 ITU 4/3 유효지구 곡률(k=4/3) 기준 — pointElevAngleDeg와 동일 프레임.
  * 빈 정의(Rust HIST_* 상수와 일치): az_bin = floor(az/0.1) 0..3600,
  * elev_bin = floor((elev+1.0)/0.05) 0..140 (elev 범위 [-1°, 6°)).
  */

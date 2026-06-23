@@ -209,7 +209,7 @@ export default function ReportOMObstacleAzElevChart({
   const { azCenter, azHalfSpan, azSpan, xTicks } = azParams;
 
   // 1b) 항적 점 투영 — 소실표적과 동일 도메인(차트 방위창 + 대상 후방)으로 필터해 (방위, 양각)으로 투영.
-  //     양각은 소실표적과 동일 헬퍼(pointElevAngleDeg, 실제지구 곡률 프레임)로 산출 → 같은 좌표계에서 겹쳐 표시.
+  //     양각은 소실표적과 동일 헬퍼(pointElevAngleDeg, ITU 4/3 유효지구 곡률 프레임)로 산출 → 같은 좌표계에서 겹쳐 표시.
   //     색은 LoS 단면도와 동일하게 detection type 별. (전수 포인트 — 다운샘플 없음)
   const trackDots = useMemo(() => {
     const out: { az: number; elev: number; radarType: string }[] = [];

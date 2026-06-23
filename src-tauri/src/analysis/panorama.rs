@@ -10,6 +10,9 @@ use crate::srtm::SrtmReader;
 
 /// 실제 지구반경 (m)
 const R_EARTH: f64 = 6_371_000.0;
+/// 4/3 유효지구반경 (m) — ITU-R 표준대기 굴절계수 k=4/3. 앙각(곡률 강하) 계산용.
+/// (좌표 변환 wgs84_to_enu 의 평면투영 스케일 R 은 실제지구 유지 — 그건 곡률 프레임이 아님.)
+const R_EFF: f64 = R_EARTH * 4.0 / 3.0;
 
 /// 건물 높이 상한 (m) — 한국 최고층 롯데월드타워 ~555m, 여유 포함 650m
 const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
@@ -19,7 +22,7 @@ const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
 pub struct PanoramaPoint {
     /// 방위 (°, 정북=0, 시계방향)
     pub azimuth_deg: f64,
-    /// 앙각 (°, 실제 지구 기하학적)
+    /// 앙각 (°, ITU 4/3 유효지구)
     pub elevation_angle_deg: f64,
     /// 장애물까지 지표 거리 (km)
     pub distance_km: f64,
@@ -160,14 +163,14 @@ fn ray_segment_intersection(
     if t > 0.0 { Some(t) } else { None }
 }
 
-/// 실제 지구 기하학적 앙각 계산
+/// ITU 4/3 유효지구 앙각 계산 (ITU-R 표준대기 k=4/3)
 /// d: 지표 거리 (m), h_obs: 장애물 해발고 (m), h_radar: 레이더 안테나 해발고 (m)
 fn elevation_angle_deg(d: f64, h_obs: f64, h_radar: f64) -> f64 {
     if d < 1.0 || !d.is_finite() || !h_obs.is_finite() || !h_radar.is_finite() {
         return 0.0;
     }
     let dh = h_obs - h_radar;
-    let curv_drop = d * d / (2.0 * R_EARTH);
+    let curv_drop = d * d / (2.0 * R_EFF);
     ((dh - curv_drop) / d).atan().to_degrees()
 }
 

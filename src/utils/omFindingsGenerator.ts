@@ -144,12 +144,12 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     for (const [key, los] of losMap) {
       const blocked = los.losBlocked;
       if (blocked) hasBlocked = true;
-      const distKm = los.totalDistance / 1000;
+      const distKm = los.totalDistance; // totalDistance 는 이미 km (computeLosBatch)
       const statusStr = blocked ? "차단" : "양호";
       let detail = `  - ${los.radarSiteName} → ${key.includes("__") ? key.split("__")[1] : key}: ${distKm.toFixed(1)}km, ${statusStr}`;
       if (blocked && los.maxBlockingPoint) {
         const bp = los.maxBlockingPoint;
-        detail += ` (차단점: ${(bp.distance / 1000).toFixed(1)}km 지점, ${bp.elevation.toFixed(0)}m${bp.name ? ` [${bp.name}]` : ""})`;
+        detail += ` (차단점: ${bp.distance.toFixed(1)}km 지점, ${bp.elevation.toFixed(0)}m${bp.name ? ` [${bp.name}]` : ""})`;
       }
       lines.push(detail);
     }

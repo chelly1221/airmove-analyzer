@@ -79,7 +79,7 @@ pub struct TrackPointGeo {
 /// 추가 차단영역 소실율 산출용 (방위×양각) 시간 히스토그램 셀.
 /// 건물-무관 원자료 — 프론트가 건물별 angleWith/angleWithout 컷오프로
 /// 추가 차단영역 밴드 셀을 합산해 소실율을 산출한다.
-/// 양각은 실제지구 곡률(R=6,371,000) 기준 — 프론트 lossElevAngleDeg와 동일 프레임.
+/// 양각은 ITU 4/3 유효지구 곡률(k=4/3) 기준 — 프론트 pointElevAngleDeg·panorama 실루엣과 동일 프레임.
 #[derive(Serialize, Clone, Debug)]
 pub struct AzElevCell {
     /// floor(normalize(az)/0.1), 0..3600
@@ -348,15 +348,18 @@ const HIST_ELEV_BIN_DEG: f64 = 0.05;
 const HIST_ELEV_MIN_DEG: f64 = -1.0;
 const HIST_ELEV_MAX_DEG: f64 = 6.0;
 
-/// 레이더→표적 양각(°). 실제지구 곡률(R=6,371,000) 보정.
-/// 반드시 프론트 lossElevAngleDeg(obstacleAnalysisHelpers.ts)와 동일 프레임이어야
-/// 추가 차단영역 슬라이스가 AzElev 차트 빨강영역과 정렬된다. los.rs의 4/3 유효지구 사용 금지.
+/// 4/3 유효지구반경 (m) — ITU-R 표준대기 굴절계수 k=4/3.
+const R_EFF_M: f64 = crate::geo::EARTH_RADIUS_M * 4.0 / 3.0;
+
+/// 레이더→표적 양각(°). ITU 4/3 유효지구 곡률(k=4/3) 보정.
+/// 반드시 프론트 pointElevAngleDeg(obstacleAnalysisHelpers.ts)·panorama.rs 실루엣과 동일 프레임이어야
+/// 추가 차단영역 슬라이스가 AzElev 차트 빨강영역과 정렬된다. (panorama.rs·프론트와 함께 4/3로 통일됨.)
 fn elev_angle_deg(dist_km: f64, alt_m: f64, radar_h_m: f64) -> f64 {
     let d_m = dist_km * 1000.0;
     if d_m <= 0.0 {
         return 0.0;
     }
-    let curv = (d_m * d_m) / (2.0 * crate::geo::EARTH_RADIUS_M);
+    let curv = (d_m * d_m) / (2.0 * R_EFF_M);
     ((alt_m - curv - radar_h_m) / d_m).atan().to_degrees()
 }
 
