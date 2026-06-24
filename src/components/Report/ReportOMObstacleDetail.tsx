@@ -5,6 +5,7 @@ import { haversineKm, bearingDeg } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
+import { losBlockedFromPanorama } from "../../utils/obstacleAnalysisHelpers";
 import BuildingGroupBadge from "./BuildingGroupBadge";
 import ReportOMObstacleAzElevChart from "./ReportOMObstacleAzElevChart";
 import ReportOMObstacleSummaryTable from "./ReportOMObstacleSummaryTable";
@@ -52,6 +53,13 @@ function ReportOMObstacleDetail({
   );
   const bTopElevM = building.ground_elev + building.height;
   const bTopFt = Math.round(bTopElevM * 3.28084);
+
+  // LoS 단면도 차단 배지 — 소실표적 분류(classifyObstacleLosses)와 동일한 panorama 실루엣 소스로 통일.
+  //   panorama 미준비 시 chord(los.losBlocked)로 폴백. (단면도 차트 본문 코리도 시각화는 그대로 유지.)
+  const losBlockedPano = useMemo(
+    () => losBlockedFromPanorama(radarSite, building, los, panoWithout) ?? los.losBlocked,
+    [radarSite, building, los, panoWithout],
+  );
 
   // 이 레이더 omResult 에서 항적·소실표적 수집
   const { losChartPts, allLossThisRadar, allTrackThisRadar } = useMemo(() => {
@@ -123,6 +131,7 @@ function ReportOMObstacleDetail({
           buildingGroup={buildingGroups.find((g) => g.id === building.group_id) ?? null}
           trackPoints={losChartPts.track}
           lossPoints={losChartPts.loss}
+          blockedOverride={losBlockedPano}
         />
       </div>
 

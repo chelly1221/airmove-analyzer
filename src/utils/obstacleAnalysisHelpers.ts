@@ -591,3 +591,33 @@ export function classifyObstacleLosses(
 
   return { bDistKm, bAzDeg, angleTotalDeg, angleTerrainDeg, losses, shadowCount, buildingCount, buildingDurationS };
 }
+
+/**
+ * LoS 단면도 차단(blocked) 판정 — 소실표적 분류(classifyObstacleLosses)와 동일한 panorama 실루엣 소스·동일 양각식으로 통일.
+ *   표적(건물 top) 양각 < 차단각(panorama, 건물 방위) → 차단.
+ *   소실표적 inShadow(lpElevDeg < angleWith)와 동일 프레임·동일 pointElevAngleDeg(ITU 4/3) 사용. 단,
+ *   소실표적은 대상 건물 '뒤'라 angleWith(표적 포함)로 보지만, **표적 건물 자신**은 실루엣에서 빠져야 한다
+ *   (panoWith 로 표적 방위를 샘플하면 표적 자신이 self-block → 항상 차단). 따라서 **panoWithout**(분석대상 제외)만 사용 —
+ *   이는 요약표 angleTerrainDeg(=angleWithoutAt(bAz))와 동일 값이라 표·배지가 일관된다.
+ *   ※ panorama 는 거리축이 없어(max-over-distance) 표적 너머 지형도 실루엣에 포함 → chord 코리도 단면도 차트와
+ *     어긋날 수 있음(의도된 통일 — 단면도 차트는 코리도 시각화 유지, blocked 판정만 panorama 로 통일).
+ *   panoWithout 미제공(Rust 제외대상 0/리로드) 시 null → 호출부가 chord(los.losBlocked)로 폴백(self-block 회피).
+ */
+export function losBlockedFromPanorama(
+  radar: RadarSite,
+  building: ManualBuilding,
+  los: LoSProfileData,
+  panoWithout?: PanoramaMergeResult,
+): boolean | null {
+  if (!panoWithout) return null;
+  const sampler = makePanoramaSampler(panoWithout);
+  const radarH = radar.altitude + radar.antenna_height;
+  // bDistKm·bAzDeg 는 classifyObstacleLosses 와 동일 산식(등거리근사 totalDistance 우선, bearing 폴백)으로 통일.
+  const bDistKm = los.totalDistance > 0
+    ? los.totalDistance
+    : haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  const bAzDeg = los.bearing ?? bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  const targetTopM = (building.ground_elev ?? 0) + building.height;
+  const targetElevDeg = pointElevAngleDeg(radarH, targetTopM, bDistKm * 1000);
+  return targetElevDeg < sampler(bAzDeg);
+}

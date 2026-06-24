@@ -17,7 +17,7 @@ import ReportSettingsModal from "../components/Report/ReportSettingsModal";
 import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import { computeAddedBlockage } from "../utils/omAddedBlockage";
-import { calcBuildingAzExtent } from "../utils/obstacleAnalysisHelpers";
+import { calcBuildingAzExtent, losBlockedFromPanorama } from "../utils/obstacleAnalysisHelpers";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
   readReportConfig, clearReportConfig, writeGenerateRequest,
@@ -774,6 +774,9 @@ export default function ReportApp() {
     if (!hasHist) return; // 히스토그램 없음(리로드 등) → 계산 불가
 
     const addedBlockageByKey: Record<string, AddedBlockageResult> = {};
+    // LoS 차단 판정 — 단면도 배지·소실표적 분류와 동일한 panorama 실루엣 소스(losBlockedFromPanorama).
+    //   findings 'LoS 분석' 프로즈가 단면도 배지와 동일 verdict 를 쓰도록 통일. key = losMap 키.
+    const losBlockedByKey = new Map<string, boolean>();
     for (const radar of omData.selectedRadarSites) {
       const rr = result.radar_results.find((r) => r.radar_name === radar.name);
       if (!rr) continue;
@@ -782,7 +785,13 @@ export default function ReportApp() {
       const pWithout = omData.panoWithoutTargets.get(radar.name);
       for (const b of omData.selectedBuildings) {
         const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
-        addedBlockageByKey[`${radar.name}_${b.id}`] = computeAddedBlockage(histByDay, pWith, pWithout, extent);
+        const key = `${radar.name}_${b.id}`;
+        addedBlockageByKey[key] = computeAddedBlockage(histByDay, pWith, pWithout, extent);
+        const los = omData.losMap.get(key);
+        if (los) {
+          const pb = losBlockedFromPanorama(radar, b, los, pWithout);
+          if (pb !== null) losBlockedByKey.set(key, pb);
+        }
       }
     }
 
@@ -800,6 +809,7 @@ export default function ReportApp() {
           covLayersWithout: prev.covLayersWithout,
           analysisMonth: prev.analysisMonth,
           addedBlockageByKey,
+          losBlockedByKey,
         });
         autoFindingsRef.current = regen;
         nextFindings = regen;

@@ -272,7 +272,7 @@ fn process_baseline_day(
         bl_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let bl_range_idx = ((bl_dists.len() as f64 * 0.95) as usize).min(bl_dists.len() - 1);
         let bl_max_range = bl_dists[bl_range_idx].max(50.0);
-        let bl_threshold = bl_scan * 1.4;
+        let bl_threshold = OM_LOSS_THRESHOLD_SECS; // 7초 고정 — TrackMap·main 경로와 동일
         let bl_boundary = bl_max_range * 1.0;
         for window in pts.windows(2) {
             let prev = window[0];
@@ -328,6 +328,11 @@ fn radar_type_str(rt: &RadarDetectionType) -> &'static str {
 
 /// OM 분석용 최대 Loss 지속시간 (초): 5분 초과 gap은 오탐 가능성 높아 제외
 const MAX_OM_LOSS_DURATION_SECS: f64 = 300.0;
+
+/// 1차 소실표적 판정 임계초 — TrackMap(loss.rs `DEFAULT_THRESHOLD_SECS`)·Worker(detectLossForTrack)와
+/// 동일하게 7.0초 고정. (종전 scan_interval×1.4 동적값 → 고정값 통일. 동일 항적에서 OM·TrackMap 이
+/// 채택하는 소실 gap 집합을 일치시켜 두 경로의 1차 판정을 동기화한다.)
+const OM_LOSS_THRESHOLD_SECS: f64 = crate::analysis::loss::DEFAULT_THRESHOLD_SECS;
 
 /// gap 전후 실제 보고 속도 변화율 임계값: 이 비율 초과 시 오탐(트랙 스왑 등)으로 제외
 const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
@@ -743,7 +748,7 @@ pub fn analyze_radar_monthly(
             let range_idx = ((distances.len() as f64 * 0.95) as usize).min(distances.len() - 1);
             let max_range = distances[range_idx].max(50.0);
 
-            let threshold = scan_interval * 1.4;
+            let threshold = OM_LOSS_THRESHOLD_SECS; // 7초 고정 — TrackMap loss.rs/Worker 와 동일 (종전 scan_interval×1.4)
             let boundary = max_range * 1.0; // OUT_OF_RANGE_THRESHOLD
 
             // Gap 탐지

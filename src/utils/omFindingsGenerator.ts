@@ -26,12 +26,15 @@ interface GenerateOMFindingsParams {
   analysisMonth: string;
   /** 건물별 추가 차단영역 소실율 (key: `${radarName}_${buildingId}`). 파노라마 준비 후 채워짐 — 비면 추가 차단영역 프로즈 생략. */
   addedBlockageByKey?: Record<string, AddedBlockageResult>;
+  /** 건물별 LoS 차단 판정 (key: losMap 키와 동일 `${radarName}_${buildingId}`). panorama 실루엣 기반(losBlockedFromPanorama,
+   *  단면도 배지·소실표적 분류와 동일 소스). 파노라마 준비 후 채워짐 — 미제공 시 los.losBlocked(chord) 폴백. */
+  losBlockedByKey?: Map<string, boolean>;
 }
 
 export function generateOMFindingsText(params: GenerateOMFindingsParams): string {
   const {
     radarResults, selectedBuildings, radarSites,
-    losMap, covLayersWithBuildings, covLayersWithout, analysisMonth, addedBlockageByKey,
+    losMap, covLayersWithBuildings, covLayersWithout, analysisMonth, addedBlockageByKey, losBlockedByKey,
   } = params;
 
   const lines: string[] = [];
@@ -142,7 +145,8 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     lines.push(`■ LoS(가시선) 분석`);
     let hasBlocked = false;
     for (const [key, los] of losMap) {
-      const blocked = los.losBlocked;
+      // 차단 판정 — panorama 실루엣(단면도 배지·소실표적 분류와 동일 소스) 우선, 없으면 chord(los.losBlocked) 폴백.
+      const blocked = losBlockedByKey?.get(key) ?? los.losBlocked;
       if (blocked) hasBlocked = true;
       const distKm = los.totalDistance; // totalDistance 는 이미 km (computeLosBatch)
       const statusStr = blocked ? "차단" : "양호";

@@ -67,7 +67,7 @@ export interface ChartTrackPoint {
  *  obstacleAnalysisHelpers 에서 200NM 까지 샘플링됨.
  */
 export function LosCrossSection({
-  los, radarName, building, buildingGroup, trackPoints, lossPoints,
+  los, radarName, building, buildingGroup, trackPoints, lossPoints, blockedOverride,
 }: {
   los: LoSProfileData;
   radarName: string;
@@ -76,6 +76,10 @@ export function LosCrossSection({
   buildingGroup?: import("../../types").BuildingGroup | null;
   trackPoints: ChartTrackPoint[];
   lossPoints: ChartTrackPoint[];
+  /** 헤드라인 차단(차단/양호) 배지 판정 — panorama 실루엣 기반(소실표적 분류와 동일 소스, losBlockedFromPanorama).
+   *  미지정(panorama 미준비) 시 차트 내부 chord 판정(blocked)으로 폴백. 차트 본문의 코리도 시각화(최저탐지선·
+   *  '차단건물 N동')는 그대로 chord/코리도 유지 — blocked 배지만 panorama 로 통일(거리축 손실로 본문과 어긋날 수 있음). */
+  blockedOverride?: boolean | null;
 }) {
   const chartData = useMemo(() => {
     const profile = los.elevationProfile;
@@ -585,6 +589,8 @@ export function LosCrossSection({
     adjTerrain, minDetStraight, minDetWithout,
     blocked, significantBuildings, maxDistance, radarHeight,
   } = chartData;
+  // 헤드라인 차단 배지 = panorama 판정(소실표적 분류와 동일 소스) 우선, 없으면 chord 폴백.
+  const displayBlocked = blockedOverride ?? blocked;
   // X 줌 윈도우에 맞춰 자동조정된 세로 범위 (전체 줌이면 chartData 전체범위와 동일)
   const { minY, maxY } = visibleYRange ?? chartData;
 
@@ -684,9 +690,9 @@ export function LosCrossSection({
           / 높이 {Math.round(targetElev * M_TO_FT).toLocaleString()}ft ({targetElev.toFixed(0)}m)
         </span>
         <span className={`ml-auto rounded px-1.5 py-0.5 text-[11px] font-medium ${
-          blocked ? "bg-red-50 text-red-600" : "bg-green-50 text-green-600"
+          displayBlocked ? "bg-red-50 text-red-600" : "bg-green-50 text-green-600"
         }`}>
-          {blocked ? "차단" : "양호"}
+          {displayBlocked ? "차단" : "양호"}
         </span>
       </div>
 
