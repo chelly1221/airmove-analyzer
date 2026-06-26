@@ -4,7 +4,7 @@ import type { AddedBlockageResult } from "../../types/obstacle";
 import {
   weightedLossAvg, weightedLossStdDev,
   weightedPsrAvg, weightedPsrStdDev,
-  gradeWithConfidence, BLOCKAGE_NONE_LABEL,
+  gradeWithConfidence,
 } from "../../utils/omStats";
 import { haversineKm, bearingDeg } from "../../utils/geo";
 import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
@@ -186,7 +186,8 @@ function ReportOMSummarySection({
                       {!los ? (
                         <span className="muted">—</span>
                       ) : blockage ? (
-                        blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류" || blockage.grade.label === BLOCKAGE_NONE_LABEL
+                        // 추가 차단 구간 미형성(BLOCKAGE_NONE_LABEL)은 라벨 대신 0.00%로 표시 — 비율 정의상 추가 소실 없음.
+                        blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류"
                           ? <span className="muted">{blockage.grade.label}</span>
                           : <span style={{ color: blockage.grade.color, fontWeight: 600 }} title={`음영소실 ${shadowLoss}건`}>
                               {blockage.lossRatePct.toFixed(2)}%
@@ -220,7 +221,7 @@ function ReportOMSummarySection({
           <i>±σ</i>: 가중 모표준편차 <i>σ<sub>w</sub> = √(Σ(wᵢ·(xᵢ - x̄<sub>w</sub>)²) / Σ(wᵢ))</i>{" · "}
           판정: 양호(&lt;0.5%) / 주의(0.5~2% 미만) / 경고(≥2%) / 보류(&lt;7일)
           {" · "}
-          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형·기존지물 차단각~대상 차단각 사이 양각 밴드)을 <i>지나는 항적이 그 안에서 소실되는 비율</i>. 판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 "{BLOCKAGE_NONE_LABEL}", 관측 7일 미만이면 "판정 보류", 차단영역 통과 항적이 없으면 "항적 없음", 노출 발생일 3일 미만이면 "판정 보류". (파노라마 미가용 시 음영소실 건수로 폴백)
+          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형·기존지물 차단각~대상 차단각 사이 양각 밴드)을 <i>지나는 항적이 그 안에서 소실되는 비율</i>. 판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 0.00%(추가 차단 없음), 관측 7일 미만이면 "판정 보류", 차단영역 통과 항적이 없으면 "항적 없음", 노출 발생일 3일 미만이면 "판정 보류". (파노라마 미가용 시 음영소실 건수로 폴백)
         </div>
       </div>
       <div className="meta-merged-row formula" style={{ borderTop: "1px solid var(--om-border)" }}>

@@ -93,8 +93,11 @@ export default function ReportOMObstacleSummaryTable({
               ↳ <OMEditable id={`${eid}.tbl.blockage.label`} value="추가 차단 구간 소실율" tag="span" />
             </td>
             <td className="ta-r mono strong" style={{ color: blockage.grade.color }}>
-              {blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류" || blockage.grade.label === BLOCKAGE_NONE_LABEL
+              {/* 추가 차단 구간 미형성(BLOCKAGE_NONE_LABEL)은 라벨 대신 0.00%로 표시 — 비율 정의상 추가 소실 없음. */}
+              {blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류"
                 ? blockage.grade.label
+                : blockage.grade.label === BLOCKAGE_NONE_LABEL
+                ? `${blockage.lossRatePct.toFixed(2)}%`
                 : `${blockage.lossRatePct.toFixed(2)}% · ${blockage.grade.label}`}
             </td>
             <td className="muted">

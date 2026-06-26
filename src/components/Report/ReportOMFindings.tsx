@@ -190,7 +190,12 @@ function ReportOMFindings({
               </td>
               <td className="ta-c">{rs.name}</td>
               <td className="ta-c mono strong" style={{ color: w.grade.color }}>
-                {graded ? `${w.lossRatePct.toFixed(2)}% · ${w.grade.label}` : w.grade.label}
+                {/* 추가 차단 구간 미형성(BLOCKAGE_NONE_LABEL)은 라벨 대신 0.00%로 표시 — 비율 정의상 추가 소실 없음. */}
+                {graded
+                  ? `${w.lossRatePct.toFixed(2)}% · ${w.grade.label}`
+                  : w.grade.label === BLOCKAGE_NONE_LABEL
+                  ? `${w.lossRatePct.toFixed(2)}%`
+                  : w.grade.label}
               </td>
               <td className="ta-c mono">
                 {graded
@@ -224,7 +229,7 @@ function ReportOMFindings({
       </table>
       <p className="muted" style={{ fontSize: "9px", marginTop: 4 }}>
         추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형·기존지물 차단각~대상 차단각)를 지나는 항적이 그 안에서 소실되는 비율.
-        {" "}판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 "{BLOCKAGE_NONE_LABEL}", 관측 {BLOCKAGE_MIN_DAYS}일 미만이면 "판정 보류", 차단영역 통과 항적이 없으면 "항적 없음", 노출 발생일 {BLOCKAGE_MIN_EXPOSURE_DAYS}일 미만이면 "판정 보류".
+        {" "}판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 0.00%(추가 차단 없음), 관측 {BLOCKAGE_MIN_DAYS}일 미만이면 "판정 보류", 차단영역 통과 항적이 없으면 "항적 없음", 노출 발생일 {BLOCKAGE_MIN_EXPOSURE_DAYS}일 미만이면 "판정 보류".
         {" "}등급(전구간 평균 소실율 기준과 별도) — 양호 &lt; {BLOCKAGE_CAUTION_PCT.toFixed(1)}% · 주의 {BLOCKAGE_CAUTION_PCT.toFixed(1)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 · 경고 ≥ {BLOCKAGE_ALERT_PCT.toFixed(0)}%.
       </p>
     </div>
