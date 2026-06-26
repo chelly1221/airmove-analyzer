@@ -215,12 +215,13 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             </div>
           )}
 
-          {/* 장애물별 상세 — (레이더 × 분석 대상 빌딩) 한 쌍당 한 페이지.
+          {/* 장애물별 상세 — (분석 대상 빌딩 × 레이더) 한 쌍당 한 페이지.
+              빌딩 바깥/레이더 안쪽 순회 → 건물별로 레이더를 번갈아 표시(건물1-레이더1, 건물1-레이더2, 건물2-레이더1 …).
               빌딩 메타 + LoS 단면도 + LoS 차단 양각 대비 표적소실 분포 (분석 대상 방위 윈도우). */}
           {sections.omLosCrossSection && omData.losMap.size > 0 && (
             <div data-toc-key="omLosCrossSection">
-              {omData.selectedRadarSites.map((rs) => {
-                return omData.selectedBuildings.map((b) => {
+              {omData.selectedBuildings.map((b) => {
+                return omData.selectedRadarSites.map((rs) => {
                   const los = omData.losMap.get(`${rs.name}_${b.id}`);
                   if (!los) return null;
                   return (

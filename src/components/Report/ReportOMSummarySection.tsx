@@ -16,10 +16,10 @@ import { PAGE_CONTENT_MM } from "./reportPageConstants";
 
 /** 표적소실 산출 로직 + 참고용 안내 기본 문구 (인라인 편집 가능) */
 const LOSS_LOGIC_NOTE =
-  "표적소실율 = (신호소실 누적 시간 ÷ 전체 추적 시간) × 100. 스캔 주기를 자동 추정(중앙값)한 뒤 "
-  + "임계값(주기 × 1.4) 초과 ~ 5분(300초) 이하의 미탐지 구간을 표적소실 후보로 보되, 범위이탈(out-of-range)과 "
-  + "속도 이상치·트랙 스왑/그룹핑 오류로 추정되는 구간은 오탐으로 제외하고 신호소실(signal loss)만 집계함. "
-  + "본 수치는 저장 자료(ASTERIX) 기반으로 자동 산출된 추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있으므로 참고 자료로만 활용 바람.";
+  "표적소실율 = (신호소실 누적 시간 ÷ 전체 추적 시간) × 100 · "
+  + "소실 후보: 미탐지 구간(gap)이 7초 초과 ~ 5분(300초) 이하 · "
+  + "오탐 제외: 범위이탈(out-of-range)·속도 이상치·트랙 스왑/그룹핑 오류 추정 구간은 빼고 신호소실(signal loss)만 집계 · "
+  + "본 수치는 저장 자료(ASTERIX) 기반 자동 산출 추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있어 참고용으로만 활용 바람.";
 
 interface Props {
   sectionNum: number;
@@ -258,7 +258,7 @@ function ReportOMSummarySection({
             <p className="kpi-sigma" />
           </div>
           <div className="kpi">
-            <p className="kpi-label">분석 포인트(≤FL200)</p>
+            <p className="kpi-label">분석 포인트</p>
             <p className="kpi-val">{totalPts.toLocaleString()}</p>
             <p className="kpi-sigma" />
           </div>

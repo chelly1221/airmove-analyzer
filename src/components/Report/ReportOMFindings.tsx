@@ -266,7 +266,7 @@ function ReportOMFindings({
         <div>
           <OMEditable id="findings.formula.h3" value="Loss 탐지" tag="p" className="formula-h" />
           <p>스캔 주기 자동 추정 (중앙값)</p>
-          <p className="formula-math"><i>임계값 = 주기 × 1.4</i></p>
+          <p className="formula-math"><i>임계값 = 7초 (고정) · 상한 5분</i></p>
         </div>
         <div>
           <OMEditable id="findings.formula.h4" value="판정 기준 (평균 소실율)" tag="p" className="formula-h" />

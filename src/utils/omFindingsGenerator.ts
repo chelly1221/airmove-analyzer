@@ -47,7 +47,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   const radarNames = radarResults.map((r) => r.radar_name).join(", ");
   lines.push(`■ 분석 개요`);
   lines.push(`${monthLabel ? monthLabel + " " : ""}장애물 월간 분석을 수행하였으며, 분석 대상 장애물은 ${bldgNames}이고, 분석 레이더는 ${radarNames}이다.`);
-  lines.push(`  - 항적 분석 고도 범위: 20,000ft(FL200) 이하 항적 (장애물 차단이 유효한 저고도 대역에 한정). FL200 초과 항적은 표적소실·PSR 등 항적 기반 통계에서 제외한다. (커버리지 비교의 FL별 분석은 별도 기준.)`);
+  lines.push(`  - 항적 분석 고도 범위: 전 고도 항적 (고도 상한 없음). 표적소실·PSR 등 항적 기반 통계는 모든 고도의 항적을 포함한다. (커버리지 비교의 FL별 분석은 별도 기준.)`);
 
   // 건물별 거리 정보
   for (const b of selectedBuildings) {
