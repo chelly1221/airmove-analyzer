@@ -27,7 +27,7 @@ import {
 } from "../utils/reportTransfer";
 import type {
   LoSProfileData, ReportMetadata,
-  PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, AzSector,
+  PanoramaMergeResult, PanoramaMergeDualResult, BuildingObstacle, ManualBuilding, BuildingGroup, RadarSite, AzSector,
   ObstacleMonthlyResult, OMReportData,
   AddedBlockageResult,
 } from "../types";
@@ -711,9 +711,25 @@ export default function ReportApp() {
           if (cancelled) { console.log(`[Panorama] ${radar.name}: 취소됨 (merge 후)`); return; }
           console.log(`[Panorama] ${radar.name}: merge_dual 완료 ${(performance.now() - mergeStart).toFixed(0)}ms (terrain=${dual.terrain.length}, bldg_with=${dual.buildings_with_targets.length}, bldg_without=${dual.buildings_without_targets?.length ?? "null"})`);
 
+          // with(분석대상 포함) 실루엣은 without(제외)의 방위각별 상위집합이어야 한다
+          //   (with = 지형+기존+대상 ⊇ without = 지형+기존). 그런데 Rust filter_visible_buildings 가
+          //   with/without 를 스칼라 peak(elevation_angle_deg) 기준으로 독립 컬링해서, without 에선
+          //   살아남은 기존 건물이 키 큰 대상에 가려 with 에서 탈락할 수 있다 — 실제 방위각별 실루엣은
+          //   peak 보다 낮아 대상 옆에서 여전히 노출됨. 이 탈락으로 with 가 without 의 상위집합이 아니게
+          //   되면 Az×Elev 차트의 '추가 차단'(with−without) 밴드가 그린(기존) 아래로 역전돼 칠해진다.
+          //   → with 를 두 집합의 합집합으로 복원해 상위집합 불변식 보장. 두 패스 모두 탈락시킨 건물만
+          //   진짜 가려진 것이라 합집합에 안 들어오고, 어느 한 패스라도 가시였던 건물은 실재하므로 정당.
+          //   (양패스 생존 건물은 동일 struct → 키로 dedup. 차트·분류기·추가차단·요약이 동일 소스로 일관.)
+          const bKey = (b: BuildingObstacle) =>
+            `${b.lat},${b.lon},${b.obstacle_type},${b.height_m},${b.azimuth_start_deg},${b.azimuth_end_deg}`;
+          const seenKeys = new Set(dual.buildings_with_targets.map(bKey));
+          const withUnion = dual.buildings_with_targets.slice();
+          for (const b of dual.buildings_without_targets ?? []) {
+            if (!seenKeys.has(bKey(b))) withUnion.push(b);
+          }
           const withResult: PanoramaMergeResult = {
             terrain: dual.terrain,
-            buildings: dual.buildings_with_targets,
+            buildings: withUnion,
           };
           const withoutResult: PanoramaMergeResult | null = dual.buildings_without_targets
             ? { terrain: dual.terrain, buildings: dual.buildings_without_targets }
