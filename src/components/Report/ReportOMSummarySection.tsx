@@ -14,12 +14,9 @@ import BuildingGroupBadge from "./BuildingGroupBadge";
 import OMEditable from "./OMEditable";
 import { PAGE_CONTENT_MM } from "./reportPageConstants";
 
-/** 표적소실 산출 로직 + 참고용 안내 기본 문구 (인라인 편집 가능) */
+/** 참고용 안내 기본 문구 (인라인 편집 가능) */
 const LOSS_LOGIC_NOTE =
-  "표적소실율 = (신호소실 누적 시간 ÷ 전체 추적 시간) × 100 · "
-  + "소실 후보: 미탐지 구간(gap)이 7초 초과 ~ 5분(300초) 이하 · "
-  + "오탐 제외: 범위이탈(out-of-range)·속도 이상치·트랙 스왑/그룹핑 오류 추정 구간은 빼고 신호소실(signal loss)만 집계 · "
-  + "본 수치는 저장 자료(ASTERIX) 기반 자동 산출 추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있어 참고용으로만 활용 바람.";
+  "본 수치는 저장 자료 기반 자동 산출 추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있어 참고용으로만 활용 바람.";
 
 interface Props {
   sectionNum: number;
@@ -42,17 +39,17 @@ interface Props {
  *
  * 페이지 구성 순서(data-order="table-first"):
  *   1) 분석 대상 장애물 표 (.om-table)
- *   2) 방위·산식 통합 박스 (.meta-merged)
+ *   2) 참고 안내 박스 (.meta-merged)
  *   3) 레이더별 KPI 행 리스트 (.kpi-list, data-kpi="list")
  *
- * 건물이 많으면 첫 페이지에 KPI/방위/산식을 두고 잔여 건물 표는 후속 페이지로
+ * 건물이 많으면 첫 페이지에 KPI/참고 안내를 두고 잔여 건물 표는 후속 페이지로
  * 분할. 페이지 inner padding 16/18mm + 새 KPI 행 리스트 높이를 반영한 추정치.
  */
 const HEADER_HEIGHT_MM = 14;
 const BLOCK_H3_MM = 8;        // "분석 대상 장애물" 제목 블록 (.block-h3, 15px + 하단여백 8px)
 const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS·추가소실율)
 const ROW_HEIGHT_MM = 7;
-const META_MERGED_MM = 58;   // 통계산식 + 표적소실 산출노트 2행 (.meta-merged, 장문 텍스트 다중 줄)
+const META_MERGED_MM = 14;   // 참고 안내 1행 (.meta-merged, 단문 1줄)
 const KPI_BLOCK_MM = 60;     // om-h3(~8mm) + 5행 × ~9.5mm + 블록 하단여백 12px ≈ 60mm
 
 function ReportOMSummarySection({
@@ -209,23 +206,10 @@ function ReportOMSummarySection({
     </table>
   );
 
-  // ── 방위·산식 통합 박스 (.meta-merged) ────────────────────────────────
+  // ── 참고 안내 (.meta-merged) ──────────────────────────────────────────
   const renderMetaMerged = () => (
     <div className="meta-merged">
       <div className="meta-merged-row formula">
-        <OMEditable id="summary.formulaLabel" value="통계 산식" tag="p" className="meta-merged-label" />
-        <div>
-          <span className="strong">통계 산식 · </span>
-          평균: 관측량 가중 평균 <i>x̄<sub>w</sub> = Σ(wᵢ·xᵢ) / Σ(wᵢ)</i>
-          {" "}(Loss: w=비행시간, PSR: w=SSR포인트수){" · "}
-          <i>±σ</i>: 가중 모표준편차 <i>σ<sub>w</sub> = √(Σ(wᵢ·(xᵢ - x̄<sub>w</sub>)²) / Σ(wᵢ))</i>{" · "}
-          판정: 양호(&lt;0.5%) / 주의(0.5~2% 미만) / 경고(≥2%) / 보류(&lt;7일)
-          {" · "}
-          <span className="strong">추가소실율</span>: 분석 대상 장애물이 새로 가리는 추가 차단영역(지형·기존지물 차단각~대상 차단각 사이 양각 밴드)을 <i>지나는 항적이 그 안에서 소실되는 비율</i>. 판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 0.00%(추가 차단 없음), 관측 7일 미만이면 "판정 보류", 차단영역 통과 항적이 없으면 "항적 없음", 노출 발생일 3일 미만이면 "판정 보류". (파노라마 미가용 시 음영소실 건수로 폴백)
-        </div>
-      </div>
-      <div className="meta-merged-row formula" style={{ borderTop: "1px solid var(--om-border)" }}>
-        <OMEditable id="summary.lossLogicLabel" value="표적소실 산출 · 참고" tag="p" className="meta-merged-label" />
         <OMEditable id="summary.lossLogicNote" value={LOSS_LOGIC_NOTE} tag="div" />
       </div>
     </div>
