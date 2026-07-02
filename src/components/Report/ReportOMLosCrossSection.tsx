@@ -852,7 +852,38 @@ export function LosCrossSection({
 
           {/* 소실표적 포인트도 canvas 오버레이(pointCanvasRef)에서 그린다 — 위 항적 포인트와 동일 사유. */}
         </g>
-
+        {/* 범례는 canvas(항적/소실표적) 위로 올리려 아래 별도 오버레이 <svg> 로 분리해 그린다. */}
+      </svg>
+      {/* 항적/소실표적 포인트 canvas 오버레이 — SVG 플롯 위에 정확히 겹친다(같은 left/top/size·동일 viewBox 스케일).
+          pointer-events:none 으로 SVG 의 줌/패닝 상호작용을 가리지 않는다. */}
+      <canvas
+        ref={pointCanvasRef}
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: canvasPx.w,
+          height: canvasPx.h,
+          pointerEvents: "none",
+          zIndex: 1,
+        }}
+      />
+      {/* 범례 오버레이 — 항적/소실표적 canvas(zIndex:1) 위(zIndex:2)에 그려 표적 포인트에 가려지지 않게.
+          메인 SVG 와 동일 viewBox·w-full·maxHeight 로 렌더 박스가 정확히 겹치고(레터박스 스케일 동일),
+          pointer-events:none 으로 SVG 의 줌/패닝 상호작용을 가리지 않는다. */}
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="w-full"
+        aria-hidden
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          maxHeight: 230,
+          pointerEvents: "none",
+          zIndex: 2,
+        }}
+      >
         {/* 범례 (좌상단 — TrackMap 방식) */}
         <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5})`}>
           <rect x={-4} y={-6} width={200} height={legendH} rx={4}
@@ -948,19 +979,6 @@ export function LosCrossSection({
           })()}
         </g>
       </svg>
-      {/* 항적/소실표적 포인트 canvas 오버레이 — SVG 플롯 위에 정확히 겹친다(같은 left/top/size·동일 viewBox 스케일).
-          pointer-events:none 으로 SVG 의 줌/패닝 상호작용을 가리지 않는다. */}
-      <canvas
-        ref={pointCanvasRef}
-        style={{
-          position: "absolute",
-          left: 0,
-          top: 0,
-          width: canvasPx.w,
-          height: canvasPx.h,
-          pointerEvents: "none",
-        }}
-      />
       </div>
     </div>
   );

@@ -130,7 +130,8 @@ export function computeAddedBlockage(
   const dayCount = series.length;
   // 노출>0 이면 밴드는 반드시 존재 — 기하 스캔의 위상 누락에도 라벨이 노출과 모순되지 않도록 OR 안전망.
   const hasBlockageBand = geometricBand || totalExposure > 0;
-  const g = gradeAddedBlockage(lossRatePct, dayCount, totalExposure, daysWithExposure, hasBlockageBand);
+  // 표본 게이트는 통과 항적 포인트 수(totalExposureCount) 단일 기준 — 관측일수/노출 발생일 게이트는 폐지.
+  const g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
 
   return {
     lossRatePct,

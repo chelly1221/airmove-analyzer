@@ -150,49 +150,48 @@ export function weightedTrendSlope(
 // gradeWithConfidence(전구간 소실율)와 달리, 얇은 추가 차단영역 내부의 조건부 비율이라
 // 스케일이 다르다(전구간 0.5/2.0 재사용 금지).
 //
-// ⚠️ 임계값은 PLACEHOLDER — 실제 추가 차단영역 소실율 분포를 관측한 뒤 반드시 보정할 것.
-export const BLOCKAGE_MIN_DAYS = 7;          // 관측일수 < 7 → 판정 보류 (주간 1주기, gradeWithConfidence 와 동일 규율)
-export const BLOCKAGE_MIN_EXPOSURE_DAYS = 3; // 노출>0 인 날이 3일 미만이면 소수 일자 편중 → 대표성 부족 보류
-export const BLOCKAGE_CAUTION_PCT = 2.0;     // 양호/주의 경계 (%)
-export const BLOCKAGE_ALERT_PCT = 10.0;      // 주의/경고 경계 (%)
+// 등급 4단계는 국가 위기경보(관심-주의-경계-심각) 체계를 차용하고, 임계 미만은 "양호"로 둔다.
+// (관심 파랑 · 주의 노랑 · 경계 주황 · 심각 빨강 — 위기경보 색상 관례)
+export const BLOCKAGE_MIN_EXPOSURE_POINTS = 10000; // 통과 항적(노출 스캔 포인트) ≤ 10,000 → 표본 부족 판정 보류
+export const BLOCKAGE_WATCH_PCT = 10.0;   // 양호/관심 경계 (%)
+export const BLOCKAGE_CAUTION_PCT = 20.0; // 관심/주의 경계 (%)
+export const BLOCKAGE_ALERT_PCT = 30.0;   // 주의/경계 경계 (%)
+export const BLOCKAGE_SEVERE_PCT = 40.0;  // 경계/심각 경계 (%)
 
 /** 추가 차단영역 자체가 형성되지 않은 경우(지형·기존지물 이하)의 등급 라벨 — 비율 개념이 성립하지 않음. */
 export const BLOCKAGE_NONE_LABEL = "추가 차단 구간 없음";
 
 /**
- * 추가 차단영역 소실율 등급 — 밴드 존재 게이트 + 삼중 게이트(관측일수·통과항적유무·노출일수) 후 임계 판정.
+ * 추가 차단영역 소실율 등급 — 밴드 존재 게이트 + 표본 게이트(통과 항적 유무·표본량) 후 임계 판정.
  *
  * 판정 순서:
  *   0) 추가 차단 밴드 미형성(분석 대상이 지형·기존지물 위로 올라오지 않음) → "추가 차단 구간 없음"
- *      — 밴드 기하는 관측일수와 무관하므로 다른 게이트보다 먼저 판정한다(panoWith 없어 판정 불가면 hasBlockageBand=true 로 폴백).
- *   1) 관측일수 < 7 → "판정 보류"
- *   2) 통과 항적 전무(노출 0) → "항적 없음"
- *   3) 노출 발생일 < 3 → "판정 보류"
- * 통과 항적이 전무(노출 0)하거나 소수 일자에 편중되면 노이즈% 대신 "항적 없음/판정 보류"를 정직하게 표기.
+ *      — 밴드 기하는 표본량과 무관하므로 다른 게이트보다 먼저 판정한다(panoWith 없어 판정 불가면 hasBlockageBand=true 로 폴백).
+ *   1) 통과 항적 전무(노출 0pt) → "항적 없음"
+ *   2) 통과 항적 ≤ 10,000pt → "판정 보류" (표본 부족)
+ * 관측일수·노출 발생일 게이트는 폐지 — 표본 충분성은 통과 항적 포인트 수 단일 기준으로 판정한다.
+ * 임계 통과 시 소실율(%)로 관심/주의/경계/심각(임계 미만은 양호)을 부여한다.
  */
 export function gradeAddedBlockage(
   lossRatePct: number,
-  dayCount: number,
-  exposureTrackTimeS: number,
-  daysWithExposure: number,
+  exposurePointCount: number,
   hasBlockageBand: boolean = true,
 ): { label: string; color: string; bg: string; border: string } {
   if (!hasBlockageBand) {
     // 분석 대상 장애물이 지형·기존지물 차단각 위로 추가 차단영역을 형성하지 않음 → 소실율(노출 조건부 비율) 정의 불가.
     return { label: BLOCKAGE_NONE_LABEL, color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
-  if (dayCount < BLOCKAGE_MIN_DAYS) {
-    return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
-  }
-  if (exposureTrackTimeS <= 0) {
-    // 차단영역을 통과한 항적이 전무 → 비율 산출 불가(정직 표기). 600초 누적-노출 게이트는 폐지.
+  if (exposurePointCount <= 0) {
+    // 차단영역을 통과한 항적이 전무 → 비율 산출 불가(정직 표기).
     return { label: "항적 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
-  if (daysWithExposure < BLOCKAGE_MIN_EXPOSURE_DAYS) {
-    // 노출 총량은 충분하나 소수 일자에 편중 → 추세·대표성 부족으로 보류
+  if (exposurePointCount <= BLOCKAGE_MIN_EXPOSURE_POINTS) {
+    // 통과 항적 표본 부족(≤ 10,000pt) → 대표성 부족으로 판정 보류.
     return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
-  if (lossRatePct < BLOCKAGE_CAUTION_PCT) return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
-  if (lossRatePct < BLOCKAGE_ALERT_PCT) return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
-  return { label: "경고", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
+  if (lossRatePct < BLOCKAGE_WATCH_PCT)   return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
+  if (lossRatePct < BLOCKAGE_CAUTION_PCT) return { label: "관심", color: "#1d4ed8", bg: "#dbeafe", border: "border-blue-200" };
+  if (lossRatePct < BLOCKAGE_ALERT_PCT)   return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
+  if (lossRatePct < BLOCKAGE_SEVERE_PCT)  return { label: "경계", color: "#c2410c", bg: "#ffedd5", border: "border-orange-200" };
+  return { label: "심각", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
 }

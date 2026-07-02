@@ -12,7 +12,8 @@ import type { AddedBlockageResult } from "../types/obstacle";
 import type { CoverageLayer } from "./radarCoverage";
 import {
   weightedLossAvg, weightedBaselineLossAvg, weightedTrendSlope,
-  BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_NONE_LABEL,
+  BLOCKAGE_WATCH_PCT, BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_SEVERE_PCT,
+  BLOCKAGE_NONE_LABEL,
 } from "./omStats";
 
 function gradeLabel(lossRate: number): string {
@@ -73,7 +74,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   if (addedBlockageByKey) {
     // 인과 헤드라인 — 건물별 추가 차단영역 소실율 최악 등급 롤업.
     // 방위 소실율은 지형·트래픽 교란이 섞여 보조지표로만 두고 항목별 요약에서 언급.
-    const order: Record<string, number> = { "경고": 3, "주의": 2, "양호": 1 };
+    const order: Record<string, number> = { "심각": 5, "경계": 4, "주의": 3, "관심": 2, "양호": 1 };
     let worst = "", worstName = "", worstRate = 0;
     let blockageCount = 0, noneCount = 0; // 사유 분리용 — 추가 차단 구간 미형성 전부 여부
     for (const rr of radarResults) {
@@ -93,16 +94,20 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     const allBandNone = blockageCount > 0 && noneCount === blockageCount;
     if (worst === "양호") {
       lines.push(`분석 대상 장애물의 추가 차단영역 소실율은 양호 수준(최고 ${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 유의미한 탐지 영향은 확인되지 않았다.`);
+    } else if (worst === "관심") {
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 관심 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 경미하나 해당 방위·고도 탐지 성능의 지속 관찰이 필요하다.`);
     } else if (worst === "주의") {
       lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 주의 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 해당 방위·고도 탐지 성능을 지속 모니터링할 필요가 있다.`);
-    } else if (worst === "경고") {
-      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 경고 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
+    } else if (worst === "경계") {
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 경계 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
+    } else if (worst === "심각") {
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 심각 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 현저한 탐지 성능 저하가 확인되어 즉각적인 운용 대책이 요구된다.`);
     } else if (allBandNone) {
       lines.push(`분석 대상 장애물이 지형·기존지물 위로 새로 가리는 구간을 형성하지 않아(추가 차단 구간 없음), 장애물에 의한 추가 탐지 영향은 없는 것으로 판단된다.`);
     } else {
       lines.push(`분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
     }
-    lines.push(`※ 추가 차단영역 등급 임계(주의 ${BLOCKAGE_CAUTION_PCT}% / 경고 ${BLOCKAGE_ALERT_PCT}%)는 실측 분포 보정 전 잠정 기준.`);
+    lines.push(`※ 추가 차단영역 등급 임계 — 관심 ${BLOCKAGE_WATCH_PCT}% / 주의 ${BLOCKAGE_CAUTION_PCT}% / 경계 ${BLOCKAGE_ALERT_PCT}% / 심각 ${BLOCKAGE_SEVERE_PCT}% 이상.`);
   } else {
     // 파노라마 미준비(생성 직후) — 방위 소실율 기준 잠정 결론. 파노라마 완료 시 인과 헤드라인으로 자동 재생성.
     const worstGrade = allGrades.some((g) => g.grade === "경고") ? "경고"
