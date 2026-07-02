@@ -17,7 +17,7 @@ import ReportSettingsModal from "../components/Report/ReportSettingsModal";
 import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import { computeAddedBlockage } from "../utils/omAddedBlockage";
-import { calcBuildingAzExtent, losBlockedFromPanorama } from "../utils/obstacleAnalysisHelpers";
+import { calcBuildingAzExtent, losBlockedFromPanorama, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
   readReportConfig, clearReportConfig, writeGenerateRequest,
@@ -27,7 +27,7 @@ import {
 } from "../utils/reportTransfer";
 import type {
   LoSProfileData, ReportMetadata,
-  PanoramaMergeResult, PanoramaMergeDualResult, BuildingObstacle, ManualBuilding, BuildingGroup, RadarSite, AzSector,
+  PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, AzSector,
   ObstacleMonthlyResult, OMReportData,
   AddedBlockageResult,
 } from "../types";
@@ -755,25 +755,13 @@ export default function ReportApp() {
           if (cancelled) { console.log(`[Panorama] ${radar.name}: 취소됨 (merge 후)`); return; }
           console.log(`[Panorama] ${radar.name}: merge_dual 완료 ${(performance.now() - mergeStart).toFixed(0)}ms (terrain=${dual.terrain.length}, bldg_with=${dual.buildings_with_targets.length}, bldg_without=${dual.buildings_without_targets?.length ?? "null"})`);
 
-          // with(분석대상 포함) 실루엣은 without(제외)의 방위각별 상위집합이어야 한다
-          //   (with = 지형+기존+대상 ⊇ without = 지형+기존). 그런데 Rust filter_visible_buildings 가
-          //   with/without 를 스칼라 peak(elevation_angle_deg) 기준으로 독립 컬링해서, without 에선
-          //   살아남은 기존 건물이 키 큰 대상에 가려 with 에서 탈락할 수 있다 — 실제 방위각별 실루엣은
-          //   peak 보다 낮아 대상 옆에서 여전히 노출됨. 이 탈락으로 with 가 without 의 상위집합이 아니게
-          //   되면 Az×Elev 차트의 '추가 차단'(with−without) 밴드가 그린(기존) 아래로 역전돼 칠해진다.
-          //   → with 를 두 집합의 합집합으로 복원해 상위집합 불변식 보장. 두 패스 모두 탈락시킨 건물만
-          //   진짜 가려진 것이라 합집합에 안 들어오고, 어느 한 패스라도 가시였던 건물은 실재하므로 정당.
-          //   (양패스 생존 건물은 동일 struct → 키로 dedup. 차트·분류기·추가차단·요약이 동일 소스로 일관.)
-          const bKey = (b: BuildingObstacle) =>
-            `${b.lat},${b.lon},${b.obstacle_type},${b.height_m},${b.azimuth_start_deg},${b.azimuth_end_deg}`;
-          const seenKeys = new Set(dual.buildings_with_targets.map(bKey));
-          const withUnion = dual.buildings_with_targets.slice();
-          for (const b of dual.buildings_without_targets ?? []) {
-            if (!seenKeys.has(bKey(b))) withUnion.push(b);
-          }
+          // with ⊇ without 상위집합 불변식은 Rust 가 구조적으로 보장 — dual 이
+          //   with = without(비대상만 컬링) ∪ 분석대상(manual_id 태깅, 비컬링) 로 반환한다.
+          //   건물별 소비(핑크영역·분류·추가차단)는 panoWithForBuilding(= without ∪ {해당 건물})으로 좁힌다.
+          //   (종전: with/without 독립 컬링으로 상위집합이 깨져 프론트에서 합집합 복원하던 우회 로직 제거)
           const withResult: PanoramaMergeResult = {
             terrain: dual.terrain,
-            buildings: withUnion,
+            buildings: dual.buildings_with_targets,
           };
           const withoutResult: PanoramaMergeResult | null = dual.buildings_without_targets
             ? { terrain: dual.terrain, buildings: dual.buildings_without_targets }
@@ -846,7 +834,11 @@ export default function ReportApp() {
       for (const b of omData.selectedBuildings) {
         const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
         const key = `${radar.name}_${b.id}`;
-        addedBlockageByKey[key] = computeAddedBlockage(histByDay, pWith, pWithout, extent);
+        // 건물별 with(= without ∪ {해당 건물}) — 방위 중첩 인접 분석 대상의 차단이 이 건물의
+        //   추가 차단영역(노출/소실)에 중복 귀속되지 않는다 (차트 핑크영역·분류와 동일 필터).
+        addedBlockageByKey[key] = computeAddedBlockage(
+          histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent,
+        );
         const los = omData.losMap.get(key);
         if (los) {
           const pb = losBlockedFromPanorama(radar, b, los, pWithout);

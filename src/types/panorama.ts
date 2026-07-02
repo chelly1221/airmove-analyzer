@@ -34,6 +34,9 @@ export interface BuildingObstacle {
   /** 방위별 상단 양각 실루엣 [[az_deg, elev_deg], ...] — 레이더 시점에서 본
    *  압출 폴리곤의 가변 윗변. 폴리곤 건물만 존재(점 건물은 undefined). */
   silhouette?: [number, number][];
+  /** 수동 건물 DB id (manual_buildings.id) — OM 보고서 '건물별' with 실루엣 필터(panoWithForBuilding)용.
+   *  GIS 건물은 undefined. */
+  manual_id?: number;
 }
 
 /** 파노라마 병합 결과 (지형 + 건물 분리) */

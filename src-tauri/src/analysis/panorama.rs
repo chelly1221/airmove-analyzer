@@ -78,6 +78,9 @@ pub struct BuildingObstacle {
     /// 압출 폴리곤의 가변 윗변. 폴리곤 건물만 존재(점 건물은 None).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silhouette: Option<Vec<[f64; 2]>>,
+    /// 수동 건물 DB id (manual_buildings.id) — OM 보고서 '건물별' with 실루엣 필터용. GIS 건물은 None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_id: Option<i64>,
 }
 
 /// 파노라마 병합 결과 (지형 + 건물 분리)
@@ -106,6 +109,7 @@ struct BuildingCandidate {
     address: Option<String>,
     usage: Option<String>,
     is_manual: bool,
+    manual_id: Option<i64>,  // manual_buildings.id (GIS는 None)
 }
 
 /// 건물 폴리곤 (3D 실루엣 계산용)
@@ -119,6 +123,7 @@ struct BuildingPolygon {
     address: Option<String>,
     usage: Option<String>,
     is_manual: bool,
+    manual_id: Option<i64>,  // manual_buildings.id (GIS는 None)
 }
 
 /// WGS84 → 레이더 중심 ENU 평면좌표 변환 (east, north) [m]
@@ -242,6 +247,7 @@ fn query_building_polygons(
                             address,
                             usage,
                             is_manual: false,
+                            manual_id: None,
                         });
                     }
                 }
@@ -259,7 +265,7 @@ fn query_building_polygons(
         format!(" AND id NOT IN ({})", ids.join(","))
     };
     let manual_sql = format!(
-        "SELECT latitude, longitude, height, ground_elev, name, memo, geometry_type, geometry_json
+        "SELECT latitude, longitude, height, ground_elev, name, memo, geometry_type, geometry_json, id
          FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2
            AND longitude BETWEEN ?3 AND ?4{}",
@@ -278,11 +284,12 @@ fn query_building_polygons(
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         ) {
             for row in rows.flatten() {
-                let (lat, lon, height_m, ground_elev, name, memo, geo_type, geo_json) = row;
+                let (lat, lon, height_m, ground_elev, name, memo, geo_type, geo_json, manual_id) = row;
 
                 // geometry_json → 폴리곤 추출 시도
                 let sample_pts = expand_manual_geometry(lat, lon, geo_type.as_deref(), geo_json.as_deref());
@@ -298,6 +305,7 @@ fn query_building_polygons(
                         address: None,
                         usage: memo,
                         is_manual: true,
+                        manual_id: Some(manual_id),
                     });
                 } else {
                     // point-only 수동 건물 → 폴백
@@ -305,6 +313,7 @@ fn query_building_polygons(
                         lat, lon, height_m, ground_elev,
                         name, address: None, usage: memo,
                         is_manual: true,
+                        manual_id: Some(manual_id),
                     });
                 }
             }
@@ -346,6 +355,13 @@ pub fn merge_buildings_into_panorama(
 
 /// with/without manual targets 동시 계산 — terrain 변환/건물 수집을 1회만 수행.
 /// exclude_manual_ids 가 비어 있으면 without_targets 는 None.
+///
+/// with = without ∪ 분석대상(manual_id 태깅, 비컬링) 로 구성한다:
+///   · without = 비대상 건물만 컬링(filter_visible_buildings) — '대상 제거 시' 관점이므로 대상에 가려지는지 무관.
+///   · 대상은 컬링하지 않고 그대로 얹는다 — 프론트 소비자(AzElev 차트·makePanoramaSampler)가 방위별 max 합성이라
+///     가려진 대상은 자연히 효과 0. 이 구성으로 '건물별 with = without ∪ {해당 대상}'(panoWithForBuilding 필터)이
+///     항상 without 의 상위집합 — 종전 with 독립 컬링 시 키 큰 대상에 가려진 기존 건물이 with 에서 탈락해
+///     프론트(ReportApp)가 합집합으로 복원하던 우회 로직이 필요 없다.
 pub fn merge_buildings_into_panorama_dual(
     srtm: &mut SrtmReader,
     conn: &Connection,
@@ -368,23 +384,30 @@ pub fn merge_buildings_into_panorama_dual(
         polygon: None,
     }).collect();
 
-    // with_targets: 전체 건물 수집 (수동 건물 제외 없이)
+    // 전체 건물 1회 수집 (수동 건물엔 manual_id 태깅) — 종전 2회 수집(전체/제외)을 파티션으로 대체
     let all_buildings = collect_building_obstacles(
         srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, &[],
     );
-    let buildings_with_targets = filter_visible_buildings(all_buildings, &terrain);
 
-    let buildings_without_targets = if exclude_manual_ids.is_empty() {
-        None
-    } else {
-        // manual_buildings 쿼리만 exclude 적용 — fac_buildings 쿼리는 OS 캐시로 저렴
-        let filtered = collect_building_obstacles(
-            srtm, conn, radar_lat, radar_lon, radar_height_m, max_range_m, exclude_manual_ids,
-        );
-        Some(filter_visible_buildings(filtered, &terrain))
-    };
+    if exclude_manual_ids.is_empty() {
+        let buildings_with_targets = filter_visible_buildings(all_buildings, &terrain);
+        return PanoramaMergeDualResult { terrain, buildings_with_targets, buildings_without_targets: None };
+    }
 
-    PanoramaMergeDualResult { terrain, buildings_with_targets, buildings_without_targets }
+    // 분석 대상(exclude id) / 비대상 분리 — SQL NOT IN 재조회와 동일 집합
+    let (targets, non_targets): (Vec<BuildingObstacle>, Vec<BuildingObstacle>) = all_buildings
+        .into_iter()
+        .partition(|b| b.manual_id.is_some_and(|id| exclude_manual_ids.contains(&id)));
+
+    let buildings_without_targets = filter_visible_buildings(non_targets, &terrain);
+    let mut buildings_with_targets = buildings_without_targets.clone();
+    buildings_with_targets.extend(targets);
+
+    PanoramaMergeDualResult {
+        terrain,
+        buildings_with_targets,
+        buildings_without_targets: Some(buildings_without_targets),
+    }
 }
 
 /// LoS에 실질적으로 영향 주는 건물만 필터:
@@ -596,6 +619,7 @@ fn collect_building_obstacles(
                 lon: bld.centroid_lon,
                 polygon: Some(bld.polygon.clone()),
                 silhouette,
+                manual_id: bld.manual_id,
             });
         }
 
@@ -629,6 +653,7 @@ fn collect_building_obstacles(
                 lon: bld.lon,
                 polygon: None,
                 silhouette: None,
+                manual_id: bld.manual_id,
             });
         }
     }

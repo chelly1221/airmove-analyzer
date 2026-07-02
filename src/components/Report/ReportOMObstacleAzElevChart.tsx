@@ -5,7 +5,9 @@
  * ReportOMAltitudeDistribution 을 대체해서 ReportOMObstacleDetail 에 인라인으로 들어감.)
  *
  *  - 베이스(연두): 지형 + 기존 지형지물 = without 윗변 아래 영역
- *  - 추가(빨강): 분석 대상 장애물로 인해 추가된 차단 영역 = with 윗변 − without 윗변
+ *  - 추가(핑크): '해당' 분석 대상 장애물 단독으로 추가된 차단 영역 = with 윗변 − without 윗변
+ *    · with 는 건물별로 좁힌 without ∪ {해당 건물}(panoWithForBuilding) — 방위창에 겹치는 인접
+ *      분석 대상 건물은 이 페이지 핑크영역에 포함되지 않는다(그 건물 자신의 페이지에서만 표시).
  *    · 윗변 = 지형 + 건물 실루엣을 방위별 max 로 합성. 건물 실루엣은 레이더 시점에서 본
  *      압출 폴리곤의 가변 윗변(방위별 양각, panorama.rs build_building_silhouette).
  *  - 소실표적: 이 방위 윈도우 + 분석 대상 후방의 모든 소실표적을 빨간 점으로 통일 표시
@@ -15,7 +17,7 @@
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, PanoramaMergeResult, BuildingObstacle } from "../../types";
 import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
-import { classifyObstacleLosses, buildingAzHalfExtentDeg, makeTerrainSampler, pointElevAngleDeg, FT_PER_M, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, buildingAzHalfExtentDeg, makeTerrainSampler, panoWithForBuilding, pointElevAngleDeg, FT_PER_M, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import { bearingDeg, haversineKm } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import OMEditable from "./OMEditable";
@@ -174,8 +176,14 @@ export default function ReportOMObstacleAzElevChart({
     [radarSite, building, lossPoints, panoWith, panoWithout, siblings],
   );
 
-  // 분석 대상 포함/제외 파노라마 (terrain 공유 + buildings 배열만 다름)
-  const pWith = panoWith ?? EMPTY_MERGE;
+  // 분석 대상 포함/제외 파노라마 (terrain 공유 + buildings 배열만 다름).
+  //   with 는 건물별로 좁힘(panoWithForBuilding = without ∪ {해당 건물}) — 인접한 다른 분석 대상 건물이
+  //   이 페이지의 핑크영역('분석 대상 추가 차단')에 섞이지 않는다. 분류(classifyObstacleLosses)도 내부에서
+  //   동일 필터를 적용하므로 핑크영역↔분류 픽셀 일치 유지.
+  const pWith = useMemo(
+    () => panoWithForBuilding(panoWith, panoWithout, building.id) ?? EMPTY_MERGE,
+    [panoWith, panoWithout, building.id],
+  );
   const pWithout = panoWithout ?? EMPTY_MERGE;
 
   // 1) 방위 윈도우 (기하 전용) — 분석 대상 건물의 노출면 방위 각폭.

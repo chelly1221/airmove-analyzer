@@ -5,14 +5,14 @@
  * = 노출 조건부 소실율. 방위 비교(교란·반사실 부재)를 대체하는 인과 지표.
  *
  * 추가 차단영역 밴드 = angleWithout(az) ≤ elev < angleWith(az) — classifyObstacleLosses 의 buildingCaused
- * 정의·AzElev 차트 빨강영역(panoWith−panoWithout)과 동일 소스(makePanoramaSampler)·동일 프레임
+ * 정의·AzElev 차트 핑크영역(건물별 panoWith−panoWithout)과 동일 소스(makePanoramaSampler)·동일 프레임
  * (ITU 4/3 유효지구, pointElevAngleDeg). Rust 히스토그램의 양각 빈도 같은 프레임이라 정렬된다.
  *
  *   분모(노출) = Σ(추가 차단영역 셀의 추적시간 + 소실시간),  분자 = Σ(추가 차단영역 셀의 소실시간)
  *   소실율(%) = 분자 / 분모 × 100
  *
- * v1: panoWithout 는 "전체 분석대상 제외" 한 종류(panoWithoutTargets). 단일/비중첩 건물엔 정확.
- *     방위 중첩 건물끼리는 공유 한계기여를 양쪽에 중복 귀속(차트 빨강영역과는 일치) — 알려진 한계.
+ * panoWith 는 호출부(ReportApp)가 건물별로 좁혀(panoWithForBuilding = without ∪ {해당 건물}) 넘긴다 —
+ * 방위 중첩 인접 분석 대상의 한계기여가 양쪽 건물에 중복 귀속되던 v1 한계 해소(차트 핑크영역과 계속 일치).
  */
 import type { PanoramaMergeResult } from "../types";
 import type { AzSector, AzElevCell, AddedBlockageResult, AddedBlockageDay } from "../types/obstacle";
@@ -51,7 +51,8 @@ export interface BlockageDayHist {
 /**
  * 건물별 추가 차단영역 소실율 산출.
  * @param histogramsByDay  레이더의 일별 az×elev 히스토그램 (모든 관측일 포함, 빈 날은 cells=[])
- * @param panoWith         지형+기존지물+분석대상 파노라마 (해당 레이더). 없으면 밴드 판정 불가 → 노출 기반 등급 폴백.
+ * @param panoWith         지형+기존지물+'해당' 분석대상 파노라마 — 호출부가 panoWithForBuilding 으로 건물별로
+ *                         좁혀 전달. 없으면 밴드 판정 불가 → 노출 기반 등급 폴백.
  * @param panoWithout      분석대상 제외 파노라마 (없으면 panoWith.terrain 으로 폴백 → without==terrain)
  * @param buildingExtent   대상 건물의 방위 노출 구간 (calcBuildingAzExtent)
  */

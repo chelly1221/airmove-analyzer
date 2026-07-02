@@ -374,10 +374,11 @@ export function mergeAzSectors(sectors: AzSector[]): AzSector[] {
 
 // ─── 장애물 음영 표적소실 분류 ─────────────────────────────────────────────
 // ReportOMObstacleAzElevChart 와 ReportOMSummarySection 이 공유하는 단일 소스.
-//   inShadow:       소실표적 양각 < with 차단각(지형+기존지물+분석대상)  → 통합 음영구역 내
-//   buildingCaused: inShadow && 양각 ≥ without 차단각(분석대상 제외)      → 분석 대상 건물 추가분에 의해서만 차단
-// with/without 두 실루엣의 유일한 차이 = 분석 대상 건물 → [without, with] 밴드 = '대상 추가 차단'.
-//   이는 panorama 빨강영역(panoWith−panoWithout)과 동일 정의 → 차트의 빨강 영역과 검은× 점이 by-construction 일치.
+//   inShadow:       소실표적 양각 < with 차단각(지형+기존지물+'해당' 분석대상)  → 해당 대상 기준 음영구역 내
+//   buildingCaused: inShadow && 양각 ≥ without 차단각(분석대상 제외)            → 해당 대상 추가분에 의해서만 차단
+// with 는 panoWithForBuilding 으로 건물별로 좁힘 — with/without 두 실루엣의 유일한 차이 = '해당' 분석 대상 건물
+//   → [without, with] 밴드 = '해당 대상 단독 추가 차단'. 인접한 다른 분석 대상의 차단은 그 건물 페이지에서만 집계.
+//   이는 panorama 핑크영역(건물별 panoWith−panoWithout)과 동일 정의 → 차트의 핑크 영역과 검은× 점이 by-construction 일치.
 // 차단각 = panorama 실루엣 방위별 max(전 거리, ITU 4/3 유효지구) → 차트와 동일 소스라 픽셀 일치.
 //   파노라마는 거리축이 없어 max-over-distance 가 본질 — 표적 너머 지형도 silhouette 에 포함되나,
 //   buildingCount(=with−without 차분)는 공통 원거리 장애물이 상쇄돼 거리 오염 없음.
@@ -628,6 +629,27 @@ export function makePanoramaSampler(pano: PanoramaMergeResult): (azDeg: number) 
 }
 
 /**
+ * 건물별 with 파노라마 — 'without ∪ {해당 건물}' 로 구성해 with 실루엣을 해당 분석 대상 하나로 좁힌다.
+ * Rust dual 이 with = without ∪ 전체 분석대상(manual_id 태깅, 비컬링)으로 반환하므로, panoWith 에서
+ * manual_id === buildingId 인 장애물만 뽑아 panoWithout 위에 얹으면 정확히 '지형+기존지물+해당 건물'.
+ * → AzElev 차트 핑크영역·buildingCaused 분류·추가 차단영역 소실율이 전부 '해당 건물 단독 추가 차단'으로
+ *   정렬되고, 인접한 다른 분석 대상의 차단이 이 건물 페이지에 섞이지 않는다(건물별 상위집합 불변식 by construction).
+ * panoWithout 미제공(Rust 제외대상 0/리로드) 시 panoWith 그대로 반환 — 기존 without==with 폴백 규칙 유지.
+ */
+export function panoWithForBuilding(
+  panoWith: PanoramaMergeResult | undefined,
+  panoWithout: PanoramaMergeResult | undefined,
+  buildingId: number,
+): PanoramaMergeResult | undefined {
+  if (!panoWith || !panoWithout) return panoWith;
+  const buildings = (panoWithout.buildings ?? []).slice();
+  for (const b of panoWith.buildings ?? []) {
+    if (b.manual_id === buildingId) buildings.push(b);
+  }
+  return { terrain: panoWith.terrain, buildings };
+}
+
+/**
  * (레이더 × 분석 대상 장애물) 의 LoS 차단각 대비 후방 소실표적 분류.
  * 방위 윈도우(건물별 허용각 azTolDeg = max(±10°, 노출면 반각폭+1°)) + 대상 후방(거리 > bDistKm) 소실표적만 채택.
  * @returns 차단각(°) + 분류된 소실 배열(점 단위) + 집계 — '…건'(이벤트)은 distinct event_id, 소실시간은 Σ share_s
@@ -637,8 +659,10 @@ export function classifyObstacleLosses(
   building: ManualBuilding,
   lossPoints: LossPointGeo[],
   opts?: {
-    /** 차단각 산출용 panorama(ITU 4/3 유효지구) — 차트 빨강영역과 동일 소스라 검은×↔빨강영역 픽셀 일치.
-     *  panoWith = 지형+기존지물+분석대상, panoWithout = 분석대상 제외(Rust 가 제외대상 0 이면 null → without==with).
+    /** 차단각 산출용 panorama(ITU 4/3 유효지구) — 차트 핑크영역과 동일 소스라 검은×↔핑크영역 픽셀 일치.
+     *  panoWith = 지형+기존지물+전체 분석대상(레이더당 1쌍) — 내부에서 panoWithForBuilding 으로
+     *  '지형+기존지물+해당 건물'로 좁혀 사용(인접 분석 대상의 차단이 이 건물 분류에 섞이지 않음).
+     *  panoWithout = 분석대상 제외(Rust 가 제외대상 0 이면 null → without==with).
      *  panoWith 자체가 없으면(해당 레이더 파노라마 계산 실패) 차단각 0 → 음영 분류 생략(보수적). */
     panoWith?: PanoramaMergeResult;
     panoWithout?: PanoramaMergeResult;
@@ -682,10 +706,12 @@ export function classifyObstacleLosses(
   //   Az×Elev 차트 창(azHalfSpan = max(반각폭+1°, 2°)) ⊆ 이 허용각 — 차트 창 안 소실 점 누락 없음.
   const azTolDeg = classifyAzToleranceDeg(radar.latitude, radar.longitude, building, bAzDeg);
 
-  // 차단각 = panorama 실루엣 방위별 max(ITU 4/3 유효지구). with(지형+기존지물+분석대상) − without(분석대상 제외) = '대상 추가 차단'.
-  //   빨강영역(panoWith−panoWithout)과 동일 소스·동일 프레임 → 차트 빨강영역·검은× 점 픽셀 일치.
+  // 차단각 = panorama 실루엣 방위별 max(ITU 4/3 유효지구). with(지형+기존지물+'해당' 대상) − without(분석대상 제외)
+  //   = '해당 대상 단독 추가 차단'. with 는 panoWithForBuilding 으로 건물별로 좁힌다 — 인접한 다른 분석 대상이
+  //   이 건물의 inShadow/buildingCaused 에 섞이지 않고, 차트 핑크영역(동일 필터)과 검은× 점이 픽셀 일치.
   //   panoWithout 가 null(Rust 가 제외대상 0 일 때) → without==with. panoWith 자체가 없으면 차단각 0(음영 분류 생략).
-  const sW = opts?.panoWith ? makePanoramaSampler(opts.panoWith) : null;
+  const panoWithB = panoWithForBuilding(opts?.panoWith, opts?.panoWithout, building.id);
+  const sW = panoWithB ? makePanoramaSampler(panoWithB) : null;
   const sWo = opts?.panoWithout ? makePanoramaSampler(opts.panoWithout) : sW;
   const angleWithAt = (azDeg: number) => (sW ? sW(azDeg) : 0);
   const angleWithoutAt = (azDeg: number) => (sWo ? sWo(azDeg) : 0);
