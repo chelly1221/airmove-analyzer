@@ -47,7 +47,7 @@ interface Props {
  */
 const HEADER_HEIGHT_MM = 14;
 const BLOCK_H3_MM = 8;        // "분석 대상 장애물" 제목 블록 (.block-h3, 15px + 하단여백 8px)
-const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS·추가소실율)
+const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS 영향·추가소실율)
 const ROW_HEIGHT_MM = 7;
 const META_MERGED_MM = 14;   // 참고 안내 1행 (.meta-merged, 단문 1줄)
 const KPI_BLOCK_MM = 60;     // om-h3(~8mm) + 5행 × ~9.5mm + 블록 하단여백 12px ≈ 60mm
@@ -84,7 +84,7 @@ function ReportOMSummarySection({
   //   AzElevChart·§3 요약표와 동일 분류(classifyObstacleLosses). '…건' 표시는 스키마 계약대로 이벤트 단위
   //   (같은 gap 의 보간점을 점 개수로 세면 과대 — buildingEventCount 사용).
   //   hasBldgEffect = 대상 차단각(with) > 지형·기존지물 차단각(without)+0.005° → 섹션3(AzElevChart)·LoS 단면도와 동일 조건.
-  //   추가 차단 양각이 없으면(지형 이하) LoS 열을 '차단'이 아닌 '양호'로 표기(섹션2,3 통일).
+  //   추가 차단 양각이 없으면(지형 이하) 'LoS 영향' 열을 O(영향)가 아닌 X(무영향)로 표기(섹션2,3 통일).
   const obstacleInfoByKey = useMemo(() => {
     const m = new Map<string, { shadowLoss: number; hasBldgEffect: boolean }>();
     for (const r of radarSites) {
@@ -137,7 +137,7 @@ function ReportOMSummarySection({
           {radarSites.map((r) => (
             <React.Fragment key={`sh-${r.name}`}>
               <th className="ta-c sm">방위/거리</th>
-              <th className="ta-c sm">LoS</th>
+              <th className="ta-c sm">LoS 영향</th>
               <th className="ta-c sm">추가소실율</th>
             </React.Fragment>
           ))}
@@ -160,8 +160,8 @@ function ReportOMSummarySection({
                 const los = losMap.get(`${r.name}_${b.id}`);
                 const info = obstacleInfoByKey.get(`${r.name}_${b.id}`);
                 const shadowLoss = info?.shadowLoss ?? 0;
-                // LoS 차단 = 대상 건물이 기존 지형지물 대비 추가 차단 양각을 만드는 경우만(섹션2,3 동일 조건).
-                //   추가 차단각이 없으면(지형 이하) 직선 LoS 가 지형에 막혀도 '양호'로 표기.
+                // LoS 영향 O = 대상 건물이 기존 지형지물 대비 추가 차단 양각을 만드는 경우만(섹션2,3 동일 조건).
+                //   추가 차단각이 없으면(지형 이하) 직선 LoS 가 지형에 막혀도 X(무영향)로 표기.
                 const blocked = info?.hasBldgEffect ?? false;
                 const blockage = addedBlockageByKey?.[`${r.name}_${b.id}`];
                 return (
@@ -170,7 +170,7 @@ function ReportOMSummarySection({
                     <td className="ta-c sm">
                       {los ? (
                         <span className={`badge ${blocked ? "bad" : "ok"}`}>
-                          {blocked ? "차단" : "양호"}
+                          {blocked ? "O" : "X"}
                         </span>
                       ) : (
                         <span className="muted">—</span>

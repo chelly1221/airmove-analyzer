@@ -31,9 +31,10 @@ const R_KM = 6371;
 
 /** canvas 백킹 픽셀(렌더 해상도) — CSS 표시폭의 약 2배 밀도로 그려 PDF 출력에서 또렷하게.
  *  표시 크기는 고정(DISP_W×자동높이)으로 두어 A4 한 페이지 높이를 넘지 않게 한다
- *  ([data-page] 가 overflow:hidden 으로 클리핑되므로 페이지 분할이 아닌 잘림 방지). */
-const BACK_W = 760;
-const BACK_H = 416;
+ *  ([data-page] 가 overflow:hidden 으로 클리핑되므로 페이지 분할이 아닌 잘림 방지).
+ *  §4 소실상세 도면(ReportOMLossEventsMap)과 공유 — 두 도면 동일 백킹 해상도. */
+export const BACK_W = 760;
+export const BACK_H = 416;
 /** 화면/PDF 표시 폭(px) — 백킹의 절반(고밀도). 높이는 종횡비 자동(≈ 197px). */
 const DISP_W = 360;
 
@@ -61,7 +62,7 @@ function destPoint(latDeg: number, lonDeg: number, brgDeg: number, distKm: numbe
 }
 
 /** 건물 footprint 폴리곤 추출 ([[lat,lon],...] 배열들). 점 건물/파싱 실패 시 빈 배열. */
-function buildingPolygons(b: ManualBuilding): [number, number][][] {
+export function buildingPolygons(b: ManualBuilding): [number, number][][] {
   if (!b.geometry_json) return [];
   let geo: unknown;
   try { geo = JSON.parse(b.geometry_json); } catch { return []; }
@@ -91,11 +92,133 @@ function buildingPolygons(b: ManualBuilding): [number, number][][] {
 /** 중심 c 기준 상대각 (−180, 180] */
 const relTo = (x: number, c: number) => ((x - c + 540) % 360) - 180;
 
-interface MapGeom {
+/** 투영 파라미터 — fitProjection 산출물. §3 부채꼴 도면·§4 소실상세 도면(ReportOMLossEventsMap) 공유. */
+export interface MapProjection {
   z: number;
   originX: number;
   originY: number;
   project: (lat: number, lon: number) => [number, number];
+  /** 미터/백킹픽셀 (중심 위도) — 축척 막대용 */
+  mpp: number;
+}
+
+/** 표시 필수 점집합([lat,lon][]) → BACK_W×BACK_H 캔버스 머케이터 투영 파라미터.
+ *  bbox 패딩 12% + 캔버스 종횡비에 맞춘 부족 축 확장(왜곡 없이 타일이 박스를 채움) + 정수 줌 [3,19]. */
+export function fitProjection(pts: [number, number][]): MapProjection {
+  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+  for (const [la, lo] of pts) {
+    if (la < minLat) minLat = la;
+    if (la > maxLat) maxLat = la;
+    if (lo < minLon) minLon = lo;
+    if (lo > maxLon) maxLon = lo;
+  }
+  const padLat = Math.max((maxLat - minLat) * 0.12, 1e-4);
+  const padLon = Math.max((maxLon - minLon) * 0.12, 1e-4);
+  minLat -= padLat; maxLat += padLat; minLon -= padLon; maxLon += padLon;
+
+  // 머케이터 span → 캔버스 종횡비에 맞춰 부족한 축 확장
+  let mxMin = mercX(minLon), mxMax = mercX(maxLon);
+  let myMin = mercY(maxLat), myMax = mercY(minLat); // y 는 위도 증가 시 감소
+  let spanX = mxMax - mxMin, spanY = myMax - myMin;
+  const targetAR = BACK_W / BACK_H;
+  if (spanX / spanY > targetAR) {
+    const need = spanX / targetAR;
+    const cy = (myMin + myMax) / 2; myMin = cy - need / 2; myMax = cy + need / 2; spanY = need;
+  } else {
+    const need = spanY * targetAR;
+    const cx = (mxMin + mxMax) / 2; mxMin = cx - need / 2; mxMax = cx + need / 2; spanX = need;
+  }
+
+  // 줌 — span 이 백킹 픽셀에 들어가는 최대 정수 줌
+  const zX = Math.log2(BACK_W / (spanX * TILE));
+  const zY = Math.log2(BACK_H / (spanY * TILE));
+  const z = Math.max(3, Math.min(19, Math.floor(Math.min(zX, zY))));
+  const worldSize = TILE * Math.pow(2, z);
+  const cMx = (mxMin + mxMax) / 2, cMy = (myMin + myMax) / 2;
+  const originX = cMx * worldSize - BACK_W / 2;
+  const originY = cMy * worldSize - BACK_H / 2;
+  const project = (lat: number, lon: number): [number, number] => [
+    mercX(lon) * worldSize - originX,
+    mercY(lat) * worldSize - originY,
+  ];
+
+  // 미터/백킹픽셀 (중심 위도) — 축척 막대용
+  const cLat = (minLat + maxLat) / 2;
+  const mpp = (Math.cos(cLat * DEG2RAD) * 2 * Math.PI * 6378137) / worldSize;
+
+  return { z, originX, originY, project, mpp };
+}
+
+/** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 완료 시 onDone(online 여부) 호출(오프라인이면 폴백 격자
+ *  + 흰 베일까지 그린 뒤). 반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청 중단 + 고아 Image
+ *  디코드 버퍼 해제(누수 방지). 취소 후엔 onDone 미호출. */
+export function composeTiles(
+  ctx: CanvasRenderingContext2D,
+  proj: Pick<MapProjection, "z" | "originX" | "originY">,
+  warnLabel: string,
+  onDone: (online: boolean) => void,
+): () => void {
+  let cancelled = false;
+  const imgs: HTMLImageElement[] = [];
+  const { z, originX, originY } = proj;
+  const n = Math.pow(2, z);
+  const tx0 = Math.floor(originX / TILE), tx1 = Math.floor((originX + BACK_W) / TILE);
+  const ty0 = Math.floor(originY / TILE), ty1 = Math.floor((originY + BACK_H) / TILE);
+
+  const loadTile = (tx: number, ty: number) =>
+    new Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>((resolve) => {
+      if (ty < 0 || ty >= n) { resolve(null); return; }
+      const wx = ((tx % n) + n) % n;
+      const img = new Image();
+      imgs.push(img);
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve({ tx, ty, img });
+      img.onerror = () => resolve(null);
+      img.src = tileUrl(z, wx, ty);
+    });
+
+  const jobs: Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>[] = [];
+  for (let tx = tx0; tx <= tx1; tx++)
+    for (let ty = ty0; ty <= ty1; ty++) jobs.push(loadTile(tx, ty));
+
+  Promise.all(jobs).then((tiles) => {
+    if (cancelled) return;
+    const ok = tiles.filter((t): t is { tx: number; ty: number; img: HTMLImageElement } => t != null);
+
+    ctx.fillStyle = "#eef1f4";
+    ctx.fillRect(0, 0, BACK_W, BACK_H);
+    if (ok.length > 0) {
+      for (const t of ok) {
+        ctx.drawImage(t.img, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY), TILE, TILE);
+      }
+    } else {
+      ctx.strokeStyle = "#d6dbe1";
+      ctx.lineWidth = 1;
+      for (let gx = 0; gx <= BACK_W; gx += 48) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, BACK_H); ctx.stroke(); }
+      for (let gy = 0; gy <= BACK_H; gy += 48) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(BACK_W, gy); ctx.stroke(); }
+      ctx.fillStyle = "#9aa3ad";
+      ctx.font = "16px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("지도 타일을 불러올 수 없습니다 (오프라인)", BACK_W / 2, 22);
+      console.warn(`[OM 지도] 타일 로드 실패 — 오프라인/네트워크. 폴백 격자 표시 (${warnLabel})`);
+    }
+
+    // 베이스맵 위 옅은 흰 베일 — 오버레이 가독성
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.fillRect(0, 0, BACK_W, BACK_H);
+
+    onDone(ok.length > 0);
+  });
+
+  return () => {
+    cancelled = true;
+    // 미완료 타일 요청 중단 + 디코드 버퍼 해제 (언마운트/재계산 시 고아 Image 누수 방지)
+    for (const im of imgs) { if (!im.complete) im.src = ""; }
+  };
+}
+
+interface MapGeom {
+  proj: MapProjection;
   rLat: number; rLon: number;
   bLat: number; bLon: number;
   bDistKm: number; bAz: number;
@@ -104,7 +227,6 @@ interface MapGeom {
   shadowFarKm: number;
   polys: [number, number][][];
   lossPx: [number, number][];
-  mpp: number;
 }
 
 interface Props {
@@ -161,45 +283,11 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
     const nearStart = destPoint(rLat, rLon, startAz, bDistKm);
     const nearEnd = destPoint(rLat, rLon, endAz, bDistKm);
 
-    // bbox — 표시 필수 점들의 위경도 경계
+    // bbox — 표시 필수 점들의 위경도 경계 → 공유 투영(fitProjection)
     const pts: [number, number][] = [[rLat, rLon], [bLat, bLon], farStart, farEnd, nearStart, nearEnd];
     for (const poly of polys) for (const p of poly) pts.push(p);
-    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-    for (const [la, lo] of pts) {
-      if (la < minLat) minLat = la;
-      if (la > maxLat) maxLat = la;
-      if (lo < minLon) minLon = lo;
-      if (lo > maxLon) maxLon = lo;
-    }
-    const padLat = Math.max((maxLat - minLat) * 0.12, 1e-4);
-    const padLon = Math.max((maxLon - minLon) * 0.12, 1e-4);
-    minLat -= padLat; maxLat += padLat; minLon -= padLon; maxLon += padLon;
-
-    // 머케이터 span → 캔버스 종횡비에 맞춰 부족한 축 확장 (왜곡 없이 타일이 박스를 채움)
-    let mxMin = mercX(minLon), mxMax = mercX(maxLon);
-    let myMin = mercY(maxLat), myMax = mercY(minLat); // y 는 위도 증가 시 감소
-    let spanX = mxMax - mxMin, spanY = myMax - myMin;
-    const targetAR = BACK_W / BACK_H;
-    if (spanX / spanY > targetAR) {
-      const need = spanX / targetAR;
-      const cy = (myMin + myMax) / 2; myMin = cy - need / 2; myMax = cy + need / 2; spanY = need;
-    } else {
-      const need = spanY * targetAR;
-      const cx = (mxMin + mxMax) / 2; mxMin = cx - need / 2; mxMax = cx + need / 2; spanX = need;
-    }
-
-    // 줌 — span 이 백킹 픽셀에 들어가는 최대 정수 줌
-    const zX = Math.log2(BACK_W / (spanX * TILE));
-    const zY = Math.log2(BACK_H / (spanY * TILE));
-    const z = Math.max(3, Math.min(19, Math.floor(Math.min(zX, zY))));
-    const worldSize = TILE * Math.pow(2, z);
-    const cMx = (mxMin + mxMax) / 2, cMy = (myMin + myMax) / 2;
-    const originX = cMx * worldSize - BACK_W / 2;
-    const originY = cMy * worldSize - BACK_H / 2;
-    const project = (lat: number, lon: number): [number, number] => [
-      mercX(lon) * worldSize - originX,
-      mercY(lat) * worldSize - originY,
-    ];
+    const proj = fitProjection(pts);
+    const { project } = proj;
 
     // 소실표적 — 부채꼴(±1°) + 건물 후방 ~ 음영 표시 범위(shadowFarKm) 이내.
     //   (shadowFarKm 밖은 표시 영향 범위 밖이라 캔버스 밖으로 투영되어 사라지므로 상한 적용)
@@ -213,18 +301,14 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
       lossPx.push(project(lp.lat, lp.lon));
     }
 
-    // 미터/백킹픽셀 (중심 위도) — 축척 막대용
-    const cLat = (minLat + maxLat) / 2;
-    const mpp = (Math.cos(cLat * DEG2RAD) * 2 * Math.PI * 6378137) / worldSize;
-
     return {
-      z, originX, originY, project,
+      proj,
       rLat, rLon, bLat, bLon, bDistKm, bAz, startAz, endAz, sweep, leftRel, rightRel,
-      shadowFarKm, polys, lossPx, mpp,
+      shadowFarKm, polys, lossPx,
     };
   }, [radarSite, building, los, lossPoints]);
 
-  // ── 렌더: 타일 합성 + 오버레이 ──
+  // ── 렌더: 타일 합성(공유 composeTiles) + 오버레이 ──
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -235,70 +319,16 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
     // PDF 내보내기(useReportExport)가 이 속성으로 타일 렌더 완료를 기다린다 — 비동기 타일이
     //   PrintToPdf 스냅샷보다 늦어 백지로 캡처되는 것을 방지. 그리기 완료 시 "true" 로 전환.
     canvas.setAttribute("data-map-ready", "false");
-    let cancelled = false;
-    const imgs: HTMLImageElement[] = [];
 
-    const { z, originX, originY } = geom;
-    const n = Math.pow(2, z);
-    const tx0 = Math.floor(originX / TILE), tx1 = Math.floor((originX + BACK_W) / TILE);
-    const ty0 = Math.floor(originY / TILE), ty1 = Math.floor((originY + BACK_H) / TILE);
-
-    const loadTile = (tx: number, ty: number) =>
-      new Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>((resolve) => {
-        if (ty < 0 || ty >= n) { resolve(null); return; }
-        const wx = ((tx % n) + n) % n;
-        const img = new Image();
-        imgs.push(img);
-        img.crossOrigin = "anonymous";
-        img.onload = () => resolve({ tx, ty, img });
-        img.onerror = () => resolve(null);
-        img.src = tileUrl(z, wx, ty);
-      });
-
-    const jobs: Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>[] = [];
-    for (let tx = tx0; tx <= tx1; tx++)
-      for (let ty = ty0; ty <= ty1; ty++) jobs.push(loadTile(tx, ty));
-
-    Promise.all(jobs).then((tiles) => {
-      if (cancelled) return;
-      const ok = tiles.filter((t): t is { tx: number; ty: number; img: HTMLImageElement } => t != null);
-
-      ctx.fillStyle = "#eef1f4";
-      ctx.fillRect(0, 0, BACK_W, BACK_H);
-      if (ok.length > 0) {
-        for (const t of ok) {
-          ctx.drawImage(t.img, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY), TILE, TILE);
-        }
-      } else {
-        ctx.strokeStyle = "#d6dbe1";
-        ctx.lineWidth = 1;
-        for (let gx = 0; gx <= BACK_W; gx += 48) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, BACK_H); ctx.stroke(); }
-        for (let gy = 0; gy <= BACK_H; gy += 48) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(BACK_W, gy); ctx.stroke(); }
-        ctx.fillStyle = "#9aa3ad";
-        ctx.font = "16px sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillText("지도 타일을 불러올 수 없습니다 (오프라인)", BACK_W / 2, 22);
-        console.warn(`[OM 지도] 타일 로드 실패 — 오프라인/네트워크. 폴백 격자 표시 (${radarSite.name} / 건물 ${building.id})`);
-      }
-
-      // 베이스맵 위 옅은 흰 베일 — 오버레이 가독성
-      ctx.fillStyle = "rgba(255,255,255,0.12)";
-      ctx.fillRect(0, 0, BACK_W, BACK_H);
-
+    return composeTiles(ctx, geom.proj, `${radarSite.name} / 건물 ${building.id}`, (online) => {
       drawOverlay(ctx, geom, groupColor);
-      drawScaleBar(ctx, geom.mpp);
+      drawScaleBar(ctx, geom.proj.mpp);
       drawNorth(ctx);
-      drawAttribution(ctx, ok.length > 0);
+      drawAttribution(ctx, online);
 
       // 렌더 완료 — 내보내기 게이트 통과 허용 (오프라인 폴백도 '완료'로 간주해 무한 대기 방지)
       canvas.setAttribute("data-map-ready", "true");
     });
-
-    return () => {
-      cancelled = true;
-      // 미완료 타일 요청 중단 + 디코드 버퍼 해제 (언마운트/재계산 시 고아 Image 누수 방지)
-      for (const im of imgs) { if (!im.complete) im.src = ""; }
-    };
   }, [geom, groupColor, radarSite.name, building.id]);
 
   const eid = `radarmap.${radarSite.name}_${building.id}`;
@@ -375,7 +405,8 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
 // ── canvas 그리기 헬퍼 ──
 
 function drawOverlay(ctx: CanvasRenderingContext2D, g: MapGeom, groupColor: string) {
-  const { project, rLat, rLon, bAz, startAz, endAz, leftRel, rightRel, shadowFarKm, bDistKm, polys, lossPx } = g;
+  const { rLat, rLon, bAz, startAz, endAz, leftRel, rightRel, shadowFarKm, bDistKm, polys, lossPx } = g;
+  const { project } = g.proj;
   const [rx, ry] = project(rLat, rLon);
 
   // 부채꼴 far/near 호 샘플 (short-arc, 좌→우)
@@ -471,7 +502,7 @@ function labelChip(ctx: CanvasRenderingContext2D, text: string, x: number, y: nu
   ctx.fillText(text, cx, cy + 0.5);
 }
 
-function drawScaleBar(ctx: CanvasRenderingContext2D, mpp: number) {
+export function drawScaleBar(ctx: CanvasRenderingContext2D, mpp: number) {
   const targetPx = 110;
   const targetM = mpp * targetPx;
   const niceM = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
@@ -489,7 +520,7 @@ function drawScaleBar(ctx: CanvasRenderingContext2D, mpp: number) {
   ctx.fillText(label, x0 + 2, y0 - 5);
 }
 
-function drawNorth(ctx: CanvasRenderingContext2D) {
+export function drawNorth(ctx: CanvasRenderingContext2D) {
   const x = BACK_W - 22, y = 26;
   ctx.beginPath();
   ctx.moveTo(x, y - 14); ctx.lineTo(x - 6, y + 6); ctx.lineTo(x, y + 1); ctx.lineTo(x + 6, y + 6);
@@ -500,7 +531,7 @@ function drawNorth(ctx: CanvasRenderingContext2D) {
   ctx.fillText("N", x, y + 7);
 }
 
-function drawAttribution(ctx: CanvasRenderingContext2D, online: boolean) {
+export function drawAttribution(ctx: CanvasRenderingContext2D, online: boolean) {
   if (!online) return;
   const text = "© OpenStreetMap · © CARTO";
   ctx.font = "10px sans-serif"; ctx.textAlign = "right"; ctx.textBaseline = "bottom";
@@ -522,7 +553,7 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
 }
 
 /** #rrggbb + alpha → rgba() */
-function hexA(hex: string, a: number): string {
+export function hexA(hex: string, a: number): string {
   const m = /^#?([0-9a-fA-F]{6})$/.exec(hex.trim());
   if (!m) return `rgba(166,7,57,${a})`;
   const num = parseInt(m[1], 16);

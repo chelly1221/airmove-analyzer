@@ -76,7 +76,7 @@ export function LosCrossSection({
   buildingGroup?: import("../../types").BuildingGroup | null;
   trackPoints: ChartTrackPoint[];
   lossPoints: ChartTrackPoint[];
-  /** 헤드라인 차단(차단/양호) 배지 판정 — panorama 실루엣 기반(소실표적 분류와 동일 소스, losBlockedFromPanorama).
+  /** 헤드라인 차단(LoS 영향 O/X) 배지 판정 — panorama 실루엣 기반(소실표적 분류와 동일 소스, losBlockedFromPanorama).
    *  미지정(panorama 미준비) 시 차트 내부 chord 판정(blocked)으로 폴백 — chord 도 분석 대상 자신을 제외한
    *  입력(excludeTargetBuildings)으로 판정하므로 self-block 없음. 차트 본문의 코리도 시각화(최저탐지선·
    *  '차단건물 N동')는 그대로 chord/코리도 유지 — blocked 배지만 panorama 로 통일(거리축 손실로 본문과 어긋날 수 있음). */
@@ -690,7 +690,7 @@ export function LosCrossSection({
         <span className={`ml-auto rounded px-1.5 py-0.5 text-[11px] font-medium ${
           displayBlocked ? "bg-red-50 text-red-600" : "bg-green-50 text-green-600"
         }`}>
-          {displayBlocked ? "차단" : "양호"}
+          {displayBlocked ? "LoS 영향 O" : "LoS 영향 X"}
         </span>
       </div>
 

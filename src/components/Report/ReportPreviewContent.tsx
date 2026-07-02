@@ -253,6 +253,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                   radarResults={omResult.radar_results}
                   radarSites={omData.selectedRadarSites}
                   selectedBuildings={omData.selectedBuildings}
+                  buildingGroups={omData.buildingGroups}
                   losMap={omData.losMap}
                   panoWithByRadar={omData.panoWithTargets}
                   panoWithoutByRadar={omData.panoWithoutTargets}
