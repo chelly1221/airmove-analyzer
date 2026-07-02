@@ -238,8 +238,48 @@ export async function computeLosBatch(
   return losMap;
 }
 
-/** 건물 도형의 레이더 방향 노출면 방위 구간 계산 */
+// ─── calcBuildingAzExtent 메모이즈 ──────────────────────────────────────────
+// 왜 필요한가(크래시 근본 원인): OM 보고서 렌더는 (건물 N × 레이더) 에 대해 §2 요약·§3 상세·§4 소실상세가
+//   각각 건물마다 buildSiblings(전체 건물) + classifyObstacleLosses 를 돌아 calcBuildingAzExtent 를
+//   O(N²) 로 호출한다. 이 함수는 내부에서 JSON.parse(geometry_json) + 폴리곤 꼭짓점 순회(멀티는 재귀)를
+//   수행하므로, 건물 100개·레이더 3개면 렌더 1회에 수만~수십만 번 JSON.parse → 건물통합정보 폴리곤
+//   (꼭짓점 수십~수백)에서 순간 수백MB~GB 힙 할당 → WebView2 렌더러 OOM → 창 소멸(커밋 7239573 회귀).
+//   calcBuildingAzExtent 는 순수 함수(같은 radar 좌표·같은 building → 항상 같은 AzSector)이므로,
+//   레이더×건물당 실제 계산(JSON.parse)을 1회로 줄이면 O(N²) 호출은 상수시간 캐시 히트가 되어 폭발이 사라진다.
+//
+// 캐시 무효화 규약:
+//   · 키 = building 객체 참조(WeakMap). building.id 같은 원시값이 아니라 객체 참조를 키로 써서 서로 다른
+//     building 인스턴스 간 오염을 원천 차단하고, building 이 GC 되면 캐시 엔트리도 자동 해제(누수 없음).
+//     ⇒ 건물의 좌표·geometry 가 바뀌면 반드시 '새 객체'로 교체해야 캐시가 무효화된다(같은 객체 in-place
+//        mutate 는 stale 캐시를 유발하므로 금지 — 실제 편집 파이프라인은 새 ManualBuilding 을 만들어 교체).
+//   · 하위 키 = `${radarLat},${radarLon}` 문자열. 레이더 객체가 참조 유지된 채 좌표만 바뀌어도 재계산된다.
+//   · 반환 AzSector 는 캐시에 저장된 객체를 '공유' 반환한다 — 전체 호출부(§2/§3/§4·ObstacleMonthlyConfigModal·
+//     ReportOMLosCrossSection·ReportOMRadarBuildingMap·ReportApp·computeAddedBlockage·mergeAzSectors·
+//     buildingAzHalfExtentDeg)를 grep 확인한 결과 start_deg/end_deg 를 mutate 하는 곳이 없어(모두 read-only,
+//     2026-07-02 조사) 공유 반환이 안전하다. 이후 mutate 하는 호출부가 생기면 그 호출부에서 값을 복제할 것.
+const azExtentCache = new WeakMap<ManualBuilding, Map<string, AzSector>>();
+
+/** 건물 도형의 레이더 방향 노출면 방위 구간 계산 — 메모이즈 래퍼(위 캐시 규약 참조). */
 export function calcBuildingAzExtent(
+  radarLat: number, radarLon: number,
+  building: ManualBuilding,
+): AzSector {
+  let byRadar = azExtentCache.get(building);
+  if (!byRadar) {
+    byRadar = new Map<string, AzSector>();
+    azExtentCache.set(building, byRadar);
+  }
+  const key = `${radarLat},${radarLon}`;
+  const cached = byRadar.get(key);
+  if (cached) return cached;
+  const result = calcBuildingAzExtentRaw(radarLat, radarLon, building);
+  byRadar.set(key, result);
+  return result;
+}
+
+/** calcBuildingAzExtent 원본 계산부(JSON.parse 포함) — 메모이즈 캐시 미스일 때만 호출.
+ *  멀티 타입 하위 도형 재귀(:아래)는 메모이즈된 export calcBuildingAzExtent 를 계속 호출한다(재귀도 캐시 이득). */
+function calcBuildingAzExtentRaw(
   radarLat: number, radarLon: number,
   building: ManualBuilding,
 ): AzSector {
