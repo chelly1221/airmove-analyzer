@@ -1,14 +1,19 @@
 /**
  * 장애물 월간 보고서 — 분석 소견 자동 생성
- * 각 항목별 분석 결과를 토대로 소견 템플릿을 자동 작성
+ *
+ * 종합 소견 페이지의 판정 카드·추가 차단 구간 표·장애물 스트립이 상세 수치를 이미 표시하므로,
+ * 소견 텍스트는 수치를 재나열하지 않고 「개요 → 종합 판정 → 항목별 요약 → 특이사항」의
+ * 압축 서술만 담는다. 특이사항 섹션은 해당 항목이 있을 때만 출력.
  */
 import type {
   RadarMonthlyResult, ManualBuilding, RadarSite, LoSProfileData,
 } from "../types";
 import type { AddedBlockageResult } from "../types/obstacle";
 import type { CoverageLayer } from "./radarCoverage";
-import { weightedLossAvg, weightedLossStdDev, weightedPsrAvg, weightedBaselineLossAvg, weightedTrendSlope, BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_NONE_LABEL } from "./omStats";
-import { haversineKm } from "./geo";
+import {
+  weightedLossAvg, weightedBaselineLossAvg, weightedTrendSlope,
+  BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_NONE_LABEL,
+} from "./omStats";
 
 function gradeLabel(lossRate: number): string {
   if (lossRate < 0.5) return "양호";
@@ -24,7 +29,7 @@ interface GenerateOMFindingsParams {
   covLayersWithBuildings: Map<string, CoverageLayer[]>;
   covLayersWithout: Map<string, CoverageLayer[]>;
   analysisMonth: string;
-  /** 건물별 추가 차단영역 소실율 (key: `${radarName}_${buildingId}`). 파노라마 준비 후 채워짐 — 비면 추가 차단영역 프로즈 생략. */
+  /** 건물별 추가 차단영역 소실율 (key: `${radarName}_${buildingId}`). 파노라마 준비 후 채워짐 — 비면 방위 소실율 기준 잠정 판정. */
   addedBlockageByKey?: Record<string, AddedBlockageResult>;
   /** 건물별 LoS 차단 판정 (key: losMap 키와 동일 `${radarName}_${buildingId}`). panorama 실루엣 기반(losBlockedFromPanorama,
    *  단면도 배지·소실표적 분류와 동일 소스). 파노라마 준비 후 채워짐 — 미제공 시 los.losBlocked(chord) 폴백. */
@@ -33,8 +38,9 @@ interface GenerateOMFindingsParams {
 
 export function generateOMFindingsText(params: GenerateOMFindingsParams): string {
   const {
-    radarResults, selectedBuildings, radarSites,
-    losMap, covLayersWithBuildings, covLayersWithout, analysisMonth, addedBlockageByKey, losBlockedByKey,
+    radarResults, selectedBuildings, losMap,
+    covLayersWithBuildings, covLayersWithout, analysisMonth,
+    addedBlockageByKey, losBlockedByKey,
   } = params;
 
   const lines: string[] = [];
@@ -42,193 +48,31 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     ? `${analysisMonth.slice(0, 4)}년 ${parseInt(analysisMonth.slice(5, 7))}월`
     : "";
 
+  // 레이더별 방위 소실율 등급 — 종합 판정(폴백)과 항목별 요약(보조지표)에서 공용
+  const allGrades = radarResults.map((rr) => {
+    const stats = rr.daily_stats;
+    const avg = weightedLossAvg(stats);
+    const dev = avg - weightedBaselineLossAvg(stats);
+    const grade = stats.length < 7 ? "판정 보류" : gradeLabel(avg);
+    return { radar: rr.radar_name, avg, dev, grade };
+  });
+  const gradeTexts = allGrades
+    .map((g) => `${g.radar} '${g.grade}'(${g.avg.toFixed(2)}%, 전방위 대비 ${g.dev > 0 ? "+" : ""}${g.dev.toFixed(2)}%p)`)
+    .join(" · ");
+
   // ── 1. 분석 개요 ──
   const bldgNames = selectedBuildings.map((b) => b.name || `건물${b.id}`).join(", ");
   const radarNames = radarResults.map((r) => r.radar_name).join(", ");
   lines.push(`■ 분석 개요`);
-  lines.push(`${monthLabel ? monthLabel + " " : ""}장애물 월간 분석을 수행하였으며, 분석 대상 장애물은 ${bldgNames}이고, 분석 레이더는 ${radarNames}이다.`);
-  lines.push(`  - 항적 분석 고도 범위: 전 고도 항적 (고도 상한 없음). 표적소실·PSR 등 항적 기반 통계는 모든 고도의 항적을 포함한다. (커버리지 비교의 FL별 분석은 별도 기준.)`);
-
-  // 건물별 거리 정보
-  for (const b of selectedBuildings) {
-    const dists = radarSites.map((rs) => {
-      const km = haversineKm(rs.latitude, rs.longitude, b.latitude, b.longitude);
-      return `${rs.name} ${km.toFixed(1)}km`;
-    });
-    lines.push(`  - ${b.name || `건물${b.id}`}: 높이 ${b.height}m, ${dists.join(", ")}`);
-  }
+  lines.push(`${monthLabel ? monthLabel + " " : ""}장애물 월간 분석 — 대상 장애물: ${bldgNames} / 분석 레이더: ${radarNames}.`);
+  lines.push(`표적소실·PSR 통계는 전 고도 항적 기준이며, 레이더별 상세 수치는 상단 판정 카드, 건물별 수치는 추가 차단 구간 표와 같다.`);
   lines.push("");
 
-  // ── 2. 레이더별 표적소실 분석 ──
-  lines.push(`■ 레이더별 표적소실 분석`);
-  for (const rr of radarResults) {
-    const stats = rr.daily_stats;
-    if (stats.length === 0) {
-      lines.push(`${rr.radar_name}: 분석 데이터 없음`);
-      continue;
-    }
-
-    const avgLoss = weightedLossAvg(stats);
-    const lossSigma = weightedLossStdDev(stats);
-    const avgBaseline = weightedBaselineLossAvg(stats);
-    const avgPsr = weightedPsrAvg(stats);
-    const deviation = avgLoss - avgBaseline;
-    const grade = stats.length < 7 ? "판정 보류" : gradeLabel(avgLoss);
-    // 소실 이벤트 건수 — loss_points_summary 는 gap 당 보간점 여러 개(60초 gap → 11점)라
-    //   점 개수로 세면 수 배 과대. distinct event_id(gap 고유 번호, 레이더 결과 내 유일)로 집계.
-    const eventIds = new Set<number>();
-    for (const d of stats) {
-      for (const lp of d.loss_points_summary) eventIds.add(lp.event_id);
-    }
-    const totalLossEvents = eventIds.size;
-
-    lines.push(`[${rr.radar_name}] 방위 소실율 등급(보조): ${grade}${stats.length < 7 ? ` (관측일수 ${stats.length}일 < 7일)` : ""}`);
-    lines.push(`  - 분석 기간: ${stats.length}일, 평균 표적소실율: ${avgLoss.toFixed(2)}%(±${lossSigma.toFixed(2)}), 기준선: ${avgBaseline.toFixed(2)}%, 편차: ${deviation > 0 ? "+" : ""}${deviation.toFixed(2)}%p`);
-    lines.push(`  - 평균 PSR 탐지율: ${(avgPsr * 100).toFixed(1)}%, 소실 이벤트: ${totalLossEvents}건`);
-
-    // ── 건물별 추가 차단 구간 소실율 — 헤드라인 인과 지표 ──
-    //   "이 건물이 새로 가리는 차단영역을 지나는 항적이 소실되는 비율". 방위 비교(아래)보다 우선.
-    if (addedBlockageByKey) {
-      const blockageLines: string[] = [];
-      for (const b of selectedBuildings) {
-        const w = addedBlockageByKey[`${rr.radar_name}_${b.id}`];
-        if (!w) continue;
-        const bn = b.name || `건물${b.id}`;
-        const expPt = Math.round(w.exposurePointCount).toLocaleString();
-        const lossPt = Math.round(w.lossPointCount).toLocaleString();
-        if (w.grade.label === BLOCKAGE_NONE_LABEL) {
-          blockageLines.push(`    · ${bn}: 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없어 추가 차단영역 미형성 → 영향 없음으로 판단`);
-        } else if (w.grade.label === "판정 보류") {
-          blockageLines.push(`    · ${bn}: 추가 차단 구간 — 관측일수 부족으로 판정 보류`);
-        } else if (w.grade.label === "항적 없음") {
-          blockageLines.push(`    · ${bn}: 추가 차단 구간을 지나는 항적이 거의 없어(통과 ${expPt}pt) 영향 없음으로 판단`);
-        } else {
-          const tr = w.trendDir === "안정"
-            ? "추세 안정"
-            : `추세 ${w.trendDir}(일당 ${w.trendSlopePctPerDay > 0 ? "+" : ""}${w.trendSlopePctPerDay.toFixed(3)}%p)`;
-          blockageLines.push(`    · ${bn}: 추가 차단 구간 소실율 ${w.lossRatePct.toFixed(2)}% (${w.grade.label}), ${tr}, 통과 ${expPt}pt 중 소실 ${lossPt}pt/${w.daysWithExposure}일`);
-        }
-      }
-      if (blockageLines.length > 0) {
-        lines.push(`  → 분석 대상 장애물의 추가 차단영역(지형·기존지물 차단각 초과~대상 차단각 사이, 지나는 항적이 소실되는 비율):`);
-        for (const wl of blockageLines) lines.push(wl);
-      }
-    }
-
-    // 참고(방위 비교) — 교란요인(지형·트래픽) 많아 보조 지표로 강등
-    lines.push(`  · 참고(방위 비교): 대상 방위 구간 소실율 ${avgLoss.toFixed(2)}% vs 전 방위 기준선 ${avgBaseline.toFixed(2)}% (편차 ${deviation > 0 ? "+" : ""}${deviation.toFixed(2)}%p). 방위마다 지형·트래픽이 달라 건물 인과 분리엔 한계가 있어, 위 추가 차단 구간 소실율을 우선 판단 근거로 함.`);
-
-    // 일별 추이 분석 (가중 최소자승 회귀) — 레이더 대상 방위 소실율 추세
-    if (stats.length >= 7) {
-      const slope = weightedTrendSlope(stats.map((d) => ({ x: d.day_of_month, y: d.loss_rate, w: d.total_track_time_secs })));
-      if (Math.abs(slope) > 0.02) {
-        const trend = slope > 0 ? "증가" : "감소";
-        lines.push(`  → 분석 기간 중 (대상 방위) 일별 소실율 ${trend} 추세 (일당 ${slope > 0 ? "+" : ""}${slope.toFixed(3)}%p).`);
-      } else {
-        lines.push(`  → 분석 기간 중 (대상 방위) 일별 소실율은 비교적 안정적.`);
-      }
-    }
-
-    // 최고 소실일
-    const maxDay = stats.reduce((max, d) => d.loss_rate > max.loss_rate ? d : max, stats[0]);
-    if (maxDay.loss_rate > avgLoss * 1.5 && maxDay.loss_rate > 1) {
-      lines.push(`  → 최대 소실일: ${maxDay.date} (${maxDay.loss_rate.toFixed(2)}%), 해당 일 특이사항 확인 필요.`);
-    }
-
-    // Loss 고도 분석 — 이벤트 0건이면 평균고도 자체가 무의미(Rust 기본값 0.0)라 줄 생략 (이중 안전)
-    if (totalLossEvents > 0 && rr.avg_loss_altitude_ft > 0) {
-      const altM = rr.avg_loss_altitude_ft * 0.3048;
-      lines.push(`  - 소실 이벤트 평균 고도: ${rr.avg_loss_altitude_ft.toFixed(0)}ft (${altM.toFixed(0)}m)`);
-      if (altM < 500) {
-        lines.push(`  → 저고도(500m 미만)에서 소실이 집중되어, 장애물에 의한 전파 차단 가능성이 있다.`);
-      }
-    }
-  }
-  lines.push("");
-
-  // ── 3. LoS 분석 결과 ──
-  if (losMap.size > 0) {
-    lines.push(`■ LoS(가시선) 분석`);
-    // 건물 표시명 조회 맵 — losMap 키는 `${radarName}_${buildingId}` (computeLosBatch, 단일 '_').
-    //   radarName 자체에 '_' 가 있어도 los.radarSiteName 접두사를 정확히 벗겨 건물 ID 를 얻는다.
-    const bldgNameById = new Map<string, string>();
-    for (const b of selectedBuildings) bldgNameById.set(String(b.id), b.name || `건물${b.id}`);
-    let hasBlocked = false;
-    for (const [key, los] of losMap) {
-      // 차단 판정 — panorama 실루엣(단면도 배지·소실표적 분류와 동일 소스) 우선, 없으면 chord(los.losBlocked) 폴백.
-      const blocked = losBlockedByKey?.get(key) ?? los.losBlocked;
-      if (blocked) hasBlocked = true;
-      const distKm = los.totalDistance; // totalDistance 는 이미 km (computeLosBatch)
-      const statusStr = blocked ? "차단" : "양호";
-      const radarPrefix = `${los.radarSiteName}_`;
-      const bldgIdStr = key.startsWith(radarPrefix) ? key.slice(radarPrefix.length) : key;
-      const targetName = bldgNameById.get(bldgIdStr) ?? `건물 #${bldgIdStr}`;
-      let detail = `  - ${los.radarSiteName} → ${targetName}: ${distKm.toFixed(1)}km, ${statusStr}`;
-      if (blocked && los.maxBlockingPoint) {
-        const bp = los.maxBlockingPoint;
-        detail += ` (차단점: ${bp.distance.toFixed(1)}km 지점, ${bp.elevation.toFixed(0)}m${bp.name ? ` [${bp.name}]` : ""})`;
-      }
-      lines.push(detail);
-    }
-    if (hasBlocked) {
-      lines.push(`  → 일부 방향에서 LoS 차단이 확인되어, 해당 방위 저고도 표적의 탐지 제한이 예상된다.`);
-    } else {
-      lines.push(`  → 모든 방향에서 LoS가 확보되어 있으며, 장애물에 의한 전파 차단은 확인되지 않는다.`);
-    }
-    lines.push("");
-  }
-
-  // ── 4. 커버리지 비교 분석 ──
-  if (covLayersWithBuildings.size > 0 && covLayersWithout.size > 0) {
-    lines.push(`■ 커버리지 비교 분석 (건물 유/무)`);
-    let anySignificantDiff = false;
-    for (const rr of radarResults) {
-      const rsLayersWith = covLayersWithBuildings.get(rr.radar_name) ?? [];
-      const rsLayersWithout = covLayersWithout.get(rr.radar_name) ?? [];
-      if (rsLayersWith.length === 0 || rsLayersWithout.length === 0) continue;
-      lines.push(`  [${rr.radar_name}]`);
-      const altFts = [...new Set(rsLayersWith.map((l) => l.altitudeFt))].sort((a, b) => a - b);
-      let significantDiff = false;
-      for (const alt of altFts) {
-        const withLayer = rsLayersWith.find((l) => l.altitudeFt === alt);
-        const withoutLayer = rsLayersWithout.find((l) => l.altitudeFt === alt);
-        if (!withLayer || !withoutLayer) continue;
-
-        const avgWith = withLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withLayer.bearings.length, 1);
-        const avgWithout = withoutLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withoutLayer.bearings.length, 1);
-        const diff = avgWithout - avgWith;
-        if (diff > 0.5) {
-          significantDiff = true;
-          anySignificantDiff = true;
-          lines.push(`  - FL${Math.round(alt / 100).toString().padStart(3, "0")} (${alt}ft): 건물에 의해 평균 커버리지 ${diff.toFixed(1)}km 감소 (${avgWithout.toFixed(1)}km → ${avgWith.toFixed(1)}km)`);
-        }
-      }
-      if (!significantDiff) {
-        lines.push(`  - 커버리지 차이 유의미하지 않음`);
-      }
-    }
-    if (anySignificantDiff) {
-      lines.push(`  → 분석 대상 건물에 의한 커버리지 감소가 확인되며, 해당 고도/방위에서 탐지 범위가 축소된다.`);
-    } else {
-      lines.push(`  → 분석 대상 건물에 의한 커버리지 차이는 유의미하지 않다.`);
-    }
-    lines.push("");
-  }
-
-  // ── 5. 종합 판정 ──
+  // ── 2. 종합 판정 ──
   lines.push(`■ 종합 판정`);
-  const allGrades = radarResults.map((rr) => {
-    const avg = weightedLossAvg(rr.daily_stats);
-    const grade = rr.daily_stats.length < 7 ? "판정 보류" : gradeLabel(avg);
-    return { radar: rr.radar_name, avg, grade };
-  });
-
-  const hasPending = allGrades.some((g) => g.grade === "판정 보류");
-  const gradeTexts = allGrades.map((g) => `${g.radar} '${g.grade}'(${g.avg.toFixed(2)}%)`).join(", ");
-
-  // 헤드라인(인과 기준) — 건물별 추가 차단영역 소실율 최악 등급 롤업을 1차 결론으로.
-  // 방위 소실율(아래)은 지형·트래픽 교란이 섞여 인과 분리엔 한계가 있어 보조지표로만 둔다.
   if (addedBlockageByKey) {
+    // 인과 헤드라인 — 건물별 추가 차단영역 소실율 최악 등급 롤업.
+    // 방위 소실율은 지형·트래픽 교란이 섞여 보조지표로만 두고 항목별 요약에서 언급.
     const order: Record<string, number> = { "경고": 3, "주의": 2, "양호": 1 };
     let worst = "", worstName = "", worstRate = 0;
     let blockageCount = 0, noneCount = 0; // 사유 분리용 — 추가 차단 구간 미형성 전부 여부
@@ -248,34 +92,136 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     }
     const allBandNone = blockageCount > 0 && noneCount === blockageCount;
     if (worst === "양호") {
-      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역 소실율은 양호 수준(최고 ${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 유의미한 탐지 영향은 확인되지 않았다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율은 양호 수준(최고 ${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 유의미한 탐지 영향은 확인되지 않았다.`);
     } else if (worst === "주의") {
-      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역 소실율이 주의 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 해당 방위·고도 탐지 성능을 지속 모니터링할 필요가 있다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 주의 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 해당 방위·고도 탐지 성능을 지속 모니터링할 필요가 있다.`);
     } else if (worst === "경고") {
-      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역 소실율이 경고 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 경고 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
     } else if (allBandNone) {
-      lines.push(`[헤드라인·인과] 분석 대상 장애물이 지형·기존지물 위로 새로 가리는 구간을 형성하지 않아(추가 차단 구간 없음), 장애물에 의한 추가 탐지 영향은 없는 것으로 판단된다.`);
+      lines.push(`분석 대상 장애물이 지형·기존지물 위로 새로 가리는 구간을 형성하지 않아(추가 차단 구간 없음), 장애물에 의한 추가 탐지 영향은 없는 것으로 판단된다.`);
     } else {
-      lines.push(`[헤드라인·인과] 분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
+      lines.push(`분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
     }
-    lines.push(`  ※ 추가 차단영역 등급 임계(주의 ${BLOCKAGE_CAUTION_PCT}% / 경고 ${BLOCKAGE_ALERT_PCT}%)는 실측 분포 보정 전 잠정 기준임.`);
-    lines.push(`참고(방위 소실율, 보조지표): ${gradeTexts}. 방위마다 지형·트래픽이 달라 위 인과 헤드라인을 우선 판단 근거로 한다.`);
+    lines.push(`※ 추가 차단영역 등급 임계(주의 ${BLOCKAGE_CAUTION_PCT}% / 경고 ${BLOCKAGE_ALERT_PCT}%)는 실측 분포 보정 전 잠정 기준.`);
   } else {
-    // 파노라마 미준비(생성 직후) — 인과 헤드라인 산출 전이라 방위 소실율 기준 잠정 결론.
+    // 파노라마 미준비(생성 직후) — 방위 소실율 기준 잠정 결론. 파노라마 완료 시 인과 헤드라인으로 자동 재생성.
     const worstGrade = allGrades.some((g) => g.grade === "경고") ? "경고"
       : allGrades.some((g) => g.grade === "주의") ? "주의" : "양호";
-    lines.push(`레이더별 판정(대상 방위 소실율): ${gradeTexts}`);
     if (worstGrade === "양호") {
-      lines.push(`분석 기간 중 모든 레이더에서 표적소실율이 양호 수준으로, 분석 대상 장애물에 의한 유의미한 운용 영향은 확인되지 않았다.`);
+      lines.push(`(잠정) 분석 기간 중 모든 레이더에서 표적소실율이 양호 수준으로, 분석 대상 장애물에 의한 유의미한 운용 영향은 확인되지 않았다.`);
     } else if (worstGrade === "주의") {
-      lines.push(`일부 레이더에서 표적소실율이 주의 수준이며, 분석 대상 장애물 방위 구간에서의 탐지 성능을 지속적으로 모니터링할 필요가 있다.`);
+      lines.push(`(잠정) 일부 레이더에서 표적소실율이 주의 수준이며, 분석 대상 장애물 방위 구간에서의 탐지 성능을 지속적으로 모니터링할 필요가 있다.`);
     } else {
-      lines.push(`일부 레이더에서 표적소실율이 경고 수준으로, 분석 대상 장애물에 의한 탐지 성능 저하가 우려되며, 운용 관련 대책 검토가 필요하다.`);
+      lines.push(`(잠정) 일부 레이더에서 표적소실율이 경고 수준으로, 분석 대상 장애물에 의한 탐지 성능 저하가 우려되며, 운용 관련 대책 검토가 필요하다.`);
+    }
+    lines.push(`※ 건물 인과 헤드라인(추가 차단영역 소실율)은 장애물 음영 분석 완료 후 자동 반영된다.`);
+  }
+  const pendingRadars = allGrades.filter((g) => g.grade === "판정 보류");
+  if (pendingRadars.length > 0) {
+    lines.push(`※ ${pendingRadars.map((g) => g.radar).join(", ")}: 관측일수 부족(7일 미만)으로 판정 보류 — 추가 데이터 확보 후 재분석 필요.`);
+  }
+  lines.push("");
+
+  // ── 3. 항목별 요약 ──
+  lines.push(`■ 항목별 요약`);
+
+  // LoS — 차단 경로만 상세, 나머지는 개수로 축약
+  if (losMap.size > 0) {
+    // 건물 표시명 조회 맵 — losMap 키는 `${radarName}_${buildingId}` (computeLosBatch, 단일 '_').
+    //   radarName 자체에 '_' 가 있어도 los.radarSiteName 접두사를 정확히 벗겨 건물 ID 를 얻는다.
+    const bldgNameById = new Map<string, string>();
+    for (const b of selectedBuildings) bldgNameById.set(String(b.id), b.name || `건물${b.id}`);
+    const blockedDescs: string[] = [];
+    for (const [key, los] of losMap) {
+      // 차단 판정 — panorama 실루엣(단면도 배지·소실표적 분류와 동일 소스) 우선, 없으면 chord(los.losBlocked) 폴백.
+      const blocked = losBlockedByKey?.get(key) ?? los.losBlocked;
+      if (!blocked) continue;
+      const radarPrefix = `${los.radarSiteName}_`;
+      const bldgIdStr = key.startsWith(radarPrefix) ? key.slice(radarPrefix.length) : key;
+      const targetName = bldgNameById.get(bldgIdStr) ?? `건물 #${bldgIdStr}`;
+      let desc = `${los.radarSiteName}→${targetName}`;
+      if (los.maxBlockingPoint) {
+        const bp = los.maxBlockingPoint;
+        desc += `(차단점 ${bp.distance.toFixed(1)}km, ${bp.elevation.toFixed(0)}m${bp.name ? ` [${bp.name}]` : ""})`;
+      }
+      blockedDescs.push(desc);
+    }
+    if (blockedDescs.length === 0) {
+      lines.push(`- LoS(가시선): 전 ${losMap.size}개 경로 가시선 확보 — 장애물에 의한 전파 차단 없음.`);
+    } else {
+      lines.push(`- LoS(가시선): ${losMap.size}개 경로 중 ${blockedDescs.length}건 차단 — ${blockedDescs.join(", ")}. 해당 방위 저고도 탐지 제한 예상.`);
     }
   }
-  if (hasPending) {
-    const pendingRadars = allGrades.filter((g) => g.grade === "판정 보류").map((g) => g.radar).join(", ");
-    lines.push(`(${pendingRadars}: 관측일수 부족으로 판정 보류 — 추가 데이터 확보 후 재분석 필요)`);
+
+  // 커버리지(건물 유/무) — 유의미한 감소(평균 0.5km 초과)만 나열
+  if (covLayersWithBuildings.size > 0 && covLayersWithout.size > 0) {
+    const diffDescs: string[] = [];
+    for (const rr of radarResults) {
+      const rsLayersWith = covLayersWithBuildings.get(rr.radar_name) ?? [];
+      const rsLayersWithout = covLayersWithout.get(rr.radar_name) ?? [];
+      if (rsLayersWith.length === 0 || rsLayersWithout.length === 0) continue;
+      const flDescs: string[] = [];
+      const altFts = [...new Set(rsLayersWith.map((l) => l.altitudeFt))].sort((a, b) => a - b);
+      for (const alt of altFts) {
+        const withLayer = rsLayersWith.find((l) => l.altitudeFt === alt);
+        const withoutLayer = rsLayersWithout.find((l) => l.altitudeFt === alt);
+        if (!withLayer || !withoutLayer) continue;
+        const avgWith = withLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withLayer.bearings.length, 1);
+        const avgWithout = withoutLayer.bearings.reduce((s, b) => s + b.maxRangeKm, 0) / Math.max(withoutLayer.bearings.length, 1);
+        const diff = avgWithout - avgWith;
+        if (diff > 0.5) {
+          flDescs.push(`FL${Math.round(alt / 100).toString().padStart(3, "0")} 평균 ${diff.toFixed(1)}km 감소(${avgWithout.toFixed(1)}→${avgWith.toFixed(1)}km)`);
+        }
+      }
+      if (flDescs.length > 0) diffDescs.push(`${rr.radar_name} ${flDescs.join(" · ")}`);
+    }
+    if (diffDescs.length === 0) {
+      lines.push(`- 커버리지(건물 유/무): 전 고도에서 유의미한 차이 없음.`);
+    } else {
+      lines.push(`- 커버리지(건물 유/무): ${diffDescs.join(" / ")} — 해당 고도·방위 탐지범위 축소.`);
+    }
+  }
+
+  // 방위 소실율 — 교란요인(지형·트래픽) 많아 보조지표
+  lines.push(`- 방위 소실율(보조지표): ${gradeTexts}. 방위별 지형·트래픽 차이로 건물 인과 분리에 한계가 있어 참고용.`);
+
+  // ── 4. 특이사항 ── (해당 항목이 있을 때만 섹션 출력)
+  const notes: string[] = [];
+  for (const rr of radarResults) {
+    const stats = rr.daily_stats;
+    if (stats.length === 0) {
+      notes.push(`- ${rr.radar_name}: 분석 데이터 없음.`);
+      continue;
+    }
+    const avgLoss = weightedLossAvg(stats);
+    // 일별 소실율 악화(증가) 추세만 보고 — 감소·안정은 생략(추가 차단 표의 추세 열로 충분)
+    if (stats.length >= 7) {
+      const slope = weightedTrendSlope(stats.map((d) => ({ x: d.day_of_month, y: d.loss_rate, w: d.total_track_time_secs })));
+      if (slope > 0.02) {
+        notes.push(`- ${rr.radar_name}: (대상 방위) 일별 소실율 증가 추세(일당 +${slope.toFixed(3)}%p) — 지속 관찰 필요.`);
+      }
+    }
+    // 최고 소실일
+    const maxDay = stats.reduce((max, d) => (d.loss_rate > max.loss_rate ? d : max), stats[0]);
+    if (maxDay.loss_rate > avgLoss * 1.5 && maxDay.loss_rate > 1) {
+      notes.push(`- ${rr.radar_name}: 최대 소실일 ${maxDay.date}(${maxDay.loss_rate.toFixed(2)}%) — 해당 일 특이사항 확인 필요.`);
+    }
+    // 저고도 소실 집중 — 이벤트 0건이면 평균고도 자체가 무의미(Rust 기본값 0.0)라 생략 (이중 안전)
+    let hasLossEvent = false;
+    for (const d of stats) {
+      if (d.loss_points_summary.length > 0) { hasLossEvent = true; break; }
+    }
+    if (hasLossEvent && rr.avg_loss_altitude_ft > 0) {
+      const altM = rr.avg_loss_altitude_ft * 0.3048;
+      if (altM < 500) {
+        notes.push(`- ${rr.radar_name}: 소실 이벤트 평균고도 ${rr.avg_loss_altitude_ft.toFixed(0)}ft(${altM.toFixed(0)}m) — 저고도 집중, 장애물에 의한 전파 차단 가능성.`);
+      }
+    }
+  }
+  if (notes.length > 0) {
+    lines.push("");
+    lines.push(`■ 특이사항`);
+    for (const n of notes) lines.push(n);
   }
 
   return lines.join("\n");
