@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback } from "react";
 import {
   Loader2,
   Eye,
@@ -8,17 +8,16 @@ import {
   FilePlus,
 } from "lucide-react";
 import { useAppStore } from "../store";
-import { emit, listen } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import {
-  writeReportPayload, writeReportConfig, readGenerateRequest, clearGenerateRequest,
+  writeReportConfig,
   templateDisplayLabel,
-  type ReportTemplate, type ReportGenerateRequest,
+  type ReportTemplate,
 } from "../utils/reportTransfer";
 import type { RadarSite } from "../types";
 
 export default function ReportGeneration() {
-  const radarSite = useAppStore((s) => s.radarSite);
   const aircraft = useAppStore((s) => s.aircraft);
   const reportMetadata = useAppStore((s) => s.reportMetadata);
   const customRadarSites = useAppStore((s) => s.customRadarSites);
@@ -48,28 +47,8 @@ export default function ReportGeneration() {
   // 보고서 준비 중 — 상세 상태 (오버레이 + 버튼 disable)
   const [prepState, setPrepState] = useState<{ active: boolean; message: string }>({ active: false, message: "" });
 
-  // 보고서 생성 요청 수신 → 페이로드 조립 + IDB 저장 + data-written emit.
-  // 분석 결과(omData)는 보고서 창의 OM 모달에서 산출되어 요청에 실려 오고,
-  // 여기서는 메인 창 스토어의 레이더/메타데이터를 더해 최종 페이로드를 완성한다.
-  const handleGenerate = useCallback(async (req: ReportGenerateRequest) => {
-    if (!req.omData) return;
-    setPrepState({ active: true, message: "보고서 준비 중..." });
-    try {
-      setPrepState({ active: true, message: "데이터 저장 중..." });
-      await writeReportPayload({
-        template: "obstacle_monthly",
-        sections: req.sections,
-        coverTitle: "장애물 월간 분석 보고서",
-        radarSite,
-        reportMetadata,
-        omData: req.omData,
-      });
-      // 이미 열려있는 보고서 창에 data-written 이벤트 전달
-      await emit("report:data-written");
-    } finally {
-      setPrepState({ active: false, message: "" });
-    }
-  }, [radarSite, reportMetadata]);
+  // NOTE: 보고서 창의 생성 요청(report:generate) 수신은 App.tsx 의 useReportGenerateListener 담당.
+  // 페이지에 두면 라우트 이동 시 리스너가 해제되어 요청이 유실되므로 상시 마운트 지점으로 이동했다.
 
   // 템플릿 클릭 → config 저장 → 보고서 창 열기 (모달은 보고서 창에서 표시)
   const handleTemplateClick = useCallback(async (tpl: ReportTemplate) => {
@@ -86,27 +65,6 @@ export default function ReportGeneration() {
       setPrepState({ active: false, message: "" });
     }
   }, [aircraft, reportMetadata, customRadarSites, openReportWindow]);
-
-  // ref로 최신 handleGenerate 참조 — 리스너 재등록 없이 항상 최신 클로저 사용
-  const handleGenerateRef = useRef(handleGenerate);
-  useEffect(() => { handleGenerateRef.current = handleGenerate; }, [handleGenerate]);
-
-  // 보고서 창에서 생성 요청 수신 → 데이터 조립 + IDB 저장 + data-written emit
-  useEffect(() => {
-    const unlisten = listen("report:generate", async () => {
-      try {
-        const req = await readGenerateRequest();
-        if (!req) return;
-        await clearGenerateRequest();
-        await handleGenerateRef.current(req);
-      } catch (e) {
-        console.error("[ReportGeneration] report:generate 처리 실패:", e);
-        // 보고서 창에 에러 전달 — 로딩 화면에서 벗어날 수 있도록
-        await emit("report:data-error", { message: e instanceof Error ? e.message : String(e) });
-      }
-    });
-    return () => { unlisten.then((fn) => fn()); };
-  }, []); // 안정적 의존성 — ref를 통해 최신 함수 참조
 
   return (
     <div className="relative space-y-6">

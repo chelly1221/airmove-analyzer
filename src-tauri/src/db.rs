@@ -259,6 +259,9 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // NULL = 아직 백필되지 않음, 0 이상 = SRTM 값 계산 완료
     let _ = conn.execute("ALTER TABLE fac_buildings ADD COLUMN ground_elev REAL", []);
 
+    // 파노라마 캐시 알고리즘 버전 컬럼 (기존 행은 0 → 로드 시 버전 불일치로 자연 미스)
+    let _ = conn.execute("ALTER TABLE panorama_cache ADD COLUMN version INTEGER NOT NULL DEFAULT 0", []);
+
     // 보고서 저장 기능 폐지 — 기존 DB에 남은 미사용 테이블 제거 (idempotent)
     let _ = conn.execute("DROP TABLE IF EXISTS saved_reports", []);
 
@@ -390,6 +393,10 @@ pub fn get_setting(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
 
 // ========== LoS 파노라마 캐시 ==========
 
+/// 파노라마 계산 알고리즘 버전 — 계산식 변경 시 증가시켜 기존 캐시를 자연 무효화
+/// v1: ray_segment_intersection 선분 파라미터 s 부호 수정 (구버전 캐시는 실루엣/거리 왜곡)
+pub const PANORAMA_CACHE_VERSION: i64 = 1;
+
 /// 파노라마 데이터 저장
 pub fn save_panorama_cache(
     conn: &Connection,
@@ -405,9 +412,9 @@ pub fn save_panorama_cache(
         .unwrap_or_default()
         .as_secs() as i64;
     conn.execute(
-        "INSERT OR REPLACE INTO panorama_cache (radar_lat, radar_lon, radar_height_m, data_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![lat_key, lon_key, radar_height_m, data_json, now],
+        "INSERT OR REPLACE INTO panorama_cache (radar_lat, radar_lon, radar_height_m, data_json, created_at, version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![lat_key, lon_key, radar_height_m, data_json, now, PANORAMA_CACHE_VERSION],
     )?;
     Ok(())
 }
@@ -415,6 +422,7 @@ pub fn save_panorama_cache(
 /// 파노라마 캐시 로드
 /// 저장된 radar_height_m 과 요청 높이가 0.01m 초과 차이나면 캐시 미스(None)
 /// — 사이트고/안테나고 수정 후 구 높이 기준 앙각 파노라마 재사용 방지
+/// 저장 버전이 PANORAMA_CACHE_VERSION 과 다르면 캐시 미스 — 구 알고리즘 결과 폐기
 pub fn load_panorama_cache(
     conn: &Connection,
     radar_lat: f64,
@@ -424,13 +432,16 @@ pub fn load_panorama_cache(
     let lat_key = format!("{:.4}", radar_lat);
     let lon_key = format!("{:.4}", radar_lon);
     let mut stmt = conn.prepare(
-        "SELECT data_json, radar_height_m FROM panorama_cache WHERE radar_lat = ?1 AND radar_lon = ?2",
+        "SELECT data_json, radar_height_m, version FROM panorama_cache WHERE radar_lat = ?1 AND radar_lon = ?2",
     )?;
     match stmt.query_row(params![lat_key, lon_key], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?))
     }) {
-        Ok((json, stored_height_m)) => {
-            if (stored_height_m - radar_height_m).abs() > 0.01 {
+        Ok((json, stored_height_m, stored_version)) => {
+            if stored_version != PANORAMA_CACHE_VERSION {
+                // 알고리즘 버전 불일치 → 캐시 미스 (호출부에서 재계산)
+                Ok(None)
+            } else if (stored_height_m - radar_height_m).abs() > 0.01 {
                 // 레이더 높이 불일치 → 캐시 미스 (호출부에서 재계산)
                 Ok(None)
             } else {

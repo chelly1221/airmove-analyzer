@@ -85,7 +85,7 @@ export default function LoSObstacle() {
     return names;
   }, []);
 
-  // 파노라마 계산 함수 (GPU 우선, CPU 폴백, DB 저장 포함)
+  // 파노라마 계산 함수 (GPU 우선, DB 저장 포함)
   const computePanorama = useCallback(async () => {
     setPanoramaLoading(true);
     setPanoramaProgress({ percent: 0, label: "초기화 중..." });

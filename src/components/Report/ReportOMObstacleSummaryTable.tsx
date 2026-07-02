@@ -12,7 +12,7 @@
 import { useMemo } from "react";
 import type { ManualBuilding, RadarSite, PanoramaMergeResult } from "../../types";
 import type { LossPointGeo, AddedBlockageResult } from "../../types/obstacle";
-import { classifyObstacleLosses, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, BLDG_EFFECT_EPS_DEG, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import { BLOCKAGE_NONE_LABEL } from "../../utils/omStats";
 import OMEditable from "./OMEditable";
 
@@ -52,7 +52,7 @@ export default function ReportOMObstacleSummaryTable({
   const freeEv = totalEv - shadowEv;               // inShadow 점이 하나도 없는 이벤트 (합 = totalEv 보존)
   const shadowRatio = totalEv > 0 ? (shadowEv / totalEv) * 100 : 0;
   const bldgRatio = totalEv > 0 ? (bldgEv / totalEv) * 100 : 0;
-  const hasBldgEffect = computed.angleTotalDeg > computed.angleTerrainDeg + 0.005;
+  const hasBldgEffect = computed.angleTotalDeg > computed.angleTerrainDeg + BLDG_EFFECT_EPS_DEG;
 
   // 인라인 편집키 접두사 — 차트와 동일 스킴(azelev.*) 유지 → 기존 편집 보존
   const eid = `azelev.${radarSite.name}_${building.id}`;

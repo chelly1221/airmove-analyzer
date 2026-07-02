@@ -6,7 +6,3 @@
  * `297 - 16 - 18 = 263mm`.
  */
 export const PAGE_CONTENT_MM = 263; // 297 - (16mm top + 18mm bottom)
-export const SECTION_HEADER_MM = 14; // 시안 band 헤더(좌측 색띠 + 회색 박스): 9px 패딩×2 + 19px 본문 ≈ 14mm 보수적
-export const TABLE_HEADER_MM = 8;
-export const ROW_HEIGHT_SM = 6;  // text-[10px~12px]
-export const ROW_HEIGHT_MD = 7;  // text-[13px~14px]

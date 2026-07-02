@@ -102,6 +102,9 @@ async function exportViaNative(
       height: auto !important;
       max-height: none !important;
       flex: none !important;
+      /* 화면용 여백(py-6 등) 무력화 — 첫 페이지가 시트 상단에서 밀려 297mm 를 초과하는 것 방지 */
+      padding: 0 !important;
+      margin: 0 !important;
     }
     /* container 직계 자식(inner wrapper) 정리 — 단, data-page 본체는 자체 스타일 유지 */
     #__print-wrapper__ > div:not([data-page]) {
@@ -142,6 +145,29 @@ async function exportViaNative(
     while (Date.now() < deadline) {
       if (mapCanvases.every((c) => c.getAttribute("data-map-ready") === "true")) break;
       await new Promise((r) => setTimeout(r, 100));
+    }
+    // 타임아웃 폴백 — 타일 요청이 '느리게 실패'(행잉)하면 composeTiles 의 배경/폴백 격자가
+    //   그려지기 전이라 캔버스가 투명(백지) 상태다. 미완료 캔버스에 최소 폴백(단색 배경 +
+    //   격자 + 안내 문구)을 직접 그려 백지 인쇄를 방지. 이후 타일 로드가 늦게 완료되면
+    //   composeTiles 가 전체를 다시 그리므로 화면 상태는 자가 복구된다.
+    const notReady = mapCanvases.filter((c) => c.getAttribute("data-map-ready") !== "true");
+    if (notReady.length > 0) {
+      console.warn(`[보고서 PDF] 지도 타일 렌더 타임아웃(4초) — 캔버스 ${notReady.length}개 폴백 배경으로 인쇄 진행`);
+      for (const c of notReady) {
+        const ctx = c.getContext("2d");
+        if (!ctx) continue;
+        const w = c.width, h = c.height;
+        ctx.fillStyle = "#eef1f4";
+        ctx.fillRect(0, 0, w, h);
+        ctx.strokeStyle = "#d6dbe1";
+        ctx.lineWidth = 1;
+        for (let gx = 0; gx <= w; gx += 48) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke(); }
+        for (let gy = 0; gy <= h; gy += 48) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke(); }
+        ctx.fillStyle = "#9aa3ad";
+        ctx.font = "16px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("지도 타일 로드 시간 초과 — 베이스맵 미표시", w / 2, 22);
+      }
     }
   }
 

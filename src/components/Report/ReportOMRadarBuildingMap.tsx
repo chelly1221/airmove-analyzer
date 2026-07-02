@@ -14,7 +14,7 @@
  *  - 축척 막대 · 나침반(N) · 변 방위 라벨.
  *
  * PDF 안전: 모든 그래픽을 단일 <canvas> 에 그려 WebView2 PrintToPdf 가 스냅샷.
- *   타일 이미지는 crossOrigin="anonymous"(CARTO 는 CORS 허용) 로 canvas 오염 방지 → html2canvas 폴백도 안전.
+ *   타일 이미지는 crossOrigin="anonymous"(CARTO 는 CORS 허용) 로 canvas 오염 방지.
  */
 import { useEffect, useMemo, useRef } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData } from "../../types";
@@ -176,8 +176,11 @@ export function composeTiles(
       const img = new Image();
       imgs.push(img);
       img.crossOrigin = "anonymous";
-      img.onload = () => resolve({ tx, ty, img });
-      img.onerror = () => resolve(null);
+      // 개별 타일 3초 타임아웃 — 행잉 요청 환경에서도 Promise.all 이 PDF 게이트(data-map-ready 4초) 안에
+      // 끝나 폴백 배경+오버레이(부채꼴·건물)가 인쇄되도록 보장 (onload/onerror 시 해제)
+      const timer = setTimeout(() => resolve(null), 3000);
+      img.onload = () => { clearTimeout(timer); resolve({ tx, ty, img }); };
+      img.onerror = () => { clearTimeout(timer); resolve(null); };
       img.src = tileUrl(z, wx, ty);
     });
 

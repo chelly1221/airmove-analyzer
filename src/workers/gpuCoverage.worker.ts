@@ -156,7 +156,10 @@ async function runShader(
 // ═══════════════════════════════════════════════════
 
 const PANORAMA_HEIGHTMAP_SHADER = /* wgsl */ `
-const R_EARTH: f32 = 6371000.0;
+// 앙각 곡률 보정 반경 — ITU 4/3 유효지구(k=4/3). Rust panorama.rs::elevation_angle_deg(R_EFF)·
+// obstacle_monthly.rs::elev_angle_deg·TS pointElevAngleDeg(R_EFF_M_LOSS)와 동일 프레임
+// (지형·건물 실루엣·소실표적 양각을 단일 4/3 프레임으로 통일)
+const R_EFF: f32 = 6371000.0 * 4.0 / 3.0;
 const RAD2DEG: f32 = 180.0 / 3.14159265358979;
 const PI: f32 = 3.14159265358979;
 
@@ -209,7 +212,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let north_m = d * cos_b;
     let elev = sample_hm_p(east_m, north_m);
     let dh = elev - params.radar_height_m;
-    let curv_drop = d * d / (2.0 * R_EARTH);
+    let curv_drop = d * d / (2.0 * R_EFF);
     let angle = atan((dh - curv_drop) / d) * RAD2DEG;
     if (angle > best_angle) {
       best_angle = angle;

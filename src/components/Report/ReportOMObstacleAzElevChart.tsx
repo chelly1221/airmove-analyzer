@@ -156,7 +156,8 @@ interface Props {
   panoWithout?: PanoramaMergeResult;
   /** 이 레이더의 모든 소실표적 (방위 윈도우 + 대상 후방 필터링은 내부에서) */
   lossPoints: LossPointGeo[];
-  /** 이 레이더의 모든 항적 포인트 — 소실표적과 동일 방위창+대상 후방 영역으로 필터해 배경 점으로 표시
+  /** 이 레이더의 항적 표시점 — 백엔드(track_points_geo)에서 일별 최대 5,000점 균등표본으로 전달됨(전수 아님).
+   *  소실표적과 동일 방위창+대상 후방 영역으로 필터해 배경 점으로 표시
    *  (LoS 단면도와 동일한 detection type 색·작은 점). 방위/양각 투영은 내부에서. */
   trackPoints?: TrackPointGeo[];
   /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적 오귀속 방지용 (분류 내부에서 사용) */
@@ -212,7 +213,7 @@ export default function ReportOMObstacleAzElevChart({
 
   // 1b) 항적 점 투영 — 소실표적과 동일 도메인(차트 방위창 + 대상 후방)으로 필터해 (방위, 양각)으로 투영.
   //     양각은 소실표적과 동일 헬퍼(pointElevAngleDeg, ITU 4/3 유효지구 곡률 프레임)로 산출 → 같은 좌표계에서 겹쳐 표시.
-  //     색은 LoS 단면도와 동일하게 detection type 별. (전수 포인트 — 다운샘플 없음)
+  //     색은 LoS 단면도와 동일하게 detection type 별. (항적 표시점은 백엔드 일별 최대 5,000점 균등표본 — 소실표적은 전수)
   const trackDots = useMemo(() => {
     const out: { az: number; elev: number; radarType: string }[] = [];
     if (!trackPoints || trackPoints.length === 0) return out;
@@ -347,7 +348,8 @@ export default function ReportOMObstacleAzElevChart({
     }
 
     // 항적 — 소실표적 위·실루엣 아래. LoS 단면도와 동일 detection type 색·작은 점.
-    //   대상 후방·방위창 내 전수 항적을 깔아 소실표적 분포의 모집단(전체 통과 항적)을 시각화.
+    //   대상 후방·방위창 내 항적을 깔아 소실표적 분포의 배경(통과 항적 표본)을 시각화.
+    //   항적 표시점은 백엔드 일별 최대 5,000점 균등표본(의도 설계)이라 전수가 아님 — 소실표적은 전수.
     for (const tp of trackDots) {
       const x = xScale(tp.az);
       const y = yScale(tp.elev);
@@ -495,7 +497,7 @@ export default function ReportOMObstacleAzElevChart({
         {trackDots.length > 0 && (
           <span className="flex items-center gap-1">
             <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: "rgba(34,197,94,0.7)" }} />
-            <OMEditable id={`${eid}.legend.track`} value="항적" tag="span" />
+            <OMEditable id={`${eid}.legend.track`} value="항적 (일별 최대 5,000점 표본)" tag="span" />
           </span>
         )}
         <span className="flex items-center gap-1">

@@ -13,6 +13,7 @@ import {
   BLOCKAGE_NONE_LABEL,
 } from "../../utils/omStats";
 import { haversineKm } from "../../utils/geo";
+import { fmtLossPct, fmtPsrPct } from "../../utils/omFormat";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import AutoPaginate from "./AutoPaginate";
 import BuildingGroupBadge from "./BuildingGroupBadge";
@@ -134,14 +135,14 @@ function ReportOMFindings({
               <tr>
                 <OMEditable id="findings.card.avgLoss" value="평균 표적소실율" tag="td" className="muted" />
                 <td className="mono strong ta-r" style={{ color: rs.avgLoss >= 2 ? "#dc2626" : "#374151" }}>
-                  {rs.avgLoss.toFixed(2)}% <span className="muted norm">±{rs.lossSigma.toFixed(2)}</span>
+                  {fmtLossPct(rs.avgLoss)}% <span className="muted norm">±{fmtLossPct(rs.lossSigma)}</span>
                 </td>
               </tr>
               {/* 기준선·편차(방위 비교) — 교란요인 많아 '참고' 보조 지표로 강등(색상 구동 제거) */}
               <tr>
                 <OMEditable id="findings.card.baseLoss" value="기준선(전방위·참고)" tag="td" className="muted" />
                 <td className="mono ta-r muted">
-                  {rs.avgBaseline.toFixed(2)}% <span className="muted">±{rs.baselineSigma.toFixed(2)}</span>
+                  {fmtLossPct(rs.avgBaseline)}% <span className="muted">±{fmtLossPct(rs.baselineSigma)}</span>
                 </td>
               </tr>
               <tr>
@@ -153,7 +154,7 @@ function ReportOMFindings({
               <tr>
                 <OMEditable id="findings.card.avgPsr" value="평균 PSR율" tag="td" className="muted" />
                 <td className="mono ta-r">
-                  {(rs.avgPsr * 100).toFixed(1)}% <span className="muted">±{(rs.psrSigma * 100).toFixed(1)}</span>
+                  {fmtPsrPct(rs.avgPsr * 100)}% <span className="muted">±{fmtPsrPct(rs.psrSigma * 100)}</span>
                 </td>
               </tr>
               <tr>

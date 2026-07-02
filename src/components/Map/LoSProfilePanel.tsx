@@ -618,9 +618,14 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         }
         const isSearched = searchedBldg !== null && b === searchedBldg;
         if (bAdj > terrainShadow || isSearched) {
-          // 이 건물이 최대 차단점 근처인지 판정
+          // 이 건물이 최대 차단점을 만든 건물인지 판정 — maxBlockPoint.distance 는 건물 near/far '엣지' 또는
+          //   지형 샘플 거리이므로, 건물 '중심'(bDist)±0.1km 고정 허용치가 아닌 footprint 구간(near−ε ~ far+ε)
+          //   포함 여부로 판정 (경로방향 span>0.2km 건물이 near 엣지에서 최대 차단을 만들면 종전 식은 누락).
+          const bNearD = b.near_dist_km ?? b.distance_km;
+          const bFarD = b.far_dist_km ?? b.distance_km;
           const isBlk = !!(maxBlockPoint &&
-            Math.abs(bDist - maxBlockPoint.distance) < 0.1 &&
+            maxBlockPoint.distance >= bNearD - 0.05 &&
+            maxBlockPoint.distance <= bFarD + 0.05 &&
             bAdj > maxBlockPoint.adjHeight - 5);
           if (isSearched) searchedBldgIdx = significantBuildings.length;
           significantBuildings.push({ ...b, isBlocking: isBlk });
@@ -1104,12 +1109,14 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const M_TO_FT = 3.28084;
     const KM_TO_NM = 1 / 1.852;
 
-    // Y축 눈금 (ft 기준)
+    // Y축 눈금 (ft 기준) — 격자·라벨은 진고도 y 를 디스플레이 프레임(y − curvDrop(dist))에 그리므로, tick 은
+    //   minY..maxY(디스플레이 높이 범위)가 아닌 표시가능 '진고도' 범위 [minY+drop(zoomStart), maxY+drop(zoomEnd)]
+    //   에서 생성해야 원거리 줌 윈도우에서도 격자·라벨이 플롯 안에 들어온다(스텝은 화면 밀도 기준 유지).
     const yRangeFt = (maxY - minY) * M_TO_FT;
     const yStepFt = yRangeFt > 30000 ? 5000 : yRangeFt > 15000 ? 2000 : yRangeFt > 5000 ? 1000 : yRangeFt > 2000 ? 500 : 200;
     const yTicks: number[] = [];
-    const minYft = minY * M_TO_FT;
-    const maxYft = maxY * M_TO_FT;
+    const minYft = (minY + curvDrop(zoomStart)) * M_TO_FT;
+    const maxYft = (maxY + curvDrop(zoomEnd)) * M_TO_FT;
     for (let yf = Math.ceil(minYft / yStepFt) * yStepFt; yf <= maxYft; yf += yStepFt) yTicks.push(yf / M_TO_FT); // m으로 저장 (yScale은 m 기준)
 
     // X축 눈금 (NM 기준, 줌 뷰포트 적용)
@@ -1138,9 +1145,12 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           </clipPath>
         </defs>
 
-        {/* Y축 라벨 (클립 밖) */}
+        {/* Y축 라벨 (클립 밖) — tick 이 진고도 범위로 확장됐으므로, 윈도우 좌단(zoomStart) 기준
+            디스플레이 값이 플롯 세로범위 밖인 tick 은 라벨 생략(격자 곡선은 clipPath 가 처리) */}
         {yTicks.map((y) => {
-          const labelY = yScale(y - curvDrop(zoomStart));
+          const yDisp = y - curvDrop(zoomStart);
+          if (yDisp < minY - 1e-9 || yDisp > maxY + 1e-9) return null;
+          const labelY = yScale(yDisp);
           return (
             <text key={`yl-${y}`} x={PAD.left - 5} y={labelY + 3} textAnchor="end"
               fill="#6b7280" fontSize={9}>

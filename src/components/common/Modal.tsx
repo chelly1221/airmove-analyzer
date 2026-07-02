@@ -7,7 +7,7 @@ interface ModalProps {
   title: string;
   children: ReactNode;
   width?: string;
-  /** false이면 배경 클릭/ESC로 닫히지 않음 (X 버튼·취소만 가능) */
+  /** false이면 배경 클릭/ESC/헤더 X 로 닫히지 않음 (호출부가 제공하는 버튼으로만 닫기) */
   closable?: boolean;
 }
 
@@ -60,13 +60,16 @@ export default function Modal({
       >
         <div className="flex items-center justify-between border-b border-gray-200 px-6 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-gray-800">{title}</h2>
-          <button
-            onClick={onClose}
-            className="rounded-lg p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
-            aria-label="닫기"
-          >
-            <X size={20} />
-          </button>
+          {/* closable=false 면 X 미표시 — 정리 로직 없는 즉시 onClose(창 destroy 등) 우회 경로 차단 */}
+          {closable && (
+            <button
+              onClick={onClose}
+              className="rounded-lg p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
+              aria-label="닫기"
+            >
+              <X size={20} />
+            </button>
+          )}
         </div>
         <div className="px-6 py-4">{children}</div>
       </div>

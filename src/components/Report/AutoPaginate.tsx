@@ -28,8 +28,43 @@ interface AutoPaginateProps {
   firstHeader?: ReactNode;
 }
 
-const CONTENT_WIDTH_MM = 182; // 210 - 14*2 (좌우 패딩)
-const SAFETY_MARGIN_MM = 2;   // 측정 오차 + 마지막 mb-* 여백 흡수
+const CONTENT_WIDTH_MM = 182; // 자식 래퍼 자신의 폭 = 210 − 14×2 (.report-page-inner 좌우 패딩 안쪽)
+const SAFETY_MARGIN_MM = 2;   // 서브픽셀 측정 오차 흡수 — collapse 마진은 escapedMarginPx 로 명시 가산되므로 소폭이면 충분
+
+/**
+ * 래퍼 밖으로 margin-collapse 되어 빠져나가는 상/하단 마진(px).
+ *
+ * 측정용 래퍼 div 는 패딩·보더가 없어 내부 블록(.ev-block margin-bottom 18px,
+ * .om-h2 margin-bottom 16px, .findings-text margin-bottom 14px 등)의 상/하 마진이
+ * 래퍼 밖으로 collapse 되고, getBoundingClientRect().height 에는 포함되지 않는다.
+ * 첫/마지막 자식 체인을 따라 내려가며(collapse 는 패딩·보더가 있으면 차단됨)
+ * margin 최댓값을 구해 실제 점유 높이에 가산한다.
+ */
+function escapedMarginPx(root: HTMLElement, side: "top" | "bottom"): number {
+  let max = 0;
+  let el: HTMLElement | null = root;
+  while (el) {
+    const cs = getComputedStyle(el);
+    max = Math.max(max, parseFloat(side === "top" ? cs.marginTop : cs.marginBottom) || 0);
+    const pad = parseFloat(side === "top" ? cs.paddingTop : cs.paddingBottom) || 0;
+    const border = parseFloat(side === "top" ? cs.borderTopWidth : cs.borderBottomWidth) || 0;
+    if (pad > 0 || border > 0) break;
+    // flex/grid 컨테이너·BFC(overflow≠visible) 내부 자식 마진은 밖으로 collapse 되지 않음
+    if (cs.display === "flex" || cs.display === "grid" || cs.overflow !== "visible") break;
+    el = (side === "top" ? el.firstElementChild : el.lastElementChild) as HTMLElement | null;
+  }
+  return max;
+}
+
+/** 블록 실제 점유 높이(px) — rect 높이 + collapse 로 래퍼 밖에 생기는 상/하 마진.
+ *  인접 블록 경계에서는 collapse 로 두 마진 중 max 만 실제 점유하지만, 배치(페이지
+ *  할당)에 따라 측정값이 달라지는 방식(offsetTop 차분)은 재배치↔재측정 오실레이션
+ *  위험이 있어 결정적·소폭 과대측정(안전 방향 — 페이지를 약간 일찍 넘김) 방식을 택했다. */
+function occupiedHeightPx(el: HTMLElement): number {
+  return el.getBoundingClientRect().height
+    + escapedMarginPx(el, "top")
+    + escapedMarginPx(el, "bottom");
+}
 
 export default function AutoPaginate({ children, repeatHeader, firstHeader }: AutoPaginateProps) {
   const childArray = Children.toArray(children).filter(isValidElement);
@@ -47,25 +82,32 @@ export default function AutoPaginate({ children, repeatHeader, firstHeader }: Au
     if (n === 0) return;
     const sample = itemRefs.current.values().next().value as HTMLElement | undefined;
     if (!sample) return;
-    const parent = sample.parentElement;
-    if (!parent) return;
-    const widthPx = parent.offsetWidth;
+    // px→mm 환산: 자식 래퍼 '자신'의 폭이 정확히 CONTENT_WIDTH_MM(182mm).
+    // 부모(.report-page-inner)는 좌우 14mm 패딩을 자신이 가진 210mm 폭 요소라
+    // 그 offsetWidth 를 182 로 나누면 pxPerMm 이 210/182≈1.15배 과대 → 블록 높이
+    // ~13% 과소측정으로 페이지 하단 클리핑이 발생했다. 높이 측정과 동일한
+    // getBoundingClientRect 기준을 써서 조상 transform scale 에도 비율이 유지된다.
+    const widthPx = sample.getBoundingClientRect().width;
     if (widthPx === 0) return;
     const pxPerMm = widthPx / CONTENT_WIDTH_MM;
 
     const heights: number[] = [];
     for (let i = 0; i < n; i++) {
       const el = itemRefs.current.get(i);
-      heights.push(el ? el.getBoundingClientRect().height / pxPerMm : 0);
+      heights.push(el ? occupiedHeightPx(el) / pxPerMm : 0);
     }
 
     const repeatH = repeatHeader && repeatHeaderRefs.current.size > 0
-      ? Math.max(...[...repeatHeaderRefs.current.values()].map((el) => el.getBoundingClientRect().height / pxPerMm))
+      ? Math.max(...[...repeatHeaderRefs.current.values()].map((el) => occupiedHeightPx(el) / pxPerMm))
       : 0;
     const firstH = firstHeader && firstHeaderRef.current
-      ? firstHeaderRef.current.getBoundingClientRect().height / pxPerMm
+      ? occupiedHeightPx(firstHeaderRef.current) / pxPerMm
       : 0;
 
+    // 한 페이지 한계 — PAGE_CONTENT_MM(263mm = 297 − 상단 16mm − 하단 18mm 패딩)이
+    // .report-page-inner 의 실제 콘텐츠 영역 높이와 일치. 블록 높이가 collapse 마진까지
+    // 포함해 182mm 기준으로 정확히 mm 환산되므로, limit 까지 채워도 물리 페이지
+    // (overflow:hidden)를 넘지 않는다.
     const limit = PAGE_CONTENT_MM - SAFETY_MARGIN_MM;
     const next: number[] = [];
     let page = 0;

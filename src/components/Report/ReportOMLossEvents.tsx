@@ -181,9 +181,23 @@ function ReportOMLossEvents({
     );
   }
 
-  const hasPanoData = (panoWithByRadar?.size ?? 0) > 0;
-
   const radarBlocks = eventsByRadar.map(({ radarName, radarSite, events, obstacleCausedCount, totalCount, mapBuildings, lossPts }) => {
+    // 파노라마 가용 여부는 '레이더별'로 검사 — 전역 any(size>0) 검사면 일부 레이더만 파노라마 실패한
+    //   세션에서 그 레이더의 classify 가 panoWith 부재로 전부 buildingCaused=0 이 되어 '없음(양호)'/
+    //   '0건(0.0%)'으로 단정 표기된다(실제로는 자료 없음 → 분류 불가). 미가용 레이더는 배지·표 대신
+    //   '파노라마 미가용 — 분류 불가' 문구로 표기.
+    const hasPano = panoWithByRadar?.has(radarName) ?? false;
+    if (!hasPano) {
+      return (
+        <div key={radarName} className="ev-block">
+          <div className="ev-head">
+            <h3 className="om-h3" style={{ margin: 0 }}>{radarName}</h3>
+          </div>
+          <p className="muted sm">파노라마 미가용 — 장애물 추가 기인 분류 불가 (전체 소실 이벤트 {totalCount}건)</p>
+        </div>
+      );
+    }
+
     if (events.length === 0) {
       return (
         <div key={radarName} className="ev-block">
@@ -201,11 +215,9 @@ function ReportOMLossEvents({
       <div key={radarName} className="ev-block">
         <div className="ev-head">
           <h3 className="om-h3" style={{ margin: 0 }}>{radarName}</h3>
-          {hasPanoData && (
-            <span className="ev-badge">
-              장애물 추가 기인: {obstacleCausedCount}/{totalCount}건 ({obstaclePct.toFixed(1)}%)
-            </span>
-          )}
+          <span className="ev-badge">
+            장애물 추가 기인: {obstacleCausedCount}/{totalCount}건 ({obstaclePct.toFixed(1)}%)
+          </span>
         </div>
 
         {/* top-down 분포 도면 — 아래 표의 이벤트가 속한 소실 보간점 전수를 지도에 표시 */}

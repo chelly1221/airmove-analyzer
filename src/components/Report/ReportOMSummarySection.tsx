@@ -7,7 +7,8 @@ import {
   gradeWithConfidence,
 } from "../../utils/omStats";
 import { haversineKm, bearingDeg } from "../../utils/geo";
-import { classifyObstacleLosses, buildSiblings } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, buildSiblings, BLDG_EFFECT_EPS_DEG } from "../../utils/obstacleAnalysisHelpers";
+import { fmtLossPct, fmtPsrPct } from "../../utils/omFormat";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import BuildingGroupBadge from "./BuildingGroupBadge";
@@ -51,6 +52,7 @@ const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·
 const ROW_HEIGHT_MM = 7;
 const META_MERGED_MM = 14;   // 참고 안내 1행 (.meta-merged, 단문 1줄)
 const KPI_BLOCK_MM = 60;     // om-h3(~8mm) + 5행 × ~9.5mm + 블록 하단여백 12px ≈ 60mm
+const KPI_FAILED_NOTE_MM = 6; // KPI 블록 하단 파싱 실패 문단(text-[11px] 1줄) — 있을 때만 높이에 가산
 
 function ReportOMSummarySection({
   sectionNum,
@@ -83,11 +85,16 @@ function ReportOMSummarySection({
   // 건물×레이더: 음영소실(장애물 추가 기인) 이벤트 건수(distinct event_id) + 추가 차단 여부 —
   //   AzElevChart·§3 요약표와 동일 분류(classifyObstacleLosses). '…건' 표시는 스키마 계약대로 이벤트 단위
   //   (같은 gap 의 보간점을 점 개수로 세면 과대 — buildingEventCount 사용).
-  //   hasBldgEffect = 대상 차단각(with) > 지형·기존지물 차단각(without)+0.005° → 섹션3(AzElevChart)·LoS 단면도와 동일 조건.
-  //   추가 차단 양각이 없으면(지형 이하) 'LoS 영향' 열을 O(영향)가 아닌 X(무영향)로 표기(섹션2,3 통일).
+  //   hasBldgEffect = 대상 차단각(with) > 지형·기존지물 차단각(without)+BLDG_EFFECT_EPS_DEG(0.005°)
+  //   → §3 AzElevChart·단면도 배지·소견 프로즈(hasBldgEffectFromPanorama)와 동일 기준('LoS 영향' 단일 의미,
+  //     2026-07-03 일괄 통일 — 종전 §3 배지의 '가시선 차단' 기준과 상반 표기되던 문제 해소).
+  //   추가 차단 양각이 없으면(지형 이하) 'LoS 영향' 열을 O(영향)가 아닌 X(무영향)로 표기.
+  //   panoAvailable = 해당 레이더 파노라마 가용 여부 — 미가용이면 샘플러 null 로 두 각 모두 0(판정 근거 없음)이라
+  //   X(무영향)로 단정하지 않고 '—'(판정 불가)로 표기하기 위한 플래그.
   const obstacleInfoByKey = useMemo(() => {
-    const m = new Map<string, { shadowLoss: number; hasBldgEffect: boolean }>();
+    const m = new Map<string, { shadowLoss: number; hasBldgEffect: boolean; panoAvailable: boolean }>();
     for (const r of radarSites) {
+      const panoAvailable = !!panoWithByRadar?.get(r.name);
       for (const b of selectedBuildings) {
         if (!losMap.has(`${r.name}_${b.id}`)) continue;
         // sibling — buildSiblings 단일 산식(§3 상세·§4 소실상세와 동일). LoS 결과 없는(=classify 미실행)
@@ -98,19 +105,25 @@ function ReportOMSummarySection({
           panoWithout: panoWithoutByRadar?.get(r.name),
           siblings,
         });
-        // 추가 차단 양각 존재 여부 (AzElevChart hasBldgEffect 와 동일 임계 0.005°)
-        const hasBldgEffect = angleTotalDeg > angleTerrainDeg + 0.005;
-        m.set(`${r.name}_${b.id}`, { shadowLoss: buildingEventCount, hasBldgEffect });
+        // 추가 차단 양각 존재 여부 (AzElevChart hasBldgEffect 와 동일 임계 BLDG_EFFECT_EPS_DEG)
+        const hasBldgEffect = angleTotalDeg > angleTerrainDeg + BLDG_EFFECT_EPS_DEG;
+        m.set(`${r.name}_${b.id}`, { shadowLoss: buildingEventCount, hasBldgEffect, panoAvailable });
       }
     }
     return m;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- radarGeoKey 는 radarSites 가 참조 유지된 채 좌표만 in-place 변경돼도 재계산시키기 위함(rule 이 루프 내 r.latitude/longitude 접근을 추적 못해 'unnecessary' 로 오판). Detail.siblings 와 동기화 보장.
   }, [selectedBuildings, radarSites, radarGeoKey, losMap, lossPointsByRadar, panoWithByRadar, panoWithoutByRadar]);
 
-  // 첫 페이지에 들어갈 수 있는 건물 행 수 계산
-  const fixedContentMm = HEADER_HEIGHT_MM + BLOCK_H3_MM + TABLE_HEADER_MM + META_MERGED_MM
-    + radarResults.length * KPI_BLOCK_MM;
-  const availForRows = PAGE_CONTENT_MM - fixedContentMm;
+  // 첫 페이지에 들어갈 수 있는 건물 행 수 계산 — KPI 블록 높이는 파싱 실패 문단(있을 때만) 가산
+  const kpiHeightsMm = radarResults.map((rr) => KPI_BLOCK_MM + (rr.failed_files.length > 0 ? KPI_FAILED_NOTE_MM : 0));
+  const kpiTotalMm = kpiHeightsMm.reduce((s, h) => s + h, 0);
+  const fixedFirstMm = HEADER_HEIGHT_MM + BLOCK_H3_MM + TABLE_HEADER_MM + META_MERGED_MM;
+  // 레이더 4개+ 처럼 KPI 총고만으로 첫 페이지 예산(263mm)을 넘보면 KPI 를 별도 페이지로 분리 —
+  //   종전엔 행 하한 3을 강제한 채 KPI 를 전부 첫 페이지에 배치해 .report-page overflow:hidden 에서
+  //   뒤쪽 KPI 블록이 통째로 잘려 PDF 에서 유실됐다(확정 오버플로우). 건물 표 최소 3행 + KPI 전체가
+  //   예산 안에 들어올 때만 첫 페이지 동거.
+  const kpiOnFirstPage = PAGE_CONTENT_MM - fixedFirstMm - kpiTotalMm >= 3 * ROW_HEIGHT_MM;
+  const availForRows = PAGE_CONTENT_MM - fixedFirstMm - (kpiOnFirstPage ? kpiTotalMm : 0);
   const maxRowsFirstPage = Math.max(3, Math.floor(availForRows / ROW_HEIGHT_MM));
   // 후속 페이지에 들어갈 수 있는 행 수 (섹션 헤더 + 테이블 헤더만)
   const maxRowsNextPage = Math.floor((PAGE_CONTENT_MM - HEADER_HEIGHT_MM - TABLE_HEADER_MM) / ROW_HEIGHT_MM);
@@ -160,15 +173,19 @@ function ReportOMSummarySection({
                 const los = losMap.get(`${r.name}_${b.id}`);
                 const info = obstacleInfoByKey.get(`${r.name}_${b.id}`);
                 const shadowLoss = info?.shadowLoss ?? 0;
-                // LoS 영향 O = 대상 건물이 기존 지형지물 대비 추가 차단 양각을 만드는 경우만(섹션2,3 동일 조건).
-                //   추가 차단각이 없으면(지형 이하) 직선 LoS 가 지형에 막혀도 X(무영향)로 표기.
+                // LoS 영향 O = 대상 건물이 기존 지형지물 대비 추가 차단 양각을 만드는 경우만(hasBldgEffect —
+                //   §3 단면도 배지·AzElevChart·소견 프로즈와 동일 기준). 추가 차단각이 없으면(지형 이하)
+                //   직선 LoS 가 지형에 막혀도 X(무영향)로 표기.
+                //   해당 레이더 파노라마 미가용(계산 실패/미준비) 시엔 판정 근거가 없으므로 X 로 단정하지 않고
+                //   '—'(판정 불가) 표기 — '추가소실율' 열의 '—' 폴백과 동일한 3-상태.
                 const blocked = info?.hasBldgEffect ?? false;
+                const bldgEffectKnown = info?.panoAvailable ?? false;
                 const blockage = addedBlockageByKey?.[`${r.name}_${b.id}`];
                 return (
                   <React.Fragment key={`cell-${r.name}-${b.id}`}>
                     <td className="ta-c mono sm">{az.toFixed(1)}° / {dist.toFixed(1)}km</td>
                     <td className="ta-c sm">
-                      {los ? (
+                      {los && bldgEffectKnown ? (
                         <span className={`badge ${blocked ? "bad" : "ok"}`}>
                           {blocked ? "O" : "X"}
                         </span>
@@ -213,7 +230,9 @@ function ReportOMSummarySection({
   );
 
   // ── 레이더별 KPI 행 리스트 ─────────────────────────────────────────────
-  const renderKPIBlocks = () => radarResults.map((rr) => {
+  // 평균 표적소실율·평균 PSR율(±σ) 자릿수는 종합 소견 판정 카드(ReportOMFindings)·자동 소견 문구와
+  //   공용 포맷(fmtLossPct/fmtPsrPct, 소수 2자리)으로 통일 — 같은 수치가 페이지마다 다르게 보이지 않도록.
+  const renderKPIBlock = (rr: RadarMonthlyResult) => {
     const days = rr.daily_stats.length;
     const avgPsr = weightedPsrAvg(rr.daily_stats) * 100;
     const psrSigma = weightedPsrStdDev(rr.daily_stats) * 100;
@@ -245,13 +264,13 @@ function ReportOMSummarySection({
           </div>
           <div className="kpi">
             <p className="kpi-label">평균 PSR율</p>
-            <p className="kpi-val" style={{ color: "var(--om-accent)" }}>{avgPsr.toFixed(2)}%</p>
-            <p className="kpi-sigma">±{psrSigma.toFixed(2)}%p</p>
+            <p className="kpi-val" style={{ color: "var(--om-accent)" }}>{fmtPsrPct(avgPsr)}%</p>
+            <p className="kpi-sigma">±{fmtPsrPct(psrSigma)}%p</p>
           </div>
           <div className="kpi">
             <p className="kpi-label">평균 표적소실율</p>
-            <p className="kpi-val" style={{ color: "#a60739" }}>{avgLoss.toFixed(3)}%</p>
-            <p className="kpi-sigma">±{lossSigma.toFixed(3)}%p</p>
+            <p className="kpi-val" style={{ color: "#a60739" }}>{fmtLossPct(avgLoss)}%</p>
+            <p className="kpi-sigma">±{fmtLossPct(lossSigma)}%p</p>
           </div>
         </div>
         {rr.failed_files.length > 0 && (
@@ -261,10 +280,40 @@ function ReportOMSummarySection({
         )}
       </div>
     );
-  });
+  };
+  const renderKPIBlocks = () => radarResults.map(renderKPIBlock);
 
-  // ── 분할 불필요: 한 페이지 ──
-  if (!needsSplit) {
+  // ── KPI 별도 페이지 빌더 — 첫 페이지 예산 초과 시(kpiOnFirstPage=false) 레이더 KPI 블록을
+  //   페이지당 예산(헤더 제외) 안에서 순서 유지 그리디 분할해 후속 페이지로 렌더 ──
+  const buildKpiPages = (): React.ReactNode[] => {
+    const budget = PAGE_CONTENT_MM - HEADER_HEIGHT_MM;
+    const groups: RadarMonthlyResult[][] = [];
+    let cur: RadarMonthlyResult[] = [];
+    let curMm = 0;
+    radarResults.forEach((rr, i) => {
+      const h = kpiHeightsMm[i];
+      if (cur.length > 0 && curMm + h > budget) {
+        groups.push(cur);
+        cur = [];
+        curMm = 0;
+      }
+      cur.push(rr);
+      curMm += h;
+    });
+    if (cur.length > 0) groups.push(cur);
+    return groups.map((group, i) => (
+      <ReportPage key={`summary-kpi-${i}`}>
+        <ReportOMSectionHeader
+          sectionNum={sectionNum}
+          title={`분석 요약 (계속) — 레이더별 지표${groups.length > 1 ? ` (${i + 1}/${groups.length})` : ""}`}
+        />
+        {group.map(renderKPIBlock)}
+      </ReportPage>
+    ));
+  };
+
+  // ── 분할 불필요: 한 페이지 (건물 표 + KPI 전부 첫 페이지 예산 내) ──
+  if (!needsSplit && kpiOnFirstPage) {
     return (
       <ReportPage>
         <ReportOMSectionHeader
@@ -280,7 +329,7 @@ function ReportOMSummarySection({
     );
   }
 
-  // ── 분할 필요: 첫 페이지 + 후속 페이지(잔여 건물 표) ──
+  // ── 분할 필요: 첫 페이지(건물 표 [+ KPI]) + 후속 페이지(잔여 건물 표) [+ KPI 별도 페이지] ──
   const pages: React.ReactNode[] = [];
   const firstSlice = selectedBuildings.slice(0, maxRowsFirstPage);
   pages.push(
@@ -292,11 +341,11 @@ function ReportOMSummarySection({
       />
       <div className="block-h3" style={{ marginTop: 0 }}>
         <OMEditable id="summary.bldgHeader" value="분석 대상 장애물" tag="span" />
-        {" "}({totalBuildings}건 중 1–{maxRowsFirstPage})
+        {needsSplit && <>{" "}({totalBuildings}건 중 1–{maxRowsFirstPage})</>}
       </div>
       {renderBuildingTable(firstSlice, 0)}
       {renderMetaMerged()}
-      {renderKPIBlocks()}
+      {kpiOnFirstPage && renderKPIBlocks()}
     </ReportPage>,
   );
 
@@ -315,6 +364,11 @@ function ReportOMSummarySection({
     );
     offset += maxRowsNextPage;
     pageIdx++;
+  }
+
+  // KPI 를 첫 페이지에 못 실은 경우 — 건물 표 페이지들 뒤에 레이더별 KPI 페이지 추가(잘림 없는 전량 렌더)
+  if (!kpiOnFirstPage) {
+    for (const p of buildKpiPages()) pages.push(p);
   }
 
   return <>{pages}</>;

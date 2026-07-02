@@ -17,10 +17,10 @@ import ReportSettingsModal from "../components/Report/ReportSettingsModal";
 import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import { computeAddedBlockage } from "../utils/omAddedBlockage";
-import { calcBuildingAzExtent, losBlockedFromPanorama, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
+import { calcBuildingAzExtent, hasBldgEffectFromPanorama, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
-  readReportConfig, clearReportConfig, writeGenerateRequest,
+  readReportConfig, clearReportConfig, writeGenerateRequest, clearGenerateRequest,
   templateDisplayLabel, DEFAULT_SECTIONS,
   type ReportTemplate, type ReportSections, type ReportWindowPayload,
   type ReportConfigPayload,
@@ -70,6 +70,9 @@ export default function ReportApp() {
 
   // 설정 모달 단계 (config payload가 있으면 모달 표시)
   const [configPayload, setConfigPayload] = useState<ReportConfigPayload | null>(null);
+  // 설정 모달 세대 — reload-config 마다 증가, 모달 key 로 사용해 강제 리마운트.
+  // 이전 플로우의 로컬 상태(step/analyzing/stage/cancelledRef 등)가 새 세션에 살아남지 않게 한다.
+  const [configEpoch, setConfigEpoch] = useState(0);
 
   // 보고서 준비 단계 (보고서 창 내 오버레이)
   const [prepPhase, setPrepPhase] = useState<"waiting" | "loading" | null>("waiting");
@@ -108,7 +111,6 @@ export default function ReportApp() {
   // PDF 내보내기
   const [generating, setGenerating] = useState(false);
   const generatingRef = useRef(false);
-  const covQueueRef = useRef<(() => void) | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportElapsed, setExportElapsed] = useState(0);
   const exportTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -146,6 +148,15 @@ export default function ReportApp() {
   // tocKey → 1-based 첫 페이지 인덱스 (DOM 측정 결과)
   const [omTocPageMap, setOmTocPageMap] = useState<Map<string, number>>(new Map());
 
+  // ── transfer 워치독 ── handleOMGenerate 의 emit("report:generate") 후 report:data-written 이
+  // 오지 않는 경우(메인 창 리스너 일시 부재/이벤트 유실) 대비 재발신·최종 에러 타이머.
+  // 페이로드 수신(loadFromIDB 성공)·reload-config·data-error 시 해제한다.
+  const transferTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const clearTransferWatchdog = useCallback(() => {
+    for (const t of transferTimersRef.current) clearTimeout(t);
+    transferTimersRef.current = [];
+  }, []);
+
   /** IDB에서 페이로드 읽기 → state 적용 */
   const loadingRef = useRef(false);
   // 재로드 세대 카운터 — reload-config 수신 시 증가. 진행 중이던 loadFromIDB 가
@@ -168,6 +179,7 @@ export default function ReportApp() {
         setPrepPhase("waiting"); // 아직 IDB에 없음 — 이벤트 대기
         return;
       }
+      clearTransferWatchdog(); // 페이로드 수신 확인 — transfer 재발신/에러 타이머 해제
       const s = payloadToState(payload);
       await clearReportPayload();
       if (epoch !== loadEpochRef.current) return; // clear 대기 중 reload — stale 적용 방지
@@ -187,18 +199,22 @@ export default function ReportApp() {
         setCoverSubtitle(s.coverSubtitle);
         setMetadata(s.reportMetadata);
         setOmData(s.omData);
+        // 늦은 성공 복구 — 60초 transfer 워치독 에러 후 data-written 이 뒤늦게 도착한 경우
+        //   에러 화면이 로드된 보고서를 영구히 가리지 않도록 해제 (확정 실패면 data-written 자체가 안 옴)
+        setError(null);
         setLoading(false);
         setPrepPhase(null);
         loadingRef.current = false;
       });
     } catch (e) {
       if (epoch !== loadEpochRef.current) return; // stale 세대의 에러는 새 흐름에 표시하지 않음
+      clearTransferWatchdog();
       setError(`데이터 로드 실패: ${e instanceof Error ? e.message : String(e)}`);
       setLoading(false);
       setPrepPhase(null);
       loadingRef.current = false;
     }
-  }, []);
+  }, [clearTransferWatchdog]);
 
   /** IDB에서 config 읽기 → 모달 표시 */
   const loadConfigFromIDB = useCallback(async () => {
@@ -212,11 +228,14 @@ export default function ReportApp() {
         setPrepPhase(null);
         return true;
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      // 실패 사유 기록만 — 호출부(마운트 경로/reload 재시도 루프)가 false 반환으로 폴백·재시도 처리
+      console.error("[Report] config 로드 실패:", err);
+    }
     return false;
   }, []);
 
-  // 이벤트 리스너: data-written, reload-config, coverage-update
+  // 이벤트 리스너: data-written, reload-config, data-error
   useEffect(() => {
     // 보고서 창 DevTools 자동 활성화 비활성 — DevTools 가 열려 있으면 panorama-debug
     // 콘솔 로그 부하로 메인 스레드 블로킹/setTimeout throttle 가능. 필요 시 F12 로 직접 열 것.
@@ -244,56 +263,52 @@ export default function ReportApp() {
     // 모달이 '완료'로 조기 종료된다(파노라마 미시작 상태인데도).
     const unlistenReloadConfig = listen("report:reload-config", async () => {
       loadEpochRef.current += 1;         // 진행 중 loadFromIDB 의 이전 세대 결과 폐기
+      const epoch = loadEpochRef.current;
       loadingRef.current = false;
       omDataCacheRef.current = null;
       autoFindingsRef.current = "";      // 이전 보고서 자동 소견 스냅샷 해제
       coverageErrorRef.current = false;  // 이전 커버리지 실패 기록 해제
       panoramaStartedRef.current = null; // 이전 result 참조 해제 (대용량 GC + 새 파노라마 실행 보장)
-      covQueueRef.current = null;        // PDF 중 큐된 이전 커버리지 업데이트 폐기
+      clearTransferWatchdog();           // 이전 플로우 transfer 재발신/에러 타이머 해제
       setPanoramaLastError(null);
       setError(null);
       setState(null);
       setOmData(null); // omData 파생 effect(파노라마) cleanup 이 진행 중 계산도 함께 취소한다
+      // 이전 플로우의 모달·분석 파이프라인 완전 차단 — configPayload 를 비워 이전 모달을
+      // unmount(→ cancelledRef=true, 이후 각 guard 에서 파이프라인 정지)시키고 Rust 분석도 명시 취소.
+      // 새 config 적용 시 configEpoch key 로 모달이 강제 리마운트되어 step/analyzing 등
+      // 로컬 상태가 초기화된다 (이전 설정의 분석 결과가 새 세션의 보고서로 둔갑하는 문제 방지).
+      setConfigPayload(null);
+      setConfigEpoch((e) => e + 1);
+      invoke("cancel_analysis").catch(() => { /* ignore */ });
       setLoading(true);
       setPrepPhase("waiting");
-      // 짧은 지연 후 config 읽기 (IDB 쓰기 완료 대기)
-      setTimeout(() => loadConfigFromIDB(), 100);
+      // 이전 플로우가 남긴 IDB 잔여 payload/generate-request 정리 — 새 플로우에 stale 데이터 유입 방지
+      await Promise.allSettled([clearReportPayload(), clearGenerateRequest()]);
+      // config 읽기 — 발신 측(handleTemplateClick)이 writeReportConfig 완료 후 emit 하므로 즉시 읽기 가능.
+      // 실패·부재 시 짧은 백오프로 재시도 후 에러 표시 ('보고서 데이터 준비 중...' 영구 스피너 방지).
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (epoch !== loadEpochRef.current) return; // 새 reload 도착 — 이 루프는 폐기
+        if (await loadConfigFromIDB()) return;
+        await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+      }
+      if (epoch !== loadEpochRef.current) return;
+      setError("보고서 설정을 불러오지 못했습니다. 창을 닫고 메인 창에서 다시 시도해주세요.");
+      setLoading(false);
+      setPrepPhase(null);
     });
 
     // report:data-error → 메인 창에서 데이터 생성 실패 시 에러 표시
     const unlistenError = listen<{ message: string }>("report:data-error", (event) => {
+      clearTransferWatchdog();
       setError(`보고서 생성 실패: ${event.payload.message}`);
       setLoading(false);
       setPrepPhase(null);
       loadingRef.current = false;
+      // OM 모달(z-[9999] 오버레이)이 에러 화면을 덮은 채 transfer 스피너로 무한 대기하지 않도록
+      // 모달을 닫는다 — unmount 로 cancelledRef=true 가 되어 잔여 파이프라인도 함께 중단된다.
+      setConfigPayload(null);
     });
-
-    // 비동기 커버리지 업데이트 수신 — PDF 생성 중이면 큐에 저장
-    const unlistenCov = listen<{
-      covLayersWithBuildings: [string, CoverageLayer[]][];
-      covLayersWithout: [string, CoverageLayer[]][];
-      coverageStatus: string;
-    }>(
-      "report:coverage-update",
-      (event) => {
-        const apply = () => {
-          setOmData((prev) => {
-            if (!prev) return prev;
-            return {
-              ...prev,
-              covLayersWithBuildings: new Map(event.payload.covLayersWithBuildings),
-              covLayersWithout: new Map(event.payload.covLayersWithout),
-              coverageStatus: event.payload.coverageStatus as OMReportData["coverageStatus"],
-            };
-          });
-        };
-        if (generatingRef.current) {
-          covQueueRef.current = apply;
-        } else {
-          apply();
-        }
-      },
-    );
 
     // 보고서 윈도우 닫기 전 미저장 확인
     const unlistenClose = appWindow.onCloseRequested(async (event) => {
@@ -310,10 +325,9 @@ export default function ReportApp() {
       unlistenPanoramaDebug.then((fn) => fn());
       unlistenReloadConfig.then((fn) => fn());
       unlistenError.then((fn) => fn());
-      unlistenCov.then((fn) => fn());
       unlistenClose.then((fn) => fn());
     };
-  }, [loadFromIDB, loadConfigFromIDB]);
+  }, [loadFromIDB, loadConfigFromIDB, clearTransferWatchdog]);
 
 
   // 현재 활성 sections
@@ -329,21 +343,23 @@ export default function ReportApp() {
   // ── 프리뷰 mount 게이트 ──
   // 파노라마 IPC 응답(20MB+ base64)이 메인 스레드 block 된 프리뷰 렌더와 경합해 영구 대기됨.
   // coverage+panorama 완료 전까지는 ReportPreviewContent 를 아예 mount 하지 않아 메인 스레드 확보.
+  // panorama 'error'(전 레이더 실패)도 통과 — §4 '파노라마 계산 실패' 페이지가 도달 가능해야
+  // 한다(커버리지의 done|error 게이트와 동형).
   const previewMountable = useMemo(() => {
     if (activeTemplate !== "obstacle_monthly") return true;
     if (!omData) return true;
     const covReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
-    const panoReady = omData.panoramaStatus === "done";
+    const panoReady = omData.panoramaStatus === "done" || omData.panoramaStatus === "error";
     return covReady && panoReady;
   }, [activeTemplate, omData]);
 
   // ── OM 준비 완료 여부 ──
-  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료
+  // 조건: (1) 커버리지 계산 종료 (2) 파노라마 계산 종료 — 양쪽 모두 done|error(실패 확정) 포함
   const omReady = useMemo(() => {
     if (activeTemplate !== "obstacle_monthly") return true;
     if (!omData) return false;
     const covReady = omData.coverageStatus === "done" || omData.coverageStatus === "error";
-    const panoReady = omData.panoramaStatus === "done";
+    const panoReady = omData.panoramaStatus === "done" || omData.panoramaStatus === "error";
     return covReady && panoReady;
   }, [activeTemplate, omData]);
   const omPreparing = activeTemplate === "obstacle_monthly" && !omReady;
@@ -523,12 +539,6 @@ export default function ReportApp() {
       if (exportTimerRef.current) { clearInterval(exportTimerRef.current); exportTimerRef.current = null; }
       setGenerating(false);
       generatingRef.current = false;
-      // 큐에 쌓인 커버리지 업데이트 적용
-      const queued = covQueueRef.current;
-      if (queued) {
-        covQueueRef.current = null;
-        queued();
-      }
     }
   }, [state, activeTemplate, activeSections, exportPDF]);
 
@@ -544,6 +554,9 @@ export default function ReportApp() {
     covWithout: Map<string, CoverageLayer[]>,
     monthStr?: string,
   ) => {
+    // 플로우 세대 — reload-config 도착 이후에도 완주하려는 stale 플로우(이전 설정의 분석)가
+    // 새 세션의 보고서로 전송되는 것을 차단한다 (모달 unmount 취소 guard 를 이미 지난 경우 대비).
+    const flowEpoch = loadEpochRef.current;
     // 생성 시점엔 파노라마 미준비 → addedBlockageByKey 없이 생성(추가 차단영역 프로즈 생략).
     // 파노라마 done 후 useEffect 에서 addedBlockageByKey 산출 + (미편집 시) findingsText 재생성.
     const autoFindings = generateOMFindingsText({
@@ -618,6 +631,7 @@ export default function ReportApp() {
 
     // 통합 모달이 살아있는 동안에는 configPayload 를 유지 — 모달이 omReady 시점에
     // onComplete 콜백으로 setConfigPayload(null) 호출하여 unmount 시킨다.
+    if (flowEpoch !== loadEpochRef.current) return; // reload 로 폐기된 플로우 — 전송하지 않음
     setLoading(true);
     setPrepPhase("waiting");
     await writeGenerateRequest({
@@ -625,8 +639,36 @@ export default function ReportApp() {
       sections: { ...DEFAULT_SECTIONS },
       omData: serializeOMData(lightOmData),
     });
+    if (flowEpoch !== loadEpochRef.current) {
+      // write 대기 중 reload — emit/워치독 금지. 방금 쓴 stale 요청도 정리해
+      // 메인 창 IDB 드레인이 이전 설정의 보고서를 생성하지 않게 한다.
+      clearGenerateRequest().catch(() => { /* ignore */ });
+      return;
+    }
     await emit("report:generate");
-  }, []);
+    if (flowEpoch !== loadEpochRef.current) return; // emit 대기 중 reload — 워치독 미등록
+    // ── transfer 워치독 ── emit 후 report:data-written 미수신(메인 창 리스너 일시 부재/
+    // 이벤트 유실) 대비: 20초 간격 2회 재발신 — 메인 창은 App 셸 상시 마운트 + IDB 드레인
+    // 재확인 구조라 재-emit 만으로 복구된다. 60초까지 미수신이면 에러 표시로 전환.
+    // 타이머는 loadFromIDB 페이로드 수신·reload-config·data-error 에서 해제.
+    clearTransferWatchdog();
+    transferTimersRef.current.push(
+      setTimeout(() => {
+        console.warn("[OM] transfer 응답 지연 — report:generate 재발신 (1/2)");
+        emit("report:generate").catch(() => { /* ignore */ });
+      }, 20_000),
+      setTimeout(() => {
+        console.warn("[OM] transfer 응답 지연 — report:generate 재발신 (2/2)");
+        emit("report:generate").catch(() => { /* ignore */ });
+      }, 40_000),
+      setTimeout(() => {
+        setError("보고서 데이터 전송에 응답이 없습니다. 창을 닫고 다시 시도해주세요.");
+        setLoading(false);
+        setPrepPhase(null);
+        setConfigPayload(null); // 모달(z-[9999])이 에러 화면을 덮지 않도록 닫기
+      }, 60_000),
+    );
+  }, [clearTransferWatchdog]);
 
   // ── 커버리지 콜백 (모달 언마운트 후에도 동작) ──
   const handleCoverageReady = useCallback((
@@ -722,6 +764,8 @@ export default function ReportApp() {
         });
       };
 
+      let successCount = 0; // 전 레이더 실패(성공 0) 시 'error' 확정용
+
       for (let i = 0; i < radars.length; i++) {
         if (cancelled) { console.log(`[Panorama] 취소됨 — 레이더 루프 진입 전 (i=${i})`); return; }
         const radar = radars[i];
@@ -784,6 +828,7 @@ export default function ReportApp() {
               panoWithoutTargets: nextWithout,
             };
           });
+          successCount += 1;
           console.log(`[Panorama] ${radar.name} 완료 (총 ${(performance.now() - radarStart).toFixed(0)}ms)`);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -793,10 +838,14 @@ export default function ReportApp() {
       }
 
       if (cancelled) { console.log("[Panorama] 취소됨 — 루프 종료 직후"); return; }
-      console.log("[Panorama] 전체 완료 — panoramaStatus done 전환");
+      // 전 레이더 실패(성공 0건) → 'error' — previewMountable/omReady 게이트가 error 도
+      // 통과시키므로 ReportPreviewContent 의 §4 '파노라마 계산 실패' 페이지가 실제로 렌더된다.
+      // 일부만 실패한 경우는 기존대로 done — §2/§4 는 해당 레이더를 '—' 처리.
+      const finalStatus: OMReportData["panoramaStatus"] = successCount === 0 ? "error" : "done";
+      console.log(`[Panorama] 전체 완료 — panoramaStatus ${finalStatus} 전환 (성공 ${successCount}/${radars.length})`);
       setPanoramaProgress(null);
       startTransition(() => {
-        setOmData((prev) => prev ? { ...prev, panoramaStatus: "done" } : prev);
+        setOmData((prev) => prev ? { ...prev, panoramaStatus: finalStatus } : prev);
       });
     })();
 
@@ -822,9 +871,10 @@ export default function ReportApp() {
     if (!hasHist) return; // 히스토그램 없음(리로드 등) → 계산 불가
 
     const addedBlockageByKey: Record<string, AddedBlockageResult> = {};
-    // LoS 차단 판정 — 단면도 배지·소실표적 분류와 동일한 panorama 실루엣 소스(losBlockedFromPanorama).
-    //   findings 'LoS 분석' 프로즈가 단면도 배지와 동일 verdict 를 쓰도록 통일. key = losMap 키.
-    const losBlockedByKey = new Map<string, boolean>();
+    // 'LoS 영향' 판정 — §1 요약표·§3 단면도 헤드라인 배지와 동일 기준(hasBldgEffectFromPanorama):
+    //   대상 건물이 기존 지형·지물(without) 위로 추가 차단각을 형성하는가. key = losMap 키.
+    //   소견 'LoS 영향' 프로즈가 §1 열·§3 배지와 동일 판정을 쓰도록 통일. 판정 불가(null)는 미수록.
+    const hasBldgEffectByKey = new Map<string, boolean>();
     for (const radar of omData.selectedRadarSites) {
       const rr = result.radar_results.find((r) => r.radar_name === radar.name);
       if (!rr) continue;
@@ -839,11 +889,8 @@ export default function ReportApp() {
         addedBlockageByKey[key] = computeAddedBlockage(
           histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent,
         );
-        const los = omData.losMap.get(key);
-        if (los) {
-          const pb = losBlockedFromPanorama(radar, b, los, pWithout);
-          if (pb !== null) losBlockedByKey.set(key, pb);
-        }
+        const eff = hasBldgEffectFromPanorama(radar, b, pWith, pWithout);
+        if (eff !== null) hasBldgEffectByKey.set(key, eff);
       }
     }
 
@@ -861,7 +908,7 @@ export default function ReportApp() {
           covLayersWithout: prev.covLayersWithout,
           analysisMonth: prev.analysisMonth,
           addedBlockageByKey,
-          losBlockedByKey,
+          hasBldgEffectByKey,
         });
         autoFindingsRef.current = regen;
         nextFindings = regen;
@@ -876,6 +923,7 @@ export default function ReportApp() {
   const omFlowActive = configPayload?.template === "obstacle_monthly";
   const omModal = omFlowActive && configPayload ? (
     <ObstacleMonthlyConfigModal
+      key={configEpoch} // reload-config 시 세대 증가 → 강제 리마운트(이전 플로우 로컬 상태 초기화)
       customRadarSites={configPayload.customRadarSites}
       aircraft={configPayload.aircraft}
       metadata={configPayload.metadata}
@@ -914,8 +962,11 @@ export default function ReportApp() {
             {error ? (
               <div className="flex flex-col items-center gap-3">
                 <p className="text-sm text-red-500">{error}</p>
+                {/* close() 는 onCloseRequested 가 가로채 확인 모달을 열지만, 이 분기(early return)에는
+                    확인 모달이 렌더되지 않아 영구 무반응이 된다 — 에러 화면은 잃을 편집본이 없으므로
+                    잔여 분석 취소 후 즉시 destroy. */}
                 <button
-                  onClick={() => appWindow.close()}
+                  onClick={() => { invoke("cancel_analysis").catch(() => { /* ignore */ }); appWindow.destroy(); }}
                   className="rounded-lg border border-gray-200 px-4 py-1.5 text-sm text-gray-600 hover:bg-gray-100"
                 >
                   닫기
@@ -981,10 +1032,9 @@ export default function ReportApp() {
   // ── 보고서 프리뷰 (공통) ──
   // coverage+panorama 완료 전에는 mount 자체를 안 함.
   // 파노라마 IPC 응답(20MB+)이 프리뷰 렌더/이미지 로드와 경합해 영구 대기되는 문제 회피.
-  // 캡처 중에는 위 오버레이(bg-white/95, z-30)가 프리뷰를 시각적으로 가려줌.
-  // 주의: visibility:hidden 또는 display:none 사용 금지 — html2canvas-pro 가
-  // hidden 컨테이너 안의 자식을 렌더하지 않아 캡처가 빈 캔버스 / 영구 hang 됨
-  // (https://github.com/niklasvh/html2canvas/issues/2171)
+  // PDF 는 WebView2 PrintToPdf 단일 경로(useReportExport, 폴백 없음)가 라이브 렌더된 DOM 을
+  // 그대로 스냅샷하므로, 프리뷰를 visibility:hidden/display:none 으로 숨겨두면 인쇄물에서도
+  // 빠진다 — 숨김 대신 '완료 전 조건부 mount' 게이트를 사용한다.
   const previewBlock = previewMountable ? (
     <div
       className="flex flex-1 min-h-0"
@@ -997,10 +1047,6 @@ export default function ReportApp() {
         reportMetadata={effectiveMetadata}
         omData={omData}
         omResult={omData?.result ?? null}
-        coverTitle={coverTitle}
-        onCoverTitleChange={setCoverTitle}
-        coverSubtitle={coverSubtitle}
-        onCoverSubtitleChange={setCoverSubtitle}
         onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
         previewRef={previewRef}
       />

@@ -1,39 +1,28 @@
 import { forwardRef, useMemo } from "react";
 import { format } from "date-fns";
-import EditableText from "./EditableText";
 import OMEditable from "./OMEditable";
 import ReportPage from "./ReportPage";
 import type { ReportMetadata } from "../../types";
 
 interface CoverPageProps {
-  template: "obstacle_monthly";
   radarName: string;
   metadata: ReportMetadata;
-  editable: boolean;
-  title: string;
-  onTitleChange: (v: string) => void;
-  subtitle: string;
-  onSubtitleChange: (v: string) => void;
-  /** OM(장애물 월간) 전용 — 분석 월 라벨 ("2026년 4월"). 있으면 정보 테이블/eyebrow 에 사용. */
+  /** 분석 월 라벨 ("2026년 4월"). 있으면 정보 테이블/부제에 사용. */
   omMonthLabel?: string;
-  /** OM 전용 — 대상 레이더 다중 표기 (없으면 radarName 사용). */
+  /** 대상 레이더 다중 표기 (없으면 radarName 사용). */
   omRadarNames?: string[];
-  /** OM 전용 — 대상 장애물 건수 (있을 때만 행 표시). */
+  /** 대상 장애물 건수 (있을 때만 행 표시). */
   omBuildingsCount?: number;
 }
 
 /** 보고서 표지 — KAC CoverD 디자인 (상단 컬러 블록 + 하단 정보 테이블).
  *
- *  사용자 결정으로 모든 템플릿이 동일 디자인을 공유. 템플릿별로 eyebrow
- *  텍스트만 다르며, OM(장애물 월간) 만 분석 월/대상 장애물 행을 추가로
- *  표시한다. 스타일은 reportOmStyles.css `.kac-report .cover-d-*`.
+ *  OM(장애물 월간) 전용 — 보고서 템플릿 단일화(2026-06-08)로 다른 템플릿
+ *  분기(EditableText 제목/부제)는 제거됨. 제목은 고정 2줄, 부제/분석 기간은
+ *  OMEditable 인라인 편집. 스타일은 reportOmStyles.css `.kac-report .cover-d-*`.
  */
 const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function ReportCoverPage(
-  {
-    template, radarName, metadata, editable,
-    title, onTitleChange, subtitle, onSubtitleChange,
-    omMonthLabel, omRadarNames, omBuildingsCount,
-  },
+  { radarName, metadata, omMonthLabel, omRadarNames, omBuildingsCount },
   ref,
 ) {
   // 최초 마운트 시 고정 — 렌더마다 작성일자 변경 방지
@@ -41,10 +30,9 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
   const issueDate = format(now, "yyyy년 MM월 dd일");
 
   // 정보 테이블 값 — OM(장애물 월간) 단일 템플릿
-  const isOM = template === "obstacle_monthly";
   const radarLabel = omRadarNames && omRadarNames.length > 0 ? omRadarNames.join(" · ") : (radarName || "—");
-  // 분석 기간 — OM 은 월 라벨만 표시(예: "2026년 2월"). 일자 범위는 생략.
-  const periodLabel = omMonthLabel ? omMonthLabel : (subtitle || "—");
+  // 분석 기간 — 월 라벨만 표시(예: "2026년 2월"). 일자 범위는 생략.
+  const periodLabel = omMonthLabel || "—";
   const orgEnSuffix = metadata.organization === "한국공항공사" ? "  ·  KOREA AIRPORTS CORPORATION" : "";
 
   return (
@@ -60,30 +48,10 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
             </span>
           </div>
           {/* OM 표지는 머리말(eyebrow) 미표시 — 제목이 컬러 블록 하단에 정렬되도록 title 에 margin-top:auto */}
-          {isOM ? (
-            // OM 시안은 두 줄 표시("레이더 장애물 / 월간 분석 보고서").
-            <h1 className="cover-d-title" style={{ marginTop: "auto" }}>레이더 장애물<br />월간 분석 보고서</h1>
-          ) : (
-            <EditableText
-              value={title}
-              onChange={onTitleChange}
-              editable={editable}
-              tag="h1"
-              className="cover-d-title"
-            />
-          )}
+          {/* OM 시안은 두 줄 표시("레이더 장애물 / 월간 분석 보고서"). */}
+          <h1 className="cover-d-title" style={{ marginTop: "auto" }}>레이더 장애물<br />월간 분석 보고서</h1>
 
-          {isOM ? (
-            <OMEditable id="cover.subtitle" value={omMonthLabel ?? ""} tag="p" className="cover-d-subtitle" />
-          ) : (
-            <EditableText
-              value={subtitle}
-              onChange={onSubtitleChange}
-              editable={editable}
-              tag="p"
-              className="cover-d-subtitle"
-            />
-          )}
+          <OMEditable id="cover.subtitle" value={omMonthLabel ?? ""} tag="p" className="cover-d-subtitle" />
         </div>
 
         <div className="cover-d-info">
@@ -92,8 +60,8 @@ const ReportCoverPage = forwardRef<HTMLDivElement, CoverPageProps>(function Repo
               <tr><th>작성일자</th><td>{issueDate}</td></tr>
               <tr><th>발행기관</th><td>{metadata.organization}{metadata.department ? ` · ${metadata.department}` : ""}{metadata.siteName ? ` · ${metadata.siteName}` : ""}</td></tr>
               <tr><th>대상 레이더</th><td>{radarLabel}</td></tr>
-              <tr><th>분석 기간</th><td>{isOM ? <OMEditable id="cover.period" value={periodLabel} tag="span" /> : periodLabel}</td></tr>
-              {isOM && omBuildingsCount != null && (
+              <tr><th>분석 기간</th><td><OMEditable id="cover.period" value={periodLabel} tag="span" /></td></tr>
+              {omBuildingsCount != null && (
                 <tr><th>대상 장애물</th><td>{omBuildingsCount}건</td></tr>
               )}
             </tbody>

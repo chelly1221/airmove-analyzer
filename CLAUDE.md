@@ -9,7 +9,7 @@ Tauri v2 기반 **Windows Portable** 데스크톱 앱. NEC 레이더 저장자�
 - **Backend**: Rust (Tauri v2), SQLite (db.rs, 21개 테이블)
 - **Map**: deck.gl 9.2 + react-map-gl 8 (GPU), MapLibre GL JS 5
 - **GPU**: WebGPU 컴퓨트 셰이더 (커버리지/파노라마/도면) + CPU 폴백
-- **PDF**: WebView2 PrintToPdf (primary) + html2canvas-pro + jsPDF (폴백)
+- **PDF**: WebView2 PrintToPdf (CDP `Page.printToPDF`) 단일 경로 — 폴백 없음, 실패 시 내보내기 에러 (html2canvas-pro/jsPDF는 제거됨, 커밋 8648cd6)
 - **State**: Zustand 5, **Font**: Pretendard Variable
 
 ## 빌드 환경 (Windows 필수)
@@ -56,9 +56,9 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 ### Loss 탐지 알고리즘
 - 스캔 주기 자동 추정 (중앙값), 기본 임계값 7.0초
 - **signal_loss**: 일반 표적소실
-- **out_of_range**: 양끝 ≥ 최대범위 88%, 또는 15연속 미탐지 + 경계 이상
+- **out_of_range**: 양끝 ≥ 최대범위 100%(`OUT_OF_RANGE_THRESHOLD=1.0`), 또는 15연속 미탐지 + 경계 이상
 - 최대 범위: 전체 거리의 95% 백분위수
-- 제외: 6시간 초과 gap, 0.5초 미만 gap
+- 제외: 4시간(14400초, 비행 분리 기준과 동일) 초과 gap, 0.5초 미만 gap
 
 ### LOS 분석 (4/3 유효지구 모델)
 - 실제 지구(R=6,371km) 디스플레이 프레임에서 4/3 유효지구(R_eff=8,495km) 굴절 경로 표시
@@ -94,6 +94,7 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 5. **처리 완료 그룹 즉시 해제** — Worker Map에서 `delete` → GC
 6. **spread 금지 (대량)** — `push(...bigArray)` 대신 `for` 루프. 10M+에서 스택 오버플로우
 7. **다운샘플링/stride 샘플링 절대 금지** — 렌더링 포함 모든 파이프라인에서 **전수 포인트** 사용. 누락 시 Loss 탐지/통계 정확도 훼손
+   - 유일한 예외: `obstacle_monthly.rs`의 `track_points_geo`(LoS 단면도·AzElev 시각화용 항적 표시점)는 일별 최대 5,000점 균등표본(의도 설계, 커밋 e21a4e4). Loss 탐지/통계는 여전히 전수 포인트 사용
 
 ### 기존 Worker 참고
 - `src/workers/flightConsolidation.worker.ts` — 비행 통합 + 뷰포트 쿼리

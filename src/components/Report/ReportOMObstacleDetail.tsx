@@ -50,10 +50,12 @@ function ReportOMObstacleDetail({
     () => haversineKm(radarSite.latitude, radarSite.longitude, building.latitude, building.longitude),
     [radarSite.latitude, radarSite.longitude, building.latitude, building.longitude],
   );
+  // 정상표고(해발) = 지반고 + 건물높이 — §2 표의 '높이(m)'(순수 건물높이)와 다른 값이므로 라벨로 구분
   const bTopElevM = building.ground_elev + building.height;
   const bTopFt = Math.round(bTopElevM * 3.28084);
 
-  // LoS 단면도 차단 배지 — 소실표적 분류(classifyObstacleLosses)와 동일한 panorama 실루엣 소스로 통일.
+  // 보조 '가시선 차단' 배지 — 레이더→건물 가시선이 기존 지형·지물에 가려지는지 (헤드라인 'LoS 영향'과 별개 지표).
+  //   소실표적 분류(classifyObstacleLosses)와 동일한 panorama 실루엣 소스로 통일.
   //   panorama 미준비 시 chord(los.losBlocked)로 폴백 — chord 도 분석 대상 자신을 제외해 판정(computeLosBatch·
   //   excludeTargetBuildings)하므로 폴백 역시 self-block 없음. (단면도 차트 본문 코리도 시각화는 그대로 유지.)
   const losBlockedPano = useMemo(
@@ -95,7 +97,7 @@ function ReportOMObstacleDetail({
           <BuildingGroupBadge groupId={building.group_id} groups={buildingGroups} />
           <span>
             위치: {building.latitude.toFixed(5)}°, {building.longitude.toFixed(5)}° ·
-            높이: {bTopFt.toLocaleString()}ft ({bTopElevM.toFixed(0)}m) ·
+            정상표고(해발): {bTopFt.toLocaleString()}ft ({bTopElevM.toFixed(0)}m) ·
             레이더 거리: {(bDistKm / 1.852).toFixed(1)}NM ({bDistKm.toFixed(1)}km) · 방위: {los.bearing.toFixed(1)}°
           </span>
         </span>
@@ -131,6 +133,8 @@ function ReportOMObstacleDetail({
           trackPoints={losChartPts.track}
           lossPoints={losChartPts.loss}
           blockedOverride={losBlockedPano}
+          panoWith={panoWith}
+          panoWithout={panoWithout}
         />
       </div>
 

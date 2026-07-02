@@ -32,12 +32,6 @@ export interface ReportPreviewContentProps {
   omData: OMReportData;
   omResult: ObstacleMonthlyResult | null;
 
-  // 편집 가능 텍스트
-  coverTitle: string;
-  onCoverTitleChange: (v: string) => void;
-  coverSubtitle: string;
-  onCoverSubtitleChange: (v: string) => void;
-
   // OM 콜백
   onOmDataChange: (updater: (prev: OMReportData) => OMReportData) => void;
 
@@ -62,10 +56,9 @@ export function getSectionToggles(_template: ReportTemplate, _sections: ReportSe
 
 export default function ReportPreviewContent(props: ReportPreviewContentProps) {
   const {
-    template, sections,
+    sections,
     radarSite, reportMetadata,
     omData, omResult,
-    coverTitle, onCoverTitleChange, coverSubtitle, onCoverSubtitleChange,
     onOmDataChange,
     previewRef,
   } = props;
@@ -165,14 +158,8 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       {sections.cover && (
         <div data-toc-key="cover">
           <ReportCoverPage
-            template={template}
             radarName={radarSite?.name ?? ""}
             metadata={reportMetadata}
-            editable
-            title={coverTitle}
-            onTitleChange={onCoverTitleChange}
-            subtitle={coverSubtitle}
-            onSubtitleChange={onCoverSubtitleChange}
             omMonthLabel={omData.analysisMonth
               ? `${omData.analysisMonth.slice(0, 4)}년 ${parseInt(omData.analysisMonth.slice(5, 7))}월`
               : undefined}

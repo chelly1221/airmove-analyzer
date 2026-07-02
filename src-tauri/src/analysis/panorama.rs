@@ -153,7 +153,9 @@ fn ray_segment_intersection(
         return None; // 평행
     }
 
-    let s = (ray_dx * n1 - ray_dy * e1) / denom;
+    // t·dx = e1 + s·se, t·dy = n1 + s·sn 에서 t 소거:
+    // s = (dy·e1 − dx·n1) / (dx·sn − dy·se)
+    let s = (ray_dy * e1 - ray_dx * n1) / denom;
     if s < 0.0 || s > 1.0 {
         return None; // 선분 밖
     }
@@ -821,4 +823,76 @@ fn expand_manual_geometry(
     }
 
     vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 폴리곤 전체 변에 레이를 쏘아 가장 가까운/먼 교차 거리 수집
+    fn ray_polygon_hits(ray_dx: f64, ray_dy: f64, poly: &[(f64, f64)]) -> Vec<f64> {
+        let n = poly.len();
+        let mut hits: Vec<f64> = Vec::new();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            if let Some(d) = ray_segment_intersection(
+                ray_dx, ray_dy,
+                poly[i].0, poly[i].1,
+                poly[j].0, poly[j].1,
+            ) {
+                hits.push(d);
+            }
+        }
+        hits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        hits
+    }
+
+    /// 정북 레이(dx=0, dy=1) vs 정면 사각 건물 (CCW 권선)
+    /// 전면 벽 4000m·후면 벽 4100m 정확 검출 (측면 벽은 레이와 평행 → 교차 없음)
+    #[test]
+    fn test_north_ray_square_building_ccw() {
+        let poly = [(-50.0, 4000.0), (50.0, 4000.0), (50.0, 4100.0), (-50.0, 4100.0)];
+        let hits = ray_polygon_hits(0.0, 1.0, &poly);
+        assert_eq!(hits.len(), 2, "전면·후면 두 벽에서 교차해야 함: {:?}", hits);
+        assert!((hits[0] - 4000.0).abs() < 1e-6, "전면 벽 4000m: {}", hits[0]);
+        assert!((hits[1] - 4100.0).abs() < 1e-6, "후면 벽 4100m: {}", hits[1]);
+    }
+
+    /// 동일 건물 CW 권선 — 권선 방향과 무관하게 동일 결과
+    #[test]
+    fn test_north_ray_square_building_cw() {
+        let poly = [(-50.0, 4000.0), (-50.0, 4100.0), (50.0, 4100.0), (50.0, 4000.0)];
+        let hits = ray_polygon_hits(0.0, 1.0, &poly);
+        assert_eq!(hits.len(), 2, "전면·후면 두 벽에서 교차해야 함: {:?}", hits);
+        assert!((hits[0] - 4000.0).abs() < 1e-6, "전면 벽 4000m: {}", hits[0]);
+        assert!((hits[1] - 4100.0).abs() < 1e-6, "후면 벽 4100m: {}", hits[1]);
+    }
+
+    /// 후방 연장 허위 교차 기각: 무한직선 교차점이 선분 시작점 후방(s∈[-1,0))이면 None
+    /// (부호 반전 버그에서는 s_code=+0.5 로 통과되어 허위 거리를 반환하던 케이스)
+    #[test]
+    fn test_rear_extension_false_intersection_rejected() {
+        // 정북 레이 vs 선분 (50,4000)→(150,4000): 직선 교차점 (0,4000)은 s=-0.5 → 선분 밖
+        let d = ray_segment_intersection(0.0, 1.0, 50.0, 4000.0, 150.0, 4000.0);
+        assert!(d.is_none(), "선분 후방 연장선 교차는 기각되어야 함: {:?}", d);
+    }
+
+    /// 레이 후방(t<0)의 선분은 교차 아님
+    #[test]
+    fn test_segment_behind_ray_rejected() {
+        let d = ray_segment_intersection(0.0, 1.0, -50.0, -4000.0, 50.0, -4000.0);
+        assert!(d.is_none(), "레이 후방 선분은 기각되어야 함: {:?}", d);
+    }
+
+    /// 임의 방위(45°) 레이 vs 사선 선분 — 축 정렬이 아닌 일반 케이스 거리 검증
+    #[test]
+    fn test_diagonal_ray_intersection_distance() {
+        // 방위 45° 레이 (dx=sin45, dy=cos45) vs 직선 e+n=1000 위 선분 (1000,0)→(0,1000)
+        // 교차점 (500,500), 거리 = 500·√2
+        let az = 45.0_f64.to_radians();
+        let d = ray_segment_intersection(az.sin(), az.cos(), 1000.0, 0.0, 0.0, 1000.0)
+            .expect("45° 레이는 사선 선분과 교차해야 함");
+        let expected = 500.0 * std::f64::consts::SQRT_2;
+        assert!((d - expected).abs() < 1e-6, "거리 {} ≠ 기대값 {}", d, expected);
+    }
 }

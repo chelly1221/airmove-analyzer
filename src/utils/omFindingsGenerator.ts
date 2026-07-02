@@ -32,8 +32,14 @@ interface GenerateOMFindingsParams {
   analysisMonth: string;
   /** 건물별 추가 차단영역 소실율 (key: `${radarName}_${buildingId}`). 파노라마 준비 후 채워짐 — 비면 방위 소실율 기준 잠정 판정. */
   addedBlockageByKey?: Record<string, AddedBlockageResult>;
-  /** 건물별 LoS 차단 판정 (key: losMap 키와 동일 `${radarName}_${buildingId}`). panorama 실루엣 기반(losBlockedFromPanorama,
-   *  단면도 배지·소실표적 분류와 동일 소스). 파노라마 준비 후 채워짐 — 미제공 시 los.losBlocked(chord) 폴백. */
+  /** 건물별 'LoS 영향'(hasBldgEffect) 판정 (key: losMap 키와 동일 `${radarName}_${buildingId}`).
+   *  hasBldgEffectFromPanorama(obstacleAnalysisHelpers) — §1 요약표 'LoS 영향' 열·§3 단면도 배지와 동일 기준
+   *  (대상 건물이 기존 지형·지물 위로 추가 차단각 형성 여부). 파노라마 준비 후 채워짐 — 판정 불가 키는 미수록.
+   *  미제공(파노라마 미준비) 시 LoS 프로즈는 '분석 완료 후 자동 반영' 문구로 대체. */
+  hasBldgEffectByKey?: Map<string, boolean>;
+  /** @deprecated 미사용 — 'LoS 영향' 프로즈가 hasBldgEffectByKey(추가 차단각 형성) 기준으로 통일되며 대체.
+   *  종전 losBlockedFromPanorama('가시선 차단') 기준은 §1 열(hasBldgEffect)과 사실상 반대 판정이라 상충했음.
+   *  호출부(ReportApp) 이행기 호환용으로만 유지. */
   losBlockedByKey?: Map<string, boolean>;
 }
 
@@ -41,7 +47,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   const {
     radarResults, selectedBuildings, losMap,
     covLayersWithBuildings, covLayersWithout, analysisMonth,
-    addedBlockageByKey, losBlockedByKey,
+    addedBlockageByKey, hasBldgEffectByKey,
   } = params;
 
   const lines: string[] = [];
@@ -84,7 +90,11 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
         blockageCount++;
         if (w.grade.label === BLOCKAGE_NONE_LABEL) noneCount++;
         if (!(w.grade.label in order)) continue;
-        if ((order[w.grade.label] ?? 0) > (order[worst] ?? 0)) {
+        // 동률 등급은 lossRatePct 최대치로 갱신(타이브레이크) — '최고 …%' 문구가 추가 차단 구간 표의
+        //   실제 최고 수치와 일치하도록. (종전: 강부등호만 비교해 같은 등급에선 먼저 순회된 항목이 대표로 남았음)
+        const o = order[w.grade.label] ?? 0;
+        const cur = order[worst] ?? 0;
+        if (o > cur || (o === cur && w.lossRatePct > worstRate)) {
           worst = w.grade.label;
           worstName = `${b.name || `건물${b.id}`}/${rr.radar_name}`;
           worstRate = w.lossRatePct;
@@ -130,31 +140,41 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   // ── 3. 항목별 요약 ──
   lines.push(`■ 항목별 요약`);
 
-  // LoS — 차단 경로만 상세, 나머지는 개수로 축약
+  // LoS 영향 — §1 요약표 'LoS 영향' 열·§3 단면도 배지와 동일 지표(hasBldgEffect: 대상 건물이
+  //   기존 지형·지물 위로 추가 차단각 형성). 형성 경로만 상세, 나머지는 개수로 축약.
+  //   (종전: losBlockedFromPanorama '가시선 차단' 기준 'N건 차단' — hasBldgEffect 와 사실상 반대 판정이라
+  //    같은 보고서에서 §1 열과 O/X 가 상충했음. 카운트·문구를 hasBldgEffect 기준으로 통일.)
   if (losMap.size > 0) {
-    // 건물 표시명 조회 맵 — losMap 키는 `${radarName}_${buildingId}` (computeLosBatch, 단일 '_').
-    //   radarName 자체에 '_' 가 있어도 los.radarSiteName 접두사를 정확히 벗겨 건물 ID 를 얻는다.
-    const bldgNameById = new Map<string, string>();
-    for (const b of selectedBuildings) bldgNameById.set(String(b.id), b.name || `건물${b.id}`);
-    const blockedDescs: string[] = [];
-    for (const [key, los] of losMap) {
-      // 차단 판정 — panorama 실루엣(단면도 배지·소실표적 분류와 동일 소스) 우선, 없으면 chord(los.losBlocked) 폴백.
-      const blocked = losBlockedByKey?.get(key) ?? los.losBlocked;
-      if (!blocked) continue;
-      const radarPrefix = `${los.radarSiteName}_`;
-      const bldgIdStr = key.startsWith(radarPrefix) ? key.slice(radarPrefix.length) : key;
-      const targetName = bldgNameById.get(bldgIdStr) ?? `건물 #${bldgIdStr}`;
-      let desc = `${los.radarSiteName}→${targetName}`;
-      if (los.maxBlockingPoint) {
-        const bp = los.maxBlockingPoint;
-        desc += `(차단점 ${bp.distance.toFixed(1)}km, ${bp.elevation.toFixed(0)}m${bp.name ? ` [${bp.name}]` : ""})`;
+    if (hasBldgEffectByKey) {
+      // 건물 표시명 조회 맵 — losMap 키는 `${radarName}_${buildingId}` (computeLosBatch, 단일 '_').
+      //   radarName 자체에 '_' 가 있어도 los.radarSiteName 접두사를 정확히 벗겨 건물 ID 를 얻는다.
+      const bldgNameById = new Map<string, string>();
+      for (const b of selectedBuildings) bldgNameById.set(String(b.id), b.name || `건물${b.id}`);
+      const effectDescs: string[] = [];
+      let knownCount = 0; // 판정 가능(파노라마 가용) 경로 수 — 문구 분모. 미수록 키(판정 불가)는 제외
+      for (const [key, los] of losMap) {
+        // 판정 불가 키(해당 레이더 파노라마 미가용)는 hasBldgEffectByKey 에 미수록 — 분모·형성 카운트
+        //   모두에서 제외(무영향 단정 금지, §1 '—' 표기와 정합)
+        if (!hasBldgEffectByKey.has(key)) continue;
+        knownCount++;
+        if (hasBldgEffectByKey.get(key) !== true) continue;
+        const radarPrefix = `${los.radarSiteName}_`;
+        const bldgIdStr = key.startsWith(radarPrefix) ? key.slice(radarPrefix.length) : key;
+        const targetName = bldgNameById.get(bldgIdStr) ?? `건물 #${bldgIdStr}`;
+        effectDescs.push(`${los.radarSiteName}→${targetName}`);
       }
-      blockedDescs.push(desc);
-    }
-    if (blockedDescs.length === 0) {
-      lines.push(`- LoS(가시선): 전 ${losMap.size}개 경로 가시선 확보 — 장애물에 의한 전파 차단 없음.`);
+      const unknownCount = losMap.size - knownCount;
+      const unknownNote = unknownCount > 0 ? ` (파노라마 미가용 ${unknownCount}건 판정 제외)` : "";
+      if (knownCount === 0) {
+        lines.push(`- LoS 영향: 전 ${losMap.size}개 경로 파노라마 미가용 — 추가 차단각 판정 불가.`);
+      } else if (effectDescs.length === 0) {
+        lines.push(`- LoS 영향: ${unknownCount > 0 ? `판정 가능 ${knownCount}개` : `전 ${knownCount}개`} 경로에서 대상 장애물이 기존 지형·지물 위로 추가 차단각을 형성하지 않음 — 장애물에 의한 추가 전파 차단 없음.${unknownNote}`);
+      } else {
+        lines.push(`- LoS 영향: ${knownCount}개 경로 중 ${effectDescs.length}건 추가 차단각 형성 — ${effectDescs.join(", ")}. 해당 방위 저고도 탐지 제한 가능.${unknownNote}`);
+      }
     } else {
-      lines.push(`- LoS(가시선): ${losMap.size}개 경로 중 ${blockedDescs.length}건 차단 — ${blockedDescs.join(", ")}. 해당 방위 저고도 탐지 제한 예상.`);
+      // 파노라마 미준비(생성 직후) — hasBldgEffect 판정 불가. 파노라마 완료 시 재생성으로 자동 반영.
+      lines.push(`- LoS 영향: 장애물 음영(파노라마) 분석 완료 후 자동 반영.`);
     }
   }
 

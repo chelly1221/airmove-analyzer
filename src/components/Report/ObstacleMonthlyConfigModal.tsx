@@ -500,6 +500,33 @@ export default function ObstacleMonthlyConfigModal({
     }
   }, [analyzing, selectedRadars, selectedBuildings, buildingGroups, radarFiles, azSectorsByRadar, aircraft, onGenerate, onCoverageReady, onCoverageError, analysisMonth, filterFilesByMonth]);
 
+  // ── transfer 단계 최종 안전망은 부모(ReportApp) 워치독으로 일원화 ──
+  // 부모가 emit 재발신(20/40초) 후 60초에 setConfigPayload(null) 로 이 모달을 닫고 에러 화면을
+  // 노출하며, 그 뒤 늦게 도착한 data-written 은 loadFromIDB 성공 시 setError(null) 로 자가 복구된다.
+  // (종전: 모달 자체 60초 타이머가 부모보다 δ초 먼저 발화 — 재시도 화면이 즉시 부모 에러 화면에
+  //  덮이고, 느린-정상 전송에선 stage=null 리셋 탓에 omReady 도착 후에도 모달이 보고서를 영구히
+  //  가리는 경합 결함이 있어 제거.)
+
+  // ── 취소 경로 단일화 ── 진행 카드 '중단/닫기'와 하단 '취소'(analyzing 중)가 공유.
+  // 창 destroy(onClose) 전에 반드시 cancelledRef + cancel_analysis 를 수행해
+  // Rust 분석(월 단위 ASS 파싱, 10M+ 규모)이 소유자 없이 백그라운드에 잔존하지 않게 한다.
+  const inLocalPhase = stage === "parsing" || stage === "los" || stage === "coverage";
+  const cancelButtonLabel = inLocalPhase ? "중단" : "닫기";
+  const onCancelClick = async () => {
+    cancelledRef.current = true;
+    try { await invoke("cancel_analysis"); } catch { /* ignore */ }
+    if (inLocalPhase) {
+      // 설정 화면 복귀
+      setAnalyzing(false);
+      setProgress("");
+      setProgressPct(0);
+      setStage(null);
+    } else {
+      // 원격 단계 — 윈도우 닫기 (부모가 destroy)
+      onClose();
+    }
+  };
+
   const allFilesSelected = selectedRadars.every((r) => (radarFiles.get(r.name)?.length ?? 0) > 0);
   const canAnalyze = selectedRadars.length > 0 && selectedBuildings.length > 0 && allFilesSelected && !analyzing;
 
@@ -755,24 +782,6 @@ export default function ObstacleMonthlyConfigModal({
                   { key: "panorama", label: "파노라마 LoS 계산", detail: panoramaDetailText },
                 ];
 
-                // 로컬 단계(취소 가능) vs 원격 단계(닫기로만)
-                const inLocalPhase = stage === "parsing" || stage === "los" || stage === "coverage";
-                const cancelButtonLabel = inLocalPhase ? "중단" : "닫기";
-                const onCancelClick = async () => {
-                  cancelledRef.current = true;
-                  try { await invoke("cancel_analysis"); } catch { /* ignore */ }
-                  if (inLocalPhase) {
-                    // 설정 화면 복귀
-                    setAnalyzing(false);
-                    setProgress("");
-                    setProgressPct(0);
-                    setStage(null);
-                  } else {
-                    // 원격 단계 — 윈도우 닫기 (부모가 destroy)
-                    onClose();
-                  }
-                };
-
                 return (
                   <div className="mt-4 rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
                     <div className="flex items-center gap-2">
@@ -828,7 +837,9 @@ export default function ObstacleMonthlyConfigModal({
             )}
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={onClose} className="rounded-lg border border-gray-200 px-4 py-2 text-[12px] text-gray-600 hover:bg-gray-50 transition-colors">취소</button>
+            {/* analyzing 중에는 진행 카드 '중단/닫기'와 동일 경로(onCancelClick) — cancel_analysis 없이
+                창만 destroy 되어 Rust 분석이 백그라운드에 잔존하는 경로 차단 */}
+            <button onClick={analyzing ? onCancelClick : onClose} className="rounded-lg border border-gray-200 px-4 py-2 text-[12px] text-gray-600 hover:bg-gray-50 transition-colors">취소</button>
             {step < 3 ? (
               <button onClick={() => setStep((s) => s + 1)} disabled={!canNext(step)}
                 className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-5 py-2 text-[12px] font-medium text-white transition-colors hover:bg-[#85062e] disabled:opacity-40">

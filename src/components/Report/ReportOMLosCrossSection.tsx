@@ -1,10 +1,13 @@
 import React, { useMemo, useRef, useState, useEffect, useCallback } from "react";
-import type { ManualBuilding, LoSProfileData, BuildingOnPath, ElevationPoint } from "../../types";
+import type { ManualBuilding, LoSProfileData, BuildingOnPath, ElevationPoint, PanoramaMergeResult } from "../../types";
 import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import { useOMChartZoom, type ChartZoom } from "./OMEditable";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import { bearingDeg, haversineKm } from "../../utils/geo";
-import { calcBuildingAzExtent, isTargetBuildingOnPath, excludeTargetBuildings, computeLosBlockage } from "../../utils/obstacleAnalysisHelpers";
+import {
+  calcBuildingAzExtent, isTargetBuildingOnPath, excludeTargetBuildings, computeLosBlockage,
+  makePanoramaSampler, panoWithForBuilding, BLDG_EFFECT_EPS_DEG,
+} from "../../utils/obstacleAnalysisHelpers";
 
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
@@ -67,7 +70,7 @@ export interface ChartTrackPoint {
  *  obstacleAnalysisHelpers 에서 200NM 까지 샘플링됨.
  */
 export function LosCrossSection({
-  los, radarName, building, buildingGroup, trackPoints, lossPoints, blockedOverride,
+  los, radarName, building, buildingGroup, trackPoints, lossPoints, blockedOverride, panoWith, panoWithout,
 }: {
   los: LoSProfileData;
   radarName: string;
@@ -76,11 +79,17 @@ export function LosCrossSection({
   buildingGroup?: import("../../types").BuildingGroup | null;
   trackPoints: ChartTrackPoint[];
   lossPoints: ChartTrackPoint[];
-  /** 헤드라인 차단(LoS 영향 O/X) 배지 판정 — panorama 실루엣 기반(소실표적 분류와 동일 소스, losBlockedFromPanorama).
-   *  미지정(panorama 미준비) 시 차트 내부 chord 판정(blocked)으로 폴백 — chord 도 분석 대상 자신을 제외한
-   *  입력(excludeTargetBuildings)으로 판정하므로 self-block 없음. 차트 본문의 코리도 시각화(최저탐지선·
-   *  '차단건물 N동')는 그대로 chord/코리도 유지 — blocked 배지만 panorama 로 통일(거리축 손실로 본문과 어긋날 수 있음). */
+  /** 보조 '가시선 차단 O/X' 배지 판정 — panorama 실루엣 기반(소실표적 분류와 동일 소스, losBlockedFromPanorama:
+   *  대상 top 양각 < 기존 지형·지물 차단각 = 레이더→대상 가시선 차단). 미지정(panorama 미준비) 시 차트 내부
+   *  chord 판정(blocked)으로 폴백 — chord 도 분석 대상 자신을 제외한 입력(excludeTargetBuildings)으로 판정하므로
+   *  self-block 없음. 헤드라인 'LoS 영향' 배지와는 별개 지표 — 아래 panoWith/panoWithout 기반 hasBldgEffect 사용. */
   blockedOverride?: boolean | null;
+  /** 이 레이더의 분석 대상 포함 파노라마 — 헤드라인 'LoS 영향 O/X' 배지(hasBldgEffect) 판정용.
+   *  내부에서 panoWithForBuilding 으로 '해당' 건물만 얹어 §1 요약표(classifyObstacleLosses angleTotalDeg)와
+   *  동일 샘플러·동일 임계(+0.005°)로 계산 — §1 'LoS 영향' 열과 배지가 항상 동일 판정. */
+  panoWith?: PanoramaMergeResult;
+  /** 이 레이더의 분석 대상 제외 파노라마 — 위 배지의 without 차단각(angleTerrainDeg) 소스 */
+  panoWithout?: PanoramaMergeResult;
 }) {
   const chartData = useMemo(() => {
     const profile = los.elevationProfile;
@@ -97,7 +106,7 @@ export function LosCrossSection({
     //   최근접 그리드점이 nearD 보다 앞쪽으로 스냅). 표시용 지형·최저탐지선은 순수 SRTM 을 base 로 쓰고
     //   건물은 edges + effElevAt override 로만 주입 → 법면에서 수직상승(TrackMap LoSProfilePanel 과 동일).
     //   ※ 차단판정(computeLosBlockage)도 이 순수 SRTM base + 대상 제외 건물 엣지(excludeTargetBuildings)로
-    //     수행 — 배지(computeLosBatch los.losBlocked)와 동일 입력·동일 식(아래 blockage 블록 참조).
+    //     수행 — 보조 '가시선 차단' 배지 폴백(computeLosBatch los.losBlocked)과 동일 입력·동일 식(아래 blockage 블록 참조).
     const baseTerrain = los.terrainProfile ?? profile;
 
     // 1) 조정 지형 (4/3 유효지구 곡률 반영) — 순수 SRTM. 건물은 실루엣(significantBuildings)으로 별도 표시.
@@ -257,6 +266,9 @@ export function LosCrossSection({
 
     // 5) 차폐 기여 빌딩 — 지형만 shadow 보다 빌딩 꼭대기가 높으면 실질 차폐 기여.
     //    단, 분석 대상 건물은 음영 여부와 무관하게 항상 포함(앞쪽 지형에 가려도 표시) — isTarget 표시.
+    //    shadow 는 순수 SRTM(baseTerrain)으로만 계산 — spike 병합본(profile)을 돌면 건물 자신의 top 스파이크가
+    //    최근접 그리드 스냅으로 bDist '앞'에 놓일 때(≈50%) 자기그림자를 만들어, 실제 차단 건물이 실루엣·범례
+    //    카운트에서 무작위 누락됐다(최저탐지선·차단판정의 baseTerrain 이전 시 이 블록만 리팩토링 누락).
     const significantBuildings: (BuildingOnPath & { isBlocking: boolean; isTarget: boolean })[] = [];
     for (const b of buildings) {
       const bDist = b.distance_km;
@@ -265,15 +277,21 @@ export function LosCrossSection({
       const bTop = b.ground_elev_m + b.height_m;
       const bAdj = bTop - curvDrop43(bDist);
       let terrainShadow = radarHeight;
-      for (const p of profile) {
+      for (const p of baseTerrain) {
         if (p.distance <= 0 || p.distance >= bDist) continue;
         const adjH = p.elevation - curvDrop43(p.distance);
         const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
         if (shadow > terrainShadow) terrainShadow = shadow;
       }
       if (bAdj > terrainShadow || isTarget) {
+        // 차단 건물(적색) 판정 — maxBlockPoint.distance 는 건물 near/far '엣지' 또는 지형 샘플 거리이므로,
+        //   건물 '중심'(bDist)±0.1km 고정 허용치가 아닌 footprint 구간(near−ε ~ far+ε) 포함 여부로 판정.
+        //   (경로방향 span>0.2km 건물이 near 엣지에서 최대 차단을 만들면 종전 식은 자기 차단점을 놓쳤음.)
+        const nearD = b.near_dist_km ?? b.distance_km;
+        const farD = b.far_dist_km ?? b.distance_km;
         const isBlk = !!(maxBlockPoint &&
-          Math.abs(bDist - maxBlockPoint.distance) < 0.1 &&
+          maxBlockPoint.distance >= nearD - 0.05 &&
+          maxBlockPoint.distance <= farD + 0.05 &&
           bAdj > maxBlockPoint.adjHeight - 5);
         significantBuildings.push({ ...b, isBlocking: isBlk, isTarget });
       }
@@ -305,6 +323,22 @@ export function LosCrossSection({
       targetElev, radarHeight,
     };
   }, [los, building]);
+
+  // 헤드라인 'LoS 영향' 배지 — §1 요약표 hasBldgEffect 와 동일 의미·동일 산식으로 통일:
+  //   대상 건물이 기존 지형·지물 위로 '추가 차단각'을 만드는가 = angleWith(bAz) > angleWithout(bAz) + EPS.
+  //   hasBldgEffectFromPanorama(단일 소스)와 동일 계산 — 이 컴포넌트는 RadarSite 대신 los.radarLat/Lon
+  //   (동일 레이더 좌표)만 보유해 인라인으로 재현(샘플러·임계 BLDG_EFFECT_EPS_DEG 는 헬퍼와 공유).
+  //   panoWith 미가용 시 null(판정 불가) — §1 표의 3-상태('—') 표기 규칙과 동일(무영향 X 단정 금지).
+  //   (종전: losBlockedFromPanorama '가시선 차단' 기준을 같은 문구로 표기 — §1과 사실상 반대 판정이라
+  //   같은 쌍이 O/X 상반 인쇄. 가시선 차단은 아래 보조 배지로 분리.)
+  const hasBldgEffect = useMemo<boolean | null>(() => {
+    const panoWithB = panoWithForBuilding(panoWith, panoWithout, building.id);
+    if (!panoWithB) return null;
+    const sW = makePanoramaSampler(panoWithB);
+    const sWo = panoWithout ? makePanoramaSampler(panoWithout) : sW;
+    const bAzDeg = bearingDeg(los.radarLat, los.radarLon, building.latitude, building.longitude);
+    return sW(bAzDeg) > sWo(bAzDeg) + BLDG_EFFECT_EPS_DEG;
+  }, [panoWith, panoWithout, building, los.radarLat, los.radarLon]);
 
   // ── 줌 편집 (클릭 → 줌모드, 휠 확대/축소 + 드래그 패닝). obstacle_monthly 편집 컨텍스트에서만 활성 ──
   const svgRef = useRef<SVGSVGElement>(null);
@@ -600,7 +634,8 @@ export function LosCrossSection({
     adjTerrain, minDetStraight, minDetWithout,
     blocked, significantBuildings, maxDistance, radarHeight,
   } = chartData;
-  // 헤드라인 차단 배지 = panorama 판정(소실표적 분류와 동일 소스) 우선, 없으면 chord 폴백.
+  // 보조 '가시선 차단' 배지 = panorama 판정(losBlockedFromPanorama, 소실표적 분류와 동일 소스) 우선, 없으면 chord 폴백.
+  //   헤드라인 'LoS 영향' 배지는 위 hasBldgEffect(§1 요약표와 동일 판정) — 두 지표는 별개(사실상 상반 경향).
   const displayBlocked = blockedOverride ?? blocked;
   // X 줌 윈도우에 맞춰 자동조정된 세로 범위 (전체 줌이면 chartData 전체범위와 동일)
   const { minY, maxY } = visibleYRange ?? chartData;
@@ -633,12 +668,16 @@ export function LosCrossSection({
         .join(" ")
     : null;
 
-  // Y축 눈금 (ft)
+  // Y축 눈금 (ft) — 격자·라벨은 진고도 y 를 디스플레이 프레임(y − curvDrop43(dist))에 그리므로, tick 은
+  //   minY..maxY(디스플레이 높이 범위)가 아닌 표시가능 '진고도' 범위 [minY+drop(zoomStart), maxY+drop(zoomEnd)]
+  //   에서 생성해야 윈도우 내 어느 거리에서든 격자가 플롯 안에 들어온다. (종전: 디스플레이 범위에서 생성 →
+  //   원거리 줌 윈도우에서 격자·라벨이 곡률강하량만큼 아래로 이탈해 상단 대역이 비었음.)
+  //   스텝은 화면 밀도(임의 거리 단면의 가시폭 = maxY−minY) 기준 유지.
   const yRangeFt = (maxY - minY) * M_TO_FT;
   const yStepFt = yRangeFt > 30000 ? 5000 : yRangeFt > 15000 ? 2000 : yRangeFt > 5000 ? 1000 : yRangeFt > 2000 ? 500 : 200;
   const yTicks: number[] = [];
-  const minYft = minY * M_TO_FT;
-  const maxYft = maxY * M_TO_FT;
+  const minYft = (minY + curvDrop43(zoomStartKm)) * M_TO_FT;
+  const maxYft = (maxY + curvDrop43(zoomEndKm)) * M_TO_FT;
   for (let yf = Math.ceil(minYft / yStepFt) * yStepFt; yf <= maxYft; yf += yStepFt) yTicks.push(yf / M_TO_FT);
 
   // X축 눈금 (NM) — 줌 윈도우 기준
@@ -698,12 +737,22 @@ export function LosCrossSection({
         <span className="text-[13px] font-bold text-gray-800">{buildingName}</span>
         <span className="text-[11px] text-gray-500">
           {radarName} → 방위 {los.bearing.toFixed(1)}° / 거리 {bDistNm.toFixed(1)}NM ({D.toFixed(1)}km)
-          / 높이 {Math.round(targetElev * M_TO_FT).toLocaleString()}ft ({targetElev.toFixed(0)}m)
+          / 정상표고(해발) {Math.round(targetElev * M_TO_FT).toLocaleString()}ft ({targetElev.toFixed(0)}m)
         </span>
+        {/* 헤드라인 배지 — 추가 차단각 형성 여부(hasBldgEffect, §1 'LoS 영향' 열과 동일 판정).
+            파노라마 미가용 시 '판정 불가'(회색) — §1의 '—' 3-상태와 정합. */}
         <span className={`ml-auto rounded px-1.5 py-0.5 text-[11px] font-medium ${
-          displayBlocked ? "bg-red-50 text-red-600" : "bg-green-50 text-green-600"
+          hasBldgEffect === null ? "bg-gray-100 text-gray-500"
+            : hasBldgEffect ? "bg-red-50 text-red-600" : "bg-green-50 text-green-600"
         }`}>
-          {displayBlocked ? "LoS 영향 O" : "LoS 영향 X"}
+          {hasBldgEffect === null ? "LoS 영향 판정 불가" : hasBldgEffect ? "LoS 영향 O" : "LoS 영향 X"}
+        </span>
+        {/* 보조 배지 — 가시선 차단(레이더→대상 top 가시성, losBlockedFromPanorama/chord 폴백).
+            지형 위로 솟은 대상은 보통 '가시선 차단 X + LoS 영향 O', 지형에 묻힌 대상은 그 반대. */}
+        <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${
+          displayBlocked ? "bg-amber-50 text-amber-600" : "bg-gray-100 text-gray-500"
+        }`}>
+          {displayBlocked ? "가시선 차단 O" : "가시선 차단 X"}
         </span>
       </div>
 
@@ -769,9 +818,12 @@ export function LosCrossSection({
           </clipPath>
         </defs>
 
-        {/* Y축 라벨 (클립 밖) */}
+        {/* Y축 라벨 (클립 밖) — tick 이 진고도 범위로 확장됐으므로, 윈도우 좌단(zoomStartKm) 기준
+            디스플레이 값이 플롯 세로범위 밖인 tick 은 라벨 생략(격자 곡선은 clipPath 가 처리) */}
         {yTicks.map((y) => {
-          const labelY = yScale(y - curvDrop43(zoomStartKm));
+          const yDisp = y - curvDrop43(zoomStartKm);
+          if (yDisp < minY - 1e-9 || yDisp > maxY + 1e-9) return null;
+          const labelY = yScale(yDisp);
           return (
             <text key={`yl-${y}`} x={PAD.left - 5} y={labelY + 3} textAnchor="end"
               fill="#6b7280" fontSize={9}>
@@ -989,8 +1041,9 @@ export function LosCrossSection({
               <g key="leg-tp">
                 <circle cx={9} cy={legendY} r={1.5} fill="rgb(34,197,94)" fillOpacity={0.7} />
                 <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
-                  {/* 차트 점 수 — '건'은 이벤트(distinct event_id) 전용 단위라 '점'으로 표기 */}
-                  항적 ({trackPoints.length.toLocaleString()}점)
+                  {/* 차트 점 수 — '건'은 이벤트(distinct event_id) 전용 단위라 '점'으로 표기.
+                      항적은 백엔드 일별 최대 5,000점 균등표본(track_points_geo) — 소실표적은 전수 */}
+                  항적 ({trackPoints.length.toLocaleString()}점 · 일별 최대 5,000점 표본)
                 </text>
               </g>,
             );
@@ -1023,7 +1076,8 @@ export function LosCrossSection({
  * 항적도 포함. (track_points_geo 는 백엔드에서 건물 중심 방위 ±max(5°, 노출면 반각폭+1.5°) 로 사전
  * 필터되어 들어온다 — ObstacleMonthlyConfigModal 이 buildingAzHalfExtentDeg 와 동일 정의의 반각폭을
  * 전송. 이 윈도우(노출면 ±1°)의 양끝은 중심에서 반각폭+1° ≤ max(5°, 반각폭+1.5°) 이므로 항상 그
- * 부분집합 — 데이터 누락 없음.)
+ * 부분집합. 단 track_points_geo 는 일별 최대 5,000점 균등표본(의도 설계, MAX_TRACK_POINTS_GEO_PER_DAY)
+ * — 항적만 표본이며 소실표적(loss_points_summary)은 전수.)
  */
 export function projectPointsToLos(
   los: LoSProfileData,

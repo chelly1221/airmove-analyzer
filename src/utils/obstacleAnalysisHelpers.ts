@@ -366,6 +366,20 @@ export function mergeAzSectors(sectors: AzSector[]): AzSector[] {
     }
   }
 
+  // 전주(全周) 케이스 — 선택 건물 노출면들이 2° 간격 이내로 전 방위를 덮으면 병합 결과가 단일 {s:0, e:360}
+  //   구간이 된다(래핑 재합치기는 merged.length >= 2 에서만 동작). 이대로 아래 map 을 타면 end 360→0 변환으로
+  //   {start_deg:0, end_deg:0} 퇴화 구간이 되어 Rust AzSector::contains 가 방위 정확히 0° 인 포인트만 통과시킨다.
+  //   ※ '빈 배열 = 필터 없음' 처리는 불가 — Rust obstacle_monthly.rs 는 in_any_sector(az, []) == false 라
+  //     sectors 가 비면 분석 대상 포인트가 전부 배제된다(in_any_sector L371-373 → in_sector 게이트 L523·L527.
+  //     has_sectors=false L450 는 베이스라인 수집 L537 만 끈다 — 2026-07-03 코드 확인).
+  //   contains 는 start<=end 면 az 를 [0,360) 정규화 후 start<=az<=end 판정이므로 {0,360} 이 전 방위 통과로 동작.
+  if (merged.length === 1 && merged[0].e - merged[0].s >= 360) {
+    return [{ start_deg: 0, end_deg: 360 }];
+  }
+
+  // end==360 잔존 케이스 점검(2026-07-03): 래핑 분리 [s,360] 조각이 있으면 짝인 [0,e] 조각이 반드시 first(s=0)로
+  //   남아 위 래핑 재합치기(first.s<=2 && last.e>=358)가 e 를 first.e(<360)로 되돌리므로, 이 map 에 e==360 이
+  //   도달하는 경우는 위에서 특수 처리한 전주 단일 구간뿐 — 일반 케이스의 360→0 변환은 발생하지 않는다.
   return merged.map((m) => ({
     start_deg: m.s >= 360 ? m.s - 360 : m.s,
     end_deg: m.e >= 360 ? m.e - 360 : m.e,
@@ -825,4 +839,30 @@ export function losBlockedFromPanorama(
   const targetTopM = (building.ground_elev ?? 0) + building.height;
   const targetElevDeg = pointElevAngleDeg(radarH, targetTopM, bDistKm * 1000);
   return targetElevDeg < sampler(bAzDeg);
+}
+
+/** 'LoS 영향'(hasBldgEffect) 판정 임계(°) — §1 요약표(obstacleInfoByKey)·§3 AzElevChart 와 동일 0.005° */
+export const BLDG_EFFECT_EPS_DEG = 0.005;
+
+/**
+ * 'LoS 영향'(hasBldgEffect) 판정 — 대상 건물이 기존 지형·지물(without) 위로 '추가 차단각'을 형성하는가.
+ * §1 요약표(obstacleInfoByKey)·§3 AzElevChart 의 hasBldgEffect(angleTotalDeg > angleTerrainDeg + 0.005°)와
+ * 동일 산식: 대상 방위(bAzDeg, bearingDeg)에서 with(지형+기존지물+'해당' 건물, panoWithForBuilding) 차단각과
+ * without 차단각을 같은 makePanoramaSampler 로 샘플해 비교 — classifyObstacleLosses 의 두 각과 값이 일치한다.
+ * panoWith 미가용(해당 레이더 파노라마 계산 실패/미준비) 시 null — 호출부는 '판정 불가'로 처리.
+ * 소견 프로즈(omFindingsGenerator hasBldgEffectByKey)·§3 배지가 §1 열과 같은 판정을 쓰기 위한 단일 소스.
+ */
+export function hasBldgEffectFromPanorama(
+  radar: RadarSite,
+  building: ManualBuilding,
+  panoWith?: PanoramaMergeResult,
+  panoWithout?: PanoramaMergeResult,
+): boolean | null {
+  const panoWithB = panoWithForBuilding(panoWith, panoWithout, building.id);
+  if (!panoWithB) return null;
+  const sW = makePanoramaSampler(panoWithB);
+  // panoWithout 미제공(Rust 제외대상 0/리로드) → without==with 폴백(classifyObstacleLosses 와 동일 규칙, 효과 0)
+  const sWo = panoWithout ? makePanoramaSampler(panoWithout) : sW;
+  const bAzDeg = bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  return sW(bAzDeg) > sWo(bAzDeg) + BLDG_EFFECT_EPS_DEG;
 }
