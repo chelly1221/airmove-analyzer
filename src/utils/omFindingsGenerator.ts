@@ -54,7 +54,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     const stats = rr.daily_stats;
     const avg = weightedLossAvg(stats);
     const dev = avg - weightedBaselineLossAvg(stats);
-    const grade = stats.length < 7 ? "판정 보류" : gradeLabel(avg);
+    const grade = stats.length < 7 ? "판정 불가" : gradeLabel(avg);
     return { radar: rr.radar_name, avg, dev, grade };
   });
   const gradeTexts = allGrades
@@ -105,7 +105,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     } else if (allBandNone) {
       lines.push(`분석 대상 장애물이 지형·기존지물 위로 새로 가리는 구간을 형성하지 않아(추가 차단 구간 없음), 장애물에 의한 추가 탐지 영향은 없는 것으로 판단된다.`);
     } else {
-      lines.push(`분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않음(또는 판정 보류).`);
+      lines.push(`분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않음(또는 판정 불가).`);
     }
     lines.push(`※ 추가 차단영역 등급 임계 — 관심 ${BLOCKAGE_WATCH_PCT}% / 주의 ${BLOCKAGE_CAUTION_PCT}% / 경계 ${BLOCKAGE_ALERT_PCT}% / 심각 ${BLOCKAGE_SEVERE_PCT}% 이상.`);
   } else {
@@ -121,9 +121,9 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     }
     lines.push(`※ 건물 인과 헤드라인(추가 차단영역 소실율)은 장애물 음영 분석 완료 후 자동 반영된다.`);
   }
-  const pendingRadars = allGrades.filter((g) => g.grade === "판정 보류");
+  const pendingRadars = allGrades.filter((g) => g.grade === "판정 불가");
   if (pendingRadars.length > 0) {
-    lines.push(`※ ${pendingRadars.map((g) => g.radar).join(", ")}: 관측일수 부족(7일 미만)으로 판정 보류 — 추가 데이터 확보 후 재분석 필요.`);
+    lines.push(`※ ${pendingRadars.map((g) => g.radar).join(", ")}: 관측일수 부족(7일 미만)으로 판정 불가 — 추가 데이터 확보 후 재분석 필요.`);
   }
   lines.push("");
 

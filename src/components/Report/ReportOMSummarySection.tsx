@@ -181,7 +181,7 @@ function ReportOMSummarySection({
                         <span className="muted">—</span>
                       ) : blockage ? (
                         // 추가 차단 구간 미형성(BLOCKAGE_NONE_LABEL)은 라벨 대신 0.00%로 표시 — 비율 정의상 추가 소실 없음.
-                        blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 보류"
+                        blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 불가"
                           ? <span className="muted">{blockage.grade.label}</span>
                           : <span style={{ color: blockage.grade.color, fontWeight: 600 }} title={`음영소실 ${shadowLoss}건`}>
                               {blockage.lossRatePct.toFixed(2)}%

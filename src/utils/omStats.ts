@@ -23,8 +23,8 @@
  *   - 관측량 기반 빈도성(frequency) 가중치 + 대표본(관측일수)이라 Bessel 보정(N-1) 영향이
  *     무시 가능 → 기술통계용 모표준편차(분모 Σw) 채택. (reliability weight 의 불편분산 보정과는 구분)
  *
- * ── 판정 보류 기준 ──
- * 관측일수 < 7일이면 "판정 보류":
+ * ── 판정 불가 기준 ──
+ * 관측일수 < 7일이면 "판정 불가":
  *   - 주간 주기(요일별 트래픽 패턴)를 최소 1회전 포함해야
  *     평일/주말 편향 없는 대표 통계가 산출된다.
  *   - 표본 크기가 충분해야 σ가 의미 있는 산포를 반영한다.
@@ -103,7 +103,7 @@ export function weightedBaselineLossStdDev(stats: DailyStats[]): number {
 }
 
 /**
- * 판정 등급 (관측일수 < 7이면 판정 보류)
+ * 판정 등급 (관측일수 < 7이면 판정 불가)
  *
  * 임계값 근거:
  *   - 양호 (< 0.5%): 자연 환경(기상, 지형)에 의한 배경 소실율 수준
@@ -115,7 +115,7 @@ export function gradeWithConfidence(
   dayCount: number,
 ): { label: string; color: string; bg: string; border: string } {
   if (dayCount < 7) {
-    return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+    return { label: "판정 불가", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
   if (avgLoss < 0.5) return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
   if (avgLoss < 2.0) return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
@@ -152,7 +152,7 @@ export function weightedTrendSlope(
 //
 // 등급 4단계는 국가 위기경보(관심-주의-경계-심각) 체계를 차용하고, 임계 미만은 "양호"로 둔다.
 // (관심 파랑 · 주의 노랑 · 경계 주황 · 심각 빨강 — 위기경보 색상 관례)
-export const BLOCKAGE_MIN_EXPOSURE_POINTS = 10000; // 통과 항적(노출 스캔 포인트) ≤ 10,000 → 표본 부족 판정 보류
+export const BLOCKAGE_MIN_EXPOSURE_POINTS = 10000; // 통과 항적(노출 스캔 포인트) ≤ 10,000 → 표본 부족 판정 불가
 export const BLOCKAGE_WATCH_PCT = 10.0;   // 양호/관심 경계 (%)
 export const BLOCKAGE_CAUTION_PCT = 20.0; // 관심/주의 경계 (%)
 export const BLOCKAGE_ALERT_PCT = 30.0;   // 주의/경계 경계 (%)
@@ -168,7 +168,7 @@ export const BLOCKAGE_NONE_LABEL = "추가 차단 구간 없음";
  *   0) 추가 차단 밴드 미형성(분석 대상이 지형·기존지물 위로 올라오지 않음) → "추가 차단 구간 없음"
  *      — 밴드 기하는 표본량과 무관하므로 다른 게이트보다 먼저 판정한다(panoWith 없어 판정 불가면 hasBlockageBand=true 로 폴백).
  *   1) 통과 항적 전무(노출 0pt) → "항적 없음"
- *   2) 통과 항적 ≤ 10,000pt → "판정 보류" (표본 부족)
+ *   2) 통과 항적 ≤ 10,000pt → "판정 불가" (표본 부족)
  * 관측일수·노출 발생일 게이트는 폐지 — 표본 충분성은 통과 항적 포인트 수 단일 기준으로 판정한다.
  * 임계 통과 시 소실율(%)로 관심/주의/경계/심각(임계 미만은 양호)을 부여한다.
  */
@@ -186,8 +186,8 @@ export function gradeAddedBlockage(
     return { label: "항적 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
   if (exposurePointCount <= BLOCKAGE_MIN_EXPOSURE_POINTS) {
-    // 통과 항적 표본 부족(≤ 10,000pt) → 대표성 부족으로 판정 보류.
-    return { label: "판정 보류", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+    // 통과 항적 표본 부족(≤ 10,000pt) → 대표성 부족으로 판정 불가.
+    return { label: "판정 불가", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
   if (lossRatePct < BLOCKAGE_WATCH_PCT)   return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
   if (lossRatePct < BLOCKAGE_CAUTION_PCT) return { label: "관심", color: "#1d4ed8", bg: "#dbeafe", border: "border-blue-200" };

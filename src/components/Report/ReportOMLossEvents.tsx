@@ -7,7 +7,6 @@ import { classifyObstacleLosses, buildSiblings, type ClassifiedLoss } from "../.
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import ReportOMLossEventsMap from "./ReportOMLossEventsMap";
 import AutoPaginate from "./AutoPaginate";
-import { PAGE_CONTENT_MM, SECTION_HEADER_MM, TABLE_HEADER_MM, ROW_HEIGHT_SM } from "./reportPageConstants";
 
 interface Props {
   sectionNum: number;
@@ -25,31 +24,8 @@ interface Props {
   panoWithoutByRadar?: Map<string, PanoramaMergeResult>;
 }
 
-/** 데이터 준비 상한 (이벤트 단위) — 실제 표시 행수는 페이지 남는 공간으로 산정(fitTableRows), 이보다 훨씬 작다 */
-const MAX_EVENTS = 30;
-
-// ── §4 레이더 블록 1페이지 예산(mm) — 정사각 fullwidth 도면 + 하단 범례를 뺀 남는 공간에 표 행수 산정 ──
-//    AutoPaginate 는 블록을 atomic 으로 다루므로(넘치면 페이지 클립) 보수적으로 잡는다.
-const MAP_MM = 183;         // 정사각 도면 = 콘텐츠 폭 182mm + 테두리
-const MAP_TITLE_MM = 6;     // 도면 제목 행 (12px + mb-1)
-const MAP_NOTE_MM = 7;      // 범례 하단 각주(9px) + 도면 블록 하단 여백(mb-2)
-const EV_HEAD_MM = 9;       // 레이더명 h3 + 배지 (margin-bottom 8px 포함)
-const LEGEND_ROW_MM = 5;    // 범례 한 줄(10px, wrap) — 줄당 항목 3개 보수 추정
-const FOOTER_MM = 6;        // '상위 N건 표시' 각주
-const SAFETY_MM = 2;        // 측정 오차
-
-/** 정사각 도면·범례가 차지하고 남는 페이지 공간에 들어가는 표 행수.
- *  섹션 헤더는 첫 페이지에만 있지만 항상 차감(후속 페이지는 그만큼 여유 — 보수적). */
-function fitTableRows(buildingCount: number, totalEvents: number): number {
-  const legendRows = Math.ceil((2 + buildingCount) / 3); // 고정 항목 2(레이더·소실표적) + 건물
-  const fixedMm = SECTION_HEADER_MM + EV_HEAD_MM + MAP_TITLE_MM + MAP_MM
-    + legendRows * LEGEND_ROW_MM + MAP_NOTE_MM + TABLE_HEADER_MM + SAFETY_MM;
-  const availMm = PAGE_CONTENT_MM - fixedMm;
-  const rows = Math.max(2, Math.floor(availMm / ROW_HEIGHT_SM));
-  if (totalEvents <= rows) return rows;
-  // 잘리면 '상위 N건' 각주가 붙는다 — 그 자리까지 확보
-  return Math.max(2, Math.floor((availMm - FOOTER_MM) / ROW_HEIGHT_SM));
-}
+/** 표 표시 상한 — 지속시간 내림차순 상위 5건 (정사각 도면이 페이지 대부분을 차지, 표는 대표 이벤트만) */
+const TABLE_TOP_N = 5;
 
 interface LossEvent {
   buildingName: string;
@@ -77,8 +53,7 @@ interface LossEvent {
  * 대표 좌표/방위/고도 = 그 이벤트의 중앙 보간점. 배지 비율도 이벤트/이벤트(분자·분모 동일 단위).
  *
  * 레이더별 블록: 헤더 + ev-badge → top-down 분포 도면(ReportOMLossEventsMap — 정사각 fullwidth,
- * 범례 하단, 보간점 전수) → 이벤트 표(sm-table, 페이지 남는 공간에 맞는 상위 N건(fitTableRows),
- * 건물명 포함, 지속시간 내림차순).
+ * 범례 하단, 보간점 전수) → 이벤트 표(sm-table, 지속시간 내림차순 상위 5건, 건물명 포함).
  * 같은 레이더의 여러 건물은 sibling 오귀속 방지(가장 강하게 소유한 건물에만 귀속)로 중복 카운트 없음.
  */
 function ReportOMLossEvents({
@@ -178,7 +153,7 @@ function ReportOMLossEvents({
       result.push({
         radarName: rr.radar_name,
         radarSite: rs,
-        events: events.slice(0, MAX_EVENTS),
+        events: events.slice(0, TABLE_TOP_N),
         obstacleCausedCount: byEvent.size,  // 장애물 추가 기인 이벤트 건수 (distinct event_id)
         totalCount: allEventIds.size,       // 전체 소실 이벤트 건수 — 분자와 동일 단위(이벤트/이벤트 비율)
         mapBuildings: selectedBuildings.filter((b) => losMap.has(`${rr.radar_name}_${b.id}`)),
@@ -221,7 +196,6 @@ function ReportOMLossEvents({
     }
 
     const obstaclePct = totalCount > 0 ? (obstacleCausedCount / totalCount) * 100 : 0;
-    const shown = events.slice(0, fitTableRows(mapBuildings.length, obstacleCausedCount));
 
     return (
       <div key={radarName} className="ev-block">
@@ -259,7 +233,7 @@ function ReportOMLossEvents({
             </tr>
           </thead>
           <tbody>
-            {shown.map((ev, i) => (
+            {events.map((ev, i) => (
               <tr key={i} className={i % 2 === 0 ? "" : "alt"}>
                 <td className="ta-c muted">{i + 1}</td>
                 <td>{ev.buildingName}</td>
@@ -275,9 +249,9 @@ function ReportOMLossEvents({
           </tbody>
         </table>
 
-        {obstacleCausedCount > shown.length && (
+        {obstacleCausedCount > events.length && (
           <p className="muted sm" style={{ textAlign: "right", marginTop: 4 }}>
-            상위 {shown.length}건 표시 (장애물 추가 기인 {obstacleCausedCount}건, 지속시간 내림차순)
+            상위 {events.length}건 표시 (장애물 추가 기인 {obstacleCausedCount}건, 지속시간 내림차순)
           </p>
         )}
       </div>

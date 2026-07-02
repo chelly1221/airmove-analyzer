@@ -501,7 +501,9 @@
   font-weight: 600;
 }
 .kac-report .pill-ok { background: #dcfce7; color: #15803d; }
+.kac-report .pill-watch { background: #dbeafe; color: #1d4ed8; } /* 추가 차단 '관심' — 위기경보 파랑 */
 .kac-report .pill-warn { background: #fef3c7; color: #a16207; }
+.kac-report .pill-alert { background: #ffedd5; color: #c2410c; } /* 추가 차단 '경계' — 위기경보 주황 */
 .kac-report .pill-bad { background: #fee2e2; color: #b91c1c; }
 .kac-report .pill-hold { background: #e5e7eb; color: #4b5563; }
 

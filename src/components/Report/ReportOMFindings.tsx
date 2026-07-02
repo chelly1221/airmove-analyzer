@@ -189,7 +189,7 @@ function ReportOMFindings({
         radarSites.map((rs) => {
           const w = addedBlockageByKey[`${rs.name}_${b.id}`];
           if (!w) return null;
-          const graded = w.grade.label !== "항적 없음" && w.grade.label !== "판정 보류" && w.grade.label !== BLOCKAGE_NONE_LABEL;
+          const graded = w.grade.label !== "항적 없음" && w.grade.label !== "판정 불가" && w.grade.label !== BLOCKAGE_NONE_LABEL;
           return (
             <tr key={`${rs.name}-${b.id}`}>
               <td>
@@ -237,7 +237,7 @@ function ReportOMFindings({
       </table>
       <p className="muted" style={{ fontSize: "9px", marginTop: 4 }}>
         추가 차단 구간 소실율 = 분석 대상 장애물이 새로 가리는 양각 밴드(지형·기존지물 차단각~대상 차단각)를 지나는 항적이 그 안에서 소실되는 비율.
-        {" "}판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 0.00%(추가 차단 없음), 차단영역 통과 항적이 없으면 "항적 없음", 통과 항적이 {BLOCKAGE_MIN_EXPOSURE_POINTS.toLocaleString()}pt 이하면 "판정 보류".
+        {" "}판정 순서 — 분석 대상이 지형·기존지물 위로 새로 가리는 구간이 없으면 0.00%(추가 차단 없음), 차단영역 통과 항적이 없으면 "항적 없음", 통과 항적이 {BLOCKAGE_MIN_EXPOSURE_POINTS.toLocaleString()}pt 이하면 "판정 불가".
         {" "}등급(전구간 평균 소실율 기준과 별도) — 양호 &lt; {BLOCKAGE_WATCH_PCT.toFixed(0)}% · 관심 {BLOCKAGE_WATCH_PCT.toFixed(0)}~{BLOCKAGE_CAUTION_PCT.toFixed(0)}% 미만 · 주의 {BLOCKAGE_CAUTION_PCT.toFixed(0)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 · 경계 {BLOCKAGE_ALERT_PCT.toFixed(0)}~{BLOCKAGE_SEVERE_PCT.toFixed(0)}% 미만 · 심각 ≥ {BLOCKAGE_SEVERE_PCT.toFixed(0)}%.
       </p>
     </div>
@@ -277,12 +277,20 @@ function ReportOMFindings({
           <p className="formula-math"><i>임계값 = 7초 (고정) · 상한 5분</i></p>
         </div>
         <div>
-          <OMEditable id="findings.formula.h4" value="판정 기준 (평균 소실율)" tag="p" className="formula-h" />
+          <OMEditable id="findings.formula.h4" value="판정 기준" tag="p" className="formula-h" />
           <p>
-            <span className="pill pill-ok">양호</span> &lt; 0.5% ·{" "}
+            평균 소실율 — <span className="pill pill-ok">양호</span> &lt; 0.5% ·{" "}
             <span className="pill pill-warn">주의</span> 0.5~2% 미만 ·{" "}
             <span className="pill pill-bad">경고</span> ≥ 2% ·{" "}
-            <span className="pill pill-hold">보류</span> &lt; 7일
+            <span className="pill pill-hold">판정 불가</span> 관측 &lt; 7일
+          </p>
+          <p>
+            추가 차단 구간 소실율 — <span className="pill pill-ok">양호</span> &lt; {BLOCKAGE_WATCH_PCT.toFixed(0)}% ·{" "}
+            <span className="pill pill-watch">관심</span> {BLOCKAGE_WATCH_PCT.toFixed(0)}~{BLOCKAGE_CAUTION_PCT.toFixed(0)}% 미만 ·{" "}
+            <span className="pill pill-warn">주의</span> {BLOCKAGE_CAUTION_PCT.toFixed(0)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 ·{" "}
+            <span className="pill pill-alert">경계</span> {BLOCKAGE_ALERT_PCT.toFixed(0)}~{BLOCKAGE_SEVERE_PCT.toFixed(0)}% 미만 ·{" "}
+            <span className="pill pill-bad">심각</span> ≥ {BLOCKAGE_SEVERE_PCT.toFixed(0)}% ·{" "}
+            <span className="pill pill-hold">판정 불가</span> 통과 항적 ≤ {BLOCKAGE_MIN_EXPOSURE_POINTS.toLocaleString()}pt
           </p>
         </div>
       </div>
