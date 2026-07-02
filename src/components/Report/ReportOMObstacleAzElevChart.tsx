@@ -13,9 +13,9 @@
  *      별도 요약표 컴포넌트(ReportOMObstacleSummaryTable)에서 제공 — 동일 classifyObstacleLosses 공유.
  */
 import { useMemo, useRef, useEffect, useCallback } from "react";
-import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult, BuildingObstacle } from "../../types";
+import type { ManualBuilding, BuildingGroup, RadarSite, PanoramaMergeResult, BuildingObstacle } from "../../types";
 import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
-import { classifyObstacleLosses, calcBuildingAzExtent, makeTerrainSampler, pointElevAngleDeg, FT_PER_M, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, buildingAzHalfExtentDeg, makeTerrainSampler, pointElevAngleDeg, FT_PER_M, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import { bearingDeg, haversineKm } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import OMEditable from "./OMEditable";
@@ -147,7 +147,6 @@ interface Props {
   building: ManualBuilding;
   /** 그룹 메타 (현재는 미사용, 향후 색 라벨용) */
   buildingGroups?: BuildingGroup[];
-  los: LoSProfileData;
   /** 분석 대상 포함 파노라마 (terrain 공유 + buildings = 전체) */
   panoWith?: PanoramaMergeResult;
   /** 분석 대상 제외 파노라마 (terrain 공유 + buildings = 대상 제외) */
@@ -162,17 +161,17 @@ interface Props {
 }
 
 export default function ReportOMObstacleAzElevChart({
-  radarSite, building, los, panoWith, panoWithout, lossPoints, trackPoints, siblings,
+  radarSite, building, panoWith, panoWithout, lossPoints, trackPoints, siblings,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // 건물 메타 + 소실표적 분류 — obstacleAnalysisHelpers 의 단일 소스 사용.
   //  panoWith/panoWithout 제공 시 차단각을 panorama(빨강영역과 동일 소스)에서 산출 → 장애물 추가 기인 분류가 빨강영역과 픽셀 일치.
-  //  (요약 표의 '음영 소실'(장애물 추가 기인) 건수가 빨강 영역과 항상 일치 — 양쪽 동일 panorama·sibling 인자.
+  //  (요약 표의 '음영 소실'(장애물 추가 기인) 집계가 빨강 영역과 항상 일치 — 양쪽 동일 panorama·sibling 인자.
   //   소실표적 점은 분류와 무관하게 모두 빨간 점으로 표시)
   const computed = useMemo(
-    () => classifyObstacleLosses(radarSite, building, los, lossPoints, { panoWith, panoWithout, siblings }),
-    [radarSite, building, los, lossPoints, panoWith, panoWithout, siblings],
+    () => classifyObstacleLosses(radarSite, building, lossPoints, { panoWith, panoWithout, siblings }),
+    [radarSite, building, lossPoints, panoWith, panoWithout, siblings],
   );
 
   // 분석 대상 포함/제외 파노라마 (terrain 공유 + buildings 배열만 다름)
@@ -180,20 +179,14 @@ export default function ReportOMObstacleAzElevChart({
   const pWithout = panoWithout ?? EMPTY_MERGE;
 
   // 1) 방위 윈도우 (기하 전용) — 분석 대상 건물의 노출면 방위 각폭.
-  //    calcBuildingAzExtent 로 건물 폴리곤의 레이더 방향 방위 구간을 구하고, 중심(대상 방위)
-  //    기준 좌우 최대 편차 + 정렬오차 흡수용 1° 마진. (LoS 단면도 항적 윈도우와 동일 스킴)
+  //    반각폭은 분류 허용각(classifyAzToleranceDeg = max(10°, 반각폭+1°))과 동일한 단일 산식
+  //    (buildingAzHalfExtentDeg, 중심 = computed.bAzDeg)으로 계산 → 창(반각폭+1°) ≤ 허용각이 항상 성립,
+  //    차트 창 안의 소실표적은 전부 computed.losses 에 포함(§3 요약표·차트·§4 상세 점 수 일치).
   const azParams = useMemo(() => {
     const azCenter = computed.bAzDeg;
-    const relAz = (az: number) => {
-      let rel = az - azCenter;
-      if (rel > 180) rel -= 360;
-      if (rel < -180) rel += 360;
-      return rel;
-    };
-    const ext = calcBuildingAzExtent(radarSite.latitude, radarSite.longitude, building);
-    const AZ_MARGIN = 1; // 정렬오차/빔폭 흡수 마진
-    const halfFromExtent = Math.max(Math.abs(relAz(ext.start_deg)), Math.abs(relAz(ext.end_deg)));
-    // 빌딩 각폭 + 마진, 최소 가독 폭 2° (점 건물 기본 ±2° 와 정합)
+    const halfFromExtent = buildingAzHalfExtentDeg(radarSite.latitude, radarSite.longitude, building, azCenter);
+    const AZ_MARGIN = 1; // 정렬오차/빔폭 흡수 마진 (CLASSIFY_AZ_MARGIN_DEG 와 동일 1°)
+    // 빌딩 각폭 + 마진, 최소 가독 폭 2° (점 건물 기본 ±2° 와 정합. 허용각 하한 10° ≥ 2° → 부분집합 유지)
     const azHalfSpan = Math.max(halfFromExtent + AZ_MARGIN, 2);
     const azSpan = azHalfSpan * 2;
 

@@ -395,8 +395,11 @@ fn filter_visible_buildings(all: Vec<BuildingObstacle>, terrain: &[PanoramaPoint
     if n == 0 { return all; }
 
     // 1단계: 지형 가림 필터
+    // 중앙방위는 span 기반으로 계산 — azimuth_end_deg는 (start+span)%360 저장이라
+    // 정북(0/360°) 걸친 건물(start>end)에서 (start+end)/2 산술평균은 정반대 방위가 됨
     let above_terrain: Vec<BuildingObstacle> = all.into_iter().filter(|b| {
-        let mid_az = ((b.azimuth_start_deg + b.azimuth_end_deg) / 2.0).rem_euclid(360.0);
+        let span = (b.azimuth_end_deg - b.azimuth_start_deg).rem_euclid(360.0);
+        let mid_az = (b.azimuth_start_deg + span / 2.0).rem_euclid(360.0);
         let idx = ((mid_az / 360.0 * n as f64).round() as usize).min(n - 1);
         b.elevation_angle_deg > terrain[idx].elevation_angle_deg
     }).collect();

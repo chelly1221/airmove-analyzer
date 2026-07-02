@@ -4,7 +4,7 @@ import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import { useOMChartZoom, type ChartZoom } from "./OMEditable";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import { bearingDeg, haversineKm } from "../../utils/geo";
-import { calcBuildingAzExtent, isTargetBuildingOnPath, computeLosBlockage } from "../../utils/obstacleAnalysisHelpers";
+import { calcBuildingAzExtent, isTargetBuildingOnPath, excludeTargetBuildings, computeLosBlockage } from "../../utils/obstacleAnalysisHelpers";
 
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
@@ -77,7 +77,8 @@ export function LosCrossSection({
   trackPoints: ChartTrackPoint[];
   lossPoints: ChartTrackPoint[];
   /** 헤드라인 차단(차단/양호) 배지 판정 — panorama 실루엣 기반(소실표적 분류와 동일 소스, losBlockedFromPanorama).
-   *  미지정(panorama 미준비) 시 차트 내부 chord 판정(blocked)으로 폴백. 차트 본문의 코리도 시각화(최저탐지선·
+   *  미지정(panorama 미준비) 시 차트 내부 chord 판정(blocked)으로 폴백 — chord 도 분석 대상 자신을 제외한
+   *  입력(excludeTargetBuildings)으로 판정하므로 self-block 없음. 차트 본문의 코리도 시각화(최저탐지선·
    *  '차단건물 N동')는 그대로 chord/코리도 유지 — blocked 배지만 panorama 로 통일(거리축 손실로 본문과 어긋날 수 있음). */
   blockedOverride?: boolean | null;
 }) {
@@ -95,7 +96,8 @@ export function LosCrossSection({
     //   최저탐지선·녹색지형이 건물 법면 '앞'에서 조기상승했다(특히 그리드 스텝보다 좁은 point 형 건물:
     //   최근접 그리드점이 nearD 보다 앞쪽으로 스냅). 표시용 지형·최저탐지선은 순수 SRTM 을 base 로 쓰고
     //   건물은 edges + effElevAt override 로만 주입 → 법면에서 수직상승(TrackMap LoSProfilePanel 과 동일).
-    //   ※ 차단판정(computeLosBlockage)·losBlocked 는 그대로 profile(=combinedElev) 유지 — 표시 base 만 분리.
+    //   ※ 차단판정(computeLosBlockage)도 이 순수 SRTM base + 대상 제외 건물 엣지(excludeTargetBuildings)로
+    //     수행 — 배지(computeLosBatch los.losBlocked)와 동일 입력·동일 식(아래 blockage 블록 참조).
     const baseTerrain = los.terrainProfile ?? profile;
 
     // 1) 조정 지형 (4/3 유효지구 곡률 반영) — 순수 SRTM. 건물은 실루엣(significantBuildings)으로 별도 표시.
@@ -232,19 +234,12 @@ export function LosCrossSection({
     //     대상 식별: 수동건물 + 치수 일치 + far_dist 가 타겟 거리(D)까지 도달 (코리도 끝 = 대상).
     //     point 형 대상은 Rust 가 pathBuildings 에서 제외 → 매칭 0 건이면 미표시(두 선 동일).
     const targetBuildings = buildings.filter((b) => isTargetBuildingOnPath(b, building, D));
-    // 대상 footprint 거리구간 — 점선의 비대상(겹침) 엣지 제외 판정용.
-    const targetSpans = targetBuildings.map((tb) => ({
-      near: tb.near_dist_km ?? tb.distance_km,
-      far: tb.far_dist_km ?? tb.distance_km,
-    }));
-    const inTargetSpan = (d: number) => targetSpans.some((s) => d >= s.near - 1e-9 && d <= s.far + 1e-9);
-    // 점선('분석 대상 제외')은 대상 건물뿐 아니라, 대상 footprint 안에 겹쳐 들어온 비대상 건물
+    // 점선('분석 대상 제외')·차단판정 공용 — 대상 건물뿐 아니라, 대상 footprint 안에 겹쳐 들어온 비대상 건물
     //   (예: 동일 위치 건물통합정보 폴리곤 — is_manual=false 라 대상매칭 불가)도 제외해야 '대상 제거 시 실제 지반'을
     //   드러낸다. 제외 안 하면 그 건물이 computeMinDet 의 near/far 엣지로 재투입돼 점선이 footprint 위에서
     //   안 내려간다. (footprint 밖 비대상 건물은 그대로 유지 — 기존 비대상 실루엣 보존 규칙 불변.)
-    const buildingsWithoutTarget = buildings.filter(
-      (b) => !isTargetBuildingOnPath(b, building, D) && !inTargetSpan(b.distance_km),
-    );
+    //   공유 헬퍼(excludeTargetBuildings)로 computeLosBatch 차단 배지와 동일 집합 보장.
+    const buildingsWithoutTarget = excludeTargetBuildings(buildings, building, D);
     // 점선 base 도 실선과 동일한 순수 SRTM(baseTerrain). spike 없는 base 라 대상 footprint 지반 복원·
     //   spike 강제복원 hack 이 모두 불필요 — 대상은 edges 에서 빠지고(buildingsWithoutTarget) footprint 는
     //   raw SRTM 지반으로 자연 하강한다.
@@ -254,8 +249,11 @@ export function LosCrossSection({
       ? computeMinDet(dashedTerrain, buildingsWithoutTarget)
       : null;
 
-    // 차단 판정 — 배지(computeLosBatch)와 동일한 computeLosBlockage 단일 소스 (동일 obstacle 집합·동일 4/3 chord 식).
-    const { blocked, maxBlockPoint } = computeLosBlockage(profile, buildings, radarHeight, D, targetElev);
+    // 차단 판정 — 배지(computeLosBatch)와 동일한 computeLosBlockage 단일 소스·동일 입력(4/3 chord 식).
+    //   지형 base = 순수 SRTM(baseTerrain), 건물 = 분석 대상 제외(buildingsWithoutTarget) — 대상 자신의
+    //   near/far 엣지·top 스파이크가 self-block 을 만들지 않는다(폴리곤형 대상이 중간 차폐 없어도 무조건
+    //   '차단'이 되던 문제 해소). 표시(지형선·건물 실루엣·최저탐지선·significantBuildings)는 기존대로 대상 포함.
+    const { blocked, maxBlockPoint } = computeLosBlockage(baseTerrain, buildingsWithoutTarget, radarHeight, D, targetElev);
 
     // 5) 차폐 기여 빌딩 — 지형만 shadow 보다 빌딩 꼭대기가 높으면 실질 차폐 기여.
     //    단, 분석 대상 건물은 음영 여부와 무관하게 항상 포함(앞쪽 지형에 가려도 표시) — isTarget 표시.
@@ -930,7 +928,8 @@ export function LosCrossSection({
               <g key="leg-tp">
                 <circle cx={9} cy={legendY} r={1.5} fill="rgb(34,197,94)" fillOpacity={0.7} />
                 <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
-                  항적 ({trackPoints.length.toLocaleString()}건)
+                  {/* 차트 점 수 — '건'은 이벤트(distinct event_id) 전용 단위라 '점'으로 표기 */}
+                  항적 ({trackPoints.length.toLocaleString()}점)
                 </text>
               </g>,
             );
@@ -940,7 +939,8 @@ export function LosCrossSection({
                 <circle cx={9} cy={legendY} r={2.5}
                   fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.9} />
                 <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
-                  소실표적 ({lossPoints.length.toLocaleString()}건)
+                  {/* 보간점 수(차트 점과 일치) — 이벤트 건수 아님. §3 요약표 'N건 · M점'의 M과 동단위 */}
+                  소실표적 ({lossPoints.length.toLocaleString()}점)
                 </text>
               </g>,
             );
@@ -972,8 +972,10 @@ export function LosCrossSection({
  * calcBuildingAzExtent 로 건물 폴리곤(점 건물이면 ±2° 기본값)의 레이더 기준 노출면
  * 방위 구간을 구하고, 양끝에 여유마진 1° 씩 더한 윈도우 안의 포인트를 채택.
  * 거리는 레이더 기준 지상거리(haversine), 최대 줌아웃(200NM, MAX_X_KM)까지 — 건물 후방(음영구역)
- * 항적도 포함. (track_points_geo 는 백엔드에서 건물 중심 ±5° 로 사전 필터되어 들어오는데
- * 건물 각폭+마진은 그보다 좁으므로 이 윈도우는 그 부분집합 — 데이터 누락 없음.)
+ * 항적도 포함. (track_points_geo 는 백엔드에서 건물 중심 방위 ±max(5°, 노출면 반각폭+1.5°) 로 사전
+ * 필터되어 들어온다 — ObstacleMonthlyConfigModal 이 buildingAzHalfExtentDeg 와 동일 정의의 반각폭을
+ * 전송. 이 윈도우(노출면 ±1°)의 양끝은 중심에서 반각폭+1° ≤ max(5°, 반각폭+1.5°) 이므로 항상 그
+ * 부분집합 — 데이터 누락 없음.)
  */
 export function projectPointsToLos(
   los: LoSProfileData,

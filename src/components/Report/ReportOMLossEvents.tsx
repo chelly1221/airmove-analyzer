@@ -3,8 +3,7 @@ import { AlertTriangle } from "lucide-react";
 import type {
   RadarMonthlyResult, RadarSite, ManualBuilding, LoSProfileData, PanoramaMergeResult, LossPointGeo,
 } from "../../types";
-import { bearingDeg, haversineKm } from "../../utils/geo";
-import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, buildSiblings, type ClassifiedLoss } from "../../utils/obstacleAnalysisHelpers";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import AutoPaginate from "./AutoPaginate";
 
@@ -22,15 +21,17 @@ interface Props {
   panoWithoutByRadar?: Map<string, PanoramaMergeResult>;
 }
 
-/** 최대 표시 건수 */
+/** 최대 표시 건수 (이벤트 단위) */
 const MAX_EVENTS = 30;
 
 interface LossEvent {
   buildingName: string;
   date: string;
+  /** 대표 좌표 — 이벤트(gap)의 중앙 보간점 */
   lat: number;
   lon: number;
   altFt: number;
+  /** 이벤트(gap) 전체 지속시간(초) — duration_s. 보간점 합산 아님 */
   durationS: number;
   azDeg: number;
   distKm: number;
@@ -43,6 +44,10 @@ interface LossEvent {
  *   buildingCaused = 통합 차단(with) 음영 안 && 양각 ≥ 분석대상 제외(without) 차단각
  *   = [without, with] '대상 추가 차단' 밴드에 든 소실표적 = 차트 빨강영역·검은× 점과 by-construction 일치.
  * 커버리지 차이 휴리스틱(이전)이 아닌, 파노라마 실루엣 기반 양각 차단 비교로 산출 — 훨씬 정확.
+ *
+ * 표는 이벤트(event_id, 소실 gap) 단위 1행 — 같은 gap 의 보간점들이 점마다 1행씩 중복 나열되던 것을
+ * distinct event_id 로 그룹핑(스키마 계약: '…건' = 이벤트 건수). 지속시간 = duration_s(부모 gap 전체),
+ * 대표 좌표/방위/고도 = 그 이벤트의 중앙 보간점. 배지 비율도 이벤트/이벤트(분자·분모 동일 단위).
  *
  * 레이더별 블록: 헤더 + ev-badge → 이벤트 표(sm-table, 상위 30건, 건물명 포함, 지속시간 내림차순).
  * 같은 레이더의 여러 건물은 sibling 오귀속 방지(가장 강하게 소유한 건물에만 귀속)로 중복 카운트 없음.
@@ -68,53 +73,68 @@ function ReportOMLossEvents({
       if (!rs) continue;
 
       // 레이더 소실표적 평탄화 + 일자 역참조 맵 (객체 참조 → 일자). 같은 배열을 건물마다 재사용.
+      //   전체 이벤트 건수(totalCount 분모)는 distinct event_id — 보간점 수로 세면 과대(스키마 계약).
       const dateByLp = new Map<LossPointGeo, string>();
       const allLoss: LossPointGeo[] = [];
+      const allEventIds = new Set<number>();
       for (const day of rr.daily_stats) {
         for (const lp of day.loss_points_summary) {
           dateByLp.set(lp, day.date);
           allLoss.push(lp);
+          allEventIds.add(lp.event_id);
         }
       }
-
-      // 같은 레이더의 건물별 방위/거리 — sibling 오귀속 방지(섹션3·요약과 동일 스킴: 정확히 한 건물만 카운트)
-      const azByBldg = selectedBuildings.map((b) => ({
-        id: b.id,
-        azDeg: bearingDeg(rs.latitude, rs.longitude, b.latitude, b.longitude),
-        distKm: haversineKm(rs.latitude, rs.longitude, b.latitude, b.longitude),
-      }));
 
       const panoWith = panoWithByRadar?.get(rr.radar_name);
       const panoWithout = panoWithoutByRadar?.get(rr.radar_name);
 
-      const events: LossEvent[] = [];
+      // 이벤트(event_id) 단위 수집 — 같은 gap 의 보간점들이 1행씩 중복 나열되지 않도록 그룹핑.
+      //   같은 이벤트의 점이 방위 경계에서 두 건물로 나뉘어 귀속될 수 있으므로 건물별 점 목록을 모아
+      //   가장 많은 점을 귀속받은 건물을 대표 건물로 삼는다(이벤트당 정확히 1행).
+      const byEvent = new Map<number, Map<string, ClassifiedLoss[]>>();
       for (const b of selectedBuildings) {
-        const los = losMap.get(`${rr.radar_name}_${b.id}`);
-        if (!los) continue;
-        const siblings = azByBldg.filter((x) => x.id !== b.id);
-        const { losses } = classifyObstacleLosses(rs, b, los, allLoss, { panoWith, panoWithout, siblings });
+        if (!losMap.has(`${rr.radar_name}_${b.id}`)) continue;
+        // sibling — buildSiblings 단일 산식(섹션2·3과 동일 스킴: 방위/거리/허용각 + LoS 없는 건물 제외)
+        const siblings = buildSiblings(rs, selectedBuildings, b.id, losMap);
+        const { losses } = classifyObstacleLosses(rs, b, allLoss, { panoWith, panoWithout, siblings });
         const bname = b.name || `건물 ${b.id}`;
         for (const l of losses) {
           if (!l.buildingCaused) continue;
-          events.push({
-            buildingName: bname,
-            date: dateByLp.get(l.source) ?? "",
-            lat: l.source.lat,
-            lon: l.source.lon,
-            altFt: l.source.alt_ft,
-            durationS: l.durationS,
-            azDeg: l.azDeg,
-            distKm: l.distKm,
-          });
+          let byBldg = byEvent.get(l.source.event_id);
+          if (!byBldg) { byBldg = new Map(); byEvent.set(l.source.event_id, byBldg); }
+          let arr = byBldg.get(bname);
+          if (!arr) { arr = []; byBldg.set(bname, arr); }
+          arr.push(l);
         }
+      }
+
+      // 이벤트당 1행 — 지속시간 = duration_s(부모 gap 전체), 대표 좌표 = 중앙 보간점(Rust 보간 순서 = 시간순).
+      const events: LossEvent[] = [];
+      for (const byBldg of byEvent.values()) {
+        let bestName = "";
+        let bestPts: ClassifiedLoss[] = [];
+        for (const [name, pts] of byBldg) {
+          if (pts.length > bestPts.length) { bestName = name; bestPts = pts; }
+        }
+        const rep = bestPts[Math.floor((bestPts.length - 1) / 2)]; // 중앙 보간점
+        events.push({
+          buildingName: bestName,
+          date: dateByLp.get(rep.source) ?? "",
+          lat: rep.source.lat,
+          lon: rep.source.lon,
+          altFt: rep.source.alt_ft,
+          durationS: rep.durationS,
+          azDeg: rep.azDeg,
+          distKm: rep.distKm,
+        });
       }
 
       events.sort((a, b) => b.durationS - a.durationS);
       result.push({
         radarName: rr.radar_name,
         events: events.slice(0, MAX_EVENTS),
-        obstacleCausedCount: events.length,
-        totalCount: allLoss.length,
+        obstacleCausedCount: byEvent.size,  // 장애물 추가 기인 이벤트 건수 (distinct event_id)
+        totalCount: allEventIds.size,       // 전체 소실 이벤트 건수 — 분자와 동일 단위(이벤트/이벤트 비율)
       });
     }
 

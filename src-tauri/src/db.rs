@@ -413,18 +413,30 @@ pub fn save_panorama_cache(
 }
 
 /// 파노라마 캐시 로드
+/// 저장된 radar_height_m 과 요청 높이가 0.01m 초과 차이나면 캐시 미스(None)
+/// — 사이트고/안테나고 수정 후 구 높이 기준 앙각 파노라마 재사용 방지
 pub fn load_panorama_cache(
     conn: &Connection,
     radar_lat: f64,
     radar_lon: f64,
+    radar_height_m: f64,
 ) -> SqlResult<Option<String>> {
     let lat_key = format!("{:.4}", radar_lat);
     let lon_key = format!("{:.4}", radar_lon);
     let mut stmt = conn.prepare(
-        "SELECT data_json FROM panorama_cache WHERE radar_lat = ?1 AND radar_lon = ?2",
+        "SELECT data_json, radar_height_m FROM panorama_cache WHERE radar_lat = ?1 AND radar_lon = ?2",
     )?;
-    match stmt.query_row(params![lat_key, lon_key], |row| row.get::<_, String>(0)) {
-        Ok(json) => Ok(Some(json)),
+    match stmt.query_row(params![lat_key, lon_key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    }) {
+        Ok((json, stored_height_m)) => {
+            if (stored_height_m - radar_height_m).abs() > 0.01 {
+                // 레이더 높이 불일치 → 캐시 미스 (호출부에서 재계산)
+                Ok(None)
+            } else {
+                Ok(Some(json))
+            }
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e),
     }

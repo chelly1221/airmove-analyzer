@@ -7,7 +7,7 @@ import {
   gradeWithConfidence,
 } from "../../utils/omStats";
 import { haversineKm, bearingDeg } from "../../utils/geo";
-import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
+import { classifyObstacleLosses, buildSiblings } from "../../utils/obstacleAnalysisHelpers";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import BuildingGroupBadge from "./BuildingGroupBadge";
@@ -77,33 +77,30 @@ function ReportOMSummarySection({
   }, [radarResults]);
 
   // radar 좌표 시그니처 — radarSites 객체가 in-place 변경(참조 유지)돼도 재계산 트리거.
-  //   Detail.siblings 가 [radarSite.latitude, radarSite.longitude] 에 의존 → 동일 민감도로 동기화(sibling 오귀속 일치).
+  //   Detail.siblings 가 [radarSite.latitude, radarSite.longitude, radarSite.name] 에 의존 → 동일 민감도로 동기화(sibling 오귀속 일치).
   const radarGeoKey = radarSites.map((r) => `${r.latitude},${r.longitude},${r.name}`).join(";");
 
-  // 건물×레이더: 음영소실(장애물 추가 기인) 건수 + 추가 차단 여부 — AzElevChart 와 동일 분류(classifyObstacleLosses)
+  // 건물×레이더: 음영소실(장애물 추가 기인) 이벤트 건수(distinct event_id) + 추가 차단 여부 —
+  //   AzElevChart·§3 요약표와 동일 분류(classifyObstacleLosses). '…건' 표시는 스키마 계약대로 이벤트 단위
+  //   (같은 gap 의 보간점을 점 개수로 세면 과대 — buildingEventCount 사용).
   //   hasBldgEffect = 대상 차단각(with) > 지형·기존지물 차단각(without)+0.005° → 섹션3(AzElevChart)·LoS 단면도와 동일 조건.
   //   추가 차단 양각이 없으면(지형 이하) LoS 열을 '차단'이 아닌 '양호'로 표기(섹션2,3 통일).
   const obstacleInfoByKey = useMemo(() => {
     const m = new Map<string, { shadowLoss: number; hasBldgEffect: boolean }>();
     for (const r of radarSites) {
-      // 같은 레이더의 건물별 방위 (sibling 오귀속 방지용 — 가장 가까운 방위 건물에 귀속)
-      const azByBldg = selectedBuildings.map((b) => ({
-        id: b.id,
-        azDeg: bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude),
-        distKm: haversineKm(r.latitude, r.longitude, b.latitude, b.longitude),
-      }));
       for (const b of selectedBuildings) {
-        const los = losMap.get(`${r.name}_${b.id}`);
-        if (!los) continue;
-        const siblings = azByBldg.filter((x) => x.id !== b.id).map((x) => ({ id: x.id, azDeg: x.azDeg, distKm: x.distKm }));
-        const { buildingCount, angleTotalDeg, angleTerrainDeg } = classifyObstacleLosses(r, b, los, lossPointsByRadar.get(r.name) ?? [], {
+        if (!losMap.has(`${r.name}_${b.id}`)) continue;
+        // sibling — buildSiblings 단일 산식(§3 상세·§4 소실상세와 동일). LoS 결과 없는(=classify 미실행)
+        //   건물은 제외해, 집계 못 할 건물이 소실표적 소유권만 가져가 누락시키는 것 방지.
+        const siblings = buildSiblings(r, selectedBuildings, b.id, losMap);
+        const { buildingEventCount, angleTotalDeg, angleTerrainDeg } = classifyObstacleLosses(r, b, lossPointsByRadar.get(r.name) ?? [], {
           panoWith: panoWithByRadar?.get(r.name),
           panoWithout: panoWithoutByRadar?.get(r.name),
           siblings,
         });
         // 추가 차단 양각 존재 여부 (AzElevChart hasBldgEffect 와 동일 임계 0.005°)
         const hasBldgEffect = angleTotalDeg > angleTerrainDeg + 0.005;
-        m.set(`${r.name}_${b.id}`, { shadowLoss: buildingCount, hasBldgEffect });
+        m.set(`${r.name}_${b.id}`, { shadowLoss: buildingEventCount, hasBldgEffect });
       }
     }
     return m;

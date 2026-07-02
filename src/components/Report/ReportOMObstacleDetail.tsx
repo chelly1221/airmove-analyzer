@@ -1,11 +1,11 @@
 import React, { useMemo } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult } from "../../types";
 import type { LossPointGeo, TrackPointGeo, ObstacleMonthlyResult, AddedBlockageResult } from "../../types/obstacle";
-import { haversineKm, bearingDeg } from "../../utils/geo";
+import { haversineKm } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
-import { losBlockedFromPanorama } from "../../utils/obstacleAnalysisHelpers";
+import { losBlockedFromPanorama, buildSiblings } from "../../utils/obstacleAnalysisHelpers";
 import BuildingGroupBadge from "./BuildingGroupBadge";
 import ReportOMObstacleAzElevChart from "./ReportOMObstacleAzElevChart";
 import ReportOMObstacleSummaryTable from "./ReportOMObstacleSummaryTable";
@@ -25,26 +25,25 @@ interface Props {
   panoWith?: PanoramaMergeResult;
   /** 이 레이더의 분석 대상 제외 파노라마 (Az×Elev 차트용) */
   panoWithout?: PanoramaMergeResult;
-  /** 선택된 전체 분석 대상 건물 — 소실표적 오귀속 방지(가장 가까운 방위 건물에 귀속)용 sibling 방위 계산 */
+  /** 선택된 전체 분석 대상 건물 — 소실표적 오귀속 방지(가장 강하게 소유한 건물에 귀속)용 sibling 계산 */
   allBuildings: ManualBuilding[];
+  /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) — sibling 에서 LoS 결과 없는(=classify 미실행)
+   *  건물을 제외하기 위한 조회용(§2·§4 와 동일 규칙). 미제공 시 전체 건물을 sibling 으로 사용(구 호출부 호환). */
+  losMap?: Map<string, LoSProfileData>;
   /** 추가 차단영역 소실율 — 헤드라인 심각도 지표 (ReportApp 에서 산출, 이 건물 키) */
   blockage?: AddedBlockageResult;
 }
 
 /** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. 빌딩 메타 + ①영향범위 도면 + ②분류 요약표 + ③LoS 단면도 + ④Az×Elev 차트. */
 function ReportOMObstacleDetail({
-  sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout, allBuildings, blockage,
+  sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout, allBuildings, losMap, blockage,
 }: Props) {
-  // 같은 레이더의 '다른' 분석 대상 건물(방위+거리) — 소실표적을 더 강하게 소유하는 건물 있으면 본 건물 집계서 제외
+  // 같은 레이더의 '다른' 분석 대상 건물 — buildSiblings(§2 요약·§4 소실상세와 동일 산식: 방위/거리/허용각 +
+  //   losMap 제공 시 LoS 결과 없는 건물 제외). 더 강하게 소유하는(claim 가능한) 건물 있으면 본 건물 집계서 제외.
   const siblings = useMemo(
-    () => allBuildings
-      .filter((b) => b.id !== building.id)
-      .map((b) => ({
-        id: b.id,
-        azDeg: bearingDeg(radarSite.latitude, radarSite.longitude, b.latitude, b.longitude),
-        distKm: haversineKm(radarSite.latitude, radarSite.longitude, b.latitude, b.longitude),
-      })),
-    [allBuildings, building.id, radarSite.latitude, radarSite.longitude],
+    () => buildSiblings(radarSite, allBuildings, building.id, losMap),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- radarSite 는 좌표·이름 granular 의존(객체 in-place 변경 대응) — §2·§4 sibling 계산과 동일 민감도.
+    [allBuildings, building.id, radarSite.latitude, radarSite.longitude, radarSite.name, losMap],
   );
   // 빌딩 위치 메타
   const bDistKm = useMemo(
@@ -55,7 +54,8 @@ function ReportOMObstacleDetail({
   const bTopFt = Math.round(bTopElevM * 3.28084);
 
   // LoS 단면도 차단 배지 — 소실표적 분류(classifyObstacleLosses)와 동일한 panorama 실루엣 소스로 통일.
-  //   panorama 미준비 시 chord(los.losBlocked)로 폴백. (단면도 차트 본문 코리도 시각화는 그대로 유지.)
+  //   panorama 미준비 시 chord(los.losBlocked)로 폴백 — chord 도 분석 대상 자신을 제외해 판정(computeLosBatch·
+  //   excludeTargetBuildings)하므로 폴백 역시 self-block 없음. (단면도 차트 본문 코리도 시각화는 그대로 유지.)
   const losBlockedPano = useMemo(
     () => losBlockedFromPanorama(radarSite, building, los, panoWithout) ?? los.losBlocked,
     [radarSite, building, los, panoWithout],
@@ -114,7 +114,6 @@ function ReportOMObstacleDetail({
       <ReportOMObstacleSummaryTable
         radarSite={radarSite}
         building={building}
-        los={los}
         lossPoints={allLossThisRadar}
         panoWith={panoWith}
         panoWithout={panoWithout}
@@ -140,7 +139,6 @@ function ReportOMObstacleDetail({
         radarSite={radarSite}
         building={building}
         buildingGroups={buildingGroups}
-        los={los}
         panoWith={panoWith}
         panoWithout={panoWithout}
         lossPoints={allLossThisRadar}

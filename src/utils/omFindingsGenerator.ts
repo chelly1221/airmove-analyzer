@@ -74,7 +74,13 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     const avgPsr = weightedPsrAvg(stats);
     const deviation = avgLoss - avgBaseline;
     const grade = stats.length < 7 ? "판정 보류" : gradeLabel(avgLoss);
-    const totalLossEvents = stats.flatMap((d) => d.loss_points_summary).length;
+    // 소실 이벤트 건수 — loss_points_summary 는 gap 당 보간점 여러 개(60초 gap → 11점)라
+    //   점 개수로 세면 수 배 과대. distinct event_id(gap 고유 번호, 레이더 결과 내 유일)로 집계.
+    const eventIds = new Set<number>();
+    for (const d of stats) {
+      for (const lp of d.loss_points_summary) eventIds.add(lp.event_id);
+    }
+    const totalLossEvents = eventIds.size;
 
     lines.push(`[${rr.radar_name}] 방위 소실율 등급(보조): ${grade}${stats.length < 7 ? ` (관측일수 ${stats.length}일 < 7일)` : ""}`);
     lines.push(`  - 분석 기간: ${stats.length}일, 평균 표적소실율: ${avgLoss.toFixed(2)}%(±${lossSigma.toFixed(2)}), 기준선: ${avgBaseline.toFixed(2)}%, 편차: ${deviation > 0 ? "+" : ""}${deviation.toFixed(2)}%p`);
@@ -129,8 +135,8 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       lines.push(`  → 최대 소실일: ${maxDay.date} (${maxDay.loss_rate.toFixed(2)}%), 해당 일 특이사항 확인 필요.`);
     }
 
-    // Loss 고도 분석
-    if (rr.avg_loss_altitude_ft > 0) {
+    // Loss 고도 분석 — 이벤트 0건이면 평균고도 자체가 무의미(Rust 기본값 0.0)라 줄 생략 (이중 안전)
+    if (totalLossEvents > 0 && rr.avg_loss_altitude_ft > 0) {
       const altM = rr.avg_loss_altitude_ft * 0.3048;
       lines.push(`  - 소실 이벤트 평균 고도: ${rr.avg_loss_altitude_ft.toFixed(0)}ft (${altM.toFixed(0)}m)`);
       if (altM < 500) {
@@ -143,6 +149,10 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
   // ── 3. LoS 분석 결과 ──
   if (losMap.size > 0) {
     lines.push(`■ LoS(가시선) 분석`);
+    // 건물 표시명 조회 맵 — losMap 키는 `${radarName}_${buildingId}` (computeLosBatch, 단일 '_').
+    //   radarName 자체에 '_' 가 있어도 los.radarSiteName 접두사를 정확히 벗겨 건물 ID 를 얻는다.
+    const bldgNameById = new Map<string, string>();
+    for (const b of selectedBuildings) bldgNameById.set(String(b.id), b.name || `건물${b.id}`);
     let hasBlocked = false;
     for (const [key, los] of losMap) {
       // 차단 판정 — panorama 실루엣(단면도 배지·소실표적 분류와 동일 소스) 우선, 없으면 chord(los.losBlocked) 폴백.
@@ -150,7 +160,10 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       if (blocked) hasBlocked = true;
       const distKm = los.totalDistance; // totalDistance 는 이미 km (computeLosBatch)
       const statusStr = blocked ? "차단" : "양호";
-      let detail = `  - ${los.radarSiteName} → ${key.includes("__") ? key.split("__")[1] : key}: ${distKm.toFixed(1)}km, ${statusStr}`;
+      const radarPrefix = `${los.radarSiteName}_`;
+      const bldgIdStr = key.startsWith(radarPrefix) ? key.slice(radarPrefix.length) : key;
+      const targetName = bldgNameById.get(bldgIdStr) ?? `건물 #${bldgIdStr}`;
+      let detail = `  - ${los.radarSiteName} → ${targetName}: ${distKm.toFixed(1)}km, ${statusStr}`;
       if (blocked && los.maxBlockingPoint) {
         const bp = los.maxBlockingPoint;
         detail += ` (차단점: ${bp.distance.toFixed(1)}km 지점, ${bp.elevation.toFixed(0)}m${bp.name ? ` [${bp.name}]` : ""})`;

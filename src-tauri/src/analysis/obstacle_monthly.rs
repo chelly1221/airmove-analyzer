@@ -51,9 +51,17 @@ pub struct RadarFileSet {
     /// 장애물 최소 거리(km) — 이보다 먼 항적만 분석 대상
     #[serde(default)]
     pub min_obstacle_distance_km: f64,
-    /// LoS 단면도 표시용 건물 방위각 목록 (±5° 이내만 track_points_geo에 포함)
+    /// LoS 단면도 표시용 건물 방위각(중심) 목록 — track_points_geo 사전필터 기준.
+    /// 허용 반폭은 건물별 max(5°, 반각폭+1.5°) — building_az_half_extents_deg 참조.
     #[serde(default)]
     pub building_bearings_deg: Vec<f64>,
+    /// 건물별 방위 반각폭(°) — building_bearings_deg 와 인덱스 정렬(병렬 배열).
+    /// 프론트 calcBuildingAzExtent 노출면 양끝이 중심 방위에서 벗어난 최대 각도.
+    /// track_points_geo 사전필터 허용 반폭 = max(5°, 반각폭 + 1.5°) 산출에 사용 —
+    /// 각폭 넓은 건물(반각폭>4°)에서 프론트 차트 창(노출면±1°)의 가장자리 항적 누락 방지.
+    /// 비어 있으면(구버전 페이로드) 반각폭 0 으로 간주 → 기존 ±5° 동작.
+    #[serde(default)]
+    pub building_az_half_extents_deg: Vec<f64>,
 }
 
 // ─── 출력 타입 ───
@@ -64,7 +72,16 @@ pub struct LossPointGeo {
     pub lat: f64,
     pub lon: f64,
     pub alt_ft: f64,
+    /// 부모 gap(소실 이벤트) 전체 지속시간(초) — 이벤트 지속시간 표시용.
+    /// 같은 gap 의 보간점 모두 동일 값이므로 점마다 합산하면 N×gap 과대 — 시간 합산엔 share_s 사용.
     pub duration_s: f64,
+    /// 소실 gap(이벤트) 고유 번호 — analyze_radar_monthly 1회 실행(레이더 결과) 내에서
+    /// gap 마다 1씩 증가. 같은 gap 의 보간점들은 같은 event_id.
+    /// '…건'(이벤트 건수) 표시는 distinct event_id 개수로 집계.
+    pub event_id: u32,
+    /// gap / total_missed — 보간점 균등 분배 시간(초). 같은 gap 의 share_s 합 = gap.
+    /// 히스토그램 loss_per_pt 와 동일 값. 소실시간 합산은 Σ share_s.
+    pub share_s: f64,
 }
 
 /// 항적 포인트 좌표 (LoS 단면도 오버레이용)
@@ -274,12 +291,17 @@ fn process_baseline_day(
     BaselineDayResult { psr_rate, loss_rate, track_time_secs: bl_track_time, ssr_points: bl_ssr }
 }
 
-/// track_points_geo 포함 여부: 건물 방위 ±5° 이내인지 확인
-fn in_any_building_bearing(az: f64, bearings: &[f64]) -> bool {
-    bearings.iter().any(|&b| {
+/// track_points_geo 포함 여부: 건물 방위 중심 ± 허용 반폭 이내인지 확인.
+/// 허용 반폭 = max(5°, 건물 방위 반각폭 + 1.5°) — 각폭 넓은 건물(반각폭>4°)에서
+/// 프론트 차트 창(노출면±1°)이 사전필터를 넘어 가장자리 항적이 원천 누락되지 않도록 확장.
+/// half_extents 는 bearings 와 병렬 배열 — 항목이 없으면 반각폭 0(기존 ±5° 동작).
+fn in_any_building_bearing(az: f64, bearings: &[f64], half_extents: &[f64]) -> bool {
+    bearings.iter().enumerate().any(|(i, &b)| {
+        let half = half_extents.get(i).copied().unwrap_or(0.0);
+        let allow = (half + 1.5).max(5.0);
         let mut diff = (az - b).abs();
         if diff > 180.0 { diff = 360.0 - diff; }
-        diff <= 5.0
+        diff <= allow
     })
 }
 
@@ -579,6 +601,8 @@ pub fn analyze_radar_monthly(
     let mut daily_stats: Vec<DailyStats> = Vec::with_capacity(total_days);
     let mut all_loss_alt_sum = 0.0f64;
     let mut all_loss_alt_count = 0u32;
+    // 소실 gap(이벤트) 카운터 — 이 레이더 결과 내에서 gap 마다 1씩 증가, 보간점 event_id 로 공유
+    let mut next_event_id = 0u32;
 
     // 안테나 해발고 (양각 계산용) — 추가 차단영역 히스토그램 전반에서 사용
     let radar_h = radar.radar_altitude + radar.antenna_height;
@@ -617,12 +641,12 @@ pub fn analyze_radar_monthly(
         let points = daily_points.get(date).expect("date exists in daily_points keys");
 
         // 항적 포인트 좌표 수집 (LoS 단면도 오버레이용)
-        // 건물 방위 ±5° 이내만 필터링하여 IPC 전송량 대폭 감소
+        // 건물 방위 중심 ± max(5°, 반각폭+1.5°) 이내만 필터링하여 IPC 전송량 대폭 감소
         // (기존: 전체 포인트 ~270만개 → 수만 개로 99% 감소)
         let day_track_geo: Vec<TrackPointGeo> = if has_building_bearings {
             points.iter().filter(|p| {
                 let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude);
-                in_any_building_bearing(az, &radar.building_bearings_deg)
+                in_any_building_bearing(az, &radar.building_bearings_deg, &radar.building_az_half_extents_deg)
             }).map(|p| TrackPointGeo {
                 lat: p.latitude,
                 lon: p.longitude,
@@ -763,8 +787,11 @@ pub fn analyze_radar_monthly(
                         all_loss_alt_sum += avg_alt_ft;
                         all_loss_alt_count += 1;
                         // 스캔별 보간 포인트 생성 (TrackMap Worker와 동일)
+                        // 같은 gap 의 보간점들은 event_id 를 공유 — 이벤트 건수는 distinct event_id
+                        next_event_id += 1;
+                        let event_id = next_event_id;
                         let total_missed = ((gap / scan_interval).round() as u32).saturating_sub(1).max(1);
-                        // 히스토그램 소실시간 분배 (보간점들에 균등 분배 → 합 = gap)
+                        // 소실시간 분배 (보간점들에 균등 분배 → 합 = gap) — share_s·히스토그램 공용
                         let loss_per_pt = gap / total_missed as f64;
                         for si in 1..=total_missed {
                             let t = si as f64 / (total_missed as f64 + 1.0);
@@ -775,7 +802,9 @@ pub fn analyze_radar_monthly(
                                 lat: ilat,
                                 lon: ilon,
                                 alt_ft: ialt * 3.28084,
-                                duration_s: gap,
+                                duration_s: gap,        // 이벤트 전체 시간 (표시용 — 합산 금지)
+                                event_id,
+                                share_s: loss_per_pt,   // 균등 분배 시간 — Σ share_s = gap
                             });
                             // ── 추가 차단영역 히스토그램: 소실시간 (보간점 셀) ──
                             let la = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, ilat, ilon);
@@ -848,7 +877,7 @@ pub fn analyze_radar_monthly(
     let avg_loss_alt = if all_loss_alt_count > 0 {
         all_loss_alt_sum / all_loss_alt_count as f64
     } else {
-        5000.0 // 기본값
+        0.0 // 소실 0건 = '값 없음' — TS 소비부(omFindingsGenerator)가 >0 가드로 표시 생략
     };
 
     info!(

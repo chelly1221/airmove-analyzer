@@ -4,29 +4,30 @@
  * 기존 ReportOMObstacleAzElevChart 캔버스 하단에 인라인이던 요약표를 단독 컴포넌트로 분리.
  * (§3 상세 재배치: 영향범위 도면 → 요약표 → LoS 단면도 → Az×Elev 차트 순. 표를 차트에서 떼어 2번째 배치)
  * 차트와 동일한 classifyObstacleLosses(동일 인자) 결과를 사용 → 집계·편집키(azelev.*.tbl.*) 완전 동일.
+ *
+ * 집계 단위 — 스키마 계약:
+ *   '…건' = 이벤트 건수(distinct event_id), 비율 = 이벤트/이벤트(분자·분모 동일 단위),
+ *   소실시간 = Σ share_s(같은 gap 보간점 합 = gap — 점×gap 과대 없음), 점 개수는 1행에 병기(차트 점과 일치).
  */
 import { useMemo } from "react";
-import type { ManualBuilding, RadarSite, LoSProfileData, PanoramaMergeResult } from "../../types";
+import type { ManualBuilding, RadarSite, PanoramaMergeResult } from "../../types";
 import type { LossPointGeo, AddedBlockageResult } from "../../types/obstacle";
 import { classifyObstacleLosses, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import { BLOCKAGE_NONE_LABEL } from "../../utils/omStats";
 import OMEditable from "./OMEditable";
 
 const KM_PER_NM = 1.852;
-/** 소실표적 분류 방위 허용오차(°) — classifyObstacleLosses 의 AZ_TOLERANCE_DEG 와 동일 (후방 소실표적 집계 윈도우) */
-const AZ_TOLERANCE = 10;
 
 interface Props {
   radarSite: RadarSite;
   building: ManualBuilding;
-  los: LoSProfileData;
   /** 이 레이더의 모든 소실표적 (방위 윈도우 + 대상 후방 필터링은 분류 내부에서) */
   lossPoints: LossPointGeo[];
   /** 분석 대상 포함 파노라마 (분류 차단각 산출 — 차트 빨강영역과 동일 소스) */
   panoWith?: PanoramaMergeResult;
   /** 분석 대상 제외 파노라마 */
   panoWithout?: PanoramaMergeResult;
-  /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적 오귀속 방지용 (분류 내부에서 사용) */
+  /** 같은 레이더의 '다른' 분석 대상 건물 — buildSiblings 산출(소실표적 오귀속 방지, 분류 내부에서 사용) */
   siblings?: SiblingBuilding[];
   /** 추가 차단영역 소실율 — 헤드라인 심각도 지표 (omAddedBlockage, ReportApp 에서 산출) */
   blockage?: AddedBlockageResult;
@@ -34,22 +35,23 @@ interface Props {
 
 /** 분류 요약표 — Az×Elev 차트와 동일 분류 결과를 표로 제공. */
 export default function ReportOMObstacleSummaryTable({
-  radarSite, building, los, lossPoints, panoWith, panoWithout, siblings, blockage,
+  radarSite, building, lossPoints, panoWith, panoWithout, siblings, blockage,
 }: Props) {
   // 차트(ReportOMObstacleAzElevChart)와 동일 인자 → 동일 집계. (보고서 1건 분량, 메모이즈로 재계산 저렴)
   const computed = useMemo(
-    () => classifyObstacleLosses(radarSite, building, los, lossPoints, { panoWith, panoWithout, siblings }),
-    [radarSite, building, los, lossPoints, panoWith, panoWithout, siblings],
+    () => classifyObstacleLosses(radarSite, building, lossPoints, { panoWith, panoWithout, siblings }),
+    [radarSite, building, lossPoints, panoWith, panoWithout, siblings],
   );
 
-  // 요약 수치
-  const total = computed.losses.length;
-  const shadowCount = computed.shadowCount;
-  const bldgCount = computed.buildingCount;
-  const bldgDuration = computed.buildingDurationS;
-  const freeCount = total - shadowCount;
-  const shadowRatio = total > 0 ? (shadowCount / total) * 100 : 0;
-  const bldgRatio = total > 0 ? (bldgCount / total) * 100 : 0;
+  // 요약 수치 — '…건'은 이벤트(distinct event_id), 비율도 이벤트/이벤트. 점 개수(totalPts)는 1행 병기용.
+  const totalPts = computed.losses.length;
+  const totalEv = computed.totalEventCount;
+  const shadowEv = computed.shadowEventCount;
+  const bldgEv = computed.buildingEventCount;
+  const bldgDuration = computed.buildingDurationS; // Σ share_s — 같은 gap 보간점 합 = gap
+  const freeEv = totalEv - shadowEv;               // inShadow 점이 하나도 없는 이벤트 (합 = totalEv 보존)
+  const shadowRatio = totalEv > 0 ? (shadowEv / totalEv) * 100 : 0;
+  const bldgRatio = totalEv > 0 ? (bldgEv / totalEv) * 100 : 0;
   const hasBldgEffect = computed.angleTotalDeg > computed.angleTerrainDeg + 0.005;
 
   // 인라인 편집키 접두사 — 차트와 동일 스킴(azelev.*) 유지 → 기존 편집 보존
@@ -67,21 +69,22 @@ export default function ReportOMObstacleSummaryTable({
       </thead>
       <tbody>
         <tr>
-          <td>방위 ±{AZ_TOLERANCE}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
-          <td className="ta-r mono">{total}건</td>
+          {/* 허용각은 건물별 max(±10°, 노출면 반각폭+1°) — classifyAzToleranceDeg(분류와 단일 소스) */}
+          <td>방위 ±{computed.azTolDeg.toFixed(1)}° · <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" /></td>
+          <td className="ta-r mono">{totalEv}건 · {totalPts}점</td>
           <td className="muted"><OMEditable id={`${eid}.tbl.r1.note`} value="분석 대상 후방 영역" tag="span" /></td>
         </tr>
         <tr className="alt">
           <td><OMEditable id={`${eid}.tbl.r2.label`} value="LoS 차단 영역 내" tag="span" /></td>
           <td className="ta-r mono">
-            {shadowCount}건 ({shadowRatio.toFixed(1)}%)
+            {shadowEv}건 ({shadowRatio.toFixed(1)}%)
           </td>
           <td className="muted"><OMEditable id={`${eid}.tbl.r2.note`} value="지형+장애물 통합 차단" tag="span" /></td>
         </tr>
         <tr>
           <td className="strong" style={{ color: "#a60739" }}><OMEditable id={`${eid}.tbl.r3.label`} value="장애물 추가 기인" tag="span" /></td>
           <td className="ta-r mono strong" style={{ color: bldgRatio > 10 ? "#dc2626" : "#374151" }}>
-            {bldgCount}건 ({bldgRatio.toFixed(1)}%) / {bldgDuration.toFixed(1)}초
+            {bldgEv}건 ({bldgRatio.toFixed(1)}%) / {bldgDuration.toFixed(1)}초
           </td>
           <td className="muted">
             <OMEditable id={`${eid}.tbl.r3.note`} value="지형·기존지물 차단각 초과 ~ 대상 차단각 사이" tag="span" />
@@ -113,7 +116,7 @@ export default function ReportOMObstacleSummaryTable({
         <tr className="alt">
           <td style={{ color: "#2563eb" }}><OMEditable id={`${eid}.tbl.r4.label`} value="장애물 무관" tag="span" /></td>
           <td className="ta-r mono">
-            {freeCount}건 ({total > 0 ? ((freeCount / total) * 100).toFixed(1) : "0.0"}%)
+            {freeEv}건 ({totalEv > 0 ? ((freeEv / totalEv) * 100).toFixed(1) : "0.0"}%)
           </td>
           <td className="muted"><OMEditable id={`${eid}.tbl.r4.note`} value="차단 영역 외 소실표적" tag="span" /></td>
         </tr>
@@ -126,7 +129,7 @@ export default function ReportOMObstacleSummaryTable({
           <td className="muted">
             {(computed.bDistKm / KM_PER_NM).toFixed(1)}NM · 추가 기인 판정:
             {" "}
-            {/* 헤드라인은 추가 차단영역 등급으로 정렬 — count 비율(bldgRatio) 폴백은 추가 차단영역 미제공 시 */}
+            {/* 헤드라인은 추가 차단영역 등급으로 정렬 — 이벤트 비율(bldgRatio) 폴백은 추가 차단영역 미제공 시 */}
             {blockage
               ? <span className="strong" style={{ color: blockage.grade.color }}>{blockage.grade.label}</span>
               : bldgRatio > 20

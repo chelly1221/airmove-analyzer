@@ -66,7 +66,14 @@ function ReportOMFindings({
     const avgBaseline = weightedBaselineLossAvg(stats);
     const baselineSigma = weightedBaselineLossStdDev(stats);
     const deviation = avgLoss - avgBaseline;
-    const totalLoss = stats.flatMap((d) => d.loss_points_summary).length;
+    // 소실표적 건수 — loss_points_summary 는 gap 당 보간점 여러 개(60초 gap → 11점)라
+    //   점 개수로 세면 수 배 과대. distinct event_id(gap 고유 번호, 레이더 결과 내 유일)로 집계
+    //   (omFindingsGenerator 의 '소실 이벤트 N건'과 동일 산식 — 같은 보고서 내 수치 일치).
+    const eventIds = new Set<number>();
+    for (const d of stats) {
+      for (const lp of d.loss_points_summary) eventIds.add(lp.event_id);
+    }
+    const totalLoss = eventIds.size;
     const grade = gradeWithConfidence(avgLoss, stats.length);
 
     return {

@@ -9,7 +9,21 @@ export interface LossPointGeo {
   lat: number;
   lon: number;
   alt_ft: number;
+  /**
+   * 부모 gap(소실 이벤트) 전체 지속시간(초) — 이벤트 지속시간 표시용.
+   * 같은 이벤트의 보간점 모두 동일 값이므로 점마다 합산하면 N×gap 과대 — 시간 합산엔 share_s 사용.
+   */
   duration_s: number;
+  /**
+   * 소실 gap(이벤트) 고유 번호 — 레이더 결과(RadarMonthlyResult) 내에서 gap 마다 1씩 증가.
+   * 같은 이벤트의 보간점들은 같은 event_id. '…건'(이벤트 건수)은 distinct event_id 개수로 집계.
+   */
+  event_id: number;
+  /**
+   * gap / total_missed — 보간점 균등 분배 시간(초). 같은 이벤트의 share_s 합 = gap.
+   * 히스토그램 loss_per_pt 와 동일 값. 소실시간 합산은 Σ share_s.
+   */
+  share_s: number;
 }
 
 /** 항적 포인트 좌표 (LoS 단면도 오버레이용) */

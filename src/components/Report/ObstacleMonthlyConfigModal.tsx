@@ -235,10 +235,21 @@ export default function ObstacleMonthlyConfigModal({
         console.log(`건물: ${selectedBuildings.map((b) => `${b.name}(${b.id})`).join(", ")}`);
         console.groupEnd();
 
-        // 건물 방위각 (LoS 단면도 track_points_geo 필터용)
+        // 건물 방위각(중심) (LoS 단면도 track_points_geo 필터용)
         const buildingBearings = selectedBuildings.map((b) =>
           bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude),
         );
+        // 건물별 방위 반각폭 — 백엔드 track_points_geo 사전필터 허용 반폭 = max(5°, 반각폭+1.5°) 산출용.
+        // calcBuildingAzExtent 노출면 양끝이 중심 방위에서 벗어난 최대 각도(비대칭 노출면 대비 max)로 계산해
+        // 단면도 차트 창(projectPointsToLos, 노출면±1°)이 항상 사전필터의 부분집합이 되도록 보장한다.
+        const buildingAzHalfExtents = selectedBuildings.map((b, bi) => {
+          const ext = calcBuildingAzExtent(r.latitude, r.longitude, b);
+          const angDiff = (a: number, c: number) => {
+            const d = Math.abs(a - c) % 360;
+            return d > 180 ? 360 - d : d;
+          };
+          return Math.max(angDiff(ext.start_deg, buildingBearings[bi]), angDiff(ext.end_deg, buildingBearings[bi]));
+        });
 
         return {
           radar_name: r.name, radar_lat: r.latitude, radar_lon: r.longitude,
@@ -247,6 +258,7 @@ export default function ObstacleMonthlyConfigModal({
           azimuth_sectors: sectors,
           min_obstacle_distance_km: minObstacleDist,
           building_bearings_deg: buildingBearings,
+          building_az_half_extents_deg: buildingAzHalfExtents,
         };
       });
 

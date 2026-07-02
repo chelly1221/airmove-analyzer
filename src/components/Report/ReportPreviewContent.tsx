@@ -236,6 +236,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
                       panoWith={omData.panoWithTargets?.get(rs.name)}
                       panoWithout={omData.panoWithoutTargets?.get(rs.name)}
                       allBuildings={omData.selectedBuildings}
+                      losMap={omData.losMap}
                       blockage={omData.addedBlockageByKey?.[`${rs.name}_${b.id}`]}
                     />
                   );

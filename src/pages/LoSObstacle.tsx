@@ -163,6 +163,8 @@ export default function LoSObstacle() {
         const cached = await invoke<string | null>("load_panorama_cache", {
           radarLat: radarSite.latitude,
           radarLon: radarSite.longitude,
+          // 저장 시(radarH) 와 동일식 — 높이 불일치 시 캐시 미스 → 재계산
+          radarHeightM: radarSite.altitude + radarSite.antenna_height,
         });
         if (cancelled) return;
         if (cached) {

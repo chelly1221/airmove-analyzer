@@ -674,17 +674,18 @@ async fn save_panorama_cache(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-/// 파노라마 캐시 로드
+/// 파노라마 캐시 로드 (저장 높이와 불일치 시 None → 호출부 재계산)
 #[tauri::command]
 async fn load_panorama_cache(
     app_handle: tauri::AppHandle,
     radar_lat: f64,
     radar_lon: f64,
+    radar_height_m: f64,
 ) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::load_panorama_cache(&conn, radar_lat, radar_lon)
+        db::load_panorama_cache(&conn, radar_lat, radar_lon, radar_height_m)
             .map_err(|e| format!("DB error: {}", e))
     })
     .await

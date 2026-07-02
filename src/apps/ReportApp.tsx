@@ -100,6 +100,10 @@ export default function ReportApp() {
   const omDataCacheRef = useRef<OMReportData | null>(null);
   // 자동 생성된 findingsText 스냅샷 — 추가 차단영역 산출 후 재생성 시 사용자 편집 보호용(미편집일 때만 덮어씀)
   const autoFindingsRef = useRef<string>("");
+  // 커버리지 실패 기록 — 모달의 커버리지 catch(onCoverageError)가 호출되는 시점엔 omData 가
+  // 아직 null 이라 setOmData 만으로는 반영이 안 되므로 ref 로 기록한다.
+  // handleOMGenerate 에서 진단용으로 소비 후 리셋, reload-config 시에도 리셋.
+  const coverageErrorRef = useRef(false);
 
   // PDF 내보내기
   const [generating, setGenerating] = useState(false);
@@ -144,13 +148,21 @@ export default function ReportApp() {
 
   /** IDB에서 페이로드 읽기 → state 적용 */
   const loadingRef = useRef(false);
+  // 재로드 세대 카운터 — reload-config 수신 시 증가. 진행 중이던 loadFromIDB 가
+  // await 후 재개될 때 세대가 바뀌었으면 이전 보고서의(stale) 페이로드를 새 흐름 위에
+  // 덮어쓰지 않도록 결과를 폐기한다 (stale omData 부활 → omReady 오판 방지).
+  const loadEpochRef = useRef(0);
   const loadFromIDB = useCallback(async () => {
     // 중복 호출 방지 (fallback timer + event 동시 발생 시)
     if (loadingRef.current) return;
     loadingRef.current = true;
+    const epoch = loadEpochRef.current;
     setPrepPhase("loading");
     try {
       const payload = await readReportPayload();
+      // 읽는 동안 reload-config 도착 → 이 페이로드는 이전 세대 것 — 상태에 반영하지 않고 폐기.
+      // loadingRef/prepPhase 는 reload 핸들러가 이미 리셋했으므로 건드리지 않는다.
+      if (epoch !== loadEpochRef.current) return;
       if (!payload) {
         loadingRef.current = false;
         setPrepPhase("waiting"); // 아직 IDB에 없음 — 이벤트 대기
@@ -158,6 +170,7 @@ export default function ReportApp() {
       }
       const s = payloadToState(payload);
       await clearReportPayload();
+      if (epoch !== loadEpochRef.current) return; // clear 대기 중 reload — stale 적용 방지
 
       // 캐시된 대용량 데이터가 있으면 IDB에서 받은 경량 버전 대신 원본 사용
       const cachedOm = omDataCacheRef.current;
@@ -179,6 +192,7 @@ export default function ReportApp() {
         loadingRef.current = false;
       });
     } catch (e) {
+      if (epoch !== loadEpochRef.current) return; // stale 세대의 에러는 새 흐름에 표시하지 않음
       setError(`데이터 로드 실패: ${e instanceof Error ? e.message : String(e)}`);
       setLoading(false);
       setPrepPhase(null);
@@ -224,11 +238,22 @@ export default function ReportApp() {
       console.log(`[Rust] ${e.payload}`);
     });
 
-    // report:reload-config → 기존 창 재사용 시 모달 다시 표시
+    // report:reload-config → 기존 창 재사용 시 모달 다시 표시.
+    // 이전 보고서의 stale 상태를 전수 초기화한다 — 특히 omData 를 남겨두면 이전 보고서의
+    // omReady=true 가 새 모달에 그대로 전달되어, 새 분석이 transfer 단계에 도달하자마자
+    // 모달이 '완료'로 조기 종료된다(파노라마 미시작 상태인데도).
     const unlistenReloadConfig = listen("report:reload-config", async () => {
+      loadEpochRef.current += 1;         // 진행 중 loadFromIDB 의 이전 세대 결과 폐기
       loadingRef.current = false;
       omDataCacheRef.current = null;
+      autoFindingsRef.current = "";      // 이전 보고서 자동 소견 스냅샷 해제
+      coverageErrorRef.current = false;  // 이전 커버리지 실패 기록 해제
+      panoramaStartedRef.current = null; // 이전 result 참조 해제 (대용량 GC + 새 파노라마 실행 보장)
+      covQueueRef.current = null;        // PDF 중 큐된 이전 커버리지 업데이트 폐기
+      setPanoramaLastError(null);
+      setError(null);
       setState(null);
+      setOmData(null); // omData 파생 effect(파노라마) cleanup 이 진행 중 계산도 함께 취소한다
       setLoading(true);
       setPrepPhase("waiting");
       // 짧은 지연 후 config 읽기 (IDB 쓰기 완료 대기)
@@ -531,6 +556,20 @@ export default function ReportApp() {
       analysisMonth: monthStr ?? "",
     });
     autoFindingsRef.current = autoFindings;
+    // ── 커버리지 상태 확정 매핑 ──
+    // 모달 흐름상 커버리지 try/catch 는 onGenerate 이전에 항상 종료된다
+    // (취소 시엔 onGenerate 자체가 호출되지 않고, 성공한 레이더는 반드시 covWith 에 entry 를 남김).
+    // 따라서 covWith.size===0 은 곧 전량 실패 확정 — "error" 로 매핑한다.
+    // 이전의 "loading"/"idle" 매핑은 파노라마 게이트(done|error 만 통과)를 영구 차단해
+    // omReady 가 영원히 false → 프리뷰 무한 로딩이 됐다. "error" 는 게이트를 통과하며,
+    // 커버리지 소비처는 omFindingsGenerator(size>0 가드) 뿐이라 비교 프로즈만 생략되고
+    // 보고서는 정상 생성된다.
+    const coverageStatus: OMReportData["coverageStatus"] = covWith.size > 0 ? "done" : "error";
+    if (coverageErrorRef.current && covWith.size > 0) {
+      // 일부 레이더만 실패한 부분 실패 — 성공 레이더 데이터는 유지하고 done 으로 진행(기존 동작)
+      console.warn(`[OM] 커버리지 부분 실패 — ${covWith.size}/${radars.length}개 레이더만 커버리지 보유`);
+    }
+    coverageErrorRef.current = false; // 이번 생성 사이클에서 소비 완료
     const newOmData: OMReportData = {
       result,
       selectedBuildings: buildings,
@@ -544,7 +583,7 @@ export default function ReportApp() {
       findingsText: autoFindings,
       textOverrides: {},
       chartZooms: {},
-      coverageStatus: covWith.size > 0 ? "done" : "loading",
+      coverageStatus,
       panoramaStatus: "deferred",
       panoWithTargets: new Map(),
       panoWithoutTargets: new Map(),
@@ -571,9 +610,10 @@ export default function ReportApp() {
       ...newOmData,
       result: lightResult,
       // 커버리지 레이어는 경량본에도 실어 창 전송 시 함께 넘긴다(10M 규모 아님).
+      // coverageStatus 는 newOmData 와 동일 확정값(done|error) — 경량본이 로드되는 경로에서도
+      // 파노라마 게이트가 차단되지 않도록 한다.
       covLayersWithBuildings: covWith,
       covLayersWithout: covWithout,
-      coverageStatus: covWith.size > 0 ? "done" : "idle",
     };
 
     // 통합 모달이 살아있는 동안에는 configPayload 를 유지 — 모달이 omReady 시점에
@@ -606,6 +646,10 @@ export default function ReportApp() {
   }, []);
 
   const handleCoverageError = useCallback(() => {
+    // 모달의 커버리지 catch 는 omData 생성(handleOMGenerate) 이전에 호출되므로 아래
+    // setOmData 는 보통 no-op — ref 에 기록해 두고, omData 가 이미 존재하는 경로에서만 즉시 반영.
+    // 전량 실패 자체는 handleOMGenerate 의 covWith.size===0 ⇒ "error" 확정 매핑이 처리한다.
+    coverageErrorRef.current = true;
     setOmData((prev) => prev ? { ...prev, coverageStatus: "error" } : prev);
   }, []);
 

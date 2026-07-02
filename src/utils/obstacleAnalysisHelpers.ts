@@ -23,8 +23,13 @@ export interface LosBlockageResult {
  * LoS 차단 판정 — ITU 4/3 유효지구 직선 현(chord) 대비 통합 장애물(지형 profile + 건물 near/far 엣지) 비교.
  * 차트(ReportOMLosCrossSection)·배지(computeLosBatch)가 동일 식·동일 obstacle 집합으로 판정하도록 추출한 단일 소스.
  *   클리어런스 = 평면현 − d1·d2/(2·R_eff). excess(=adjH − 현높이) 가 최대(>0)인 지점을 차단점으로.
- * @param profile           지형 프로파일(elevationProfile = 건물 spike 포함 combinedElev). {distance(km), elevation(m ASL)}
- * @param pathBuildings     경로상 건물 — near/far 엣지를 obstacle 로 추가
+ *   ※ self-block 방지 — 분석 대상이 폴리곤형 건물이면 대상 자신의 near/far 엣지·top 스파이크가 표적(=대상 top)
+ *     바로 앞에서 무조건 '차단'을 만들므로, 호출부는 대상 자신을 제외한 입력을 넘긴다:
+ *     profile = 스파이크 없는 순수 SRTM(terrainProfile), pathBuildings = excludeTargetBuildings(대상 제외).
+ *     비대상 건물 높이는 near/far 엣지로 들어가므로 스파이크 부재에 따른 판정 차이는 없다
+ *     (footprint 내부 중간점 1개 차이 — 곡률 2차항 ≈ mm 오더).
+ * @param profile           판정용 지형 프로파일 {distance(km), elevation(m ASL)} — 순수 SRTM(대상 스파이크 없음)
+ * @param pathBuildings     경로상 건물(분석 대상 자신 제외) — near/far 엣지를 obstacle 로 추가
  * @param radarHeight       레이더 안테나 해발고 (m)
  * @param totalDistanceKm   레이더↔표적 지표거리 (km)
  * @param targetElev        표적 해발고 (m)
@@ -175,24 +180,29 @@ export async function computeLosBatch(
           longitude: lons[idx],
         }));
 
-        // 차단 판정 — 차트(ReportOMLosCrossSection)와 동일한 computeLosBlockage 단일 소스.
-        //   동일 obstacle 집합(elevProfile + pathBuildings near/far 엣지)·동일 4/3 직선 현(chord) 식이라
-        //   los.losBlocked 와 차트 blocked 가 정확히 일치. (OM 보고서 LoS·장애물 분석 전부 ITU 4/3.)
-        const { blocked, maxBlockPoint } = computeLosBlockage(
-          elevProfile, pathBuildings, radarHeight, totalDist, targetElev,
-        );
-        let maxBlockName = "";
-        if (maxBlockPoint) {
-          const nearBldg = pathBuildings.find((pb) => Math.abs(pb.distance_km - maxBlockPoint.distance) < 0.5);
-          maxBlockName = nearBldg?.name ?? nearBldg?.address ?? "";
-        }
-        // 순수 지형 프로파일 (건물 병합 전 raw SRTM) — 단면도 '분석 대상 제외' 선 계산용
+        // 순수 지형 프로파일 (건물 병합 전 raw SRTM) — 단면도 '분석 대상 제외' 선 + 차단판정 지형 base
         const terrainProf = elevations.map((elev, idx) => ({
           distance: dists[idx],
           elevation: elev,
           latitude: lats[idx],
           longitude: lons[idx],
         }));
+        // 차단 판정 — 차트(ReportOMLosCrossSection)와 동일한 computeLosBlockage 단일 소스·동일 4/3 chord 식.
+        //   입력에서 분석 대상 자신을 제외(self-block 방지): 지형 base = 스파이크 없는 순수 SRTM(terrainProf),
+        //   건물 = excludeTargetBuildings(대상 매칭 + 대상 footprint 겹침 제외). 종전엔 elevProfile(대상 top
+        //   스파이크 포함) + pathBuildings(대상 near/far 엣지 포함)를 그대로 넣어 폴리곤형 대상이 중간 차폐
+        //   없어도 무조건 '차단'이었다 — losBlockedFromPanorama 문서의 'chord 폴백은 self-block 회피'와 구현 일치.
+        //   차트(ReportOMLosCrossSection)도 동일 입력(terrainProfile + 대상 제외 건물)로 판정 → 배지↔차트 식 일치 유지.
+        //   비대상 건물은 near/far 엣지로 동일 높이가 들어가므로 스파이크 부재에 따른 판정 차이 없음.
+        const judgeBuildings = excludeTargetBuildings(pathBuildings, bldg, totalDist);
+        const { blocked, maxBlockPoint } = computeLosBlockage(
+          terrainProf, judgeBuildings, radarHeight, totalDist, targetElev,
+        );
+        let maxBlockName = "";
+        if (maxBlockPoint) {
+          const nearBldg = judgeBuildings.find((pb) => Math.abs(pb.distance_km - maxBlockPoint.distance) < 0.5);
+          maxBlockName = nearBldg?.name ?? nearBldg?.address ?? "";
+        }
         const key = `${radar.name}_${bldg.id}`;
         const data: LoSProfileData = {
           id: `${prefix}_${radar.name}_${bldg.id}`,
@@ -337,18 +347,88 @@ export function mergeAzSectors(sectors: AzSector[]): AzSector[] {
  *  프레임에 두어 검은×↔빨강영역 픽셀 일치. 단면도·차단 배지(computeLosBatch)와도 동일 4/3 프레임. */
 const R_EFF_M_LOSS = (6_371_000 * 4) / 3;
 const FT_PER_M_LOSS = 3.28084;
+/** 소실표적 분류 방위 허용각 하한(°) — 실제 허용각은 건물별 classifyAzToleranceDeg = max(이 하한, 노출면 반각폭+1°).
+ *  (종전 ±10° 고정 캡 — 총 각폭 18° 초과 근접 대상에서 차트 창 안의 소실표적이 분류에서 누락되던 문제 해소.) */
 const AZ_TOLERANCE_DEG = 10;
+/** 허용각 반각폭 마진(°) — Az×Elev 차트 창(ReportOMObstacleAzElevChart AZ_MARGIN)과 동일 1° (창 ⊆ 허용각 보장) */
+const CLASSIFY_AZ_MARGIN_DEG = 1;
 
-/** classifyObstacleLosses 의 sibling(같은 레이더의 다른 분석 대상) — 방위·거리·id 로 오귀속 타이브레이크(전순서). */
+/**
+ * 건물 노출면 반각폭(°) — calcBuildingAzExtent 노출면 양끝이 중심 방위(centerAzDeg)에서 벗어난 최대 원형 각차
+ * (비대칭 노출면 대비 max). 분류 허용각(classifyAzToleranceDeg)·Az×Elev 차트 창(azHalfSpan)이 공유하는
+ * 단일 산식 — 백엔드 track_points_geo 사전필터 반폭 산출(ObstacleMonthlyConfigModal)과도 동일 정의.
+ */
+export function buildingAzHalfExtentDeg(
+  radarLat: number, radarLon: number, building: ManualBuilding, centerAzDeg: number,
+): number {
+  const ext = calcBuildingAzExtent(radarLat, radarLon, building);
+  const circDiff = (a: number): number => {
+    const d = Math.abs(a - centerAzDeg) % 360;
+    return d > 180 ? 360 - d : d;
+  };
+  return Math.max(circDiff(ext.start_deg), circDiff(ext.end_deg));
+}
+
+/**
+ * 건물별 소실표적 분류 방위 허용각(°) = max(±10° 하한, 노출면 반각폭 + 1° 마진).
+ * classifyObstacleLosses(자기 창)·buildSiblings(sibling claim 가능성 검사)가 공유하는 단일 진실원천.
+ * Az×Elev 차트 창(azHalfSpan = max(반각폭+1°, 2°)) ≤ 이 허용각 — 차트 창 안의 소실 점은 항상 분류에 포함.
+ */
+export function classifyAzToleranceDeg(
+  radarLat: number, radarLon: number, building: ManualBuilding, centerAzDeg: number,
+): number {
+  return Math.max(
+    AZ_TOLERANCE_DEG,
+    buildingAzHalfExtentDeg(radarLat, radarLon, building, centerAzDeg) + CLASSIFY_AZ_MARGIN_DEG,
+  );
+}
+
+/** classifyObstacleLosses 의 sibling(같은 레이더의 다른 분석 대상) — buildSiblings 로 생성.
+ *  방위·거리·허용각은 classify 의 자기 판정(bAzDeg·bDistKm·azTolDeg)과 동일 산식 → 어느 건물 pass 에서
+ *  계산해도 소유자가 동일하게 결정(대칭 전순서). 방위·거리·id 로 오귀속 타이브레이크. */
 export interface SiblingBuilding {
   id: number;
+  /** 레이더→건물 방위(°, bearingDeg) — classify 의 bAzDeg 와 동일 산식 */
   azDeg: number;
+  /** 레이더→건물 거리(km, haversine) — classify 의 bDistKm 와 동일 산식 */
   distKm: number;
+  /** 그 건물의 분류 방위 허용각(°, classifyAzToleranceDeg) — claim 가능성(방위창) 검사용 */
+  azTolDeg: number;
+}
+
+/**
+ * classify 호출부 공용 sibling 목록 빌더 — 자기(selfId) 제외 + losMap 제공 시 LoS 결과 없는 건물 제외.
+ * LoS 결과가 없으면 그 건물의 classify 자체가 돌지 않으므로, 그런 건물이 소유권만 가져가면 해당 소실표적이
+ * 모든 건물 집계에서 누락된다 — sibling 에서 제외해 다음으로 강한(집계 가능한) 건물이 귀속받게 한다.
+ * §2 요약(ReportOMSummarySection)·§3 상세(ReportOMObstacleDetail)·§4 소실상세(ReportOMLossEvents)가
+ * 전부 이 빌더를 사용해야 표·차트 점 수가 일치한다.
+ */
+export function buildSiblings(
+  radar: RadarSite,
+  allBuildings: ManualBuilding[],
+  selfId: number,
+  losMap?: Map<string, LoSProfileData> | null,
+): SiblingBuilding[] {
+  const out: SiblingBuilding[] = [];
+  for (const b of allBuildings) {
+    if (b.id === selfId) continue;
+    if (losMap && !losMap.has(`${radar.name}_${b.id}`)) continue; // classify 미실행 건물 — 소유권 대상 아님
+    const azDeg = bearingDeg(radar.latitude, radar.longitude, b.latitude, b.longitude);
+    out.push({
+      id: b.id,
+      azDeg,
+      distKm: haversineKm(radar.latitude, radar.longitude, b.latitude, b.longitude),
+      azTolDeg: classifyAzToleranceDeg(radar.latitude, radar.longitude, b, azDeg),
+    });
+  }
+  return out;
 }
 
 export interface ClassifiedLoss {
   azDeg: number;
   elevAngleDeg: number;
+  /** 부모 gap(이벤트) 전체 지속시간(초) — 이벤트 지속시간 표시용. 같은 이벤트의 보간점 모두 동일 값이라
+   *  점마다 합산하면 보간점 수 × gap 과대 — 시간 합산은 source.share_s(Σ = gap)를 사용. */
   durationS: number;
   /** 레이더↔소실표적 거리(km) — 표/상세 표시용 (내부 lpDistKm) */
   distKm: number;
@@ -370,6 +450,29 @@ export function isTargetBuildingOnPath(
     && Math.abs(b.ground_elev_m - (building.ground_elev ?? 0)) < 1
     && Math.abs(b.height_m - building.height) < 1
     && (b.far_dist_km ?? b.distance_km) >= totalDistKm - 0.5;
+}
+
+/**
+ * LoS 경로 건물에서 '분석 대상 자신'을 제외 — 차단판정(self-block 방지)·단면도 '대상 제외' 점선의 단일 규칙.
+ * 대상 매칭(isTargetBuildingOnPath)뿐 아니라 대상 footprint 거리구간에 겹친 비대상 건물
+ * (동일 위치 건물통합정보 폴리곤 등 — is_manual=false 라 대상매칭 불가)도 함께 제외해야 '대상 제거 시'
+ * 관점이 성립한다. (footprint 밖 비대상 건물은 유지.)
+ * computeLosBatch(차단 배지 los.losBlocked)·ReportOMLosCrossSection(차트 blocked·점선)이 공유
+ * → 배지↔차트가 항상 동일 obstacle 집합으로 판정.
+ */
+export function excludeTargetBuildings(
+  pathBuildings: BuildingOnPath[], building: ManualBuilding, totalDistKm: number,
+): BuildingOnPath[] {
+  const targetSpans: { near: number; far: number }[] = [];
+  for (const b of pathBuildings) {
+    if (isTargetBuildingOnPath(b, building, totalDistKm)) {
+      targetSpans.push({ near: b.near_dist_km ?? b.distance_km, far: b.far_dist_km ?? b.distance_km });
+    }
+  }
+  const inTargetSpan = (d: number) => targetSpans.some((s) => d >= s.near - 1e-9 && d <= s.far + 1e-9);
+  return pathBuildings.filter(
+    (b) => !isTargetBuildingOnPath(b, building, totalDistKm) && !inTargetSpan(b.distance_km),
+  );
 }
 
 /** 표적 양각(°) — ITU 4/3 유효지구 곡률 보정 후(보고된 고도에서 d²/2R_eff 강하량 차감). panorama 실루엣과 동일 프레임.
@@ -486,13 +589,12 @@ export function makePanoramaSampler(pano: PanoramaMergeResult): (azDeg: number) 
 
 /**
  * (레이더 × 분석 대상 장애물) 의 LoS 차단각 대비 후방 소실표적 분류.
- * 방위 윈도우(±10°) + 대상 후방(거리 > bDistKm) 소실표적만 채택.
- * @returns 차단각(°) + 분류된 소실 배열 + 집계(음영/장애물기인 건수, 장애물기인 소실시간)
+ * 방위 윈도우(건물별 허용각 azTolDeg = max(±10°, 노출면 반각폭+1°)) + 대상 후방(거리 > bDistKm) 소실표적만 채택.
+ * @returns 차단각(°) + 분류된 소실 배열(점 단위) + 집계 — '…건'(이벤트)은 distinct event_id, 소실시간은 Σ share_s
  */
 export function classifyObstacleLosses(
   radar: RadarSite,
   building: ManualBuilding,
-  los: LoSProfileData,
   lossPoints: LossPointGeo[],
   opts?: {
     /** 차단각 산출용 panorama(ITU 4/3 유효지구) — 차트 빨강영역과 동일 소스라 검은×↔빨강영역 픽셀 일치.
@@ -500,25 +602,45 @@ export function classifyObstacleLosses(
      *  panoWith 자체가 없으면(해당 레이더 파노라마 계산 실패) 차단각 0 → 음영 분류 생략(보수적). */
     panoWith?: PanoramaMergeResult;
     panoWithout?: PanoramaMergeResult;
-    /** 같은 레이더의 '다른' 분석 대상 건물(방위°+거리km) — 소실표적을 더 강하게 소유하는 건물이 있으면 본 건물 집계서 제외(오귀속 방지).
-     *  소유 우선순위: 방위 근접 > 거리 근접 > 작은 방위값 (정확히 한 건물만 카운트 — 같은 방위 중복 방지). */
+    /** 같은 레이더의 '다른' 분석 대상 건물 — buildSiblings 로 생성(LoS 결과 없는 건물 제외).
+     *  '실제로 claim 가능한'(자기 pass 와 동일 조건: 방위차 ≤ 그 sibling 의 허용각 && 대상 후방) sibling 이
+     *  더 강하게 소유하면 본 건물 집계서 제외(오귀속 방지). 소유 우선순위: 방위 근접 > 거리 근접 > 작은 방위값 > 작은 id. */
     siblings?: SiblingBuilding[];
   },
 ): {
+  /** 레이더↔대상 거리(km, haversine) — 후방 판정·sibling 대칭 기준 */
   bDistKm: number;
+  /** 레이더↔대상 방위(°, bearingDeg) — 창 중심·sibling 대칭 기준 */
   bAzDeg: number;
+  /** 건물별 방위 허용각(° = max(10, 노출면 반각폭+1)) — 표 '방위 ±N°' 표시·차트 창 부분집합 검증용 */
+  azTolDeg: number;
   angleTotalDeg: number;
   angleTerrainDeg: number;
+  /** 채택 소실표적(점 단위) — 차트 점·'소실표적 수' 라벨은 이 길이(점 개수)를 사용 */
   losses: ClassifiedLoss[];
+  /** inShadow 점 개수(점 단위) */
   shadowCount: number;
+  /** buildingCaused 점 개수(점 단위) */
   buildingCount: number;
+  /** 장애물 추가 기인 소실시간(초) = buildingCaused 점 Σ share_s — 같은 gap 보간점 합 = gap (과대 없음) */
   buildingDurationS: number;
+  /** 채택 소실표적의 distinct 이벤트(gap) 수 — '…건' 표시·비율 분모용 */
+  totalEventCount: number;
+  /** inShadow 점을 1개 이상 포함한 이벤트 수 — 'LoS 차단 영역 내 N건' */
+  shadowEventCount: number;
+  /** buildingCaused 점을 1개 이상 포함한 이벤트 수 — '장애물 추가 기인 N건' */
+  buildingEventCount: number;
 } {
   const radarH = radar.altitude + radar.antenna_height;
-  const bDistKm = los.totalDistance > 0
-    ? los.totalDistance
-    : haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
-  const bAzDeg = los.bearing ?? bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  // 대상 방위·거리·허용각 — sibling(buildSiblings)과 동일 산식(bearingDeg·haversineKm·classifyAzToleranceDeg).
+  //   소유권 판정(claim 가능성 + 타이브레이크)이 어느 건물 pass 에서 계산돼도 같은 수치 위에서 이뤄져
+  //   소유자가 유일하게 결정된다(대칭 전순서). (종전: 자기만 창 중심 los.bearing·후방 기준 los.totalDistance
+  //   (등거리근사)를 써서 sibling 메트릭(bearingDeg/haversine)과 체계가 어긋났음 — 전부 단일화.)
+  const bDistKm = haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  const bAzDeg = bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  // 건물별 방위 허용각 — ±10° 고정 캡 제거: 각폭 넓은 근접 대상도 노출면 전체(+1° 마진)를 커버.
+  //   Az×Elev 차트 창(azHalfSpan = max(반각폭+1°, 2°)) ⊆ 이 허용각 — 차트 창 안 소실 점 누락 없음.
+  const azTolDeg = classifyAzToleranceDeg(radar.latitude, radar.longitude, building, bAzDeg);
 
   // 차단각 = panorama 실루엣 방위별 max(ITU 4/3 유효지구). with(지형+기존지물+분석대상) − without(분석대상 제외) = '대상 추가 차단'.
   //   빨강영역(panoWith−panoWithout)과 동일 소스·동일 프레임 → 차트 빨강영역·검은× 점 픽셀 일치.
@@ -533,36 +655,33 @@ export function classifyObstacleLosses(
   const angleTerrainDeg = angleWithoutAt(bAzDeg);
 
   const siblings = opts?.siblings ?? [];
-  // sibling 오귀속 비교용 자기 방위·거리 — 호출부가 sibling 을 bearingDeg·haversineKm 로 계산하므로 동일 기준 사용(비대칭 제거).
-  //   ※ 거리 동률/근접 판정에 bDistKm(=los.totalDistance, 등거리근사)을 쓰면 sibling.distKm(haversine)과 메트릭이
-  //     불일치해(등거리>haversine 체계적 편향) 동방위·동일위치 건물쌍에서 전순서가 깨진다 — 양쪽 모두 양보→소실표적 누락,
-  //     id fail-safe 사문화. 자기 거리도 haversine 으로 통일해 antisymmetric 전순서(정확히 한 건물만 소유) 복원.
-  const selfAzForSibling = bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
-  const selfDistForSibling = haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
   const losses: ClassifiedLoss[] = [];
   for (const lp of lossPoints) {
     const lpDistKm = haversineKm(radar.latitude, radar.longitude, lp.lat, lp.lon);
     const lpAz = bearingDeg(radar.latitude, radar.longitude, lp.lat, lp.lon);
     let azDiff = Math.abs(lpAz - bAzDeg);
     if (azDiff > 180) azDiff = 360 - azDiff;
-    if (azDiff > AZ_TOLERANCE_DEG) continue;
+    if (azDiff > azTolDeg) continue;
     if (lpDistKm <= bDistKm + 0.01) continue;
     // 오귀속 방지(#4): '다른' 분석 대상이 이 소실표적을 더 강하게 소유하면 본 건물 집계서 제외.
     //   결정론적 전순서 — 방위 근접 > 거리 근접 > 작은 방위값 > 작은 id → 정확히 한 건물만 카운트.
     //   (같은 위치 중복 건물 등 완전동률도 id 로 단독 소유 결정 → 중복 카운트 원천 차단)
-    let azDiffSelf = Math.abs(lpAz - selfAzForSibling);
-    if (azDiffSelf > 180) azDiffSelf = 360 - azDiffSelf;
+    //   자기 기준값(bAzDeg·bDistKm)이 sibling(buildSiblings)과 동일 산식이라 azDiff/거리 비교가 대칭.
     let ownedByOther = false;
     for (const s of siblings) {
       let sd = Math.abs(lpAz - s.azDeg);
       if (sd > 180) sd = 360 - sd;
-      const tieAz = Math.abs(sd - azDiffSelf) <= 1e-9;
-      const tieDist = Math.abs(s.distKm - selfDistForSibling) <= 1e-9;
-      const tieAzDeg = Math.abs(s.azDeg - selfAzForSibling) <= 1e-9;
-      if (sd < azDiffSelf - 1e-9                                      // 방위 근접
-        || (tieAz && s.distKm < selfDistForSibling - 1e-9)            // 동률 → 거리 근접
-        || (tieAz && tieDist && s.azDeg < selfAzForSibling - 1e-9)    // +동률 → 작은 방위값
-        || (tieAz && tieDist && tieAzDeg && s.id < building.id)) {    // +완전동률(동일 위치) → 작은 id (fail-safe)
+      // claim 가능성 검사 — 그 sibling 자기 pass 와 동일 조건(방위차 ≤ 그 건물의 허용각 && 대상 후방)을
+      //   통과하는 sibling 만 소유권 대상. (종전: 방위 근접만으로 무조건 양보 → 소유권 가져간 sibling 이
+      //   자기 pass 의 창/후방 조건에서 그 점을 못 받으면 소실표적이 모든 건물 집계에서 누락되는 구멍.)
+      if (sd > s.azTolDeg || lpDistKm <= s.distKm + 0.01) continue;
+      const tieAz = Math.abs(sd - azDiff) <= 1e-9;
+      const tieDist = Math.abs(s.distKm - bDistKm) <= 1e-9;
+      const tieAzDeg = Math.abs(s.azDeg - bAzDeg) <= 1e-9;
+      if (sd < azDiff - 1e-9                                      // 방위 근접
+        || (tieAz && s.distKm < bDistKm - 1e-9)                   // 동률 → 거리 근접
+        || (tieAz && tieDist && s.azDeg < bAzDeg - 1e-9)          // +동률 → 작은 방위값
+        || (tieAz && tieDist && tieAzDeg && s.id < building.id)) { // +완전동률(동일 위치) → 작은 id (fail-safe)
         ownedByOther = true;
         break;
       }
@@ -578,18 +697,37 @@ export function classifyObstacleLosses(
     losses.push({ azDeg: lpAz, elevAngleDeg: lpElevDeg, durationS: lp.duration_s, distKm: lpDistKm, source: lp, inShadow, buildingCaused });
   }
 
+  // 집계 — 스키마 계약: '…건'(이벤트 건수)은 distinct event_id, 소실시간 합산은 Σ share_s(같은 gap 보간점 합 = gap),
+  //   점 단위 카운트(shadowCount/buildingCount)는 차트 점·'소실표적 수' 라벨용으로 유지.
+  //   (종전 buildingDurationS 는 점마다 durationS(=부모 gap 전체)를 합산 → 보간점 수 × gap 과대 — Σ share_s 로 교정.)
+  //   이벤트 분류는 any-point 규칙: 그 이벤트의 보간점 중 1개 이상이 해당 분류면 그 이벤트로 집계
+  //   (buildingCaused ⇒ inShadow 이므로 buildingEventCount ⊆ shadowEventCount, 총합 보존).
   let shadowCount = 0;
   let buildingCount = 0;
   let buildingDurationS = 0;
+  const totalEventIds = new Set<number>();
+  const shadowEventIds = new Set<number>();
+  const buildingEventIds = new Set<number>();
   for (const l of losses) {
-    if (l.inShadow) shadowCount++;
+    totalEventIds.add(l.source.event_id);
+    if (l.inShadow) {
+      shadowCount++;
+      shadowEventIds.add(l.source.event_id);
+    }
     if (l.buildingCaused) {
       buildingCount++;
-      buildingDurationS += l.durationS;
+      buildingEventIds.add(l.source.event_id);
+      buildingDurationS += l.source.share_s;
     }
   }
 
-  return { bDistKm, bAzDeg, angleTotalDeg, angleTerrainDeg, losses, shadowCount, buildingCount, buildingDurationS };
+  return {
+    bDistKm, bAzDeg, azTolDeg, angleTotalDeg, angleTerrainDeg, losses,
+    shadowCount, buildingCount, buildingDurationS,
+    totalEventCount: totalEventIds.size,
+    shadowEventCount: shadowEventIds.size,
+    buildingEventCount: buildingEventIds.size,
+  };
 }
 
 /**
@@ -601,22 +739,23 @@ export function classifyObstacleLosses(
  *   이는 요약표 angleTerrainDeg(=angleWithoutAt(bAz))와 동일 값이라 표·배지가 일관된다.
  *   ※ panorama 는 거리축이 없어(max-over-distance) 표적 너머 지형도 실루엣에 포함 → chord 코리도 단면도 차트와
  *     어긋날 수 있음(의도된 통일 — 단면도 차트는 코리도 시각화 유지, blocked 판정만 panorama 로 통일).
- *   panoWithout 미제공(Rust 제외대상 0/리로드) 시 null → 호출부가 chord(los.losBlocked)로 폴백(self-block 회피).
+ *   panoWithout 미제공(Rust 제외대상 0/리로드) 시 null → 호출부가 chord(los.losBlocked)로 폴백.
+ *   chord 판정도 분석 대상 자신을 제외(computeLosBatch·excludeTargetBuildings)하므로 폴백 역시 self-block 없음.
  */
 export function losBlockedFromPanorama(
   radar: RadarSite,
   building: ManualBuilding,
-  los: LoSProfileData,
+  _los: LoSProfileData,
   panoWithout?: PanoramaMergeResult,
 ): boolean | null {
   if (!panoWithout) return null;
   const sampler = makePanoramaSampler(panoWithout);
   const radarH = radar.altitude + radar.antenna_height;
-  // bDistKm·bAzDeg 는 classifyObstacleLosses 와 동일 산식(등거리근사 totalDistance 우선, bearing 폴백)으로 통일.
-  const bDistKm = los.totalDistance > 0
-    ? los.totalDistance
-    : haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
-  const bAzDeg = los.bearing ?? bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  // bDistKm·bAzDeg 는 classifyObstacleLosses 와 동일 산식(bearingDeg·haversineKm 단일화)으로 통일 —
+  //   요약표 '대상 차단각'(angleTotalDeg, classify bAzDeg 샘플)과 배지가 같은 방위·거리 기준을 쓴다.
+  //   (_los 는 호출부(ReportApp·ReportOMObstacleDetail) 시그니처 호환용으로 유지 — 산식 단일화 후 미사용.)
+  const bDistKm = haversineKm(radar.latitude, radar.longitude, building.latitude, building.longitude);
+  const bAzDeg = bearingDeg(radar.latitude, radar.longitude, building.latitude, building.longitude);
   const targetTopM = (building.ground_elev ?? 0) + building.height;
   const targetElevDeg = pointElevAngleDeg(radarH, targetTopM, bDistKm * 1000);
   return targetElevDeg < sampler(bAzDeg);
