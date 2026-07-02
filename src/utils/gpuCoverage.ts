@@ -213,14 +213,14 @@ export async function computeCoverageLayersOM(
   params: CoverageOMParams,
   altFts: number[],
   excludeManualIds: number[],
-  onProgress?: (msg: string) => void,
+  onProgress?: (msg: string, frac?: number) => void,
 ): Promise<{
   layersWith: CoverageLayer[];
   layersWithout: CoverageLayer[];
 }> {
   const bearingStepDeg = pixelBearingStepDeg(params.rangeNm);
 
-  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (건물 포함)`);
+  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (건물 포함)`, 0.02);
   await invoke("compute_coverage_terrain_profile", {
     radarName: params.radarName,
     radarLat: params.radarLat,
@@ -230,12 +230,13 @@ export async function computeCoverageLayersOM(
     rangeNm: params.rangeNm,
     bearingStepDeg,
   });
+  onProgress?.(`커버리지 레이어 계산 중... ${params.radarName} (건물 포함)`, 0.3);
   const layersWith = await invoke<CoverageLayer[]>("compute_coverage_layers_batch", {
     altFts,
     bearingStep: 1,
   });
 
-  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (분석 대상 전체 제외)`);
+  onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (분석 대상 전체 제외)`, 0.5);
   await invoke("compute_coverage_terrain_profile_excluding", {
     radarName: params.radarName,
     radarLat: params.radarLat,
@@ -246,6 +247,7 @@ export async function computeCoverageLayersOM(
     excludeManualIds,
     bearingStepDeg,
   });
+  onProgress?.(`커버리지 레이어 계산 중... ${params.radarName} (분석 대상 전체 제외)`, 0.8);
   const layersWithout = await invoke<CoverageLayer[]>("compute_coverage_layers_batch_excluded", {
     altFts,
     bearingStep: 1,

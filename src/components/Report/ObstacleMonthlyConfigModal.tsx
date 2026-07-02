@@ -30,6 +30,17 @@ export type PanoramaProgress = {
   currentRadarName: string;
   phase: PanoramaPhase;
 };
+
+// ── 통합 진행률 단계 경계 — [시작%, 스팬%] ──
+// 각 스테이지 내 실제 진행(frac 0~1)을 해당 스팬에 매핑해 전체 0→100 단조 진행을 만든다.
+// 스팬은 통상 소요시간 비중 근사치 (파싱·파노라마가 지배적).
+const STAGE_BOUNDS = {
+  parsing: [0, 32],
+  los: [32, 8],
+  coverage: [40, 22],
+  transfer: [62, 4],
+  panorama: [66, 34],
+} as const;
 export default function ObstacleMonthlyConfigModal({
   customRadarSites,
   aircraft,
@@ -99,6 +110,51 @@ export default function ObstacleMonthlyConfigModal({
     cancelledRef.current = false;
     return () => { cancelledRef.current = true; };
   }, []);
+
+  // ── 통합 진행률 (실측) ──
+  // parsing/los/coverage/transfer 는 progressPct(스테이지 내 0~100 정규화),
+  // panorama 는 부모 progress 의 레이더 인덱스 + phase 가중치로 산출.
+  const realPct = useMemo(() => {
+    if (!stage) return 0;
+    if (stage === "done") return 100;
+    const [base, span] = STAGE_BOUNDS[stage];
+    let frac = 0;
+    if (stage === "panorama") {
+      if (panoramaStatus === "done") frac = 1;
+      else if (panoramaProgress && panoramaProgress.totalRadars > 0) {
+        const phaseFrac = panoramaProgress.phase === "heightmap" ? 0.1
+          : panoramaProgress.phase === "gpu" ? 0.45
+          : 0.85;
+        frac = (panoramaProgress.currentIndex - 1 + phaseFrac) / panoramaProgress.totalRadars;
+      }
+    } else {
+      frac = progressPct / 100;
+    }
+    return base + span * Math.max(0, Math.min(1, frac));
+  }, [stage, progressPct, panoramaStatus, panoramaProgress]);
+
+  // ── 화면 표시 진행률 (단조 증가 + 트리클) ──
+  // 실측(realPct)을 하한으로 절대 뒤로 가지 않고, 신호 공백 구간(GPU 계산 등)에도
+  // 현재 스테이지 상한 직전까지 점근적으로 차올라 사용자에게 연속적인 0→100 진행으로 보이게 한다.
+  const [displayPct, setDisplayPct] = useState(0);
+  const trickleRef = useRef({ real: 0, ceil: 100 });
+  trickleRef.current = {
+    real: realPct,
+    ceil: stage && stage !== "done" ? STAGE_BOUNDS[stage][0] + STAGE_BOUNDS[stage][1] - 0.8 : 100,
+  };
+  useEffect(() => {
+    if (!analyzing || !stage) { setDisplayPct(0); return; }
+    if (stage === "done") { setDisplayPct(100); return; }
+    const id = setInterval(() => {
+      setDisplayPct((prev) => {
+        const { real, ceil } = trickleRef.current;
+        let next = Math.max(prev, real);
+        if (next < ceil) next = Math.min(ceil, next + (ceil - next) * 0.012 + 0.02);
+        return next;
+      });
+    }, 200);
+    return () => clearInterval(id);
+  }, [analyzing, stage]);
 
   // ── prop-driven 스테이지 전환 ──
   // 로컬 작업(transfer 까지) 후 부모 상태에 따라 panorama → done 자동 진행.
@@ -201,11 +257,20 @@ export default function ObstacleMonthlyConfigModal({
 
     let unlistenFn: (() => void) | null = null;
     try {
+      // 레이더마다 Rust 가 "parsing"(파일 i/N) → "analyzing"(일 d/D)로 current/total 을 리셋하며
+      // emit 하므로, 그대로 쓰면 파싱 구간에서 바가 톱니처럼 왕복한다. 레이더 인덱스 + 스테이지
+      // 가중(파일 75% / 일별 집계 25%)으로 전역 0~100 단조 매핑한다.
+      const radarIndexByName = new Map(selectedRadars.map((r, i) => [r.name, i]));
+      const radarCount = Math.max(1, selectedRadars.length);
       unlistenFn = await listen<ObstacleMonthlyProgress>("obstacle-monthly-progress", (e) => {
         if (cancelledRef.current) return;
         setProgress(e.payload.message);
         setStageDetail((prev) => ({ ...prev, parsing: e.payload.message }));
-        if (e.payload.total > 0) setProgressPct(Math.round((e.payload.current / e.payload.total) * 100));
+        if (e.payload.stage === "error" || e.payload.total <= 0) return;
+        const ri = radarIndexByName.get(e.payload.radar_name) ?? 0;
+        const within = Math.min(1, e.payload.current / e.payload.total);
+        const radarFrac = e.payload.stage === "analyzing" ? 0.75 + 0.25 * within : 0.75 * within;
+        setProgressPct(((ri + radarFrac) / radarCount) * 100);
       });
       const excludeMs = aircraft.map((a) => a.mode_s_code).filter(Boolean);
 
@@ -363,6 +428,7 @@ export default function ObstacleMonthlyConfigModal({
       const covWithoutMap = new Map<string, CoverageLayer[]>();
       if (selectedRadars.length > 0) {
         setStage("coverage");
+        setProgressPct(0); // LoS 잔여값(100) 유입 방지 — 스테이지 진입 시 항상 리셋
         setStageDetail((prev) => ({ ...prev, coverage: `0/${selectedRadars.length} 레이더 시작` }));
         const altFts = [1000, 2000, 3000, 5000, 10000, 15000, 20000, 25000, 30000];
         const excludeIds = selectedBuildings.map((b) => b.id);
@@ -372,19 +438,21 @@ export default function ObstacleMonthlyConfigModal({
             if (cancelledRef.current) break;
             const r = selectedRadars[ri];
             setProgress(`커버리지 계산 중... (${r.name}, ${ri + 1}/${selectedRadars.length})`);
-            setProgressPct(85 + Math.floor((ri / selectedRadars.length) * 8));
+            setProgressPct((ri / selectedRadars.length) * 100);
             setStageDetail((prev) => ({ ...prev, coverage: `${ri + 1}/${selectedRadars.length} · ${r.name}` }));
             const covResult = await computeCoverageLayersOM(
               { radarName: r.name, radarLat: r.latitude, radarLon: r.longitude, radarAltitude: r.altitude, antennaHeight: r.antenna_height, rangeNm: r.range_nm },
               altFts, excludeIds,
-              (msg) => {
+              (msg, frac) => {
                 if (cancelledRef.current) return;
                 setProgress(`[${r.name}] ${msg}`);
+                if (frac !== undefined) setProgressPct(((ri + frac) / selectedRadars.length) * 100);
                 setStageDetail((prev) => ({ ...prev, coverage: `${ri + 1}/${selectedRadars.length} · ${r.name} — ${msg}` }));
               },
             );
             covWithMap.set(r.name, covResult.layersWith);
             covWithoutMap.set(r.name, covResult.layersWithout);
+            setProgressPct(((ri + 1) / selectedRadars.length) * 100);
           }
           setStageDetail((prev) => ({ ...prev, coverage: `${covWithMap.size}개 레이더 완료` }));
         } catch (err) {
@@ -405,10 +473,11 @@ export default function ObstacleMonthlyConfigModal({
 
       // 보고서 생성
       setProgress("보고서 생성 중...");
-      setProgressPct(95);
       setStage("transfer");
+      setProgressPct(10);
       setStageDetail((prev) => ({ ...prev, transfer: "보고서 창으로 데이터 전송 중" }));
       await onGenerate(filteredResult, selectedBuildings, buildingGroups, selectedRadars, azSectorsByRadar, losMap, covWithMap, covWithoutMap, effectiveMonth);
+      setProgressPct(70);
 
       if (covWithMap.size > 0) onCoverageReady(covWithMap, covWithoutMap);
 
@@ -675,36 +744,8 @@ export default function ObstacleMonthlyConfigModal({
                   : panoramaStatus === "loading" ? "진행 상세 대기"
                   : "대기 중";
 
-                // 통합 진행률 — 단계별 가중치
-                const baseFor = (s: AnalyzeStage): number =>
-                  s === "parsing" ? 0
-                  : s === "los" ? 15
-                  : s === "coverage" ? 30
-                  : s === "transfer" ? 55
-                  : s === "panorama" ? 60
-                  : 100;
-                const spanFor = (s: AnalyzeStage): number =>
-                  s === "parsing" ? 15
-                  : s === "los" ? 15
-                  : s === "coverage" ? 25
-                  : s === "transfer" ? 5
-                  : s === "panorama" ? 40
-                  : 0;
-                const overallPct = (() => {
-                  if (!stage || stage === "done") return stage === "done" ? 100 : 0;
-                  const base = baseFor(stage);
-                  const span = spanFor(stage);
-                  let frac = 0;
-                  if (stage === "parsing" || stage === "los" || stage === "coverage") frac = progressPct / 100;
-                  else if (stage === "transfer") frac = 0.5;
-                  else if (stage === "panorama") {
-                    if (panoramaStatus === "done") frac = 1;
-                    else if (panoramaProgress && panoramaProgress.totalRadars > 0) {
-                      frac = (panoramaProgress.currentIndex - 1) / panoramaProgress.totalRadars;
-                    }
-                  }
-                  return Math.min(100, Math.round(base + span * Math.max(0, Math.min(1, frac))));
-                })();
+                // 통합 진행률 — 실측+트리클로 단조 증가하는 displayPct 를 그대로 표시
+                const shownPct = Math.round(displayPct);
 
                 const stageList: { key: AnalyzeStage; label: string; detail: string }[] = [
                   { key: "parsing", label: "ASS 파일 파싱", detail: stageDetail.parsing || "대기 중" },
@@ -738,12 +779,12 @@ export default function ObstacleMonthlyConfigModal({
                       <Loader2 size={16} className="animate-spin text-[#a60739]" />
                       <h3 className="text-[13px] font-semibold text-gray-800">보고서 준비 중</h3>
                       <div className="flex-1" />
-                      <span className="text-[11px] font-medium text-gray-500">{overallPct}%</span>
+                      <span className="text-[11px] font-medium text-gray-500">{shownPct}%</span>
                       <button onClick={onCancelClick}
                         className="rounded-lg border border-red-200 bg-white px-2.5 py-1 text-[11px] text-red-600 hover:bg-red-50 transition-colors">{cancelButtonLabel}</button>
                     </div>
                     <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-gray-100">
-                      <div className="h-full bg-[#a60739] transition-all duration-300" style={{ width: `${overallPct}%` }} />
+                      <div className="h-full bg-[#a60739] transition-all duration-300" style={{ width: `${displayPct}%` }} />
                     </div>
                     <div className="mt-4 flex flex-col gap-2.5">
                       {stageList.map(({ key, label, detail }) => {

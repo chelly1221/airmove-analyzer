@@ -310,7 +310,11 @@ export function LosCrossSection({
   const svgRef = useRef<SVGSVGElement>(null);
   // 항적/소실 포인트 전용 canvas 오버레이 — 수천~수만 점을 <circle> DOM 노드 없이 래스터로 그려
   //   PDF 캡처(WebView2 PrintToPdf) 병목을 제거한다. SVG(축/그리드/선/건물/범례)는 그대로 유지.
+  //   z-순서: 소실표적(zIndex:0, SVG 아래 최하층) < SVG(zIndex:1) < 항적(zIndex:1, DOM 후순) < 범례(zIndex:2)
   const pointCanvasRef = useRef<HTMLCanvasElement>(null);
+  // 소실표적 전용 canvas — SVG(지형/건물/LoS선) '아래'(z 맨 뒤)에 깔린다. 빨간 점 군집이
+  //   LoS선·건물 실루엣을 가리지 않도록 분리 (지형 fill 0.35 투명도라 아래서도 비쳐 보임).
+  const lossCanvasRef = useRef<HTMLCanvasElement>(null);
   // canvas 의 실제 렌더 픽셀 크기 — SVG(viewBox 0 0 W H, w-full)가 컨테이너 폭에 맞춰 스케일되므로
   //   ResizeObserver 로 렌더 박스를 추적해 viewBox→픽셀 스케일을 정확히 재현(1px 정합).
   const [canvasPx, setCanvasPx] = useState<{ w: number; h: number }>({ w: W, h: H });
@@ -507,10 +511,9 @@ export function LosCrossSection({
   //    canvas 의 viewBox→픽셀 스케일(sx, sy)·DPR 을 곱해 그린다 → SVG path/축과 1px 정합.
   //    의존성에 liveZoom·visibleYRange·canvasPx 가 포함되어 줌/패닝/리사이즈 시 자동 재그리기.
   useEffect(() => {
-    const canvas = pointCanvasRef.current;
-    if (!canvas || !chartData) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    const pointCanvas = pointCanvasRef.current;
+    const lossCanvas = lossCanvasRef.current;
+    if (!pointCanvas || !lossCanvas || !chartData) return;
 
     const { minY, maxY } = visibleYRange ?? chartData;
     const { maxDistance } = chartData;
@@ -533,52 +536,62 @@ export function LosCrossSection({
     // backing store 픽셀 크기 (DPR 적용) — 멈춤 없이 매 그리기마다 동기화
     const bw = Math.round(canvasPx.w * dpr);
     const bh = Math.round(canvasPx.h * dpr);
-    if (canvas.width !== bw) canvas.width = bw;
-    if (canvas.height !== bh) canvas.height = bh;
 
-    // 이후 좌표는 viewBox(0..W, 0..H) 그대로 사용 — DPR·균일스케일·레터박스 오프셋 합성
-    ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
-    ctx.clearRect(-ox / s, -oy / s, canvasPx.w / s, canvasPx.h / s);
-
-    // SVG clipPath(plot rect)와 동일 클립 — 줌 시 윈도우 밖 포인트가 축 영역을 넘지 않게
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(PAD.left, PAD.top, cw, ch);
-    ctx.clip();
-
-    // 항적 포인트 — <circle r=1.5 fillOpacity=0.7> + PSR 흰 테두리. SVG 와 동일 cx/cy.
-    for (const tp of trackPoints) {
-      const adjAlt = tp.altM - curvDrop43(tp.distKm);
-      const px = xScaleV(tp.distKm);
-      const py = yScaleV(adjAlt);
-      const col = detectionTypeColor(tp.radarType);
+    // 두 canvas(소실표적/항적) 공통 셋업 — 크기 동기화 + viewBox 변환 + plot rect 클립(SVG clipPath 와 동일)
+    const setup = (canvas: HTMLCanvasElement): CanvasRenderingContext2D | null => {
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      if (canvas.width !== bw) canvas.width = bw;
+      if (canvas.height !== bh) canvas.height = bh;
+      // 이후 좌표는 viewBox(0..W, 0..H) 그대로 사용 — DPR·균일스케일·레터박스 오프셋 합성
+      ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
+      ctx.clearRect(-ox / s, -oy / s, canvasPx.w / s, canvasPx.h / s);
+      ctx.save();
       ctx.beginPath();
-      ctx.arc(px, py, 1.5, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.7)`;
-      ctx.fill();
-      if (PSR_TYPES.has(tp.radarType)) {
-        ctx.lineWidth = 1;
-        ctx.strokeStyle = "rgba(255,255,255,0.6)";
-        ctx.stroke();
+      ctx.rect(PAD.left, PAD.top, cw, ch);
+      ctx.clip();
+      return ctx;
+    };
+
+    // 소실표적 포인트 — 최하층 canvas(SVG 아래, z 맨 뒤). 항적점과 동일 크기(r=1.5) + 반투명 테두리.
+    const lossCtx = setup(lossCanvas);
+    if (lossCtx) {
+      const lr = LOSS_COLOR[0], lg = LOSS_COLOR[1], lb = LOSS_COLOR[2];
+      for (const lp of lossPoints) {
+        const adjAlt = lp.altM - curvDrop43(lp.distKm);
+        const px = xScaleV(lp.distKm);
+        const py = yScaleV(adjAlt);
+        lossCtx.beginPath();
+        lossCtx.arc(px, py, 1.5, 0, Math.PI * 2);
+        lossCtx.fillStyle = `rgba(${lr},${lg},${lb},0.9)`;
+        lossCtx.fill();
+        lossCtx.lineWidth = 0.5;
+        lossCtx.strokeStyle = `rgba(${lr},${lg},${lb},0.5)`;
+        lossCtx.stroke();
       }
+      lossCtx.restore();
     }
 
-    // 소실표적 포인트 — 항적점과 동일 크기(r=1.5) + 반투명 테두리. SVG 와 동일 cx/cy.
-    const lr = LOSS_COLOR[0], lg = LOSS_COLOR[1], lb = LOSS_COLOR[2];
-    for (const lp of lossPoints) {
-      const adjAlt = lp.altM - curvDrop43(lp.distKm);
-      const px = xScaleV(lp.distKm);
-      const py = yScaleV(adjAlt);
-      ctx.beginPath();
-      ctx.arc(px, py, 1.5, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${lr},${lg},${lb},0.9)`;
-      ctx.fill();
-      ctx.lineWidth = 0.5;
-      ctx.strokeStyle = `rgba(${lr},${lg},${lb},0.5)`;
-      ctx.stroke();
+    // 항적 포인트 — SVG 위 canvas. <circle r=1.5 fillOpacity=0.7> + PSR 흰 테두리. SVG 와 동일 cx/cy.
+    const trackCtx = setup(pointCanvas);
+    if (trackCtx) {
+      for (const tp of trackPoints) {
+        const adjAlt = tp.altM - curvDrop43(tp.distKm);
+        const px = xScaleV(tp.distKm);
+        const py = yScaleV(adjAlt);
+        const col = detectionTypeColor(tp.radarType);
+        trackCtx.beginPath();
+        trackCtx.arc(px, py, 1.5, 0, Math.PI * 2);
+        trackCtx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.7)`;
+        trackCtx.fill();
+        if (PSR_TYPES.has(tp.radarType)) {
+          trackCtx.lineWidth = 1;
+          trackCtx.strokeStyle = "rgba(255,255,255,0.6)";
+          trackCtx.stroke();
+        }
+      }
+      trackCtx.restore();
     }
-
-    ctx.restore();
   }, [chartData, visibleYRange, liveZoom, canvasPx, trackPoints, lossPoints]);
 
   if (!chartData) return null;
@@ -719,12 +732,28 @@ export function LosCrossSection({
             )}
           </div>
         )}
+      {/* 소실표적 canvas — SVG(지형/건물/LoS선)보다 아래(zIndex:0, z 맨 뒤). 지형 fill 이 반투명이라 비쳐 보인다.
+          SVG 에 position:relative+zIndex:1 을 줘야 static 흐름 위로 올라가 이 canvas 를 덮는다. */}
+      <canvas
+        ref={lossCanvasRef}
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: canvasPx.w,
+          height: canvasPx.h,
+          pointerEvents: "none",
+          zIndex: 0,
+        }}
+      />
       <svg
         ref={svgRef}
         viewBox={`0 0 ${W} ${H}`}
         className={`w-full ${zoomMode ? "rounded ring-2 ring-blue-400" : ""}`}
         style={{
           maxHeight: 230,
+          position: "relative",
+          zIndex: 1,
           cursor: editable
             ? (zoomMode
                 ? (liveZoom[0] !== 0 || liveZoom[1] !== 100 ? "grab" : "crosshair")
@@ -782,7 +811,8 @@ export function LosCrossSection({
           <path d={terrainFill} fill="#22c55e" fillOpacity={0.35} />
           <path d={terrainLine} fill="none" stroke="#22c55e" strokeWidth={1.5} />
 
-          {/* 항적/소실표적 포인트는 SVG 가 아닌 canvas 오버레이로 렌더(아래 pointCanvasRef).
+          {/* 항적/소실표적 포인트는 SVG 가 아닌 canvas 로 렌더 — 항적은 SVG 위 오버레이(pointCanvasRef),
+              소실표적은 SVG 아래 최하층(lossCanvasRef, z 맨 뒤).
               수천~수만 <circle> DOM 노드를 제거해 PDF 캡처(WebView2 PrintToPdf) 병목을 없앤다. */}
 
           {/* 건물 실루엣 — TrackMap 방식 (사다리꼴 / 세로선) */}
@@ -850,11 +880,11 @@ export function LosCrossSection({
             {radarName} ({Math.round(radarHeight * M_TO_FT).toLocaleString()}ft)
           </text>
 
-          {/* 소실표적 포인트도 canvas 오버레이(pointCanvasRef)에서 그린다 — 위 항적 포인트와 동일 사유. */}
+          {/* 소실표적 포인트는 SVG 아래 canvas(lossCanvasRef)에서 그린다 — 위 항적 포인트와 동일 사유. */}
         </g>
         {/* 범례는 canvas(항적/소실표적) 위로 올리려 아래 별도 오버레이 <svg> 로 분리해 그린다. */}
       </svg>
-      {/* 항적/소실표적 포인트 canvas 오버레이 — SVG 플롯 위에 정확히 겹친다(같은 left/top/size·동일 viewBox 스케일).
+      {/* 항적 포인트 canvas 오버레이 — SVG 플롯 위에 정확히 겹친다(같은 left/top/size·동일 viewBox 스케일).
           pointer-events:none 으로 SVG 의 줌/패닝 상호작용을 가리지 않는다. */}
       <canvas
         ref={pointCanvasRef}
@@ -868,7 +898,7 @@ export function LosCrossSection({
           zIndex: 1,
         }}
       />
-      {/* 범례 오버레이 — 항적/소실표적 canvas(zIndex:1) 위(zIndex:2)에 그려 표적 포인트에 가려지지 않게.
+      {/* 범례 오버레이 — 항적 canvas(zIndex:1) 위(zIndex:2)에 그려 표적 포인트에 가려지지 않게.
           메인 SVG 와 동일 viewBox·w-full·maxHeight 로 렌더 박스가 정확히 겹치고(레터박스 스케일 동일),
           pointer-events:none 으로 SVG 의 줌/패닝 상호작용을 가리지 않는다. */}
       <svg

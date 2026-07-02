@@ -32,7 +32,8 @@ const R_KM = 6371;
 /** canvas 백킹 픽셀(렌더 해상도) — CSS 표시폭의 약 2배 밀도로 그려 PDF 출력에서 또렷하게.
  *  표시 크기는 고정(DISP_W×자동높이)으로 두어 A4 한 페이지 높이를 넘지 않게 한다
  *  ([data-page] 가 overflow:hidden 으로 클리핑되므로 페이지 분할이 아닌 잘림 방지).
- *  §4 소실상세 도면(ReportOMLossEventsMap)과 공유 — 두 도면 동일 백킹 해상도. */
+ *  §4 소실상세 도면(ReportOMLossEventsMap)은 동일 헬퍼를 정사각 백킹(w=h)으로 호출 — 아래
+ *  fitProjection/composeTiles/장식 함수들의 w/h 파라미터 기본값이 이 상수(§3 규격). */
 export const BACK_W = 760;
 export const BACK_H = 416;
 /** 화면/PDF 표시 폭(px) — 백킹의 절반(고밀도). 높이는 종횡비 자동(≈ 197px). */
@@ -102,9 +103,9 @@ export interface MapProjection {
   mpp: number;
 }
 
-/** 표시 필수 점집합([lat,lon][]) → BACK_W×BACK_H 캔버스 머케이터 투영 파라미터.
+/** 표시 필수 점집합([lat,lon][]) → w×h 백킹 캔버스 머케이터 투영 파라미터 (기본 §3 규격 BACK_W×BACK_H).
  *  bbox 패딩 12% + 캔버스 종횡비에 맞춘 부족 축 확장(왜곡 없이 타일이 박스를 채움) + 정수 줌 [3,19]. */
-export function fitProjection(pts: [number, number][]): MapProjection {
+export function fitProjection(pts: [number, number][], w = BACK_W, h = BACK_H): MapProjection {
   let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
   for (const [la, lo] of pts) {
     if (la < minLat) minLat = la;
@@ -120,7 +121,7 @@ export function fitProjection(pts: [number, number][]): MapProjection {
   let mxMin = mercX(minLon), mxMax = mercX(maxLon);
   let myMin = mercY(maxLat), myMax = mercY(minLat); // y 는 위도 증가 시 감소
   let spanX = mxMax - mxMin, spanY = myMax - myMin;
-  const targetAR = BACK_W / BACK_H;
+  const targetAR = w / h;
   if (spanX / spanY > targetAR) {
     const need = spanX / targetAR;
     const cy = (myMin + myMax) / 2; myMin = cy - need / 2; myMax = cy + need / 2; spanY = need;
@@ -130,13 +131,13 @@ export function fitProjection(pts: [number, number][]): MapProjection {
   }
 
   // 줌 — span 이 백킹 픽셀에 들어가는 최대 정수 줌
-  const zX = Math.log2(BACK_W / (spanX * TILE));
-  const zY = Math.log2(BACK_H / (spanY * TILE));
+  const zX = Math.log2(w / (spanX * TILE));
+  const zY = Math.log2(h / (spanY * TILE));
   const z = Math.max(3, Math.min(19, Math.floor(Math.min(zX, zY))));
   const worldSize = TILE * Math.pow(2, z);
   const cMx = (mxMin + mxMax) / 2, cMy = (myMin + myMax) / 2;
-  const originX = cMx * worldSize - BACK_W / 2;
-  const originY = cMy * worldSize - BACK_H / 2;
+  const originX = cMx * worldSize - w / 2;
+  const originY = cMy * worldSize - h / 2;
   const project = (lat: number, lon: number): [number, number] => [
     mercX(lon) * worldSize - originX,
     mercY(lat) * worldSize - originY,
@@ -150,20 +151,23 @@ export function fitProjection(pts: [number, number][]): MapProjection {
 }
 
 /** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 완료 시 onDone(online 여부) 호출(오프라인이면 폴백 격자
- *  + 흰 베일까지 그린 뒤). 반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청 중단 + 고아 Image
+ *  + 흰 베일까지 그린 뒤). w/h 는 fitProjection 과 동일한 백킹 크기 (기본 §3 규격).
+ *  반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청 중단 + 고아 Image
  *  디코드 버퍼 해제(누수 방지). 취소 후엔 onDone 미호출. */
 export function composeTiles(
   ctx: CanvasRenderingContext2D,
   proj: Pick<MapProjection, "z" | "originX" | "originY">,
   warnLabel: string,
   onDone: (online: boolean) => void,
+  w = BACK_W,
+  h = BACK_H,
 ): () => void {
   let cancelled = false;
   const imgs: HTMLImageElement[] = [];
   const { z, originX, originY } = proj;
   const n = Math.pow(2, z);
-  const tx0 = Math.floor(originX / TILE), tx1 = Math.floor((originX + BACK_W) / TILE);
-  const ty0 = Math.floor(originY / TILE), ty1 = Math.floor((originY + BACK_H) / TILE);
+  const tx0 = Math.floor(originX / TILE), tx1 = Math.floor((originX + w) / TILE);
+  const ty0 = Math.floor(originY / TILE), ty1 = Math.floor((originY + h) / TILE);
 
   const loadTile = (tx: number, ty: number) =>
     new Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>((resolve) => {
@@ -186,7 +190,7 @@ export function composeTiles(
     const ok = tiles.filter((t): t is { tx: number; ty: number; img: HTMLImageElement } => t != null);
 
     ctx.fillStyle = "#eef1f4";
-    ctx.fillRect(0, 0, BACK_W, BACK_H);
+    ctx.fillRect(0, 0, w, h);
     if (ok.length > 0) {
       for (const t of ok) {
         ctx.drawImage(t.img, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY), TILE, TILE);
@@ -194,18 +198,18 @@ export function composeTiles(
     } else {
       ctx.strokeStyle = "#d6dbe1";
       ctx.lineWidth = 1;
-      for (let gx = 0; gx <= BACK_W; gx += 48) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, BACK_H); ctx.stroke(); }
-      for (let gy = 0; gy <= BACK_H; gy += 48) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(BACK_W, gy); ctx.stroke(); }
+      for (let gx = 0; gx <= w; gx += 48) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke(); }
+      for (let gy = 0; gy <= h; gy += 48) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke(); }
       ctx.fillStyle = "#9aa3ad";
       ctx.font = "16px sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("지도 타일을 불러올 수 없습니다 (오프라인)", BACK_W / 2, 22);
+      ctx.fillText("지도 타일을 불러올 수 없습니다 (오프라인)", w / 2, 22);
       console.warn(`[OM 지도] 타일 로드 실패 — 오프라인/네트워크. 폴백 격자 표시 (${warnLabel})`);
     }
 
     // 베이스맵 위 옅은 흰 베일 — 오버레이 가독성
     ctx.fillStyle = "rgba(255,255,255,0.12)";
-    ctx.fillRect(0, 0, BACK_W, BACK_H);
+    ctx.fillRect(0, 0, w, h);
 
     onDone(ok.length > 0);
   });
@@ -502,14 +506,14 @@ function labelChip(ctx: CanvasRenderingContext2D, text: string, x: number, y: nu
   ctx.fillText(text, cx, cy + 0.5);
 }
 
-export function drawScaleBar(ctx: CanvasRenderingContext2D, mpp: number) {
+export function drawScaleBar(ctx: CanvasRenderingContext2D, mpp: number, h = BACK_H) {
   const targetPx = 110;
   const targetM = mpp * targetPx;
   const niceM = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
   let chosen = niceM[0];
   for (const m of niceM) if (m <= targetM) chosen = m;
   const barPx = chosen / mpp;
-  const x0 = 14, y0 = BACK_H - 16;
+  const x0 = 14, y0 = h - 16;
   ctx.strokeStyle = "#1f2937"; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + barPx, y0); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(x0, y0 - 4); ctx.lineTo(x0, y0 + 4); ctx.stroke();
@@ -520,8 +524,8 @@ export function drawScaleBar(ctx: CanvasRenderingContext2D, mpp: number) {
   ctx.fillText(label, x0 + 2, y0 - 5);
 }
 
-export function drawNorth(ctx: CanvasRenderingContext2D) {
-  const x = BACK_W - 22, y = 26;
+export function drawNorth(ctx: CanvasRenderingContext2D, w = BACK_W) {
+  const x = w - 22, y = 26;
   ctx.beginPath();
   ctx.moveTo(x, y - 14); ctx.lineTo(x - 6, y + 6); ctx.lineTo(x, y + 1); ctx.lineTo(x + 6, y + 6);
   ctx.closePath();
@@ -531,15 +535,15 @@ export function drawNorth(ctx: CanvasRenderingContext2D) {
   ctx.fillText("N", x, y + 7);
 }
 
-export function drawAttribution(ctx: CanvasRenderingContext2D, online: boolean) {
+export function drawAttribution(ctx: CanvasRenderingContext2D, online: boolean, w = BACK_W, h = BACK_H) {
   if (!online) return;
   const text = "© OpenStreetMap · © CARTO";
   ctx.font = "10px sans-serif"; ctx.textAlign = "right"; ctx.textBaseline = "bottom";
-  const w = ctx.measureText(text).width + 6;
+  const tw = ctx.measureText(text).width + 6;
   ctx.fillStyle = "rgba(255,255,255,0.7)";
-  ctx.fillRect(BACK_W - w - 2, BACK_H - 14, w, 13);
+  ctx.fillRect(w - tw - 2, h - 14, tw, 13);
   ctx.fillStyle = "#6b7280";
-  ctx.fillText(text, BACK_W - 4, BACK_H - 2);
+  ctx.fillText(text, w - 4, h - 2);
 }
 
 function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {

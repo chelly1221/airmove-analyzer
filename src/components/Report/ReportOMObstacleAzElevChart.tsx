@@ -11,8 +11,9 @@
  *    · 윗변 = 지형 + 건물 실루엣을 방위별 max 로 합성. 건물 실루엣은 레이더 시점에서 본
  *      압출 폴리곤의 가변 윗변(방위별 양각, panorama.rs build_building_silhouette).
  *  - 소실표적: 이 방위 윈도우 + 분석 대상 후방의 모든 소실표적을 빨간 점으로 통일 표시
- *      (LoS 단면도와 동일 #ff1745). 분류별 건수(장애물 추가 기인 / 지형 차단 / 장애물 무관)는
- *      별도 요약표 컴포넌트(ReportOMObstacleSummaryTable)에서 제공 — 동일 classifyObstacleLosses 공유.
+ *      (LoS 단면도와 동일 #ff1745). z-순서는 최하층(항적·실루엣 아래)이되, 핑크영역 안의 점
+ *      (buildingCaused)만 실루엣 위 최상층으로 재드로우. 분류별 건수(장애물 추가 기인 / 지형 차단 /
+ *      장애물 무관)는 별도 요약표 컴포넌트(ReportOMObstacleSummaryTable)에서 제공 — 동일 classifyObstacleLosses 공유.
  */
 import { useMemo, useRef, useEffect, useCallback } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, PanoramaMergeResult, BuildingObstacle } from "../../types";
@@ -170,7 +171,7 @@ export default function ReportOMObstacleAzElevChart({
   // 건물 메타 + 소실표적 분류 — obstacleAnalysisHelpers 의 단일 소스 사용.
   //  panoWith/panoWithout 제공 시 차단각을 panorama(빨강영역과 동일 소스)에서 산출 → 장애물 추가 기인 분류가 빨강영역과 픽셀 일치.
   //  (요약 표의 '음영 소실'(장애물 추가 기인) 집계가 빨강 영역과 항상 일치 — 양쪽 동일 panorama·sibling 인자.
-  //   소실표적 점은 분류와 무관하게 모두 빨간 점으로 표시)
+  //   소실표적 점은 분류와 무관하게 모두 빨간 점 — 단 buildingCaused 만 핑크영역 위 최상층 재드로우)
   const computed = useMemo(
     () => classifyObstacleLosses(radarSite, building, lossPoints, { panoWith, panoWithout, siblings }),
     [radarSite, building, lossPoints, panoWith, panoWithout, siblings],
@@ -331,7 +332,21 @@ export default function ReportOMObstacleAzElevChart({
     const { withoutLine, withLine } = sil;
     const clamp0 = (e: number) => (e < 0 ? 0 : e);
 
-    // 항적 — 배경 레이어(소실표적/실루엣 아래). LoS 단면도와 동일 detection type 색·작은 점.
+    // 소실표적 — 최하층(z 맨 뒤). 모든 소실표적을 빨간 점으로 통일 (LoS 단면도와 동일 #ff1745).
+    //   항적·실루엣 영역(지형/추가차단) 아래로 깔리고, '분석 대상 추가 차단'(핑크영역) 안의 점만
+    //   실루엣 위 최상층으로 재드로우(아래 buildingCaused 블록). 크기는 항적점(r=1.3)과 동일.
+    //   (분류별 건수는 별도 요약표 컴포넌트에서 제공)
+    ctx.fillStyle = "rgba(255,23,69,0.9)";
+    for (const l of computed.losses) {
+      if (l.elevAngleDeg < 0) continue;
+      const x = xScale(l.azDeg);
+      const y = yScale(l.elevAngleDeg);
+      ctx.beginPath();
+      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // 항적 — 소실표적 위·실루엣 아래. LoS 단면도와 동일 detection type 색·작은 점.
     //   대상 후방·방위창 내 전수 항적을 깔아 소실표적 분포의 모집단(전체 통과 항적)을 시각화.
     for (const tp of trackDots) {
       const x = xScale(tp.az);
@@ -348,20 +363,7 @@ export default function ReportOMObstacleAzElevChart({
       }
     }
 
-    // 소실표적 — 모든 소실표적을 빨간 점으로 통일 (LoS 단면도와 동일 #ff1745).
-    //   항적 위·실루엣 영역(지형/추가차단) 아래로 깔린다. 크기는 항적점(r=1.3)과 동일.
-    //   (분류별 건수는 별도 요약표 컴포넌트에서 제공)
-    ctx.fillStyle = "rgba(255,23,69,0.9)";
-    for (const l of computed.losses) {
-      if (l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      ctx.beginPath();
-      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // 방위별 실루엣 윗변 — 소실표적 위에 겹쳐 그림 (반투명 영역이 분포 위로 올라와 잘 보임).
+    // 방위별 실루엣 윗변 — 항적/소실표적 위에 겹쳐 그림 (반투명 영역이 분포 위로 올라와 잘 보임).
     // without(녹색 base) / with(분석 대상 포함). 동일 rel 격자.
     if (withoutLine.length >= 2) {
       // 1) 베이스: 지형 + 기존 지형지물 (without 윗변 아래, 연두)
@@ -405,6 +407,19 @@ export default function ReportOMObstacleAzElevChart({
       };
       drawLine(withoutLine, "#166534", 0.8);
       drawLine(withLine, "#22c55e", 1);
+    }
+
+    // 소실표적 재드로우 — '분석 대상 추가 차단'(핑크영역) 안의 점만 실루엣 위 최상층으로.
+    //   판정은 분류(classifyObstacleLosses)의 buildingCaused 재사용 — 핑크영역(with−without)과
+    //   동일 panorama 샘플러 소스라 픽셀 일치(경계 재계산 불필요).
+    ctx.fillStyle = "rgba(255,23,69,0.9)";
+    for (const l of computed.losses) {
+      if (!l.buildingCaused || l.elevAngleDeg < 0) continue;
+      const x = xScale(l.azDeg);
+      const y = yScale(l.elevAngleDeg);
+      ctx.beginPath();
+      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
+      ctx.fill();
     }
 
     // (분석 대상 방위 마커 제거 — 대상 차단각 높이는 연홍색 '추가 차단' 영역이 표현)
