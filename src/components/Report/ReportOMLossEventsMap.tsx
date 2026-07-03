@@ -10,7 +10,7 @@
  *    아래 가로 나열. 남는 페이지 공간에 이벤트 표가 들어간다(행수 산정: ReportOMLossEvents).
  *  - 소실표적: 이벤트 대표점이 아닌 분류된 보간점 전수를 그대로 찍는다(다운샘플링 금지 원칙).
  *  - 건물: 이 레이더에서 LoS 결과가 있는 분석 대상 건물만 — 표 분류 대상과 동일 집합.
- *  - PDF 안전: 단일 canvas + data-map-canvas/data-map-ready 게이트(useReportExport 폴링) — §3 도면과 동일.
+ *  - PDF 안전: 단일 canvas + data-map-canvas/data-map-ready·data-map-complete 게이트(useReportExport 폴링) — §3 도면과 동일.
  */
 import { useEffect, useMemo, useRef } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite } from "../../types";
@@ -82,8 +82,9 @@ export default function ReportOMLossEventsMap({ radarSite, buildings, buildingGr
     canvas.height = SQ;
     // PDF 내보내기(useReportExport)가 data-map-ready 폴링 — §3 도면과 동일 게이트
     canvas.setAttribute("data-map-ready", "false");
+    canvas.setAttribute("data-map-complete", "false");
 
-    return composeTiles(ctx, geom.proj, `${radarSite.name} 소실상세`, (online) => {
+    return composeTiles(ctx, geom.proj, `${radarSite.name} 소실상세`, (online, complete) => {
       // 소실표적 점 — 보간점 전수 (반투명 겹침으로 밀집도 표현, 보고서 통일 색 #ff1745)
       ctx.fillStyle = "rgba(255,23,69,0.55)";
       for (const [px, py] of geom.lossPx) { ctx.beginPath(); ctx.arc(px, py, 2.2, 0, Math.PI * 2); ctx.fill(); }
@@ -123,6 +124,8 @@ export default function ReportOMLossEventsMap({ radarSite, buildings, buildingGr
 
       // 렌더 완료 — 내보내기 게이트 통과 허용 (오프라인 폴백도 '완료'로 간주해 무한 대기 방지)
       canvas.setAttribute("data-map-ready", "true");
+      // 타일 부분 유실 자가치유(백그라운드 재시도 재합성) 진행 여부 — 내보내기 게이트가 잠시 대기
+      canvas.setAttribute("data-map-complete", complete ? "true" : "false");
     }, SQ, SQ);
   }, [geom, radarSite.name]);
 
@@ -142,6 +145,7 @@ export default function ReportOMLossEventsMap({ radarSite, buildings, buildingGr
         height={SQ}
         data-map-canvas="1"
         data-map-ready="false"
+        data-map-complete="false"
         style={{ width: "100%", height: "auto", display: "block", border: "1px solid #e5e7eb", borderRadius: 4 }}
       />
 

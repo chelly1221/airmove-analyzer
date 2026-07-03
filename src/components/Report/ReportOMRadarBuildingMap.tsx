@@ -151,14 +151,17 @@ export function fitProjection(pts: [number, number][], w = BACK_W, h = BACK_H): 
 }
 
 // ── 전역 타일 로드 동시성 제한 ──
-// §3 상세(빌딩×레이더) 도면 + §4 소실상세 도면이 다수 마운트되면 도면당 12~25개 타일 요청이
+// §3 상세(빌딩×레이더) 도면 + §4 소실상세 도면이 다수 마운트되면 도면당 12~49개 타일 요청이
 // 한꺼번에 발화해 수백 개 Image 네트워크/디코드가 렌더러·공유 GPU 프로세스 메모리를 일시에
 // 점유한다(다건물 보고서에서 두 창 동시 blank/프리징의 가중 요인). 풀 크기만큼만 동시 로드하고
 // 나머지는 큐 대기.
-// 타일 3초 데드라인은 '큐 대기 포함' 전체 예산 — composeTiles 가 항상 ≤3초에 종료해야
+// 첫 패스 타일 3초 데드라인은 '큐 대기 포함' 전체 예산 — 첫 합성이 항상 ≤3초에 종료해야
 // PDF 게이트(useReportExport data-map-ready 4초) 안에 오버레이(부채꼴·건물·소실점)까지 그려진
 // 도면이 인쇄된다. 행잉 네트워크에서 큐 대기가 예산을 소모하면 잔여 시간만 로드에 사용하고,
 // 큐에서 예산이 소진된 타일은 Image 생성 없이 즉시 포기한다.
+// 예산 소진으로 미수신된 타일은 '구멍(회색 조각)' 상태로 확정하지 않고 백그라운드 재시도
+// (최대 RETRY_MAX 회)로 자가치유한다 — 동시 마운트 혼잡에서 뒤쪽 큐 타일이 대량 유실돼
+// 일부만 로딩된 지도가 PDF 에 인쇄되던 문제 방지. 진행 상태는 data-map-complete 로 노출.
 const TILE_POOL = 24;
 let tileActive = 0;
 const tileQueue: (() => void)[] = [];
@@ -182,30 +185,52 @@ function releaseTileSlot() {
   else tileActive--;
 }
 
-/** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 완료 시 onDone(online 여부) 호출(오프라인이면 폴백 격자
- *  + 흰 베일까지 그린 뒤). w/h 는 fitProjection 과 동일한 백킹 크기 (기본 §3 규격).
- *  반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청 중단 + 고아 Image
+/** 첫 패스 타일 예산(ms) — 큐 대기 포함. 첫 합성이 ≤3초에 끝나 data-map-ready 게이트를 연다. */
+const TILE_BUDGET_FIRST_MS = 3000;
+/** 재시도 패스 타일 예산(ms) — ready 게이트 무관 백그라운드 자가치유라 여유 있게. */
+const TILE_BUDGET_RETRY_MS = 4000;
+/** 미수신 타일 재시도 상한 — 첫 패스 이후 최대 2회. */
+const RETRY_MAX = 2;
+/** 재시도 지연(ms) — 동시 마운트 도면들의 첫 패스 혼잡이 풀에서 빠지길 기다렸다 재요청. */
+const RETRY_DELAY_MS = 800;
+
+/** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 합성(첫 패스 + 자가치유 재합성)마다
+ *  onDone(online, complete) 호출: 베이스 전체를 다시 그렸으므로 호출측은 매번 오버레이를 다시 그린다.
+ *    online   = 성공 타일 존재 (false 면 폴백 격자 상태)
+ *    complete = 합성 확정 — 전 타일 수신 또는 재시도 소진(추가 자가치유 없음)
+ *  첫 패스는 타일당 3초(큐 대기 포함) 예산으로 ≤3초 내 종료해 PDF 게이트(data-map-ready)를 열고,
+ *  미수신 타일은 백그라운드 재시도(최대 RETRY_MAX 회)로 채운 뒤 재합성 — '일부만 로딩된 지도'가
+ *  화면·PDF 에 확정되는 것을 방지 (PDF 게이트는 data-map-complete 로 자가치유 완료를 잠시 대기).
+ *  w/h 는 fitProjection 과 동일한 백킹 크기 (기본 §3 규격).
+ *  반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청·재시도 타이머 중단 + 고아 Image
  *  디코드 버퍼 해제(누수 방지). 취소 후엔 onDone 미호출. */
 export function composeTiles(
   ctx: CanvasRenderingContext2D,
   proj: Pick<MapProjection, "z" | "originX" | "originY">,
   warnLabel: string,
-  onDone: (online: boolean) => void,
+  onDone: (online: boolean, complete: boolean) => void,
   w = BACK_W,
   h = BACK_H,
 ): () => void {
   let cancelled = false;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
   const imgs: HTMLImageElement[] = [];
   const { z, originX, originY } = proj;
   const n = Math.pow(2, z);
   const tx0 = Math.floor(originX / TILE), tx1 = Math.floor((originX + w) / TILE);
   const ty0 = Math.floor(originY / TILE), ty1 = Math.floor((originY + h) / TILE);
 
-  const loadTile = async (tx: number, ty: number): Promise<{ tx: number; ty: number; img: HTMLImageElement } | null> => {
-    if (ty < 0 || ty >= n) return null;
-    // 3초 데드라인 = 큐 대기 + 네트워크/디코드 전체 예산 — composeTiles 의 Promise.all 이 항상
-    // ≤3초에 끝나 PDF 게이트(data-map-ready 4초) 안에 오버레이 포함 도면이 인쇄되도록 보장.
-    const deadline = Date.now() + 3000;
+  // 대상 타일 전체 목록 (머케이터 세로 범위 밖 제외) — 재시도 라운드의 잔여 목록 산출 기준
+  const targets: { tx: number; ty: number }[] = [];
+  for (let tx = tx0; tx <= tx1; tx++)
+    for (let ty = ty0; ty <= ty1; ty++) if (ty >= 0 && ty < n) targets.push({ tx, ty });
+
+  // 수신 성공 타일 누적 — 재합성마다 전체를 다시 그린다 (라운드 간 증분 유지)
+  const loaded: { tx: number; ty: number; img: HTMLImageElement }[] = [];
+
+  const loadTile = async (tx: number, ty: number, budgetMs: number): Promise<{ tx: number; ty: number; img: HTMLImageElement } | null> => {
+    // 데드라인 = 큐 대기 + 네트워크/디코드 전체 예산 — 라운드의 Promise.all 이 예산 내 종료 보장
+    const deadline = Date.now() + budgetMs;
     if (!(await acquireTileSlotUntil(deadline))) return null; // 큐 대기 중 예산 소진 — 슬롯 미보유
     if (cancelled) { releaseTileSlot(); return null; }
     try {
@@ -225,18 +250,12 @@ export function composeTiles(
     }
   };
 
-  const jobs: Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>[] = [];
-  for (let tx = tx0; tx <= tx1; tx++)
-    for (let ty = ty0; ty <= ty1; ty++) jobs.push(loadTile(tx, ty));
-
-  Promise.all(jobs).then((tiles) => {
-    if (cancelled) return;
-    const ok = tiles.filter((t): t is { tx: number; ty: number; img: HTMLImageElement } => t != null);
-
+  /** 누적 loaded 로 베이스 전체 재합성 + 흰 베일 + onDone(오버레이 재그리기) */
+  const drawAll = (complete: boolean, warnOffline: boolean) => {
     ctx.fillStyle = "#eef1f4";
     ctx.fillRect(0, 0, w, h);
-    if (ok.length > 0) {
-      for (const t of ok) {
+    if (loaded.length > 0) {
+      for (const t of loaded) {
         ctx.drawImage(t.img, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY), TILE, TILE);
       }
     } else {
@@ -248,18 +267,48 @@ export function composeTiles(
       ctx.font = "16px sans-serif";
       ctx.textAlign = "center";
       ctx.fillText("지도 타일을 불러올 수 없습니다 (오프라인)", w / 2, 22);
-      console.warn(`[OM 지도] 타일 로드 실패 — 오프라인/네트워크. 폴백 격자 표시 (${warnLabel})`);
+      if (warnOffline) console.warn(`[OM 지도] 타일 로드 실패 — 오프라인/네트워크. 폴백 격자 표시 (${warnLabel})`);
     }
 
     // 베이스맵 위 옅은 흰 베일 — 오버레이 가독성
     ctx.fillStyle = "rgba(255,255,255,0.12)";
     ctx.fillRect(0, 0, w, h);
 
-    onDone(ok.length > 0);
-  });
+    onDone(loaded.length > 0, complete);
+  };
+
+  /** round=0 첫 패스, 이후 미수신 타일만 재시도. 라운드 종료마다 필요 시 재합성 + 다음 라운드 예약. */
+  const runRound = (round: number, pending: { tx: number; ty: number }[], budgetMs: number) => {
+    Promise.all(pending.map((t) => loadTile(t.tx, t.ty, budgetMs))).then((results) => {
+      if (cancelled) return;
+      const missing: { tx: number; ty: number }[] = [];
+      let gained = 0;
+      results.forEach((r, i) => {
+        if (r) { loaded.push(r); gained++; }
+        else missing.push(pending[i]);
+      });
+      const settled = missing.length === 0 || round >= RETRY_MAX;
+      // 첫 패스는 항상 합성(폴백 포함). 재시도 라운드는 신규 타일 수신 시, 또는 확정 시(complete
+      // 전환을 onDone 으로 알리기 위해) 재합성. 오프라인 경고는 첫 패스에서만 1회.
+      if (round === 0 || gained > 0 || settled) drawAll(settled, round === 0);
+      if (settled) {
+        if (missing.length > 0)
+          console.warn(`[OM 지도] 타일 ${missing.length}/${targets.length}개 미수신 상태로 확정 — 재시도 소진 (${warnLabel})`);
+        return;
+      }
+      console.warn(`[OM 지도] 타일 ${missing.length}/${targets.length}개 미수신 — ${round + 1}차 재시도 예약 (${warnLabel})`);
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        if (!cancelled) runRound(round + 1, missing, TILE_BUDGET_RETRY_MS);
+      }, RETRY_DELAY_MS);
+    });
+  };
+
+  runRound(0, targets, TILE_BUDGET_FIRST_MS);
 
   return () => {
     cancelled = true;
+    if (retryTimer != null) clearTimeout(retryTimer);
     // 미완료 타일 요청 중단 + 디코드 버퍼 해제 (언마운트/재계산 시 고아 Image 누수 방지)
     for (const im of imgs) { if (!im.complete) im.src = ""; }
   };
@@ -371,8 +420,9 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
     // PDF 내보내기(useReportExport)가 이 속성으로 타일 렌더 완료를 기다린다 — 비동기 타일이
     //   PrintToPdf 스냅샷보다 늦어 백지로 캡처되는 것을 방지. 그리기 완료 시 "true" 로 전환.
     canvas.setAttribute("data-map-ready", "false");
+    canvas.setAttribute("data-map-complete", "false");
 
-    return composeTiles(ctx, geom.proj, `${radarSite.name} / 건물 ${building.id}`, (online) => {
+    return composeTiles(ctx, geom.proj, `${radarSite.name} / 건물 ${building.id}`, (online, complete) => {
       drawOverlay(ctx, geom, groupColor);
       drawScaleBar(ctx, geom.proj.mpp);
       drawNorth(ctx);
@@ -380,6 +430,8 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
 
       // 렌더 완료 — 내보내기 게이트 통과 허용 (오프라인 폴백도 '완료'로 간주해 무한 대기 방지)
       canvas.setAttribute("data-map-ready", "true");
+      // 타일 부분 유실 자가치유(백그라운드 재시도 재합성) 진행 여부 — 내보내기 게이트가 잠시 대기
+      canvas.setAttribute("data-map-complete", complete ? "true" : "false");
     });
   }, [geom, groupColor, radarSite.name, building.id]);
 
@@ -401,6 +453,7 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
           height={BACK_H}
           data-map-canvas="1"
           data-map-ready="false"
+          data-map-complete="false"
           style={{ width: DISP_W, height: "auto", display: "block", flex: "0 0 auto", border: "1px solid #e5e7eb", borderRadius: 4 }}
         />
 

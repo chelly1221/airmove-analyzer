@@ -6,7 +6,8 @@
  * 차트와 동일한 classifyObstacleLosses(동일 인자) 결과를 사용 → 집계·편집키(azelev.*.tbl.*) 완전 동일.
  *
  * 집계 단위 — 스키마 계약:
- *   '…건' = 이벤트 건수(distinct event_id), 비율 = 이벤트/이벤트(분자·분모 동일 단위),
+ *   '…건' = 이벤트 건수(distinct event_id), 분류 행은 '분자/분모건'(분모 = 후방 소실표적 총 이벤트)으로
+ *   표기해 이벤트/이벤트 비율임을 표기 자체로 드러냄(% 병기 없음 — '건/초' 오독 방지),
  *   소실시간 = Σ share_s(같은 gap 보간점 합 = gap — 점×gap 과대 없음), 점 개수는 1행에 병기(차트 점과 일치).
  */
 import { useMemo } from "react";
@@ -43,14 +44,14 @@ export default function ReportOMObstacleSummaryTable({
     [radarSite, building, lossPoints, panoWith, panoWithout, siblings],
   );
 
-  // 요약 수치 — '…건'은 이벤트(distinct event_id), 비율도 이벤트/이벤트. 점 개수(totalPts)는 1행 병기용.
+  // 요약 수치 — '…건'은 이벤트(distinct event_id). 점 개수(totalPts)는 1행 병기용.
   const totalPts = computed.losses.length;
   const totalEv = computed.totalEventCount;
   const shadowEv = computed.shadowEventCount;
   const bldgEv = computed.buildingEventCount;
   const bldgDuration = computed.buildingDurationS; // Σ share_s — 같은 gap 보간점 합 = gap
   const freeEv = totalEv - shadowEv;               // inShadow 점이 하나도 없는 이벤트 (합 = totalEv 보존)
-  const shadowRatio = totalEv > 0 ? (shadowEv / totalEv) * 100 : 0;
+  // 표시용은 분자/분모건 — bldgRatio 는 강조색·폴백 판정에만 사용
   const bldgRatio = totalEv > 0 ? (bldgEv / totalEv) * 100 : 0;
   const hasBldgEffect = computed.angleTotalDeg > computed.angleTerrainDeg + BLDG_EFFECT_EPS_DEG;
 
@@ -77,14 +78,14 @@ export default function ReportOMObstacleSummaryTable({
         <tr className="alt">
           <td><OMEditable id={`${eid}.tbl.r2.label`} value="LoS 차단 영역 내" tag="span" /></td>
           <td className="ta-r mono">
-            {shadowEv}건 ({shadowRatio.toFixed(1)}%)
+            {shadowEv}/{totalEv}건
           </td>
           <td className="muted"><OMEditable id={`${eid}.tbl.r2.note`} value="지형+장애물 통합 차단" tag="span" /></td>
         </tr>
         <tr>
           <td className="strong" style={{ color: "#a60739" }}><OMEditable id={`${eid}.tbl.r3.label`} value="장애물 추가 기인" tag="span" /></td>
           <td className="ta-r mono strong" style={{ color: bldgRatio > 10 ? "#dc2626" : "#374151" }}>
-            {bldgEv}건 ({bldgRatio.toFixed(1)}%) / {bldgDuration.toFixed(1)}초
+            {bldgEv}/{totalEv}건 · 소실 {bldgDuration.toFixed(1)}초
           </td>
           <td className="muted">
             <OMEditable id={`${eid}.tbl.r3.note`} value="지형·기존지물 차단각 초과 ~ 대상 차단각 사이" tag="span" />
@@ -116,7 +117,7 @@ export default function ReportOMObstacleSummaryTable({
         <tr className="alt">
           <td style={{ color: "#2563eb" }}><OMEditable id={`${eid}.tbl.r4.label`} value="장애물 무관" tag="span" /></td>
           <td className="ta-r mono">
-            {freeEv}건 ({totalEv > 0 ? ((freeEv / totalEv) * 100).toFixed(1) : "0.0"}%)
+            {freeEv}/{totalEv}건
           </td>
           <td className="muted"><OMEditable id={`${eid}.tbl.r4.note`} value="차단 영역 외 소실표적" tag="span" /></td>
         </tr>

@@ -185,6 +185,22 @@ async function exportViaNative(
         ctx.fillText("지도 타일 로드 시간 초과 — 베이스맵 미표시", w / 2, 22);
       }
     }
+
+    // 타일 부분 유실 자가치유 대기 — 첫 합성에서 일부 타일이 미수신이면(data-map-complete="false")
+    //   composeTiles 백그라운드 재시도(최대 2회)가 도면을 재합성한다. 확정까지 잠시 추가 대기해
+    //   '일부만 로딩된(회색 조각) 지도'가 인쇄되는 것을 방지. ready 미달 캔버스(위 폴백 처리)는
+    //   제외 — 이미 수동 폴백을 그렸고 complete 를 기다릴 근거가 없다.
+    //   정상 네트워크에선 complete="true"가 이미 세팅돼 있어 대기 0초로 통과.
+    const isHealing = () => mapCanvases.some(
+      (c) => c.getAttribute("data-map-ready") === "true" && c.getAttribute("data-map-complete") === "false",
+    );
+    const healDeadline = Date.now() + 8000;
+    while (isHealing() && Date.now() < healDeadline) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    if (isHealing()) {
+      console.warn("[보고서 PDF] 지도 타일 자가치유 대기 타임아웃(8초) — 현재 상태로 인쇄 진행");
+    }
   }
 
   // DOM 복원 함수 (정상 흐름 + 비정상 종료 양쪽에서 사용)
