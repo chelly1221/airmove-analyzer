@@ -16,6 +16,8 @@ import ObstacleMonthlyConfigModal from "../components/Report/ObstacleMonthlyConf
 import ReportSettingsModal from "../components/Report/ReportSettingsModal";
 import ReportPdfExportModal from "../components/Report/ReportPdfExportModal";
 import { generateOMFindingsText } from "../utils/omFindingsGenerator";
+import { readBulkJson } from "../utils/bulkIpc";
+import type { BulkRef } from "../utils/bulkIpc";
 import { computeAddedBlockage } from "../utils/omAddedBlockage";
 import { calcBuildingAzExtent, hasBldgEffectFromPanorama, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
 import {
@@ -795,7 +797,8 @@ export default function ReportApp() {
           console.log(`[Panorama] ${radar.name}: terrainResults ${terrainResults.length}개, ${(performance.now() - radarStart).toFixed(0)}ms. invoke panorama_merge_buildings_dual`);
 
           const mergeStart = performance.now();
-          const dual = await invoke<PanoramaMergeDualResult>("panorama_merge_buildings_dual", {
+          // 결과(terrain 36K + 건물 실루엣 ×2, 수십 MB)는 bulk:// 파일 매개 수신 (bulkIpc.ts)
+          const dualRef = await invoke<BulkRef>("panorama_merge_buildings_dual", {
             radarLat: radar.latitude,
             radarLon: radar.longitude,
             radarHeightM: radarH,
@@ -803,6 +806,7 @@ export default function ReportApp() {
             terrainResults,
             excludeManualIds: excludeIds.length > 0 ? excludeIds : null,
           });
+          const dual = await readBulkJson<PanoramaMergeDualResult>(dualRef);
           if (cancelled) { console.log(`[Panorama] ${radar.name}: 취소됨 (merge 후)`); return; }
           console.log(`[Panorama] ${radar.name}: merge_dual 완료 ${(performance.now() - mergeStart).toFixed(0)}ms (terrain=${dual.terrain.length}, bldg_with=${dual.buildings_with_targets.length}, bldg_without=${dual.buildings_without_targets?.length ?? "null"})`);
 

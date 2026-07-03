@@ -66,14 +66,32 @@ pub struct RadarFileSet {
 
 // ─── 출력 타입 ───
 
+// ── 직렬화 정밀도 절사 ──
+// 대용량 배열(loss_points_summary·track_points_geo·az_elev_histogram)의 f64 를
+// 표시 정밀도로 절사해 결과 JSON 크기를 2~3배 축소 (17자리 → 6~9자리).
+// lat/lon 1e-6°≈0.11m, 시간 1ms, 고도 0.1ft — 모든 소비처(차트·지도·합산)에 무영향 수준.
+fn ser_deg6<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64((v * 1e6).round() / 1e6)
+}
+fn ser_s3<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64((v * 1e3).round() / 1e3)
+}
+fn ser_ft1<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64((v * 10.0).round() / 10.0)
+}
+
 /// Loss 발생 좌표 요약 (커버리지맵 오버레이용)
 #[derive(Serialize, Clone, Debug)]
 pub struct LossPointGeo {
+    #[serde(serialize_with = "ser_deg6")]
     pub lat: f64,
+    #[serde(serialize_with = "ser_deg6")]
     pub lon: f64,
+    #[serde(serialize_with = "ser_ft1")]
     pub alt_ft: f64,
     /// 부모 gap(소실 이벤트) 전체 지속시간(초) — 이벤트 지속시간 표시용.
     /// 같은 gap 의 보간점 모두 동일 값이므로 점마다 합산하면 N×gap 과대 — 시간 합산엔 share_s 사용.
+    #[serde(serialize_with = "ser_s3")]
     pub duration_s: f64,
     /// 소실 gap(이벤트) 고유 번호 — analyze_radar_monthly 1회 실행(레이더 결과) 내에서
     /// gap 마다 1씩 증가. 같은 gap 의 보간점들은 같은 event_id.
@@ -81,14 +99,18 @@ pub struct LossPointGeo {
     pub event_id: u32,
     /// gap / total_missed — 보간점 균등 분배 시간(초). 같은 gap 의 share_s 합 = gap.
     /// 히스토그램 loss_per_pt 와 동일 값. 소실시간 합산은 Σ share_s.
+    #[serde(serialize_with = "ser_s3")]
     pub share_s: f64,
 }
 
 /// 항적 포인트 좌표 (LoS 단면도 오버레이용)
 #[derive(Serialize, Clone, Debug)]
 pub struct TrackPointGeo {
+    #[serde(serialize_with = "ser_deg6")]
     pub lat: f64,
+    #[serde(serialize_with = "ser_deg6")]
     pub lon: f64,
+    #[serde(serialize_with = "ser_ft1")]
     pub alt_ft: f64,
     pub radar_type: String,
 }
@@ -104,8 +126,10 @@ pub struct AzElevCell {
     /// floor((elev + 1.0)/0.05), 0..140
     pub elev_bin: u16,
     /// 정상 추적 노출시간 합 (초)
+    #[serde(serialize_with = "ser_s3")]
     pub track_time_s: f64,
     /// 소실시간 합 (초)
+    #[serde(serialize_with = "ser_s3")]
     pub loss_time_s: f64,
     /// 정상 추적 스캔 포인트 수 (gap ≤ threshold 인 연속 스캔 1건 = 1포인트)
     pub track_count: u32,

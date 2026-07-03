@@ -2,18 +2,20 @@
  * WebGPU 파노라마 앙각 계산 — GPU Worker에 위임
  *
  * 아키텍처:
- *   Phase 1: 메인 스레드 — Rust IPC로 heightmap 수신 + base64 decode
+ *   Phase 1: 메인 스레드 — Rust IPC 메타 + bulk:// fetch 로 f32 heightmap 수신
  *   Phase 2: GPU Worker — heightmap에서 polar→ENU 샘플링 + 앙각 계산
  *   Phase 3: 메인 스레드 — TerrainResult 배열로 변환
  */
 
 import { invoke } from "@tauri-apps/api/core";
 import { getGPUWorkerInstance } from "./gpuCoverage";
+import { readBulkBytes } from "./bulkIpc";
 
-// ─── Rust heightmap 결과 타입 ────────────────────────
+// ─── Rust heightmap 결과 타입 (lib.rs HeightmapBulkResult 미러) ──
 
-interface HeightmapResult {
-  data_b64: string;
+interface HeightmapBulkResult {
+  bulk_id: string;
+  bytes: number;
   width: number;
   height: number;
   pixel_size_m: number;
@@ -32,25 +34,6 @@ export interface TerrainResult {
   ground_elev_m: number;
   lat: number;
   lon: number;
-}
-
-// ─── base64 decode (인라인 Worker) ──────────────────
-
-function decodeBase64OffThread(base64: string): Promise<ArrayBuffer> {
-  return new Promise((resolve, reject) => {
-    const code = `self.onmessage=function(e){try{var b=atob(e.data),n=b.length,u=new Uint8Array(n);for(var i=0;i<n;i++)u[i]=b.charCodeAt(i);postMessage(u.buffer,[u.buffer])}catch(err){postMessage({error:String(err)})}}`;
-    const blob = new Blob([code], { type: "text/javascript" });
-    const url = URL.createObjectURL(blob);
-    const w = new Worker(url);
-    w.onmessage = (e) => {
-      if (e.data instanceof ArrayBuffer) resolve(e.data);
-      else reject(new Error(e.data?.error ?? "Base64 decode failed"));
-      w.terminate();
-      URL.revokeObjectURL(url);
-    };
-    w.onerror = (err) => { reject(err); w.terminate(); URL.revokeObjectURL(url); };
-    w.postMessage(base64);
-  });
 }
 
 // ─── destination_point (좌표 복원용) ────────────────
@@ -87,11 +70,11 @@ export async function computePanoramaTerrainGPU(
 ): Promise<TerrainResult[]> {
   const numAzimuths = Math.round(360 / azimuthStepDeg);
 
-  // 1. Rust에서 heightmap 수신
+  // 1. Rust에서 heightmap 메타 수신 → bulk:// 로 f32 raw 본체 fetch
   const rangeNm = maxRangeKm / 1.852;
   console.log(`[GPU Panorama] build_heightmap invoke 시작 (lat=${radarLat.toFixed(4)}, lon=${radarLon.toFixed(4)}, rangeNm=${rangeNm.toFixed(1)})`);
   console.time("[GPU Panorama] Heightmap fetch");
-  const meta = await invoke<HeightmapResult>("build_heightmap", {
+  const meta = await invoke<HeightmapBulkResult>("build_heightmap", {
     radarLat, radarLon,
     radarAltitude: radarHeightM,
     antennaHeight: 0,
@@ -99,11 +82,10 @@ export async function computePanoramaTerrainGPU(
     pixelSizeM: 100,
     skipBuildings: true,
   });
-  console.log(`[GPU Panorama] build_heightmap 응답: ${meta.width}×${meta.height}, pixel=${meta.pixel_size_m}m, b64=${(meta.data_b64.length / 1024 / 1024).toFixed(1)}MB`);
-  const ab = await decodeBase64OffThread(meta.data_b64);
-  meta.data_b64 = "";
+  console.log(`[GPU Panorama] build_heightmap 응답: ${meta.width}×${meta.height}, pixel=${meta.pixel_size_m}m, raw=${(meta.bytes / 1024 / 1024).toFixed(1)}MB`);
+  const ab = await readBulkBytes(meta);
   console.timeEnd("[GPU Panorama] Heightmap fetch");
-  console.log(`[GPU Panorama] ArrayBuffer decoded: ${(ab.byteLength / 1024 / 1024).toFixed(1)}MB`);
+  console.log(`[GPU Panorama] ArrayBuffer 수신: ${(ab.byteLength / 1024 / 1024).toFixed(1)}MB`);
   onProgress?.("heightmap_done");
   // React paint 기회 부여 — phase 전환 상태가 UI에 반영될 틈
   await new Promise((r) => setTimeout(r, 0));
@@ -114,7 +96,16 @@ export async function computePanoramaTerrainGPU(
   const worker = await getGPUWorkerInstance();
   console.log(`[GPU Panorama] GPU Worker 준비 완료, PANORAMA_COMPUTE 전송`);
   const seq = Date.now();
-  const { data_b64: _, ...metaClean } = meta;
+  // Worker HeightmapMeta — bulk 참조 필드 제외한 그리드 메타만 전달
+  const metaClean = {
+    width: meta.width,
+    height: meta.height,
+    pixel_size_m: meta.pixel_size_m,
+    center_lat: meta.center_lat,
+    center_lon: meta.center_lon,
+    radar_height_m: meta.radar_height_m,
+    max_range_km: meta.max_range_km,
+  };
 
   const resultF32 = await new Promise<Float32Array>((resolve, reject) => {
     const handler = (e: MessageEvent) => {

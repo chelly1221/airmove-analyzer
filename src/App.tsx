@@ -17,10 +17,13 @@ import AircraftManagement from "./pages/AircraftManagement";
 import RadarManagement from "./pages/RadarManagement";
 import { useAppStore } from "./store";
 import { writeReportPayload, readGenerateRequest, clearGenerateRequest } from "./utils/reportTransfer";
+import { readBulkJson } from "./utils/bulkIpc";
+import type { BulkRef } from "./utils/bulkIpc";
 import SourceOverlay from "./dev/SourceOverlay";
 import { ToastContainer } from "./components/common/Toast";
 import { Loader2 } from "lucide-react";
 import type { Aircraft, RadarSite } from "./types";
+import type { MultiCoverageResult } from "./utils/radarCoverage";
 
 // 설정 복원 완료 신호 — report:generate 처리가 스토어(radarSite/reportMetadata)를 복원 전
 //   기본값(김포 #1·기본 메타) 상태에서 읽어 잘못된 표지/머리말로 페이로드를 조립하지 않도록,
@@ -86,9 +89,10 @@ function useRestoreSettings() {
       } catch {
         try {
           const rs = useAppStore.getState().radarSite;
-          const cachedJson = await invoke<string | null>("load_coverage_cache", { radarName: rs.name });
-          if (cachedJson) {
-            useAppStore.setState({ coverageData: JSON.parse(cachedJson) });
+          // 캐시 JSON(수십 MB)은 bulk:// 파일 매개 수신 (bulkIpc.ts)
+          const cachedRef = await invoke<BulkRef | null>("load_coverage_cache", { radarName: rs.name });
+          if (cachedRef) {
+            useAppStore.setState({ coverageData: await readBulkJson<MultiCoverageResult>(cachedRef) });
           }
         } catch {}
       }

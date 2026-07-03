@@ -15,6 +15,8 @@ import type {
   ReportMetadata,
 } from "../types";
 import type { MultiCoverageResult } from "../utils/radarCoverage";
+import { readBulkJson, cleanupBulk } from "../utils/bulkIpc";
+import type { BulkRef } from "../utils/bulkIpc";
 import type { TcasReport, WeatherVector } from "../types/track";
 import type { AsterixStats } from "../types/asterix";
 
@@ -369,15 +371,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (v && !get().coverageData && get().coverageCacheAvailable && !get().coverageLoading) {
       set({ coverageLoading: true });
       const radarName = get().radarSite.name;
-      invoke<string | null>("load_coverage_cache", { radarName }).then((json) => {
+      // 캐시 JSON(수십 MB)은 bulk:// 파일 매개 수신 (bulkIpc.ts)
+      invoke<BulkRef | null>("load_coverage_cache", { radarName }).then(async (ref) => {
         // 로드 완료 시 현재 레이더가 변경되었으면 무시 (stale closure 방지)
         if (get().radarSite.name !== radarName) {
           console.log(`[Coverage] 레이더 변경됨 (${radarName} → ${get().radarSite.name}), 캐시 무시`);
+          if (ref) cleanupBulk(ref);
           return;
         }
-        if (json) {
+        if (ref) {
           try {
-            const data = JSON.parse(json);
+            const data = await readBulkJson<MultiCoverageResult>(ref);
+            // 본문 수신 동안 레이더가 바뀌었을 수 있음 — 재확인
+            if (get().radarSite.name !== radarName) return;
             set({ coverageData: data });
             console.log(`[Coverage] 캐시 lazy load 완료 (${radarName})`);
           } catch (e) {

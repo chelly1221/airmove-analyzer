@@ -11,31 +11,14 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { readBulkJson, readBulkBytes } from "./bulkIpc";
+import type { BulkRef } from "./bulkIpc";
 import type { CoverageLayer, MultiCoverageResult } from "./radarCoverage";
 import type { RadarSite } from "../types";
 
 // ─── 상수 ───────────────────────────────────────────
 
 const MAX_ELEV_DEG = 40;
-
-// ─── Base64 디코딩 (별도 Worker) ────────────────────
-
-function decodeBase64OffThread(base64: string): Promise<ArrayBuffer> {
-  return new Promise((resolve, reject) => {
-    const code = `self.onmessage=function(e){try{var b=atob(e.data),n=b.length,u=new Uint8Array(n);for(var i=0;i<n;i++)u[i]=b.charCodeAt(i);postMessage(u.buffer,[u.buffer])}catch(err){postMessage({error:String(err)})}}`;
-    const blob = new Blob([code], { type: "text/javascript" });
-    const url = URL.createObjectURL(blob);
-    const w = new Worker(url);
-    w.onmessage = (e) => {
-      if (e.data instanceof ArrayBuffer) resolve(e.data);
-      else reject(new Error(e.data?.error ?? "Base64 decode failed"));
-      w.terminate();
-      URL.revokeObjectURL(url);
-    };
-    w.onerror = (err) => { reject(err); w.terminate(); URL.revokeObjectURL(url); };
-    w.postMessage(base64);
-  });
-}
 
 // ═══════════════════════════════════════════════════
 // GPU Worker 관리 — 파노라마/도면 계산에만 사용
@@ -137,7 +120,8 @@ export async function renderCoverageImageAsync(
   const h = Math.min(viewport.height, 2048);
 
   const result = await invoke<{
-    bitmap_b64: string;
+    bulk_id: string;
+    bytes: number;
     width: number;
     height: number;
     bounds: [number, number, number, number];
@@ -153,8 +137,8 @@ export async function renderCoverageImageAsync(
     height: h,
   });
 
-  // base64 → RGBA → ImageBitmap
-  const ab = await decodeBase64OffThread(result.bitmap_b64);
+  // bulk:// raw RGBA → ImageBitmap
+  const ab = await readBulkBytes(result);
   const rgba = new Uint8ClampedArray(ab);
   const imageData = new ImageData(rgba, result.width, result.height);
   const image = await createImageBitmap(imageData);
@@ -231,10 +215,9 @@ export async function computeCoverageLayersOM(
     bearingStepDeg,
   });
   onProgress?.(`커버리지 레이어 계산 중... ${params.radarName} (건물 포함)`, 0.3);
-  const layersWith = await invoke<CoverageLayer[]>("compute_coverage_layers_batch", {
-    altFts,
-    bearingStep: 1,
-  });
+  const layersWith = await readBulkJson<CoverageLayer[]>(
+    await invoke<BulkRef>("compute_coverage_layers_batch", { altFts, bearingStep: 1 }),
+  );
 
   onProgress?.(`지형 프로파일 계산 중... ${params.radarName} (분석 대상 전체 제외)`, 0.5);
   await invoke("compute_coverage_terrain_profile_excluding", {
@@ -248,10 +231,9 @@ export async function computeCoverageLayersOM(
     bearingStepDeg,
   });
   onProgress?.(`커버리지 레이어 계산 중... ${params.radarName} (분석 대상 전체 제외)`, 0.8);
-  const layersWithout = await invoke<CoverageLayer[]>("compute_coverage_layers_batch_excluded", {
-    altFts,
-    bearingStep: 1,
-  });
+  const layersWithout = await readBulkJson<CoverageLayer[]>(
+    await invoke<BulkRef>("compute_coverage_layers_batch_excluded", { altFts, bearingStep: 1 }),
+  );
 
   return { layersWith, layersWithout };
 }

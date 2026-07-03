@@ -714,11 +714,10 @@ struct PixelCoverageState {
     num_bearing_slots: usize,
 }
 
-/// 비트맵 렌더링 결과
-#[derive(Serialize)]
+/// 비트맵 렌더링 결과 — bitmap 은 lib.rs 가 bulk:// 파일 매개로 전달 (직렬화 대상 아님)
 pub struct CoverageBitmapResult {
-    /// RGBA 비트맵 base64
-    pub bitmap_b64: String,
+    /// RGBA 비트맵 (width × height × 4)
+    pub bitmap: Vec<u8>,
     pub width: u32,
     pub height: u32,
     /// 맵 오버레이 bounds [west, south, east, north]
@@ -919,7 +918,6 @@ pub fn render_coverage_bitmap(
     west: f64, south: f64, east: f64, north: f64,
     width: u32, height: u32,
 ) -> Option<CoverageBitmapResult> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::HashMap;
 
     let ps_guard = PIXEL_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1059,9 +1057,8 @@ pub fn render_coverage_bitmap(
         }
     }
 
-    let bitmap_b64 = STANDARD.encode(&bitmap);
     Some(CoverageBitmapResult {
-        bitmap_b64,
+        bitmap,
         width,
         height,
         bounds: [west, south, east, north],

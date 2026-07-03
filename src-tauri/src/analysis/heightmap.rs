@@ -1,18 +1,17 @@
 //! 2D heightmap 빌더 — SRTM 지형 + 건물 높이를 단일 ENU 그리드로 합성
 //!
-//! GPU 커버리지/파노라마에서 공유하는 heightmap을 1회 IPC로 전송.
+//! GPU 커버리지/파노라마에서 공유하는 heightmap을 생성.
 //! 기존 presample_elevations_batch(방사선 36K개 × 2400 샘플)을 대체.
+//! 그리드 본체는 invoke 응답에 싣지 않고 bulk:// 파일 매개로 전달한다 (lib.rs build_heightmap).
 
 use rayon::prelude::*;
-use serde::Serialize;
 
 use crate::srtm::{self, SrtmReader};
 
-/// Heightmap 빌드 결과 — JS에서 GPU 텍스처로 업로드
-#[derive(Serialize)]
+/// Heightmap 빌드 결과 — data 는 lib.rs 가 f32 LE raw 로 bulk 파일에 기록
 pub struct HeightmapResult {
-    /// f32 LE base64 (width × height, row-major, SW corner = (0,0))
-    pub data_b64: String,
+    /// f32 그리드 (width × height, row-major, SW corner = (0,0))
+    pub data: Vec<f32>,
     pub width: u32,
     pub height: u32,
     /// 픽셀당 미터
@@ -63,7 +62,6 @@ pub fn build_heightmap_with_progress(
     skip_buildings: bool,
     progress_cb: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> HeightmapResult {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     let emit = |msg: String| {
         log::info!("{}", &msg);
         if let Some(cb) = progress_cb { cb(msg); }
@@ -152,17 +150,12 @@ pub fn build_heightmap_with_progress(
     // 2. 건물 래스터화 (max semantics) — skip_buildings 시 생략
     let mut data = data;
     if skip_buildings {
-        // f32 LE → base64 (건물 없는 순수 지형)
-        emit("[Heightmap] base64 인코딩 시작".into());
-        let t_enc = std::time::Instant::now();
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let data_b64 = STANDARD.encode(&bytes);
-        emit(format!("[Heightmap] base64 인코딩 완료 ({}ms, {:.1}MB). 전체 {}ms",
-            t_enc.elapsed().as_millis(),
-            data_b64.len() as f64 / 1024.0 / 1024.0,
+        // 건물 없는 순수 지형 — raw 그대로 반환 (bulk 기록은 lib.rs)
+        emit(format!("[Heightmap] 완료 (f32 {:.1}MB, 전체 {}ms)",
+            (data.len() * 4) as f64 / 1024.0 / 1024.0,
             t_total.elapsed().as_millis()));
         return HeightmapResult {
-            data_b64,
+            data,
             width: width as u32,
             height: height as u32,
             pixel_size_m: pixel_size_m as f32,
@@ -201,12 +194,8 @@ pub fn build_heightmap_with_progress(
     }
     drop(bldg_heights);
 
-    // f32 LE → base64
-    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let data_b64 = STANDARD.encode(&bytes);
-
     HeightmapResult {
-        data_b64,
+        data,
         width: width as u32,
         height: height as u32,
         pixel_size_m: pixel_size_m as f32,

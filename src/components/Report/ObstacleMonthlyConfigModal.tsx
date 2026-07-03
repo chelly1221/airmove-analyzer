@@ -13,6 +13,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import Modal from "../common/Modal";
 import MonthPicker from "../common/MonthPicker";
 import { haversineKm, bearingDeg } from "../../utils/geo";
+import { readBulkJson } from "../../utils/bulkIpc";
+import type { BulkRef } from "../../utils/bulkIpc";
 import { computeLosBatch, calcBuildingAzExtent, mergeAzSectors } from "../../utils/obstacleAnalysisHelpers";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import type {
@@ -332,7 +334,12 @@ export default function ObstacleMonthlyConfigModal({
         excludeModeS: excludeMs,
       });
 
-      const result = await invoke<ObstacleMonthlyResult>("analyze_obstacle_monthly", { radarFileSets, excludeModeS: excludeMs });
+      // 결과(수백 MB 급)는 bulk:// 파일 매개 수신 — invoke 응답에 실으면 IPC eval 폴백 시
+      // 공유 브라우저 프로세스 OOM(전 창 백지) 크래시 (bulkIpc.ts 참조)
+      const resultRef = await invoke<BulkRef>("analyze_obstacle_monthly", { radarFileSets, excludeModeS: excludeMs });
+      setProgress(`분석 결과 수신 중... (${(resultRef.bytes / 1024 / 1024).toFixed(1)}MB)`);
+      setStageDetail((prev) => ({ ...prev, parsing: `분석 결과 수신 중 (${(resultRef.bytes / 1024 / 1024).toFixed(1)}MB)` }));
+      const result = await readBulkJson<ObstacleMonthlyResult>(resultRef);
       if (cancelledRef.current) return;
 
       // ── 백엔드 결과 진단 ──

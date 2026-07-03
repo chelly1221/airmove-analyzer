@@ -95,6 +95,7 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 6. **spread 금지 (대량)** — `push(...bigArray)` 대신 `for` 루프. 10M+에서 스택 오버플로우
 7. **다운샘플링/stride 샘플링 절대 금지** — 렌더링 포함 모든 파이프라인에서 **전수 포인트** 사용. 누락 시 Loss 탐지/통계 정확도 훼손
    - 유일한 예외: `obstacle_monthly.rs`의 `track_points_geo`(LoS 단면도·AzElev 시각화용 항적 표시점)는 일별 최대 5,000점 균등표본(의도 설계, 커밋 e21a4e4). Loss 탐지/통계는 여전히 전수 포인트 사용
+8. **대용량 invoke 응답 금지 — bulk:// 파일 매개 전송** — 수 MB+ 응답(분석 결과·heightmap·커버리지 레이어·비트맵·캐시 JSON)은 Rust `bulk::write_json/write_bytes`(bulk.rs)로 임시 파일에 쓰고 `BulkRef{bulk_id,bytes}`만 반환, 프론트는 `readBulkJson/readBulkBytes`(utils/bulkIpc.ts)로 수신. **이유**: WebView2에서 IPC 커스텀 프로토콜 fetch가 1회라도 실패하면 postMessage+eval로 영구 강등되고, 응답 전체가 CDP `Runtime.evaluate` 문자열로 공유 브라우저 프로세스를 통과(수 배 복제)해 OOM 크래시(0xE0000008, **모든 창 동시 백지+호스트 동반 크래시**)를 유발(2026-07-03 Crashpad 덤프 확진). String 반환 커맨드는 강등 없이도 항상 eval 경로를 탐 — 대용량 문자열 응답도 금지
 
 ### 기존 Worker 참고
 - `src/workers/flightConsolidation.worker.ts` — 비행 통합 + 뷰포트 쿼리

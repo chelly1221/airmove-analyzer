@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod building;
+pub mod bulk;
 pub mod coord;
 pub mod db;
 pub mod declination;
@@ -76,11 +77,11 @@ fn emit_and_drain_weather_vectors(
 }
 
 /// Application state for managing aircraft data.
-struct AppState {
-    app_data_dir: Mutex<PathBuf>,
-    db: Mutex<db::DbPool>,
-    srtm: Mutex<srtm::SrtmReader>,
-    analysis_cancel: Arc<AtomicBool>,
+pub(crate) struct AppState {
+    pub(crate) app_data_dir: Mutex<PathBuf>,
+    pub(crate) db: Mutex<db::DbPool>,
+    pub(crate) srtm: Mutex<srtm::SrtmReader>,
+    pub(crate) analysis_cancel: Arc<AtomicBool>,
 }
 
 /// 앱 데이터 디렉토리 경로 확보
@@ -593,6 +594,7 @@ async fn import_database(
 }
 
 /// GPU 파노라마 건물 병합 (GPU에서 계산한 지형 결과에 건물 데이터 오버레이)
+/// 결과는 수 MB~수십 MB — bulk:// 파일 매개 전송 (BulkRef 반환, bulk.rs 참조)
 #[tauri::command]
 async fn panorama_merge_buildings(
     app_handle: tauri::AppHandle,
@@ -603,22 +605,25 @@ async fn panorama_merge_buildings(
     azimuth_step_deg: Option<f64>,
     terrain_results: Vec<analysis::panorama::TerrainResult>,
     exclude_manual_ids: Option<Vec<i64>>,
-) -> Result<analysis::panorama::PanoramaMergeResult, String> {
+) -> Result<bulk::BulkRef, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let max_range = max_range_km.unwrap_or(100.0);
         let az_step = azimuth_step_deg.unwrap_or(0.01);
         let exclude_ids = exclude_manual_ids.unwrap_or_default();
 
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        let result = {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+            let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
 
-        Ok(analysis::panorama::merge_buildings_into_panorama(
-            &mut srtm, &conn,
-            &terrain_results,
-            radar_lat, radar_lon, radar_height_m,
-            max_range * 1000.0, az_step, &exclude_ids,
-        ))
+            analysis::panorama::merge_buildings_into_panorama(
+                &mut srtm, &conn,
+                &terrain_results,
+                radar_lat, radar_lon, radar_height_m,
+                max_range * 1000.0, az_step, &exclude_ids,
+            )
+        };
+        bulk::write_json(&app_handle, &result)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -626,6 +631,7 @@ async fn panorama_merge_buildings(
 
 /// GPU 파노라마 건물 병합 (dual) — with/without manual targets 를 단일 IPC로 반환.
 /// terrain 직렬화/송신을 1회만 수행하여 기존 대비 IPC 비용 절반 수준.
+/// 결과(terrain 36K + 건물 실루엣 ×2)는 수십 MB — bulk:// 파일 매개 전송
 #[tauri::command]
 async fn panorama_merge_buildings_dual(
     app_handle: tauri::AppHandle,
@@ -635,21 +641,24 @@ async fn panorama_merge_buildings_dual(
     max_range_km: Option<f64>,
     terrain_results: Vec<analysis::panorama::TerrainResult>,
     exclude_manual_ids: Option<Vec<i64>>,
-) -> Result<analysis::panorama::PanoramaMergeDualResult, String> {
+) -> Result<bulk::BulkRef, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let max_range = max_range_km.unwrap_or(100.0);
         let exclude_ids = exclude_manual_ids.unwrap_or_default();
 
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        let result = {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+            let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
 
-        Ok(analysis::panorama::merge_buildings_into_panorama_dual(
-            &mut srtm, &conn,
-            &terrain_results,
-            radar_lat, radar_lon, radar_height_m,
-            max_range * 1000.0, &exclude_ids,
-        ))
+            analysis::panorama::merge_buildings_into_panorama_dual(
+                &mut srtm, &conn,
+                &terrain_results,
+                radar_lat, radar_lon, radar_height_m,
+                max_range * 1000.0, &exclude_ids,
+            )
+        };
+        bulk::write_json(&app_handle, &result)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -675,18 +684,25 @@ async fn save_panorama_cache(
 }
 
 /// 파노라마 캐시 로드 (저장 높이와 불일치 시 None → 호출부 재계산)
+/// 캐시 JSON 은 수십 MB 급 문자열 — String 응답은 항상 eval(CDP) 경로를 타므로 bulk:// 전송
 #[tauri::command]
 async fn load_panorama_cache(
     app_handle: tauri::AppHandle,
     radar_lat: f64,
     radar_lon: f64,
     radar_height_m: f64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<bulk::BulkRef>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::load_panorama_cache(&conn, radar_lat, radar_lon, radar_height_m)
-            .map_err(|e| format!("DB error: {}", e))
+        let cached = {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+            db::load_panorama_cache(&conn, radar_lat, radar_lon, radar_height_m)
+                .map_err(|e| format!("DB error: {}", e))?
+        };
+        match cached {
+            Some(json) => Ok(Some(bulk::write_bytes(&app_handle, json.as_bytes(), "json")?)),
+            None => Ok(None),
+        }
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1238,15 +1254,23 @@ async fn save_coverage_cache(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// 커버리지 캐시 로드 — 레이어 JSON 은 수십 MB 급 문자열이므로 bulk:// 전송
+/// (String 응답은 IPC 폴백과 무관하게 항상 eval(CDP) 경로를 타 브라우저 프로세스를 압박)
 #[tauri::command]
 async fn load_coverage_cache(
     app_handle: tauri::AppHandle,
     radar_name: String,
-) -> Result<Option<String>, String> {
+) -> Result<Option<bulk::BulkRef>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
-        db::load_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))
+        let cached = {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+            db::load_coverage_cache(&conn, &radar_name).map_err(|e| format!("DB error: {}", e))?
+        };
+        match cached {
+            Some(json) => Ok(Some(bulk::write_bytes(&app_handle, json.as_bytes(), "json")?)),
+            None => Ok(None),
+        }
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1328,12 +1352,14 @@ fn cancel_analysis(state: tauri::State<'_, AppState>) {
 }
 
 /// 장애물 월간 분석 IPC 커맨드
+/// 결과(일별 az×elev 히스토그램·track_points_geo·loss_points_summary)는 수백 MB 급 —
+/// invoke 응답에 실으면 IPC eval 폴백 시 브라우저 프로세스 OOM(전 창 백지)이므로 bulk:// 전송
 #[tauri::command]
 async fn analyze_obstacle_monthly(
     app_handle: tauri::AppHandle,
     radar_file_sets: Vec<analysis::obstacle_monthly::RadarFileSet>,
     exclude_mode_s: Vec<String>,
-) -> Result<analysis::obstacle_monthly::ObstacleMonthlyResult, String> {
+) -> Result<bulk::BulkRef, String> {
     use analysis::obstacle_monthly::{self as om, ObstacleMonthlyProgress};
 
     info!(
@@ -1401,7 +1427,17 @@ async fn analyze_obstacle_monthly(
     .await
     .map_err(|e| format!("분석 스레드 오류: {}", e))??;
 
-    Ok(result)
+    // 대용량 결과를 bulk 파일로 기록 — 직렬화(수백 MB)도 blocking 스레드에서 수행
+    let handle2 = app_handle.clone();
+    let bulk_ref = tauri::async_runtime::spawn_blocking(move || bulk::write_json(&handle2, &result))
+        .await
+        .map_err(|e| format!("bulk 직렬화 스레드 오류: {}", e))??;
+    info!(
+        "[ObstacleMonthly] 결과 bulk 기록: {} ({:.1}MB)",
+        bulk_ref.bulk_id,
+        bulk_ref.bytes as f64 / 1024.0 / 1024.0
+    );
+    Ok(bulk_ref)
 }
 
 /// 건물 제외 커버리지 프로파일 계산 (장애물 월간 보고서용)
@@ -1433,18 +1469,40 @@ async fn compute_coverage_terrain_profile_excluding(
 }
 
 /// 건물 제외 캐시에서 레이어 배치 계산
+/// 레이어(고도 9 × bearing 수만 개)는 수십 MB — bulk:// 파일 매개 전송
 #[tauri::command]
 async fn compute_coverage_layers_batch_excluded(
+    app_handle: tauri::AppHandle,
     alt_fts: Vec<f64>,
     bearing_step: Option<usize>,
-) -> Result<Vec<analysis::coverage::CoverageLayer>, String> {
-    let step = bearing_step.unwrap_or(1);
-    Ok(analysis::coverage::compute_layers_batch_excluded(&alt_fts, step))
+) -> Result<bulk::BulkRef, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let step = bearing_step.unwrap_or(1);
+        let layers = analysis::coverage::compute_layers_batch_excluded(&alt_fts, step);
+        bulk::write_json(&app_handle, &layers)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
 /// GPU용 커버리지 프리샘플 (SRTM + 건물 → base64)
 
-/// GPU용 2D heightmap 빌드 (SRTM + 건물 → base64 그리드)
+/// build_heightmap 응답 메타 — 그리드 본체(f32 LE raw)는 bulk:// 파일 매개 전송
+#[derive(serde::Serialize)]
+struct HeightmapBulkResult {
+    bulk_id: String,
+    bytes: u64,
+    width: u32,
+    height: u32,
+    pixel_size_m: f32,
+    center_lat: f64,
+    center_lon: f64,
+    radar_height_m: f64,
+    max_range_km: f64,
+}
+
+/// GPU용 2D heightmap 빌드 (SRTM + 건물 → f32 raw 그리드, bulk:// 전송)
+/// 그리드는 ~16MB+ — base64 invoke 응답 대신 파일 매개로 전달 (bulk.rs 참조)
 #[tauri::command]
 async fn build_heightmap(
     app_handle: tauri::AppHandle,
@@ -1456,7 +1514,7 @@ async fn build_heightmap(
     pixel_size_m: Option<f64>,
     exclude_manual_ids: Option<Vec<i64>>,
     skip_buildings: Option<bool>,
-) -> Result<analysis::heightmap::HeightmapResult, String> {
+) -> Result<HeightmapBulkResult, String> {
     let pix = pixel_size_m.unwrap_or(100.0);
     let skip_bldg = skip_buildings.unwrap_or(false);
 
@@ -1490,11 +1548,32 @@ async fn build_heightmap(
             skip_bldg,
             Some(&progress_cb),
         );
-        emit(format!("build_heightmap: 내부 계산 완료 ({}ms, {}×{}, b64 {:.1}MB)",
+        drop(srtm);
+        drop(conn);
+        emit(format!("build_heightmap: 내부 계산 완료 ({}ms, {}×{}, f32 {:.1}MB)",
             t2.elapsed().as_millis(), result.width, result.height,
-            result.data_b64.len() as f64 / 1024.0 / 1024.0));
+            (result.data.len() * 4) as f64 / 1024.0 / 1024.0));
 
-        Ok(result)
+        // f32 LE raw → bulk 파일 (base64 인코딩/디코딩 완전 제거)
+        let mut bytes = Vec::with_capacity(result.data.len() * 4);
+        for v in &result.data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let bulk_ref = bulk::write_bytes(&handle, &bytes, "bin")?;
+        emit(format!("build_heightmap: bulk 기록 완료 ({}, {:.1}MB)",
+            bulk_ref.bulk_id, bulk_ref.bytes as f64 / 1024.0 / 1024.0));
+
+        Ok(HeightmapBulkResult {
+            bulk_id: bulk_ref.bulk_id,
+            bytes: bulk_ref.bytes,
+            width: result.width,
+            height: result.height,
+            pixel_size_m: result.pixel_size_m,
+            center_lat: result.center_lat,
+            center_lon: result.center_lon,
+            radar_height_m: result.radar_height_m,
+            max_range_km: result.max_range_km,
+        })
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1580,12 +1659,19 @@ async fn compute_coverage_terrain_profile(
 }
 
 
+/// 커버리지 레이어 배치 계산 — 수십 MB 응답이므로 bulk:// 파일 매개 전송
 #[tauri::command]
 async fn compute_coverage_layers_batch(
+    app_handle: tauri::AppHandle,
     alt_fts: Vec<f64>,
     bearing_step: Option<usize>,
-) -> Result<Vec<analysis::coverage::CoverageLayer>, String> {
-    Ok(analysis::coverage::compute_layers_batch(&alt_fts, bearing_step.unwrap_or(1)))
+) -> Result<bulk::BulkRef, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let layers = analysis::coverage::compute_layers_batch(&alt_fts, bearing_step.unwrap_or(1));
+        bulk::write_json(&app_handle, &layers)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
 
@@ -1630,7 +1716,19 @@ async fn query_min_detection_alt(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// render_coverage_bitmap 응답 메타 — RGBA 본체는 bulk:// 파일 매개 전송
+#[derive(serde::Serialize)]
+struct CoverageBitmapBulkResult {
+    bulk_id: String,
+    bytes: u64,
+    width: u32,
+    height: u32,
+    bounds: [f64; 4],
+    used_alt_fts: Vec<f64>,
+}
+
 /// Per-pixel 커버리지 비트맵 렌더링 (무한해상도)
+/// RGBA(최대 2048²×4 ≈ 16MB)는 base64 invoke 응답 대신 bulk:// 파일 매개 전송
 #[tauri::command]
 async fn render_coverage_bitmap(
     app_handle: tauri::AppHandle,
@@ -1642,14 +1740,25 @@ async fn render_coverage_bitmap(
     north: f64,
     width: u32,
     height: u32,
-) -> Result<analysis::coverage::CoverageBitmapResult, String> {
+) -> Result<CoverageBitmapBulkResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
-        analysis::coverage::render_coverage_bitmap(
-            &mut srtm, &alt_fts, show_cone,
-            west, south, east, north, width, height,
-        ).ok_or_else(|| "커버리지 캐시 미초기화".to_string())
+        let r = {
+            let state = app_handle.state::<AppState>();
+            let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+            analysis::coverage::render_coverage_bitmap(
+                &mut srtm, &alt_fts, show_cone,
+                west, south, east, north, width, height,
+            ).ok_or_else(|| "커버리지 캐시 미초기화".to_string())?
+        };
+        let bulk_ref = bulk::write_bytes(&app_handle, &r.bitmap, "bin")?;
+        Ok(CoverageBitmapBulkResult {
+            bulk_id: bulk_ref.bulk_id,
+            bytes: bulk_ref.bytes,
+            width: r.width,
+            height: r.height,
+            bounds: r.bounds,
+            used_alt_fts: r.used_alt_fts,
+        })
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -2012,6 +2121,12 @@ fn open_devtools(window: tauri::WebviewWindow) {
     window.open_devtools();
 }
 
+/// bulk 전송 파일 삭제 — 프론트(bulkIpc.ts)가 수신 완료 후 호출
+#[tauri::command]
+fn bulk_cleanup(app_handle: tauri::AppHandle, id: String) -> Result<(), String> {
+    bulk::remove(&app_handle, &id)
+}
+
 // ---------- App Entry Point ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2022,6 +2137,31 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // 대용량 IPC 응답 파일 매개 수신용 커스텀 프로토콜 (bulk.rs 참조).
+        // invoke 응답에 수백 MB 를 실으면 IPC eval 폴백 경로에서 브라우저 프로세스가
+        // OOM(0xE0000008) 크래시(전 창 백지)하므로, 본문은 이 프로토콜로 스트리밍한다.
+        .register_asynchronous_uri_scheme_protocol("bulk", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let id = request.uri().path().trim_start_matches('/').to_string();
+            tauri::async_runtime::spawn_blocking(move || {
+                let response = match bulk::read(&app, &id) {
+                    Ok(data) => tauri::http::Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/octet-stream")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Cache-Control", "no-store")
+                        .body(data),
+                    Err(e) => tauri::http::Response::builder()
+                        .status(404)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(e.into_bytes()),
+                };
+                match response {
+                    Ok(r) => responder.respond(r),
+                    Err(e) => log::warn!("[Bulk] 프로토콜 응답 빌드 실패: {}", e),
+                }
+            });
+        })
         .setup(|app| {
             let app_data_dir = get_app_data_dir(app.handle())
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -2061,6 +2201,9 @@ pub fn run() {
                 srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir, db_path.clone())),
                 analysis_cancel: Arc::new(AtomicBool::new(false)),
             });
+
+            // 이전 세션 잔여 bulk 전송 파일 정리
+            bulk::sweep(app.handle());
 
             // 프로덕션 빌드에서도 DevTools 활성화 — 모든 윈도우
             #[cfg(not(debug_assertions))]
@@ -2168,6 +2311,8 @@ pub fn run() {
             vworld_download_n3p,
             // WebView2 네이티브 PDF
             webview_print_to_pdf,
+            // 대용량 IPC 파일 매개 전송
+            bulk_cleanup,
             // DevTools
             open_devtools,
         ])

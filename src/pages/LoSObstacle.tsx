@@ -10,6 +10,8 @@ import { useToastStore } from "../components/common/Toast";
 import { useAppStore } from "../store";
 import type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult, NearbyPeak, RadarSite } from "../types";
 import { haversineKm } from "../utils/geo";
+import { readBulkJson, cleanupBulk } from "../utils/bulkIpc";
+import type { BulkRef } from "../utils/bulkIpc";
 
 export default function LoSObstacle() {
   const radarSite = useAppStore((s) => s.radarSite);
@@ -114,7 +116,8 @@ export default function LoSObstacle() {
       );
 
       setPanoramaProgress({ percent: 55, label: `건물 장애물 스캔 중...` });
-      const result = await invoke<PanoramaMergeResult>("panorama_merge_buildings", {
+      // 결과(수 MB~수십 MB)는 bulk:// 파일 매개 수신 (bulkIpc.ts)
+      const resultRef = await invoke<BulkRef>("panorama_merge_buildings", {
         radarLat: radarSite.latitude,
         radarLon: radarSite.longitude,
         radarHeightM: radarH,
@@ -122,6 +125,7 @@ export default function LoSObstacle() {
         azimuthStepDeg: azStep,
         terrainResults,
       });
+      const result = await readBulkJson<PanoramaMergeResult>(resultRef);
 
       setPanoramaProgress({ percent: 70, label: `산 이름 조회 중...` });
       const peakNames = await fetchPeakNames(result.terrain);
@@ -160,16 +164,18 @@ export default function LoSObstacle() {
     setPanoramaProgress({ percent: 5, label: "캐시 확인 중..." });
     (async () => {
       try {
-        const cached = await invoke<string | null>("load_panorama_cache", {
+        // 캐시 JSON(수십 MB)은 bulk:// 파일 매개 수신 (bulkIpc.ts)
+        const cachedRef = await invoke<BulkRef | null>("load_panorama_cache", {
           radarLat: radarSite.latitude,
           radarLon: radarSite.longitude,
           // 저장 시(radarH) 와 동일식 — 높이 불일치 시 캐시 미스 → 재계산
           radarHeightM: radarSite.altitude + radarSite.antenna_height,
         });
-        if (cancelled) return;
-        if (cached) {
+        if (cancelled) { if (cachedRef) cleanupBulk(cachedRef); return; }
+        if (cachedRef) {
           try {
-            const parsed = JSON.parse(cached);
+            const parsed = await readBulkJson<PanoramaMergeResult | null>(cachedRef);
+            if (cancelled) return;
             if (parsed && !Array.isArray(parsed) && Array.isArray(parsed.terrain) && parsed.terrain.length > 0) {
               setPanoramaProgress({ percent: 40, label: "캐시 로드 완료 · 산 이름 조회 중..." });
               const peakNames = await fetchPeakNames(parsed.terrain);
