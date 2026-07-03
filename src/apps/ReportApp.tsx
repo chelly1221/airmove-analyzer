@@ -269,6 +269,7 @@ export default function ReportApp() {
       autoFindingsRef.current = "";      // 이전 보고서 자동 소견 스냅샷 해제
       coverageErrorRef.current = false;  // 이전 커버리지 실패 기록 해제
       panoramaStartedRef.current = null; // 이전 result 참조 해제 (대용량 GC + 새 파노라마 실행 보장)
+      addedBlockageStartedRef.current = null; // 이전 result 참조 해제 (새 추가차단 산출 보장)
       clearTransferWatchdog();           // 이전 플로우 transfer 재발신/에러 타이머 해제
       setPanoramaLastError(null);
       setError(null);
@@ -622,11 +623,17 @@ export default function ReportApp() {
     const lightOmData: OMReportData = {
       ...newOmData,
       result: lightResult,
-      // 커버리지 레이어는 경량본에도 실어 창 전송 시 함께 넘긴다(10M 규모 아님).
+      // 커버리지 레이어도 경량본에서 제외 — 레이더당 수십만 CoverageBearing 객체가 IDB 왕복
+      // (보고서 창 직렬화 → IDB put → 메인 창 get/재put → 보고서 창 get)에서 4회 structured-clone
+      // 되며 양 창 메인 스레드를 동시에 블로킹(백지)하고 메모리를 배가시킨다. 정상 경로에선
+      // loadFromIDB 가 어차피 omDataCacheRef(풀 버전, 커버리지 포함)로 덮어쓰므로 전송분은 사용되지
+      // 않는 순수 낭비. 유일 소비처인 소견 생성(omFindingsGenerator)은 size>0 가드로 안전하며,
+      // 보고서 창 리로드 등 캐시 소실 경로에서도 생성 시점 findingsText(커버리지 프로즈 포함)가
+      // 문자열로 이미 페이로드에 실려 있어 내용 손실이 없다.
       // coverageStatus 는 newOmData 와 동일 확정값(done|error) — 경량본이 로드되는 경로에서도
       // 파노라마 게이트가 차단되지 않도록 한다.
-      covLayersWithBuildings: covWith,
-      covLayersWithout: covWithout,
+      covLayersWithBuildings: new Map(),
+      covLayersWithout: new Map(),
     };
 
     // 통합 모달이 살아있는 동안에는 configPayload 를 유지 — 모달이 omReady 시점에
@@ -861,60 +868,100 @@ export default function ReportApp() {
   // 미편집 findingsText 는 추가 차단영역 프로즈 포함해 재생성(autoFindingsRef 비교로 사용자 편집 보호).
   // addedBlockageByKey 는 라이브 세션에서만 산출·소비된다(저장/직렬화 대상 아님). 히스토그램이 비면(방어) 계산을
   // 건너뛰지만, 정상 생성 경로에선 풀 result 가 omDataCacheRef 로 유지되므로 항상 산출된다.
+  // 실행 방식: (레이더×건물) 쌍 단위 비동기 yield — 쌍당 전 히스토그램 셀 × 파노라마 샘플러 순회라
+  //   동기 일괄 실행 시 다건물 구성에서 메인 스레드가 수 초~수십 초 블로킹(백지)된다. startedRef 로
+  //   동일 result 중복 실행을 차단하고(진행 중 setOmData 재진입 대비), 최종 커밋은 result 동일성을
+  //   검사해 reload 로 폐기된 stale 산출이 새 보고서에 병합되지 않게 한다.
+  const addedBlockageStartedRef = useRef<unknown>(null);
+  // 산출 진행 중 여부 — 프리뷰에 [data-om-computing] 센티널로 노출되어 PDF 내보내기
+  // (useReportExport)가 산출 완료를 대기한다. 파노라마 done 순간 내보내기 버튼은 이미 활성이므로,
+  // 게이트가 없으면 산출 중 인쇄된 PDF 에서 §1 추가소실율·§3 심각도·소견 프로즈가 통째로 빠진다.
+  const [addedBlockageComputing, setAddedBlockageComputing] = useState(false);
   useEffect(() => {
     if (!omData || omData.panoramaStatus !== "done") return;
     if (omData.addedBlockageByKey) return; // 이미 산출됨(빈 {} 포함) — 재계산해도 동일 결과라 무한 setOmData 루프 방지
     const result = omData.result;
     if (!result) return;
+    if (addedBlockageStartedRef.current === result) return; // 동일 result 에 대해 이미 산출 진행 중
     const hasHist = result.radar_results.some((rr) =>
       rr.daily_stats.some((d) => (d.az_elev_histogram?.length ?? 0) > 0));
     if (!hasHist) return; // 히스토그램 없음(리로드 등) → 계산 불가
+    addedBlockageStartedRef.current = result;
+    setAddedBlockageComputing(true);
 
-    const addedBlockageByKey: Record<string, AddedBlockageResult> = {};
-    // 'LoS 영향' 판정 — §1 요약표·§3 단면도 헤드라인 배지와 동일 기준(hasBldgEffectFromPanorama):
-    //   대상 건물이 기존 지형·지물(without) 위로 추가 차단각을 형성하는가. key = losMap 키.
-    //   소견 'LoS 영향' 프로즈가 §1 열·§3 배지와 동일 판정을 쓰도록 통일. 판정 불가(null)는 미수록.
-    const hasBldgEffectByKey = new Map<string, boolean>();
-    for (const radar of omData.selectedRadarSites) {
-      const rr = result.radar_results.find((r) => r.radar_name === radar.name);
-      if (!rr) continue;
-      const histByDay = rr.daily_stats.map((d) => ({ day: d.day_of_month, cells: d.az_elev_histogram ?? [] }));
-      const pWith = omData.panoWithTargets.get(radar.name);
-      const pWithout = omData.panoWithoutTargets.get(radar.name);
-      for (const b of omData.selectedBuildings) {
-        const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
-        const key = `${radar.name}_${b.id}`;
-        // 건물별 with(= without ∪ {해당 건물}) — 방위 중첩 인접 분석 대상의 차단이 이 건물의
-        //   추가 차단영역(노출/소실)에 중복 귀속되지 않는다 (차트 핑크영역·분류와 동일 필터).
-        addedBlockageByKey[key] = computeAddedBlockage(
-          histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent,
-        );
-        const eff = hasBldgEffectFromPanorama(radar, b, pWith, pWithout);
-        if (eff !== null) hasBldgEffectByKey.set(key, eff);
-      }
-    }
+    const flowEpoch = loadEpochRef.current;
+    const radars = omData.selectedRadarSites;
+    const buildings = omData.selectedBuildings;
+    const panoWithTargets = omData.panoWithTargets;
+    const panoWithoutTargets = omData.panoWithoutTargets;
 
-    setOmData((prev) => {
-      if (!prev) return prev;
-      let nextFindings = prev.findingsText;
-      // 사용자 미편집(자동 생성 그대로)일 때만 추가 차단영역 프로즈 포함 재생성
-      if (prev.findingsText === autoFindingsRef.current) {
-        const regen = generateOMFindingsText({
-          radarResults: prev.result?.radar_results ?? [],
-          selectedBuildings: prev.selectedBuildings,
-          radarSites: prev.selectedRadarSites,
-          losMap: prev.losMap,
-          covLayersWithBuildings: prev.covLayersWithBuildings,
-          covLayersWithout: prev.covLayersWithout,
-          analysisMonth: prev.analysisMonth,
-          addedBlockageByKey,
-          hasBldgEffectByKey,
+    (async () => {
+      try {
+        const addedBlockageByKey: Record<string, AddedBlockageResult> = {};
+        // 'LoS 영향' 판정 — §1 요약표·§3 단면도 헤드라인 배지와 동일 기준(hasBldgEffectFromPanorama):
+        //   대상 건물이 기존 지형·지물(without) 위로 추가 차단각을 형성하는가. key = losMap 키.
+        //   소견 'LoS 영향' 프로즈가 §1 열·§3 배지와 동일 판정을 쓰도록 통일. 판정 불가(null)는 미수록.
+        const hasBldgEffectByKey = new Map<string, boolean>();
+        for (const radar of radars) {
+          const rr = result.radar_results.find((r) => r.radar_name === radar.name);
+          if (!rr) continue;
+          const histByDay = rr.daily_stats.map((d) => ({ day: d.day_of_month, cells: d.az_elev_histogram ?? [] }));
+          const pWith = panoWithTargets.get(radar.name);
+          const pWithout = panoWithoutTargets.get(radar.name);
+          for (const b of buildings) {
+            if (flowEpoch !== loadEpochRef.current) return; // reload — stale 산출 폐기
+            const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
+            const key = `${radar.name}_${b.id}`;
+            // 건물별 with(= without ∪ {해당 건물}) — 방위 중첩 인접 분석 대상의 차단이 이 건물의
+            //   추가 차단영역(노출/소실)에 중복 귀속되지 않는다 (차트 핑크영역·분류와 동일 필터).
+            addedBlockageByKey[key] = computeAddedBlockage(
+              histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent,
+            );
+            const eff = hasBldgEffectFromPanorama(radar, b, pWith, pWithout);
+            if (eff !== null) hasBldgEffectByKey.set(key, eff);
+            // 쌍 사이 이벤트 루프 양보 — 프리뷰 점진 마운트/페인트와 교차 실행
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        }
+        if (flowEpoch !== loadEpochRef.current) return; // reload — stale 산출 폐기
+
+        setOmData((prev) => {
+          if (!prev || prev.result !== result) return prev; // 새 보고서로 교체됨 — stale 병합 금지
+          let nextFindings = prev.findingsText;
+          // 사용자 미편집(자동 생성 그대로)일 때만 추가 차단영역 프로즈 포함 재생성
+          if (prev.findingsText === autoFindingsRef.current) {
+            const regen = generateOMFindingsText({
+              radarResults: prev.result?.radar_results ?? [],
+              selectedBuildings: prev.selectedBuildings,
+              radarSites: prev.selectedRadarSites,
+              losMap: prev.losMap,
+              covLayersWithBuildings: prev.covLayersWithBuildings,
+              covLayersWithout: prev.covLayersWithout,
+              analysisMonth: prev.analysisMonth,
+              addedBlockageByKey,
+              hasBldgEffectByKey,
+            });
+            autoFindingsRef.current = regen;
+            nextFindings = regen;
+          }
+          return { ...prev, addedBlockageByKey, findingsText: nextFindings };
         });
-        autoFindingsRef.current = regen;
-        nextFindings = regen;
+      } catch (err) {
+        // fire-and-forget 비동기라 catch 없으면 조용한 unhandledrejection(운영 빌드에선 무표시)이 되고
+        // startedRef 가 이 result 에 영구 래치되어 재시도도 불가 — 빈 {} 를 종결 상태로 커밋한다
+        // (line 상단 가드가 빈 {} 포함을 '산출 완료'로 취급, 소비처는 키 부재를 '판정 불가'로 표시).
+        console.error("[AddedBlockage] 산출 실패 — 추가 차단영역 지표 없이 진행:", err);
+        if (flowEpoch === loadEpochRef.current) {
+          setOmData((prev) =>
+            !prev || prev.result !== result || prev.addedBlockageByKey
+              ? prev
+              : { ...prev, addedBlockageByKey: {} });
+        }
+      } finally {
+        // 모든 종료 경로(정상 커밋·reload 폐기·예외)에서 센티널 해제 — PDF 게이트 영구 대기 방지
+        setAddedBlockageComputing(false);
       }
-      return { ...prev, addedBlockageByKey, findingsText: nextFindings };
-    });
+    })();
   }, [omData]);
 
   // ── 통합 OM 모달 (전체 prep 라이프사이클을 가로지름) ──
@@ -1049,6 +1096,7 @@ export default function ReportApp() {
         omResult={omData?.result ?? null}
         onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
         previewRef={previewRef}
+        omComputing={addedBlockageComputing}
       />
     </div>
   ) : null;

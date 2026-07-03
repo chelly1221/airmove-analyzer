@@ -277,7 +277,9 @@ export default function ReportOMObstacleAzElevChart({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    // willReadFrequently: 소프트웨어(CPU) 백킹 강제 — (빌딩×레이더) 페이지마다 반복되는 DPR=2 백킹
+    // (1440×480, ~2.8MB)이 GPU 가속이면 공유 GPU 프로세스에 페이지 수만큼 상주(§3 도면과 동일 근거).
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
 
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);

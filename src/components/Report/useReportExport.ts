@@ -25,6 +25,22 @@ async function exportViaNative(
   }
 
   const container = containerRef.current;
+
+  // 프리뷰 준비 센티널 대기 — 진행 중 인쇄하면 콘텐츠가 통째로 누락된다:
+  //   [data-om-mounting]  §3 상세(빌딩×레이더) 페이지 점진 마운트(ReportPreviewContent detailPairs)
+  //                       진행 중 — 미마운트 페이지가 PDF 에서 빠짐 (쌍당 ~120ms, 수 초 내 완료)
+  //   [data-om-computing] 추가 차단영역 산출(ReportApp addedBlockage 비동기 루프) 진행 중 —
+  //                       §1 추가소실율·§3 심각도·소견 프로즈가 '판정 불가'로 인쇄됨 (수 초~수십 초)
+  //   30초는 초대형 구성 안전 여유. 타임아웃 시엔 현재 상태로 진행.
+  const READY_SENTINELS = "[data-om-mounting],[data-om-computing]";
+  const mountDeadline = Date.now() + 30_000;
+  while (container.querySelector(READY_SENTINELS) && Date.now() < mountDeadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (container.querySelector(READY_SENTINELS)) {
+    console.warn("[보고서 PDF] 프리뷰 준비 대기 타임아웃(30초) — 현재 상태로 인쇄 진행");
+  }
+
   const pages = container.querySelectorAll<HTMLDivElement>("[data-page]");
   if (pages.length === 0) {
     return { success: false, error: "보고서 페이지가 없습니다" };

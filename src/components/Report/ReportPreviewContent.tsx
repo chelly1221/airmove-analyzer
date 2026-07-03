@@ -3,7 +3,7 @@
  * 툴바는 포함하지 않음. 호출 측에서 previewRef와 상태를 관리.
  * 장애물 월간(OM) 보고서 단일 템플릿 전용.
  */
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 import ReportPage, { ReportPageHeaderProvider } from "./ReportPage";
 import { OMEditProvider } from "./OMEditable";
@@ -37,6 +37,10 @@ export interface ReportPreviewContentProps {
 
   // ref
   previewRef: React.RefObject<HTMLDivElement | null>;
+
+  /** 추가 차단영역 산출 진행 중(ReportApp addedBlockage 비동기 루프) — true 면 [data-om-computing]
+   *  센티널을 렌더해 PDF 내보내기(useReportExport)가 산출 완료까지 대기한다(§1·§3·소견 누락 방지). */
+  omComputing?: boolean;
 }
 
 // ── 섹션 토글 정의 ──
@@ -61,6 +65,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     omData, omResult,
     onOmDataChange,
     previewRef,
+    omComputing,
   } = props;
 
   // OM 보고서 인라인 편집 컨텍스트 — 모든 문구를 textOverrides 로 덮어쓴다.
@@ -102,6 +107,44 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     if (sections.omFindings) nums.omFindings = n++;
     return nums;
   }, [sections, omData?.losMap]);
+
+  // ── §3 상세 페이지 점진 마운트 ──
+  // (분석 대상 빌딩 × 레이더) 전조합 페이지가 previewMountable 게이트 해제 순간 단일 React 커밋으로
+  // 폭발 마운트되면, 페이지당 캔버스 3개 + CARTO 타일 요청이 일시에 몰려 렌더러가 수 초 블로킹(백지)
+  // 되고 다건물 구성에서 메모리 스파이크를 만든다(두 창 동시 blank/프리징의 트리거 지점).
+  // → 유효 쌍 목록을 먼저 산출하고 DETAIL_CHUNK 개씩 시차 마운트해 레이아웃·타일·페인트를 분산한다.
+  //   페이지 수/TOC 는 ReportApp 의 MutationObserver 측정이 마운트 진행에 따라 자동 갱신.
+  //   PDF 내보내기는 [data-om-mounting] 센티널 소멸을 대기(useReportExport)해 페이지 누락을 방지.
+  const detailPairs = useMemo(() => {
+    const pairs: { key: string }[] = [];
+    if (!omData) return pairs;
+    for (const b of omData.selectedBuildings) {
+      for (const rs of omData.selectedRadarSites) {
+        if (omData.losMap.has(`${rs.name}_${b.id}`)) pairs.push({ key: `${rs.name}_${b.id}` });
+      }
+    }
+    return pairs;
+  }, [omData]);
+  const DETAIL_CHUNK = 2;
+  const [detailMountCount, setDetailMountCount] = useState(DETAIL_CHUNK);
+  // §3 토글 오프 시 램프 즉시 재무장 — 렌더 중 파생 상태 조정 패턴(조건부라 무한 루프 없음).
+  //   effect 로 리셋하면 재활성 '첫 커밋'이 이미 전량 마운트(버스트)된 후라 늦다. 오프 렌더 시점에
+  //   카운트를 초기화해 두면, 다시 켤 때 첫 커밋부터 DETAIL_CHUNK 개만 마운트되고 램프가 재가동된다.
+  if (!sections.omLosCrossSection && detailMountCount !== DETAIL_CHUNK) {
+    setDetailMountCount(DETAIL_CHUNK);
+  }
+  useEffect(() => {
+    if (!sections.omLosCrossSection) return; // 섹션 오프 — 램프 정지 (위 렌더 중 리셋과 쌍)
+    if (detailMountCount >= detailPairs.length) return;
+    // 청크 간 간격 — 직전 청크의 커밋/레이아웃/타일 발화가 이벤트 루프를 비울 틈을 준다
+    const t = setTimeout(() => setDetailMountCount((c) => c + DETAIL_CHUNK), 120);
+    return () => clearTimeout(t);
+  }, [detailMountCount, detailPairs.length, sections.omLosCrossSection]);
+  const detailMountedKeys = useMemo(
+    () => new Set(detailPairs.slice(0, detailMountCount).map((p) => p.key)),
+    [detailPairs, detailMountCount],
+  );
+  const detailMounting = detailMountCount < detailPairs.length;
 
   // OM 레이더별 조건 텍스트 — 장애물 후방(최근접) 거리만 사용
   const omRadarConditions = useMemo(() => {
@@ -153,6 +196,8 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     <div ref={previewRef} className="relative flex-1 overflow-auto bg-gray-300 py-6">
       <ReportPageHeaderProvider value={pageHeaderText}>
       <OMEditProvider value={omEditCtx}>
+      {/* 추가 차단영역 산출 진행 센티널 — useReportExport 가 인쇄 전 소멸을 대기 */}
+      {omComputing && <div data-om-computing="true" style={{ display: "none" }} />}
       <div className="kac-report">
       {/* 표지 */}
       {sections.cover && (
@@ -204,13 +249,16 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
 
           {/* 장애물별 상세 — (분석 대상 빌딩 × 레이더) 한 쌍당 한 페이지.
               빌딩 바깥/레이더 안쪽 순회 → 건물별로 레이더를 번갈아 표시(건물1-레이더1, 건물1-레이더2, 건물2-레이더1 …).
-              빌딩 메타 + LoS 단면도 + LoS 차단 양각 대비 표적소실 분포 (분석 대상 방위 윈도우). */}
+              빌딩 메타 + LoS 단면도 + LoS 차단 양각 대비 표적소실 분포 (분석 대상 방위 윈도우).
+              점진 마운트: detailMountedKeys 에 포함된 쌍만 렌더 (위 detailPairs 주석 참조). */}
           {sections.omLosCrossSection && omData.losMap.size > 0 && (
             <div data-toc-key="omLosCrossSection">
+              {detailMounting && <div data-om-mounting="true" style={{ display: "none" }} />}
               {omData.selectedBuildings.map((b) => {
                 return omData.selectedRadarSites.map((rs) => {
                   const los = omData.losMap.get(`${rs.name}_${b.id}`);
                   if (!los) return null;
+                  if (!detailMountedKeys.has(`${rs.name}_${b.id}`)) return null;
                   return (
                     <ReportOMObstacleDetail
                       key={`obs-${rs.name}-${b.id}`}

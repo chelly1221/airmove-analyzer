@@ -33,6 +33,10 @@ interface HeightmapMeta {
 // ─── GPU 인프라 (Worker 내부 자체 보유) ─────────────
 
 let _device: GPUDevice | null = null;
+// device.lost 시 reject 되는 프라미스 — GPU 프로세스 크래시/드라이버 리셋 시
+// onSubmittedWorkDone/mapAsync 콜백이 영영 오지 않아 in-flight 계산이 영구 대기(→ 파노라마
+// 루프·보고서 프리뷰 게이트 무한 대기)되는 것을 방지. GPU 대기 지점마다 race 로 합성한다.
+let _deviceLost: Promise<never> | null = null;
 const _pipelineCache = new Map<string, { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout }>();
 
 async function getDevice(): Promise<GPUDevice> {
@@ -52,14 +56,25 @@ async function getDevice(): Promise<GPUDevice> {
     },
   });
 
-  _device!.lost.then((info) => {
-    console.warn(`[GPU Worker] Device lost: ${info.message}`);
-    _pipelineCache.clear();
-    _device = null;
+  const lostPromise = new Promise<never>((_, reject) => {
+    _device!.lost.then((info) => {
+      console.warn(`[GPU Worker] Device lost: ${info.message}`);
+      _pipelineCache.clear();
+      _device = null;
+      _deviceLost = null;
+      reject(new Error(`GPU device lost: ${info.message}`));
+    });
   });
+  lostPromise.catch(() => { /* unhandledrejection 방지 — 소비는 raceLost 에서 */ });
+  _deviceLost = lostPromise;
 
   console.log("[GPU Worker] Device initialized");
   return _device!;
+}
+
+/** GPU 완료 대기를 device-lost 와 race — lost 시 reject 로 전환해 호출측 catch(ERROR postMessage)로 전파 */
+function raceLost<T>(p: Promise<T>, lost: Promise<never> | null): Promise<T> {
+  return lost ? Promise.race([p, lost]) : p;
 }
 
 function createBuffer(
@@ -90,14 +105,19 @@ async function readBuffer(
     size,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
-  const encoder = device.createCommandEncoder();
-  encoder.copyBufferToBuffer(buffer, 0, readBuf, 0, size);
-  device.queue.submit([encoder.finish()]);
-  await readBuf.mapAsync(GPUMapMode.READ);
-  const result = new Float32Array(readBuf.getMappedRange().slice(0));
-  readBuf.unmap();
-  readBuf.destroy();
-  return result;
+  try {
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, readBuf, 0, size);
+    device.queue.submit([encoder.finish()]);
+    // device-lost 와 race — lost 시 mapAsync 콜백이 오지 않을 수 있어 영구 대기 방지
+    await raceLost(readBuf.mapAsync(GPUMapMode.READ), _deviceLost);
+    const result = new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+    return result;
+  } finally {
+    // mapAsync reject(device lost 등) 경로에서도 read-back 버퍼 해제 (누수 방지)
+    readBuf.destroy();
+  }
 }
 
 function getOrCreatePipeline(
@@ -147,7 +167,8 @@ async function runShader(
   pass.dispatchWorkgroups(...workgroupCount);
   pass.end();
   device.queue.submit([encoder.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  // device-lost 와 race — GPU 프로세스 크래시 시 onSubmittedWorkDone 콜백이 드롭될 수 있어 영구 대기 방지
+  await raceLost(device.queue.onSubmittedWorkDone(), _deviceLost);
 }
 
 

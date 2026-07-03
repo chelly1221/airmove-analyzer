@@ -563,7 +563,9 @@ export function LosCrossSection({
     //   SVG 기본 preserveAspectRatio="xMidYMid meet" 와 동일하게 맞춘다:
     //   maxHeight(230) 로 높이가 클램프되면 SVG 는 균일 스케일(min) + 중앙 정렬(레터박스)로 그려지므로
     //   canvas 도 동일 스케일 s = min(boxW/W, boxH/H) 와 중앙 오프셋(ox, oy)을 적용해야 1px 정합.
-    const dpr = window.devicePixelRatio || 1;
+    // DPR 상한 1.5 — 페이지마다 2개(항적/소실) 반복되는 오버레이 캔버스의 백킹 메모리 절감.
+    //   점(r=1.5) 래스터 오버레이라 1.5x 로도 화면·PDF 인쇄 충분(축/선/텍스트는 SVG 벡터 그대로).
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     const s = Math.min(canvasPx.w / W, canvasPx.h / H);
     const ox = (canvasPx.w - W * s) / 2; // 가로 레터박스 오프셋(px)
     const oy = (canvasPx.h - H * s) / 2; // 세로 레터박스 오프셋(px)
@@ -572,8 +574,10 @@ export function LosCrossSection({
     const bh = Math.round(canvasPx.h * dpr);
 
     // 두 canvas(소실표적/항적) 공통 셋업 — 크기 동기화 + viewBox 변환 + plot rect 클립(SVG clipPath 와 동일)
+    // willReadFrequently: 소프트웨어(CPU) 백킹 강제 — 페이지마다 2개씩 반복되는 오버레이 캔버스가
+    //   GPU 가속 백킹이면 공유 GPU 프로세스에 페이지 수만큼 상주(§3 도면과 동일 근거).
     const setup = (canvas: HTMLCanvasElement): CanvasRenderingContext2D | null => {
-      const ctx = canvas.getContext("2d");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
       if (!ctx) return null;
       if (canvas.width !== bw) canvas.width = bw;
       if (canvas.height !== bh) canvas.height = bh;

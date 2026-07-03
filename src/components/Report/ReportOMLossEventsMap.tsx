@@ -74,7 +74,9 @@ export default function ReportOMLossEventsMap({ radarSite, buildings, buildingGr
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    // willReadFrequently: 소프트웨어(CPU) 백킹 강제 — 1376² 대형 정사각 백킹(~7.6MB)이 레이더 수만큼
+    // 반복되므로 GPU 가속 백킹이면 공유 GPU 프로세스 상주 메모리를 크게 점유(§3 도면과 동일 근거).
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
     canvas.width = SQ;
     canvas.height = SQ;

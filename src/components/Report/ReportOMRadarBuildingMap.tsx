@@ -150,6 +150,38 @@ export function fitProjection(pts: [number, number][], w = BACK_W, h = BACK_H): 
   return { z, originX, originY, project, mpp };
 }
 
+// ── 전역 타일 로드 동시성 제한 ──
+// §3 상세(빌딩×레이더) 도면 + §4 소실상세 도면이 다수 마운트되면 도면당 12~25개 타일 요청이
+// 한꺼번에 발화해 수백 개 Image 네트워크/디코드가 렌더러·공유 GPU 프로세스 메모리를 일시에
+// 점유한다(다건물 보고서에서 두 창 동시 blank/프리징의 가중 요인). 풀 크기만큼만 동시 로드하고
+// 나머지는 큐 대기.
+// 타일 3초 데드라인은 '큐 대기 포함' 전체 예산 — composeTiles 가 항상 ≤3초에 종료해야
+// PDF 게이트(useReportExport data-map-ready 4초) 안에 오버레이(부채꼴·건물·소실점)까지 그려진
+// 도면이 인쇄된다. 행잉 네트워크에서 큐 대기가 예산을 소모하면 잔여 시간만 로드에 사용하고,
+// 큐에서 예산이 소진된 타일은 Image 생성 없이 즉시 포기한다.
+const TILE_POOL = 24;
+let tileActive = 0;
+const tileQueue: (() => void)[] = [];
+/** 슬롯 획득 — deadline(절대시각)까지 대기. 성공 시 true(슬롯 보유 → 반드시 releaseTileSlot),
+ *  큐 대기 중 예산 소진 시 큐에서 자신을 제거하고 false(슬롯 미보유 → release 금지). */
+function acquireTileSlotUntil(deadline: number): Promise<boolean> {
+  if (tileActive < TILE_POOL) { tileActive++; return Promise.resolve(true); }
+  return new Promise((resolve) => {
+    const waiter = () => { clearTimeout(timer); resolve(true); }; // 슬롯 이양받음 (tileActive 유지)
+    const timer = setTimeout(() => {
+      const i = tileQueue.indexOf(waiter);
+      // i<0 이면 이양(waiter 호출)과 경합해 이미 슬롯을 받은 것 — resolve(true)가 선승, 여기선 무시
+      if (i >= 0) { tileQueue.splice(i, 1); resolve(false); }
+    }, Math.max(0, deadline - Date.now()));
+    tileQueue.push(waiter);
+  });
+}
+function releaseTileSlot() {
+  const next = tileQueue.shift();
+  if (next) next(); // 슬롯 이양 (tileActive 유지)
+  else tileActive--;
+}
+
 /** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 완료 시 onDone(online 여부) 호출(오프라인이면 폴백 격자
  *  + 흰 베일까지 그린 뒤). w/h 는 fitProjection 과 동일한 백킹 크기 (기본 §3 규격).
  *  반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청 중단 + 고아 Image
@@ -169,20 +201,29 @@ export function composeTiles(
   const tx0 = Math.floor(originX / TILE), tx1 = Math.floor((originX + w) / TILE);
   const ty0 = Math.floor(originY / TILE), ty1 = Math.floor((originY + h) / TILE);
 
-  const loadTile = (tx: number, ty: number) =>
-    new Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>((resolve) => {
-      if (ty < 0 || ty >= n) { resolve(null); return; }
-      const wx = ((tx % n) + n) % n;
-      const img = new Image();
-      imgs.push(img);
-      img.crossOrigin = "anonymous";
-      // 개별 타일 3초 타임아웃 — 행잉 요청 환경에서도 Promise.all 이 PDF 게이트(data-map-ready 4초) 안에
-      // 끝나 폴백 배경+오버레이(부채꼴·건물)가 인쇄되도록 보장 (onload/onerror 시 해제)
-      const timer = setTimeout(() => resolve(null), 3000);
-      img.onload = () => { clearTimeout(timer); resolve({ tx, ty, img }); };
-      img.onerror = () => { clearTimeout(timer); resolve(null); };
-      img.src = tileUrl(z, wx, ty);
-    });
+  const loadTile = async (tx: number, ty: number): Promise<{ tx: number; ty: number; img: HTMLImageElement } | null> => {
+    if (ty < 0 || ty >= n) return null;
+    // 3초 데드라인 = 큐 대기 + 네트워크/디코드 전체 예산 — composeTiles 의 Promise.all 이 항상
+    // ≤3초에 끝나 PDF 게이트(data-map-ready 4초) 안에 오버레이 포함 도면이 인쇄되도록 보장.
+    const deadline = Date.now() + 3000;
+    if (!(await acquireTileSlotUntil(deadline))) return null; // 큐 대기 중 예산 소진 — 슬롯 미보유
+    if (cancelled) { releaseTileSlot(); return null; }
+    try {
+      return await new Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>((resolve) => {
+        const wx = ((tx % n) + n) % n;
+        const img = new Image();
+        imgs.push(img);
+        img.crossOrigin = "anonymous";
+        // 잔여 예산으로 로드 타임아웃 — 행잉 요청 환경에서도 데드라인 안에 종료 (onload/onerror 시 해제)
+        const timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
+        img.onload = () => { clearTimeout(timer); resolve({ tx, ty, img }); };
+        img.onerror = () => { clearTimeout(timer); resolve(null); };
+        img.src = tileUrl(z, wx, ty);
+      });
+    } finally {
+      releaseTileSlot();
+    }
+  };
 
   const jobs: Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>[] = [];
   for (let tx = tx0; tx <= tx1; tx++)
@@ -319,7 +360,11 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    // willReadFrequently: 소프트웨어(CPU) 백킹 강제 — 이 도면은 (빌딩×레이더) 페이지마다 반복되어
+    // GPU 가속 백킹이면 페이지 수만큼 공유 WebView2 GPU 프로세스에 상주, 다건물 보고서에서 GPU
+    // 프로세스 메모리 고갈 → 두 창 동시 blank/프리징. 정적 1회 그리기라 CPU 래스터로 충분하고,
+    // 컴포지터는 뷰포트 근처 타일만 GPU 텍스처로 올리므로 화면 밖 페이지는 GPU 를 점유하지 않는다.
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
     canvas.width = BACK_W;
     canvas.height = BACK_H;
