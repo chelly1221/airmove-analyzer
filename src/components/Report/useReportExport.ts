@@ -2,6 +2,10 @@ import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { save } from "@tauri-apps/plugin-dialog";
+// 자가치유 대기 창(healWindow)을 composeTiles 재시도 스케줄에서 유도하기 위한 상수
+import { RETRY_MAX, RETRY_DELAY_MS, TILE_BUDGET_RETRY_MS } from "./ReportOMRadarBuildingMap";
+// 인쇄 임계구간 재페이지네이션 동결 — 지도 canvas remount 로 1회 스냅샷과 어긋나는 것 차단
+import { setPaginationFrozen } from "./AutoPaginate";
 
 export interface ExportResult {
   success: boolean;
@@ -45,6 +49,12 @@ async function exportViaNative(
   if (pages.length === 0) {
     return { success: false, error: "보고서 페이지가 없습니다" };
   }
+
+  // 인쇄 임계구간 진입 — 재페이지네이션 동결(AutoPaginate §4·§5). 이 지점 이후 블록 remount 로
+  //   지도 canvas 가 리셋돼 아래 1회 canvas 스냅샷(data-map-canvas)과 어긋나는 것을 차단한다.
+  //   restoreDOM 에서 해제 — finally·beforeunload 양쪽에서 호출되어 정상/비정상 종료 모두 복원
+  //   (container.id·display 복원과 동일 계약). READY_SENTINELS 소멸 후라 배치는 이미 확정 상태.
+  setPaginationFrozen(true);
 
   // 1. 컨테이너에 프린트 래퍼 ID 부여 (페이지를 이동하지 않음)
   const prevContainerId = container.id;
@@ -187,19 +197,26 @@ async function exportViaNative(
     }
 
     // 타일 부분 유실 자가치유 대기 — 첫 합성에서 일부 타일이 미수신이면(data-map-complete="false")
-    //   composeTiles 백그라운드 재시도(최대 2회)가 도면을 재합성한다. 확정까지 잠시 추가 대기해
+    //   composeTiles 백그라운드 재시도(최대 RETRY_MAX 회)가 도면을 재합성한다. 확정까지 추가 대기해
     //   '일부만 로딩된(회색 조각) 지도'가 인쇄되는 것을 방지. ready 미달 캔버스(위 폴백 처리)는
     //   제외 — 이미 수동 폴백을 그렸고 complete 를 기다릴 근거가 없다.
     //   정상 네트워크에선 complete="true"가 이미 세팅돼 있어 대기 0초로 통과.
     const isHealing = () => mapCanvases.some(
       (c) => c.getAttribute("data-map-ready") === "true" && c.getAttribute("data-map-complete") === "false",
     );
-    const healDeadline = Date.now() + 8000;
+    // 대기 창은 composeTiles 재시도 스케줄 전체를 덮어야 한다 — ready 이후 최악
+    //   RETRY_MAX×(RETRY_DELAY_MS+TILE_BUDGET_RETRY_MS)(= 2×(800+4000) = 9600ms) 소요.
+    //   과거 하드코딩 8000ms 는 이보다 짧아 round-2 완료(≈9.6s) 직전 잘려 §4 소실상세 도면이
+    //   일부만 로딩된 채 인쇄됐다(1376² 최대 49타일이 공유 풀에서 첫 패스에 다 못 채워지는 케이스).
+    //   상수에서 유도(+여유)해 향후 스케줄 변경에도 자동 정합.
+    const HEAL_MARGIN_MS = 1500;
+    const healWindow = RETRY_MAX * (RETRY_DELAY_MS + TILE_BUDGET_RETRY_MS) + HEAL_MARGIN_MS;
+    const healDeadline = Date.now() + healWindow;
     while (isHealing() && Date.now() < healDeadline) {
       await new Promise((r) => setTimeout(r, 150));
     }
     if (isHealing()) {
-      console.warn("[보고서 PDF] 지도 타일 자가치유 대기 타임아웃(8초) — 현재 상태로 인쇄 진행");
+      console.warn(`[보고서 PDF] 지도 타일 자가치유 대기 타임아웃(${(healWindow / 1000).toFixed(1)}초) — 현재 상태로 인쇄 진행`);
     }
   }
 
@@ -211,6 +228,7 @@ async function exportViaNative(
     hiddenBodyChildren.forEach((el) => el.style.removeProperty("display"));
     hiddenAncestorSiblings.forEach((el) => el.style.removeProperty("display"));
     overriddenAncestors.forEach((el) => el.classList.remove("__print-ancestor__"));
+    setPaginationFrozen(false); // 재페이지네이션 동결 해제
   };
 
   // 비정상 종료 시 DOM 복원 보장

@@ -20,6 +20,17 @@ import {
 import ReportPage from "./ReportPage";
 import { PAGE_CONTENT_MM } from "./reportPageConstants";
 
+// ── PDF 내보내기 임계구간 재페이지네이션 동결 ──
+// 인쇄 직전 자식 블록이 다른 ReportPage(key=pi)로 재배치되면 React 가 remount → 그 안의 지도
+// canvas 가 새로 생성되고 composeTiles 가 0라운드부터 재시작하며 data-map-ready 가 false 로 리셋된다.
+// 그러면 내보내기 게이트(useReportExport)가 1회 스냅샷한 canvas 집합과 실제 인쇄 DOM 이 어긋나
+// §4 도면이 백지/일부로딩으로 스냅샷될 수 있다(remount 는 게이트 폴링 밖에서 일어남). 인쇄 임계구간엔
+// 화면에서 이미 확정된 페이지 배치를 그대로 유지(동결)해 remount 를 원천 차단한다. 배치(assign)는
+// mm 기준 scale-불변이라 인쇄 레이아웃과 동일 → 동결이 페이지 나눔을 어긋나게 하지 않는다.
+let paginationFrozen = false;
+/** useReportExport 가 인쇄 임계구간 진입/이탈 시 호출 — 동결 중 recompute 는 무시(remount 차단). */
+export function setPaginationFrozen(frozen: boolean) { paginationFrozen = frozen; }
+
 interface AutoPaginateProps {
   children: ReactNode;
   /** 모든 페이지 상단에 반복 출력할 헤더 (예: "섹션 (계속)" 표시용) */
@@ -79,6 +90,7 @@ export default function AutoPaginate({ children, repeatHeader, firstHeader }: Au
   const observerRef = useRef<ResizeObserver | null>(null);
 
   const recompute = useCallback(() => {
+    if (paginationFrozen) return; // 인쇄 임계구간 — 확정 배치 유지(remount 차단)
     if (n === 0) return;
     const sample = itemRefs.current.values().next().value as HTMLElement | undefined;
     if (!sample) return;

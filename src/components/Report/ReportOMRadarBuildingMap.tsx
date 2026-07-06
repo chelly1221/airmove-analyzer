@@ -187,12 +187,16 @@ function releaseTileSlot() {
 
 /** 첫 패스 타일 예산(ms) — 큐 대기 포함. 첫 합성이 ≤3초에 끝나 data-map-ready 게이트를 연다. */
 const TILE_BUDGET_FIRST_MS = 3000;
+// 아래 세 상수는 첫 패스 이후 백그라운드 재시도(자가치유) 스케줄을 정의한다. useReportExport 의
+// 자가치유 대기 창(healWindow)이 이 값들에서 유도되므로 export 한다 — 과거 하드코딩 8초 대기가
+// 재시도 스케줄(RETRY_MAX×(RETRY_DELAY_MS+TILE_BUDGET_RETRY_MS)≈9.6초)보다 짧아 round-2 완료
+// 직전 잘려 §4 도면이 일부만 인쇄되던 버그를 방지한다(상수 변경 시 대기 창 자동 정합).
 /** 재시도 패스 타일 예산(ms) — ready 게이트 무관 백그라운드 자가치유라 여유 있게. */
-const TILE_BUDGET_RETRY_MS = 4000;
+export const TILE_BUDGET_RETRY_MS = 4000;
 /** 미수신 타일 재시도 상한 — 첫 패스 이후 최대 2회. */
-const RETRY_MAX = 2;
+export const RETRY_MAX = 2;
 /** 재시도 지연(ms) — 동시 마운트 도면들의 첫 패스 혼잡이 풀에서 빠지길 기다렸다 재요청. */
-const RETRY_DELAY_MS = 800;
+export const RETRY_DELAY_MS = 800;
 
 /** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 합성(첫 패스 + 자가치유 재합성)마다
  *  onDone(online, complete) 호출: 베이스 전체를 다시 그렸으므로 호출측은 매번 오버레이를 다시 그린다.
@@ -250,13 +254,24 @@ export function composeTiles(
     }
   };
 
-  /** 누적 loaded 로 베이스 전체 재합성 + 흰 베일 + onDone(오버레이 재그리기) */
+  /** 누적 loaded 로 베이스 전체 재합성 + 흰 베일 + onDone(오버레이 재그리기).
+   *  complete 확정 후에도 남은 미수신 타일(재시도 소진) 자리에는 '타일 없음' 사선 해치를 덧그려
+   *  회색 빈칸이 '깨진 캡처'로 보이지 않게 마감한다 — data-map-complete 는 '더 이상 재시도 없음'이지
+   *  '전 타일 수신'이 아니므로, 확정 시 잔여 구멍을 명시(의도된 미표시)로 처리한다. */
   const drawAll = (complete: boolean, warnOffline: boolean) => {
     ctx.fillStyle = "#eef1f4";
     ctx.fillRect(0, 0, w, h);
     if (loaded.length > 0) {
       for (const t of loaded) {
         ctx.drawImage(t.img, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY), TILE, TILE);
+      }
+      // 확정(complete)된 미수신 타일 — 사선 해치로 마감 (전 타일 수신 시 미발동)
+      if (complete && loaded.length < targets.length) {
+        const have = new Set(loaded.map((t) => `${t.tx},${t.ty}`));
+        for (const t of targets) {
+          if (have.has(`${t.tx},${t.ty}`)) continue;
+          hatchMissingTile(ctx, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY));
+        }
       }
     } else {
       ctx.strokeStyle = "#d6dbe1";
@@ -605,6 +620,26 @@ function labelChip(ctx: CanvasRenderingContext2D, text: string, x: number, y: nu
   ctx.strokeStyle = "#a60739"; ctx.lineWidth = 1; ctx.stroke();
   ctx.fillStyle = "#a60739";
   ctx.fillText(text, cx, cy + 0.5);
+}
+
+/** 확정 미수신 타일 자리 — 옅은 배경 + 사선 해치. '일부만 로딩된 지도'의 회색 빈칸을
+ *  '타일 없음(의도된 미표시)'으로 읽히게 한다. 오프라인 폴백 격자(#d6dbe1)와 톤 통일. */
+function hatchMissingTile(ctx: CanvasRenderingContext2D, x: number, y: number) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, TILE, TILE);
+  ctx.clip();
+  ctx.fillStyle = "#e7ebf0";
+  ctx.fillRect(x, y, TILE, TILE);
+  ctx.strokeStyle = "rgba(154,163,173,0.45)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let d = -TILE; d <= TILE; d += 12) {
+    ctx.moveTo(x + d, y);
+    ctx.lineTo(x + d + TILE, y + TILE);
+  }
+  ctx.stroke();
+  ctx.restore();
 }
 
 export function drawScaleBar(ctx: CanvasRenderingContext2D, mpp: number, h = BACK_H) {

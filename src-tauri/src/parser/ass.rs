@@ -2403,6 +2403,7 @@ fn parse_block_records(
     nec_abs: Option<f64>,
     base_date_secs: f64,
     start_tod: Option<f64>,
+    tod_utc_shift: f64,
     parse_errors_out: &mut u64,
 ) -> Vec<ScanRecord> {
     let cat = data[offset];
@@ -2417,7 +2418,10 @@ fn parse_block_records(
                     let frns = parse_fspec(block, rec_offset)
                         .map(|(f, _)| f)
                         .unwrap_or_default();
-                    let tod = record.time_of_day;
+                    // TOD → UTC 정규화 (KST 인코딩 레이더 흡수) — parse_ass_file 와 동일 규칙.
+                    let tod = record
+                        .time_of_day
+                        .map(|t| if tod_utc_shift != 0.0 { normalize_tod(t, tod_utc_shift) } else { t });
                     let abs_time = tod.map(|t| {
                         let base = base_date_secs
                             + compute_day_offset(Some(t), nec_abs, base_date_secs, start_tod);
@@ -2494,6 +2498,7 @@ fn walk_asterix<F: FnMut(&ScanFrame)>(
     valid_dates: &[(i64, u8, u8)],
     base_date_secs: f64,
     start_tod: Option<f64>,
+    tod_utc_shift: f64,
     totals: &mut WalkTotals,
     mut on_frame: F,
 ) {
@@ -2548,6 +2553,7 @@ fn walk_asterix<F: FnMut(&ScanFrame)>(
                 nec_abs,
                 base_date_secs,
                 start_tod,
+                tod_utc_shift,
                 &mut totals.parse_errors,
             );
             if framed {
@@ -2589,6 +2595,7 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
         .unwrap_or_else(|| path.to_string());
 
     let (valid_dates, base_date_secs, start_tod) = asterix_date_context(path, &data);
+    let tod_utc_shift = detect_tod_utc_shift(&data, &valid_dates);
     let mut totals = WalkTotals::default();
 
     let acc = &mut state.acc;
@@ -2602,6 +2609,7 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
         &valid_dates,
         base_date_secs,
         start_tod,
+        tod_utc_shift,
         &mut totals,
         |frame| {
             acc.frame_count += 1;
@@ -2811,6 +2819,7 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
     for (file_index, path) in paths.iter().enumerate() {
         let data = std::fs::read(path).map_err(|e| e.to_string())?;
         let (valid_dates, base_date_secs, start_tod) = asterix_date_context(path, &data);
+        let tod_utc_shift = detect_tod_utc_shift(&data, &valid_dates);
         let mut totals = WalkTotals::default();
 
         walk_asterix(
@@ -2818,6 +2827,7 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
             &valid_dates,
             base_date_secs,
             start_tod,
+            tod_utc_shift,
             &mut totals,
             |frame| {
                 if frame.records.is_empty() {

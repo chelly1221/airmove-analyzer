@@ -412,11 +412,15 @@ async fn webview_print_to_pdf(
                     let core = controller.CoreWebView2().unwrap();
 
                     // CDP 파라미터: A4 용지, 여백 0, 배경색 출력
+                    // preferCSSPageSize:true 라 @page{size:210mm 297mm} 가 시트를 결정하고 아래
+                    // paperWidth/Height 는 폴백값이다. 반올림(8.27/11.69=210.06×296.93mm)이 아닌
+                    // 정확한 A4 인치(210/25.4, 297/25.4)로 못박아, 혹 preferCSSPageSize 가 무시되는
+                    // 빌드에서도 시트가 정확히 210×297mm 가 되게 한다 (296.93mm 폴백 시 매 장 빈 페이지 방지).
                     let params = r#"{
                         "landscape": false,
                         "printBackground": true,
-                        "paperWidth": 8.27,
-                        "paperHeight": 11.69,
+                        "paperWidth": 8.2677165354,
+                        "paperHeight": 11.6929133858,
                         "marginTop": 0,
                         "marginBottom": 0,
                         "marginLeft": 0,
