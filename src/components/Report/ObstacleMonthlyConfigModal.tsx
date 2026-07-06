@@ -19,7 +19,7 @@ import { computeLosBatch, calcBuildingAzExtent, mergeAzSectors } from "../../uti
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import type {
   RadarSite, Aircraft as AircraftType, ReportMetadata, ManualBuilding, BuildingGroup,
-  AzSector, ObstacleMonthlyResult, ObstacleMonthlyProgress, LoSProfileData,
+  AzSector, ObstacleMonthlyResult, RadarMonthlyResult, ObstacleMonthlyProgress, LoSProfileData,
 } from "../../types";
 
 // ── 통합 진행 상태 모니터링용 타입 (ReportApp 측 정의와 미러) ──
@@ -335,11 +335,20 @@ export default function ObstacleMonthlyConfigModal({
       });
 
       // 결과(수백 MB 급)는 bulk:// 파일 매개 수신 — invoke 응답에 실으면 IPC eval 폴백 시
-      // 공유 브라우저 프로세스 OOM(전 창 백지) 크래시 (bulkIpc.ts 참조)
-      const resultRef = await invoke<BulkRef>("analyze_obstacle_monthly", { radarFileSets, excludeModeS: excludeMs });
-      setProgress(`분석 결과 수신 중... (${(resultRef.bytes / 1024 / 1024).toFixed(1)}MB)`);
-      setStageDetail((prev) => ({ ...prev, parsing: `분석 결과 수신 중 (${(resultRef.bytes / 1024 / 1024).toFixed(1)}MB)` }));
-      const result = await readBulkJson<ObstacleMonthlyResult>(resultRef);
+      // 공유 브라우저 프로세스 OOM(전 창 백지) 크래시 (bulkIpc.ts 참조).
+      // ★ 레이더별 개별 bulk 파일로 분리 수신: 다중 레이더 결합 JSON 은 V8 문자열 한계(~512MB)를
+      //   넘겨 res.json() 이 truncation("Unexpected end of JSON input")되므로, 레이더 단위로
+      //   나눠 각각 파싱(단일 레이더는 한계 미만)한 뒤 병합한다.
+      const bulkRefs = await invoke<BulkRef[]>("analyze_obstacle_monthly", { radarFileSets, excludeModeS: excludeMs });
+      const totalMB = bulkRefs.reduce((s, r) => s + r.bytes, 0) / 1024 / 1024;
+      setProgress(`분석 결과 수신 중... (${totalMB.toFixed(1)}MB · ${bulkRefs.length}개 레이더)`);
+      setStageDetail((prev) => ({ ...prev, parsing: `분석 결과 수신 중 (${totalMB.toFixed(1)}MB · ${bulkRefs.length}개 레이더)` }));
+      const radarResults: RadarMonthlyResult[] = [];
+      for (const ref of bulkRefs) {
+        if (cancelledRef.current) return;
+        radarResults.push(await readBulkJson<RadarMonthlyResult>(ref));
+      }
+      const result: ObstacleMonthlyResult = { radar_results: radarResults };
       if (cancelledRef.current) return;
 
       // ── 백엔드 결과 진단 ──

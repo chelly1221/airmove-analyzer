@@ -1359,7 +1359,7 @@ async fn analyze_obstacle_monthly(
     app_handle: tauri::AppHandle,
     radar_file_sets: Vec<analysis::obstacle_monthly::RadarFileSet>,
     exclude_mode_s: Vec<String>,
-) -> Result<bulk::BulkRef, String> {
+) -> Result<Vec<bulk::BulkRef>, String> {
     use analysis::obstacle_monthly::{self as om, ObstacleMonthlyProgress};
 
     info!(
@@ -1387,8 +1387,13 @@ async fn analyze_obstacle_monthly(
     };
 
     let handle = app_handle.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let mut radar_results = Vec::new();
+    // 레이더별로 개별 bulk 파일을 기록하고 참조 목록(매니페스트)만 반환한다.
+    // 결합 결과 JSON 을 하나로 전송하면 다중 레이더 시 V8 문자열 한계(~512MB)를 넘겨
+    // 프론트 res.json() 이 truncation("Unexpected end of JSON input")된다 (커밋 1fd88a4 참조).
+    // 레이더 단위로 나누면 각 파일이 한계 미만이라 프론트가 순차 파싱·병합할 수 있다.
+    // 직렬화(수백 MB)도 blocking 스레드에서 수행.
+    let bulk_refs = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<bulk::BulkRef>, String> {
+        let mut refs: Vec<bulk::BulkRef> = Vec::new();
 
         for radar in &radar_file_sets {
             // 취소 체크
@@ -1402,7 +1407,17 @@ async fn analyze_obstacle_monthly(
             };
 
             match om::analyze_radar_monthly(radar, &exclude_mode_s, mag_dec, &cancel, &progress_fn) {
-                Ok(result) => radar_results.push(result),
+                Ok(result) => {
+                    // 레이더 1개 결과를 개별 bulk 파일로 즉시 기록 → 메모리도 즉시 해제
+                    let r = bulk::write_json(&handle, &result)?;
+                    info!(
+                        "[ObstacleMonthly] 레이더 '{}' 결과 bulk: {} ({:.1}MB)",
+                        result.radar_name,
+                        r.bulk_id,
+                        r.bytes as f64 / 1024.0 / 1024.0
+                    );
+                    refs.push(r);
+                }
                 Err(e) if e.contains("취소") => {
                     return Err(e);
                 }
@@ -1422,22 +1437,17 @@ async fn analyze_obstacle_monthly(
             }
         }
 
-        Ok(om::ObstacleMonthlyResult { radar_results })
+        Ok(refs)
     })
     .await
     .map_err(|e| format!("분석 스레드 오류: {}", e))??;
 
-    // 대용량 결과를 bulk 파일로 기록 — 직렬화(수백 MB)도 blocking 스레드에서 수행
-    let handle2 = app_handle.clone();
-    let bulk_ref = tauri::async_runtime::spawn_blocking(move || bulk::write_json(&handle2, &result))
-        .await
-        .map_err(|e| format!("bulk 직렬화 스레드 오류: {}", e))??;
     info!(
-        "[ObstacleMonthly] 결과 bulk 기록: {} ({:.1}MB)",
-        bulk_ref.bulk_id,
-        bulk_ref.bytes as f64 / 1024.0 / 1024.0
+        "[ObstacleMonthly] 완료: {} 레이더, 총 {:.1}MB",
+        bulk_refs.len(),
+        bulk_refs.iter().map(|r| r.bytes).sum::<u64>() as f64 / 1024.0 / 1024.0
     );
-    Ok(bulk_ref)
+    Ok(bulk_refs)
 }
 
 /// 건물 제외 커버리지 프로파일 계산 (장애물 월간 보고서용)
