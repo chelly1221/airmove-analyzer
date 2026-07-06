@@ -41,7 +41,9 @@ const STAGE_BOUNDS = {
   los: [32, 8],
   coverage: [40, 22],
   transfer: [62, 4],
-  panorama: [66, 34],
+  panorama: [66, 26],
+  // 파노라마 종료 후 §3 상세 페이지 배치 + 추가 차단영역 산출 마무리 구간 (프리뷰 노출 직전)
+  finalize: [92, 8],
 } as const;
 export default function ObstacleMonthlyConfigModal({
   customRadarSites,
@@ -58,6 +60,8 @@ export default function ObstacleMonthlyConfigModal({
   panoramaElapsedMs,
   panoramaLastError,
   omReady,
+  finalizing,
+  finalizeDetail,
   onComplete,
 }: {
   customRadarSites: RadarSite[];
@@ -85,7 +89,13 @@ export default function ObstacleMonthlyConfigModal({
   panoramaProgress?: PanoramaProgress | null;
   panoramaElapsedMs?: number;
   panoramaLastError?: string | null;
+  /** 프리뷰 '완전 준비' — true 가 되면 모달이 닫히고 완성된 프리뷰가 노출된다
+   *  (커버리지+파노라마+§3 상세 마운트+추가 차단영역 산출까지 완료). */
   omReady?: boolean;
+  /** 파노라마는 끝났으나 아직 렌더/산출 중 — 마지막 '보고서 렌더링' 스테이지 표시용 */
+  finalizing?: boolean;
+  /** 렌더링 스테이지 상세 문구 (추가 차단영역 산출/상세 페이지 배치 등) */
+  finalizeDetail?: string;
   onComplete?: () => void;
 }) {
   const [step, setStep] = useState(0);
@@ -100,9 +110,10 @@ export default function ObstacleMonthlyConfigModal({
   const [progress, setProgress] = useState("");
   const [progressPct, setProgressPct] = useState(0);
   const [error, setError] = useState("");
-  // 통합 모달 — 5단계 스테이지로 진행 표시 (parsing → los → coverage → transfer → panorama → done)
-  // parsing/los/coverage/transfer 는 모달 로컬 작업, panorama 는 부모 props 로 모니터링
-  type AnalyzeStage = "parsing" | "los" | "coverage" | "transfer" | "panorama" | "done";
+  // 통합 모달 — 6단계 스테이지 (parsing → los → coverage → transfer → panorama → finalize → done)
+  // parsing/los/coverage/transfer 는 모달 로컬 작업, panorama/finalize 는 부모 props 로 모니터링.
+  // finalize: 파노라마 종료 후 §3 상세 페이지 배치 + 추가 차단영역 산출 마무리 (프리뷰 노출 직전)
+  type AnalyzeStage = "parsing" | "los" | "coverage" | "transfer" | "panorama" | "finalize" | "done";
   const [stage, setStage] = useState<AnalyzeStage | null>(null);
   const [stageDetail, setStageDetail] = useState<{ parsing: string; los: string; coverage: string; transfer: string }>({
     parsing: "", los: "", coverage: "", transfer: "",
@@ -129,6 +140,10 @@ export default function ObstacleMonthlyConfigModal({
           : 0.85;
         frac = (panoramaProgress.currentIndex - 1 + phaseFrac) / panoramaProgress.totalRadars;
       }
+    } else if (stage === "finalize") {
+      // 세부 진행 신호가 없어 실측은 스팬 시작(92%)에 고정 — 트리클이 99.2%까지 점근하고
+      // fullyReady(→ stage "done")에서 100%로 마감. (progressPct 는 transfer 잔재라 사용 금지)
+      frac = 0;
     } else {
       frac = progressPct / 100;
     }
@@ -159,15 +174,18 @@ export default function ObstacleMonthlyConfigModal({
   }, [analyzing, stage]);
 
   // ── prop-driven 스테이지 전환 ──
-  // 로컬 작업(transfer 까지) 후 부모 상태에 따라 panorama → done 자동 진행.
+  // 로컬 작업(transfer 까지) 후 부모 상태에 따라 panorama → finalize → done 자동 진행.
   // panorama "deferred" 는 부모 effect 가 아직 안 돈 상태이므로 transfer 에 머무름.
+  // finalizing(파노라마 종료·미완성) → finalize, omReady(완전 준비) → done. 둘은 상호배타적.
+  // omReady 가 즉시 달성되면(작은 보고서 등) finalize 를 건너뛰고 바로 done — 무해.
   useEffect(() => {
     if (!stage || stage === "done") return;
     if (stage === "transfer") {
       if (panoramaStatus === "loading" || panoramaStatus === "error") setStage("panorama");
     }
-    if ((stage === "transfer" || stage === "panorama") && omReady) setStage("done");
-  }, [stage, panoramaStatus, omReady]);
+    if ((stage === "transfer" || stage === "panorama") && finalizing) setStage("finalize");
+    if ((stage === "transfer" || stage === "panorama" || stage === "finalize") && omReady) setStage("done");
+  }, [stage, panoramaStatus, finalizing, omReady]);
 
   // stage 가 "done" 이 되면 onComplete 호출.
   // 별도 effect 로 분리한 이유: 스테이지 전환 effect 의 cleanup 이 setStage 재실행 시
@@ -748,9 +766,9 @@ export default function ObstacleMonthlyConfigModal({
               </div>
 
               {analyzing && (() => {
-                // 통합 진행 카드 — 5단계 (parsing → los → coverage → transfer → panorama)
+                // 통합 진행 카드 — 6단계 (parsing → los → coverage → transfer → panorama → finalize)
                 type StageStatus = "waiting" | "active" | "done" | "error";
-                const order: AnalyzeStage[] = ["parsing", "los", "coverage", "transfer", "panorama"];
+                const order: AnalyzeStage[] = ["parsing", "los", "coverage", "transfer", "panorama", "finalize"];
                 const currentIdx = stage && stage !== "done" ? order.indexOf(stage) : (stage === "done" ? order.length : -1);
                 const statusOf = (key: AnalyzeStage): StageStatus => {
                   const idx = order.indexOf(key);
@@ -796,6 +814,7 @@ export default function ObstacleMonthlyConfigModal({
                   { key: "coverage", label: "커버리지 계산", detail: stageDetail.coverage || "대기 중" },
                   { key: "transfer", label: "보고서 창 전송", detail: stageDetail.transfer || "대기 중" },
                   { key: "panorama", label: "파노라마 LoS 계산", detail: panoramaDetailText },
+                  { key: "finalize", label: "보고서 렌더링", detail: stage === "finalize" ? (finalizeDetail ?? "마무리 중...") : stage === "done" ? "완료" : "대기 중" },
                 ];
 
                 return (

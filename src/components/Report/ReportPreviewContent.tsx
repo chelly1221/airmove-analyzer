@@ -41,6 +41,10 @@ export interface ReportPreviewContentProps {
   /** 추가 차단영역 산출 진행 중(ReportApp addedBlockage 비동기 루프) — true 면 [data-om-computing]
    *  센티널을 렌더해 PDF 내보내기(useReportExport)가 산출 완료까지 대기한다(§1·§3·소견 누락 방지). */
   omComputing?: boolean;
+
+  /** §3 상세 페이지 점진 마운트 진행 상태를 부모(ReportApp)에 보고 — 부모의 '완전 준비' 게이트가
+   *  전량 마운트 완료까지 프리뷰 노출(모달 종료)을 미루는 데 사용. 마운트 시 반드시 1회 보고한다. */
+  onMountingChange?: (mounting: boolean) => void;
 }
 
 // ── 섹션 토글 정의 ──
@@ -66,6 +70,7 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     onOmDataChange,
     previewRef,
     omComputing,
+    onMountingChange,
   } = props;
 
   // OM 보고서 인라인 편집 컨텍스트 — 모든 문구를 textOverrides 로 덮어쓴다.
@@ -144,7 +149,17 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     () => new Set(detailPairs.slice(0, detailMountCount).map((p) => p.key)),
     [detailPairs, detailMountCount],
   );
-  const detailMounting = detailMountCount < detailPairs.length;
+  // §3 섹션이 꺼져 있으면 상세 페이지를 아예 렌더하지 않으므로 '마운트 중'이 아니다.
+  //   (detailPairs 는 토글과 무관히 losMap 로 산출 → 섹션 오프 + 3쌍 이상이면 detailMountCount 가
+  //    DETAIL_CHUNK 에 고정돼 detailMounting 이 영구 true 가 되는 잠재 결함을, 토글 조건으로 차단.
+  //    [data-om-mounting] 센티널도 이미 섹션 게이트 안에서만 렌더되므로 보고값과 정합.)
+  const detailMounting = sections.omLosCrossSection && detailMountCount < detailPairs.length;
+
+  // §3 상세 마운트 진행 상태를 부모에 보고 (마운트 시 초기값도 반드시 1회 보고 — 부모의
+  //   previewDetailMounting 초깃값 true 를 정확한 값으로 확정시켜 조기 fullyReady 를 방지).
+  useEffect(() => {
+    onMountingChange?.(detailMounting);
+  }, [detailMounting, onMountingChange]);
 
   // OM 레이더별 조건 텍스트 — 장애물 후방(최근접) 거리만 사용
   const omRadarConditions = useMemo(() => {

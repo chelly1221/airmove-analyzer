@@ -97,6 +97,21 @@ export default function ReportApp() {
   // omData (로컬, 비동기 업데이트 가능)
   const [omData, setOmData] = useState<OMReportData | null>(null);
 
+  // ── 프리뷰 '완전 준비' 게이트용 상태 ──
+  // 프리뷰 창을 revealing 하기 전, 구조적으로 완성될 때까지(§3 상세 페이지 전량 마운트 + 추가
+  // 차단영역 산출 완료) 설정/진행 모달을 유지한다. 종전엔 omReady(커버리지+파노라마)만 되면 모달이
+  // 닫혀, 아직 §3 페이지가 하나씩 튀어나오고 §1/§3/소견 수치가 뒤늦게 채워지는 '미완성 프리뷰'가
+  // 사용자에게 노출됐다. detailMounting 은 ReportPreviewContent 가 콜백으로 보고한다.
+  //   초깃값 true — 프리뷰가 마운트되어 실제 값을 보고하기 전에 fullyReady 가 순간 true 로 튀어
+  //   모달이 조기 종료되는 레이스를 막는다 (프리뷰는 최초 effect 에서 반드시 값을 보고한다).
+  const [previewDetailMounting, setPreviewDetailMounting] = useState(true);
+  const handleMountingChange = useCallback((mounting: boolean) => {
+    setPreviewDetailMounting(mounting);
+  }, []);
+  // 폴백 리빌 — 어떤 준비 신호가 (버그/행잉으로) 끝내 해제되지 않아도 모달이 영구히 걸리지 않도록,
+  // 파노라마 종료(omReady) 후 일정 시간이 지나면 강제로 프리뷰를 노출한다. reload 시 리셋.
+  const [forceReveal, setForceReveal] = useState(false);
+
   // 닫기 확인 모달
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
@@ -276,6 +291,8 @@ export default function ReportApp() {
       setPanoramaLastError(null);
       setError(null);
       setState(null);
+      setPreviewDetailMounting(true); // 새 플로우 — 상세 마운트 미완으로 초기화 (조기 fullyReady 방지)
+      setForceReveal(false);          // 이전 플로우의 폴백 리빌 해제
       setOmData(null); // omData 파생 effect(파노라마) cleanup 이 진행 중 계산도 함께 취소한다
       // 이전 플로우의 모달·분석 파이프라인 완전 차단 — configPayload 를 비워 이전 모달을
       // unmount(→ cancelledRef=true, 이후 각 guard 에서 파이프라인 정지)시키고 Rust 분석도 명시 취소.
@@ -379,78 +396,119 @@ export default function ReportApp() {
     const container = previewRef.current;
     if (!container) return;
 
-    let rafId: number | null = null;
+    // ── 스크롤 버벅임 근본 원인 분리 ──
+    // 종전: scroll 이벤트마다(rAF 스로틀) 전체 [data-page] 를 getBoundingClientRect(O(N) 강제
+    //   리플로우) + setState 4종을 실행 → 페이지가 많으면 매 스크롤 프레임이 메인 스레드를 점유해
+    //   WebView2 리페인트가 끊겼다.
+    // 개선: '레이아웃 측정'(오프셋/토크키/총 페이지수)은 DOM 변화(Mutation)·리사이즈 때만 계산해
+    //   ref 에 캐시하고, '스크롤 핫패스'에서는 container.scrollTop(리플로우 유발 없는 단일 read) +
+    //   캐시된 오프셋 배열 이진탐색으로 활성 페이지만 갱신한다. 값이 실제로 바뀔 때만 setState 해
+    //   사이드바 리렌더도 최소화. (페이지엔 이미 contain:layout paint 격리가 적용됨.)
+    const layout: { offsets: number[]; tocKeys: (string | null)[] } = { offsets: [], tocKeys: [] };
+    let lastActiveIdx = -1;
+    let lastActiveKey: string | null | undefined = undefined;
+    // 재측정 시점의 콘텐츠 총 높이 — 스크롤 중 이 값이 바뀌면(차트/지도 canvas 비동기 리사이즈,
+    //   편집 텍스트 reflow 등 childList 아닌 높이 변화 포함) 캐시 오프셋이 낡았다는 신호. 단일
+    //   정수 read 로 감지해 자가 재측정 → 스크롤 핫패스의 저비용을 유지하면서 stale 오프셋을 치유.
+    let lastScrollHeight = -1;
 
-    const measureNow = () => {
-      rafId = null;
+    // 활성 페이지 갱신 — 스크롤 핫패스. 레이아웃 read 없이 캐시 오프셋만 사용.
+    const updateActive = () => {
+      const offsets = layout.offsets;
+      if (offsets.length === 0) return;
+      // 컨테이너 상단 80px 아래 sentinel 라인 위쪽의 마지막 페이지 = active.
+      const sentinel = container.scrollTop + 80;
+      let lo = 0, hi = offsets.length - 1, active = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (offsets[mid] <= sentinel) { active = mid; lo = mid + 1; }
+        else hi = mid - 1;
+      }
+      if (active !== lastActiveIdx) {
+        lastActiveIdx = active;
+        setOmCurrentPage(active + 1);
+      }
+      const key = layout.tocKeys[active] ?? null;
+      if (key !== lastActiveKey) {
+        lastActiveKey = key;
+        setOmActiveTocKey(key);
+      }
+    };
+
+    // 레이아웃 재측정 — DOM 변화/리사이즈/초기 시에만 (스크롤 경로 밖). 여기서만 O(N)
+    //   getBoundingClientRect 를 수행하되, 오프셋은 현재 스크롤과 무관한 '콘텐츠 절대 오프셋'
+    //   (rect.top − containerTop + scrollTop)으로 저장해 이후 스크롤이 캐시를 무효화하지 않게 한다.
+    const remeasure = () => {
       const pages = Array.from(container.querySelectorAll<HTMLDivElement>("[data-page]"));
-      setOmTotalPages(pages.length);
+      lastScrollHeight = container.scrollHeight;
       if (pages.length === 0) {
+        layout.offsets = []; layout.tocKeys = [];
+        lastActiveIdx = -1; lastActiveKey = undefined;
+        setOmTotalPages(0);
         setOmCurrentPage(1);
         setOmActiveTocKey(null);
+        setOmTocPageMap(new Map());
         return;
       }
-
-      // toc-key → 첫 페이지 인덱스(1-based)
+      const containerTop = container.getBoundingClientRect().top;
+      const scrollTop = container.scrollTop;
+      const offsets: number[] = new Array(pages.length);
+      const tocKeys: (string | null)[] = new Array(pages.length);
       const tocMap = new Map<string, number>();
       for (let i = 0; i < pages.length; i++) {
+        offsets[i] = pages[i].getBoundingClientRect().top - containerTop + scrollTop;
+        // 조상 체인에서 toc-key 탐색 (페이지별 활성 토크키 + 첫 페이지 인덱스 맵)
         let el: HTMLElement | null = pages[i];
+        let key: string | null = null;
         while (el && el !== container) {
           const k = el.dataset.tocKey;
-          if (k && !tocMap.has(k)) {
-            tocMap.set(k, i + 1);
-            break;
-          }
+          if (k) { key = k; if (!tocMap.has(k)) tocMap.set(k, i + 1); break; }
           el = el.parentElement;
         }
+        tocKeys[i] = key;
       }
+      layout.offsets = offsets;
+      layout.tocKeys = tocKeys;
+      setOmTotalPages(pages.length);
       setOmTocPageMap(tocMap);
-
-      // 현재 페이지: 컨테이너 상단으로부터 80px 아래에 sentinel.
-      // sentinel 위쪽에 있는 페이지 중 가장 마지막 = active.
-      const containerRect = container.getBoundingClientRect();
-      const sentinel = containerRect.top + 80;
-      let activeIdx = 0;
-      for (let i = 0; i < pages.length; i++) {
-        const r = pages[i].getBoundingClientRect();
-        if (r.top > sentinel) break;
-        activeIdx = i;
-      }
-      setOmCurrentPage(activeIdx + 1);
-
-      // 활성 페이지의 toc-key 조상
-      let el: HTMLElement | null = pages[activeIdx];
-      let foundKey: string | null = null;
-      while (el && el !== container) {
-        const k = el.dataset.tocKey;
-        if (k) { foundKey = k; break; }
-        el = el.parentElement;
-      }
-      setOmActiveTocKey(foundKey);
+      // 재측정 직후(스크롤 없이 콘텐츠만 변한 경우) 활성 페이지 즉시 반영
+      lastActiveIdx = -1; lastActiveKey = undefined;
+      updateActive();
     };
 
-    const schedule = () => {
-      if (rafId !== null) return;
-      rafId = requestAnimationFrame(measureNow);
+    // 스크롤: rAF 스로틀 — 캐시 오프셋 기반 활성 페이지만 갱신. 콘텐츠 총 높이가 바뀐 경우에만
+    //   (드물게) O(N) 재측정, 그 외에는 scrollTop 단일 read + 이진탐색으로 레이아웃 read 0.
+    let scrollRaf: number | null = null;
+    const onScroll = () => {
+      if (scrollRaf !== null) return;
+      scrollRaf = requestAnimationFrame(() => {
+        scrollRaf = null;
+        if (container.scrollHeight !== lastScrollHeight) remeasure();
+        else updateActive();
+      });
     };
 
-    // 창 가장자리 리사이즈 전용 경로 — 컨테이너(flex-1)는 창 폭과 함께 매 프레임
-    // 크기가 바뀌어 ResizeObserver 가 드래그 내내 발화한다. 그러나 페이지는 210mm
-    // 고정폭이라 리사이즈로 페이지수/TOC/현재페이지 값은 변하지 않으므로 드래그 중
-    // 재측정은 무의미한데, measureNow(전체 [data-page] 동기 getBoundingClientRect +
-    // setState)가 매 프레임 메인 스레드를 점유해 WebView2 리페인트가 끊긴다.
-    // → 드래그가 멎은 뒤 1회만 측정하도록 디바운스해 측정 경로를 리사이즈 프레임에서 분리.
+    // DOM 변화: rAF 스로틀 재측정 (점진 마운트 중 다발 Mutation 를 1프레임 1회로 합침)
+    let measureRaf: number | null = null;
+    const scheduleRemeasure = () => {
+      if (measureRaf !== null) return;
+      measureRaf = requestAnimationFrame(() => { measureRaf = null; remeasure(); });
+    };
+
+    // 창 가장자리 리사이즈 — 컨테이너(flex-1)는 창 폭과 함께 매 프레임 크기가 바뀌지만 페이지는
+    //   210mm 고정폭이라 페이지수/TOC 는 불변. 드래그가 멎은 뒤 1회만 재측정(오프셋은 컨테이너
+    //   상단 기준이라 세로 배치 변화 시 갱신 필요)해 리사이즈 프레임에서 측정 경로를 분리.
     let resizeSettle: ReturnType<typeof setTimeout> | null = null;
     const scheduleResize = () => {
       if (resizeSettle !== null) clearTimeout(resizeSettle);
-      resizeSettle = setTimeout(schedule, 150);
+      resizeSettle = setTimeout(scheduleRemeasure, 150);
     };
 
     // 초기 측정 (DOM 안정화 시간 약간 확보)
-    const initialTimer = setTimeout(measureNow, 50);
+    const initialTimer = setTimeout(remeasure, 50);
 
-    container.addEventListener("scroll", schedule, { passive: true });
-    const mo = new MutationObserver(schedule);
+    container.addEventListener("scroll", onScroll, { passive: true });
+    const mo = new MutationObserver(scheduleRemeasure);
     mo.observe(container, { childList: true, subtree: true });
     const ro = new ResizeObserver(scheduleResize);
     ro.observe(container);
@@ -458,8 +516,9 @@ export default function ReportApp() {
     return () => {
       clearTimeout(initialTimer);
       if (resizeSettle !== null) clearTimeout(resizeSettle);
-      if (rafId !== null) cancelAnimationFrame(rafId);
-      container.removeEventListener("scroll", schedule);
+      if (scrollRaf !== null) cancelAnimationFrame(scrollRaf);
+      if (measureRaf !== null) cancelAnimationFrame(measureRaf);
+      container.removeEventListener("scroll", onScroll);
       mo.disconnect();
       ro.disconnect();
     };
@@ -968,8 +1027,36 @@ export default function ReportApp() {
     })();
   }, [omData]);
 
+  // ── 프리뷰 '완전 준비' 판정 ──
+  // omReady(커버리지+파노라마 종료)에 더해, §3 상세 페이지 전량 마운트(!previewDetailMounting)와
+  // 추가 차단영역 산출 완료(!addedBlockageComputing)까지 갖춰져야 진짜 완성. 이 시점에만 모달을 닫아
+  // 프리뷰를 노출하면, 사용자는 '페이지가 튀어나오고 수치가 뒤늦게 채워지는' 과도기를 보지 않는다.
+  //   forceReveal(폴백 타이머)로 신호가 끝내 안 풀려도 결국 노출되게 한다.
+  const structurallyReady = omReady && !previewDetailMounting && !addedBlockageComputing;
+  const fullyReady = activeTemplate !== "obstacle_monthly" || structurallyReady || forceReveal;
+  // finalizing — 파노라마는 끝났으나 아직 렌더/산출 중(모달의 마지막 '보고서 렌더링' 스테이지 표시용)
+  const finalizing = activeTemplate === "obstacle_monthly" && omReady && !fullyReady;
+  const finalizeDetail = addedBlockageComputing
+    ? "추가 차단영역 지표 산출 중..."
+    : previewDetailMounting
+      ? "장애물별 상세 페이지 배치 중..."
+      : "마무리 중...";
+
+  // 폴백 리빌 타이머 — omReady(파노라마 종료) 후 상세 마운트/추가차단 산출은 결정적으로 끝나지만,
+  // 만일의 행잉에 대비해 최대 대기 상한을 둔다(모달 영구 정지 방지). fullyReady 달성 시/omReady 해제
+  // (reload)·언마운트 시 타이머 해제. 이미 fullyReady 면 타이머 불필요.
+  useEffect(() => {
+    if (activeTemplate !== "obstacle_monthly") return;
+    if (!omReady || structurallyReady || forceReveal) return;
+    const t = setTimeout(() => {
+      console.warn("[OM] 완전 준비 대기 상한(120초) 도달 — 프리뷰 강제 노출");
+      setForceReveal(true);
+    }, 120_000);
+    return () => clearTimeout(t);
+  }, [activeTemplate, omReady, structurallyReady, forceReveal]);
+
   // ── 통합 OM 모달 (전체 prep 라이프사이클을 가로지름) ──
-  // configPayload 가 obstacle_monthly 인 동안 항상 마운트되며, 모달이 omReady 시점에
+  // configPayload 가 obstacle_monthly 인 동안 항상 마운트되며, 모달이 fullyReady 시점에
   // onComplete 콜백으로 configPayload 를 비워야 unmount 된다.
   const omFlowActive = configPayload?.template === "obstacle_monthly";
   const omModal = omFlowActive && configPayload ? (
@@ -987,7 +1074,9 @@ export default function ReportApp() {
       panoramaProgress={panoramaProgress}
       panoramaElapsedMs={panoramaElapsedMs}
       panoramaLastError={panoramaLastError}
-      omReady={omReady}
+      omReady={fullyReady}
+      finalizing={finalizing}
+      finalizeDetail={finalizeDetail}
       onComplete={() => setConfigPayload(null)}
     />
   ) : null;
@@ -1101,6 +1190,7 @@ export default function ReportApp() {
         onOmDataChange={(updater) => setOmData((prev) => prev ? updater(prev) : prev)}
         previewRef={previewRef}
         omComputing={addedBlockageComputing}
+        onMountingChange={handleMountingChange}
       />
     </div>
   ) : null;
