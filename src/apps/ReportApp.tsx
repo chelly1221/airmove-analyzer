@@ -108,6 +108,12 @@ export default function ReportApp() {
   const handleMountingChange = useCallback((mounting: boolean) => {
     setPreviewDetailMounting(mounting);
   }, []);
+  // 프리뷰 §3·§4 도면 타일 로딩 게이트 — 구조(상세 마운트+추가차단 산출)가 완성된 뒤에도 CARTO
+  //   타일이 백그라운드 자가치유(composeTiles 재시도)로 채워지는 중이면 모달을 유지한다. 종전엔 이
+  //   신호가 없어, 구조만 갖춰지면 모달이 닫히고 §4 소실상세 도면이 '일부만 로딩된(회색 조각)' 채
+  //   노출됐다. 초깃값 true — 도면 canvas 가 complete 를 보고하기 전 조기 fullyReady 를 막는다.
+  //   구조 준비(structureReady) 이후 아래 폴링 게이트가 data-map-complete 를 관측해 내린다. reload 시 리셋.
+  const [previewMapsLoading, setPreviewMapsLoading] = useState(true);
   // 폴백 리빌 — 어떤 준비 신호가 (버그/행잉으로) 끝내 해제되지 않아도 모달이 영구히 걸리지 않도록,
   // 파노라마 종료(omReady) 후 일정 시간이 지나면 강제로 프리뷰를 노출한다. reload 시 리셋.
   const [forceReveal, setForceReveal] = useState(false);
@@ -292,6 +298,7 @@ export default function ReportApp() {
       setError(null);
       setState(null);
       setPreviewDetailMounting(true); // 새 플로우 — 상세 마운트 미완으로 초기화 (조기 fullyReady 방지)
+      setPreviewMapsLoading(true);    // 새 플로우 — 도면 타일 미로딩으로 초기화 (조기 fullyReady 방지)
       setForceReveal(false);          // 이전 플로우의 폴백 리빌 해제
       setOmData(null); // omData 파생 effect(파노라마) cleanup 이 진행 중 계산도 함께 취소한다
       // 이전 플로우의 모달·분석 파이프라인 완전 차단 — configPayload 를 비워 이전 모달을
@@ -1032,19 +1039,53 @@ export default function ReportApp() {
   // 추가 차단영역 산출 완료(!addedBlockageComputing)까지 갖춰져야 진짜 완성. 이 시점에만 모달을 닫아
   // 프리뷰를 노출하면, 사용자는 '페이지가 튀어나오고 수치가 뒤늦게 채워지는' 과도기를 보지 않는다.
   //   forceReveal(폴백 타이머)로 신호가 끝내 안 풀려도 결국 노출되게 한다.
-  const structurallyReady = omReady && !previewDetailMounting && !addedBlockageComputing;
+  // 구조 준비 — §3 상세 페이지 전량 마운트 + 추가 차단영역 산출 완료. 이 시점에 전 도면 canvas 가
+  //   DOM 에 존재하므로 비로소 지도 타일 로딩(previewMapsLoading)을 관측할 수 있다(아래 폴링 게이트).
+  const structureReady = omReady && !previewDetailMounting && !addedBlockageComputing;
+  // 완전 준비 — 구조에 더해 §3·§4 도면 타일까지 자가치유 확정(complete)돼야 진짜 완성. '일부만
+  //   로딩된(회색 조각) 지도'가 노출되는 것을 막는다(PDF 게이트 useReportExport 의 healWindow 와 동형).
+  const structurallyReady = structureReady && !previewMapsLoading;
   const fullyReady = activeTemplate !== "obstacle_monthly" || structurallyReady || forceReveal;
-  // finalizing — 파노라마는 끝났으나 아직 렌더/산출 중(모달의 마지막 '보고서 렌더링' 스테이지 표시용)
+  // finalizing — 파노라마는 끝났으나 아직 렌더/산출/타일로딩 중(모달의 마지막 '보고서 렌더링' 스테이지 표시용)
   const finalizing = activeTemplate === "obstacle_monthly" && omReady && !fullyReady;
   const finalizeDetail = addedBlockageComputing
     ? "추가 차단영역 지표 산출 중..."
     : previewDetailMounting
       ? "장애물별 상세 페이지 배치 중..."
-      : "마무리 중...";
+      : previewMapsLoading
+        ? "지도 타일 로딩 중..."
+        : "마무리 중...";
 
-  // 폴백 리빌 타이머 — omReady(파노라마 종료) 후 상세 마운트/추가차단 산출은 결정적으로 끝나지만,
-  // 만일의 행잉에 대비해 최대 대기 상한을 둔다(모달 영구 정지 방지). fullyReady 달성 시/omReady 해제
-  // (reload)·언마운트 시 타이머 해제. 이미 fullyReady 면 타이머 불필요.
+  // ── 프리뷰 도면 타일 로딩 게이트 ──
+  // structureReady 가 되면 §3·§4 도면 canvas 가 모두 DOM 에 존재한다. 이때부터 각 도면의 CARTO 타일
+  // 자가치유 확정(data-map-complete="true")까지 폴링해 previewMapsLoading 을 내린다. composeTiles 는
+  // 미수신 타일을 백그라운드 재시도(RETRY_MAX 회)로 채운 뒤, 오프라인/심각 혼잡이면 잔여 구멍을 사선
+  // 해치로 마감한 뒤 complete 로 확정하므로(무한대기 없음), 이 게이트는 최악에도 재시도 스케줄(≈13초)
+  // 안에 해제된다(+아래 120초 forceReveal 백스톱). 구조 준비 전에는 canvas 가 아직 다 마운트되지 않아
+  // 폴링을 시작하지 않는다(일부 canvas 만 존재하는 순간의 조기 통과 방지). 도면 섹션이 전부 off 면
+  // canvas 0개 → 공허참으로 즉시 통과. 이 게이트는 composeTiles/타일풀/RETRY_MAX 를 건드리지 않고
+  // data-map-complete 만 관측한다(healgate 불변식 준수).
+  useEffect(() => {
+    if (activeTemplate !== "obstacle_monthly") { setPreviewMapsLoading(false); return; }
+    if (!structureReady) { setPreviewMapsLoading(true); return; }
+    const container = previewRef.current;
+    const allMapsComplete = () => {
+      if (!container) return false;
+      const canvases = container.querySelectorAll<HTMLCanvasElement>("canvas[data-map-canvas]");
+      for (const c of canvases) if (c.getAttribute("data-map-complete") !== "true") return false;
+      return true;
+    };
+    if (allMapsComplete()) { setPreviewMapsLoading(false); return; }
+    const id = setInterval(() => {
+      if (allMapsComplete()) { setPreviewMapsLoading(false); clearInterval(id); }
+    }, 200);
+    return () => clearInterval(id);
+  }, [activeTemplate, structureReady]);
+
+  // 폴백 리빌 타이머 — omReady(파노라마 종료) 후 상세 마운트/추가차단 산출/도면 타일 로딩은 결정적으로
+  // 끝나지만, 만일의 행잉(타일 서버 무응답 등)에 대비해 최대 대기 상한을 둔다(모달 영구 정지 방지).
+  // structurallyReady 는 이제 지도 타일 완료(!previewMapsLoading)까지 포함하므로, 타일 로딩 중에도
+  // 타이머가 유지된다. fullyReady 달성 시/omReady 해제(reload)·언마운트 시 타이머 해제. 이미 fullyReady 면 불필요.
   useEffect(() => {
     if (activeTemplate !== "obstacle_monthly") return;
     if (!omReady || structurallyReady || forceReveal) return;

@@ -125,6 +125,14 @@ async function exportViaNative(
       max-height: none !important;
       overflow: visible !important;
       flex: none !important;
+      /* 조상 체인의 테두리/여백 제거 — 인쇄 흐름 시작점을 시트 좌상단(0,0)에 정확히 맞춘다.
+         남겨두면(예: 미리보기 콘텐츠 영역의 border-t 1px) 그 오프셋만큼 흐름이 아래로 밀려,
+         고정 높이(297mm) '첫 페이지'의 하단이 다음 시트로 스필한다(유령 반쪽 시트 → 표지만
+         2장으로 나뉘고 §1 이 뒤로 밀림). 이후 [data-page] 는 break-after:page 로 매번 시트
+         상단에서 새로 시작하므로 영향이 없다 — 그래서 '첫장만' 밀리는 증상이 된다. */
+      border: 0 !important;
+      padding: 0 !important;
+      margin: 0 !important;
     }
     #__print-wrapper__ {
       background: white;
