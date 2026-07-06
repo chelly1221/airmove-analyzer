@@ -1059,6 +1059,18 @@ pub fn parse_ass_file(
         Vec::new()
     };
 
+    // I140 TOD 타임존 자동판별 (레이더 기종별 UTC/KST 인코딩 차이 흡수).
+    // KST 인코딩 파일은 여기서 산출한 shift 로 파싱 시 UTC 로 정규화 → NEC↔TOD 교차검증·
+    // timestamp·day_offset·통합·월필터가 전부 UTC 로 공통 동작한다.
+    let tod_utc_shift = detect_tod_utc_shift(&data, &valid_dates);
+    if tod_utc_shift != 0.0 {
+        info!(
+            "TOD 타임존 보정 적용: {} → I140 TOD 를 {:+.0}h 시프트하여 UTC 정규화 (로컬시각 인코딩 감지)",
+            filename,
+            tod_utc_shift / 3600.0
+        );
+    }
+
     // Extract base date + start TOD from filename
     let (base_date_secs, start_tod) = extract_base_date_and_start_tod(&filename);
 
@@ -1163,7 +1175,7 @@ pub fn parse_ass_file(
 
                 while rec_offset < block_data.len() {
                     match parse_cat048_record(block_data, rec_offset) {
-                        Ok((record, next_offset, was_truncated)) => {
+                        Ok((mut record, next_offset, was_truncated)) => {
                             total_records += 1;
                             assembler.stats.total_asterix_records += 1;
                             if after_recovery {
@@ -1176,6 +1188,14 @@ pub fn parse_ass_file(
                                 truncated_records += 1;
                                 rec_offset = next_offset;
                                 continue;
+                            }
+
+                            // TOD → UTC 정규화 (KST 인코딩 레이더 흡수). 이후 교차검증·
+                            // timestamp·day_offset 이 모두 UTC 기준으로 동작한다.
+                            if tod_utc_shift != 0.0 {
+                                if let Some(t) = record.time_of_day {
+                                    record.time_of_day = Some(normalize_tod(t, tod_utc_shift));
+                                }
                             }
 
                             if record.mode3a_garbled {
@@ -1530,6 +1550,73 @@ fn compute_day_offset(
             }
         }
     }
+}
+
+/// I048/140 Time-of-Day 를 UTC 로 정규화.
+/// `shift_secs` 만큼 더한 뒤 하루(86400s)로 wrap. shift=0 이면 이미 UTC 이므로 무변화.
+fn normalize_tod(tod: f64, shift_secs: f64) -> f64 {
+    (tod + shift_secs).rem_euclid(86400.0)
+}
+
+/// I048/140 TOD 타임존을 파일 단위로 자동 판별한다.
+///
+/// **배경**: NEC 레이더 기종별로 I140 TOD 인코딩 타임존이 다르다.
+/// - 김포#1(SIC1): TOD = UTC (파일 전반이 UTC 자정 기준)
+/// - 김포#2(SIC7): TOD = KST(로컬 벽시계) — UTC 보다 +9h 앞섬
+///
+/// KST 로 인코딩된 파일을 그대로 두면 NEC↔TOD 교차검증(NEC KST→UTC 기대값 대비)이
+/// 매 레코드 ~9h 불일치로 전건 폐기 → 해당 레이더 항적이 통째로 사라진다.
+///
+/// **판별**: NEC 프레임(KST 벽시계) 뒤에 오는 CAT048 첫 레코드의 TOD 를 여러 표본에서 읽어
+/// `TOD − expected_utc`(expected_utc = NEC KST − 9h) 의 중앙값을 시(hour) 단위로 반올림한다.
+/// - 중앙값 ≈ 0 → 이미 UTC → shift 0
+/// - 중앙값 ≈ +9h → KST → shift −9h (TOD 에서 9h 빼 UTC 로)
+///
+/// 반환값 = TOD 에 더해 UTC 로 만드는 보정초. NEC 프레임/표본이 부족하면 0(무보정, 기존 동작).
+fn detect_tod_utc_shift(data: &[u8], valid_dates: &[(i64, u8, u8)]) -> f64 {
+    if valid_dates.is_empty() {
+        return 0.0;
+    }
+    // 파일 앞부분만 스캔 — NEC 프레임은 촘촘하므로 소량으로 충분
+    let scan_len = data.len().min(4_000_000);
+    let mut offsets: Vec<f64> = Vec::new();
+    let mut i = 0usize;
+    while i + 8 < scan_len && offsets.len() < 200 {
+        if is_nec_frame(data, i, valid_dates) {
+            let nec_h = data[i + 2] as i32;
+            let nec_m = data[i + 3] as i32;
+            // NEC 5바이트 프레임 뒤가 CAT048 블록이면 첫 레코드 TOD 표본 추출
+            let bpos = i + 5;
+            if bpos + 3 <= data.len() && data[bpos] == CAT048 {
+                let blen = ((data[bpos + 1] as usize) << 8) | (data[bpos + 2] as usize);
+                if blen >= 3 && bpos + blen <= data.len() {
+                    let block = &data[bpos..bpos + blen];
+                    if let Ok((rec, _, false)) = parse_cat048_record(block, 3) {
+                        if let Some(tod) = rec.time_of_day {
+                            let expected = (((nec_h - 9 + 24) % 24) * 3600 + nec_m * 60) as f64;
+                            // 순환 차이를 [-43200, 43200) 로 매핑
+                            let mut d = (tod - expected).rem_euclid(86400.0);
+                            if d > 43200.0 {
+                                d -= 86400.0;
+                            }
+                            offsets.push(d);
+                        }
+                    }
+                }
+            }
+            i += 5;
+            continue;
+        }
+        i += 1;
+    }
+    // 표본이 충분해야 신뢰 (소수 오염 레코드에 흔들리지 않도록 중앙값 사용)
+    if offsets.len() < 8 {
+        return 0.0;
+    }
+    offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = offsets[offsets.len() / 2];
+    // 시 단위 반올림 → UTC 로 만드는 보정 = -round(median/3600)*3600
+    -(median / 3600.0).round() * 3600.0
 }
 
 /// 파일명에서 날짜 추출 (YYYY-MM-DD 형식 반환). 편각 조회용.
