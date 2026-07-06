@@ -24,7 +24,10 @@ import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
 import OMEditable from "./OMEditable";
 
 const CHART_W = 720;
-const CHART_H = 240;
+// 표시 높이 = 콘텐츠폭(182mm) × CHART_H/CHART_W. 240 → 200 으로 낮춰 §3 상세(도면+요약표+
+//   LoS 단면도+본 차트)가 A4 한 페이지(297mm) 안에 수납되게 한다 — 과거 240 에선 본 차트 하단
+//   범례 행이 ~1cm 넘쳐 다음 시트로 스필(유령 반쪽 페이지 → 이후 섹션 밀림). 표시 높이 61mm→51mm.
+const CHART_H = 200;
 const MARGIN = { top: 16, right: 16, bottom: 34, left: 50 };
 const INNER_W = CHART_W - MARGIN.left - MARGIN.right;
 const INNER_H = CHART_H - MARGIN.top - MARGIN.bottom;

@@ -50,6 +50,11 @@ async function exportViaNative(
     return { success: false, error: "보고서 페이지가 없습니다" };
   }
 
+  // 문서 최종 페이지 마킹 — 인쇄 CSS 의 [data-last-page] 규칙(맨 뒤 빈 시트 방지)이 섹션별
+  //   마지막이 아니라 '진짜' 마지막 페이지에만 적용되도록. restoreDOM 에서 해제.
+  const lastPage = pages[pages.length - 1];
+  lastPage.setAttribute("data-last-page", "true");
+
   // 인쇄 임계구간 진입 — 재페이지네이션 동결(AutoPaginate §4·§5). 이 지점 이후 블록 remount 로
   //   지도 canvas 가 리셋돼 아래 1회 canvas 스냅샷(data-map-canvas)과 어긋나는 것을 차단한다.
   //   restoreDOM 에서 해제 — finally·beforeunload 양쪽에서 호출되어 정상/비정상 종료 모두 복원
@@ -143,12 +148,24 @@ async function exportViaNative(
       page-break-after: always;
       break-after: page;
       width: 210mm !important;
-      min-height: 297mm !important;
+      /* 고정 높이(min-height 아님) — 한 [data-page] 는 반드시 정확히 1 인쇄 시트. 콘텐츠가 297mm 를
+         넘으면 overflow:hidden 로 페이지 내부에서 클립하고 다음 시트로 조각(fragment)/스필하지 않는다.
+         min-height 는 박스를 콘텐츠만큼 키워 한 페이지가 2 시트에 걸쳐 인쇄되게 했고(유령 반쪽 시트),
+         그 여파로 다음 섹션이 시트 중간에서 시작해 콘텐츠가 인쇄영역 밖으로 밀리는 연쇄(§3 이후 잘림)를
+         일으켰다. 페이지별 콘텐츠는 §3 상세 차트 높이 축소로 297mm 안에 수납되므로 클립은 안전망. */
+      height: 297mm !important;
+      min-height: 0 !important;
+      max-height: 297mm !important;
       margin: 0 !important;
       box-shadow: none !important;
       overflow: hidden !important;
     }
-    #__print-wrapper__ [data-page]:last-child {
+    /* 문서의 '진짜' 마지막 페이지에만 강제 개행 해제(맨 뒤 빈 시트 방지). :last-child 는 각 섹션
+       래퍼(div[data-toc-key])의 마지막 페이지마다 매칭돼, 그 페이지가 오버플로우면 강제 개행이
+       사라지며 다음 섹션이 시트 중간에서 시작했다. 내보내기 직전 JS 로 마지막 [data-page] 에만
+       부여하는 data-last-page 로 한정한다(fix #1 로 페이지=시트가 보장되면 무해하지만, 규칙 자체를
+       구조 의존이 아니라 의미(문서 최종 페이지)로 못박아 회귀에 견고하게 한다). */
+    #__print-wrapper__ [data-page][data-last-page] {
       page-break-after: auto;
       break-after: auto;
     }
@@ -224,6 +241,7 @@ async function exportViaNative(
   const restoreDOM = () => {
     styleEl.remove();
     container.id = prevContainerId;
+    lastPage.removeAttribute("data-last-page");
     hiddenContainerChildren.forEach((el) => el.style.removeProperty("display"));
     hiddenBodyChildren.forEach((el) => el.style.removeProperty("display"));
     hiddenAncestorSiblings.forEach((el) => el.style.removeProperty("display"));

@@ -722,7 +722,8 @@ export function LosCrossSection({
   const idSuffix = `${los.id}-${building.id}`.replace(/[^A-Za-z0-9_-]/g, "_");
 
   return (
-    <div className="mb-3">
+    /* mb-2 (구 mb-3) — §3 상세 4블록을 A4 한 페이지에 수납하기 위한 여백 정리(하단 AzElev 차트 범례 스필 방지) */
+    <div className="mb-2">
       {/* 제목 */}
       <div className="mb-1 flex items-center gap-2">
         {buildingGroup && (
