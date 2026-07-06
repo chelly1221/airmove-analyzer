@@ -160,8 +160,8 @@ export function fitProjection(pts: [number, number][], w = BACK_W, h = BACK_H): 
 // 도면이 인쇄된다. 행잉 네트워크에서 큐 대기가 예산을 소모하면 잔여 시간만 로드에 사용하고,
 // 큐에서 예산이 소진된 타일은 Image 생성 없이 즉시 포기한다.
 // 예산 소진으로 미수신된 타일은 '구멍(회색 조각)' 상태로 확정하지 않고 백그라운드 재시도
-// (최대 RETRY_MAX 회)로 자가치유한다 — 동시 마운트 혼잡에서 뒤쪽 큐 타일이 대량 유실돼
-// 일부만 로딩된 지도가 PDF 에 인쇄되던 문제 방지. 진행 상태는 data-map-complete 로 노출.
+// (진행이 있는 한 재시도, 최대 MAX_ROUNDS 회)로 자가치유한다 — 동시 마운트 혼잡에서 뒤쪽 큐
+// 타일이 대량 유실돼 일부만 로딩된 지도가 PDF 에 인쇄되던 문제 방지. 진행 상태는 data-map-complete 로 노출.
 const TILE_POOL = 24;
 let tileActive = 0;
 const tileQueue: (() => void)[] = [];
@@ -187,23 +187,32 @@ function releaseTileSlot() {
 
 /** 첫 패스 타일 예산(ms) — 큐 대기 포함. 첫 합성이 ≤3초에 끝나 data-map-ready 게이트를 연다. */
 const TILE_BUDGET_FIRST_MS = 3000;
-// 아래 세 상수는 첫 패스 이후 백그라운드 재시도(자가치유) 스케줄을 정의한다. useReportExport 의
+// 아래 상수들은 첫 패스 이후 백그라운드 재시도(자가치유) 스케줄을 정의한다. useReportExport 의
 // 자가치유 대기 창(healWindow)이 이 값들에서 유도되므로 export 한다 — 과거 하드코딩 8초 대기가
-// 재시도 스케줄(RETRY_MAX×(RETRY_DELAY_MS+TILE_BUDGET_RETRY_MS)≈9.6초)보다 짧아 round-2 완료
-// 직전 잘려 §4 도면이 일부만 인쇄되던 버그를 방지한다(상수 변경 시 대기 창 자동 정합).
+// 재시도 스케줄보다 짧아 완료 직전 잘려 §4 도면이 일부만 인쇄되던 버그를 방지한다(상수 변경 시
+// 대기 창 자동 정합).
 /** 재시도 패스 타일 예산(ms) — ready 게이트 무관 백그라운드 자가치유라 여유 있게. */
 export const TILE_BUDGET_RETRY_MS = 4000;
-/** 미수신 타일 재시도 상한 — 첫 패스 이후 최대 2회. */
-export const RETRY_MAX = 2;
 /** 재시도 지연(ms) — 동시 마운트 도면들의 첫 패스 혼잡이 풀에서 빠지길 기다렸다 재요청. */
 export const RETRY_DELAY_MS = 800;
+// 재시도 종료 조건 — '진행 기반 적응형'. 종전 고정 상한(RETRY_MAX=2)은 다건물 보고서에서 (레이더×건물)
+// §3 도면이 수십 개 동시 마운트돼 공유 풀(TILE_POOL=24)이 심하게 혼잡하면, 아직 타일이 큐에서 빠지는
+// 중인데도 2라운드만에 잘려 '일부만 로딩된(사선 해치) 지도'를 complete 로 확정했다. → 라운드가 신규
+// 타일을 1개라도 얻는 한(혼잡 해소 진행 중) 계속 재시도하고, 연속 무진행(오프라인/행잉) 시에만 조기
+// 종료한다. 동시성(TILE_POOL)은 그대로라 OOM 위험 불변 — 늘어나는 건 순차 라운드 수뿐.
+/** 총 재시도 라운드 하드 상한(round 0=첫 패스 포함). 진행이 이어져도 이 라운드에서 확정 —
+ *  대기 창(healWindow)·프리뷰 리빌이 무한 확장되지 않게 한다. healWindow 가 이 값에서 유도된다. */
+export const MAX_ROUNDS = 6;
+/** 연속 무진행(신규 타일 0개) 라운드 상한(round 0부터 집계). 오프라인/행잉이면 이 횟수만에 확정 —
+ *  종전 RETRY_MAX=2 의 오프라인 종료 지연(round0 + 2회 ≈ 12.6초)과 동일. 무의미한 재시도 방지. */
+export const NO_PROGRESS_MAX = 3;
 
 /** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 합성(첫 패스 + 자가치유 재합성)마다
  *  onDone(online, complete) 호출: 베이스 전체를 다시 그렸으므로 호출측은 매번 오버레이를 다시 그린다.
  *    online   = 성공 타일 존재 (false 면 폴백 격자 상태)
  *    complete = 합성 확정 — 전 타일 수신 또는 재시도 소진(추가 자가치유 없음)
  *  첫 패스는 타일당 3초(큐 대기 포함) 예산으로 ≤3초 내 종료해 PDF 게이트(data-map-ready)를 열고,
- *  미수신 타일은 백그라운드 재시도(최대 RETRY_MAX 회)로 채운 뒤 재합성 — '일부만 로딩된 지도'가
+ *  미수신 타일은 백그라운드 재시도(진행 기반 적응형, 최대 MAX_ROUNDS 회)로 채운 뒤 재합성 — '일부만 로딩된 지도'가
  *  화면·PDF 에 확정되는 것을 방지 (PDF 게이트는 data-map-complete 로 자가치유 완료를 잠시 대기).
  *  w/h 는 fitProjection 과 동일한 백킹 크기 (기본 §3 규격).
  *  반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청·재시도 타이머 중단 + 고아 Image
@@ -218,6 +227,9 @@ export function composeTiles(
 ): () => void {
   let cancelled = false;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  // 연속 무진행(신규 타일 0개) 라운드 누적 — 반드시 클로저 스코프(라운드 간 유지). runRound 내부에
+  //   두면 매 라운드 리셋돼 무진행 조기 종료가 발동하지 않고 항상 MAX_ROUNDS 까지 돈다.
+  let noProgressStreak = 0;
   const imgs: HTMLImageElement[] = [];
   const { z, originX, originY } = proj;
   const n = Math.pow(2, z);
@@ -302,13 +314,18 @@ export function composeTiles(
         if (r) { loaded.push(r); gained++; }
         else missing.push(pending[i]);
       });
-      const settled = missing.length === 0 || round >= RETRY_MAX;
+      // 무진행(신규 0) 라운드 누적 — 진행이 있으면 리셋. 재시도는 줄어드는 missing 만 재요청하므로
+      //   진행은 단조(streak 진동 없음). 혼잡 해소가 진행되는 한(gained>0) 계속 돌고, 오프라인/행잉이면
+      //   곧 NO_PROGRESS_MAX 도달로 조기 확정, 진행이 이어져도 MAX_ROUNDS 하드 상한에서 확정.
+      noProgressStreak = gained > 0 ? 0 : noProgressStreak + 1;
+      const settled =
+        missing.length === 0 || noProgressStreak >= NO_PROGRESS_MAX || round >= MAX_ROUNDS;
       // 첫 패스는 항상 합성(폴백 포함). 재시도 라운드는 신규 타일 수신 시, 또는 확정 시(complete
       // 전환을 onDone 으로 알리기 위해) 재합성. 오프라인 경고는 첫 패스에서만 1회.
       if (round === 0 || gained > 0 || settled) drawAll(settled, round === 0);
       if (settled) {
         if (missing.length > 0)
-          console.warn(`[OM 지도] 타일 ${missing.length}/${targets.length}개 미수신 상태로 확정 — 재시도 소진 (${warnLabel})`);
+          console.warn(`[OM 지도] 타일 ${missing.length}/${targets.length}개 미수신 상태로 확정 — 재시도 종료 (${warnLabel})`);
         return;
       }
       console.warn(`[OM 지도] 타일 ${missing.length}/${targets.length}개 미수신 — ${round + 1}차 재시도 예약 (${warnLabel})`);

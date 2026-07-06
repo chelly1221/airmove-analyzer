@@ -1059,12 +1059,12 @@ export default function ReportApp() {
   // ── 프리뷰 도면 타일 로딩 게이트 ──
   // structureReady 가 되면 §3·§4 도면 canvas 가 모두 DOM 에 존재한다. 이때부터 각 도면의 CARTO 타일
   // 자가치유 확정(data-map-complete="true")까지 폴링해 previewMapsLoading 을 내린다. composeTiles 는
-  // 미수신 타일을 백그라운드 재시도(RETRY_MAX 회)로 채운 뒤, 오프라인/심각 혼잡이면 잔여 구멍을 사선
-  // 해치로 마감한 뒤 complete 로 확정하므로(무한대기 없음), 이 게이트는 최악에도 재시도 스케줄(≈13초)
-  // 안에 해제된다(+아래 120초 forceReveal 백스톱). 구조 준비 전에는 canvas 가 아직 다 마운트되지 않아
-  // 폴링을 시작하지 않는다(일부 canvas 만 존재하는 순간의 조기 통과 방지). 도면 섹션이 전부 off 면
-  // canvas 0개 → 공허참으로 즉시 통과. 이 게이트는 composeTiles/타일풀/RETRY_MAX 를 건드리지 않고
-  // data-map-complete 만 관측한다(healgate 불변식 준수).
+  // 미수신 타일을 백그라운드 재시도(진행 기반 적응형, 최대 MAX_ROUNDS 회)로 채운 뒤, 오프라인/심각
+  // 혼잡이면 잔여 구멍을 사선 해치로 마감한 뒤 complete 로 확정하므로(무한대기 없음), 이 게이트는
+  // 최악에도 재시도 스케줄(≈30초) 안에 해제된다(+아래 120초 forceReveal 백스톱). 구조 준비 전에는
+  // canvas 가 아직 다 마운트되지 않아 폴링을 시작하지 않는다(일부 canvas 만 존재하는 순간의 조기 통과
+  // 방지). 도면 섹션이 전부 off 면 canvas 0개 → 공허참으로 즉시 통과. 이 게이트는 composeTiles/타일풀/
+  // 재시도 상한을 건드리지 않고 data-map-complete 만 관측한다(healgate 불변식 준수).
   useEffect(() => {
     if (activeTemplate !== "obstacle_monthly") { setPreviewMapsLoading(false); return; }
     if (!structureReady) { setPreviewMapsLoading(true); return; }
