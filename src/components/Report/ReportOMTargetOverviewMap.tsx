@@ -17,7 +17,7 @@
  *      2장(~8.6MB) 추가는 허용.
  *  - PDF 안전: 단일 <canvas> + data-map-canvas/ready/complete 게이트. data-map-ready 는 base 첫 onDone
  *      시점에 열려 토지이용 로드가 내보내기 게이트(4초 예산)를 지연시키지 않는다. data-map-complete 는
- *      base 자가치유 확정 **및** 토지이용 로드 확정(전 타일 처리/4초 데드라인/스킵) 양쪽이 끝나야 true — 의미 확장.
+ *      base 자가치유 확정 **및** 토지이용 로드 확정(전 타일 처리 또는 재시도 패스 소진/스킵) 양쪽이 끝나야 true — 의미 확장.
  *  - 표↔지도 대조: 각 건물 centroid 에 §2 표 행 번호(buildings 배열 순서 index+1)와 동일한 번호 칩을
  *      찍어 "한눈에" 위치를 대응시킨다.
  */
@@ -222,8 +222,6 @@ export default function ReportOMTargetOverviewMap({ buildings, buildingGroups, r
     for (let tx = ltx0; tx <= ltx1; tx++)
       for (let ty = lty0; ty <= lty1; ty++) if (ty >= 0 && ty < nLu) luTargets.push({ tx, ty });
 
-    const deadline = Date.now() + 4000; // 하드 데드라인 — 초과 시 그때까지 받은 타일로 확정(게이트 무한대기 방지)
-
     // 토지이용 로드 확정 — 확정 플래그 세우고 redraw(base 미완이면 no-op → 이후 base onDone 에서 반영).
     const finalizeLanduse = () => {
       if (landuseSettled) return;
@@ -240,43 +238,78 @@ export default function ReportOMTargetOverviewMap({ buildings, buildingGroups, r
       if (landuseCount === 1) setLanduseShown(true); // 첫 타일 도착 → 범례에 토지이용 안내 표시
     };
 
-    // 타일 1개 로드 — invoke(로컬 DB, get_landuse_tile) → base64 → Image. null/에러/데드라인은 조용히 스킵.
-    //   잔여 예산 setTimeout(finish) 로 invoke 행잉 시에도 반드시 데드라인 내 resolve (풀이 무한 대기 방지).
-    const loadOne = (t: { tx: number; ty: number }) => new Promise<void>((resolve) => {
+    // 타일 1개 로드 결과 분류: "drawn"(성공, 그림) / "absent"(invoke null — DB에 없음, 영구, 재시도
+    //   불필요) / "retry"(데드라인 만료·invoke 에러·onerror — 미처리, 다음 패스에서 재시도).
+    //   잔여 예산 setTimeout 으로 invoke 행잉 시에도 반드시 데드라인 내 resolve (풀이 무한 대기 방지).
+    type LuResult = "drawn" | "absent" | "retry";
+    const loadOne = (t: { tx: number; ty: number }, deadline: number) => new Promise<LuResult>((resolve) => {
       let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
-      const timer = setTimeout(finish, Math.max(0, deadline - Date.now()));
-      if (cancelled) { clearTimeout(timer); finish(); return; }
+      const finish = (r: LuResult) => { if (!done) { done = true; resolve(r); } };
+      const timer = setTimeout(() => finish("retry"), Math.max(0, deadline - Date.now()));
+      if (cancelled) { clearTimeout(timer); finish("retry"); return; }
       const wx = ((t.tx % nLu) + nLu) % nLu; // x 랩 (composeTiles 와 동일)
       invoke<string | null>("get_landuse_tile", { z: landuseZ, x: wx, y: t.ty })
         .then((base64) => {
-          if (cancelled || !base64 || Date.now() > deadline) { clearTimeout(timer); finish(); return; }
+          if (cancelled) { clearTimeout(timer); finish("retry"); return; }
+          if (!base64) { clearTimeout(timer); finish("absent"); return; }       // DB에 없음 — 영구, 재시도 불필요
+          if (Date.now() > deadline) { clearTimeout(timer); finish("retry"); return; } // 데드라인 만료 — 재시도
           const img = new Image();
           luImgs.push(img);
-          img.onload = () => { clearTimeout(timer); if (!cancelled && !done) drawLuTile(t, img); finish(); };
-          img.onerror = () => { clearTimeout(timer); finish(); };
+          img.onload = () => { clearTimeout(timer); if (!cancelled && !done) drawLuTile(t, img); finish("drawn"); };
+          img.onerror = () => { clearTimeout(timer); finish("retry"); };
           img.src = `data:image/png;base64,${base64}`;
         })
-        .catch(() => { clearTimeout(timer); finish(); });
+        .catch(() => { clearTimeout(timer); finish("retry"); });
     });
 
-    // 초광역 뷰 가드 — 타일 400개 초과면 오버레이 전체 스킵. 그 외엔 동시성 8 풀로 소진 후 확정.
+    // 한 패스 — 대상 인덱스를 동시성 8 풀로 소진. drawn/absent 는 luStatus 에 확정 기록하고, retry 는
+    //   pending 을 유지해 다음 패스로 넘긴다(데드라인 초과로 미착수된 인덱스도 pending 으로 남는다).
+    const luStatus: ("pending" | "drawn" | "absent")[] = luTargets.map(() => "pending");
+    const runPass = (indices: number[], deadline: number): Promise<void> => {
+      let cursor = 0;
+      const worker = async () => {
+        while (!cancelled && Date.now() <= deadline) {
+          const k = cursor++;
+          if (k >= indices.length) return;
+          const i = indices[k];
+          const r = await loadOne(luTargets[i], deadline);
+          if (r !== "retry") luStatus[i] = r; // 확정(drawn/absent)만 기록; retry 는 pending 유지 → 다음 패스
+        }
+      };
+      const poolN = Math.min(8, indices.length); // 대상이 없으면 Promise.all([]) 즉시 resolve
+      return Promise.all(Array.from({ length: poolN }, () => worker())).then(() => undefined);
+    };
+    const pendingIndices = (): number[] => {
+      const out: number[] = [];
+      for (let i = 0; i < luStatus.length; i++) if (luStatus[i] === "pending") out.push(i);
+      return out;
+    };
+
+    // 초광역 뷰 가드 — 타일 400개 초과면 오버레이 전체 스킵. 그 외엔 첫 패스(4초) 후 미처리 타일이
+    //   남으면 최대 2회 추가 패스(패스 전 1000ms 지연·패스당 fresh 6000ms 데드라인·동시성 8)로 재시도.
+    //   미리보기 빌드 중 메인스레드 점유로 일부 타일이 조용히 누락된 채 확정되던 문제 방지.
     if (luTargets.length > 400) {
       console.warn(`[OM 지도] 토지이용 타일 ${luTargets.length}개(>400) — 초광역 뷰, 오버레이 스킵 (분석 대상 위치 도면)`);
       finalizeLanduse();
     } else {
-      let nextIdx = 0;
-      const worker = async () => {
-        while (!cancelled && Date.now() <= deadline) {
-          const i = nextIdx++;
-          if (i >= luTargets.length) return;
-          await loadOne(luTargets[i]);
+      const runAllPasses = async () => {
+        // 첫 패스 — 기존 4초 하드 데드라인·동시성 8·전 타일 대상 (현행 유지). 이 패스의 신규 타일은
+        //   base onDone 재합성 또는 아래 추가 패스/finalizeLanduse 의 redraw 로 보이는 canvas 에 반영.
+        await runPass(luTargets.map((_, i) => i), Date.now() + 4000);
+        // 추가 패스 — 미처리가 남으면 최대 2회. base 확정 이후일 수 있어 base onDone 재합성에 편승할
+        //   수 없으므로, 신규 타일이 그려진 패스는 종료 시 redraw() 1회(타일별 매번 redraw 는 핫패스라 금지).
+        for (let pass = 0; pass < 2 && !cancelled; pass++) {
+          const pending = pendingIndices();
+          if (pending.length === 0) break;
+          await new Promise((r) => setTimeout(r, 1000)); // 패스 전 지연 — 첫 패스 혼잡/행잉이 풀리길 대기
+          if (cancelled) break;
+          const before = landuseCount;
+          await runPass(pending, Date.now() + 6000); // 패스당 fresh 데드라인 6000ms
+          if (!cancelled && landuseCount > before) redraw();
         }
-      };
-      const poolN = Math.min(8, luTargets.length); // 타일이 없으면 Promise.all([]) 즉시 resolve → 확정
-      Promise.all(Array.from({ length: poolN }, () => worker())).then(() => {
         if (!cancelled) finalizeLanduse();
-      });
+      };
+      runAllPasses();
     }
 
     return () => {

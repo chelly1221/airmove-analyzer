@@ -165,18 +165,23 @@ export function fitProjection(
   return { z, originX, originY, project, mpp };
 }
 
-// ── 전역 타일 로드 동시성 제한 ──
-// §3 상세(빌딩×레이더) 도면 + §4 소실상세 도면이 다수 마운트되면 도면당 12~49개 타일 요청이
-// 한꺼번에 발화해 수백 개 Image 네트워크/디코드가 렌더러·공유 GPU 프로세스 메모리를 일시에
-// 점유한다(다건물 보고서에서 두 창 동시 blank/프리징의 가중 요인). 풀 크기만큼만 동시 로드하고
-// 나머지는 큐 대기.
-// 첫 패스 타일 3초 데드라인은 '큐 대기 포함' 전체 예산 — 첫 합성이 항상 ≤3초에 종료해야
+// ── 전역 타일 로드 동시성 제한 + 캐시 + in-flight 중복 제거 ──
+// §2/§3/§4/§5/§1 도면이 다수 마운트되면 도면당 12~49개 타일 요청이 한꺼번에 발화해 수백 개
+// Image 네트워크/디코드가 렌더러·공유 GPU 프로세스 메모리를 일시에 점유한다(다건물 보고서에서
+// 두 창 동시 blank/프리징의 가중 요인). 풀 크기(TILE_POOL)만큼만 동시 로드하고 나머지는 큐 대기.
+//
+// 동시 마운트 도면들은 같은 레이더 주변·정수 줌이라 동일 (z/x/y) 타일을 대량 중복 요청한다. 그래서
+// 성공 타일을 모듈 전역 캐시(tileCache)에 담아 재요청 없이 즉시 재사용하고, 진행 중 로드는 in-flight
+// Promise(tileInflight)를 공유해 같은 타일에 Image/슬롯이 하나만 생기게 한다. 재시도 라운드도 네트워크를
+// 다시 때리지 않고 캐시/공유 로드에 편승 → 혼잡 자체를 완화(중복 요청 제거).
+//
+// 첫 패스(round 0) 타일 3초 데드라인은 '큐 대기 포함' 전체 예산 — 첫 합성이 항상 ≤3초에 종료해야
 // PDF 게이트(useReportExport data-map-ready 4초) 안에 오버레이(부채꼴·건물·소실점)까지 그려진
-// 도면이 인쇄된다. 행잉 네트워크에서 큐 대기가 예산을 소모하면 잔여 시간만 로드에 사용하고,
-// 큐에서 예산이 소진된 타일은 Image 생성 없이 즉시 포기한다.
-// 예산 소진으로 미수신된 타일은 '구멍(회색 조각)' 상태로 확정하지 않고 백그라운드 재시도
-// (진행이 있는 한 재시도, 최대 MAX_ROUNDS 회)로 자가치유한다 — 동시 마운트 혼잡에서 뒤쪽 큐
-// 타일이 대량 유실돼 일부만 로딩된 지도가 PDF 에 인쇄되던 문제 방지. 진행 상태는 data-map-complete 로 노출.
+// 도면이 인쇄된다. 큐 대기가 예산을 소모하면 잔여 시간만 로드에 쓰고, 예산 소진 타일은 포기한다.
+// 미수신 타일은 '구멍(회색 조각)'으로 확정하지 않고 백그라운드 재시도(진행 기반 적응형, 최대
+// MAX_ROUNDS 회)로 자가치유한다. 재시도 라운드(round≥1)는 큐 대기를 라운드 예산에서 제외한다 —
+// 전역 혼잡에 의한 슬롯 기아(starvation)를 '무진행(오프라인)'으로 오판해 일부만 로딩된 지도를
+// 영구 확정하던 버그를 방지(아래 loadTile/runRound 참조). 진행 상태는 data-map-complete 로 노출.
 const TILE_POOL = 24;
 let tileActive = 0;
 const tileQueue: (() => void)[] = [];
@@ -200,26 +205,101 @@ function releaseTileSlot() {
   else tileActive--;
 }
 
+// ── 전역 타일 캐시 (LRU) + in-flight 중복 제거 ──
+// 성공 타일은 캐시해 여러 도면·재시도 라운드가 재요청 없이 공유한다. 실패/타임아웃은 캐시하지
+// 않는다(재시도 가능해야 하므로). 진행 중 로드는 in-flight Promise 로 공유해 같은 타일에 Image/
+// 슬롯이 중복 생성되지 않게 한다.
+/** 성공 타일 캐시 (키 `${zInt}/${wx}/${ty}`, wx=x 랩 적용값). LRU 상한 512 — 히트 시 delete+set
+ *  재삽입으로 최신화, 초과 시 가장 오래된 항목 evict. */
+const TILE_CACHE_MAX = 512;
+const tileCache = new Map<string, HTMLImageElement>();
+/** 진행 중 타일 로드 — 같은 키 요청은 이 Promise 를 공유(새 Image/슬롯 생성 없음). */
+const tileInflight = new Map<string, Promise<HTMLImageElement | null>>();
+
+/** 캐시 조회 + LRU 최신화(히트 시 재삽입). 미스면 undefined. */
+function tileCacheGet(key: string): HTMLImageElement | undefined {
+  const img = tileCache.get(key);
+  if (img) { tileCache.delete(key); tileCache.set(key, img); }
+  return img;
+}
+/** 캐시 저장 + LRU evict(상한 초과 시 가장 오래된 항목 제거). */
+function tileCachePut(key: string, img: HTMLImageElement) {
+  tileCache.set(key, img);
+  if (tileCache.size > TILE_CACHE_MAX) {
+    const oldest = tileCache.keys().next().value;
+    if (oldest !== undefined) tileCache.delete(oldest);
+  }
+}
+
+/** 슬롯을 이미 보유한 소유자가 호출 — 전역 소유 Image 로 실제 네트워크 로드. loadBudgetMs 안에
+ *  onload/onerror/타임아웃 중 하나로 반드시 종료하고, 종료 시 슬롯 반환 + in-flight 제거(성공 시
+ *  캐시 저장). 반환 Promise 를 in-flight 로 등록해 같은 키의 다른 요청이 새 Image/슬롯 없이 공유한다.
+ *  이 Image 는 특정 도면 소유가 아니므로 도면 취소로 해제(src="")하지 않는다 — 완료되면 캐시 자산이
+ *  된다. 동시 in-flight Image 는 슬롯 보유자만 만들 수 있고, 타임아웃/실패 시 src="" 로 요청을 끊어
+ *  슬롯 반환과 함께 Image 를 해제하므로, 살아있는 로드 Image 수는 언제나 보유 슬롯 수(≤TILE_POOL)
+ *  이하 — 고아 누수 없음. */
+function startSharedLoad(key: string, zInt: number, wx: number, ty: number, loadBudgetMs: number): Promise<HTMLImageElement | null> {
+  const p = new Promise<HTMLImageElement | null>((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    let settled = false;
+    const done = (result: HTMLImageElement | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      tileInflight.delete(key);
+      if (result) tileCachePut(key, result);
+      else img.src = ""; // 타임아웃/실패 — 진행 중 요청을 끊어 슬롯 반환과 동시에 Image 해제(유계 유지)
+      releaseTileSlot();
+      resolve(result);
+    };
+    const timer = setTimeout(() => done(null), Math.max(0, loadBudgetMs));
+    img.onload = () => done(img);
+    img.onerror = () => done(null);
+    img.src = tileUrl(zInt, wx, ty);
+  });
+  tileInflight.set(key, p);
+  return p;
+}
+
+/** 공유 in-flight Promise 를 deadline(절대시각)까지 기다린다. 만료 시 null 반환하되 공유 로드는
+ *  중단하지 않는다(다른 대기자·캐시 자산 — 완료되면 캐시에 들어가 다음 라운드에 히트). */
+function raceInflightUntil(p: Promise<HTMLImageElement | null>, deadline: number): Promise<HTMLImageElement | null> {
+  return new Promise<HTMLImageElement | null>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null); } }, Math.max(0, deadline - Date.now()));
+    p.then((img) => { if (!settled) { settled = true; clearTimeout(timer); resolve(img); } });
+  });
+}
+
 /** 첫 패스 타일 예산(ms) — 큐 대기 포함. 첫 합성이 ≤3초에 끝나 data-map-ready 게이트를 연다. */
 const TILE_BUDGET_FIRST_MS = 3000;
 // 아래 상수들은 첫 패스 이후 백그라운드 재시도(자가치유) 스케줄을 정의한다. useReportExport 의
 // 자가치유 대기 창(healWindow)이 이 값들에서 유도되므로 export 한다 — 과거 하드코딩 8초 대기가
 // 재시도 스케줄보다 짧아 완료 직전 잘려 §4 도면이 일부만 인쇄되던 버그를 방지한다(상수 변경 시
 // 대기 창 자동 정합).
-/** 재시도 패스 타일 예산(ms) — ready 게이트 무관 백그라운드 자가치유라 여유 있게. */
+/** 재시도 패스 타일 로드 예산(ms) — ready 게이트 무관 백그라운드 자가치유라 여유 있게. 재시도
+ *  라운드에선 이 예산을 '슬롯 획득 시점'부터 기산한다(큐 대기는 예산에서 제외 — 아래 loadTile). */
 export const TILE_BUDGET_RETRY_MS = 4000;
+/** 재시도 라운드 슬롯 획득 대기 상한(ms) — 예산과 분리된 큐 대기 캡. 전역 혼잡으로 슬롯이 늦게
+ *  나도 라운드가 굶어 죽지(무진행 오판) 않도록 넉넉히. 로드 예산(TILE_BUDGET_RETRY_MS)은 슬롯을
+ *  받은 뒤부터 별도로 기산한다. 모듈 내부 상수(healWindow 유도엔 불참 — export 불요). */
+const RETRY_QUEUE_WAIT_CAP_MS = 60_000;
 /** 재시도 지연(ms) — 동시 마운트 도면들의 첫 패스 혼잡이 풀에서 빠지길 기다렸다 재요청. */
 export const RETRY_DELAY_MS = 800;
 // 재시도 종료 조건 — '진행 기반 적응형'. 종전 고정 상한(RETRY_MAX=2)은 다건물 보고서에서 (레이더×건물)
 // §3 도면이 수십 개 동시 마운트돼 공유 풀(TILE_POOL=24)이 심하게 혼잡하면, 아직 타일이 큐에서 빠지는
 // 중인데도 2라운드만에 잘려 '일부만 로딩된(사선 해치) 지도'를 complete 로 확정했다. → 라운드가 신규
-// 타일을 1개라도 얻는 한(혼잡 해소 진행 중) 계속 재시도하고, 연속 무진행(오프라인/행잉) 시에만 조기
-// 종료한다. 동시성(TILE_POOL)은 그대로라 OOM 위험 불변 — 늘어나는 건 순차 라운드 수뿐.
+// 타일을 1개라도 얻는 한(혼잡 해소 진행 중) 계속 재시도하고, 연속 무진행(진짜 네트워크 실패) 시에만
+// 조기 종료한다. 동시성(TILE_POOL)은 그대로라 OOM 위험 불변 — 늘어나는 건 순차 라운드 수뿐.
+// 핵심 정정: 재시도 라운드는 큐 대기를 라운드 예산에서 제외(RETRY_QUEUE_WAIT_CAP_MS)하므로, 전역
+// 혼잡에 의한 슬롯 기아는 더 이상 '무진행(신규 0)'으로 집계되지 않는다 — noProgressStreak 는 이제
+// onerror/로드 타임아웃 같은 실제 로드 실패만 센다(혼잡은 시간이 걸릴 뿐 라운드가 굶어 죽지 않음).
 /** 총 재시도 라운드 하드 상한(round 0=첫 패스 포함). 진행이 이어져도 이 라운드에서 확정 —
  *  대기 창(healWindow)·프리뷰 리빌이 무한 확장되지 않게 한다. healWindow 가 이 값에서 유도된다. */
 export const MAX_ROUNDS = 6;
-/** 연속 무진행(신규 타일 0개) 라운드 상한(round 0부터 집계). 오프라인/행잉이면 이 횟수만에 확정 —
- *  종전 RETRY_MAX=2 의 오프라인 종료 지연(round0 + 2회 ≈ 12.6초)과 동일. 무의미한 재시도 방지. */
+/** 연속 무진행(신규 타일 0개) 라운드 상한(round 0부터 집계). 진짜 로드 실패(오프라인/onerror/로드
+ *  타임아웃)가 이어지면 이 횟수만에 확정 — 무의미한 재시도 방지. (큐 대기 기아는 무진행에서 제외됨.) */
 export const NO_PROGRESS_MAX = 3;
 
 /** 베이스맵 래스터 타일을 canvas 에 정적 합성 — 합성(첫 패스 + 자가치유 재합성)마다
@@ -230,8 +310,9 @@ export const NO_PROGRESS_MAX = 3;
  *  미수신 타일은 백그라운드 재시도(진행 기반 적응형, 최대 MAX_ROUNDS 회)로 채운 뒤 재합성 — '일부만 로딩된 지도'가
  *  화면·PDF 에 확정되는 것을 방지 (PDF 게이트는 data-map-complete 로 자가치유 완료를 잠시 대기).
  *  w/h 는 fitProjection 과 동일한 백킹 크기 (기본 §3 규격).
- *  반환: 취소 함수 — 언마운트/재계산 시 호출해 미완료 타일 요청·재시도 타이머 중단 + 고아 Image
- *  디코드 버퍼 해제(누수 방지). 취소 후엔 onDone 미호출. */
+ *  반환: 취소 함수 — 언마운트/재계산 시 호출해 '결과 그리기 중단(onDone 미호출) + 재시도 타이머
+ *  중단'만 한다. 진행 중 타일 로드는 전역 로더(startSharedLoad) 소유라 취소로 끊지 않는다 —
+ *  완료되면 전역 캐시 자산이 되고, 슬롯은 로드 종료 시 반드시 반환돼 누수가 없다(고아 Image 없음). */
 export function composeTiles(
   ctx: CanvasRenderingContext2D,
   proj: Pick<MapProjection, "z" | "originX" | "originY">,
@@ -245,7 +326,6 @@ export function composeTiles(
   // 연속 무진행(신규 타일 0개) 라운드 누적 — 반드시 클로저 스코프(라운드 간 유지). runRound 내부에
   //   두면 매 라운드 리셋돼 무진행 조기 종료가 발동하지 않고 항상 MAX_ROUNDS 까지 돈다.
   let noProgressStreak = 0;
-  const imgs: HTMLImageElement[] = [];
   const { z, originX, originY } = proj;
   // 분수 줌 지원 — 타일은 정수 줌(zInt)에서 요청하고, 화면엔 s=2^(z−zInt) 배 스케일(T=TILE·s)로 배치.
   // 정수 z 호출(§3/§4 도면)은 s=1·T=TILE 이라 기존과 비트 단위 동일(아래 그리기 스냅 좌표도 동일). §1
@@ -265,26 +345,53 @@ export function composeTiles(
   // 수신 성공 타일 누적 — 재합성마다 전체를 다시 그린다 (라운드 간 증분 유지)
   const loaded: { tx: number; ty: number; img: HTMLImageElement }[] = [];
 
-  const loadTile = async (tx: number, ty: number, budgetMs: number): Promise<{ tx: number; ty: number; img: HTMLImageElement } | null> => {
-    // 데드라인 = 큐 대기 + 네트워크/디코드 전체 예산 — 라운드의 Promise.all 이 예산 내 종료 보장
-    const deadline = Date.now() + budgetMs;
-    if (!(await acquireTileSlotUntil(deadline))) return null; // 큐 대기 중 예산 소진 — 슬롯 미보유
-    if (cancelled) { releaseTileSlot(); return null; }
-    try {
-      return await new Promise<{ tx: number; ty: number; img: HTMLImageElement } | null>((resolve) => {
-        const wx = ((tx % n) + n) % n;
-        const img = new Image();
-        imgs.push(img);
-        img.crossOrigin = "anonymous";
-        // 잔여 예산으로 로드 타임아웃 — 행잉 요청 환경에서도 데드라인 안에 종료 (onload/onerror 시 해제)
-        const timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
-        img.onload = () => { clearTimeout(timer); resolve({ tx, ty, img }); };
-        img.onerror = () => { clearTimeout(timer); resolve(null); };
-        img.src = tileUrl(zInt, wx, ty);
-      });
-    } finally {
-      releaseTileSlot();
+  // 타일 1개 로드 — 캐시/in-flight 공유를 우선하고, 미스 시 소유자로서 슬롯 획득 후 전역 로드.
+  //   round 0(첫 패스)은 큐 대기 포함 예산(TILE_BUDGET_FIRST_MS) — data-map-ready 4초 게이트가 이
+  //     예산에 걸리므로 반드시 ≤3초에 종료(기존 계약 불변).
+  //   round≥1(재시도)은 큐 대기를 예산에서 제외 — 슬롯은 RETRY_QUEUE_WAIT_CAP_MS 까지 기다리고,
+  //     로드 예산(TILE_BUDGET_RETRY_MS)은 슬롯 획득 시점부터 기산한다. 전역 혼잡에 의한 큐 대기가
+  //     '신규 타일 0개(무진행)'로 집계되지 않아 혼잡 기아를 오프라인으로 오판하지 않는다.
+  const loadTile = async (
+    tx: number,
+    ty: number,
+    round: number,
+  ): Promise<{ tx: number; ty: number; img: HTMLImageElement } | null> => {
+    const wx = ((tx % n) + n) % n;
+    const key = `${zInt}/${wx}/${ty}`;
+
+    // ① 캐시 히트 — 슬롯/예산 소모 없이 즉시 반환 (라운드 진행(gained)으로 집계).
+    const cached = tileCacheGet(key);
+    if (cached) return { tx, ty, img: cached };
+
+    const first = round === 0;
+    // round0: 큐 대기 포함 절대 데드라인. round≥1: 슬롯/공유 대기 상한(예산과 분리).
+    const waitDeadline = first ? Date.now() + TILE_BUDGET_FIRST_MS : Date.now() + RETRY_QUEUE_WAIT_CAP_MS;
+
+    // ② 진행 중(in-flight) — 새 Image/슬롯 없이 공유 Promise 를 자기 데드라인과 race. 자기 예산이
+    //    만료돼도 공유 로드는 중단하지 않는다(완료되면 캐시에 들어가 다음 라운드에 히트).
+    const shared = tileInflight.get(key);
+    if (shared) {
+      const img = await raceInflightUntil(shared, waitDeadline);
+      return img ? { tx, ty, img } : null;
     }
+
+    // ③ 미스 — 소유자로서 슬롯 획득. round0 은 waitDeadline(=큐 대기 포함 예산)까지, 재시도는
+    //    RETRY_QUEUE_WAIT_CAP_MS 까지 대기. 대기 중 예산 소진(슬롯 미보유)이면 null.
+    if (!(await acquireTileSlotUntil(waitDeadline))) return null;
+    // 슬롯 대기 중 다른 소유자가 같은 키를 시작했거나 캐시에 채워졌을 수 있다(경합) → 슬롯 반환 후 편승.
+    const racedCache = tileCacheGet(key);
+    if (racedCache) { releaseTileSlot(); return { tx, ty, img: racedCache }; }
+    const racedInflight = tileInflight.get(key);
+    if (racedInflight) {
+      releaseTileSlot();
+      const img = await raceInflightUntil(racedInflight, waitDeadline);
+      return img ? { tx, ty, img } : null;
+    }
+    // 로드 예산 — round0 은 잔여(큐 대기 차감분), 재시도는 슬롯 획득 시점부터 TILE_BUDGET_RETRY_MS.
+    //   startSharedLoad 가 슬롯 반환·in-flight 제거·성공 시 캐시 저장을 소유(도면 취소와 무관하게 완료).
+    const loadBudget = first ? Math.max(0, waitDeadline - Date.now()) : TILE_BUDGET_RETRY_MS;
+    const img = await startSharedLoad(key, zInt, wx, ty, loadBudget);
+    return img ? { tx, ty, img } : null;
   };
 
   /** 누적 loaded 로 베이스 전체 재합성 + 흰 베일 + onDone(오버레이 재그리기).
@@ -330,9 +437,10 @@ export function composeTiles(
     onDone(loaded.length > 0, complete);
   };
 
-  /** round=0 첫 패스, 이후 미수신 타일만 재시도. 라운드 종료마다 필요 시 재합성 + 다음 라운드 예약. */
-  const runRound = (round: number, pending: { tx: number; ty: number }[], budgetMs: number) => {
-    Promise.all(pending.map((t) => loadTile(t.tx, t.ty, budgetMs))).then((results) => {
+  /** round=0 첫 패스, 이후 미수신 타일만 재시도. 라운드 종료마다 필요 시 재합성 + 다음 라운드 예약.
+   *  타일 예산은 loadTile 이 round 로 결정(round0=큐 대기 포함, round≥1=슬롯 획득부터 기산)한다. */
+  const runRound = (round: number, pending: { tx: number; ty: number }[]) => {
+    Promise.all(pending.map((t) => loadTile(t.tx, t.ty, round))).then((results) => {
       if (cancelled) return;
       const missing: { tx: number; ty: number }[] = [];
       let gained = 0;
@@ -341,8 +449,10 @@ export function composeTiles(
         else missing.push(pending[i]);
       });
       // 무진행(신규 0) 라운드 누적 — 진행이 있으면 리셋. 재시도는 줄어드는 missing 만 재요청하므로
-      //   진행은 단조(streak 진동 없음). 혼잡 해소가 진행되는 한(gained>0) 계속 돌고, 오프라인/행잉이면
-      //   곧 NO_PROGRESS_MAX 도달로 조기 확정, 진행이 이어져도 MAX_ROUNDS 하드 상한에서 확정.
+      //   진행은 단조(streak 진동 없음). 혼잡 해소가 진행되는 한(gained>0) 계속 돌고, 진짜 로드 실패가
+      //   이어지면 곧 NO_PROGRESS_MAX 도달로 조기 확정, 진행이 이어져도 MAX_ROUNDS 하드 상한에서 확정.
+      //   재시도 라운드는 큐 대기를 예산에서 제외하므로, 혼잡한 타일은 이 라운드에서 시간이 걸려도
+      //   결국 gained 로 잡히고 missing(=진짜 실패)만 무진행에 기여한다.
       noProgressStreak = gained > 0 ? 0 : noProgressStreak + 1;
       const settled =
         missing.length === 0 || noProgressStreak >= NO_PROGRESS_MAX || round >= MAX_ROUNDS;
@@ -357,18 +467,20 @@ export function composeTiles(
       console.warn(`[OM 지도] 타일 ${missing.length}/${targets.length}개 미수신 — ${round + 1}차 재시도 예약 (${warnLabel})`);
       retryTimer = setTimeout(() => {
         retryTimer = null;
-        if (!cancelled) runRound(round + 1, missing, TILE_BUDGET_RETRY_MS);
+        if (!cancelled) runRound(round + 1, missing);
       }, RETRY_DELAY_MS);
     });
   };
 
-  runRound(0, targets, TILE_BUDGET_FIRST_MS);
+  runRound(0, targets);
 
   return () => {
     cancelled = true;
     if (retryTimer != null) clearTimeout(retryTimer);
-    // 미완료 타일 요청 중단 + 디코드 버퍼 해제 (언마운트/재계산 시 고아 Image 누수 방지)
-    for (const im of imgs) { if (!im.complete) im.src = ""; }
+    // 진행 중 타일 로드는 전역 로더(startSharedLoad)가 소유 — 도면 취소로 중단/해제(src="")하지
+    //   않는다. 완료되면 전역 캐시 자산이 되어 다른 도면/다음 프리뷰가 재사용한다. 슬롯은 로드 종료
+    //   시 startSharedLoad 가 반드시 반환하므로(예산 내 반드시 종료) 취소로 인한 슬롯 누수는 없다.
+    //   취소는 '결과를 그리지 않음(runRound cancelled 가드) + 재시도 타이머 중단'만 담당한다.
   };
 }
 

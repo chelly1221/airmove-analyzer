@@ -229,12 +229,14 @@ async function exportViaNative(
     const isHealing = () => mapCanvases.some(
       (c) => c.getAttribute("data-map-ready") === "true" && c.getAttribute("data-map-complete") === "false",
     );
-    // 대기 창은 composeTiles 재시도 스케줄 전체를 덮어야 한다 — 적응형 재시도의 최악은 매 라운드
-    //   신규 타일을 얻어(무진행 조기 종료 미발동) 하드 상한까지 도는 경우로, ready 이후 최악
-    //   MAX_ROUNDS×(RETRY_DELAY_MS+TILE_BUDGET_RETRY_MS)(= 6×(800+4000) = 28800ms) 소요.
-    //   (NO_PROGRESS_MAX 조기 종료는 이 상한을 줄이기만 하므로 MAX_ROUNDS 기준이 정확한 상한.)
-    //   과거 하드코딩 8000ms 는 재시도 스케줄보다 짧아 완료 직전 잘려 §4 소실상세 도면이 일부만
-    //   로딩된 채 인쇄됐다. 상수에서 유도(+여유)해 향후 스케줄 변경에도 자동 정합.
+    // 대기 창은 composeTiles 재시도 스케줄을 실용적으로 덮는다. MAX_ROUNDS×(RETRY_DELAY_MS+
+    //   TILE_BUDGET_RETRY_MS)(= 6×(800+4000) = 28800ms)는, 재시도 라운드가 슬롯 대기(큐)를 예산에서
+    //   제외하게 된 뒤로는 '엄밀한' 상한이 아니라 '통상 스케줄을 덮는 실용 상한'이다 — 전역 혼잡으로
+    //   슬롯이 크게 밀리면 한 라운드가 이 예산보다 오래 걸릴 수 있으나(로드 예산은 슬롯 획득 후부터
+    //   기산), 그 경우 아래 타임아웃에서 warn-and-proceed 하고 화면 자가치유는 배경에서 계속된다.
+    //   (NO_PROGRESS_MAX 조기 종료는 이 창을 줄이기만 한다.) 과거 하드코딩 8000ms 는 통상 스케줄보다
+    //   짧아 완료 직전 잘려 §4 소실상세 도면이 일부만 로딩된 채 인쇄됐다 — 상수에서 유도(+여유)해
+    //   향후 스케줄 변경에도 자동 정합.
     const HEAL_MARGIN_MS = 1500;
     const healWindow = MAX_ROUNDS * (RETRY_DELAY_MS + TILE_BUDGET_RETRY_MS) + HEAL_MARGIN_MS;
     const healDeadline = Date.now() + healWindow;
