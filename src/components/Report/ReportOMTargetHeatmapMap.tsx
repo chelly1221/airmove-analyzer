@@ -9,9 +9,10 @@
  *  - "진짜 히트맵" 룩: box blur 로 스무딩 → ln 정규화 → 붉은계열(ColorBrewer Reds) 색 램프 LUT.
  *      저강도는 은은한 살구색, 고밀도 항로는 진홍으로 타오른다(단색 alpha → 강도별 색 그라디언트 전환).
  *  - 소실표적(loss_points_summary, 전수)도 같은 강도 버퍼에 +1 스탬프 — 시각 구분 없음(기존 설계 유지).
- *  - 북한 크롭: 상단(북)을 최북단 레이더 위도 + TOP_MARGIN_DEG 에서 고정 크롭(북측 원거리 표적·
- *      원 상단은 의도적으로 숨김)하고 하단(남)을 페이지 크기에 맞춰 확장 — 지도가 A4 페이지 잔여
- *      높이를 꽉 채운다(297mm 오버플로우 금지 — ASPECT 유도 참조).
+ *  - 북한 크롭: 상단(북)을 최북단 레이더 위도 + TOP_MARGIN_DEG(기본 여유)로 잡되 북한 육지 미노출
+ *      상한(NK_CROP_MAX_LAT)으로 캡 — 남부 레이더는 여유가, 수도권 레이더는 상한이 걸린다(북측
+ *      원거리 표적·원 상단은 의도적으로 숨김). 하단(남)은 페이지 크기에 맞춰 확장 — 지도가 A4 페이지
+ *      잔여 높이를 꽉 채운다(297mm 오버플로우 금지 — ASPECT 유도 참조).
  *  - 원 밖 표적: Rust 그리드가 ±150NM 로 확장되어 60NM 원 밖 표적도 표시 창 안이면 전부 보인다.
  *  - 60NM 원·레이더 마커는 유지(상단 크롭으로 원 상단이 잘려 보이는 것 정상).
  *  - track_heatmap 부재(구버전 캐시) 시에도 소실점·마커만으로 렌더 — 크래시/배너 없음.
@@ -34,10 +35,15 @@ const R_KM = 6371;
 /** 범위 원 = 60NM(OM 통계 스코프). 표시 유지 — 원 밖 표적도 그리드 확장으로 표시됨. */
 const OM_RANGE_NM = 60;
 /**
- * 뷰 상단 크롭 여유(°) — 최북단 레이더 위도 + 이 값에서 상단을 고정 크롭.
- * 북쪽(북한 방면) 데이터·60NM 원 상단은 의도적으로 잘라내고, 고정 높이(H)만큼 하단(남쪽)이 넓게 보인다.
+ * 뷰 상단 기본 여유(°) — 최북단 레이더 위도 + 이 값. 남부 레이더는 이만큼 북쪽 컨텍스트가 보인다.
  */
-const TOP_MARGIN_DEG = 0.1;
+const TOP_MARGIN_DEG = 0.5;
+/**
+ * 뷰 상단 절대 상한(°N) — 북한 육지 미노출 컷. 한강 하구(조강) 남안(김포반도·강화 북단, ≈37.76°N)까지는
+ * 표시하고 북안(개풍군, ≈37.78°N~)은 화면 밖. 수도권 레이더에선 이 상한이 걸리고, 남부 레이더는
+ * TOP_MARGIN_DEG 가 걸린다.
+ */
+const NK_CROP_MAX_LAT = 37.76;
 /** 범위 원 표시용 샘플 분할 수. */
 const RING_SEG = 128;
 
@@ -174,9 +180,9 @@ export default function ReportOMTargetHeatmapMap({ sectionNum, radars }: Props) 
     const z = Math.max(3, Math.min(19, Math.log2(worldSize / TILE))); // 분수 줌(composeTiles 가 처리)
     const originX = mxCenter * worldSize - W / 2;
 
-    // 세로 상단(북한 크롭): 데이터와 무관하게 최북단 레이더 위도 + TOP_MARGIN_DEG 로 고정 크롭.
-    //   북측 원거리 표적·60NM 원 상단은 의도적으로 숨기고, 고정 높이(H)만큼 하단(남쪽)이 넓게 보인다.
-    const topLat = radarMaxLat + TOP_MARGIN_DEG;
+    // 상단(북한 크롭): 기본 여유(TOP_MARGIN_DEG)를 주되 북한 육지 미노출 상한(NK_CROP_MAX_LAT)으로 캡.
+    //   레이더가 상한 부근/이북인 극단 구성에서도 마커가 상단에 붙지 않게 최소 여유 0.05° 는 보장.
+    const topLat = Math.max(Math.min(radarMaxLat + TOP_MARGIN_DEG, NK_CROP_MAX_LAT), radarMaxLat + 0.05);
     const originY = mercY(topLat) * worldSize; // 상단 = topLat, 이후 H 픽셀만큼 남쪽으로
 
     const project = (lat: number, lon: number): [number, number] => [
