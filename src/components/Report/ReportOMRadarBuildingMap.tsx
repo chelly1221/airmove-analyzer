@@ -26,7 +26,8 @@ import OMEditable from "./OMEditable";
 
 const DEG2RAD = Math.PI / 180;
 const KM_PER_NM = 1.852;
-const TILE = 256;
+/** 웹 머케이터 타일 픽셀 크기. §1 히트맵이 자체 투영 구성에 재사용하므로 export. */
+export const TILE = 256;
 const R_KM = 6371;
 
 /** canvas 백킹 픽셀(렌더 해상도) — CSS 표시폭의 약 2배 밀도로 그려 PDF 출력에서 또렷하게.
@@ -43,9 +44,9 @@ const DISP_W = 360;
 const tileUrl = (z: number, x: number, y: number) =>
   `https://basemaps.cartocdn.com/rastertiles/voyager/${z}/${x}/${y}.png`;
 
-// ── 머케이터 투영 (0..1 정규화) ──
-const mercX = (lonDeg: number) => (lonDeg + 180) / 360;
-const mercY = (latDeg: number) => {
+// ── 머케이터 투영 (0..1 정규화) ── §1 히트맵이 자체 투영 구성에 재사용하므로 export.
+export const mercX = (lonDeg: number) => (lonDeg + 180) / 360;
+export const mercY = (latDeg: number) => {
   const lat = Math.max(-85.05, Math.min(85.05, latDeg)) * DEG2RAD;
   return (1 - Math.log(Math.tan(lat) + 1 / Math.cos(lat)) / Math.PI) / 2;
 };
@@ -104,8 +105,19 @@ export interface MapProjection {
 }
 
 /** 표시 필수 점집합([lat,lon][]) → w×h 백킹 캔버스 머케이터 투영 파라미터 (기본 §3 규격 BACK_W×BACK_H).
- *  bbox 패딩 12% + 캔버스 종횡비에 맞춘 부족 축 확장(왜곡 없이 타일이 박스를 채움) + 정수 줌 [3,19]. */
-export function fitProjection(pts: [number, number][], w = BACK_W, h = BACK_H): MapProjection {
+ *  bbox 패딩(기본 12%) + 캔버스 종횡비에 맞춘 부족 축 확장(왜곡 없이 타일이 박스를 채움) + 줌 [3,19].
+ *  opts.padRatio  — bbox 패딩 비율(기본 0.12 = 현행값).
+ *  opts.fractionalZoom — true 면 Math.floor 없이 분수 줌 그대로(§1 히트맵·§2 위치도가 프레임 꽉 채우기용).
+ *  기본(opts 미지정)은 padRatio 0.12 + 정수 줌(Math.floor)이라 §3 부채꼴·§4 소실상세 도면과 **비트 단위
+ *  동일** — 기본 인자 경로/수치 불변. */
+export function fitProjection(
+  pts: [number, number][],
+  w = BACK_W,
+  h = BACK_H,
+  opts?: { padRatio?: number; fractionalZoom?: boolean },
+): MapProjection {
+  const padRatio = opts?.padRatio ?? 0.12;              // 기본 0.12 = 현행값
+  const fractionalZoom = opts?.fractionalZoom ?? false; // 기본 false = 현행 Math.floor 정수 줌
   let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
   for (const [la, lo] of pts) {
     if (la < minLat) minLat = la;
@@ -113,8 +125,8 @@ export function fitProjection(pts: [number, number][], w = BACK_W, h = BACK_H): 
     if (lo < minLon) minLon = lo;
     if (lo > maxLon) maxLon = lo;
   }
-  const padLat = Math.max((maxLat - minLat) * 0.12, 1e-4);
-  const padLon = Math.max((maxLon - minLon) * 0.12, 1e-4);
+  const padLat = Math.max((maxLat - minLat) * padRatio, 1e-4);
+  const padLon = Math.max((maxLon - minLon) * padRatio, 1e-4);
   minLat -= padLat; maxLat += padLat; minLon -= padLon; maxLon += padLon;
 
   // 머케이터 span → 캔버스 종횡비에 맞춰 부족한 축 확장
@@ -130,10 +142,13 @@ export function fitProjection(pts: [number, number][], w = BACK_W, h = BACK_H): 
     const cx = (mxMin + mxMax) / 2; mxMin = cx - need / 2; mxMax = cx + need / 2; spanX = need;
   }
 
-  // 줌 — span 이 백킹 픽셀에 들어가는 최대 정수 줌
+  // 줌 — span 이 백킹 픽셀에 들어가는 최대 줌. 기본(fractionalZoom=false)은 Math.floor 정수 줌으로
+  //   기존과 비트 단위 동일. true 면 floor 없이 분수 줌 그대로(clamp [3,19] 는 유지) — worldSize=
+  //   TILE·2^z 등 나머지 수식은 분수 z 로도 그대로 성립(composeTiles 가 zInt=round(z)로 타일 배치).
   const zX = Math.log2(w / (spanX * TILE));
   const zY = Math.log2(h / (spanY * TILE));
-  const z = Math.max(3, Math.min(19, Math.floor(Math.min(zX, zY))));
+  const zRaw = Math.min(zX, zY);
+  const z = Math.max(3, Math.min(19, fractionalZoom ? zRaw : Math.floor(zRaw)));
   const worldSize = TILE * Math.pow(2, z);
   const cMx = (mxMin + mxMax) / 2, cMy = (myMin + myMax) / 2;
   const originX = cMx * worldSize - w / 2;
@@ -232,9 +247,15 @@ export function composeTiles(
   let noProgressStreak = 0;
   const imgs: HTMLImageElement[] = [];
   const { z, originX, originY } = proj;
-  const n = Math.pow(2, z);
-  const tx0 = Math.floor(originX / TILE), tx1 = Math.floor((originX + w) / TILE);
-  const ty0 = Math.floor(originY / TILE), ty1 = Math.floor((originY + h) / TILE);
+  // 분수 줌 지원 — 타일은 정수 줌(zInt)에서 요청하고, 화면엔 s=2^(z−zInt) 배 스케일(T=TILE·s)로 배치.
+  // 정수 z 호출(§3/§4 도면)은 s=1·T=TILE 이라 기존과 비트 단위 동일(아래 그리기 스냅 좌표도 동일). §1
+  // 히트맵만 페이지 채움 위해 정확한 지리 창(분수 줌)으로 호출한다.
+  const zInt = Math.round(z);
+  const s = Math.pow(2, z - zInt);
+  const T = TILE * s;
+  const n = Math.pow(2, zInt);
+  const tx0 = Math.floor(originX / T), tx1 = Math.floor((originX + w) / T);
+  const ty0 = Math.floor(originY / T), ty1 = Math.floor((originY + h) / T);
 
   // 대상 타일 전체 목록 (머케이터 세로 범위 밖 제외) — 재시도 라운드의 잔여 목록 산출 기준
   const targets: { tx: number; ty: number }[] = [];
@@ -259,7 +280,7 @@ export function composeTiles(
         const timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
         img.onload = () => { clearTimeout(timer); resolve({ tx, ty, img }); };
         img.onerror = () => { clearTimeout(timer); resolve(null); };
-        img.src = tileUrl(z, wx, ty);
+        img.src = tileUrl(zInt, wx, ty);
       });
     } finally {
       releaseTileSlot();
@@ -275,14 +296,19 @@ export function composeTiles(
     ctx.fillRect(0, 0, w, h);
     if (loaded.length > 0) {
       for (const t of loaded) {
-        ctx.drawImage(t.img, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY), TILE, TILE);
+        // 픽셀 경계 스냅(심 방지) — 정수 z 는 T=TILE 이라 x1−x0=TILE·좌표가 기존과 동일(비트 단위 동일).
+        const x0 = Math.round(t.tx * T - originX), y0 = Math.round(t.ty * T - originY);
+        const x1 = Math.round((t.tx + 1) * T - originX), y1 = Math.round((t.ty + 1) * T - originY);
+        ctx.drawImage(t.img, x0, y0, x1 - x0, y1 - y0);
       }
       // 확정(complete)된 미수신 타일 — 사선 해치로 마감 (전 타일 수신 시 미발동)
       if (complete && loaded.length < targets.length) {
         const have = new Set(loaded.map((t) => `${t.tx},${t.ty}`));
         for (const t of targets) {
           if (have.has(`${t.tx},${t.ty}`)) continue;
-          hatchMissingTile(ctx, Math.round(t.tx * TILE - originX), Math.round(t.ty * TILE - originY));
+          const x0 = Math.round(t.tx * T - originX), y0 = Math.round(t.ty * T - originY);
+          const x1 = Math.round((t.tx + 1) * T - originX), y1 = Math.round((t.ty + 1) * T - originY);
+          hatchMissingTile(ctx, x0, y0, x1 - x0, y1 - y0);
         }
       }
     } else {
@@ -640,20 +666,22 @@ function labelChip(ctx: CanvasRenderingContext2D, text: string, x: number, y: nu
 }
 
 /** 확정 미수신 타일 자리 — 옅은 배경 + 사선 해치. '일부만 로딩된 지도'의 회색 빈칸을
- *  '타일 없음(의도된 미표시)'으로 읽히게 한다. 오프라인 폴백 격자(#d6dbe1)와 톤 통일. */
-function hatchMissingTile(ctx: CanvasRenderingContext2D, x: number, y: number) {
+ *  '타일 없음(의도된 미표시)'으로 읽히게 한다. 오프라인 폴백 격자(#d6dbe1)와 톤 통일.
+ *  tw/th 기본값 TILE — 분수 줌(§1) 에선 스냅된 화면 타일 크기를 넘겨 해치를 정확히 채운다. */
+function hatchMissingTile(ctx: CanvasRenderingContext2D, x: number, y: number, tw = TILE, th = TILE) {
   ctx.save();
   ctx.beginPath();
-  ctx.rect(x, y, TILE, TILE);
+  ctx.rect(x, y, tw, th);
   ctx.clip();
   ctx.fillStyle = "#e7ebf0";
-  ctx.fillRect(x, y, TILE, TILE);
+  ctx.fillRect(x, y, tw, th);
   ctx.strokeStyle = "rgba(154,163,173,0.45)";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  for (let d = -TILE; d <= TILE; d += 12) {
+  const span = Math.max(tw, th);
+  for (let d = -span; d <= span; d += 12) {
     ctx.moveTo(x + d, y);
-    ctx.lineTo(x + d + TILE, y + TILE);
+    ctx.lineTo(x + d + th, y + th);
   }
   ctx.stroke();
   ctx.restore();

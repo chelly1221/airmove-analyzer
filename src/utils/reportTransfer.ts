@@ -17,6 +17,8 @@ export type ReportTemplate = "obstacle_monthly";
 
 export interface ReportSections {
   cover: boolean;
+  /** 전체 표적 히트맵 — §1 (분석 요약 앞). 레이더별 60NM 전방위 전수 밀도 지도. */
+  omTargetHeatmap: boolean;
   omSummary: boolean;
   /** 일별 PSR·표적소실 결합 라인 차트 (페이지 2). 기존 omDailyPsr/omDailyLoss 두 토글을 합친 단일 토글. */
   omDailyPsrLoss: boolean;
@@ -122,6 +124,7 @@ export function templateDisplayLabel(_tpl: ReportTemplate): string {
 
 export const DEFAULT_SECTIONS: ReportSections = {
   cover: true,
+  omTargetHeatmap: true,
   omSummary: true,
   omDailyPsrLoss: true,
   omLosCrossSection: true,

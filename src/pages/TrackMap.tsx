@@ -64,7 +64,7 @@ import { format } from "date-fns";
 import { useAppStore } from "../store";
 import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, BuildingOnPath } from "../types";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
-import { LOS_PROFILE_MAX_KM } from "../utils/geo";
+import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
 import LoSProfileTabs from "../components/Map/LoSProfileTabs";
 import { isGPUCacheValidFor, renderCoverageImageAsync, queryMinDetectionAlt, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
@@ -2002,9 +2002,12 @@ export default function TrackMap() {
     const lineDyM = (tLon - rLon) * mPerDegLon;
     const lineLen = Math.sqrt(lineDxM ** 2 + lineDyM ** 2);
     if (lineLen === 0) return []; // 타겟=레이더 동일좌표 → 0 나눗셈(NaN) 방지
-    // 단면도 x축 도메인(200NM 또는 타겟거리)과 동일한 정규화 — distRatio가 차트 maxDistance와 정합.
-    // 코리도는 타겟 너머 200NM까지 연장(스크롤 줌아웃 시 원거리 항적/Loss도 표시).
-    const profileMaxM = Math.max(LOS_PROFILE_MAX_KM * 1000, lineLen);
+    // distRatio = haversine 거리 / max(200NM, haversine 타겟거리) — 패널 maxDistance(profileMaxKm)와
+    //   동일 분모 → 차트 x = 실제 haversine 거리로, 지형 축(평면 보간점의 haversine 라벨)과 정확히 일치.
+    //   코리도 멤버십 판정(along·across)만 평면 투영 유지(전수 포인트 핫루프 — 통과 포인트에만 haversine 계산).
+    //   코리도는 타겟 너머 200NM까지 연장(스크롤 줌아웃 시 원거리 항적/Loss도 표시).
+    const profileMaxM = Math.max(LOS_PROFILE_MAX_KM * 1000, lineLen); // 평면 cap 전용
+    const profileMaxKm = Math.max(LOS_PROFILE_MAX_KM, haversineKm(rLat, rLon, tLat, tLon));
     const cosB = lineDxM / lineLen;
     const sinB = lineDyM / lineLen;
     const TOLERANCE_M = 1000; // 일반 모드: 수직 1km 여유 코리도
@@ -2047,7 +2050,7 @@ export default function TrackMap() {
       const along = dx * cosB + dy * sinB;
       const across = -dx * sinB + dy * cosB;
       if (along > 0 && along <= profileMaxM && inCorridor(along, across)) {
-        pts.push({ distRatio: along / profileMaxM, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false, latitude: p.latitude, longitude: p.longitude });
+        pts.push({ distRatio: haversineKm(rLat, rLon, p.latitude, p.longitude) / profileMaxKm, altitude: p.altitude, mode_s: p.mode_s, timestamp: p.timestamp, radar_type: p.radar_type, isLoss: false, latitude: p.latitude, longitude: p.longitude });
       }
     }
     // Loss 포인트
@@ -2057,7 +2060,7 @@ export default function TrackMap() {
       const along = dx * cosB + dy * sinB;
       const across = -dx * sinB + dy * cosB;
       if (along > 0 && along <= profileMaxM && inCorridor(along, across)) {
-        pts.push({ distRatio: along / profileMaxM, altitude: lp.altitude, mode_s: lp.mode_s, timestamp: lp.timestamp, radar_type: "loss", isLoss: true, latitude: lp.latitude, longitude: lp.longitude });
+        pts.push({ distRatio: haversineKm(rLat, rLon, lp.latitude, lp.longitude) / profileMaxKm, altitude: lp.altitude, mode_s: lp.mode_s, timestamp: lp.timestamp, radar_type: "loss", isLoss: true, latitude: lp.latitude, longitude: lp.longitude });
       }
     }
     return pts;
@@ -2103,8 +2106,19 @@ export default function TrackMap() {
       if (losTarget && losHoverRatio !== null) {
         const rLat = radarSite.latitude;
         const rLon = radarSite.longitude;
-        const hoverLat = rLat + (losTarget.lat - rLat) * losHoverRatio;
-        const hoverLon = rLon + (losTarget.lon - rLon) * losHoverRatio;
+        // 차트 x축은 haversine 거리 프레임 — 선형 분율(lat/lon×ratio) 배치는 분율점의 실제 haversine
+        //   거리가 목표와 달라 중간 구간에서 수백 m 편차. 선형 직선상에서 목표 haversine 거리
+        //   dKm 에 정확히 도달하는 t 를 고정점 반복으로 역산 (h(t)≈t 비례라 2회면 sub-meter 수렴).
+        const dKm = losHoverRatio * haversineKm(rLat, rLon, losTarget.lat, losTarget.lon);
+        let t = losHoverRatio; // 초기값: 선형 근사 (레이더 근방 dKm≈0이면 그대로 사용)
+        if (dKm > 1e-6) {
+          for (let i = 0; i < 2; i++) {
+            const h = haversineKm(rLat, rLon, rLat + (losTarget.lat - rLat) * t, rLon + (losTarget.lon - rLon) * t);
+            if (h > 1e-9) t *= dKm / h;
+          }
+        }
+        const hoverLat = rLat + (losTarget.lat - rLat) * t;
+        const hoverLon = rLon + (losTarget.lon - rLon) * t;
         // 타겟 너머를 호버하면(단면도가 200NM까지 확장) 타겟→호버점 연장선으로 점을 방위선에 연결
         if (losHoverRatio > 1) {
           layers.push(

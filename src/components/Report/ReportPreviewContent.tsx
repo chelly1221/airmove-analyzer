@@ -9,12 +9,13 @@ import ReportPage, { ReportPageHeaderProvider } from "./ReportPage";
 import { OMEditProvider } from "./OMEditable";
 import ReportCoverPage from "./ReportCoverPage";
 import ReportOMSummarySection from "./ReportOMSummarySection";
+import ReportOMTargetHeatmapMap from "./ReportOMTargetHeatmapMap";
 import ReportOMCombinedDailyChart from "./ReportOMCombinedDailyChart";
 import ReportOMObstacleDetail from "./ReportOMObstacleDetail";
 import ReportOMFindings from "./ReportOMFindings";
 import ReportOMLossEvents from "./ReportOMLossEvents";
 import type {
-  RadarSite, ReportMetadata, ObstacleMonthlyResult, OMReportData,
+  RadarSite, ReportMetadata, ObstacleMonthlyResult, OMReportData, RadarMonthlyResult,
 } from "../../types";
 import type { ReportTemplate, ReportSections } from "../../utils/reportTransfer";
 
@@ -52,7 +53,8 @@ export interface ReportPreviewContentProps {
 export function getSectionToggles(_template: ReportTemplate, _sections: ReportSections): { key: keyof ReportSections; label: string }[] {
   return [
     { key: "cover", label: "표지" },
-    { key: "omSummary", label: "요약" },
+    { key: "omTargetHeatmap", label: "전체 표적 히트맵" },
+    { key: "omSummary", label: "분석 대상" },
     { key: "omDailyPsrLoss", label: "일별 PSR·표적소실" },
     { key: "omLosCrossSection", label: "장애물별 상세" },
     { key: "omLossEvents", label: "표적소실상세" },
@@ -101,10 +103,22 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
     return `${reportMetadata.organization}  |  레이더 장애물 월간 분석 보고서`;
   }, [reportMetadata.organization]);
 
+  // §1 결합 히트맵 대상 레이더 — 렌더마다 새 배열이 생기지 않게 최상위 useMemo 로 참조 안정화.
+  // (JSX 내 IIFE 로 만들면 부모 리렌더(인라인 편집 타이핑 등)마다 radars 참조가 바뀌어 자식의
+  //  geom useMemo 무효화 → 강도버퍼+블러 전체 재계산 + composeTiles 타일 재합성 재시작.)
+  const heatmapRadars = useMemo(
+    () =>
+      (omResult?.radar_results ?? [])
+        .map((rr) => ({ site: omData?.selectedRadarSites.find((r) => r.name === rr.radar_name), result: rr }))
+        .filter((x): x is { site: RadarSite; result: RadarMonthlyResult } => !!x.site),
+    [omResult, omData?.selectedRadarSites],
+  );
+
   // 활성 섹션 번호 계산
   const sectionNumbers = useMemo(() => {
     const nums: Record<string, number> = {};
     let n = 1;
+    if (sections.omTargetHeatmap) nums.omTargetHeatmap = n++;
     if (sections.omSummary) nums.omSummary = n++;
     if (sections.omDailyPsrLoss) nums.omDailyPsrLoss = n++;
     if (sections.omLosCrossSection && omData?.losMap && omData.losMap.size > 0) nums.omLosCrossSection = n++;
@@ -232,18 +246,27 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
       {/* ─── 장애물 월간 ─── */}
       {omResult && (
         <>
+          {/* §1 전체 표적 히트맵 — 모든 레이더를 합친 단일 페이지 1장(붉은 램프 결합 밀도, 위에서 본
+              전방위 전수). 상단(북) 데이터 경계 크롭 + 하단(남) 페이지 채움. 요약(§2) 앞.
+              heatmapRadars(최상위 useMemo — 참조 안정)가 비면(선택 레이더와 결과 매칭 0) 페이지 미렌더. */}
+          {sections.omTargetHeatmap && heatmapRadars.length > 0 && (
+            <div data-toc-key="omTargetHeatmap">
+              <ReportPage>
+                <ReportOMTargetHeatmapMap
+                  sectionNum={sectionNumbers.omTargetHeatmap ?? 1}
+                  radars={heatmapRadars}
+                />
+              </ReportPage>
+            </div>
+          )}
+
           {sections.omSummary && (
             <div data-toc-key="omSummary">
               <ReportOMSummarySection
                 sectionNum={sectionNumbers.omSummary ?? 1}
-                radarResults={omResult.radar_results}
                 selectedBuildings={omData.selectedBuildings}
                 buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
-                losMap={omData.losMap}
-                panoWithByRadar={omData.panoWithTargets}
-                panoWithoutByRadar={omData.panoWithoutTargets}
-                addedBlockageByKey={omData.addedBlockageByKey}
               />
             </div>
           )}

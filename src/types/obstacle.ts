@@ -113,6 +113,26 @@ export interface AddedBlockageResult {
   grade: { label: string; color: string };
 }
 
+/**
+ * 전체표적 히트맵 그리드 (레이더 중심 ±150NM, 전방위, 전수 카운트, 월간 누적).
+ * 표시 전용 — 보고서 통계 스코프(60NM)와 무관. 거리 컷(60NM) 이전에 그리드 bbox 이내 전 표적을
+ * 누적하므로 60NM 밖 표적도 표시 창 안이면 포함(§1 결합 히트맵 ReportOMTargetHeatmapMap).
+ * Rust TrackHeatmap 미러 (snake_case). 희소 — cells/counts 병렬 배열(점유 셀만).
+ * idx = iy * nx + ix (ix: 경도 방향 0..nx, iy: 위도 방향 0..ny).
+ * 셀 지오 사각형: lat0 = min_lat + iy*cell_deg_lat, lon0 = min_lon + ix*cell_deg_lon.
+ */
+export interface TrackHeatmap {
+  min_lat: number;
+  min_lon: number;
+  cell_deg_lat: number;
+  cell_deg_lon: number;
+  nx: number;
+  ny: number;
+  cells: number[];
+  counts: number[];
+  max_count: number;
+}
+
 /** 레이더별 월간 결과 */
 export interface RadarMonthlyResult {
   radar_name: string;
@@ -121,6 +141,8 @@ export interface RadarMonthlyResult {
   total_files_parsed: number;
   total_points_filtered: number;
   failed_files: string[];
+  /** 전체표적 히트맵 (±150NM 전방위 전수 밀도, 표시 전용 — 통계 스코프 60NM 와 무관) — 구버전 캐시엔 없을 수 있음 */
+  track_heatmap?: TrackHeatmap | null;
 }
 
 /** 장애물 월간 분석 전체 결과 */

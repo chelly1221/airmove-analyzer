@@ -54,7 +54,9 @@ interface LoadedState {
 function payloadToState(p: ReportWindowPayload): LoadedState {
   return {
     template: p.template,
-    sections: p.sections,
+    // 스프레드-디폴트: 페이로드에 없는(구버전) 섹션 키는 DEFAULT_SECTIONS 로 채워 기본 표시.
+    //   사용자가 명시적으로 끈 키(false)는 그대로 유지되고, 누락 키만 기본값(true)으로 폴백된다.
+    sections: { ...DEFAULT_SECTIONS, ...p.sections },
     coverTitle: p.coverTitle,
     coverSubtitle: p.coverSubtitle ?? format(new Date(), "yyyy년 MM월"),
     radarSite: p.radarSite,
@@ -546,7 +548,8 @@ export default function ReportApp() {
     if (activeTemplate !== "obstacle_monthly" || !activeSections || !omData) return [];
     const candidates: { key: string; name: string; visible: boolean }[] = [
       { key: "cover",             name: "표지",              visible: !!activeSections.cover },
-      { key: "omSummary",         name: "분석 요약",         visible: !!activeSections.omSummary },
+      { key: "omTargetHeatmap",   name: "전체 표적 히트맵",  visible: !!activeSections.omTargetHeatmap },
+      { key: "omSummary",         name: "분석 대상",         visible: !!activeSections.omSummary },
       { key: "omDailyPsrLoss",    name: "일별 PSR·표적소실", visible: !!activeSections.omDailyPsrLoss },
       { key: "omLosCrossSection", name: "장애물별 상세",     visible: !!activeSections.omLosCrossSection && omData.losMap.size > 0 },
       { key: "omLossEvents",      name: "표적소실 상세",     visible: !!activeSections.omLossEvents },

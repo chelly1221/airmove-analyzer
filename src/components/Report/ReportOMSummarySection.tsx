@@ -1,129 +1,52 @@
-import React, { useMemo } from "react";
-import type { RadarMonthlyResult, ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, LossPointGeo, PanoramaMergeResult } from "../../types";
-import type { AddedBlockageResult } from "../../types/obstacle";
-import {
-  weightedLossAvg, weightedLossStdDev,
-  weightedPsrAvg, weightedPsrStdDev,
-  gradeWithConfidence,
-} from "../../utils/omStats";
+import React from "react";
+import type { ManualBuilding, BuildingGroup, RadarSite } from "../../types";
 import { haversineKm, bearingDeg } from "../../utils/geo";
-import { classifyObstacleLosses, buildSiblings, BLDG_EFFECT_EPS_DEG } from "../../utils/obstacleAnalysisHelpers";
-import { fmtLossPct, fmtPsrPct } from "../../utils/omFormat";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
+import ReportOMTargetOverviewMap from "./ReportOMTargetOverviewMap";
 import BuildingGroupBadge from "./BuildingGroupBadge";
 import OMEditable from "./OMEditable";
 import { PAGE_CONTENT_MM } from "./reportPageConstants";
 
-/** 참고용 안내 기본 문구 (인라인 편집 가능) */
-const LOSS_LOGIC_NOTE =
-  "본 수치는 저장 자료 기반 자동 산출 추정치로, 레이더 원시 로그·정비 기록과 차이가 있을 수 있어 참고용으로만 활용 바람.";
-
 interface Props {
   sectionNum: number;
-  radarResults: RadarMonthlyResult[];
   selectedBuildings: ManualBuilding[];
-  /** 건물 그룹 메타 (인라인 배지 표시용) */
+  /** 건물 그룹 메타 (인라인 배지 + 위치 도면 그룹색용) */
   buildingGroups: BuildingGroup[];
   radarSites: RadarSite[];
-  /** 건물별 × 레이더별 LoS 결과 (key: `${radarName}_${buildingId}`) — 차단여부·음영소실 열용 */
-  losMap: Map<string, LoSProfileData>;
-  /** 레이더별 분석대상 포함/제외 파노라마 — 음영소실 분류를 AzElev 차트와 동일 소스(빨강영역)로 산출 */
-  panoWithByRadar?: Map<string, PanoramaMergeResult>;
-  panoWithoutByRadar?: Map<string, PanoramaMergeResult>;
-  /** 건물별 추가 차단영역 소실율 (key: `${radarName}_${buildingId}`) — 헤드라인 심각도 */
-  addedBlockageByKey?: Record<string, AddedBlockageResult>;
 }
 
 /**
- * 분석 요약 페이지 (페이지 1).
+ * 분석 대상 페이지 (페이지 1).
  *
  * 페이지 구성 순서(data-order="table-first"):
- *   1) 분석 대상 장애물 표 (.om-table)
- *   2) 참고 안내 박스 (.meta-merged)
- *   3) 레이더별 KPI 행 리스트 (.kpi-list, data-kpi="list")
+ *   1) 분석 대상 장애물 표 (.om-table) — 건물명·높이 + 레이더별 방위/거리(단일 헤더 행)
+ *   2) 분석 대상 위치 도면 (ReportOMTargetOverviewMap) — 레이더 + 전체 건물 위치 정적 지도
  *
- * 건물이 많으면 첫 페이지에 KPI/참고 안내를 두고 잔여 건물 표는 후속 페이지로
- * 분할. 페이지 inner padding 16/18mm + 새 KPI 행 리스트 높이를 반영한 추정치.
+ * 건물이 많으면 첫 페이지에 표 첫 슬라이스[+지도]를 두고 잔여 건물 표는 후속 페이지로 분할.
+ * 지도가 첫 페이지 예산에 못 들어가면 표 페이지들 뒤 별도 페이지에 단독 배치.
+ * (종전의 LoS 영향·추가소실율 열·참고 안내 박스·레이더별 KPI 판정 블록은 제거 — 자동 산출 추정
+ *  수치는 §5 종합 소견으로 일원화, 이 페이지는 '분석 대상'의 제원·위치만 제시.)
  */
 const HEADER_HEIGHT_MM = 14;
 const BLOCK_H3_MM = 8;        // "분석 대상 장애물" 제목 블록 (.block-h3, 15px + 하단여백 8px)
-const TABLE_HEADER_MM = 16;   // 2단 헤더 (레이더 그룹 + 방위/거리·LoS 영향·추가소실율)
+const TABLE_HEADER_MM = 8;    // 단일 헤더 행 (# · 건물명 · 높이 · 레이더별 방위/거리)
 const ROW_HEIGHT_MM = 7;
-const META_MERGED_MM = 14;   // 참고 안내 1행 (.meta-merged, 단문 1줄)
-const KPI_BLOCK_MM = 60;     // om-h3(~8mm) + 5행 × ~9.5mm + 블록 하단여백 12px ≈ 60mm
-const KPI_FAILED_NOTE_MM = 6; // KPI 블록 하단 파싱 실패 문단(text-[11px] 1줄) — 있을 때만 높이에 가산
+// 위치 도면 블록 = 제목(.block-h3 margin 14/8px + 15px 텍스트 ≈ 11mm) + 캔버스(콘텐츠 폭 182mm ×
+//   774/1376 ≈ 102.4mm) + 범례(mt-1 + 10px 1줄 ≈ 5mm) ≈ 118mm → 119mm (과소 추정 시 첫 페이지
+//   표 만행(滿行) 케이스에서 범례가 페이지 하단 overflow:hidden 에 잘리므로 보수적으로).
+const MAP_MM = 119;
 
 function ReportOMSummarySection({
   sectionNum,
-  radarResults,
   selectedBuildings,
   buildingGroups,
   radarSites,
-  losMap,
-  panoWithByRadar,
-  panoWithoutByRadar,
-  addedBlockageByKey,
 }: Props) {
-  // 레이더별 소실표적 (음영소실 분류용) — daily_stats 의 loss_points_summary 집계
-  const lossPointsByRadar = useMemo(() => {
-    const m = new Map<string, LossPointGeo[]>();
-    for (const rr of radarResults) {
-      const all: LossPointGeo[] = [];
-      for (const ds of rr.daily_stats) {
-        for (const lp of ds.loss_points_summary) all.push(lp);
-      }
-      m.set(rr.radar_name, all);
-    }
-    return m;
-  }, [radarResults]);
-
-  // radar 좌표 시그니처 — radarSites 객체가 in-place 변경(참조 유지)돼도 재계산 트리거.
-  //   Detail.siblings 가 [radarSite.latitude, radarSite.longitude, radarSite.name] 에 의존 → 동일 민감도로 동기화(sibling 오귀속 일치).
-  const radarGeoKey = radarSites.map((r) => `${r.latitude},${r.longitude},${r.name}`).join(";");
-
-  // 건물×레이더: 음영소실(장애물 추가 기인) 이벤트 건수(distinct event_id) + 추가 차단 여부 —
-  //   AzElevChart·§3 요약표와 동일 분류(classifyObstacleLosses). '…건' 표시는 스키마 계약대로 이벤트 단위
-  //   (같은 gap 의 보간점을 점 개수로 세면 과대 — buildingEventCount 사용).
-  //   hasBldgEffect = 대상 차단각(with) > 지형·기존지물 차단각(without)+BLDG_EFFECT_EPS_DEG(0.005°)
-  //   → §3 AzElevChart·단면도 배지·소견 프로즈(hasBldgEffectFromPanorama)와 동일 기준('LoS 영향' 단일 의미,
-  //     2026-07-03 일괄 통일 — 종전 §3 배지의 '가시선 차단' 기준과 상반 표기되던 문제 해소).
-  //   추가 차단 양각이 없으면(지형 이하) 'LoS 영향' 열을 O(영향)가 아닌 X(무영향)로 표기.
-  //   panoAvailable = 해당 레이더 파노라마 가용 여부 — 미가용이면 샘플러 null 로 두 각 모두 0(판정 근거 없음)이라
-  //   X(무영향)로 단정하지 않고 '—'(판정 불가)로 표기하기 위한 플래그.
-  const obstacleInfoByKey = useMemo(() => {
-    const m = new Map<string, { shadowLoss: number; hasBldgEffect: boolean; panoAvailable: boolean }>();
-    for (const r of radarSites) {
-      const panoAvailable = !!panoWithByRadar?.get(r.name);
-      for (const b of selectedBuildings) {
-        if (!losMap.has(`${r.name}_${b.id}`)) continue;
-        // sibling — buildSiblings 단일 산식(§3 상세·§4 소실상세와 동일). LoS 결과 없는(=classify 미실행)
-        //   건물은 제외해, 집계 못 할 건물이 소실표적 소유권만 가져가 누락시키는 것 방지.
-        const siblings = buildSiblings(r, selectedBuildings, b.id, losMap);
-        const { buildingEventCount, angleTotalDeg, angleTerrainDeg } = classifyObstacleLosses(r, b, lossPointsByRadar.get(r.name) ?? [], {
-          panoWith: panoWithByRadar?.get(r.name),
-          panoWithout: panoWithoutByRadar?.get(r.name),
-          siblings,
-        });
-        // 추가 차단 양각 존재 여부 (AzElevChart hasBldgEffect 와 동일 임계 BLDG_EFFECT_EPS_DEG)
-        const hasBldgEffect = angleTotalDeg > angleTerrainDeg + BLDG_EFFECT_EPS_DEG;
-        m.set(`${r.name}_${b.id}`, { shadowLoss: buildingEventCount, hasBldgEffect, panoAvailable });
-      }
-    }
-    return m;
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- radarGeoKey 는 radarSites 가 참조 유지된 채 좌표만 in-place 변경돼도 재계산시키기 위함(rule 이 루프 내 r.latitude/longitude 접근을 추적 못해 'unnecessary' 로 오판). Detail.siblings 와 동기화 보장.
-  }, [selectedBuildings, radarSites, radarGeoKey, losMap, lossPointsByRadar, panoWithByRadar, panoWithoutByRadar]);
-
-  // 첫 페이지에 들어갈 수 있는 건물 행 수 계산 — KPI 블록 높이는 파싱 실패 문단(있을 때만) 가산
-  const kpiHeightsMm = radarResults.map((rr) => KPI_BLOCK_MM + (rr.failed_files.length > 0 ? KPI_FAILED_NOTE_MM : 0));
-  const kpiTotalMm = kpiHeightsMm.reduce((s, h) => s + h, 0);
-  const fixedFirstMm = HEADER_HEIGHT_MM + BLOCK_H3_MM + TABLE_HEADER_MM + META_MERGED_MM;
-  // 레이더 4개+ 처럼 KPI 총고만으로 첫 페이지 예산(263mm)을 넘보면 KPI 를 별도 페이지로 분리 —
-  //   종전엔 행 하한 3을 강제한 채 KPI 를 전부 첫 페이지에 배치해 .report-page overflow:hidden 에서
-  //   뒤쪽 KPI 블록이 통째로 잘려 PDF 에서 유실됐다(확정 오버플로우). 건물 표 최소 3행 + KPI 전체가
-  //   예산 안에 들어올 때만 첫 페이지 동거.
-  const kpiOnFirstPage = PAGE_CONTENT_MM - fixedFirstMm - kpiTotalMm >= 3 * ROW_HEIGHT_MM;
-  const availForRows = PAGE_CONTENT_MM - fixedFirstMm - (kpiOnFirstPage ? kpiTotalMm : 0);
+  // 첫 페이지에 표 ≥3행 + 지도가 함께 들어갈 예산이 되면 동거, 아니면 지도는 별도 페이지.
+  const fixedFirstMm = HEADER_HEIGHT_MM + BLOCK_H3_MM + TABLE_HEADER_MM;
+  const mapOnFirstPage = PAGE_CONTENT_MM - fixedFirstMm - MAP_MM >= 3 * ROW_HEIGHT_MM;
+  const availForRows = PAGE_CONTENT_MM - fixedFirstMm - (mapOnFirstPage ? MAP_MM : 0);
   const maxRowsFirstPage = Math.max(3, Math.floor(availForRows / ROW_HEIGHT_MM));
   // 후속 페이지에 들어갈 수 있는 행 수 (섹션 헤더 + 테이블 헤더만)
   const maxRowsNextPage = Math.floor((PAGE_CONTENT_MM - HEADER_HEIGHT_MM - TABLE_HEADER_MM) / ROW_HEIGHT_MM);
@@ -131,7 +54,7 @@ function ReportOMSummarySection({
   const totalBuildings = selectedBuildings.length;
   const needsSplit = totalBuildings > maxRowsFirstPage;
 
-  // ── 분석 대상 장애물 표 (2단 헤더: 레이더 그룹 × 방위/거리·LoS·추가소실율) ──────────
+  // ── 분석 대상 장애물 표 (단일 헤더: # · 건물명 · 높이 · {레이더명} 방위/거리) ──────────
   const renderBuildingTable = (buildings: ManualBuilding[], startIdx: number) => (
     <table className="om-table">
       <thead>
@@ -140,19 +63,7 @@ function ReportOMSummarySection({
           <th className="ta-l">건물명</th>
           <th className="ta-r">높이(m)</th>
           {radarSites.map((r) => (
-            <th key={r.name} colSpan={3} className="ta-c">{r.name}</th>
-          ))}
-        </tr>
-        <tr className="sub">
-          <th />
-          <th />
-          <th />
-          {radarSites.map((r) => (
-            <React.Fragment key={`sh-${r.name}`}>
-              <th className="ta-c sm">방위/거리</th>
-              <th className="ta-c sm">LoS 영향</th>
-              <th className="ta-c sm">추가소실율</th>
-            </React.Fragment>
+            <th key={r.name} className="ta-c">{r.name} 방위/거리</th>
           ))}
         </tr>
       </thead>
@@ -170,47 +81,8 @@ function ReportOMSummarySection({
               {radarSites.map((r) => {
                 const az = bearingDeg(r.latitude, r.longitude, b.latitude, b.longitude);
                 const dist = haversineKm(r.latitude, r.longitude, b.latitude, b.longitude);
-                const los = losMap.get(`${r.name}_${b.id}`);
-                const info = obstacleInfoByKey.get(`${r.name}_${b.id}`);
-                const shadowLoss = info?.shadowLoss ?? 0;
-                // LoS 영향 O = 대상 건물이 기존 지형지물 대비 추가 차단 양각을 만드는 경우만(hasBldgEffect —
-                //   §3 단면도 배지·AzElevChart·소견 프로즈와 동일 기준). 추가 차단각이 없으면(지형 이하)
-                //   직선 LoS 가 지형에 막혀도 X(무영향)로 표기.
-                //   해당 레이더 파노라마 미가용(계산 실패/미준비) 시엔 판정 근거가 없으므로 X 로 단정하지 않고
-                //   '—'(판정 불가) 표기 — '추가소실율' 열의 '—' 폴백과 동일한 3-상태.
-                const blocked = info?.hasBldgEffect ?? false;
-                const bldgEffectKnown = info?.panoAvailable ?? false;
-                const blockage = addedBlockageByKey?.[`${r.name}_${b.id}`];
                 return (
-                  <React.Fragment key={`cell-${r.name}-${b.id}`}>
-                    <td className="ta-c mono sm">{az.toFixed(1)}° / {dist.toFixed(1)}km</td>
-                    <td className="ta-c sm">
-                      {los && bldgEffectKnown ? (
-                        <span className={`badge ${blocked ? "bad" : "ok"}`}>
-                          {blocked ? "O" : "X"}
-                        </span>
-                      ) : (
-                        <span className="muted">—</span>
-                      )}
-                    </td>
-                    <td className="ta-c mono sm">
-                      {!los ? (
-                        <span className="muted">—</span>
-                      ) : blockage ? (
-                        // 추가 차단 구간 미형성(BLOCKAGE_NONE_LABEL)은 라벨 대신 0.00%로 표시 — 비율 정의상 추가 소실 없음.
-                        blockage.grade.label === "항적 없음" || blockage.grade.label === "판정 불가"
-                          ? <span className="muted">{blockage.grade.label}</span>
-                          : <span style={{ color: blockage.grade.color, fontWeight: 600 }} title={`음영소실 ${shadowLoss}건`}>
-                              {blockage.lossRatePct.toFixed(2)}%
-                            </span>
-                      ) : (
-                        // 파노라마/히스토그램 미가용(리로드 등) → 음영소실 건수 폴백
-                        shadowLoss > 0
-                          ? <span style={{ color: "#a60739", fontWeight: 600 }}>{shadowLoss}건</span>
-                          : <span className="muted">—</span>
-                      )}
-                    </td>
-                  </React.Fragment>
+                  <td key={r.name} className="ta-c mono sm">{az.toFixed(1)}° / {dist.toFixed(1)}km</td>
                 );
               })}
             </tr>
@@ -220,123 +92,39 @@ function ReportOMSummarySection({
     </table>
   );
 
-  // ── 참고 안내 (.meta-merged) ──────────────────────────────────────────
-  const renderMetaMerged = () => (
-    <div className="meta-merged">
-      <div className="meta-merged-row formula">
-        <OMEditable id="summary.lossLogicNote" value={LOSS_LOGIC_NOTE} tag="div" />
-      </div>
-    </div>
+  // ── 분석 대상 위치 도면 (레이더 + 전체 건물 정적 지도) ──
+  const renderMap = () => (
+    <ReportOMTargetOverviewMap
+      buildings={selectedBuildings}
+      buildingGroups={buildingGroups}
+      radarSites={radarSites}
+    />
   );
 
-  // ── 레이더별 KPI 행 리스트 ─────────────────────────────────────────────
-  // 평균 표적소실율·평균 PSR율(±σ) 자릿수는 종합 소견 판정 카드(ReportOMFindings)·자동 소견 문구와
-  //   공용 포맷(fmtLossPct/fmtPsrPct, 소수 2자리)으로 통일 — 같은 수치가 페이지마다 다르게 보이지 않도록.
-  const renderKPIBlock = (rr: RadarMonthlyResult) => {
-    const days = rr.daily_stats.length;
-    const avgPsr = weightedPsrAvg(rr.daily_stats) * 100;
-    const psrSigma = weightedPsrStdDev(rr.daily_stats) * 100;
-    const avgLoss = weightedLossAvg(rr.daily_stats);
-    const lossSigma = weightedLossStdDev(rr.daily_stats);
-    const totalPts = rr.total_points_filtered;
-    const grade = gradeWithConfidence(avgLoss, days);
-    // 종합 판정 행에 등급 색을 인라인 CSS 변수로 주입 → .kpi.grade 에서 사용
-    const gradeVars = { "--grade-bg": grade.bg, "--grade-color": grade.color } as React.CSSProperties;
-
-    return (
-      <div key={rr.radar_name} className="kpi-block">
-        <h3 className="om-h3">{rr.radar_name}</h3>
-        <div className="kpi-list">
-          <div className="kpi grade" style={gradeVars}>
-            <p className="kpi-label">종합 판정</p>
-            <p className="kpi-val">{grade.label}</p>
-            <p className="kpi-sigma" />
-          </div>
-          <div className="kpi">
-            <p className="kpi-label">분석일수</p>
-            <p className="kpi-val">{days}일</p>
-            <p className="kpi-sigma" />
-          </div>
-          <div className="kpi">
-            <p className="kpi-label">분석 포인트</p>
-            <p className="kpi-val">{totalPts.toLocaleString()}</p>
-            <p className="kpi-sigma" />
-          </div>
-          <div className="kpi">
-            <p className="kpi-label">평균 PSR율</p>
-            <p className="kpi-val" style={{ color: "var(--om-accent)" }}>{fmtPsrPct(avgPsr)}%</p>
-            <p className="kpi-sigma">±{fmtPsrPct(psrSigma)}%p</p>
-          </div>
-          <div className="kpi">
-            <p className="kpi-label">평균 표적소실율</p>
-            <p className="kpi-val" style={{ color: "#a60739" }}>{fmtLossPct(avgLoss)}%</p>
-            <p className="kpi-sigma">±{fmtLossPct(lossSigma)}%p</p>
-          </div>
-        </div>
-        {rr.failed_files.length > 0 && (
-          <p className="mt-1 text-[11px]" style={{ color: "#dc2626" }}>
-            파싱 실패: {rr.failed_files.length}건 ({rr.failed_files.map((f) => f.split(/[/\\]/).pop()).join(", ")})
-          </p>
-        )}
-      </div>
-    );
-  };
-  const renderKPIBlocks = () => radarResults.map(renderKPIBlock);
-
-  // ── KPI 별도 페이지 빌더 — 첫 페이지 예산 초과 시(kpiOnFirstPage=false) 레이더 KPI 블록을
-  //   페이지당 예산(헤더 제외) 안에서 순서 유지 그리디 분할해 후속 페이지로 렌더 ──
-  const buildKpiPages = (): React.ReactNode[] => {
-    const budget = PAGE_CONTENT_MM - HEADER_HEIGHT_MM;
-    const groups: RadarMonthlyResult[][] = [];
-    let cur: RadarMonthlyResult[] = [];
-    let curMm = 0;
-    radarResults.forEach((rr, i) => {
-      const h = kpiHeightsMm[i];
-      if (cur.length > 0 && curMm + h > budget) {
-        groups.push(cur);
-        cur = [];
-        curMm = 0;
-      }
-      cur.push(rr);
-      curMm += h;
-    });
-    if (cur.length > 0) groups.push(cur);
-    return groups.map((group, i) => (
-      <ReportPage key={`summary-kpi-${i}`}>
-        <ReportOMSectionHeader
-          sectionNum={sectionNum}
-          title={`분석 요약 (계속) — 레이더별 지표${groups.length > 1 ? ` (${i + 1}/${groups.length})` : ""}`}
-        />
-        {group.map(renderKPIBlock)}
-      </ReportPage>
-    ));
-  };
-
-  // ── 분할 불필요: 한 페이지 (건물 표 + KPI 전부 첫 페이지 예산 내) ──
-  if (!needsSplit && kpiOnFirstPage) {
+  // ── 분할 불필요 + 지도 동거: 한 페이지 (표 전량 + 지도) ──
+  if (!needsSplit && mapOnFirstPage) {
     return (
       <ReportPage>
         <ReportOMSectionHeader
           sectionNum={sectionNum}
-          title="분석 요약"
+          title="분석 대상"
           editId="summary.title"
         />
         <OMEditable id="summary.bldgHeader" value="분석 대상 장애물" tag="div" className="block-h3" style={{ marginTop: 0 }} />
         {renderBuildingTable(selectedBuildings, 0)}
-        {renderMetaMerged()}
-        {renderKPIBlocks()}
+        {renderMap()}
       </ReportPage>
     );
   }
 
-  // ── 분할 필요: 첫 페이지(건물 표 [+ KPI]) + 후속 페이지(잔여 건물 표) [+ KPI 별도 페이지] ──
+  // ── 분할/별도 지도 페이지: 첫 페이지(표 [+지도]) + 후속 페이지(잔여 표) [+ 지도 단독 페이지] ──
   const pages: React.ReactNode[] = [];
   const firstSlice = selectedBuildings.slice(0, maxRowsFirstPage);
   pages.push(
     <ReportPage key="summary-0">
       <ReportOMSectionHeader
         sectionNum={sectionNum}
-        title="분석 요약"
+        title="분석 대상"
         editId="summary.title"
       />
       <div className="block-h3" style={{ marginTop: 0 }}>
@@ -344,8 +132,7 @@ function ReportOMSummarySection({
         {needsSplit && <>{" "}({totalBuildings}건 중 1–{maxRowsFirstPage})</>}
       </div>
       {renderBuildingTable(firstSlice, 0)}
-      {renderMetaMerged()}
-      {kpiOnFirstPage && renderKPIBlocks()}
+      {mapOnFirstPage && renderMap()}
     </ReportPage>,
   );
 
@@ -357,7 +144,7 @@ function ReportOMSummarySection({
       <ReportPage key={`summary-${pageIdx}`}>
         <ReportOMSectionHeader
           sectionNum={sectionNum}
-          title={`분석 요약 (계속) — 장애물 ${offset + 1}–${Math.min(offset + maxRowsNextPage, totalBuildings)}/${totalBuildings}`}
+          title={`분석 대상 (계속) — 장애물 ${offset + 1}–${Math.min(offset + maxRowsNextPage, totalBuildings)}/${totalBuildings}`}
         />
         {renderBuildingTable(slice, offset)}
       </ReportPage>,
@@ -366,9 +153,17 @@ function ReportOMSummarySection({
     pageIdx++;
   }
 
-  // KPI 를 첫 페이지에 못 실은 경우 — 건물 표 페이지들 뒤에 레이더별 KPI 페이지 추가(잘림 없는 전량 렌더)
-  if (!kpiOnFirstPage) {
-    for (const p of buildKpiPages()) pages.push(p);
+  // 지도를 첫 페이지에 못 실은 경우 — 표 페이지들 뒤에 위치 도면 단독 페이지 추가
+  if (!mapOnFirstPage) {
+    pages.push(
+      <ReportPage key="summary-map">
+        <ReportOMSectionHeader
+          sectionNum={sectionNum}
+          title="분석 대상 (계속) — 위치 도면"
+        />
+        {renderMap()}
+      </ReportPage>,
+    );
   }
 
   return <>{pages}</>;

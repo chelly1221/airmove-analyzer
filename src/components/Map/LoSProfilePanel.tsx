@@ -142,6 +142,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   // GPU 렌더링 (항적 포인트)
   const trackCanvasRef = useRef<HTMLCanvasElement>(null);
   const gpu2dRef = useRef<GPU2D | null>(null);
+  // WebGL 컨텍스트 복구 세대 — contextrestored 시 증가시켜 GPU 재초기화·재그리기 트리거
+  const [gpuEpoch, setGpuEpoch] = useState(0);
   // 안정적인 콜백 ref (useCallback 의존성 최소화)
   const hoveredTrackIdxRef = useRef<number | null>(null);
   const pinnedTrackIdxRef = useRef<number | null>(null);
@@ -245,14 +247,35 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         //   지형/최저탐지선·항적점이 200NM 까지 그려지므로(줌아웃) 건물도 같은 범위로 조회해야 줌 어느 단계에서나
         //   선과 건물이 함께 보인다. farLat/farLon 은 레이더→타겟 방위선상의 200NM 점(위 프로파일 종점과 동일).
         //   백엔드가 코리도를 세그먼트 bbox 로 조회하므로 장거리 연장도 빠름.
+        // 이번 effect 런에서 조회한 건물 (조회 실패 시 빈 배열) — 아래 산 이름 결정에 상태 buildings 대신
+        //   이 로컬 값을 사용해 타겟 변경 시 이전 타겟 건물을 참조하는 stale closure 방지
+        let bldgs: BuildingOnPath[] = [];
         try {
-          const bldgs: BuildingOnPath[] = await invoke("query_buildings_along_path", {
+          bldgs = await invoke<BuildingOnPath[]>("query_buildings_along_path", {
             radarLat: radarSite.latitude,
             radarLon: radarSite.longitude,
             targetLat: farLat,
             targetLon: farLon,
             corridorWidthM: 100.0,
           });
+          // building.rs 는 건물 거리를 (평면 직선 파라메트릭 t)×(haversine 총거리)로 반환 — 지형 축은
+          //   평면 보간점의 haversine 라벨이라 대각·장거리 중간 구간에서 수백 m 벌어짐.
+          //   동일 보간 구성으로 t→haversine 재라벨링해 지형·항적점과 x축 프레임 통일.
+          //   (단일 choke-point: setBuildings·아래 산 이름 루프 모두 변환값 사용)
+          const totalHavKm = haversineKm(radarSite.latitude, radarSite.longitude, farLat, farLon);
+          if (totalHavKm > 1e-6) {
+            const toHav = (d: number): number => {
+              const t = Math.min(1, Math.max(0, d / totalHavKm));
+              const [hLat, hLon] = interpolate(radarSite.latitude, radarSite.longitude, farLat, farLon, t);
+              return haversineKm(radarSite.latitude, radarSite.longitude, hLat, hLon);
+            };
+            bldgs = bldgs.map((b) => ({
+              ...b,
+              distance_km: toHav(b.distance_km),
+              near_dist_km: b.near_dist_km != null ? toHav(b.near_dist_km) : b.near_dist_km,
+              far_dist_km: b.far_dist_km != null ? toHav(b.far_dist_km) : b.far_dist_km,
+            }));
+          }
           if (!cancelled && bldgs.length > 0) {
             // 백엔드(query_buildings_along_path)가 GIS 건물 지반을 centroid SRTM(live)로, 수동 건물은 사용자 입력값으로 제공함
             setBuildings(bldgs);
@@ -269,16 +292,16 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           const di = points[i].distance;
           if (di <= 0) continue;
           if (di > totalDist) break; // 산 이름은 타겟까지의 차단 지형만 대상 (원거리 확장 구간 제외)
-          // 건물을 포함한 effective elevation 사용
+          // 건물을 포함한 effective elevation 사용 — 산 이름은 "지형+건물 통합 장애물" 모델 기준의
+          //   결정적 값이어야 하므로 showBuildings 토글과 무관하게, 이번 런에서 조회한 bldgs 사용
+          //   (상태 buildings 는 이 effect 의존성 밖이라 타겟 변경 시 이전 타겟 값으로 stale)
           let elev = points[i].elevation;
-          if (showBuildings) {
-            for (const b of buildings) {
-              const nearD = b.near_dist_km ?? b.distance_km;
-              const farD = b.far_dist_km ?? b.distance_km;
-              if (di >= nearD - 0.05 && di <= farD + 0.05) {
-                const bTop = b.ground_elev_m + b.height_m;
-                if (bTop > elev) elev = bTop;
-              }
+          for (const b of bldgs) {
+            const nearD = b.near_dist_km ?? b.distance_km;
+            const farD = b.far_dist_km ?? b.distance_km;
+            if (di >= nearD - 0.05 && di <= farD + 0.05) {
+              const bTop = b.ground_elev_m + b.height_m;
+              if (bTop > elev) elev = bTop;
             }
           }
           const adjH = elev - curvDrop(di);
@@ -506,9 +529,12 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       height: radarHeight + p.distance * 1000 * Math.tan((BRA_DEG * Math.PI) / 180),
     }));
 
-    // 차단 판정 (실제 지구 프레임에서 지형 vs 레이더→타겟 직선)
-    const losStraightH = (d: number) =>
-      radarHeight + (adjTarget - radarHeight) * (d / D);
+    // 차단 판정 — 4/3 유효지구 현(chord): 레이더↔타겟 직선을 4/3 프레임에서 평가
+    //   (지도측 los.rs·OM 보고서 computeLosBlockage 와 동일 식 — 실제지구 판정은 4/3 대비
+    //   d(D−d)/(8R)만큼 비관적이라 경계 케이스에서 배지·건물 분류가 지도와 뒤집힘)
+    const adjTarget43 = targetElev - curvDrop43(D);
+    const chord43H = (d: number) =>
+      radarHeight + (adjTarget43 - radarHeight) * (d / D);
     let blocked = false;
     let maxBlockPoint: {
       distance: number;
@@ -517,17 +543,17 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       name?: string;
     } | null = null;
     let maxExcess = 0;
-    // 통합 장애물로 차단 판정 (지형 + 건물)
+    // 통합 장애물로 차단 판정 (지형 + 건물) — 판정(excess·blocked)만 4/3,
+    //   마커 좌표(adjHeight)는 차트 yScale·isBlocking 비교와 같은 디스플레이(실제지구) 프레임 유지
     for (const ob of obstacles) {
       if (ob.distance <= 0 || ob.distance >= D) continue;
-      const adjH = ob.elevation - curvDrop(ob.distance);
-      const excess = adjH - losStraightH(ob.distance);
+      const excess = (ob.elevation - curvDrop43(ob.distance)) - chord43H(ob.distance);
       if (excess > maxExcess) {
         maxExcess = excess;
         blocked = true;
         maxBlockPoint = {
           distance: ob.distance,
-          adjHeight: adjH,
+          adjHeight: ob.elevation - curvDrop(ob.distance),
           realElevation: ob.elevation,
         };
       }
@@ -681,20 +707,21 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (!chartData) return null;
     const { adjTerrain, minDetStraight, minDetFresnel, braLine,
             significantBuildings, maxDistance, minY: fullMinY, maxY: fullMaxY } = chartData;
-    // 전체 줌이면 기존 범위 그대로
-    if (xZoom[0] === 0 && xZoom[1] === 100) return { minY: fullMinY, maxY: fullMaxY };
-
-    const zoomStart = (xZoom[0] / 100) * maxDistance;
-    const zoomEnd = (xZoom[1] / 100) * maxDistance;
+    // Y 자동범위는 표시 중인 레이어만 반영 — 숨겨진 BRA(200NM에서 1,600m+) 등이 maxY를 부풀리면
+    //   m/px가 커져 건물이 서브픽셀로 떨어져 사라지므로, 실제 그려지는 시리즈만 높이 수집에 포함.
+    //   full-zoom(전체 거리)·줌인(윈도우) 모두 동일한 레이어-인지 로직을 태워 범위 출렁임 제거.
+    const fullZoom = xZoom[0] === 0 && xZoom[1] === 100;
+    const zoomStart = fullZoom ? 0 : (xZoom[0] / 100) * maxDistance;
+    const zoomEnd = fullZoom ? maxDistance : (xZoom[1] / 100) * maxDistance;
     const inRange = (d: number) => d >= zoomStart && d <= zoomEnd;
 
-    // 보이는 구간 내 높이값 수집
+    // 보이는 구간 내 높이값 수집 (표시 레이어만; cos는 원래 미포함 — 매우 가파름)
     const heights: number[] = [];
-    for (const p of adjTerrain) if (inRange(p.distance)) heights.push(p.height);
-    for (const p of minDetStraight) if (inRange(p.distance)) heights.push(p.height);
-    for (const p of minDetFresnel) if (inRange(p.distance)) heights.push(p.height);
-    for (const p of braLine) if (inRange(p.distance)) heights.push(p.height);
-    // 건물 꼭대기
+    if (layers.terrain) for (const p of adjTerrain) if (inRange(p.distance)) heights.push(p.height);
+    if (layers.los43) for (const p of minDetStraight) if (inRange(p.distance)) heights.push(p.height);
+    if (layers.fresnel) for (const p of minDetFresnel) if (inRange(p.distance)) heights.push(p.height);
+    if (layers.bra) for (const p of braLine) if (inRange(p.distance)) heights.push(p.height);
+    // 건물 꼭대기 (significantBuildings는 이미 showBuildings에 종속)
     for (const b of significantBuildings) {
       const nearD = b.near_dist_km ?? b.distance_km;
       const farD = b.far_dist_km ?? b.distance_km;
@@ -706,6 +733,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     // 레이더 높이 (시작점이 보이면)
     if (zoomStart <= 0.1) heights.push(radarHeight);
 
+    // 표시 레이어가 모두 꺼져 수집값이 없으면 기존 전체 범위로 폴백
     if (heights.length === 0) return { minY: fullMinY, maxY: fullMaxY };
 
     let rawMin = Infinity, rawMax = -Infinity;
@@ -714,13 +742,13 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const padding = Math.max(range * 0.12, 50); // 최소 50m 여유
     const visMinY = rawMin - padding;
     let visMaxY = rawMax + padding;
-    // 0ft가 차트 40% 이하에 오도록 보장 (기존 로직과 동일)
+    // 0ft가 차트 40% 이하에 오도록 보장 (full-zoom·줌인 두 경로 공통)
     if (visMinY < 0) {
       const minMaxYFor40Pct = -visMinY * 1.5;
       if (visMaxY < minMaxYFor40Pct) visMaxY = minMaxYFor40Pct;
     }
     return { minY: visMinY, maxY: visMaxY };
-  }, [chartData, xZoom, radarHeight]);
+  }, [chartData, xZoom, radarHeight, layers.terrain, layers.los43, layers.fresnel, layers.bra]);
 
   // ── GPU: 항적 포인트 좌표 사전계산 (히트테스트 + 렌더링 공용) ──
   const trackPointPositions = useMemo(() => {
@@ -756,6 +784,21 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const canvas = trackCanvasRef.current;
     const svg = svgRef.current;
     if (!canvas || !svg || !losTrackPoints) return;
+    // WebGL 컨텍스트 소실 복구: lost 는 preventDefault 로 복구 허용,
+    //   restored 시 GPU2D 재생성 + gpuEpoch 증가로 재그리기 (미처리 시 타겟 재지정 전까지 포인트 소실)
+    const onCtxLost = (e: Event) => e.preventDefault();
+    const onCtxRestored = () => {
+      gpu2dRef.current?.dispose();
+      gpu2dRef.current = null;
+      setGpuEpoch((v) => v + 1);
+    };
+    canvas.addEventListener("webglcontextlost", onCtxLost);
+    canvas.addEventListener("webglcontextrestored", onCtxRestored);
+    // 캔버스 엘리먼트 교체 시 리스너 정리/재부착 — 모든 조기 return 경로에서도 반환할 것
+    const cleanup = () => {
+      canvas.removeEventListener("webglcontextlost", onCtxLost);
+      canvas.removeEventListener("webglcontextrestored", onCtxRestored);
+    };
     // 캔버스 엘리먼트가 변경되면 GPU2D 재생성 (로딩 후 새 캔버스)
     if (gpu2dRef.current && gpuCanvasElRef.current !== canvas) {
       gpu2dRef.current.dispose();
@@ -768,7 +811,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         gpuCanvasElRef.current = canvas;
       } catch (e) {
         console.warn('[LoS] WebGL2 초기화 실패:', e);
-        return;
+        return cleanup;
       }
     }
     const gpu = gpu2dRef.current;
@@ -776,7 +819,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const rect = svg.getBoundingClientRect();
     gpu.syncSize(rect.width, rect.height);
     gpu.clear();
-    if (trackPointPositions.length === 0) { gpu.flush(); return; }
+    if (trackPointPositions.length === 0) { gpu.flush(); return cleanup; }
     // 차트 영역 클리핑
     gpu.scissor(PAD.left, PAD.top, cw, ch);
     const circles: CircleData[] = [];
@@ -808,7 +851,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     gpu.drawCircles(circles);
     gpu.noScissor();
     gpu.flush();
-  }, [trackPointPositions, losTrackPoints, hoveredTrackIdx, pinnedTrackIdx, externalHoverIdx, chartData]);
+    return cleanup;
+  }, [trackPointPositions, losTrackPoints, hoveredTrackIdx, pinnedTrackIdx, externalHoverIdx, chartData, gpuEpoch]);
 
   // X축 줌 네이티브 휠 핸들러 (passive: false 필수)
   useEffect(() => {
@@ -992,14 +1036,11 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (hoverX === null || !chartData || profile.length === 0) return null;
     const { adjTerrain, minDetStraight, minDetFresnel, maxDistance } = chartData;
 
-    const PAD_LEFT = 65;
-    const PAD_RIGHT = 30;
-    const cw = 900 - PAD_LEFT - PAD_RIGHT;
-    // 줌 뷰포트 반영
+    // 줌 뷰포트 반영 (PAD/cw 는 컴포넌트 차트 상수 공용 — 로컬 재정의 금지)
     const zoomStart = xZoom[0] / 100 * maxDistance;
     const zoomEnd = xZoom[1] / 100 * maxDistance;
     const zoomRange = zoomEnd - zoomStart;
-    const dist = zoomStart + ((hoverX - PAD_LEFT) / cw) * zoomRange;
+    const dist = zoomStart + ((hoverX - PAD.left) / cw) * zoomRange;
     if (dist < zoomStart || dist > zoomEnd) return null;
 
     // 거리 기반 선형 보간 헬퍼 (각 배열이 자체 distance를 가지므로 독립 보간)
@@ -1018,7 +1059,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     // 프로파일에서 보간하여 값 계산
     const terrainH = lerpAt(adjTerrain, dist);
-    let realElev = 0;
+    // 호버 거리가 마지막 프로파일 점(haversine 거리)을 넘으면 보간 미발견 → 끝점 고도로 폴백 (0ft 오표기 방지)
+    let realElev = profile[profile.length - 1].elevation;
     for (let i = 1; i < profile.length; i++) {
       if (profile[i].distance >= dist) {
         const denom = profile[i].distance - profile[i - 1].distance;
@@ -1211,11 +1253,12 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           const bxNear = xScale(nearD);
           const bxFar = hasExtent ? xScale(farD) : bxNear;
           const byBottomNear = yScale(nearGroundAdj);
-          const byTopNear = yScale(nearTopAdj);
+          let byTopNear = yScale(nearTopAdj);
           const byBottomFar = hasExtent ? yScale(farGroundAdj) : byBottomNear;
-          const byTopFar = hasExtent ? yScale(farTopAdj) : byTopNear;
-          const bHeight = byBottomNear - byTopNear;
-          if (bHeight < 1) return null;
+          let byTopFar = hasExtent ? yScale(farTopAdj) : byTopNear;
+          // 줌아웃으로 픽셀 높이가 1px 미만이 되면 건물이 통째로 사라지므로, top 을 bottom−2px 로 올려 최소 2px 실루엣 보장
+          if (byBottomNear - byTopNear < 2) byTopNear = byBottomNear - 2;
+          if (byBottomFar - byTopFar < 2) byTopFar = byBottomFar - 2;
           const isHovered = hoveredBldgIdx === bi;
           const isClicked = clickedBldgIdx === bi;
           // 수동 건물 그룹 색상 조회
