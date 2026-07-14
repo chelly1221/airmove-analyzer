@@ -301,7 +301,8 @@ fn process_baseline_day(
                     let avg_spd = (prev.speed + next.speed) / 2.0;
                     (next.speed - prev.speed).abs() / avg_spd
                 } else { 0.0 };
-                let is_oor = (sd >= bl_boundary && ed >= bl_boundary)
+                let is_oor = gap_straddles_analysis_cut(sd, ed, prev.speed, bl_scan)
+                    || (sd >= bl_boundary && ed >= bl_boundary)
                     || (missed >= 15.0 && (sd >= bl_boundary || ed >= bl_boundary))
                     || speed_dev > 0.5
                     || speed_change > OM_SPEED_CHANGE_RATIO;
@@ -353,8 +354,29 @@ const OM_LOSS_THRESHOLD_SECS: f64 = crate::analysis::loss::DEFAULT_THRESHOLD_SEC
 /// gap 전후 실제 보고 속도 변화율 임계값: 이 비율 초과 시 오탐(트랙 스왑 등)으로 제외
 const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
 
-/// PSR 통계 계산 범위: 60NM
-const PSR_RANGE_KM: f64 = 60.0 * 1.852;
+/// OM 분석 최대 거리(km): 60NM — 이보다 먼 항적/소실은 분석 대상에서 제외한다.
+/// 손실율·PSR·추가차단 히스토그램·소실표적(loss_points_summary)·track_points_geo·베이스라인이
+/// 전부 이 상한으로 컷된다(파일 파싱 직후 거리필터에서 sector/baseline 분기 이전에 공통 적용 →
+/// 단일 지점에서 모든 통계가 60NM 스코프로 통일). LoS 단면도 차트(FULL_X_NM/MAX_X_NM=60)·
+/// 파노라마(ReportApp MAX_RANGE_KM=60NM=111km)와 동일 스코프.
+const OM_MAX_RANGE_KM: f64 = 60.0 * 1.852;
+
+/// PSR 통계 계산 범위 = OM 분석 범위(60NM). 단일 소스(OM_MAX_RANGE_KM)로 통일 —
+/// 어차피 daily_points·baseline 이 60NM 로 이미 컷되므로 이 게이트는 명시적 재확인(중복이나 무해).
+const PSR_RANGE_KM: f64 = OM_MAX_RANGE_KM;
+
+/// gap 양끝 중 하나라도 인위적 분석 컷(OM_MAX_RANGE_KM=60NM)에서 1스캔 이동거리 이내면 true.
+/// true → 그 gap 은 표적이 60NM 분석권 밖으로 이탈했다 재진입한 것으로 보아 out_of_range 로 처리(신호소실 오탐 방지).
+/// 왜 필요한가: is_oor 의 boundary 는 '컷된' 항적 거리의 p95 라, 표적이 60NM 경계를 밀착 비행하면
+///   (예: 비행검사기 60NM DME arc/orbit) boundary 가 재진입점보다 높아져 경계 straddling gap 을
+///   signal_loss 로 오탐할 수 있다. 컷은 정확히 OM_MAX_RANGE_KM 에서 일어나므로, 끝점이 한 스캔 이동거리
+///   이내로 컷에 붙은 gap 은 경계 이탈로 확정한다. 1스캔 이동거리 = 속도(kt)×스캔주기(s) (최소 0.5km 폴백).
+/// 컷(60NM)보다 실제 도달거리가 짧은 레이더에서는 끝점이 60NM 근처에 오지 않아 항상 false → 무영향.
+fn gap_straddles_analysis_cut(start_dist: f64, end_dist: f64, speed_kt: f64, scan_interval_s: f64) -> bool {
+    let one_scan_km = (speed_kt.max(0.0) * scan_interval_s / 3600.0) * 1.852;
+    let margin = one_scan_km.max(0.5); // 저속/무속도 폴백 하한 0.5km
+    start_dist >= OM_MAX_RANGE_KM - margin || end_dist >= OM_MAX_RANGE_KM - margin
+}
 
 // ─── 추가 차단영역 히스토그램 상수 ───
 // 방위×양각 시간 히스토그램의 빈 크기·범위. 프론트(omAddedBlockage.ts)와 반드시 일치.
@@ -531,13 +553,20 @@ pub fn analyze_radar_monthly(
                 continue;
             }
 
-            // 장애물 후방 필터: 장애물보다 먼 항적만 포함
-            // (분석 대상 + 전체 방위 베이스라인에 공통 적용)
-            if radar.min_obstacle_distance_km > 0.0 {
+            // 거리 필터: 장애물 후방(min) ~ 분석 최대 범위(OM_MAX_RANGE_KM=60NM).
+            // 분석 대상(sector)·전체 방위 베이스라인 양쪽에 공통 적용 — 아래 분기 이전에 두어
+            // 손실율·PSR·히스토그램·소실표적·track_geo·베이스라인이 모두 동일 60NM 스코프로 컷된다.
+            //   상한(60NM): 60NM 밖 항적/소실은 보고서 집계에서 전부 제외(분자·분모 동시 컷 → 율 정합 유지).
+            //   경계(60NM) 재진입 gap(레이더권 이탈 후 복귀)은 gap_straddles_analysis_cut 로 out_of_range 확정 →
+            //   signal_loss 오탐 없음(경계 밀착 arc 등 p95 boundary 가 헐거운 케이스까지 차단).
+            {
                 let dist = calculate_haversine_distance(
                     radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude,
                 );
-                if dist < radar.min_obstacle_distance_km {
+                if dist > OM_MAX_RANGE_KM {
+                    continue;
+                }
+                if radar.min_obstacle_distance_km > 0.0 && dist < radar.min_obstacle_distance_km {
                     continue;
                 }
             }
@@ -799,7 +828,8 @@ pub fn analyze_radar_monthly(
                         0.0
                     };
 
-                    let is_oor = (start_dist >= boundary && end_dist >= boundary)
+                    let is_oor = gap_straddles_analysis_cut(start_dist, end_dist, prev.speed, scan_interval)
+                        || (start_dist >= boundary && end_dist >= boundary)
                         || (missed >= 15.0 && (start_dist >= boundary || end_dist >= boundary))
                         || speed_dev > 0.5
                         || speed_change > OM_SPEED_CHANGE_RATIO;

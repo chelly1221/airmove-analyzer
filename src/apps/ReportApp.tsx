@@ -815,7 +815,9 @@ export default function ReportApp() {
     console.log(`[Panorama] 시작 (${radars.length}개 레이더, GPU terrain)`, radars.map((r) => r.name));
 
     let cancelled = false;
-    const MAX_RANGE_KM = 100;
+    // 파노라마 장애물 실루엣 수집 범위 = 60NM(=111.12km) — 보고서 전 스코프 60NM 통일.
+    //   (Rust OM_MAX_RANGE_KM·LoS 단면도 FULL_X_NM/MAX_X_NM=60 과 동일. 종전 100km≈54NM → 60NM 로.)
+    const MAX_RANGE_KM = 60 * 1.852;
     const AZ_STEP_DEG = 0.01;
     const RANGE_STEP_M = 200;
 

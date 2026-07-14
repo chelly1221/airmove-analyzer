@@ -8,9 +8,9 @@ import type { LossPointGeo } from "../types/obstacle";
 import { haversineKm, bearingDeg } from "./geo";
 
 /** OM 보고서 LoS 단면도 차트 최소 X축 (km) — 빌딩이 가까워도 이만큼은 terrain 을 샘플링.
- *  200NM = 200 * 1.852 km. ReportOMLosCrossSection 의 편집모드 최대 줌아웃(MAX_X_KM)과 일치 —
- *  기본 뷰는 100NM 이지만 줌아웃 시 200NM 까지 보이므로 그만큼 미리 샘플링. */
-const EXTEND_PROFILE_MIN_KM = 200 * 1.852;
+ *  60NM = 60 * 1.852 km. ReportOMLosCrossSection 의 X축 고정 스코프(FULL_X_KM=MAX_X_KM=60NM)와 일치.
+ *  (보고서 전 스코프 60NM 통일 — Rust OM_MAX_RANGE_KM·파노라마 MAX_RANGE_KM 과 동일.) */
+const EXTEND_PROFILE_MIN_KM = 60 * 1.852;
 
 /** LoS 차단 판정 결과 — 차트(ReportOMLosCrossSection)와 배지(computeLosBatch)가 공유하는 단일 소스. */
 export interface LosBlockageResult {
@@ -100,7 +100,7 @@ export async function computeLosBatch(
           ((bldg.longitude - radar.longitude) * 111320 * Math.cos(radar.latitude * Math.PI / 180)) ** 2,
         ) / 1000;
         // Terrain sampling 종료 거리: 빌딩 거리와 EXTEND_PROFILE_MIN_KM 중 큰 값.
-        //   빌딩이 가까워도 보고서 차트가 (줌아웃 시) 200NM 까지 길게 보이도록 — TrackMap 의 동작과 일관.
+        //   빌딩이 가까워도 보고서 차트 X축 고정 스코프(60NM)까지 terrain 을 채우도록.
         const profileEndKm = Math.max(totalDist, EXTEND_PROFILE_MIN_KM);
         // 거리 그리드(km) — 코리도(레이더→빌딩 0..totalDist)는 근거리 지형 봉우리를 잡도록 조밀하게(≈60m),
         //   빌딩 너머 확장부(totalDist..profileEndKm)는 줌아웃 표시용으로 거칠게(≈370m) 샘플링.
@@ -117,7 +117,7 @@ export async function computeLosBatch(
         const corridorSamples = Math.min(MAX_CORRIDOR_SAMPLES, Math.max(1, Math.round(totalDist / CORRIDOR_STEP_KM)));
         const dists: number[] = [];
         for (let j = 0; j <= corridorSamples; j++) dists.push((j / corridorSamples) * totalDist);
-        // 확장부: totalDist 초과 ~ profileEndKm 거칠게 (빌딩이 200NM 너머면 profileEndKm==totalDist → 확장 없음)
+        // 확장부: totalDist 초과 ~ profileEndKm 거칠게 (빌딩이 60NM 너머면 profileEndKm==totalDist → 확장 없음)
         if (profileEndKm > totalDist + 1e-9) {
           const extSamples = Math.max(1, Math.round((profileEndKm - totalDist) / EXT_STEP_KM));
           for (let j = 1; j <= extSamples; j++) dists.push(totalDist + (j / extSamples) * (profileEndKm - totalDist));
