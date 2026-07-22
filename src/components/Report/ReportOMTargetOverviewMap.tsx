@@ -348,16 +348,16 @@ export default function ReportOMTargetOverviewMap({ buildings, buildingGroups, r
 
 // ── canvas 그리기 헬퍼 ──
 
-/** 건물 centroid 번호 칩 — 그룹색 배경 원(반지름 11) + 흰 외곽선 + 흰 bold 번호. 표 행 번호와 대조. */
+/** 건물 centroid 번호 칩 — 그룹색 배경 원(반지름 14) + 흰 외곽선 + 흰 bold 번호. 표 행 번호와 대조. */
 function drawNumberChip(ctx: CanvasRenderingContext2D, x: number, y: number, text: string, color: string) {
   ctx.beginPath();
-  ctx.arc(x, y, 11, 0, Math.PI * 2);
+  ctx.arc(x, y, 14, 0, Math.PI * 2);
   ctx.fillStyle = color;
   ctx.fill();
   ctx.lineWidth = 2;
   ctx.strokeStyle = "#fff";
   ctx.stroke();
-  ctx.font = "bold 13px sans-serif";
+  ctx.font = "bold 17px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = "#fff";

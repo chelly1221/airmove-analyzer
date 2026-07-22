@@ -310,9 +310,9 @@ export default function ReportOMTargetHeatmapMap({ sectionNum, radars }: Props) 
       // 3) 레이더 마커(◉) + (2개 이상이면) 이름 라벨(흰 halo)
       for (const r of geom.radars) {
         const [rx, ry] = r.px;
-        ctx.beginPath(); ctx.arc(rx, ry, 7, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
-        ctx.beginPath(); ctx.arc(rx, ry, 5, 0, Math.PI * 2); ctx.fillStyle = "#1d4ed8"; ctx.fill();
-        ctx.beginPath(); ctx.arc(rx, ry, 2, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
+        ctx.beginPath(); ctx.arc(rx, ry, 10, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
+        ctx.beginPath(); ctx.arc(rx, ry, 7, 0, Math.PI * 2); ctx.fillStyle = "#1d4ed8"; ctx.fill();
+        ctx.beginPath(); ctx.arc(rx, ry, 3, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
         if (showLabels) drawRadarNameLabel(ctx, rx, ry, r.name);
       }
 
@@ -353,15 +353,15 @@ export default function ReportOMTargetHeatmapMap({ sectionNum, radars }: Props) 
 
 // ── canvas 그리기 헬퍼 ──
 
-/** 레이더명 라벨 — 마커 우측에 흰 halo 텍스트(작게). 오른쪽 넘치면 좌측으로 반전. */
+/** 레이더명 라벨 — 마커 우측에 흰 halo 텍스트. 오른쪽 넘치면 좌측으로 반전. */
 function drawRadarNameLabel(ctx: CanvasRenderingContext2D, x: number, y: number, name: string) {
-  ctx.font = "bold 13px sans-serif";
+  ctx.font = "bold 17px sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   const tw = ctx.measureText(name).width;
-  let tx = x + 11;
-  if (tx + tw > W - 4) tx = x - 11 - tw;
-  ctx.lineWidth = 3;
+  let tx = x + 14;
+  if (tx + tw > W - 4) tx = x - 14 - tw;
+  ctx.lineWidth = 4;
   ctx.strokeStyle = "rgba(255,255,255,0.9)";
   ctx.strokeText(name, tx, y);
   ctx.fillStyle = "#1e3a8a";

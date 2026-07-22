@@ -5,7 +5,7 @@ import { haversineKm } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
-import { losBlockedFromPanorama, buildSiblings } from "../../utils/obstacleAnalysisHelpers";
+import { buildSiblings, classifyObstacleLosses, BLDG_EFFECT_EPS_DEG } from "../../utils/obstacleAnalysisHelpers";
 import BuildingGroupBadge from "./BuildingGroupBadge";
 import ReportOMObstacleAzElevChart from "./ReportOMObstacleAzElevChart";
 import ReportOMObstacleSummaryTable from "./ReportOMObstacleSummaryTable";
@@ -54,15 +54,6 @@ function ReportOMObstacleDetail({
   const bTopElevM = building.ground_elev + building.height;
   const bTopFt = Math.round(bTopElevM * 3.28084);
 
-  // 보조 '가시선 차단' 배지 — 레이더→건물 가시선이 기존 지형·지물에 가려지는지 (헤드라인 'LoS 영향'과 별개 지표).
-  //   소실표적 분류(classifyObstacleLosses)와 동일한 panorama 실루엣 소스로 통일.
-  //   panorama 미준비 시 chord(los.losBlocked)로 폴백 — chord 도 분석 대상 자신을 제외해 판정(computeLosBatch·
-  //   excludeTargetBuildings)하므로 폴백 역시 self-block 없음. (단면도 차트 본문 코리도 시각화는 그대로 유지.)
-  const losBlockedPano = useMemo(
-    () => losBlockedFromPanorama(radarSite, building, los, panoWithout) ?? los.losBlocked,
-    [radarSite, building, los, panoWithout],
-  );
-
   // 이 레이더 omResult 에서 항적·소실표적 수집
   const { losChartPts, allLossThisRadar, allTrackThisRadar } = useMemo(() => {
     const empty = { losChartPts: { track: [], loss: [] }, allLossThisRadar: [] as LossPointGeo[], allTrackThisRadar: [] as TrackPointGeo[] };
@@ -82,6 +73,13 @@ function ReportOMObstacleDetail({
     };
   }, [omResult, radarSite.name, los, building]);
 
+  // ② 요약표·메타 스트립 공용 분류 결과 — 차트(AzElev)와 동일 인자·동일 분류 (표 내부 호출을 리프트)
+  const computed = useMemo(
+    () => classifyObstacleLosses(radarSite, building, allLossThisRadar, { panoWith, panoWithout, siblings }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- radarSite 는 좌표 granular 의존(객체 in-place 변경 대응) — sibling 계산과 동일 민감도.
+    [allLossThisRadar, building, panoWith, panoWithout, siblings, radarSite.latitude, radarSite.longitude],
+  );
+
   return (
     <ReportPage>
       <ReportOMSectionHeader
@@ -99,6 +97,7 @@ function ReportOMObstacleDetail({
             위치: {building.latitude.toFixed(5)}°, {building.longitude.toFixed(5)}° ·
             정상표고(해발): {bTopFt.toLocaleString()}ft ({bTopElevM.toFixed(0)}m) ·
             레이더 거리: {(bDistKm / 1.852).toFixed(1)}NM ({bDistKm.toFixed(1)}km) · 방위: {los.bearing.toFixed(1)}°
+            {" · "}대상 차단각: {computed.angleTotalDeg.toFixed(2)}°{computed.angleTotalDeg > computed.angleTerrainDeg + BLDG_EFFECT_EPS_DEG ? ` (지형 ${computed.angleTerrainDeg.toFixed(2)}°)` : " (지형 이하)"}
           </span>
         </span>
       </div>
@@ -112,14 +111,11 @@ function ReportOMObstacleDetail({
         lossPoints={allLossThisRadar}
       />
 
-      {/* ② 소실표적 분류 요약표 — 아래 Az×Elev 차트와 동일 분류 결과(동일 classifyObstacleLosses) */}
+      {/* ② 소실표적 분류 요약표 — 아래 Az×Elev 차트와 동일 분류 결과(동일 classifyObstacleLosses, computed 리프트) */}
       <ReportOMObstacleSummaryTable
         radarSite={radarSite}
         building={building}
-        lossPoints={allLossThisRadar}
-        panoWith={panoWith}
-        panoWithout={panoWithout}
-        siblings={siblings}
+        computed={computed}
         blockage={blockage}
       />
 
@@ -132,9 +128,6 @@ function ReportOMObstacleDetail({
           buildingGroup={buildingGroups.find((g) => g.id === building.group_id) ?? null}
           trackPoints={losChartPts.track}
           lossPoints={losChartPts.loss}
-          blockedOverride={losBlockedPano}
-          panoWith={panoWith}
-          panoWithout={panoWithout}
         />
       </div>
 

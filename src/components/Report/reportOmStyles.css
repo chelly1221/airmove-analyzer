@@ -299,6 +299,22 @@
 .kac-report .om-table.sm-table tbody td { padding: 2px 6px; }
 .kac-report .om-table.weekly-table { margin-top: 8px; }
 
+/* §4 요약표 — 판정 헤드라인 바 + 각주 (안 1 리디자인) */
+.kac-report .om-verdict-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--om-border);
+  border-left: 3px solid var(--om-text-muted); /* 등급색 inline override */
+  background: var(--om-muted-bg);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.kac-report .om-verdict-bar .vb-detail { font-size: 11px; color: var(--om-text-muted); text-align: right; }
+.kac-report .om-tbl-note { margin-top: 3px; font-size: 10px; color: var(--om-text-muted); }
+
 /* 표 셀 정렬·서식 */
 .kac-report .ta-l { text-align: left; }
 .kac-report .ta-c { text-align: center; }
