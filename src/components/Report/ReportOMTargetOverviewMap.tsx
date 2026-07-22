@@ -173,10 +173,10 @@ export default function ReportOMTargetOverviewMap({ buildings, buildingGroups, r
         } else {
           const [bx, by] = b.centerPx;
           ctx.beginPath();
-          ctx.arc(bx, by, 6, 0, Math.PI * 2);
+          ctx.arc(bx, by, 9, 0, Math.PI * 2);
           ctx.fillStyle = hexA(b.color, 0.85);
           ctx.fill();
-          ctx.lineWidth = 1.5;
+          ctx.lineWidth = 2;
           ctx.strokeStyle = "#fff";
           ctx.stroke();
         }
@@ -186,9 +186,9 @@ export default function ReportOMTargetOverviewMap({ buildings, buildingGroups, r
       // 3-3) 레이더 마커 (◉) + 레이더명 라벨 칩
       for (const r of geom.radars) {
         const [rx, ry] = r.px;
-        ctx.beginPath(); ctx.arc(rx, ry, 7, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
-        ctx.beginPath(); ctx.arc(rx, ry, 5, 0, Math.PI * 2); ctx.fillStyle = "#1d4ed8"; ctx.fill();
-        ctx.beginPath(); ctx.arc(rx, ry, 2, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
+        ctx.beginPath(); ctx.arc(rx, ry, 11, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
+        ctx.beginPath(); ctx.arc(rx, ry, 8, 0, Math.PI * 2); ctx.fillStyle = "#1d4ed8"; ctx.fill();
+        ctx.beginPath(); ctx.arc(rx, ry, 3.5, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
         drawRadarLabel(ctx, rx, ry, r.name);
       }
       // 3-4) 축척 막대 · 나침반 · 저작권
@@ -348,39 +348,39 @@ export default function ReportOMTargetOverviewMap({ buildings, buildingGroups, r
 
 // ── canvas 그리기 헬퍼 ──
 
-/** 건물 centroid 번호 칩 — 그룹색 배경 원(반지름 14) + 흰 외곽선 + 흰 bold 번호. 표 행 번호와 대조. */
+/** 건물 centroid 번호 칩 — 그룹색 배경 원(반지름 20) + 흰 외곽선 + 흰 bold 번호. 표 행 번호와 대조. */
 function drawNumberChip(ctx: CanvasRenderingContext2D, x: number, y: number, text: string, color: string) {
   ctx.beginPath();
-  ctx.arc(x, y, 14, 0, Math.PI * 2);
+  ctx.arc(x, y, 20, 0, Math.PI * 2);
   ctx.fillStyle = color;
   ctx.fill();
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 2.5;
   ctx.strokeStyle = "#fff";
   ctx.stroke();
-  ctx.font = "bold 17px sans-serif";
+  ctx.font = "bold 26px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = "#fff";
-  ctx.fillText(text, x, y + 0.5);
+  ctx.fillText(text, x, y + 1);
 }
 
 /** 레이더명 라벨 칩 — 마커 우측에 흰 반투명 배경 + 텍스트. 캔버스 경계 안으로 클램프. */
 function drawRadarLabel(ctx: CanvasRenderingContext2D, x: number, y: number, name: string) {
-  ctx.font = "bold 14px sans-serif";
+  ctx.font = "bold 20px sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   const tw = ctx.measureText(name).width;
-  const padX = 5, boxH = 20;
+  const padX = 7, boxH = 28;
   const boxW = tw + padX * 2;
-  // 마커 우측 12px 에 배치 → 오른쪽 넘치면 마커 좌측으로 반전
-  let bx = x + 12;
-  if (bx + boxW > W - 4) bx = x - 12 - boxW;
+  // 마커 우측 16px 에 배치 → 오른쪽 넘치면 마커 좌측으로 반전
+  let bx = x + 16;
+  if (bx + boxW > W - 4) bx = x - 16 - boxW;
   bx = Math.max(2, Math.min(W - boxW - 2, bx));
   const by = Math.max(2, Math.min(H - boxH - 2, y - boxH / 2));
-  roundRect(ctx, bx, by, boxW, boxH, 4);
+  roundRect(ctx, bx, by, boxW, boxH, 5);
   ctx.fillStyle = "rgba(255,255,255,0.82)";
   ctx.fill();
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1.5;
   ctx.strokeStyle = "#1d4ed8";
   ctx.stroke();
   ctx.fillStyle = "#1e3a8a";

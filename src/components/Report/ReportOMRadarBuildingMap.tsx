@@ -2,15 +2,15 @@
  * OM 보고서 — (레이더 × 분석 대상 장애물) 위에서 본(top-down) 지도 도면.
  *
  * TrackMap 을 위에서 본 듯한 느낌으로, 레이더와 건물을 같은 지도(CARTO voyager 베이스맵) 위에 얹고
- * **레이더 → 건물 양쪽 끝 방위**로 뻗는 부채꼴(영향/음영 범위)을 표시한다.
+ * **레이더 → 건물 양쪽 끝 방위**로 뻗는 부채꼴(차폐 방위 구간)을 표시한다. 부채꼴은 레이더에서
+ * 건물까지만 그린다 — 건물 후방 음영 확장·소실표적 점 오버레이는 없다.
  *
  *  - 베이스맵: CARTO voyager **래스터** 타일을 bbox/줌에 맞춰 canvas 에 정적 합성.
  *      (라이브 MapLibre 미사용 — 보고서는 페이지마다 도면이 반복되므로 WebGL 컨텍스트 고갈/PDF 캡처
  *       불안정을 피해 정적 래스터로 그린다. 오프라인이면 격자 폴백.)
- *  - 부채꼴: calcBuildingAzExtent(레이더↔건물 폴리곤) 의 양끝 방위(start/end) 로 두 변을 그리고,
- *      건물 뒤(거리>건물거리) 음영 구역을 진하게 채운다. 레이더→건물 구간은 옅게.
+ *  - 부채꼴: calcBuildingAzExtent(레이더↔건물 폴리곤) 의 양끝 방위(start/end) 로 두 변을 그리고
+ *      레이더 → 건물(양끝 코너 최대거리, fanKm) 까지 옅게 채운다. 도면은 건물 주변으로 타이트하게 줌인.
  *  - 건물 footprint: geometry_json(polygon/multi) 폴리곤을 그룹 색으로 채움. 점 건물이면 마커.
- *  - 소실표적: 이 부채꼴 + 건물 후방의 소실표적을 빨간 점으로 오버레이(보고서 통일 색 #ff1745).
  *  - 축척 막대 · 나침반(N) · 변 방위 라벨.
  *
  * PDF 안전: 모든 그래픽을 단일 <canvas> 에 그려 WebView2 PrintToPdf 가 스냅샷.
@@ -18,7 +18,6 @@
  */
 import { useEffect, useMemo, useRef } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData } from "../../types";
-import type { LossPointGeo } from "../../types/obstacle";
 import { calcBuildingAzExtent } from "../../utils/obstacleAnalysisHelpers";
 import { bearingDeg, haversineKm } from "../../utils/geo";
 import { groupColorOf } from "./BuildingGroupBadge";
@@ -491,9 +490,8 @@ interface MapGeom {
   bDistKm: number; bAz: number;
   startAz: number; endAz: number; sweep: number;
   leftRel: number; rightRel: number;
-  shadowFarKm: number;
+  fanKm: number;
   polys: [number, number][][];
-  lossPx: [number, number][];
 }
 
 interface Props {
@@ -501,15 +499,13 @@ interface Props {
   building: ManualBuilding;
   buildingGroups: BuildingGroup[];
   los: LoSProfileData;
-  /** 이 레이더의 소실표적 — 부채꼴 + 건물 후방으로 필터해 점 오버레이 */
-  lossPoints?: LossPointGeo[];
 }
 
-export default function ReportOMRadarBuildingMap({ radarSite, building, buildingGroups, los, lossPoints }: Props) {
+export default function ReportOMRadarBuildingMap({ radarSite, building, buildingGroups, los }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const groupColor = groupColorOf(building.group_id, buildingGroups) ?? "#a60739";
 
-  // ── 기하 계산 (투영 파라미터 + 부채꼴/footprint/소실점) ──
+  // ── 기하 계산 (투영 파라미터 + 부채꼴/footprint) ──
   const geom = useMemo<MapGeom>(() => {
     const rLat = radarSite.latitude, rLon = radarSite.longitude;
     const bLat = building.latitude, bLon = building.longitude;
@@ -521,12 +517,15 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
     let leftRel = Math.min(relTo(ext.start_deg, bAz), relTo(ext.end_deg, bAz));
     let rightRel = Math.max(relTo(ext.start_deg, bAz), relTo(ext.end_deg, bAz));
 
-    // 음영(영향) 외곽 거리 — 건물 뒤로 보기 좋게 확장 + 레이더 제원범위 상한
-    const rangeKm = radarSite.range_nm > 0 ? radarSite.range_nm * KM_PER_NM : Infinity;
-    const extendKm = Math.min(Math.max(bDistKm * 0.45, 1.5), 6);
-    const shadowFarKm = Math.min(bDistKm + extendKm, rangeKm);
-
     const polys = buildingPolygons(building);
+
+    // 부채꼴 외곽 거리(fanKm) — 레이더에서 건물까지만. footprint 전 코너의 레이더 거리 최댓값과 건물
+    //   중심 거리(bDistKm) 중 큰 값(점 건물이면 bDistKm). 건물 뒤로 확장하지 않는다.
+    let fanKm = bDistKm;
+    for (const poly of polys) for (const [la, lo] of poly) {
+      const d = haversineKm(rLat, rLon, la, lo);
+      if (d > fanKm) fanKm = d;
+    }
 
     // 방어 — calcBuildingAzExtent 은 '최대 공백의 여집합' 구간을 돌려주므로, 레이더가 footprint 안/극근접일
     //   드문 경우 각폭이 180°를 넘어(주호 선택) 부채꼴이 뒤집힐 수 있다. 이때는 실제 코너 방위에서 대상
@@ -544,36 +543,21 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
     const endAz = (bAz + rightRel + 360) % 360;     // 우측 변
     const sweep = Math.max(0.5, rightRel - leftRel); // 각폭(°)
 
-    // 부채꼴 far/near 변 끝점 (구면) — bbox 산출용
-    const farStart = destPoint(rLat, rLon, startAz, shadowFarKm);
-    const farEnd = destPoint(rLat, rLon, endAz, shadowFarKm);
-    const nearStart = destPoint(rLat, rLon, startAz, bDistKm);
-    const nearEnd = destPoint(rLat, rLon, endAz, bDistKm);
+    // 부채꼴 변 끝점(레이더 → fanKm, 구면) — bbox 산출용
+    const fanStart = destPoint(rLat, rLon, startAz, fanKm);
+    const fanEnd = destPoint(rLat, rLon, endAz, fanKm);
 
-    // bbox — 표시 필수 점들의 위경도 경계 → 공유 투영(fitProjection)
-    const pts: [number, number][] = [[rLat, rLon], [bLat, bLon], farStart, farEnd, nearStart, nearEnd];
+    // bbox — 표시 필수 점들의 위경도 경계 → 공유 투영(fitProjection). 건물 주변으로 타이트하게 줌인.
+    const pts: [number, number][] = [[rLat, rLon], [bLat, bLon], fanStart, fanEnd];
     for (const poly of polys) for (const p of poly) pts.push(p);
     const proj = fitProjection(pts);
-    const { project } = proj;
-
-    // 소실표적 — 부채꼴(±1°) + 건물 후방 ~ 음영 표시 범위(shadowFarKm) 이내.
-    //   (shadowFarKm 밖은 표시 영향 범위 밖이라 캔버스 밖으로 투영되어 사라지므로 상한 적용)
-    const lossPx: [number, number][] = [];
-    for (const lp of lossPoints ?? []) {
-      const d = haversineKm(rLat, rLon, lp.lat, lp.lon);
-      if (d <= bDistKm * 0.98 || d > shadowFarKm) continue;
-      const az = bearingDeg(rLat, rLon, lp.lat, lp.lon);
-      const r = relTo(az, bAz);
-      if (r < leftRel - 1 || r > rightRel + 1) continue;
-      lossPx.push(project(lp.lat, lp.lon));
-    }
 
     return {
       proj,
       rLat, rLon, bLat, bLon, bDistKm, bAz, startAz, endAz, sweep, leftRel, rightRel,
-      shadowFarKm, polys, lossPx,
+      fanKm, polys,
     };
-  }, [radarSite, building, los, lossPoints]);
+  }, [radarSite, building, los]);
 
   // ── 렌더: 타일 합성(공유 composeTiles) + 오버레이 ──
   useEffect(() => {
@@ -640,11 +624,7 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
             </span>
             <span className="flex items-center gap-1.5">
               <span className="inline-block w-3 h-2.5 rounded-sm" style={{ backgroundColor: "rgba(166,7,57,0.28)", border: "1px dashed #a60739" }} />
-              <OMEditable id={`${eid}.legend.fan`} value="영향(음영) 부채꼴" tag="span" />
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "rgba(255,23,69,0.9)" }} />
-              <OMEditable id={`${eid}.legend.loss`} value="소실표적" tag="span" />
+              <OMEditable id={`${eid}.legend.fan`} value="영향 부채꼴" tag="span" />
             </span>
           </div>
 
@@ -662,14 +642,10 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
                 <td><OMEditable id={`${eid}.tbl.dist`} value="레이더 거리" tag="span" /></td>
                 <td className="ta-r mono">{(geom.bDistKm / KM_PER_NM).toFixed(1)}NM ({geom.bDistKm.toFixed(1)}km)</td>
               </tr>
-              <tr className="alt">
-                <td><OMEditable id={`${eid}.tbl.far`} value="음영 표시 범위" tag="span" /></td>
-                <td className="ta-r mono">~{(geom.shadowFarKm / KM_PER_NM).toFixed(1)}NM</td>
-              </tr>
             </tbody>
           </table>
           <div className="mt-1 text-[9px] text-gray-400 leading-snug">
-            <OMEditable id={`${eid}.tbl.note`} value="부채꼴은 레이더에서 건물 양쪽 끝 방위로 뻗는 음영(차폐) 구역 — 이 범위 후방의 표적이 차폐 영향을 받는다." tag="span" />
+            <OMEditable id={`${eid}.tbl.note`} value="부채꼴은 레이더에서 건물 양쪽 끝 방위로 뻗는 차폐 방위 구간 — 이 구간 후방의 표적이 차폐 영향을 받는다." tag="span" />
           </div>
         </div>
       </div>
@@ -680,40 +656,30 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
 // ── canvas 그리기 헬퍼 ──
 
 function drawOverlay(ctx: CanvasRenderingContext2D, g: MapGeom, groupColor: string) {
-  const { rLat, rLon, bAz, startAz, endAz, leftRel, rightRel, shadowFarKm, bDistKm, polys, lossPx } = g;
+  const { rLat, rLon, bAz, startAz, endAz, leftRel, rightRel, fanKm, polys } = g;
   const { project } = g.proj;
   const [rx, ry] = project(rLat, rLon);
 
-  // 부채꼴 far/near 호 샘플 (short-arc, 좌→우)
+  // 부채꼴 호 샘플 (short-arc, 좌→우) — 레이더 → fanKm 끝
   const K = 48;
-  const farPts: [number, number][] = [];
-  const nearPts: [number, number][] = [];
+  const arcPts: [number, number][] = [];
   for (let i = 0; i <= K; i++) {
     const rel = leftRel + ((rightRel - leftRel) * i) / K;
     const az = (bAz + rel + 360) % 360;
-    farPts.push(project(...destPoint(rLat, rLon, az, shadowFarKm)));
-    nearPts.push(project(...destPoint(rLat, rLon, az, bDistKm)));
+    arcPts.push(project(...destPoint(rLat, rLon, az, fanKm)));
   }
 
-  // 1) 옅은 전체 부채꼴 (레이더 → far)
+  // 1) 옅은 부채꼴 (레이더 → 호)
   ctx.beginPath();
   ctx.moveTo(rx, ry);
-  for (const p of farPts) ctx.lineTo(p[0], p[1]);
+  for (const p of arcPts) ctx.lineTo(p[0], p[1]);
   ctx.closePath();
   ctx.fillStyle = "rgba(166,7,57,0.12)";
   ctx.fill();
 
-  // 2) 진한 음영 (건물 뒤 near→far)
-  ctx.beginPath();
-  for (let i = 0; i < nearPts.length; i++) { const p = nearPts[i]; if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]); }
-  for (let i = farPts.length - 1; i >= 0; i--) ctx.lineTo(farPts[i][0], farPts[i][1]);
-  ctx.closePath();
-  ctx.fillStyle = "rgba(166,7,57,0.26)";
-  ctx.fill();
-
-  // 3) 변(레이더→far) 점선 + 끝점 반환
+  // 2) 변(레이더→fanKm 끝) 점선 + 끝점 반환
   const edge = (az: number): [number, number] => {
-    const f = project(...destPoint(rLat, rLon, az, shadowFarKm));
+    const f = project(...destPoint(rLat, rLon, az, fanKm));
     ctx.beginPath();
     ctx.setLineDash([6, 4]);
     ctx.strokeStyle = "#a60739";
@@ -746,10 +712,6 @@ function drawOverlay(ctx: CanvasRenderingContext2D, g: MapGeom, groupColor: stri
     ctx.fill();
     ctx.lineWidth = 1.5; ctx.strokeStyle = "#fff"; ctx.stroke();
   }
-
-  // 소실표적 점
-  ctx.fillStyle = "rgba(255,23,69,0.9)";
-  for (const [px, py] of lossPx) { ctx.beginPath(); ctx.arc(px, py, 2.4, 0, Math.PI * 2); ctx.fill(); }
 
   // 레이더 마커 (◉)
   ctx.beginPath(); ctx.arc(rx, ry, 7, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();

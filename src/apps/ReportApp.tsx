@@ -19,7 +19,7 @@ import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import { readBulkJson } from "../utils/bulkIpc";
 import type { BulkRef } from "../utils/bulkIpc";
 import { computeAddedBlockage } from "../utils/omAddedBlockage";
-import { calcBuildingAzExtent, hasBldgEffectFromPanorama, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
+import { calcBuildingAzExtent, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
   readReportConfig, clearReportConfig, writeGenerateRequest, clearGenerateRequest,
@@ -634,11 +634,6 @@ export default function ReportApp() {
     const autoFindings = generateOMFindingsText({
       radarResults: result.radar_results,
       selectedBuildings: buildings,
-      radarSites: radars,
-      losMap,
-      covLayersWithBuildings: covWith,
-      covLayersWithout: covWithout,
-      analysisMonth: monthStr ?? "",
     });
     autoFindingsRef.current = autoFindings;
     // ── 커버리지 상태 확정 매핑 ──
@@ -973,10 +968,6 @@ export default function ReportApp() {
     (async () => {
       try {
         const addedBlockageByKey: Record<string, AddedBlockageResult> = {};
-        // 'LoS 영향' 판정 — §1 요약표·§3 단면도 헤드라인 배지와 동일 기준(hasBldgEffectFromPanorama):
-        //   대상 건물이 기존 지형·지물(without) 위로 추가 차단각을 형성하는가. key = losMap 키.
-        //   소견 'LoS 영향' 프로즈가 §1 열·§3 배지와 동일 판정을 쓰도록 통일. 판정 불가(null)는 미수록.
-        const hasBldgEffectByKey = new Map<string, boolean>();
         for (const radar of radars) {
           const rr = result.radar_results.find((r) => r.radar_name === radar.name);
           if (!rr) continue;
@@ -992,8 +983,6 @@ export default function ReportApp() {
             addedBlockageByKey[key] = computeAddedBlockage(
               histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent,
             );
-            const eff = hasBldgEffectFromPanorama(radar, b, pWith, pWithout);
-            if (eff !== null) hasBldgEffectByKey.set(key, eff);
             // 쌍 사이 이벤트 루프 양보 — 프리뷰 점진 마운트/페인트와 교차 실행
             await new Promise((r) => setTimeout(r, 0));
           }
@@ -1008,13 +997,7 @@ export default function ReportApp() {
             const regen = generateOMFindingsText({
               radarResults: prev.result?.radar_results ?? [],
               selectedBuildings: prev.selectedBuildings,
-              radarSites: prev.selectedRadarSites,
-              losMap: prev.losMap,
-              covLayersWithBuildings: prev.covLayersWithBuildings,
-              covLayersWithout: prev.covLayersWithout,
-              analysisMonth: prev.analysisMonth,
               addedBlockageByKey,
-              hasBldgEffectByKey,
             });
             autoFindingsRef.current = regen;
             nextFindings = regen;

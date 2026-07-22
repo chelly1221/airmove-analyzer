@@ -12,7 +12,6 @@ import {
   BLOCKAGE_WATCH_PCT, BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_SEVERE_PCT,
   BLOCKAGE_NONE_LABEL,
 } from "../../utils/omStats";
-import { haversineKm } from "../../utils/geo";
 import { fmtLossPct, fmtPsrPct } from "../../utils/omFormat";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import AutoPaginate from "./AutoPaginate";
@@ -38,9 +37,9 @@ interface Props {
 /**
  * 종합 소견 페이지 (페이지 7).
  *
- * 레이더별 판정 카드 그리드 → 분석 대상 장애물 스트립 → 분석 소견 텍스트 →
- * 산식 근거 2×2 그리드 순서. 스타일은 reportOmStyles.css 의 `.summary-cards`,
- * `.sumcard`, `.bldg-strip`, `.findings-text`, `.formula-grid`, `.pill` 등.
+ * 레이더별 판정 카드 그리드 → 추가 차단 구간 소실율 표 → 분석 소견 텍스트 순서.
+ * 스타일은 reportOmStyles.css 의 `.summary-cards`, `.sumcard`, `.bldg-strip`,
+ * `.findings-text` 등.
  */
 function ReportOMFindings({
   sectionNum,
@@ -89,20 +88,6 @@ function ReportOMFindings({
       dayCount: stats.length,
     };
   }), [radarResults]);
-
-  // 건물별 거리 텍스트 사전 계산 (분석 대상 장애물 스트립)
-  const buildingDistTexts = useMemo(() =>
-    selectedBuildings.map((b) => ({
-      id: b.id,
-      name: b.name || `건물${b.id}`,
-      groupId: b.group_id,
-      height: b.height,
-      dists: radarSites.map((rs) => {
-        const km = haversineKm(rs.latitude, rs.longitude, b.latitude, b.longitude);
-        return `${rs.name} ${km.toFixed(1)}km`;
-      }),
-    })),
-  [selectedBuildings, radarSites]);
 
   const sectionHeader = (
     <ReportOMSectionHeader
@@ -168,23 +153,7 @@ function ReportOMFindings({
     </div>
   );
 
-  // 2) 분석 대상 장애물 스트립
-  const buildingsBlock = (
-    <div className="bldg-strip">
-      <OMEditable id="findings.bldgHeader" value="분석 대상 장애물" tag="div" className="block-h3" style={{ margin: 0, marginBottom: 6 }} />
-      <div className="bldg-strip-list">
-        {buildingDistTexts.map((bt) => (
-          <span key={bt.id}>
-            <BuildingGroupBadge groupId={bt.groupId} groups={buildingGroups} placement="before" />
-            <span className="strong">{bt.name}</span>
-            {" "}({bt.height}m) — {bt.dists.join(", ")}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-
-  // 2.5) 건물별 추가 차단 구간 소실율 — 헤드라인 인과 지표 (파노라마 준비 후 표시)
+  // 2) 건물별 추가 차단 구간 소실율 — 헤드라인 인과 지표 (파노라마 준비 후 표시)
   const blockageRows = addedBlockageByKey
     ? selectedBuildings.flatMap((b) =>
         radarSites.map((rs) => {
@@ -214,7 +183,7 @@ function ReportOMFindings({
                   : "—"}
               </td>
               <td className="ta-c mono">
-                {graded ? `${Math.round(w.exposurePointCount).toLocaleString()}pt 중 소실 ${Math.round(w.lossPointCount).toLocaleString()}pt/${w.daysWithExposure}일` : "—"}
+                {graded ? `${Math.round(w.exposurePointCount).toLocaleString()}pt 중 소실 ${Math.round(w.lossPointCount).toLocaleString()}pt` : "—"}
               </td>
             </tr>
           );
@@ -231,7 +200,7 @@ function ReportOMFindings({
             <th className="ta-c"><OMEditable id="findings.blockage.colRadar" value="레이더" tag="span" /></th>
             <th className="ta-c"><OMEditable id="findings.blockage.colRate" value="추가 차단 구간 소실율" tag="span" /></th>
             <th className="ta-c"><OMEditable id="findings.blockage.colTrend" value="추세(일당)" tag="span" /></th>
-            <th className="ta-c"><OMEditable id="findings.blockage.colExp" value="통과 항적" tag="span" /></th>
+            <th className="ta-c"><OMEditable id="findings.blockage.colExp" value="소실율" tag="span" /></th>
           </tr>
         </thead>
         <tbody>{blockageRows}</tbody>
@@ -258,53 +227,11 @@ function ReportOMFindings({
     </>
   );
 
-  // 4) 산식 근거 2×2 그리드 — 디자인 시안 그대로 Times italic 평문 사용
-  const formulaBlock = (
-    <div className="formula-grid">
-      <OMEditable id="findings.formula.title" value="산식 근거" tag="p" className="formula-title" />
-      <div className="formula-grid-inner">
-        <div>
-          <OMEditable id="findings.formula.h1" value="관측량 가중 평균" tag="p" className="formula-h" />
-          <p className="formula-math"><i>x̄<sub>w</sub> = Σᵢ(wᵢ·xᵢ) / Σᵢ(wᵢ)</i></p>
-          <p>Loss: <i>w</i> = 비행시간 · PSR: <i>w</i> = SSR 포인트수</p>
-        </div>
-        <div>
-          <OMEditable id="findings.formula.h2" value="가중 모표준편차" tag="p" className="formula-h" />
-          <p className="formula-math"><i>σ<sub>w</sub> = √( Σᵢ(wᵢ·(xᵢ - x̄<sub>w</sub>)²) / Σᵢ(wᵢ) )</i></p>
-        </div>
-        <div>
-          <OMEditable id="findings.formula.h3" value="Loss 탐지" tag="p" className="formula-h" />
-          <p>스캔 주기 자동 추정 (중앙값)</p>
-          <p className="formula-math"><i>임계값 = 7초 (고정) · 상한 5분</i></p>
-        </div>
-        <div>
-          <OMEditable id="findings.formula.h4" value="판정 기준" tag="p" className="formula-h" />
-          <p>
-            평균 소실율 — <span className="pill pill-ok">양호</span> &lt; 0.5% ·{" "}
-            <span className="pill pill-warn">주의</span> 0.5~2% 미만 ·{" "}
-            <span className="pill pill-bad">경고</span> ≥ 2% ·{" "}
-            <span className="pill pill-hold">판정 불가</span> 관측 &lt; 7일
-          </p>
-          <p>
-            추가 차단 구간 소실율 — <span className="pill pill-ok">양호</span> &lt; {BLOCKAGE_WATCH_PCT.toFixed(0)}% ·{" "}
-            <span className="pill pill-watch">관심</span> {BLOCKAGE_WATCH_PCT.toFixed(0)}~{BLOCKAGE_CAUTION_PCT.toFixed(0)}% 미만 ·{" "}
-            <span className="pill pill-warn">주의</span> {BLOCKAGE_CAUTION_PCT.toFixed(0)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 ·{" "}
-            <span className="pill pill-alert">경계</span> {BLOCKAGE_ALERT_PCT.toFixed(0)}~{BLOCKAGE_SEVERE_PCT.toFixed(0)}% 미만 ·{" "}
-            <span className="pill pill-bad">심각</span> ≥ {BLOCKAGE_SEVERE_PCT.toFixed(0)}% ·{" "}
-            <span className="pill pill-hold">판정 불가</span> 통과 항적 ≤ {BLOCKAGE_MIN_EXPOSURE_POINTS.toLocaleString()}pt
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-
   return (
     <AutoPaginate firstHeader={sectionHeader}>
       {summaryCardsBlock}
       {blockageBlock}
-      {buildingsBlock}
       {findingsBlock}
-      {formulaBlock}
     </AutoPaginate>
   );
 }

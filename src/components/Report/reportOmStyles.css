@@ -315,6 +315,74 @@
 .kac-report .om-verdict-bar .vb-detail { font-size: 11px; color: var(--om-text-muted); text-align: right; }
 .kac-report .om-tbl-note { margin-top: 3px; font-size: 10px; color: var(--om-text-muted); }
 
+/* §4 요약표 — 분류 누적 막대(안 2): 3분할 세그먼트 + 브래킷 + 레전드.
+   canvas/svg 대신 순수 div/CSS 로만 그려 WebView2 PrintToPdf 인쇄 경로 안전. */
+.kac-report .om-cls-chart { margin-top: 6px; }
+.kac-report .om-cls-empty { font-size: 11.5px; color: #9ca3af; }
+.kac-report .om-cls-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  margin-bottom: 3px;
+}
+.kac-report .om-cls-bar {
+  display: flex;
+  column-gap: 2px;       /* 세그먼트 사이 흰 간격 — 테두리 대신 페이지 배경 노출 */
+  height: 18px;
+  border-radius: 4px;    /* 외곽 모서리만 라운드 */
+  overflow: hidden;
+}
+.kac-report .om-cls-seg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;          /* flex 축소 허용 — 내부 라벨이 세그먼트 폭을 밀지 않도록 */
+}
+.kac-report .om-cls-seg span {
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  white-space: nowrap;
+}
+.kac-report .om-cls-bracket { margin-top: 2px; }
+.kac-report .om-cls-bracket-line {
+  height: 4px;
+  border: 1px solid #9ca3af;
+  border-top: 0;         /* ⊔형 — 상단 개방 */
+}
+.kac-report .om-cls-bracket-label {
+  white-space: nowrap;   /* 오른쪽 overflow 허용(브래킷 폭보다 라벨이 길 수 있음) */
+  font-size: 10px;
+  color: var(--om-text);
+  margin-top: 1px;
+}
+.kac-report .om-cls-legend {
+  display: flex;
+  flex-direction: column;
+  row-gap: 2px;
+  margin-top: 5px;
+  font-size: 11.5px;
+}
+.kac-report .om-cls-lg-row {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+.kac-report .om-cls-chip {
+  flex: none;
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+.kac-report .om-cls-zero {
+  font-size: 11px;
+  color: #374151;
+  margin-top: 2px;
+}
+
 /* 표 셀 정렬·서식 */
 .kac-report .ta-l { text-align: left; }
 .kac-report .ta-c { text-align: center; }

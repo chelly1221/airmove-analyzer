@@ -2219,12 +2219,6 @@ pub fn run() {
             // 이전 세션 잔여 bulk 전송 파일 정리
             bulk::sweep(app.handle());
 
-            // 프로덕션 빌드에서도 DevTools 활성화 — 모든 윈도우
-            #[cfg(not(debug_assertions))]
-            for (_label, w) in app.webview_windows() {
-                w.open_devtools();
-            }
-
             // 백그라운드: WMM fallback 편각을 NOAA 데이터로 치환
             let bg_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

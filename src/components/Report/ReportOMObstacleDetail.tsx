@@ -1,11 +1,10 @@
 import React, { useMemo } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, LoSProfileData, PanoramaMergeResult } from "../../types";
 import type { LossPointGeo, TrackPointGeo, ObstacleMonthlyResult, AddedBlockageResult } from "../../types/obstacle";
-import { haversineKm } from "../../utils/geo";
 import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
-import { buildSiblings, classifyObstacleLosses, BLDG_EFFECT_EPS_DEG } from "../../utils/obstacleAnalysisHelpers";
+import { buildSiblings, classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
 import BuildingGroupBadge from "./BuildingGroupBadge";
 import ReportOMObstacleAzElevChart from "./ReportOMObstacleAzElevChart";
 import ReportOMObstacleSummaryTable from "./ReportOMObstacleSummaryTable";
@@ -34,7 +33,7 @@ interface Props {
   blockage?: AddedBlockageResult;
 }
 
-/** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. 빌딩 메타 + ①영향범위 도면 + ②분류 요약표 + ③LoS 단면도 + ④Az×Elev 차트. */
+/** 한 페이지 = (레이더, 분석 대상 장애물) 한 쌍. ①영향범위 도면 + ②분류 요약표 + ③LoS 단면도 + ④Az×Elev 차트. */
 function ReportOMObstacleDetail({
   sectionNum, radarSite, building, buildingGroups, los, omResult, panoWith, panoWithout, allBuildings, losMap, blockage,
 }: Props) {
@@ -45,15 +44,6 @@ function ReportOMObstacleDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- radarSite 는 좌표·이름 granular 의존(객체 in-place 변경 대응) — §2·§4 sibling 계산과 동일 민감도.
     [allBuildings, building.id, radarSite.latitude, radarSite.longitude, radarSite.name, losMap],
   );
-  // 빌딩 위치 메타
-  const bDistKm = useMemo(
-    () => haversineKm(radarSite.latitude, radarSite.longitude, building.latitude, building.longitude),
-    [radarSite.latitude, radarSite.longitude, building.latitude, building.longitude],
-  );
-  // 정상표고(해발) = 지반고 + 건물높이 — §2 표의 '높이(m)'(순수 건물높이)와 다른 값이므로 라벨로 구분
-  const bTopElevM = building.ground_elev + building.height;
-  const bTopFt = Math.round(bTopElevM * 3.28084);
-
   // 이 레이더 omResult 에서 항적·소실표적 수집
   const { losChartPts, allLossThisRadar, allTrackThisRadar } = useMemo(() => {
     const empty = { losChartPts: { track: [], loss: [] }, allLossThisRadar: [] as LossPointGeo[], allTrackThisRadar: [] as TrackPointGeo[] };
@@ -84,31 +74,20 @@ function ReportOMObstacleDetail({
     <ReportPage>
       <ReportOMSectionHeader
         sectionNum={sectionNum}
-        title={`분석 대상 장애물 상세 — ${building.name || `건물 ${building.id}`}`}
+        title="분석 대상 장애물 상세"
+        titleSuffix={
+          <span>{"— "}<BuildingGroupBadge groupId={building.group_id} groups={buildingGroups} placement="before" />{building.name || `건물 ${building.id}`}</span>
+        }
         radarName={radarSite.name}
         editId={`detail.${radarSite.name}_${building.id}.title`}
       />
 
-      {/* 빌딩 메타 정보 */}
-      <div className="mb-2 flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] text-gray-600">
-        <span className="flex items-center gap-2">
-          <BuildingGroupBadge groupId={building.group_id} groups={buildingGroups} />
-          <span>
-            위치: {building.latitude.toFixed(5)}°, {building.longitude.toFixed(5)}° ·
-            정상표고(해발): {bTopFt.toLocaleString()}ft ({bTopElevM.toFixed(0)}m) ·
-            레이더 거리: {(bDistKm / 1.852).toFixed(1)}NM ({bDistKm.toFixed(1)}km) · 방위: {los.bearing.toFixed(1)}°
-            {" · "}대상 차단각: {computed.angleTotalDeg.toFixed(2)}°{computed.angleTotalDeg > computed.angleTerrainDeg + BLDG_EFFECT_EPS_DEG ? ` (지형 ${computed.angleTerrainDeg.toFixed(2)}°)` : " (지형 이하)"}
-          </span>
-        </span>
-      </div>
-
-      {/* ① 영향 범위 — 위에서 본 도면 (레이더 → 건물 양끝 부채꼴). §3 최상단 배치 */}
+      {/* ① 영향 범위 — 위에서 본 도면 (레이더 → 건물 양끝 부채꼴). §4 최상단 배치 */}
       <ReportOMRadarBuildingMap
         radarSite={radarSite}
         building={building}
         buildingGroups={buildingGroups}
         los={los}
-        lossPoints={allLossThisRadar}
       />
 
       {/* ② 소실표적 분류 요약표 — 아래 Az×Elev 차트와 동일 분류 결과(동일 classifyObstacleLosses, computed 리프트) */}
