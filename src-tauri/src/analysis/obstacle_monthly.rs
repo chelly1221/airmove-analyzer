@@ -168,7 +168,7 @@ pub struct DailyStats {
     pub az_elev_histogram: Vec<AzElevCell>,
 }
 
-/// 전체표적 히트맵 그리드 (레이더 중심 ±150NM=HM_RANGE_KM, 전방위, 전수 카운트, 월간 누적).
+/// 전체표적 히트맵 그리드 (남한 전역 고정 bbox(HM_MIN/MAX_LAT/LON), 전방위, 전수 카운트, 월간 누적).
 /// 표시 전용 — 보고서 통계 스코프(60NM)와 무관. 분석 방위/장애물 후방/거리 컷(60NM) 필터 이전에
 /// 그리드 bbox 이내 모든 표적(radar_type 무관, 검사기 제외)을 250~300m 셀에 전수 누적한다
 /// (60NM 밖 표적도 표시 창 안이면 포함). 희소(점유 셀만) 직렬화 — dense Vec 로 집계 후 count>0 셀만 전송.
@@ -195,7 +195,7 @@ pub struct RadarMonthlyResult {
     pub total_files_parsed: usize,
     pub total_points_filtered: u32,
     pub failed_files: Vec<String>,
-    /// 전체표적 히트맵 (±150NM 전방위 전수 밀도, 표시 전용 — 통계 스코프 60NM 와 무관).
+    /// 전체표적 히트맵 (남한 전역 bbox 전수 밀도, 표시 전용 — 통계 스코프 60NM 와 무관).
     /// Option — 구버전 캐시 역직렬화 호환.
     pub track_heatmap: Option<TrackHeatmap>,
 }
@@ -382,12 +382,15 @@ const OM_SPEED_CHANGE_RATIO: f64 = 0.5;
 /// 파노라마(ReportApp MAX_RANGE_KM=60NM=111km)와 동일 스코프.
 const OM_MAX_RANGE_KM: f64 = 60.0 * 1.852;
 
-/// §1 결합 히트맵(전체 표적 히트맵) 표시 그리드 반경 = ±150NM(=277.8km). 통계 스코프(60NM)와 무관 —
-/// 표시 전용. §1 은 여러 레이더를 한 장에 합쳐 상단(북) 데이터 경계를 크롭하고 하단(남)을 A4 페이지
-/// 잔여 높이에 맞춰 확장하므로 표시 창이 레이더 남쪽 최대 ~140NM 까지 내려간다 → 대칭 ±150NM 이
-/// 여유를 포함해 커버. 히트맵 누적은 거리 컷(60NM) 이전에 이 그리드 bbox 로만 이뤄진다(손실·PSR 등
-/// 통계는 여전히 OM_MAX_RANGE_KM 로 컷 — 아래 거리필터 불변).
-const HM_RANGE_KM: f64 = 150.0 * 1.852;
+/// §1 결합 히트맵(전체 표적 히트맵) 그리드 = 남한 전역 고정 bbox (표시 전용, 통계 스코프 60NM 와 무관).
+/// 프론트 §1 뷰(ReportOMTargetHeatmapMap.tsx: 북단 38.65°N 앵커·남단 33.05°N, 종횡비 맞춤 가로
+/// ≈124.9~130.3°E)를 여유 포함 커버 — "보이는 창 안 표적은 전부 표시"(2026-07-22 사용자 결정).
+/// 구 방식(레이더 중심 ±150NM)은 남한 전역 뷰 남부(호남·제주권)를 못 덮어 폐기. 국내 레이더 전제의
+/// 절대 bbox — 레이더 위치와 무관.
+const HM_MIN_LAT: f64 = 32.9;
+const HM_MAX_LAT: f64 = 38.8;
+const HM_MIN_LON: f64 = 124.3;
+const HM_MAX_LON: f64 = 130.8;
 
 /// PSR 통계 계산 범위 = OM 분석 범위(60NM). 단일 소스(OM_MAX_RANGE_KM)로 통일 —
 /// 어차피 daily_points·baseline 이 60NM 로 이미 컷되므로 이 게이트는 명시적 재확인(중복이나 무해).
@@ -524,22 +527,19 @@ pub fn analyze_radar_monthly(
     let has_sectors = !radar.azimuth_sectors.is_empty();
     let has_building_bearings = !radar.building_bearings_deg.is_empty();
 
-    // ── 전체표적 히트맵 그리드 준비 (레이더 중심 ±150NM = HM_RANGE_KM, 250~300m 셀) ──
-    // §1 결합 히트맵은 여러 레이더를 한 장에 합치고 상단(북) 데이터 경계 크롭 + 하단(남) 페이지 채움
-    // 확장으로 표시 창이 레이더 남쪽 최대 ~140NM 까지 내려가므로, 대칭 ±150NM 이 여유 포함 커버(표시 전용).
-    // 방위/장애물 후방 필터·거리 컷(60NM) 이전에 그리드 bbox 이내 전 표적을 dense Vec 에 전수 누적한다.
+    // ── 전체표적 히트맵 그리드 준비 (남한 전역 고정 bbox, 250~300m 셀) ──
+    // §1 결합 히트맵은 여러 레이더를 한 장에 합쳐 남한 전역 뷰로 표시하므로, 그리드도 레이더 위치와
+    // 무관한 남한 전역 절대 bbox(HM_MIN/MAX_LAT/LON)로 고정한다(표시 전용). 방위/장애물 후방 필터·
+    // 거리 컷(60NM) 이전에 그리드 bbox 이내 전 표적을 dense Vec 에 전수 누적한다.
     // cell_deg_lat≈0.0025(≈278m), cell_deg_lon = cell_deg_lat/cos(lat) 로 지상거리 정방형.
-    const KM_PER_DEG_LAT: f64 = 111.32;
     let hm_cell_lat = 0.0025_f64;
     let hm_cos_lat = radar.radar_lat.to_radians().cos().abs().max(0.1);
     let hm_cell_lon = hm_cell_lat / hm_cos_lat;
-    let hm_half_lat = HM_RANGE_KM / KM_PER_DEG_LAT;              // 150NM → 위도 deg
-    let hm_half_lon = HM_RANGE_KM / (KM_PER_DEG_LAT * hm_cos_lat); // 150NM → 경도 deg
-    let hm_min_lat = radar.radar_lat - hm_half_lat;
-    let hm_min_lon = radar.radar_lon - hm_half_lon;
-    let hm_ny = ((2.0 * hm_half_lat) / hm_cell_lat).ceil() as u32;   // 위도 방향 셀 수
-    let hm_nx = ((2.0 * hm_half_lon) / hm_cell_lon).ceil() as u32;   // 경도 방향 셀 수
-    // dense 누적 버퍼 (~2000×2000 u32 ≈ 4~5M 셀 ≈ 16~20MB) — 파일 순회 동안 일시 유지,
+    let hm_min_lat = HM_MIN_LAT;
+    let hm_min_lon = HM_MIN_LON;
+    let hm_ny = ((HM_MAX_LAT - HM_MIN_LAT) / hm_cell_lat).ceil() as u32;   // 위도 방향 셀 수 (=2360)
+    let hm_nx = ((HM_MAX_LON - HM_MIN_LON) / hm_cell_lon).ceil() as u32;   // 경도 방향 셀 수 (김포권 ≈2061)
+    // dense 누적 버퍼 (~2360×2100 u32 ≈ 5M 셀 ≈ 19~20MB) — 파일 순회 동안 일시 유지,
     // 종료 시 count>0 점유 셀만 희소 직렬화(cells/counts 병렬 배열, 기존과 동일 전송 형상).
     let mut heatmap_grid = vec![0u32; (hm_nx as usize) * (hm_ny as usize)];
 
@@ -600,7 +600,7 @@ pub fn analyze_radar_monthly(
                 continue;
             }
 
-            // ── 전체표적 히트맵 누적: 그리드 bbox(±150NM=HM_RANGE_KM) 이내 전수 카운트 ──
+            // ── 전체표적 히트맵 누적: 그리드 bbox(남한 전역) 이내 전수 카운트 ──
             // exclude_mode_s(검사기) 직후·거리 컷(60NM) 이전에 누적 → 60NM 밖 표적도 표시 창 안이면 포함
             // (§1 결합 히트맵 표시 전용, 통계 스코프와 무관). haversine 불필요 — 그리드 인덱스 bbox 검사만으로 충분.
             // 다운샘플링 없음(전수, CLAUDE.md 규칙 7).
