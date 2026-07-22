@@ -1454,6 +1454,263 @@ async fn analyze_obstacle_monthly(
     Ok(bulk_refs)
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// OM 기준데이터(참조 달) — 집계 산출물 영구 저장/로드
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 원시 track point 는 저장하지 않고, 집계 산출물(일별 요약 + 월간 합산 az×elev
+// 히스토그램)만 앱데이터 루트 아래 om_reference/ 에 레이더별 1파일로 보관한다.
+// 이 디렉토리는 bulk_ipc 의 10분 sweep 대상이 아니다(영구 보관) — bulk.rs 와
+// 동일한 app_data_dir 루트를 사용하되 별도 하위 디렉토리.
+
+/// om_reference 영구 디렉토리 (app_data/om_reference) — bulk sweep 비대상
+fn om_reference_dir(state: &AppState) -> Result<PathBuf, String> {
+    let base = state
+        .app_data_dir
+        .lock()
+        .map_err(|e| format!("app_data_dir lock: {}", e))?
+        .clone();
+    let d = base.join("om_reference");
+    if !d.exists() {
+        fs::create_dir_all(&d).map_err(|e| format!("om_reference 디렉토리 생성 실패: {}", e))?;
+    }
+    Ok(d)
+}
+
+/// 레지스트리: radar_name → {메타 + 파일경로}. settings 키 om_reference_registry 에 JSON 저장.
+type OmReferenceRegistry =
+    std::collections::HashMap<String, analysis::obstacle_monthly::OmReferenceRegistryEntry>;
+
+/// 레지스트리 로드 (없으면 빈 맵, 파싱 실패해도 빈 맵으로 복구 — 기능 브릭 방지)
+fn load_om_registry(state: &AppState) -> Result<OmReferenceRegistry, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| format!("db lock: {}", e))?
+        .get()
+        .map_err(|e| format!("DB pool: {}", e))?;
+    let raw = db::get_setting(&conn, "om_reference_registry").map_err(|e| format!("DB error: {}", e))?;
+    match raw {
+        Some(s) => Ok(serde_json::from_str(&s).unwrap_or_else(|e| {
+            log::warn!("[OmReference] 레지스트리 파싱 실패(빈 맵으로 복구): {}", e);
+            OmReferenceRegistry::new()
+        })),
+        None => Ok(OmReferenceRegistry::new()),
+    }
+}
+
+/// 레지스트리 저장
+fn save_om_registry(state: &AppState, reg: &OmReferenceRegistry) -> Result<(), String> {
+    let json = serde_json::to_string(reg).map_err(|e| format!("레지스트리 직렬화 실패: {}", e))?;
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| format!("db lock: {}", e))?
+        .get()
+        .map_err(|e| format!("DB pool: {}", e))?;
+    db::set_setting(&conn, "om_reference_registry", &json).map_err(|e| format!("DB error: {}", e))
+}
+
+/// 기준데이터 빌드: 파싱→집계(전방위 60NM)→om_reference/ 파일 저장→레지스트리 upsert.
+/// 대용량 IPC 없음 — 소형 메타 목록만 직접 반환. 진행률은 om-reference-progress 이벤트.
+#[tauri::command]
+async fn build_om_reference(
+    app_handle: tauri::AppHandle,
+    radar_file_sets: Vec<analysis::obstacle_monthly::RadarFileSet>,
+    exclude_mode_s: Vec<String>,
+    month_label: String,
+) -> Result<Vec<analysis::obstacle_monthly::OmReferenceMeta>, String> {
+    use analysis::obstacle_monthly::{self as om, ObstacleMonthlyProgress};
+
+    info!(
+        "Command: build_om_reference({} radars, month={}, exclude={:?})",
+        radar_file_sets.len(),
+        month_label,
+        exclude_mode_s
+    );
+
+    // 편각: 첫 레이더의 첫 파일 기준 (analyze_obstacle_monthly 와 동일)
+    let mag_dec = if let Some(rfs) = radar_file_sets.first() {
+        if let Some(first_path) = rfs.file_paths.first() {
+            resolve_declination(&app_handle, first_path, rfs.radar_lat, rfs.radar_lon).await
+        } else {
+            -8.5
+        }
+    } else {
+        -8.5
+    };
+
+    // 취소 토큰 초기화 (analyze 경로와 동일한 플래그 재사용 — cancel_analysis 로 중단 가능)
+    let cancel = {
+        let state = app_handle.state::<AppState>();
+        state.analysis_cancel.store(false, Ordering::Relaxed);
+        Arc::clone(&state.analysis_cancel)
+    };
+
+    let handle = app_handle.clone();
+    let metas = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<om::OmReferenceMeta>, String> {
+        let state = handle.state::<AppState>();
+        let ref_dir = om_reference_dir(&state)?;
+        let mut registry = load_om_registry(&state)?;
+        let mut metas: Vec<om::OmReferenceMeta> = Vec::new();
+
+        for radar in &radar_file_sets {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("분석이 취소되었습니다".to_string());
+            }
+
+            // JSON 집계 파일 + 원시 포인트 아카이브 디렉토리 경로 (결정적 스템)
+            let filename = om::reference_filename(&radar.radar_name);
+            let json_path = ref_dir.join(&filename);
+            let points_dir = ref_dir.join("points").join(om::reference_dirname(&radar.radar_name));
+
+            let h = handle.clone();
+            let progress_fn = move |p: ObstacleMonthlyProgress| {
+                let _ = h.emit("om-reference-progress", p);
+            };
+
+            match om::build_reference_for_radar(radar, &exclude_mode_s, &month_label, mag_dec, &points_dir, &cancel, &progress_fn) {
+                Ok(data) => {
+                    // 기존 등록 파일/디렉토리가 다른 경로면 제거 (upsert 시 고아 정리)
+                    if let Some(prev) = registry.get(&radar.radar_name) {
+                        if prev.file_path != json_path.to_string_lossy() {
+                            let _ = fs::remove_file(&prev.file_path);
+                        }
+                        if prev.points_dir != points_dir.to_string_lossy() {
+                            let _ = fs::remove_dir_all(&prev.points_dir);
+                        }
+                    }
+                    // 스트리밍 직렬화 (수십 MB — 전체 문자열 복제 없음)
+                    let file = fs::File::create(&json_path).map_err(|e| format!("기준데이터 파일 생성 실패: {}", e))?;
+                    let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+                    serde_json::to_writer(&mut w, &data).map_err(|e| format!("기준데이터 직렬화 실패: {}", e))?;
+                    {
+                        use std::io::Write;
+                        w.flush().map_err(|e| format!("기준데이터 flush 실패: {}", e))?;
+                    }
+
+                    let meta = data.meta.clone();
+                    registry.insert(
+                        radar.radar_name.clone(),
+                        om::OmReferenceRegistryEntry {
+                            meta: meta.clone(),
+                            file_path: json_path.to_string_lossy().to_string(),
+                            points_dir: points_dir.to_string_lossy().to_string(),
+                        },
+                    );
+                    // 부분 진행 영속화 — 레이더 1개 끝날 때마다 레지스트리 저장
+                    save_om_registry(&state, &registry)?;
+
+                    let bytes = fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
+                    info!(
+                        "[OmReference] 레이더 '{}' 저장: {} ({:.1}MB) + 아카이브 {} pts / {:.1}MB",
+                        radar.radar_name,
+                        filename,
+                        bytes as f64 / 1024.0 / 1024.0,
+                        meta.total_points,
+                        meta.archive_bytes as f64 / 1024.0 / 1024.0
+                    );
+                    metas.push(meta);
+                }
+                Err(e) if e.contains("취소") => {
+                    // 반쯤 쓰인 아카이브 정리 (registry 미등록 → 다음 빌드가 어차피 재작성하지만 즉시 정리)
+                    let _ = fs::remove_dir_all(&points_dir);
+                    return Err(e);
+                }
+                Err(e) => {
+                    info!("[OmReference] 레이더 '{}' 빌드 실패: {}", radar.radar_name, e);
+                    // 실패한 레이더의 반쯤 쓰인 아카이브 정리 (JSON 은 미생성, registry 미등록)
+                    let _ = fs::remove_dir_all(&points_dir);
+                    let h2 = handle.clone();
+                    let _ = h2.emit(
+                        "om-reference-progress",
+                        ObstacleMonthlyProgress {
+                            radar_name: radar.radar_name.clone(),
+                            stage: "error".to_string(),
+                            message: format!("레이더 '{}' 기준데이터 빌드 실패: {}", radar.radar_name, e),
+                            current: 0,
+                            total: 0,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(metas)
+    })
+    .await
+    .map_err(|e| format!("빌드 스레드 오류: {}", e))??;
+
+    info!("[OmReference] 완료: {} 레이더 저장", metas.len());
+    Ok(metas)
+}
+
+/// 저장된 기준데이터 메타 목록 (소형 JSON — 직접 반환)
+#[tauri::command]
+async fn list_om_references(
+    app_handle: tauri::AppHandle,
+) -> Result<Vec<analysis::obstacle_monthly::OmReferenceMeta>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let registry = load_om_registry(&state)?;
+        let mut metas: Vec<_> = registry.into_values().map(|e| e.meta).collect();
+        metas.sort_by(|a, b| a.radar_name.cmp(&b.radar_name));
+        Ok(metas)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// 기준데이터 삭제 (파일 + 레지스트리)
+#[tauri::command]
+async fn delete_om_reference(radar_name: String, app_handle: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let mut registry = load_om_registry(&state)?;
+        if let Some(entry) = registry.remove(&radar_name) {
+            let _ = fs::remove_file(&entry.file_path);
+            let _ = fs::remove_dir_all(&entry.points_dir);
+            save_om_registry(&state, &registry)?;
+            info!("[OmReference] 레이더 '{}' 기준데이터 삭제 (집계 + 아카이브)", radar_name);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// 기준데이터 로드: 저장 파일(수십 MB 가능)을 bulk:// 경유로 반환.
+/// CLAUDE.md 규칙상 대용량/String 직접 반환 금지 — 영구 파일을 bulk_ipc 로 복사 후 BulkRef 반환.
+#[tauri::command]
+async fn load_om_reference(
+    radar_name: String,
+    app_handle: tauri::AppHandle,
+) -> Result<Option<bulk::BulkRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let registry = load_om_registry(&state)?;
+        let Some(entry) = registry.get(&radar_name) else {
+            return Ok(None);
+        };
+        let bytes = match fs::read(&entry.file_path) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!(
+                    "[OmReference] '{}' 파일 읽기 실패({}): {}",
+                    radar_name,
+                    entry.file_path,
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        // 영구 파일 → bulk_ipc 로 복사 후 BulkRef 반환 (프론트가 bulk:// 프로토콜로 스트리밍 수신)
+        let bulk_ref = bulk::write_bytes(&app_handle, &bytes, "json")?;
+        Ok(Some(bulk_ref))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// 건물 제외 커버리지 프로파일 계산 (장애물 월간 보고서용)
 #[tauri::command]
 async fn compute_coverage_terrain_profile_excluding(
@@ -2305,6 +2562,11 @@ pub fn run() {
             // 장애물 월간 분석
             analyze_obstacle_monthly,
             cancel_analysis,
+            // OM 기준데이터(참조 달) 집계 저장/로드
+            build_om_reference,
+            list_om_references,
+            delete_om_reference,
+            load_om_reference,
             compute_coverage_terrain_profile_excluding,
             compute_coverage_layers_batch_excluded,
             // 토지이용계획도 타일

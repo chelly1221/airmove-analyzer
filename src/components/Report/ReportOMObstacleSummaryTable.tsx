@@ -50,6 +50,9 @@ export default function ReportOMObstacleSummaryTable({
   // 인라인 편집키 접두사 — 차트와 동일 스킴(azelev.*) 유지 → 기존 편집 보존
   const eid = `azelev.${radarSite.name}_${building.id}`;
 
+  // Δ%p 부호 표기 — 양수 +, 음수는 − (U+2212) 사용 (요구 사양)
+  const signedPp = (v: number) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}`;
+
   // 3분할 세그먼트 — 색·라벨·편집키(key)·산정 기준 단일 원천(막대·레전드 공유). Σ ev = totalEv 정확 보존.
   //   색은 CVD 검증 통과 팔레트: 추가 기인 #a60739 / 지형·기존지물 #a16207 / 장애물 무관 #2563eb.
   const segments = [
@@ -92,13 +95,27 @@ export default function ReportOMObstacleSummaryTable({
                 <span className="mono">{blockage.lossRatePct.toFixed(2)}%</span> ·{" "}
                 <OMEditable id={`${eid}.tbl.blockage.noteNone`} value="지형·기존지물 이하 → 추가 차단영역 미형성" tag="span" />
               </>
+            ) : blockage.gradingMode === "delta" && blockage.refLossRatePct !== undefined && blockage.deltaPp !== undefined ? (
+              /* delta 모드 — 기준월 대비 편차 병기 (분석월 소실율 = blockage.lossRatePct) */
+              <>
+                <OMEditable id={`${eid}.tbl.blockage.deltaLabel`} value="추가 차단 구간" tag="span" />{" "}
+                기준 {blockage.refMonthLabel} <span className="mono">{blockage.refLossRatePct.toFixed(2)}%</span>
+                {" → "}분석월 <span className="mono">{blockage.lossRatePct.toFixed(2)}%</span>{" "}
+                <span className="mono strong" style={{ color: verdict.color }}>(Δ {signedPp(blockage.deltaPp)}%p)</span>
+                {" · 추세 "}{blockage.trendDir}
+                {blockage.trendDir !== "안정" ? (
+                  <span className="mono">{` (일당 ${blockage.trendSlopePctPerDay > 0 ? "+" : ""}${blockage.trendSlopePctPerDay.toFixed(3)}%p)`}</span>
+                ) : ""}
+              </>
             ) : (
+              /* absolute 폴백 — 기존 표시 유지 + 기준데이터 미적용 소자 */
               <>
                 <OMEditable id={`${eid}.tbl.blockage.label`} value="추가 차단 구간 소실율" tag="span" />{" "}
                 <span className="mono">{blockage.lossRatePct.toFixed(2)}%</span> · 추세 {blockage.trendDir}
                 {blockage.trendDir !== "안정" ? (
                   <span className="mono">{` (일당 ${blockage.trendSlopePctPerDay > 0 ? "+" : ""}${blockage.trendSlopePctPerDay.toFixed(3)}%p)`}</span>
                 ) : ""}
+                <span className="muted">{" · 기준데이터 미적용"}</span>
               </>
             )}
           </span>

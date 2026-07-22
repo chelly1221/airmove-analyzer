@@ -6,6 +6,7 @@ import {
   ChevronRight,
   ChevronDown,
   FilePlus,
+  Settings,
 } from "lucide-react";
 import { useAppStore } from "../store";
 import { emit } from "@tauri-apps/api/event";
@@ -15,6 +16,7 @@ import {
   templateDisplayLabel,
   type ReportTemplate,
 } from "../utils/reportTransfer";
+import OMReferenceModal from "../components/Report/OMReferenceModal";
 import type { RadarSite } from "../types";
 
 export default function ReportGeneration() {
@@ -47,6 +49,9 @@ export default function ReportGeneration() {
   // 보고서 준비 중 — 상세 상태 (오버레이 + 버튼 disable)
   const [prepState, setPrepState] = useState<{ active: boolean; message: string }>({ active: false, message: "" });
 
+  // 기준데이터 관리 모달
+  const [referenceModalOpen, setReferenceModalOpen] = useState(false);
+
   // NOTE: 보고서 창의 생성 요청(report:generate) 수신은 App.tsx 의 useReportGenerateListener 담당.
   // 페이지에 두면 라우트 이동 시 리스너가 해제되어 요청이 유실되므로 상시 마운트 지점으로 이동했다.
 
@@ -78,11 +83,22 @@ export default function ReportGeneration() {
         </div>
       )}
       {/* Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-gray-800">보고서 생성</h1>
-        <p className="mt-1 text-sm text-gray-500">
-          템플릿을 선택하여 분석 결과 PDF 보고서를 생성합니다
-        </p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-800">보고서 생성</h1>
+          <p className="mt-1 text-sm text-gray-500">
+            템플릿을 선택하여 분석 결과 PDF 보고서를 생성합니다
+          </p>
+        </div>
+        {/* 기준데이터 관리 (헤드라인 Δ 판정 기준월) */}
+        <button
+          onClick={() => setReferenceModalOpen(true)}
+          className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-800"
+          title="기준데이터 관리"
+        >
+          <Settings size={16} className="text-[#a60739]" />
+          기준데이터 관리
+        </button>
       </div>
 
       {/* Template list */}
@@ -97,6 +113,14 @@ export default function ReportGeneration() {
           disabled={prepState.active}
         />
       </div>
+
+      {/* 기준데이터 관리 모달 */}
+      <OMReferenceModal
+        open={referenceModalOpen}
+        onClose={() => setReferenceModalOpen(false)}
+        customRadarSites={customRadarSites}
+        aircraft={aircraft}
+      />
     </div>
   );
 }

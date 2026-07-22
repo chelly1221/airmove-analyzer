@@ -12,6 +12,7 @@ import type { AddedBlockageResult } from "../types/obstacle";
 import {
   weightedLossAvg,
   BLOCKAGE_WATCH_PCT, BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_SEVERE_PCT,
+  BLOCKAGE_DELTA_WATCH_PP, BLOCKAGE_DELTA_CAUTION_PP, BLOCKAGE_DELTA_ALERT_PP, BLOCKAGE_DELTA_SEVERE_PP,
   BLOCKAGE_NONE_LABEL,
 } from "./omStats";
 
@@ -49,12 +50,15 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     // 방위 소실율은 지형·트래픽 교란이 섞여 보조지표로만 두고 항목별 요약에서 언급.
     const order: Record<string, number> = { "심각": 5, "경계": 4, "주의": 3, "관심": 2, "양호": 1 };
     let worst = "", worstName = "", worstRate = 0;
+    let worstW: AddedBlockageResult | null = null; // 최악 등급 항목 — delta 표현 구성용
     let blockageCount = 0, noneCount = 0; // 사유 분리용 — 추가 차단 구간 미형성 전부 여부
+    let anyDelta = false; // 기준월 대비 편차(Δ%p) 판정 항목 존재 여부 — 임계 각주 분기용
     for (const rr of radarResults) {
       for (const b of selectedBuildings) {
         const w = addedBlockageByKey[`${rr.radar_name}_${b.id}`];
         if (!w) continue;
         blockageCount++;
+        if (w.gradingMode === "delta") anyDelta = true;
         if (w.grade.label === BLOCKAGE_NONE_LABEL) noneCount++;
         if (!(w.grade.label in order)) continue;
         // 동률 등급은 lossRatePct 최대치로 갱신(타이브레이크) — '최고 …%' 문구가 추가 차단 구간 표의
@@ -65,26 +69,35 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
           worst = w.grade.label;
           worstName = `${b.name || `건물${b.id}`}/${rr.radar_name}`;
           worstRate = w.lossRatePct;
+          worstW = w;
         }
       }
     }
     const allBandNone = blockageCount > 0 && noneCount === blockageCount;
+    // 최악 항목이 delta 판정이면 '기준월(라벨) 대비 ±X.XX%p' 중립 병기 (참조 달의 성격은 가정하지 않음)
+    const deltaPhrase = worstW && worstW.gradingMode === "delta" && worstW.refMonthLabel && worstW.deltaPp !== undefined
+      ? ` (기준월(${worstW.refMonthLabel}) 대비 ${worstW.deltaPp >= 0 ? "+" : "−"}${Math.abs(worstW.deltaPp).toFixed(2)}%p)`
+      : "";
     if (worst === "양호") {
-      lines.push(`분석 대상 장애물의 추가 차단영역 소실율은 양호 수준(최고 ${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 유의미한 탐지 영향은 확인되지 않았다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율은 양호 수준(최고 ${worstName} ${worstRate.toFixed(2)}%${deltaPhrase})으로, 장애물에 의한 유의미한 탐지 영향은 확인되지 않았다.`);
     } else if (worst === "관심") {
-      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 관심 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 경미하나 해당 방위·고도 탐지 성능의 지속 관찰이 필요하다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 관심 수준(${worstName} ${worstRate.toFixed(2)}%${deltaPhrase})으로, 경미하나 해당 방위·고도 탐지 성능의 지속 관찰이 필요하다.`);
     } else if (worst === "주의") {
-      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 주의 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 해당 방위·고도 탐지 성능을 지속 모니터링할 필요가 있다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 주의 수준(${worstName} ${worstRate.toFixed(2)}%${deltaPhrase})으로, 해당 방위·고도 탐지 성능을 지속 모니터링할 필요가 있다.`);
     } else if (worst === "경계") {
-      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 경계 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 경계 수준(${worstName} ${worstRate.toFixed(2)}%${deltaPhrase})으로, 장애물에 의한 탐지 성능 저하가 우려되며 운용 대책 검토가 필요하다.`);
     } else if (worst === "심각") {
-      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 심각 수준(${worstName} ${worstRate.toFixed(2)}%)으로, 현저한 탐지 성능 저하가 확인되어 즉각적인 운용 대책이 요구된다.`);
+      lines.push(`분석 대상 장애물의 추가 차단영역 소실율이 심각 수준(${worstName} ${worstRate.toFixed(2)}%${deltaPhrase})으로, 현저한 탐지 성능 저하가 확인되어 즉각적인 운용 대책이 요구된다.`);
     } else if (allBandNone) {
       lines.push(`분석 대상 장애물이 지형·기존지물 위로 새로 가리는 구간을 형성하지 않아(추가 차단 구간 없음), 장애물에 의한 추가 탐지 영향은 없는 것으로 판단된다.`);
     } else {
       lines.push(`분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않음(또는 판정 불가).`);
     }
-    lines.push(`※ 추가 차단영역 등급 임계 — 관심 ${BLOCKAGE_WATCH_PCT}% / 주의 ${BLOCKAGE_CAUTION_PCT}% / 경계 ${BLOCKAGE_ALERT_PCT}% / 심각 ${BLOCKAGE_SEVERE_PCT}% 이상.`);
+    if (anyDelta) {
+      lines.push(`※ 추가 차단영역 등급 임계(기준월 대비 편차 Δ%p) — 관심 +${BLOCKAGE_DELTA_WATCH_PP}%p / 주의 +${BLOCKAGE_DELTA_CAUTION_PP}%p / 경계 +${BLOCKAGE_DELTA_ALERT_PP}%p / 심각 +${BLOCKAGE_DELTA_SEVERE_PP}%p 이상.`);
+    } else {
+      lines.push(`※ 추가 차단영역 등급 임계 — 관심 ${BLOCKAGE_WATCH_PCT}% / 주의 ${BLOCKAGE_CAUTION_PCT}% / 경계 ${BLOCKAGE_ALERT_PCT}% / 심각 ${BLOCKAGE_SEVERE_PCT}% 이상.`);
+    }
   } else {
     // 파노라마 미준비(생성 직후) — 방위 소실율 기준 잠정 결론. 파노라마 완료 시 인과 헤드라인으로 자동 재생성.
     const worstGrade = allGrades.some((g) => g.grade === "경고") ? "경고"

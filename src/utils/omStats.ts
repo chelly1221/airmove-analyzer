@@ -195,3 +195,46 @@ export function gradeAddedBlockage(
   if (lossRatePct < BLOCKAGE_SEVERE_PCT)  return { label: "경계", color: "#c2410c", bg: "#ffedd5", border: "border-orange-200" };
   return { label: "심각", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
 }
+
+// ─── 추가 차단영역 소실율 — 기준데이터 대비 편차(Δ%p) 등급 ───
+//
+// 절대 임계(gradeAddedBlockage)는 소실율 스케일 자체가 사이트·지형·트래픽에 좌우돼 임계 보정이 어렵다.
+// 임의 참조 달(기준데이터) 1달치 대비 편차(Δ%p = 분석월 소실율 − 기준월 소실율)로 판정하면 사이트 고유
+// 배경 소실이 상쇄되어 '장애물 준공 등 변화에 의한 순증분'만 남는다.
+//
+// ※ 초기 임계값 — 운영 데이터로 보정 예정. (절대 임계 BLOCKAGE_*_PCT 와 동일하게 관심-주의-경계-심각
+//    4단계 위기경보 색상 관례를 따르되, 스케일은 '%p 편차'라 별도 상수로 둔다.)
+//   음수 Δ(기준보다 개선)도 양호로 판정한다.
+export const BLOCKAGE_DELTA_WATCH_PP = 5.0;   // 양호/관심 경계 (Δ %p)
+export const BLOCKAGE_DELTA_CAUTION_PP = 10.0; // 관심/주의 경계 (Δ %p)
+export const BLOCKAGE_DELTA_ALERT_PP = 20.0;   // 주의/경계 경계 (Δ %p)
+export const BLOCKAGE_DELTA_SEVERE_PP = 30.0;  // 경계/심각 경계 (Δ %p)
+
+/**
+ * 추가 차단영역 소실율 등급 (기준데이터 대비 편차 Δ%p 기준).
+ *
+ * 게이트(밴드 미형성·항적 없음·표본 부족 ≤ 10,000pt)는 gradeAddedBlockage 와 완전 동일 —
+ * 게이트 통과 시에만 편차 임계로 판정한다. 반환 형태({label,color,bg,border})도 동일해
+ * 소비처(요약표·소견표)가 delta/absolute 를 구분 없이 렌더할 수 있다.
+ *   Δ < 5 양호(음수 포함) / < 10 관심 / < 20 주의 / < 30 경계 / ≥ 30 심각.
+ */
+export function gradeAddedBlockageDelta(
+  deltaPp: number,
+  exposurePointCount: number,
+  hasBlockageBand: boolean = true,
+): { label: string; color: string; bg: string; border: string } {
+  if (!hasBlockageBand) {
+    return { label: BLOCKAGE_NONE_LABEL, color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+  }
+  if (exposurePointCount <= 0) {
+    return { label: "항적 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+  }
+  if (exposurePointCount <= BLOCKAGE_MIN_EXPOSURE_POINTS) {
+    return { label: "판정 불가", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
+  }
+  if (deltaPp < BLOCKAGE_DELTA_WATCH_PP)   return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
+  if (deltaPp < BLOCKAGE_DELTA_CAUTION_PP) return { label: "관심", color: "#1d4ed8", bg: "#dbeafe", border: "border-blue-200" };
+  if (deltaPp < BLOCKAGE_DELTA_ALERT_PP)   return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
+  if (deltaPp < BLOCKAGE_DELTA_SEVERE_PP)  return { label: "경계", color: "#c2410c", bg: "#ffedd5", border: "border-orange-200" };
+  return { label: "심각", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
+}

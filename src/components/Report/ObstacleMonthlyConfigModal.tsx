@@ -6,13 +6,14 @@
  */
 import { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import { CheckSquare, Square, ChevronRight, ChevronDown, MinusSquare, Loader2, BarChart3, Radio, Building2, FolderOpen, ArrowRight, ArrowLeft, Check, Circle, TriangleAlert } from "lucide-react";
-import { format, lastDayOfMonth, subMonths } from "date-fns";
+import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import Modal from "../common/Modal";
 import MonthPicker from "../common/MonthPicker";
 import { haversineKm, bearingDeg } from "../../utils/geo";
+import { extractDateFromFilename, filterFilesByMonth } from "../../utils/omFiles";
 import { readBulkJson } from "../../utils/bulkIpc";
 import type { BulkRef } from "../../utils/bulkIpc";
 import { computeLosBatch, calcBuildingAzExtent, mergeAzSectors } from "../../utils/obstacleAnalysisHelpers";
@@ -233,37 +234,7 @@ export default function ObstacleMonthlyConfigModal({
     }
   }, []);
 
-  /** 파일명에서 날짜(YYYY-MM-DD) 추출 (Rust extract_date_from_filename 미러) */
-  const extractDateFromFilename = useCallback((path: string): string | null => {
-    const filename = path.split(/[/\\]/).pop() ?? path;
-    const stem = filename.replace(/\.[^.]+$/, "");
-    for (const part of stem.split("_")) {
-      if (part.length === 6) {
-        const yy = parseInt(part.slice(0, 2), 10);
-        const mm = parseInt(part.slice(2, 4), 10);
-        const dd = parseInt(part.slice(4, 6), 10);
-        if (!isNaN(yy) && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
-          return `${2000 + yy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
-        }
-      }
-    }
-    return null;
-  }, []);
-
-  /** 선택 월에 해당하는 파일만 필터 (전월 마지막날 포함 — 자정 이후 데이터 포함 가능) */
-  const filterFilesByMonth = useCallback((files: string[], month: string): string[] => {
-    // month = "YYYY-MM"
-    const [y, m] = month.split("-").map(Number);
-    const prevMonth = subMonths(new Date(y, m - 1, 1), 1);
-    const prevLastDay = format(lastDayOfMonth(prevMonth), "yyyy-MM-dd");
-
-    return files.filter((f) => {
-      const date = extractDateFromFilename(f);
-      if (!date) return true; // 날짜 추출 실패 시 포함 (안전)
-      // 해당 월이거나 전월 마지막날
-      return date.startsWith(month) || date === prevLastDay;
-    });
-  }, [extractDateFromFilename]);
+  // 파일명 날짜 추출·월 필터는 omFiles.ts 공유 순수 함수 사용 (기준데이터 관리 모달과 규칙 공유).
 
   const handleAnalyze = useCallback(async () => {
     if (analyzing) return;

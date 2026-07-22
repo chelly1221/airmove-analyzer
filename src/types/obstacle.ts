@@ -109,8 +109,65 @@ export interface AddedBlockageResult {
   daysWithExposure: number;
   /** 일별 시계열 */
   series: AddedBlockageDay[];
-  /** 등급 (gradeAddedBlockage) */
+  /** 등급 (gradeAddedBlockage / gradeAddedBlockageDelta) */
   grade: { label: string; color: string };
+  /**
+   * 판정 방식 — 'delta': 기준데이터(참조 달) 대비 편차(Δ%p) 기준, 'absolute': 절대 임계 기준.
+   * 정합성 통과한 기준데이터가 로드되고 기준 표본이 충분할 때만 'delta'. 그 외는 'absolute' 폴백.
+   */
+  gradingMode: "delta" | "absolute";
+  /** (delta 모드) 기준월 추가 차단영역 소실율 (%) */
+  refLossRatePct?: number;
+  /** (delta 모드) 편차 = 분석월 소실율 − 기준월 소실율 (%p). 음수면 기준보다 개선. */
+  deltaPp?: number;
+  /** (delta 모드) 기준월 노출 포인트 수 (frac 가중 합) — 기준 표본량 표시용 */
+  refExposureCount?: number;
+  /** (delta 모드) 기준월 라벨 ("YYYY-MM") */
+  refMonthLabel?: string;
+}
+
+// ─── OM 기준데이터 (참조 달 1달치, 헤드라인 Δ 판정용) ───
+//
+// 임의 참조 달(예: 준공 전 기준 달) 1달치를 전방위 처리해 저장한 뒤, 월간 보고서의
+// 추가 차단영역 소실율을 이 기준 대비 편차(Δ%p)로 판정한다.
+// build_om_reference 가 파싱·집계·저장까지 수행하고 메타만 반환, load_om_reference 로 라이브 로드.
+// (라이브 세션 한정 소비 — SerializedOMData/보고서 창 전송 대상 아님. 보고서 창에서 직접 로드.)
+
+/** OM 기준데이터 메타 (list_om_references·build_om_reference 반환, snake_case Rust 미러) */
+export interface OmReferenceMeta {
+  radar_name: string;
+  month_label: string;
+  file_count: number;
+  first_date: string;
+  last_date: string;
+  created_at: string;
+  radar_lat: number;
+  radar_lon: number;
+  radar_altitude: number;
+  antenna_height: number;
+  total_track_time_secs: number;
+  total_loss_time_secs: number;
+  /** 함께 보관된 원시 포인트 수 (ASS 원본 없이 재집계 가능) */
+  total_points: number;
+  /** 아카이브 파일 합계 바이트 (원시 포인트 바이너리) */
+  archive_bytes: number;
+}
+
+/** OM 기준데이터 일별 요약 */
+export interface OmReferenceDaily {
+  date: string;
+  psr_rate: number;
+  loss_rate: number;
+  track_time_secs: number;
+  ssr_points: number;
+}
+
+/** OM 기준데이터 본문 (load_om_reference → readBulkJson 로 수신). 월간 합산·전방위 히스토그램. */
+export interface OmReferenceData {
+  version: number;
+  meta: OmReferenceMeta;
+  daily: OmReferenceDaily[];
+  az_elev_histogram: AzElevCell[];
 }
 
 /**

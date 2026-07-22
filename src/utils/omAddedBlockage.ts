@@ -17,7 +17,10 @@
 import type { PanoramaMergeResult } from "../types";
 import type { AzSector, AzElevCell, AddedBlockageResult, AddedBlockageDay } from "../types/obstacle";
 import { makePanoramaSampler } from "./obstacleAnalysisHelpers";
-import { gradeAddedBlockage, weightedTrendSlope } from "./omStats";
+import {
+  gradeAddedBlockage, gradeAddedBlockageDelta, weightedTrendSlope,
+  BLOCKAGE_MIN_EXPOSURE_POINTS,
+} from "./omStats";
 
 // Rust HIST_* 상수와 반드시 일치 (obstacle_monthly.rs)
 const HIST_AZ_BIN_DEG = 0.1;
@@ -48,6 +51,41 @@ export interface BlockageDayHist {
   cells: AzElevCell[];
 }
 
+/** 기준데이터 참조 (헤드라인 Δ 판정용) — 월간 합산·전방위 히스토그램 + 기준월 라벨. */
+export interface BlockageReference {
+  histogram: AzElevCell[];
+  monthLabel: string;
+}
+
+/**
+ * 히스토그램 셀 배열을 추가 차단영역 밴드 [without, with) 로 슬라이스해 노출/소실을 누적.
+ * 셀의 양각 범위 [elLo, elHi) 와 밴드의 겹침 비율(frac)로 가중 — 일별 루프와 기준(단일 패스)이
+ * 동일 샘플러·동일 밴드·동일 frac 가중을 공유하도록 단일 함수로 분리.
+ */
+function accumulateBand(
+  cells: AzElevCell[],
+  angleWithAt: (az: number) => number,
+  angleWithoutAt: (az: number) => number,
+  buildingExtent: AzSector,
+): { loss: number; exposure: number; lossCount: number; exposureCount: number } {
+  let loss = 0, exposure = 0, lossCount = 0, exposureCount = 0;
+  for (const c of cells) {
+    const azC = c.az_bin * HIST_AZ_BIN_DEG + HIST_AZ_BIN_DEG / 2;
+    if (!azInSector(azC, buildingExtent)) continue;
+    const elLo = HIST_ELEV_MIN_DEG + c.elev_bin * HIST_ELEV_BIN_DEG;
+    const elHi = elLo + HIST_ELEV_BIN_DEG;
+    const overlap = Math.min(elHi, angleWithAt(azC)) - Math.max(elLo, angleWithoutAt(azC));
+    if (overlap > 0) {
+      const frac = overlap / HIST_ELEV_BIN_DEG; // 0 < frac ≤ 1 (셀이 밴드에 겹치는 비율)
+      loss += c.loss_time_s * frac;
+      exposure += (c.track_time_s + c.loss_time_s) * frac;
+      lossCount += c.loss_count * frac;
+      exposureCount += (c.track_count + c.loss_count) * frac;
+    }
+  }
+  return { loss, exposure, lossCount, exposureCount };
+}
+
 /**
  * 건물별 추가 차단영역 소실율 산출.
  * @param histogramsByDay  레이더의 일별 az×elev 히스토그램 (모든 관측일 포함, 빈 날은 cells=[])
@@ -55,12 +93,15 @@ export interface BlockageDayHist {
  *                         좁혀 전달. 없으면 밴드 판정 불가 → 노출 기반 등급 폴백.
  * @param panoWithout      분석대상 제외 파노라마 (없으면 panoWith.terrain 으로 폴백 → without==terrain)
  * @param buildingExtent   대상 건물의 방위 노출 구간 (calcBuildingAzExtent)
+ * @param reference        기준데이터(참조 달) — 있으면 동일 샘플러·밴드·frac 가중으로 기준 소실율을
+ *                         산출해 편차(Δ%p) 판정. 없거나 기준 표본 부족이면 절대 임계 폴백.
  */
 export function computeAddedBlockage(
   histogramsByDay: BlockageDayHist[],
   panoWith: PanoramaMergeResult | undefined,
   panoWithout: PanoramaMergeResult | undefined,
   buildingExtent: AzSector,
+  reference?: BlockageReference | null,
 ): AddedBlockageResult {
   // 컷오프 샘플러 — classifyObstacleLosses(차트 빨강영역)와 정확히 동일한 폴백 규칙.
   //   panoWith 없으면 차단각 0(추가 차단영역 없음 → 노출 0).
@@ -98,25 +139,14 @@ export function computeAddedBlockage(
   let daysWithExposure = 0;
 
   for (const dh of histogramsByDay) {
-    let dayLoss = 0;
-    let dayExposure = 0;
-    for (const c of dh.cells) {
-      const azC = c.az_bin * HIST_AZ_BIN_DEG + HIST_AZ_BIN_DEG / 2;
-      if (!azInSector(azC, buildingExtent)) continue;
-      // 셀의 양각 범위 [elLo, elHi) 와 추가 차단영역 밴드 [without, with) 의 겹침 비율로 가중한다.
-      // (셀 중심각만으로 전량 포함/배제하면 0.05° 빈 경계에서 얇은 밴드의 노출/소실이 ±반빈만큼 편향)
-      const elLo = HIST_ELEV_MIN_DEG + c.elev_bin * HIST_ELEV_BIN_DEG;
-      const elHi = elLo + HIST_ELEV_BIN_DEG;
-      const overlap = Math.min(elHi, angleWithAt(azC)) - Math.max(elLo, angleWithoutAt(azC));
-      if (overlap > 0) {
-        const frac = overlap / HIST_ELEV_BIN_DEG; // 0 < frac ≤ 1 (셀이 밴드에 겹치는 비율)
-        dayLoss += c.loss_time_s * frac;
-        dayExposure += (c.track_time_s + c.loss_time_s) * frac;
-        // 포인트 수도 동일 frac 가중 — 시간 누적과 셀·조건 완전 일치 (표시 시 반올림)
-        totalLossCount += c.loss_count * frac;
-        totalExposureCount += (c.track_count + c.loss_count) * frac;
-      }
-    }
+    // 셀의 양각 범위 [elLo, elHi) 와 추가 차단영역 밴드 [without, with) 의 겹침 비율로 가중한다.
+    // (셀 중심각만으로 전량 포함/배제하면 0.05° 빈 경계에서 얇은 밴드의 노출/소실이 ±반빈만큼 편향)
+    const acc = accumulateBand(dh.cells, angleWithAt, angleWithoutAt, buildingExtent);
+    const dayLoss = acc.loss;
+    const dayExposure = acc.exposure;
+    // 포인트 수도 동일 frac 가중 — 시간 누적과 셀·조건 완전 일치 (표시 시 반올림)
+    totalLossCount += acc.lossCount;
+    totalExposureCount += acc.exposureCount;
     const ratePct = dayExposure > 0 ? (dayLoss / dayExposure) * 100 : 0;
     series.push({ day: dh.day, ratePct, exposureS: dayExposure });
     totalLoss += dayLoss;
@@ -131,8 +161,36 @@ export function computeAddedBlockage(
   const dayCount = series.length;
   // 노출>0 이면 밴드는 반드시 존재 — 기하 스캔의 위상 누락에도 라벨이 노출과 모순되지 않도록 OR 안전망.
   const hasBlockageBand = geometricBand || totalExposure > 0;
-  // 표본 게이트는 통과 항적 포인트 수(totalExposureCount) 단일 기준 — 관측일수/노출 발생일 게이트는 폐지.
-  const g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
+
+  // ── 기준데이터 대비 편차(Δ%p) 판정 ──
+  // 기준데이터가 있고(정합성 게이트는 호출부에서 통과) 기준 표본이 충분하면(refExposureCount > 10,000pt)
+  // 동일 샘플러·동일 밴드·동일 frac 가중으로 기준월 소실율을 산출해 편차 임계로 판정한다(delta 모드).
+  // 그 외(기준 없음/기준 표본 부족)는 절대 임계 폴백(absolute 모드). 현재 노출 게이트는 등급 함수 내부가 처리.
+  let gradingMode: "delta" | "absolute" = "absolute";
+  let refLossRatePct: number | undefined;
+  let deltaPp: number | undefined;
+  let refExposureCount: number | undefined;
+  let refMonthLabel: string | undefined;
+  let g: { label: string; color: string };
+
+  if (reference && reference.histogram.length > 0) {
+    const ref = accumulateBand(reference.histogram, angleWithAt, angleWithoutAt, buildingExtent);
+    const refRate = ref.exposure > 0 ? (ref.loss / ref.exposure) * 100 : 0;
+    if (ref.exposureCount > BLOCKAGE_MIN_EXPOSURE_POINTS) {
+      gradingMode = "delta";
+      refLossRatePct = refRate;
+      refExposureCount = ref.exposureCount;
+      refMonthLabel = reference.monthLabel;
+      deltaPp = lossRatePct - refRate;
+      g = gradeAddedBlockageDelta(deltaPp, totalExposureCount, hasBlockageBand);
+    } else {
+      // 기준 표본 부족 → 절대 임계 폴백 (분모 대표성 없어 편차 신뢰 불가)
+      g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
+    }
+  } else {
+    // 기준데이터 없음 → 절대 임계 폴백. 표본 게이트는 통과 항적 포인트 수(totalExposureCount) 단일 기준.
+    g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
+  }
 
   return {
     lossRatePct,
@@ -145,5 +203,10 @@ export function computeAddedBlockage(
     daysWithExposure,
     series,
     grade: { label: g.label, color: g.color },
+    gradingMode,
+    refLossRatePct,
+    deltaPp,
+    refExposureCount,
+    refMonthLabel,
   };
 }
