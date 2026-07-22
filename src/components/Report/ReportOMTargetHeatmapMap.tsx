@@ -9,12 +9,14 @@
  *  - "진짜 히트맵" 룩: box blur 로 스무딩 → ln 정규화 → 붉은계열(ColorBrewer Reds) 색 램프 LUT.
  *      저강도는 은은한 살구색, 고밀도 항로는 진홍으로 타오른다(단색 alpha → 강도별 색 그라디언트 전환).
  *  - 소실표적(loss_points_summary, 전수)도 같은 강도 버퍼에 +1 스탬프 — 시각 구분 없음(기존 설계 유지).
- *  - 북한 크롭: 상단(북)을 최북단 레이더 위도 + TOP_MARGIN_DEG(기본 여유)로 잡되 북한 육지 미노출
- *      상한(NK_CROP_MAX_LAT)으로 캡 — 남부 레이더는 여유가, 수도권 레이더는 상한이 걸린다(북측
- *      원거리 표적·원 상단은 의도적으로 숨김). 하단(남)은 페이지 크기에 맞춰 확장 — 지도가 A4 페이지
- *      잔여 높이를 꽉 채운다(297mm 오버플로우 금지 — ASPECT 유도 참조).
+ *  - 남한 전역 뷰: 상단(북)을 남한 북단(SK_NORTH_LAT ≈38.65°N, 강원 고성)에 앵커 고정, 하단(남)은
+ *      남한 남단(SK_SOUTH_LAT ≈33.05°N, 마라도)까지. 세로가 지배축이면 가로를 자동 확장(여분 동서
+ *      균등 → 중심 정렬), 가로가 지배축이면 세로 여분은 전부 남쪽으로 확장(상단 앵커 고정). DMZ 이북
+ *      북한 육지가 상단에 노출되는 것은 허용(사용자 결정, 2026-07-22). 지도는 A4 페이지 잔여 높이를
+ *      꽉 채운다(297mm 오버플로우 금지 — ASPECT 유도 참조).
  *  - 원 밖 표적: Rust 그리드가 ±150NM 로 확장되어 60NM 원 밖 표적도 표시 창 안이면 전부 보인다.
- *  - 60NM 원·레이더 마커는 유지(상단 크롭으로 원 상단이 잘려 보이는 것 정상).
+ *  - 60NM 원·레이더 마커는 유지(전국 뷰에서 원은 대체로 창 안에 들어오나, 극단 구성 — 예: 제주 레이더
+ *      원 남단 — 은 잘릴 수 있고 이는 허용).
  *  - track_heatmap 부재(구버전 캐시) 시에도 소실점·마커만으로 렌더 — 크래시/배너 없음.
  *  - PDF 안전: 단일 canvas + data-map-canvas/ready/complete 게이트(§2/§3/§4 도면과 동일 자가치유).
  *    무거운 연산(강도 합산·blur·LUT·ImageData)은 전부 useMemo 1회 — 오프스크린 캔버스로 메모이즈해
@@ -34,16 +36,14 @@ const KM_PER_NM = 1.852;
 const R_KM = 6371;
 /** 범위 원 = 60NM(OM 통계 스코프). 표시 유지 — 원 밖 표적도 그리드 확장으로 표시됨. */
 const OM_RANGE_NM = 60;
-/**
- * 뷰 상단 기본 여유(°) — 최북단 레이더 위도 + 이 값. 남부 레이더는 이만큼 북쪽 컨텍스트가 보인다.
- */
-const TOP_MARGIN_DEG = 0.5;
-/**
- * 뷰 상단 절대 상한(°N) — 북한 육지 미노출 컷. 한강 하구(조강) 남안(김포반도·강화 북단, ≈37.76°N)까지는
- * 표시하고 북안(개풍군, ≈37.78°N~)은 화면 밖. 수도권 레이더에선 이 상한이 걸리고, 남부 레이더는
- * TOP_MARGIN_DEG 가 걸린다.
- */
-const NK_CROP_MAX_LAT = 37.76;
+/** 남한 전역 뷰 북단(°N) — 강원 고성 통일전망대 부근(≈38.61°N) + 소여유. DMZ 이북 육지 노출 허용(사용자 결정). */
+const SK_NORTH_LAT = 38.65;
+/** 남한 전역 뷰 남단(°N) — 마라도(≈33.11°N) 이남 소여유. */
+const SK_SOUTH_LAT = 33.05;
+/** 남한 전역 뷰 서단(°E) — 본토 서해안 기준(도서는 종횡비 맞춤 가로 확장으로 흑산도·홍도까지 자연 포함). */
+const SK_WEST_LON = 126.0;
+/** 남한 전역 뷰 동단(°E) — 포항 호미곶(≈129.57°E) + 소여유. 울릉도·독도는 스코프 제외. */
+const SK_EAST_LON = 129.6;
 /** 범위 원 표시용 샘플 분할 수. */
 const RING_SEG = 128;
 
@@ -159,30 +159,33 @@ export default function ReportOMTargetHeatmapMap({ sectionNum, radars }: Props) 
 
   // ── 기하 + 히트맵 오프스크린 — 전부 useMemo 1회(렌더 핫패스 방지) ──
   const geom = useMemo<Geom>(() => {
-    // ── 자체 투영 구성 ──
+    // ── 자체 투영 구성 (남한 전역 뷰) ──
     const lats = radars.map((r) => r.site.latitude);
-    const lons = radars.map((r) => r.site.longitude);
-    const radarMaxLat = lats.length ? Math.max(...lats) : 37.5;         // radars 소수(spread 안전)
-    const centerLon = lons.length ? lons.reduce((s, v) => s + v, 0) / lons.length : 127;
 
-    // 가로: 모든 레이더 60NM 원 동서 극점 + 양측 4% 패딩을 centerLon 중심으로 커버.
-    const mxCenter = mercX(centerLon);
-    let halfMerc = 1e-6;
+    // X 요구범위: 남한 bbox ∪ 각 레이더 60NM 원 동서 극점 (기존 원 커버 보장 유지).
+    let west = mercX(SK_WEST_LON), east = mercX(SK_EAST_LON);
     for (const { site } of radars) {
       const dLat = (OM_RANGE_NM * KM_PER_NM) / R_KM / DEG2RAD;
       const dLon = dLat / Math.max(0.1, Math.cos(site.latitude * DEG2RAD));
-      const east = mercX(site.longitude + dLon), west = mercX(site.longitude - dLon);
-      halfMerc = Math.max(halfMerc, east - mxCenter, mxCenter - west);
+      west = Math.min(west, mercX(site.longitude - dLon));
+      east = Math.max(east, mercX(site.longitude + dLon));
     }
-    halfMerc *= 1.04;                          // 양측 4% 패딩
-    const spanXMerc = 2 * halfMerc;
+    const requiredSpanX = (east - west) * 1.04;   // 양측 4% 패딩(기존과 동일)
+
+    // 상단 앵커: 남한 북단 고정. 극단 구성(레이더가 북단 이북) 가드만 유지.
+    const radarMaxLat = lats.length ? Math.max(...lats) : 37.5;   // radars 소수(spread 안전)
+    const topLat = Math.max(SK_NORTH_LAT, radarMaxLat + 0.05);
+
+    // Y 요구범위: topLat ~ 남한 남단 (mercY 는 남쪽으로 증가).
+    const requiredSpanY = mercY(SK_SOUTH_LAT) - mercY(topLat);
+
+    // 종횡비 맞춤: 지배축 기준으로 가로 스팬 확정 — 세로 지배 시 가로가 확장(여분은 동서 균등),
+    // 가로 지배 시 세로가 확장(여분은 전부 남쪽 — 상단 앵커 고정이라 북한 추가 노출 없음).
+    const targetAspect = H / W;
+    const spanXMerc = Math.max(requiredSpanX, requiredSpanY / targetAspect);
     const worldSize = W / spanXMerc;           // 가로 W 픽셀이 이 지리 창을 담도록
     const z = Math.max(3, Math.min(19, Math.log2(worldSize / TILE))); // 분수 줌(composeTiles 가 처리)
-    const originX = mxCenter * worldSize - W / 2;
-
-    // 상단(북한 크롭): 기본 여유(TOP_MARGIN_DEG)를 주되 북한 육지 미노출 상한(NK_CROP_MAX_LAT)으로 캡.
-    //   레이더가 상한 부근/이북인 극단 구성에서도 마커가 상단에 붙지 않게 최소 여유 0.05° 는 보장.
-    const topLat = Math.max(Math.min(radarMaxLat + TOP_MARGIN_DEG, NK_CROP_MAX_LAT), radarMaxLat + 0.05);
+    const originX = ((west + east) / 2) * worldSize - W / 2;   // X 는 요구범위 중심 정렬
     const originY = mercY(topLat) * worldSize; // 상단 = topLat, 이후 H 픽셀만큼 남쪽으로
 
     const project = (lat: number, lon: number): [number, number] => [
@@ -291,7 +294,7 @@ export default function ReportOMTargetHeatmapMap({ sectionNum, radars }: Props) 
       // 1) 히트맵 — 메모이즈된 오프스크린 1회 그리기(재합성마다 재계산 없음)
       ctx.drawImage(geom.offscreen, 0, 0);
 
-      // 2) 레이더별 60NM 원 — 옅은 회색 외곽선(상단 크롭으로 잘려 보이는 것 정상)
+      // 2) 레이더별 60NM 원 — 옅은 회색 외곽선(전국 뷰 밖으로 나가면 잘려 보이는 것 정상)
       for (const r of geom.radars) {
         ctx.beginPath();
         for (let i = 0; i < r.ringPx.length; i++) {
