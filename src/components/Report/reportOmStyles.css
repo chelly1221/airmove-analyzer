@@ -485,36 +485,6 @@
 }
 
 /* ── 종합 소견 ───────────────────────────────────────────────────────── */
-.kac-report .summary-cards { display: grid; gap: 10px; margin-bottom: 14px; }
-.kac-report .sumcard {
-  border: 1px solid var(--om-border);
-  border-radius: 6px;
-  padding: 10px 12px;
-  background: #fff;
-}
-.kac-report .sumcard-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 6px;
-}
-.kac-report .sumcard-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-}
-.kac-report .sumcard-table td { padding: 2px 0; }
-
-.kac-report .badge {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 700;
-}
-.kac-report .badge.ok { background: #dcfce7; color: #15803d; }
-.kac-report .badge.bad { background: #fee2e2; color: #b91c1c; }
-
 .kac-report .bldg-strip {
   background: var(--om-muted-bg);
   border: 1px solid var(--om-border);

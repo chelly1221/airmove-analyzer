@@ -55,7 +55,10 @@ export default function ReportOMLossEventsMap({ radarSite, buildings, buildingGr
     }
     for (const p of lossPts) pts.push(p);
 
-    const proj = fitProjection(pts, SQ, SQ);
+    // 레이더·소실표적이 한눈에 최대 줌으로 보이도록 분수 줌(정수 floor 미적용 → bbox 대비 최대 ~2배
+    //   줌아웃 해소) + 패딩 축소(0.06)로 정사각 프레임을 꽉 채운다. §1 히트맵·§2 위치도가 쓰는 검증된
+    //   경로(composeTiles zInt=round(z) 타일 배치·축척막대 mpp 분수 z 성립). §3 부채꼴 도면은 기본 인자 경로라 불변.
+    const proj = fitProjection(pts, SQ, SQ, { fractionalZoom: true, padRatio: 0.06 });
     const { project } = proj;
 
     return {

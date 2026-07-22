@@ -352,14 +352,12 @@ export default function ReportPreviewContent(props: ReportPreviewContentProps) {
             <div data-toc-key="omFindings">
               <ReportOMFindings
                 sectionNum={sectionNumbers.omFindings ?? 6}
-                radarResults={omResult.radar_results}
                 selectedBuildings={omData.selectedBuildings}
                 buildingGroups={omData.buildingGroups}
                 radarSites={omData.selectedRadarSites}
                 findingsText={omData.findingsText}
                 onFindingsChange={(text) => onOmDataChange((prev) => ({ ...prev, findingsText: text }))}
                 editable={true}
-                analysisMonth={omData.analysisMonth}
                 addedBlockageByKey={omData.addedBlockageByKey}
               />
             </div>
