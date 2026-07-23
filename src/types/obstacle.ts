@@ -87,6 +87,15 @@ export interface AddedBlockageDay {
 }
 
 /**
+ * 기준데이터 미적용(absolute 폴백) 사유 — 보고서 표기·각주 분기용.
+ * - none: 저장된 기준데이터 없음
+ * - mismatch: 레이더 좌표·안테나고 정합성 불일치 (utils/omReference.checkRefCoherence)
+ * - load_failed: 기준데이터 파일 로드 실패
+ * - ref_insufficient: 기준 표본 부족 (해당 쐐기 기준 노출 ≤ 게이트) 또는 기준 히스토그램 없음
+ */
+export type RefFallbackReason = "none" | "mismatch" | "load_failed" | "ref_insufficient";
+
+/**
  * 건물별 추가 차단영역 소실율 결과 (헤드라인 심각도 지표).
  * 노출 조건부 소실율 = Σ(추가 차단영역 내 소실시간) / Σ(추가 차단영역 내 노출시간) × 100%.
  */
@@ -124,6 +133,8 @@ export interface AddedBlockageResult {
   refExposureCount?: number;
   /** (delta 모드) 기준월 라벨 ("YYYY-MM") */
   refMonthLabel?: string;
+  /** (absolute 폴백 시) 기준데이터 미적용 사유 — delta 모드면 undefined */
+  refFallback?: RefFallbackReason;
 }
 
 // ─── OM 기준데이터 (참조 달 1달치, 헤드라인 Δ 판정용) ───
@@ -151,6 +162,8 @@ export interface OmReferenceMeta {
   total_points: number;
   /** 아카이브 파일 합계 바이트 (원시 포인트 바이너리) */
   archive_bytes: number;
+  /** 별도 보관된 원본 ASS 파일 합계 바이트 — 0이면 미보관(구버전 빌드/보관 실패), 재계산 불가 */
+  ass_bytes: number;
 }
 
 /** OM 기준데이터 일별 요약 */

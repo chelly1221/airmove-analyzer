@@ -2,13 +2,14 @@ import React from "react";
 import EditableText from "./EditableText";
 import OMEditable from "./OMEditable";
 import type { ManualBuilding, BuildingGroup, RadarSite } from "../../types";
-import type { AddedBlockageResult } from "../../types/obstacle";
+import type { AddedBlockageResult, RefFallbackReason } from "../../types/obstacle";
 import {
   BLOCKAGE_MIN_EXPOSURE_POINTS,
   BLOCKAGE_WATCH_PCT, BLOCKAGE_CAUTION_PCT, BLOCKAGE_ALERT_PCT, BLOCKAGE_SEVERE_PCT,
   BLOCKAGE_DELTA_WATCH_PP, BLOCKAGE_DELTA_CAUTION_PP, BLOCKAGE_DELTA_ALERT_PP, BLOCKAGE_DELTA_SEVERE_PP,
   BLOCKAGE_NONE_LABEL,
 } from "../../utils/omStats";
+import { REF_FALLBACK_LABELS } from "../../utils/omReference";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import AutoPaginate from "./AutoPaginate";
 import BuildingGroupBadge from "./BuildingGroupBadge";
@@ -58,6 +59,8 @@ function ReportOMFindings({
   // delta/absolute 판정 방식 혼재 여부 — 각주 분기용 (delta 각주·※ 절대 임계 각주 병기 판단)
   let hasDelta = false;    // 기준월 대비 Δ 판정된 정상 등급 행 존재
   let hasAbsolute = false; // 기준데이터 미적용(절대 임계) 정상 등급 행 존재
+  // 절대 임계 폴백 사유별 건수 — 렌더 루프에서 그 자리 수집(새 O(N²) 순회 없음), 각주 병기용.
+  const absFallbackCounts: Partial<Record<RefFallbackReason, number>> = {};
   const blockageRows = addedBlockageByKey
     ? selectedBuildings.flatMap((b) =>
         radarSites.map((rs) => {
@@ -68,7 +71,11 @@ function ReportOMFindings({
           const isDelta = graded && w.gradingMode === "delta" && w.refLossRatePct !== undefined && w.deltaPp !== undefined;
           const isAbsGraded = graded && !isDelta; // 정상 등급인데 기준데이터 미적용(절대 임계 폴백)
           if (isDelta) hasDelta = true;
-          if (isAbsGraded) hasAbsolute = true;
+          if (isAbsGraded) {
+            hasAbsolute = true;
+            const reason = w.refFallback ?? "none";
+            absFallbackCounts[reason] = (absFallbackCounts[reason] ?? 0) + 1;
+          }
           return (
             <tr key={`${rs.name}-${b.id}`}>
               <td>
@@ -88,8 +95,12 @@ function ReportOMFindings({
               <td className="ta-c mono">
                 {isDelta ? `${w.refLossRatePct!.toFixed(2)}%` : "—"}
               </td>
-              {/* Δ(%p) — delta 모드 행만 값(등급색), 절대 임계 정상 등급 행은 "— ※", 나머지 "—" */}
-              <td className="ta-c mono" style={isDelta ? { color: w.grade.color } : undefined}>
+              {/* Δ(%p) — delta 모드 행만 값(등급색), 절대 임계 정상 등급 행은 "— ※"(사유 title), 나머지 "—" */}
+              <td
+                className="ta-c mono"
+                style={isDelta ? { color: w.grade.color } : undefined}
+                title={isAbsGraded ? REF_FALLBACK_LABELS[w.refFallback ?? "none"] : undefined}
+              >
                 {isDelta ? `${signedPp(w.deltaPp!)}%p` : isAbsGraded ? "— ※" : "—"}
               </td>
               <td className="ta-c mono">
@@ -107,6 +118,14 @@ function ReportOMFindings({
         }),
       ).filter(Boolean)
     : [];
+  // 절대 임계 폴백 사유 병기 문구 — 고정 순서(라벨 정의 순)로 집계, 1종이면 건수 생략(사유만).
+  const REASON_ORDER: RefFallbackReason[] = ["none", "mismatch", "load_failed", "ref_insufficient"];
+  const absReasonEntries = REASON_ORDER
+    .map((r) => [r, absFallbackCounts[r] ?? 0] as [RefFallbackReason, number])
+    .filter(([, n]) => n > 0);
+  const absFallbackText = absReasonEntries.length === 1
+    ? REF_FALLBACK_LABELS[absReasonEntries[0][0]]
+    : absReasonEntries.map(([r, n]) => `${REF_FALLBACK_LABELS[r]} ${n}건`).join(" · ");
   const blockageBlock = blockageRows.length > 0 ? (
     <div className="bldg-strip">
       <OMEditable id="findings.blockageHeader" value="추가 차단 구간 소실율 — 건물 인과 헤드라인" tag="div" className="block-h3" style={{ margin: 0, marginBottom: 6 }} />
@@ -134,7 +153,7 @@ function ReportOMFindings({
         )}
         {(hasAbsolute || !hasDelta) && (
           <>
-            {" "}{hasAbsolute ? "※ 기준데이터 미적용 행(절대 임계) — " : "등급(전구간 평균 소실율 기준과 별도) — "}양호 &lt; {BLOCKAGE_WATCH_PCT.toFixed(0)}% · 관심 {BLOCKAGE_WATCH_PCT.toFixed(0)}~{BLOCKAGE_CAUTION_PCT.toFixed(0)}% 미만 · 주의 {BLOCKAGE_CAUTION_PCT.toFixed(0)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 · 경계 {BLOCKAGE_ALERT_PCT.toFixed(0)}~{BLOCKAGE_SEVERE_PCT.toFixed(0)}% 미만 · 심각 ≥ {BLOCKAGE_SEVERE_PCT.toFixed(0)}%.
+            {" "}{hasAbsolute ? `※ 기준데이터 미적용 행(절대 임계 — ${absFallbackText}) — ` : "등급(전구간 평균 소실율 기준과 별도) — "}양호 &lt; {BLOCKAGE_WATCH_PCT.toFixed(0)}% · 관심 {BLOCKAGE_WATCH_PCT.toFixed(0)}~{BLOCKAGE_CAUTION_PCT.toFixed(0)}% 미만 · 주의 {BLOCKAGE_CAUTION_PCT.toFixed(0)}~{BLOCKAGE_ALERT_PCT.toFixed(0)}% 미만 · 경계 {BLOCKAGE_ALERT_PCT.toFixed(0)}~{BLOCKAGE_SEVERE_PCT.toFixed(0)}% 미만 · 심각 ≥ {BLOCKAGE_SEVERE_PCT.toFixed(0)}%.
           </>
         )}
       </p>

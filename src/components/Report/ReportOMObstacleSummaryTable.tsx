@@ -21,6 +21,7 @@ import type { ManualBuilding, RadarSite } from "../../types";
 import type { AddedBlockageResult } from "../../types/obstacle";
 import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
 import { BLOCKAGE_NONE_LABEL } from "../../utils/omStats";
+import { REF_FALLBACK_LABELS } from "../../utils/omReference";
 import OMEditable from "./OMEditable";
 
 interface Props {
@@ -115,7 +116,7 @@ export default function ReportOMObstacleSummaryTable({
                 {blockage.trendDir !== "안정" ? (
                   <span className="mono">{` (일당 ${blockage.trendSlopePctPerDay > 0 ? "+" : ""}${blockage.trendSlopePctPerDay.toFixed(3)}%p)`}</span>
                 ) : ""}
-                <span className="muted">{" · 기준데이터 미적용"}</span>
+                <span className="muted">{` · 기준데이터 미적용(${REF_FALLBACK_LABELS[blockage.refFallback ?? "none"]})`}</span>
               </>
             )}
           </span>

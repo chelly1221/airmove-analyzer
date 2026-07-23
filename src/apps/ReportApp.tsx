@@ -19,6 +19,8 @@ import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import { readBulkJson } from "../utils/bulkIpc";
 import type { BulkRef } from "../utils/bulkIpc";
 import { computeAddedBlockage } from "../utils/omAddedBlockage";
+import { checkRefCoherence } from "../utils/omReference";
+import type { RefFallbackReason } from "../types/obstacle";
 import { calcBuildingAzExtent, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
 import {
   readReportPayload, clearReportPayload, deserializeOMData, serializeOMData,
@@ -971,21 +973,25 @@ export default function ReportApp() {
         // 정합성 게이트: 레이더 위치(lat/lon)·안테나고 일치 확인. 불일치/부재/로드실패는 조용히
         // 절대 임계 폴백(보고서 생성이 막히면 안 됨). 통과분만 Map 에 보관해 computeAddedBlockage 에 전달.
         const refByRadar = new Map<string, { histogram: AzElevCell[]; monthLabel: string }>();
+        // 절대 임계로 확정된 레이더의 미적용 사유 — 통과분은 넣지 않는다(computeAddedBlockage 가
+        //   refByRadar 로 delta 판정). none: 저장된 기준 없음 · load_failed: 로드 예외 · mismatch: 정합성 불일치.
+        const refFallbackByRadar = new Map<string, RefFallbackReason>();
         for (const radar of radars) {
           try {
             const ref = await invoke<BulkRef | null>("load_om_reference", { radarName: radar.name });
-            if (!ref) continue;
+            if (!ref) { refFallbackByRadar.set(radar.name, "none"); continue; }
             const data = await readBulkJson<OmReferenceData>(ref);
             const m = data.meta;
-            const latOk = Math.abs(m.radar_lat - radar.latitude) < 0.0005;
-            const lonOk = Math.abs(m.radar_lon - radar.longitude) < 0.0005;
-            const antOk = Math.abs(m.antenna_height - radar.antenna_height) < 0.1;
-            if (latOk && lonOk && antOk) {
+            // 정합성 판정은 utils/omReference.checkRefCoherence 단일 원천(임계 0.0005°/0.1m·사유 문구 공유).
+            const coh = checkRefCoherence(m, radar);
+            if (coh.ok) {
               refByRadar.set(radar.name, { histogram: data.az_elev_histogram ?? [], monthLabel: m.month_label });
             } else {
-              console.warn(`[OM] 기준데이터 정합성 불일치 — ${radar.name} 기준 미적용 (Δlat=${(m.radar_lat - radar.latitude).toFixed(5)}, Δlon=${(m.radar_lon - radar.longitude).toFixed(5)}, Δant=${(m.antenna_height - radar.antenna_height).toFixed(2)})`);
+              refFallbackByRadar.set(radar.name, "mismatch");
+              console.warn(`[OM] 기준데이터 정합성 불일치 — ${radar.name} 기준 미적용 (${coh.reasonText})`);
             }
           } catch (e) {
+            refFallbackByRadar.set(radar.name, "load_failed");
             console.warn(`[OM] 기준데이터 로드 실패 — ${radar.name} 절대 임계 폴백:`, e);
           }
         }
@@ -998,6 +1004,7 @@ export default function ReportApp() {
           const pWith = panoWithTargets.get(radar.name);
           const pWithout = panoWithoutTargets.get(radar.name);
           const radarRef = refByRadar.get(radar.name) ?? null;
+          const radarFallback = refFallbackByRadar.get(radar.name); // 통과분은 undefined (radarRef 로 delta 판정)
           for (const b of buildings) {
             if (flowEpoch !== loadEpochRef.current) return; // reload — stale 산출 폐기
             const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
@@ -1005,7 +1012,7 @@ export default function ReportApp() {
             // 건물별 with(= without ∪ {해당 건물}) — 방위 중첩 인접 분석 대상의 차단이 이 건물의
             //   추가 차단영역(노출/소실)에 중복 귀속되지 않는다 (차트 핑크영역·분류와 동일 필터).
             addedBlockageByKey[key] = computeAddedBlockage(
-              histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent, radarRef,
+              histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent, radarRef, radarFallback,
             );
             // 쌍 사이 이벤트 루프 양보 — 프리뷰 점진 마운트/페인트와 교차 실행
             await new Promise((r) => setTimeout(r, 0));

@@ -15,7 +15,7 @@
  * 방위 중첩 인접 분석 대상의 한계기여가 양쪽 건물에 중복 귀속되던 v1 한계 해소(차트 핑크영역과 계속 일치).
  */
 import type { PanoramaMergeResult } from "../types";
-import type { AzSector, AzElevCell, AddedBlockageResult, AddedBlockageDay } from "../types/obstacle";
+import type { AzSector, AzElevCell, AddedBlockageResult, AddedBlockageDay, RefFallbackReason } from "../types/obstacle";
 import { makePanoramaSampler } from "./obstacleAnalysisHelpers";
 import {
   gradeAddedBlockage, gradeAddedBlockageDelta, weightedTrendSlope,
@@ -95,6 +95,10 @@ function accumulateBand(
  * @param buildingExtent   대상 건물의 방위 노출 구간 (calcBuildingAzExtent)
  * @param reference        기준데이터(참조 달) — 있으면 동일 샘플러·밴드·frac 가중으로 기준 소실율을
  *                         산출해 편차(Δ%p) 판정. 없거나 기준 표본 부족이면 절대 임계 폴백.
+ * @param refFallback      호출부(ReportApp)가 수집한 '기준데이터 미적용' 사유 — reference 가 없을 때
+ *                         결과 refFallback 로 그대로 전달(none/mismatch/load_failed). reference 가
+ *                         주어진 경로(있으나 표본 부족·히스토그램 없음)는 내부에서 "ref_insufficient" 로
+ *                         산출하므로 이 인자는 무시된다. delta 모드로 확정되면 결과 refFallback 는 undefined.
  */
 export function computeAddedBlockage(
   histogramsByDay: BlockageDayHist[],
@@ -102,6 +106,7 @@ export function computeAddedBlockage(
   panoWithout: PanoramaMergeResult | undefined,
   buildingExtent: AzSector,
   reference?: BlockageReference | null,
+  refFallback?: RefFallbackReason,
 ): AddedBlockageResult {
   // 컷오프 샘플러 — classifyObstacleLosses(차트 빨강영역)와 정확히 동일한 폴백 규칙.
   //   panoWith 없으면 차단각 0(추가 차단영역 없음 → 노출 0).
@@ -171,6 +176,8 @@ export function computeAddedBlockage(
   let deltaPp: number | undefined;
   let refExposureCount: number | undefined;
   let refMonthLabel: string | undefined;
+  // absolute 로 확정되는 각 경로에서 '기준데이터 미적용' 사유를 산출 — delta 모드면 undefined.
+  let refFallbackOut: RefFallbackReason | undefined;
   let g: { label: string; color: string };
 
   if (reference && reference.histogram.length > 0) {
@@ -183,12 +190,17 @@ export function computeAddedBlockage(
       refMonthLabel = reference.monthLabel;
       deltaPp = lossRatePct - refRate;
       g = gradeAddedBlockageDelta(deltaPp, totalExposureCount, hasBlockageBand);
+      // delta 모드 — 기준데이터 적용됨 → refFallbackOut undefined 유지
     } else {
       // 기준 표본 부족 → 절대 임계 폴백 (분모 대표성 없어 편차 신뢰 불가)
+      refFallbackOut = "ref_insufficient";
       g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
     }
   } else {
-    // 기준데이터 없음 → 절대 임계 폴백. 표본 게이트는 통과 항적 포인트 수(totalExposureCount) 단일 기준.
+    // 기준데이터 없음(또는 기준 히스토그램 비었음) → 절대 임계 폴백. 표본 게이트는 통과 항적
+    //   포인트 수(totalExposureCount) 단일 기준. 사유는: reference 객체는 있으나 히스토그램이 비었으면
+    //   '기준 표본 부족', reference 자체가 없으면 호출부 수집 사유(없음/불일치/로드실패) ?? "none".
+    refFallbackOut = reference ? "ref_insufficient" : (refFallback ?? "none");
     g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
   }
 
@@ -208,5 +220,6 @@ export function computeAddedBlockage(
     deltaPp,
     refExposureCount,
     refMonthLabel,
+    refFallback: refFallbackOut,
   };
 }

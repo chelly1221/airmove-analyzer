@@ -1077,6 +1077,9 @@ pub struct OmReferenceMeta {
     pub total_points: u64,
     /// 아카이브 일자 파일 바이트 합계
     pub archive_bytes: u64,
+    /// 별도 보관된 원본 ASS 합계 바이트 — 0=미보관(구버전 빌드/보관 실패), 재계산 불가.
+    #[serde(default)]
+    pub ass_bytes: u64,
 }
 
 /// 기준데이터 일별 요약 (전방위 60NM)
@@ -1110,6 +1113,10 @@ pub struct OmReferenceRegistryEntry {
     pub file_path: String,
     /// 원시 포인트 아카이브 디렉토리 절대경로 (om_reference/points/<dir>/)
     pub points_dir: String,
+    /// 원본 ASS 보관 디렉토리 절대경로 (om_reference/ass/<dir>/) — 빈 문자열=미보관.
+    /// registry 는 settings JSON 에서 역직렬화되므로 serde(default) 로 구버전 호환.
+    #[serde(default)]
+    pub ass_dir: String,
 }
 
 // ─── 기준데이터 집계 헬퍼 ───
@@ -1540,6 +1547,8 @@ pub fn build_reference_for_radar(
         total_loss_time_secs: total_loss_time,
         total_points,
         archive_bytes,
+        // 원본 ASS 별도 보관은 호출부(lib.rs)의 책임 — 여기선 0 초기화.
+        ass_bytes: 0,
     };
 
     Ok(OmReferenceData {

@@ -17,10 +17,12 @@ import { extractDateFromFilename, filterFilesByMonth } from "../../utils/omFiles
 import { readBulkJson } from "../../utils/bulkIpc";
 import type { BulkRef } from "../../utils/bulkIpc";
 import { computeLosBatch, calcBuildingAzExtent, mergeAzSectors } from "../../utils/obstacleAnalysisHelpers";
+import { checkRefCoherence } from "../../utils/omReference";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import type {
   RadarSite, Aircraft as AircraftType, ReportMetadata, ManualBuilding, BuildingGroup,
   AzSector, ObstacleMonthlyResult, RadarMonthlyResult, ObstacleMonthlyProgress, LoSProfileData,
+  OmReferenceMeta,
 } from "../../types";
 
 // ── 통합 진행 상태 모니터링용 타입 (ReportApp 측 정의와 미러) ──
@@ -103,6 +105,8 @@ export default function ObstacleMonthlyConfigModal({
   const [checkedRadars, setCheckedRadars] = useState<Set<string>>(new Set());
   const [manualBuildings, setManualBuildings] = useState<ManualBuilding[]>([]);
   const [buildingGroups, setBuildingGroups] = useState<BuildingGroup[]>([]);
+  // OM 기준데이터 메타 목록 — Step 1 판정 모드 예고용(소형 메타라 직접 invoke, 실패 시 빈 배열).
+  const [omReferences, setOmReferences] = useState<OmReferenceMeta[]>([]);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<number | null>>(new Set());
   const [checkedBldgIds, setCheckedBldgIds] = useState<Set<number>>(new Set());
   const [radarFiles, setRadarFiles] = useState<Map<string, string[]>>(new Map());
@@ -203,6 +207,8 @@ export default function ObstacleMonthlyConfigModal({
   useEffect(() => {
     invoke<ManualBuilding[]>("list_manual_buildings").then(setManualBuildings).catch((err) => console.warn("건물 목록 로드 실패:", err));
     invoke<BuildingGroup[]>("list_building_groups").then(setBuildingGroups).catch((err) => console.warn("건물 그룹 로드 실패:", err));
+    // 판정 모드 예고 — 기준데이터 메타 1회 로드. 실패는 무시(빈 배열 유지 → 전 레이더 "기준데이터 없음").
+    invoke<OmReferenceMeta[]>("list_om_references").then(setOmReferences).catch((err) => console.warn("기준데이터 목록 로드 실패:", err));
   }, []);
 
   const selectedRadars = useMemo(
@@ -568,16 +574,49 @@ export default function ObstacleMonthlyConfigModal({
               <div className="space-y-1.5 rounded-xl border border-gray-200 p-3">
                 {customRadarSites.map((r) => {
                   const checked = checkedRadars.has(r.name);
+                  // 판정 모드 예고 — 기준데이터 유무·정합성으로 Δ 판정/절대 임계 예고.
+                  const refMeta = omReferences.find((m) => m.radar_name === r.name);
+                  const coh = refMeta ? checkRefCoherence(refMeta, r) : null;
+                  let statusText: string;
+                  let statusTone: string;
+                  if (refMeta && coh?.ok) {
+                    statusText = `기준데이터 ${refMeta.month_label} · Δ 판정 적용`;
+                    statusTone = checked ? "text-white/70" : "text-gray-400";
+                  } else if (refMeta && coh) {
+                    statusText = `기준데이터 ${refMeta.month_label} · 정합성 불일치(${coh.reasonText}) — 절대 임계`;
+                    statusTone = checked ? "text-amber-200" : "text-amber-600";
+                  } else {
+                    statusText = "기준데이터 없음 — 절대 임계";
+                    statusTone = checked ? "text-white/70" : "text-gray-400";
+                  }
                   return (
                     <button key={r.name} onClick={() => setCheckedRadars((prev) => { const next = new Set(prev); if (next.has(r.name)) next.delete(r.name); else next.add(r.name); return next; })}
-                      className={`flex w-full items-center gap-2.5 rounded-lg border px-3.5 py-2.5 text-left transition-all ${checked ? "border-[#a60739] bg-[#a60739] text-white shadow-sm shadow-[#a60739]/10" : "border-gray-100 hover:border-gray-300 hover:bg-gray-50"}`}>
-                      {checked ? <CheckSquare size={15} className="shrink-0 text-white" /> : <Square size={15} className="shrink-0 text-gray-300" />}
-                      <span className={`text-[12px] font-medium ${checked ? "text-white" : "text-gray-600"}`}>{r.name}</span>
-                      <span className={`ml-auto text-[10px] ${checked ? "text-white/70" : "text-gray-400"}`}>{r.latitude.toFixed(4)}°N {r.longitude.toFixed(4)}°E</span>
+                      className={`flex w-full items-start gap-2.5 rounded-lg border px-3.5 py-2.5 text-left transition-all ${checked ? "border-[#a60739] bg-[#a60739] text-white shadow-sm shadow-[#a60739]/10" : "border-gray-100 hover:border-gray-300 hover:bg-gray-50"}`}>
+                      <div className="mt-0.5 shrink-0">{checked ? <CheckSquare size={15} className="text-white" /> : <Square size={15} className="text-gray-300" />}</div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className={`text-[12px] font-medium ${checked ? "text-white" : "text-gray-600"}`}>{r.name}</span>
+                          <span className={`ml-auto text-[10px] ${checked ? "text-white/70" : "text-gray-400"}`}>{r.latitude.toFixed(4)}°N {r.longitude.toFixed(4)}°E</span>
+                        </div>
+                        <p className={`mt-0.5 text-[10px] ${statusTone}`}>{statusText}</p>
+                      </div>
                     </button>
                   );
                 })}
               </div>
+              {/* 기준월 == 분석월 경고 — Δ 판정이 무의미(Δ≈0). 체크된 레이더 중 정합성 ok & month_label===analysisMonth 이면 노출. */}
+              {customRadarSites.some((r) => {
+                if (!checkedRadars.has(r.name)) return false;
+                const m = omReferences.find((x) => x.radar_name === r.name);
+                return !!m && checkRefCoherence(m, r).ok && m.month_label === analysisMonth;
+              }) && (
+                <div className="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                  <TriangleAlert size={14} className="mt-0.5 shrink-0 text-amber-500" />
+                  <p className="text-[10.5px] leading-snug text-amber-700">
+                    분석월이 기준월({analysisMonth})과 동일한 레이더가 있습니다 — Δ 판정이 무의미합니다(Δ≈0). 기준데이터 관리에서 참조 달을 다른 달로 재생성하거나 분석월을 확인하세요.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 

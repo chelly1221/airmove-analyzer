@@ -9,6 +9,7 @@ import {
   Settings,
 } from "lucide-react";
 import { useAppStore } from "../store";
+import { useOmReferenceBuildStore } from "../store/omReferenceBuild";
 import { emit } from "@tauri-apps/api/event";
 import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import {
@@ -138,6 +139,8 @@ function TemplateTable({
   disabled?: boolean;
 }) {
   const [expandedRow, setExpandedRow] = useState<ReportTemplate | null>(null);
+  // 기준데이터 빌드가 백그라운드 진행 중인지 (모달을 닫아도 스토어에서 계속) — 버튼에 스피너 표시
+  const refBuilding = useOmReferenceBuildStore((s) => s.building);
 
   const rows: TemplateRowDef[] = [
     {
@@ -215,8 +218,10 @@ function TemplateTable({
                       onClick={() => onOpenReference()}
                       className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-4 py-1.5 text-sm text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-800"
                     >
-                      <Settings size={14} className="text-[#a60739]" />
-                      기준데이터 관리
+                      {refBuilding
+                        ? <Loader2 size={14} className="animate-spin text-[#a60739]" />
+                        : <Settings size={14} className="text-[#a60739]" />}
+                      기준데이터 관리{refBuilding ? " (빌드 중)" : ""}
                     </button>
                   )}
                 </div>
