@@ -83,22 +83,11 @@ export default function ReportGeneration() {
         </div>
       )}
       {/* Header */}
-      <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-800">보고서 생성</h1>
-          <p className="mt-1 text-sm text-gray-500">
-            템플릿을 선택하여 분석 결과 PDF 보고서를 생성합니다
-          </p>
-        </div>
-        {/* 기준데이터 관리 (헤드라인 Δ 판정 기준월) */}
-        <button
-          onClick={() => setReferenceModalOpen(true)}
-          className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-800"
-          title="기준데이터 관리"
-        >
-          <Settings size={16} className="text-[#a60739]" />
-          기준데이터 관리
-        </button>
+      <div>
+        <h1 className="text-2xl font-bold text-gray-800">보고서 생성</h1>
+        <p className="mt-1 text-sm text-gray-500">
+          템플릿을 선택하여 분석 결과 PDF 보고서를 생성합니다
+        </p>
       </div>
 
       {/* Template list */}
@@ -110,6 +99,7 @@ export default function ReportGeneration() {
         <TemplateTable
           customRadarSites={customRadarSites}
           onSelect={handleTemplateClick}
+          onOpenReference={() => setReferenceModalOpen(true)}
           disabled={prepState.active}
         />
       </div>
@@ -139,10 +129,12 @@ interface TemplateRowDef {
 function TemplateTable({
   customRadarSites,
   onSelect,
+  onOpenReference,
   disabled: externalDisabled,
 }: {
   customRadarSites: RadarSite[];
   onSelect: (tpl: ReportTemplate) => void;
+  onOpenReference: () => void;
   disabled?: boolean;
 }) {
   const [expandedRow, setExpandedRow] = useState<ReportTemplate | null>(null);
@@ -209,13 +201,25 @@ function TemplateTable({
             {isExpanded && !row.disabled && (
               <div className="border-t border-gray-100 bg-gray-50/50 px-4 py-3">
                 <p className="mb-3 text-xs leading-relaxed text-gray-500">{row.description}</p>
-                <button
-                  onClick={() => onSelect(row.type)}
-                  className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e]"
-                >
-                  <Eye size={14} />
-                  설정 및 생성
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => onSelect(row.type)}
+                    className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-[#85062e]"
+                  >
+                    <Eye size={14} />
+                    설정 및 생성
+                  </button>
+                  {/* 기준데이터 관리 (헤드라인 Δ 판정 기준월) */}
+                  {row.type === "obstacle_monthly" && (
+                    <button
+                      onClick={() => onOpenReference()}
+                      className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-4 py-1.5 text-sm text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-800"
+                    >
+                      <Settings size={14} className="text-[#a60739]" />
+                      기준데이터 관리
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
