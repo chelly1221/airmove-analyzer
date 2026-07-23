@@ -19,6 +19,7 @@ import { generateOMFindingsText } from "../utils/omFindingsGenerator";
 import { readBulkJson } from "../utils/bulkIpc";
 import type { BulkRef } from "../utils/bulkIpc";
 import { computeAddedBlockage } from "../utils/omAddedBlockage";
+import type { BlockageReference, BlockageRefDay } from "../utils/omAddedBlockage";
 import { checkRefCoherence } from "../utils/omReference";
 import { calcBuildingAzExtent, panoWithForBuilding } from "../utils/obstacleAnalysisHelpers";
 import {
@@ -32,7 +33,7 @@ import type {
   LoSProfileData, ReportMetadata,
   PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, AzSector,
   ObstacleMonthlyResult, OMReportData,
-  AddedBlockageResult, OmReferenceData, AzElevCell,
+  AddedBlockageResult, OmReferenceData,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
 import SourceOverlay from "../dev/SourceOverlay";
@@ -971,7 +972,7 @@ export default function ReportApp() {
         // ── 기준데이터(참조 달) 로드 — 레이더별, 헤드라인 Δ 판정용 ──
         // 정합성 게이트: 레이더 위치(lat/lon)·안테나고 일치 확인. 불일치/부재/로드실패는 조용히
         // 기준 미적용(noref)으로 진행(보고서 생성이 막히면 안 됨). 통과분만 Map 에 보관해 computeAddedBlockage 에 전달.
-        const refByRadar = new Map<string, { histogram: AzElevCell[]; monthLabel: string }>();
+        const refByRadar = new Map<string, BlockageReference>();
         // 정합성 통과분만 Map 에 보관 — computeAddedBlockage 가 refByRadar 로 delta 판정한다.
         //   미등록·로드 실패·정합성 불일치는 조용히 기준 미적용(noref) — reference 를 넘기지 않는다.
         for (const radar of radars) {
@@ -980,10 +981,22 @@ export default function ReportApp() {
             if (!ref) continue; // 저장된 기준 없음 → noref
             const data = await readBulkJson<OmReferenceData>(ref);
             const m = data.meta;
+            // v2 필수: 일별 히스토그램(중앙값 산출용)이 없으면(v1 파일) 기준 미적용(noref) — 재계산 시 v2 자동 갱신.
+            if (!Array.isArray(data.daily_hist) || data.daily_hist.length === 0) {
+              console.warn(`[OM] v1 기준데이터 — ${radar.name} 기준 미적용 (재계산 필요)`);
+              continue;
+            }
             // 정합성 판정은 utils/omReference.checkRefCoherence 단일 원천(임계 0.0005°/0.1m·사유 문구 공유).
             const coh = checkRefCoherence(m, radar);
             if (coh.ok) {
-              refByRadar.set(radar.name, { histogram: data.az_elev_histogram ?? [], monthLabel: m.month_label });
+              // 일별 컬럼형을 즉시 TypedArray 로 변환(AzElevCell 객체화 금지 — 수백만 쌍 OOM 리스크, 스트리밍 원칙).
+              const days: BlockageRefDay[] = data.daily_hist.map((h) => ({
+                az: Uint16Array.from(h.az_bins),
+                el: Uint16Array.from(h.elev_bins),
+                tt: Float64Array.from(h.track_time_s),
+                lt: Float64Array.from(h.loss_time_s),
+              }));
+              refByRadar.set(radar.name, { histogram: data.az_elev_histogram ?? [], days, monthLabel: m.month_label });
             } else {
               console.warn(`[OM] 기준데이터 정합성 불일치 — ${radar.name} 기준 미적용 (${coh.reasonText})`);
             }

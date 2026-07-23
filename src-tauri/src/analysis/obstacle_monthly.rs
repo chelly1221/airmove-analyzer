@@ -1092,6 +1092,19 @@ pub struct OmReferenceDaily {
     pub ssr_points: u64,
 }
 
+/// 기준데이터 일별 az×elev 히스토그램 (컬럼형 병렬 배열 — 셀 객체 대비 JSON 수 배 절감).
+/// 4배열은 같은 길이, (az_bins[i], elev_bins[i]) 셀의 시간이 track_time_s[i]/loss_time_s[i].
+/// 카운트(track_count/loss_count)는 일별로 저장하지 않음 — 표본 각주는 월 병합 histogram 사용.
+/// 시간은 0.1s 양자화(밴드 일별 합산 용도로 충분, 파일 크기 절감).
+#[derive(Serialize, Clone, Debug)]
+pub struct OmReferenceDayHist {
+    pub date: String,
+    pub az_bins: Vec<u16>,
+    pub elev_bins: Vec<u16>,
+    pub track_time_s: Vec<f64>,
+    pub loss_time_s: Vec<f64>,
+}
+
 /// 저장/로드되는 기준데이터 전체 (version=1). 파일(수십 MB 가능)로 기록되고,
 /// load 커맨드는 이 파일을 bulk:// 경유 원시 바이트로 프론트에 전달한다
 /// (Rust 에서 역직렬화하지 않으므로 Serialize 만 필요).
@@ -1101,6 +1114,8 @@ pub struct OmReferenceData {
     pub meta: OmReferenceMeta,
     pub daily: Vec<OmReferenceDaily>,
     pub az_elev_histogram: Vec<AzElevCell>,
+    /// v2 신설 — 일별 노출가중 중앙값 산출용 az×elev 히스토그램 (date 오름차순).
+    pub daily_hist: Vec<OmReferenceDayHist>,
 }
 
 /// 레지스트리 항목 (settings `om_reference_registry` JSON: radar_name → 이 값).
@@ -1169,6 +1184,33 @@ fn merge_hist(
         e.1 += lt;
         e.2 += tc;
         e.3 += lc;
+    }
+}
+
+/// 일별 히스토그램 누적기(packed key맵)를 컬럼형 OmReferenceDayHist 로 변환.
+/// packed key 오름차순 정렬 = (az_bin, elev_bin) 오름차순(az_bin 이 상위 16비트) → 결정성 보장.
+/// 시간은 (x*10).round()/10 으로 0.1s 양자화(파일 크기 절감). 카운트는 저장하지 않음(시간만).
+fn hist_to_columnar(date: &str, hist: &HashMap<u32, (f64, f64, u32, u32)>) -> OmReferenceDayHist {
+    let mut keys: Vec<u32> = hist.keys().copied().collect();
+    keys.sort_unstable();
+    let n = keys.len();
+    let mut az_bins = Vec::with_capacity(n);
+    let mut elev_bins = Vec::with_capacity(n);
+    let mut track_time_s = Vec::with_capacity(n);
+    let mut loss_time_s = Vec::with_capacity(n);
+    for k in keys {
+        let (tt, lt, _tc, _lc) = hist[&k];
+        az_bins.push((k >> 16) as u16);
+        elev_bins.push((k & 0xFFFF) as u16);
+        track_time_s.push((tt * 10.0).round() / 10.0);
+        loss_time_s.push((lt * 10.0).round() / 10.0);
+    }
+    OmReferenceDayHist {
+        date: date.to_string(),
+        az_bins,
+        elev_bins,
+        track_time_s,
+        loss_time_s,
     }
 }
 
@@ -1383,6 +1425,8 @@ pub fn build_reference_for_radar(
     // (전체 누적 시 51M × 80B ≈ 4GB OOM — analyze_radar_monthly baseline 패턴과 동일)
     let mut daily_points: HashMap<String, Vec<LightPoint>> = HashMap::with_capacity(4);
     let mut daily_results: HashMap<String, OmReferenceDaily> = HashMap::with_capacity(31);
+    // 일별 컬럼형 히스토그램 (v2 — 노출가중 중앙값 산출용, 플러시 시점에 채움)
+    let mut daily_hist_map: HashMap<String, OmReferenceDayHist> = HashMap::with_capacity(31);
     // 월간 합산 히스토그램 누적기 (packed key = (az_bin<<16)|elev_bin)
     let mut monthly_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
     let mut total_track_time = 0.0f64;
@@ -1473,6 +1517,7 @@ pub fn build_reference_for_radar(
                     total_track_time += r.daily.track_time_secs;
                     total_loss_time += r.loss_time_secs;
                     merge_hist(&mut monthly_hist, &r.hist);
+                    daily_hist_map.insert(fd.clone(), hist_to_columnar(&fd, &r.hist));
                     daily_results.insert(fd, r.daily);
                     // pts drop → 메모리 해제
                 }
@@ -1494,6 +1539,7 @@ pub fn build_reference_for_radar(
             total_track_time += r.daily.track_time_secs;
             total_loss_time += r.loss_time_secs;
             merge_hist(&mut monthly_hist, &r.hist);
+            daily_hist_map.insert(fd.clone(), hist_to_columnar(&fd, &r.hist));
             daily_results.insert(fd, r.daily);
         }
     }
@@ -1501,6 +1547,11 @@ pub fn build_reference_for_radar(
     // 일별 정렬
     let mut daily: Vec<OmReferenceDaily> = daily_results.into_values().collect();
     daily.sort_by(|a, b| a.date.cmp(&b.date));
+
+    // 일별 컬럼형 히스토그램도 date 오름차순 Vec 으로 (daily 와 동일 정렬)
+    let mut daily_hist: Vec<OmReferenceDayHist> = daily_hist_map.into_values().collect();
+    daily_hist.sort_by(|a, b| a.date.cmp(&b.date));
+    let daily_hist_pairs: usize = daily_hist.iter().map(|h| h.az_bins.len()).sum();
 
     let first_date = daily.first().map(|d| d.date.clone()).unwrap_or_default();
     let last_date = daily.last().map(|d| d.date.clone()).unwrap_or_default();
@@ -1519,7 +1570,7 @@ pub fn build_reference_for_radar(
         .collect();
 
     info!(
-        "[OmReference] 레이더 '{}' 빌드 완료: {} days ({}~{}), track {:.0}s loss {:.0}s, hist {} cells, 아카이브 {} pts / {:.1}MB, 실패 {}개",
+        "[OmReference] 레이더 '{}' 빌드 완료: {} days ({}~{}), track {:.0}s loss {:.0}s, hist {} cells, daily_hist {} (day,cell) 쌍, 아카이브 {} pts / {:.1}MB, 실패 {}개",
         radar.radar_name,
         daily.len(),
         first_date,
@@ -1527,6 +1578,7 @@ pub fn build_reference_for_radar(
         total_track_time,
         total_loss_time,
         az_elev_histogram.len(),
+        daily_hist_pairs,
         total_points,
         archive_bytes as f64 / 1024.0 / 1024.0,
         failed_files
@@ -1552,10 +1604,11 @@ pub fn build_reference_for_radar(
     };
 
     Ok(OmReferenceData {
-        version: 1,
+        version: 2,
         meta,
         daily,
         az_elev_histogram,
+        daily_hist,
     })
 }
 

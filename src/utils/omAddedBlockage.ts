@@ -8,8 +8,10 @@
  * 정의·AzElev 차트 핑크영역(건물별 panoWith−panoWithout)과 동일 소스(makePanoramaSampler)·동일 프레임
  * (ITU 4/3 유효지구, pointElevAngleDeg). Rust 히스토그램의 양각 빈도 같은 프레임이라 정렬된다.
  *
- *   분모(노출) = Σ(추가 차단영역 셀의 추적시간 + 소실시간),  분자 = Σ(추가 차단영역 셀의 소실시간)
- *   소실율(%) = 분자 / 분모 × 100
+ *   일별 소실율(%) = Σ(그날 추가 차단영역 소실시간) / Σ(그날 추가 차단영역 노출시간[추적+소실]) × 100
+ *   헤드라인 소실율 = 일별 소실율의 노출시간 가중 중앙값(하측) — 단발 이상일(정비·특정기체 이상)이 월 수치를
+ *     지배하지 않도록 완화. 노출/소실 시간·포인트 카운트 집계는 종전대로 전량 합산(중앙값은 헤드라인 표시에만).
+ *   Δ%p = 분석월 중앙값 − 기준월 중앙값 (기준데이터 일별 히스토그램에서 동일 통계량으로 산출).
  *
  * panoWith 는 호출부(ReportApp)가 건물별로 좁혀(panoWithForBuilding = without ∪ {해당 건물}) 넘긴다 —
  * 방위 중첩 인접 분석 대상의 한계기여가 양쪽 건물에 중복 귀속되던 v1 한계 해소(차트 핑크영역과 계속 일치).
@@ -51,9 +53,16 @@ export interface BlockageDayHist {
   cells: AzElevCell[];
 }
 
-/** 기준데이터 참조 (헤드라인 Δ 판정용) — 월간 합산·전방위 히스토그램 + 기준월 라벨. */
+/** 기준데이터 참조 (헤드라인 Δ 판정용) — v2 필수: 일별 컬럼형 히스토그램(중앙값용) + 월 병합(표본 각주용). */
+export interface BlockageRefDay {
+  az: Uint16Array;      // az_bins
+  el: Uint16Array;      // elev_bins
+  tt: Float64Array;     // track_time_s
+  lt: Float64Array;     // loss_time_s
+}
 export interface BlockageReference {
-  histogram: AzElevCell[];
+  histogram: AzElevCell[];      // 월 병합 (refExposureCount 표본 각주 전용)
+  days: BlockageRefDay[];       // 일별 컬럼형 (기준월 중앙값 산출)
   monthLabel: string;
 }
 
@@ -84,6 +93,52 @@ function accumulateBand(
     }
   }
   return { loss, exposure, lossCount, exposureCount };
+}
+
+/**
+ * accumulateBand 의 컬럼형 변형 — 일별 기준 히스토그램(BlockageRefDay 병렬 배열)을 밴드로 슬라이스.
+ * 셀 수학(azC 빈중심·elLo·overlap·frac)은 accumulateBand 와 문자 그대로 동일. 카운트 없음(시간만).
+ * (AzElevCell 객체화 없이 TypedArray 를 인덱스 순회 — 수백만 셀 OOM 방지, CLAUDE.md 스트리밍 원칙)
+ */
+function accumulateBandColumnar(
+  d: BlockageRefDay,
+  angleWithAt: (az: number) => number,
+  angleWithoutAt: (az: number) => number,
+  buildingExtent: AzSector,
+): { loss: number; exposure: number } {
+  let loss = 0, exposure = 0;
+  const n = d.az.length;
+  for (let i = 0; i < n; i++) {
+    const azC = d.az[i] * HIST_AZ_BIN_DEG + HIST_AZ_BIN_DEG / 2;
+    if (!azInSector(azC, buildingExtent)) continue;
+    const elLo = HIST_ELEV_MIN_DEG + d.el[i] * HIST_ELEV_BIN_DEG;
+    const elHi = elLo + HIST_ELEV_BIN_DEG;
+    const overlap = Math.min(elHi, angleWithAt(azC)) - Math.max(elLo, angleWithoutAt(azC));
+    if (overlap > 0) {
+      const frac = overlap / HIST_ELEV_BIN_DEG; // 0 < frac ≤ 1 (셀이 밴드에 겹치는 비율)
+      loss += d.lt[i] * frac;
+      exposure += (d.tt[i] + d.lt[i]) * frac;
+    }
+  }
+  return { loss, exposure };
+}
+
+/** 노출시간 가중 중앙값 (lower weighted median) — w>0 항목만, (rate, day순) 정렬 후 누적가중 ≥ W/2 첫 항목. 빈 입력 → 0. */
+function weightedMedianRate(items: { rate: number; w: number }[]): number {
+  const xs = items.filter((it) => it.w > 0);
+  if (xs.length === 0) return 0;
+  // rate 오름차순 안정 정렬(동률은 입력순=일자순 유지) — 누적 노출가중이 전체의 절반에 처음 도달하는 항목(하측).
+  const sorted = [...xs].sort((a, b) => a.rate - b.rate);
+  let total = 0;
+  for (const s of sorted) total += s.w;
+  if (total <= 0) return 0; // Σw=0 → 0
+  const half = total / 2;
+  let cum = 0;
+  for (const s of sorted) {
+    cum += s.w;
+    if (cum >= half) return s.rate;
+  }
+  return sorted[sorted.length - 1].rate;
 }
 
 /**
@@ -155,7 +210,11 @@ export function computeAddedBlockage(
     if (dayExposure > 0) daysWithExposure++;
   }
 
-  const lossRatePct = totalExposure > 0 ? (totalLoss / totalExposure) * 100 : 0;
+  // 헤드라인 소실율 = 일별 소실율의 노출시간 가중 중앙값(하측) — 단발 이상일(정비·특정기체 이상)이 월 수치를
+  // 지배하지 않도록 완화. 노출 0 인 날은 제외. (totalLoss/totalExposure 합산·카운트·series·추세는 종전대로 유지)
+  const lossRatePct = weightedMedianRate(
+    series.filter((s) => s.exposureS > 0).map((s) => ({ rate: s.ratePct, w: s.exposureS })),
+  );
   // 추세: 노출시간 가중 최소자승 (노출 0 인 날은 weight 0 → 무영향)
   const slope = weightedTrendSlope(series.map((s) => ({ x: s.day, y: s.ratePct, w: s.exposureS })));
   const trendDir = Math.abs(slope) <= TREND_FLAT_THRESHOLD ? "안정" : slope > 0 ? "증가" : "감소";
@@ -165,8 +224,9 @@ export function computeAddedBlockage(
 
   // ── 기준데이터 대비 편차(Δ%p) 판정 ──
   // 기준데이터가 있고(정합성 게이트는 호출부에서 통과) 기준 히스토그램이 있으면 동일 샘플러·동일 밴드·
-  // 동일 frac 가중으로 기준월 소실율을 산출해 편차 임계로 판정한다(delta 모드). 표본 게이트는 폐지 —
-  // 기준 노출 0이면 refRate=0 을 그대로 쓴다. 기준이 없거나 히스토그램이 비면 기준 미적용(noref).
+  // 동일 frac 가중으로 기준월 '일별 소실율의 노출가중 중앙값'을 산출해(분석월과 동일 통계량) 편차 임계로
+  // 판정한다(delta 모드). 표본 게이트는 폐지 — 기준 노출 0이면 refRate=0 을 그대로 쓴다. refExposureCount(표본
+  // 각주)는 월 병합 히스토그램의 노출 카운트를 유지. 기준이 없거나 히스토그램이 비면 기준 미적용(noref).
   let gradingMode: "delta" | "noref" = "noref";
   let refLossRatePct: number | undefined;
   let deltaPp: number | undefined;
@@ -176,8 +236,14 @@ export function computeAddedBlockage(
 
   if (reference && reference.histogram.length > 0) {
     // 기준 히스토그램이 있으면 무조건 delta — 기준 노출 0이면 refRate=0 을 그대로 사용(표본 게이트 폐지).
+    // 기준월 소실율도 분석월과 동일 통계량(일별 소실율의 노출가중 중앙값)으로 산출 — Δ 는 중앙값 − 중앙값.
+    const refRate = weightedMedianRate(
+      reference.days
+        .map((d) => accumulateBandColumnar(d, angleWithAt, angleWithoutAt, buildingExtent))
+        .map((a) => ({ rate: a.exposure > 0 ? (a.loss / a.exposure) * 100 : 0, w: a.exposure })),
+    );
+    // 표본 각주(refExposureCount)는 종전대로 월 병합 히스토그램의 노출 카운트 사용.
     const ref = accumulateBand(reference.histogram, angleWithAt, angleWithoutAt, buildingExtent);
-    const refRate = ref.exposure > 0 ? (ref.loss / ref.exposure) * 100 : 0;
     gradingMode = "delta";
     refLossRatePct = refRate;
     refExposureCount = ref.exposureCount;
