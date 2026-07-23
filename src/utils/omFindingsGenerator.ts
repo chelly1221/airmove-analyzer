@@ -95,7 +95,7 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       lines.push(`분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않았다.`);
     }
     if (anyDelta) {
-      lines.push(`※ 추가 차단영역 등급 임계(기준월 대비 편차 Δ%p) — 관심 +${BLOCKAGE_DELTA_WATCH_PP}%p / 주의 +${BLOCKAGE_DELTA_CAUTION_PP}%p / 경계 +${BLOCKAGE_DELTA_ALERT_PP}%p / 심각 +${BLOCKAGE_DELTA_SEVERE_PP}%p 이상. · 소실율=일별 노출가중 중앙값`);
+      lines.push(`※ 추가 차단영역 등급 임계(기준월 대비 편차 Δ%p) — 관심 +${BLOCKAGE_DELTA_WATCH_PP}%p / 주의 +${BLOCKAGE_DELTA_CAUTION_PP}%p / 경계 +${BLOCKAGE_DELTA_ALERT_PP}%p / 심각 +${BLOCKAGE_DELTA_SEVERE_PP}%p 이상.`);
     }
     if (norefRadars.size > 0) {
       lines.push(`※ 기준데이터 미등록(${[...norefRadars].join(", ")}): 등급 판정 제외 — 기준데이터 등록 후 Δ 판정 가능.`);

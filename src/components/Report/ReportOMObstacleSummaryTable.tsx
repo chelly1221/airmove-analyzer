@@ -190,7 +190,6 @@ export default function ReportOMObstacleSummaryTable({
         {blockage && blockage.exposurePointCount > 0
           ? ` · 통과 ${Math.round(blockage.exposurePointCount).toLocaleString()}pt 중 소실 ${Math.round(blockage.lossPointCount).toLocaleString()}pt · ${blockage.daysWithExposure}일`
           : ""}
-        {" · 소실율은 일별 소실율의 노출시간 가중 중앙값(특정일 단발 이상 소실 과대반영 완화, 기준월 동일 방식)."}
       </div>
     </div>
   );

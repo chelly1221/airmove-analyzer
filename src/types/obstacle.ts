@@ -91,7 +91,7 @@ export interface AddedBlockageDay {
  * 노출 조건부 소실율 = Σ(추가 차단영역 내 소실시간) / Σ(추가 차단영역 내 노출시간) × 100%.
  */
 export interface AddedBlockageResult {
-  /** 헤드라인 추가 차단영역 소실율 (%) — 일별 소실율의 노출시간 가중 중앙값(단발 이상일 완화). */
+  /** 월간 추가 차단영역 소실율 (%) */
   lossRatePct: number;
   /** 일별 추세 기울기 (%p/day) */
   trendSlopePctPerDay: number;
@@ -117,7 +117,7 @@ export interface AddedBlockageResult {
    * ※ 레거시 직렬화 스냅샷에 'absolute' 가 남아 있을 수 있어, 소비처는 !== "delta" 를 전부 기준 미적용으로 취급한다.
    */
   gradingMode: "delta" | "noref";
-  /** (delta 모드) 기준월 추가 차단영역 소실율 (%) — 분석월과 동일하게 일별 소실율의 노출시간 가중 중앙값. */
+  /** (delta 모드) 기준월 추가 차단영역 소실율 (%) */
   refLossRatePct?: number;
   /** (delta 모드) 편차 = 분석월 소실율 − 기준월 소실율 (%p). 음수면 기준보다 개선. */
   deltaPp?: number;
@@ -171,8 +171,6 @@ export interface OmReferenceData {
   meta: OmReferenceMeta;
   daily: OmReferenceDaily[];
   az_elev_histogram: AzElevCell[];
-  /** v2 신설 — 일별 컬럼형 az×elev 히스토그램(노출가중 중앙값 산출용, date 오름차순). v1 파일엔 없음(optional). */
-  daily_hist?: { date: string; az_bins: number[]; elev_bins: number[]; track_time_s: number[]; loss_time_s: number[] }[];
 }
 
 /**
