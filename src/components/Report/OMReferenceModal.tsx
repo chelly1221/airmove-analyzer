@@ -2,8 +2,8 @@
  * OM 기준데이터 관리 모달
  *
  * 헤드라인 심각도 판정(추가 차단영역 소실율)을 "기준데이터(임의 참조 달 1달치) 대비 편차 Δ%p"로
- * 판정하기 위한 기준데이터를 관리한다. 저장된 기준데이터 목록(레이더별)을 보여주고, 레이더별로
- * 파일·기준월을 각각 선택해 다중 레이더 순차 빌드를 수행한다.
+ * 판정하기 위한 기준데이터를 관리한다. 레이더 단위 행 목록 하나로 저장 데이터·신규/재계산을 통합하고,
+ * 파일·기준월 선택은 레이더별 설정 서브모달로 분리한다(파일 선택 시 펼쳐지던 드럼휠이 본 모달을 늘리지 않게).
  *
  * 빌드 오케스트레이션은 이 모달이 아니라 스토어(useOmReferenceBuildStore)가 소유한다 —
  * 모달을 닫아도 빌드는 백그라운드로 계속된다(수십 분 빌드가 메인 창을 인질로 잡지 않게).
@@ -13,12 +13,15 @@
  * - rebuild_om_reference: 보관된 원본 ASS 로 파일 재선택 없이 재계산(현재 좌표·안테나고 반영 → 정합성 해소).
  * - 원시 포인트 아카이브 + 원본 ASS 가 별도 경로에 보관되어 원본 없이도 재계산 가능(meta.ass_bytes>0).
  * - 동일 radar_name 재빌드는 덮어쓰기다.
+ *
+ * 폼 상태(forms Map)는 이 부모가 소유 — 설정 서브모달은 뷰일 뿐이다.
+ * 레이더 A 설정 → 닫기 → B 설정 후 본 모달의 일괄 빌드가 유지되도록.
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Radio, FolderOpen, Trash2, Loader2, Database, TriangleAlert, RefreshCw, X } from "lucide-react";
+import { Radio, FolderOpen, Trash2, Loader2, Database, TriangleAlert, RefreshCw, Settings, X } from "lucide-react";
 import Modal from "../common/Modal";
 import MonthPicker from "../common/MonthPicker";
 import { extractDateFromFilename, filterFilesByMonth } from "../../utils/omFiles";
@@ -68,6 +71,111 @@ const STATUS_CHIP: Record<OmRefJobStatus, { label: string; cls: string }> = {
   cancelled: { label: "취소", cls: "bg-gray-100 text-gray-400" },
 };
 
+/**
+ * 레이더별 설정 서브모달 내용 (파일 선택 + 기준월).
+ * 폼 상태는 부모 소유 — 여기선 표시·조작 콜백만 받는다.
+ */
+function RadarConfigForm({
+  radar, form, existing, building,
+  onSelectFiles, onMonthChange, onClearFiles, onConfirm,
+}: {
+  radar: RadarSite;
+  form: RadarForm | undefined;
+  existing: OmReferenceMeta | undefined;
+  building: boolean;
+  onSelectFiles: () => void;
+  onMonthChange: (month: string) => void;
+  onClearFiles: () => void;
+  onConfirm: () => void;
+}) {
+  const files = form?.files ?? [];
+  const month = form?.month ?? format(new Date(), "yyyy-MM");
+  const monthFiles = files.length > 0 ? filterFilesByMonth(files, month) : [];
+  const unknownCount = files.filter((f) => extractDateFromFilename(f) === null).length;
+  // 파일명 월 분포
+  const distMap = new Map<string, number>();
+  for (const f of files) {
+    const d = extractDateFromFilename(f);
+    const key = d ? d.slice(0, 7) : "미상";
+    distMap.set(key, (distMap.get(key) ?? 0) + 1);
+  }
+  const monthDist = [...distMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
+  return (
+    <div className="space-y-3">
+      {/* 파일 선택 */}
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] text-gray-400">{radar.latitude.toFixed(4)}°N {radar.longitude.toFixed(4)}°E</span>
+        <button onClick={onSelectFiles} disabled={building}
+          className="flex items-center gap-1.5 rounded-lg bg-gray-100 px-3 py-1.5 text-[11px] text-gray-600 hover:bg-gray-200 disabled:opacity-40">
+          <FolderOpen size={12} /> 파일 선택
+        </button>
+      </div>
+
+      {files.length === 0 ? (
+        <p className="text-[10px] text-gray-400">이 레이더의 기준월 ASS 파일을 선택하세요.</p>
+      ) : (
+        <div className="space-y-2.5">
+          {/* 선택 요약 */}
+          <div>
+            <p className="text-[10px] font-medium text-[#a60739]">
+              {files.length}개 선택 · {monthFiles.length}개 파싱 예정
+              {files.length - monthFiles.length > 0 ? ` (${files.length - monthFiles.length}개 월 불일치 제외)` : ""}
+              {unknownCount > 0 ? ` · 날짜 미상 ${unknownCount}개 포함(파싱에 포함됨)` : ""}
+            </p>
+            {monthDist.length > 0 && (
+              <p className="mt-1 text-[10px] text-gray-400">
+                월 분포: {monthDist.map(([m, c]) => `${m} ${c}개`).join(" · ")}
+              </p>
+            )}
+          </div>
+
+          {/* 월 파일 0 경고 (빌드 대상 제외) */}
+          {monthFiles.length === 0 && (
+            <p className="flex items-center gap-1.5 rounded-lg bg-amber-50 px-2.5 py-1.5 text-[10px] text-amber-600">
+              <TriangleAlert size={11} className="shrink-0" /> 선택한 월에 해당하는 파일이 없습니다 — 빌드 대상에서 제외됩니다.
+            </p>
+          )}
+
+          {/* 덮어쓰기 경고 */}
+          {existing && monthFiles.length > 0 && (
+            <p className="flex items-center gap-1.5 text-[10px] text-amber-600">
+              <TriangleAlert size={11} className="shrink-0" /> 빌드 시 {existing.month_label} 기준데이터를 덮어씁니다.
+            </p>
+          )}
+
+          {/* 기준월 선택 */}
+          <div className="rounded-lg border border-gray-100 bg-gray-50/50 p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[11px] font-semibold text-gray-600">기준월</span>
+              <span className="font-mono text-[11px] text-[#a60739]">{month}</span>
+            </div>
+            <div className={`flex justify-center ${building ? "pointer-events-none opacity-40" : ""}`}>
+              <MonthPicker value={month} onChange={onMonthChange} />
+            </div>
+          </div>
+
+          {/* 파일 선택 해제 */}
+          <div className="flex justify-end">
+            <button onClick={onClearFiles} disabled={building}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-40">
+              <X size={11} /> 파일 선택 해제
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 확인 — 서브모달 닫기 (빌드는 본 모달 하단 버튼에서 일괄 실행) */}
+      <div className="flex justify-end border-t border-gray-100 pt-3">
+        <button onClick={onConfirm}
+          className="rounded-lg bg-[#a60739] px-4 py-2 text-[12px] font-medium text-white transition-colors hover:bg-[#85062e]">
+          확인
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function OMReferenceModal({ open, onClose, customRadarSites, aircraft }: OMReferenceModalProps) {
   // 저장된 기준데이터 목록
   const [references, setReferences] = useState<OmReferenceMeta[]>([]);
@@ -75,6 +183,9 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
 
   // 레이더별 폼 상태 (파일 선택 + 기준월)
   const [forms, setForms] = useState<Map<string, RadarForm>>(new Map());
+
+  // 설정 서브모달 대상 (radar_name). null 이면 닫힘
+  const [configTarget, setConfigTarget] = useState<string | null>(null);
 
   // 삭제 확인
   const [deleteTarget, setDeleteTarget] = useState<OmReferenceMeta | null>(null);
@@ -107,6 +218,11 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
   useEffect(() => {
     if (open) refreshList();
   }, [open, refreshList]);
+
+  // 본 모달이 닫히면 설정 서브모달도 함께 정리 (고아 서브모달 방지)
+  useEffect(() => {
+    if (!open) setConfigTarget(null);
+  }, [open]);
 
   // 빌드 종료 감지(true→false) — done 레이더 파일선택만 클리어(error/cancelled 는 재시도용 유지) + 목록 갱신
   const prevBuildingRef = useRef(building);
@@ -190,9 +306,20 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
   const progressPct = progress && progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : null;
   const errorJobs = jobs.filter((j) => j.status === "error");
 
+  // 레이더 미등록 저장 데이터 (customRadarSites 에 없는 radar_name — 삭제만 가능)
+  const unregisteredRefs = useMemo(
+    () => references.filter((r) => !customRadarSites.some((s) => s.name === r.radar_name)),
+    [references, customRadarSites],
+  );
+
+  // 설정 서브모달 대상 레이더 (등록 레이더만 — 미등록/미존재면 null 로 닫힘 처리)
+  const configRadar = configTarget ? customRadarSites.find((s) => s.name === configTarget) ?? null : null;
+
+  const isEmpty = customRadarSites.length === 0 && unregisteredRefs.length === 0;
+
   return (
     <>
-      <Modal open={open} onClose={onClose} title="기준데이터 관리" width="max-w-4xl" closable>
+      <Modal open={open} onClose={onClose} title="기준데이터 관리" width="max-w-3xl" closable>
         <div className="space-y-5">
           {/* 안내 문구 */}
           <div className="flex items-start gap-2 rounded-lg bg-[#a60739]/5 px-3.5 py-2.5">
@@ -203,96 +330,137 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
             </p>
           </div>
 
-          {/* ── 저장된 기준데이터 목록 ── */}
+          {/* ── 레이더별 기준데이터 (저장 데이터 + 신규/재계산 통합) ── */}
           <section>
             <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-[11px] font-bold uppercase tracking-[0.06em] text-gray-400">저장된 기준데이터</h3>
+              <h3 className="text-[11px] font-bold uppercase tracking-[0.06em] text-gray-400">레이더별 기준데이터</h3>
               <button onClick={refreshList} disabled={loadingList}
                 className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-40">
                 <RefreshCw size={11} className={loadingList ? "animate-spin" : ""} /> 새로고침
               </button>
             </div>
-            {references.length === 0 ? (
+
+            {isEmpty ? (
               <div className="rounded-xl border border-dashed border-gray-200 px-4 py-6 text-center text-[11px] text-gray-400">
-                {loadingList ? "불러오는 중..." : "저장된 기준데이터가 없습니다. 아래에서 새로 생성하세요."}
+                {loadingList ? "불러오는 중..." : "등록된 레이더가 없습니다. 레이더를 먼저 등록하세요."}
               </div>
             ) : (
-              <>
-                <div className="overflow-x-auto rounded-xl border border-gray-200">
-                  <table className="w-full text-[11px]">
-                    <thead>
-                      <tr className="border-b border-gray-100 bg-gray-50 text-gray-400">
-                        <th className="px-3 py-2 text-left font-medium">레이더</th>
-                        <th className="px-3 py-2 text-center font-medium">기준월</th>
-                        <th className="px-3 py-2 text-center font-medium">정합성</th>
-                        <th className="px-3 py-2 text-center font-medium">파일</th>
-                        <th className="px-3 py-2 text-center font-medium">기간</th>
-                        <th className="px-3 py-2 text-right font-medium">포인트</th>
-                        <th className="px-3 py-2 text-right font-medium">아카이브</th>
-                        <th className="px-3 py-2 text-right font-medium">원본 ASS</th>
-                        <th className="px-3 py-2 text-center font-medium">생성일</th>
-                        <th className="px-3 py-2 text-center font-medium"></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {references.map((r) => {
-                        const site = customRadarSites.find((s) => s.name === r.radar_name);
-                        const coh = site ? checkRefCoherence(r, site) : null;
-                        const canRebuild = !building && r.ass_bytes > 0 && !!site;
-                        return (
-                          <tr key={r.radar_name} className="border-b border-gray-50 last:border-0">
-                            <td className="px-3 py-2 font-semibold text-gray-700">{r.radar_name}</td>
-                            <td className="px-3 py-2 text-center font-mono text-gray-600">{r.month_label}</td>
-                            <td className="px-3 py-2 text-center">
-                              {!site ? (
-                                <span className="rounded px-1.5 py-0.5 text-[9px] bg-gray-100 text-gray-400">레이더 미등록</span>
-                              ) : coh && !coh.ok ? (
-                                <span className="rounded px-1.5 py-0.5 text-[9px] bg-amber-50 text-amber-600" title="빌드 시점과 현재 레이더 좌표·안테나고가 달라 편차 판정이 절대 임계로 폴백됩니다.">
+              <div className="space-y-2">
+                {/* 등록 레이더 행 */}
+                {customRadarSites.map((radar) => {
+                  const existing = references.find((r) => r.radar_name === radar.name);
+                  const coh = existing ? checkRefCoherence(existing, radar) : null;
+                  const canRebuild = !building && !!existing && existing.ass_bytes > 0;
+                  const form = forms.get(radar.name);
+                  const files = form?.files ?? [];
+                  const month = form?.month ?? "";
+                  const monthFiles = files.length > 0 ? filterFilesByMonth(files, month) : [];
+
+                  return (
+                    <div key={radar.name} className="rounded-xl border border-gray-200 p-3">
+                      {/* 1행(주): 아이콘 + 이름 + 상태 배지 + 액션 */}
+                      <div className="flex items-center gap-2">
+                        <Radio size={14} className="shrink-0 text-[#a60739]" />
+                        <span className="text-[12px] font-semibold text-gray-700">{radar.name}</span>
+
+                        <div className="flex flex-wrap items-center gap-1">
+                          {existing ? (
+                            <>
+                              <span className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[9px] text-gray-500">기준월 {existing.month_label}</span>
+                              {coh && !coh.ok ? (
+                                <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-600" title="빌드 시점과 현재 레이더 좌표·안테나고가 달라 편차 판정이 절대 임계로 폴백됩니다.">
                                   미적용 · {coh.reasonText}
                                 </span>
                               ) : (
-                                <span className="rounded px-1.5 py-0.5 text-[9px] bg-emerald-50 text-emerald-600">적용 가능</span>
+                                <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[9px] text-emerald-600">적용 가능</span>
                               )}
-                            </td>
-                            <td className="px-3 py-2 text-center text-gray-500">{r.file_count}개</td>
-                            <td className="px-3 py-2 text-center font-mono text-[10px] text-gray-400">
-                              {r.first_date}<br />~ {r.last_date}
-                            </td>
-                            <td className="px-3 py-2 text-right font-mono text-gray-600">{r.total_points.toLocaleString()}</td>
-                            <td className="px-3 py-2 text-right font-mono text-gray-600">{formatBytes(r.archive_bytes)}</td>
-                            <td className="px-3 py-2 text-right font-mono">
-                              {r.ass_bytes > 0
-                                ? <span className="text-gray-600">{formatBytes(r.ass_bytes)}</span>
-                                : <span className="text-gray-400">미보관</span>}
-                            </td>
-                            <td className="px-3 py-2 text-center font-mono text-[10px] text-gray-400">{r.created_at.slice(0, 10)}</td>
-                            <td className="px-3 py-2">
-                              <div className="flex items-center justify-center gap-0.5">
-                                <button
-                                  onClick={() => site && handleRebuild(site, r.month_label)}
-                                  disabled={!canRebuild}
-                                  className="rounded-md p-1 text-gray-300 hover:bg-[#a60739]/5 hover:text-[#a60739] disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-gray-300"
-                                  title={r.ass_bytes === 0
-                                    ? "원본 미보관(구버전 빌드) — 파일을 다시 선택해 재계산하세요"
-                                    : "보관된 원본 ASS로 재계산 — 현재 레이더 좌표·안테나고 반영"}>
-                                  <RefreshCw size={13} />
-                                </button>
-                                <button onClick={() => setDeleteTarget(r)} disabled={building}
-                                  className="rounded-md p-1 text-gray-300 hover:bg-red-50 hover:text-red-500 disabled:opacity-40" title="삭제">
-                                  <Trash2 size={13} />
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-                <p className="mt-1.5 px-1 text-[10px] text-gray-400">
-                  기간에는 전월 마지막날 파일(자정 이후 데이터 보정)이 포함될 수 있습니다.
-                </p>
-              </>
+                            </>
+                          ) : (
+                            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[9px] text-gray-400">기준데이터 없음</span>
+                          )}
+                          {/* 폼에 파일이 선택돼 있으면 파싱 예정 배지 */}
+                          {files.length > 0 && (
+                            monthFiles.length > 0 ? (
+                              <span className="rounded bg-[#a60739]/10 px-1.5 py-0.5 text-[9px] text-[#a60739]">
+                                {monthFiles.length}개 파싱 예정 · {month}
+                              </span>
+                            ) : (
+                              <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-600">선택 월 파일 없음</span>
+                            )
+                          )}
+                        </div>
+
+                        <div className="ml-auto flex items-center gap-0.5">
+                          {existing && (
+                            <>
+                              <button
+                                onClick={() => handleRebuild(radar, existing.month_label)}
+                                disabled={!canRebuild}
+                                className="rounded-md p-1 text-gray-300 hover:bg-[#a60739]/5 hover:text-[#a60739] disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-gray-300"
+                                title={existing.ass_bytes === 0
+                                  ? "원본 미보관(구버전 빌드) — 파일을 다시 선택해 재계산하세요"
+                                  : "보관된 원본 ASS로 재계산 — 현재 레이더 좌표·안테나고 반영"}>
+                                <RefreshCw size={13} />
+                              </button>
+                              <button onClick={() => setDeleteTarget(existing)} disabled={building}
+                                className="rounded-md p-1 text-gray-300 hover:bg-red-50 hover:text-red-500 disabled:opacity-40" title="삭제">
+                                <Trash2 size={13} />
+                              </button>
+                            </>
+                          )}
+                          <button onClick={() => setConfigTarget(radar.name)}
+                            className="flex items-center gap-1 rounded-lg bg-[#a60739] px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e]">
+                            <Settings size={12} /> 설정
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* 2행(부, 저장 데이터 있을 때만): 상세 */}
+                      {existing && (
+                        <p className="mt-1.5 pl-[22px] font-mono text-[10px] text-gray-400">
+                          기간 {existing.first_date} ~ {existing.last_date} · 파일 {existing.file_count}개 · 포인트 {existing.total_points.toLocaleString()}
+                          {" · "}아카이브 {formatBytes(existing.archive_bytes)}
+                          {" · "}원본 ASS {existing.ass_bytes > 0 ? formatBytes(existing.ass_bytes) : "미보관"}
+                          {" · "}생성 {existing.created_at.slice(0, 10)}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* 레이더 미등록 저장 데이터 행 (삭제만 가능) */}
+                {unregisteredRefs.map((r) => (
+                  <div key={r.radar_name} className="rounded-xl border border-gray-200 p-3">
+                    <div className="flex items-center gap-2">
+                      <Radio size={14} className="shrink-0 text-gray-300" />
+                      <span className="text-[12px] font-semibold text-gray-700">{r.radar_name}</span>
+                      <div className="flex flex-wrap items-center gap-1">
+                        <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[9px] text-gray-400">레이더 미등록</span>
+                        <span className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[9px] text-gray-500">기준월 {r.month_label}</span>
+                      </div>
+                      <div className="ml-auto flex items-center gap-0.5">
+                        <button onClick={() => setDeleteTarget(r)} disabled={building}
+                          className="rounded-md p-1 text-gray-300 hover:bg-red-50 hover:text-red-500 disabled:opacity-40" title="삭제">
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    </div>
+                    <p className="mt-1.5 pl-[22px] font-mono text-[10px] text-gray-400">
+                      기간 {r.first_date} ~ {r.last_date} · 파일 {r.file_count}개 · 포인트 {r.total_points.toLocaleString()}
+                      {" · "}아카이브 {formatBytes(r.archive_bytes)}
+                      {" · "}원본 ASS {r.ass_bytes > 0 ? formatBytes(r.ass_bytes) : "미보관"}
+                      {" · "}생성 {r.created_at.slice(0, 10)}
+                    </p>
+                  </div>
+                ))}
+
+                {/* 각주 — 저장 데이터가 있을 때만 (기간 표기 관련) */}
+                {references.length > 0 && (
+                  <p className="px-1 pt-0.5 text-[10px] text-gray-400">
+                    기간에는 전월 마지막날 파일(자정 이후 데이터 보정)이 포함될 수 있습니다.
+                  </p>
+                )}
+              </div>
             )}
           </section>
 
@@ -354,107 +522,6 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
             </div>
           )}
 
-          {/* ── 신규 / 재계산 — 레이더별 카드 ── */}
-          <section className="border-t border-gray-100 pt-4">
-            <h3 className="mb-2 text-[11px] font-bold uppercase tracking-[0.06em] text-gray-400">신규 / 재계산</h3>
-
-            {customRadarSites.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-gray-200 px-4 py-6 text-center text-[11px] text-gray-400">
-                등록된 레이더가 없습니다.
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {customRadarSites.map((radar) => {
-                  const form = forms.get(radar.name);
-                  const existing = references.find((r) => r.radar_name === radar.name);
-                  const files = form?.files ?? [];
-                  const month = form?.month ?? format(new Date(), "yyyy-MM");
-                  const monthFiles = files.length > 0 ? filterFilesByMonth(files, month) : [];
-                  const unknownCount = files.filter((f) => extractDateFromFilename(f) === null).length;
-                  // 파일명 월 분포
-                  const distMap = new Map<string, number>();
-                  for (const f of files) {
-                    const d = extractDateFromFilename(f);
-                    const key = d ? d.slice(0, 7) : "미상";
-                    distMap.set(key, (distMap.get(key) ?? 0) + 1);
-                  }
-                  const monthDist = [...distMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-
-                  return (
-                    <div key={radar.name} className="rounded-xl border border-gray-200 p-3.5">
-                      {/* 헤더 */}
-                      <div className="flex items-center gap-2.5">
-                        <Radio size={14} className="shrink-0 text-[#a60739]" />
-                        <span className="text-[12px] font-semibold text-gray-700">{radar.name}</span>
-                        {existing && (
-                          <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-600">보유 {existing.month_label}</span>
-                        )}
-                        <span className="ml-auto text-[10px] text-gray-400">{radar.latitude.toFixed(4)}°N {radar.longitude.toFixed(4)}°E</span>
-                        <button onClick={() => handleSelectFiles(radar.name)} disabled={building}
-                          className="flex items-center gap-1.5 rounded-lg bg-gray-100 px-3 py-1.5 text-[11px] text-gray-600 hover:bg-gray-200 disabled:opacity-40">
-                          <FolderOpen size={12} /> 파일 선택
-                        </button>
-                      </div>
-
-                      {files.length === 0 ? (
-                        <p className="mt-2 text-[10px] text-gray-400">이 레이더의 기준월 ASS 파일을 선택하세요.</p>
-                      ) : (
-                        <div className="mt-3 space-y-2.5">
-                          {/* 선택 요약 */}
-                          <div>
-                            <p className="text-[10px] font-medium text-[#a60739]">
-                              {files.length}개 선택 · {monthFiles.length}개 파싱 예정
-                              {files.length - monthFiles.length > 0 ? ` (${files.length - monthFiles.length}개 월 불일치 제외)` : ""}
-                              {unknownCount > 0 ? ` · 날짜 미상 ${unknownCount}개 포함(파싱에 포함됨)` : ""}
-                            </p>
-                            {monthDist.length > 0 && (
-                              <p className="mt-1 text-[10px] text-gray-400">
-                                월 분포: {monthDist.map(([m, c]) => `${m} ${c}개`).join(" · ")}
-                              </p>
-                            )}
-                          </div>
-
-                          {/* 월 파일 0 경고 (빌드 대상 제외) */}
-                          {monthFiles.length === 0 && (
-                            <p className="flex items-center gap-1.5 rounded-lg bg-amber-50 px-2.5 py-1.5 text-[10px] text-amber-600">
-                              <TriangleAlert size={11} className="shrink-0" /> 선택한 월에 해당하는 파일이 없습니다 — 빌드 대상에서 제외됩니다.
-                            </p>
-                          )}
-
-                          {/* 덮어쓰기 경고 */}
-                          {existing && monthFiles.length > 0 && (
-                            <p className="flex items-center gap-1.5 text-[10px] text-amber-600">
-                              <TriangleAlert size={11} className="shrink-0" /> 빌드 시 {existing.month_label} 기준데이터를 덮어씁니다.
-                            </p>
-                          )}
-
-                          {/* 기준월 선택 */}
-                          <div className="rounded-lg border border-gray-100 bg-gray-50/50 p-3">
-                            <div className="mb-2 flex items-center justify-between">
-                              <span className="text-[11px] font-semibold text-gray-600">기준월</span>
-                              <span className="font-mono text-[11px] text-[#a60739]">{month}</span>
-                            </div>
-                            <div className={`flex justify-center ${building ? "pointer-events-none opacity-40" : ""}`}>
-                              <MonthPicker value={month} onChange={(m) => handleMonthChange(radar.name, m)} />
-                            </div>
-                          </div>
-
-                          {/* 파일 선택 해제 */}
-                          <div className="flex justify-end">
-                            <button onClick={() => handleClearFiles(radar.name)} disabled={building}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-40">
-                              <X size={11} /> 파일 선택 해제
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-
           {/* ── 하단 버튼 ── */}
           <div className="flex items-center justify-end gap-2 border-t border-gray-100 pt-4">
             <button onClick={onClose}
@@ -466,6 +533,28 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
             </button>
           </div>
         </div>
+      </Modal>
+
+      {/* 레이더별 설정 서브모달 — 본 모달 뒤(JSX상 나중)에 두어 동일 z에서 위에 그려짐 */}
+      <Modal
+        open={configRadar !== null}
+        onClose={() => setConfigTarget(null)}
+        title={configRadar ? `기준데이터 설정 — ${configRadar.name}` : ""}
+        width="max-w-md"
+        closable
+      >
+        {configRadar && (
+          <RadarConfigForm
+            radar={configRadar}
+            form={forms.get(configRadar.name)}
+            existing={references.find((r) => r.radar_name === configRadar.name)}
+            building={building}
+            onSelectFiles={() => handleSelectFiles(configRadar.name)}
+            onMonthChange={(m) => handleMonthChange(configRadar.name, m)}
+            onClearFiles={() => handleClearFiles(configRadar.name)}
+            onConfirm={() => setConfigTarget(null)}
+          />
+        )}
       </Modal>
 
       {/* 삭제 확인 — 모달(z-9999) 위 */}
