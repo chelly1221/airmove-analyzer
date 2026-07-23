@@ -168,7 +168,6 @@ function ReportOMFindings({
             <th className="ta-c"><OMEditable id="findings.blockage.colDelta" value="Δ(%p)" tag="span" /></th>
             <th className="ta-c"><OMEditable id="findings.blockage.colGrade" value="등급" tag="span" /></th>
             <th className="ta-c"><OMEditable id="findings.blockage.colTrend" value="추세(일당)" tag="span" /></th>
-            <th className="ta-c"><OMEditable id="findings.blockage.colExp" value="소실pt/통과pt" tag="span" /></th>
           </tr>
         </thead>
         <tbody>
@@ -207,8 +206,6 @@ function ReportOMFindings({
                         : `${w.trendDir} ${w.trendSlopePctPerDay > 0 ? "+" : ""}${w.trendSlopePctPerDay.toFixed(3)}%p`)
                       : "—"}
                   </td>
-                  {/* 소실pt/통과pt — 전 행 실측(항적 없음 행 "0 / 0pt" 포함) */}
-                  <td className="ta-c mono">{`${Math.round(w.lossPointCount).toLocaleString()} / ${Math.round(w.exposurePointCount).toLocaleString()}pt`}</td>
                 </tr>
               );
             }),
