@@ -184,12 +184,13 @@ export default function ReportOMObstacleSummaryTable({
         )}
       </div>
 
-      {/* (C) 각주 — 표시점 수(차트 점과 일치)·소실시간 정의 + (정상 등급 한정) 통과/소실 표본 상세(구 4행 비고 이관) */}
+      {/* (C) 각주 — 표시점 수(차트 점과 일치)·소실시간 정의 + (정상 등급 한정) 방위 통과/추가 차단영역 소실 표본 상세(구 4행 비고 이관) */}
       <div className="om-tbl-note">
         ※ 표시점 {totalPts.toLocaleString()}점(Az×Elev 차트 표시점과 일치) · 소실시간 = Σ 이벤트 분담시간(share_s)
         {blockage && blockage.exposurePointCount > 0
-          ? ` · 통과 ${Math.round(blockage.exposurePointCount).toLocaleString()}pt 중 소실 ${Math.round(blockage.lossPointCount).toLocaleString()}pt · ${blockage.daysWithExposure}일`
+          ? ` · 방위 통과 ${Math.round(blockage.exposurePointCount).toLocaleString()}pt 중 추가 차단영역 소실 ${Math.round(blockage.lossPointCount).toLocaleString()}pt · ${blockage.daysWithExposure}일`
           : ""}
+        <br />※ 소실율 = 건물 방위(노출면 각폭) 전체 항적 시간 대비 추가 차단영역 내 소실시간 비율(기준월 동일 방식).
       </div>
     </div>
   );
