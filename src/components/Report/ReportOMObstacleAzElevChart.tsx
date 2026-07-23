@@ -15,20 +15,22 @@
  *      (buildingCaused)만 실루엣 위 최상층으로 재드로우. 분류별 건수(장애물 추가 기인 / 지형 차단 /
  *      장애물 무관)는 별도 요약표 컴포넌트(ReportOMObstacleSummaryTable)에서 제공 — 동일 classifyObstacleLosses 공유.
  */
-import { useMemo, useRef, useEffect, useCallback } from "react";
+import { useMemo, useRef, useEffect, useCallback, useState } from "react";
 import type { ManualBuilding, BuildingGroup, RadarSite, PanoramaMergeResult, BuildingObstacle } from "../../types";
 import type { LossPointGeo, TrackPointGeo } from "../../types/obstacle";
 import { classifyObstacleLosses, buildingAzHalfExtentDeg, makeTerrainSampler, panoWithForBuilding, pointElevAngleDeg, FT_PER_M, type SiblingBuilding } from "../../utils/obstacleAnalysisHelpers";
 import { bearingDeg, haversineKm } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
+import { drawDensityHeatmap, HEATMAP_TRACK_RGB, HEATMAP_LOSS_RGB } from "./chartDensityHeatmap";
 import OMEditable from "./OMEditable";
 
 const CHART_W = 720;
 // 표시 높이 = 콘텐츠폭(182mm) × CHART_H/CHART_W. 240 → 200 으로 낮춰 §3 상세(도면+요약표+
 //   LoS 단면도+본 차트)가 A4 한 페이지(297mm) 안에 수납되게 한다 — 과거 240 에선 본 차트 하단
 //   범례 행이 ~1cm 넘쳐 다음 시트로 스필(유령 반쪽 페이지 → 이후 섹션 밀림). 표시 높이 61mm→51mm.
-const CHART_H = 200;
-const MARGIN = { top: 16, right: 16, bottom: 34, left: 50 };
+// 2026-07-24 하단 각주 제거로 확보된 여유 내에서 200→208(축 라벨 확대 수용, 표시높이 +~2mm).
+const CHART_H = 208;
+const MARGIN = { top: 16, right: 16, bottom: 40, left: 50 };
 const INNER_W = CHART_W - MARGIN.left - MARGIN.right;
 const INNER_H = CHART_H - MARGIN.top - MARGIN.bottom;
 const DPR = 2;
@@ -171,6 +173,8 @@ export default function ReportOMObstacleAzElevChart({
   radarSite, building, panoWith, panoWithout, lossPoints, trackPoints, siblings,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // 점 표시 ↔ 밀도 히트맵 토글 — 로컬 상태(영속화 안 함). 편집 모드와 무관하게 항상 사용 가능.
+  const [heatmapMode, setHeatmapMode] = useState(false);
 
   // 건물 메타 + 소실표적 분류 — obstacleAnalysisHelpers 의 단일 소스 사용.
   //  panoWith/panoWithout 제공 시 차단각을 panorama(빨강영역과 동일 소스)에서 산출 → 장애물 추가 기인 분류가 빨강영역과 픽셀 일치.
@@ -341,32 +345,50 @@ export default function ReportOMObstacleAzElevChart({
     // 소실표적 — 최하층(z 맨 뒤). 모든 소실표적을 빨간 점으로 통일 (LoS 단면도와 동일 #ff1745).
     //   항적·실루엣 영역(지형/추가차단) 아래로 깔리고, '분석 대상 추가 차단'(핑크영역) 안의 점만
     //   실루엣 위 최상층으로 재드로우(아래 buildingCaused 블록). 크기는 항적점(r=1.3)과 동일.
-    //   (분류별 건수는 별도 요약표 컴포넌트에서 제공)
-    ctx.fillStyle = "rgba(255,23,69,0.9)";
-    for (const l of computed.losses) {
-      if (l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      ctx.beginPath();
-      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
-      ctx.fill();
+    //   히트맵 모드: 동일 투영으로 빨강 램프. 점 모드 경로는 기존 그대로. (분류별 건수는 별도 요약표 컴포넌트에서 제공)
+    if (heatmapMode) {
+      const pts: { x: number; y: number }[] = [];
+      for (const l of computed.losses) {
+        if (l.elevAngleDeg < 0) continue;
+        pts.push({ x: xScale(l.azDeg), y: yScale(l.elevAngleDeg) });
+      }
+      drawDensityHeatmap(ctx, pts, { x: MARGIN.left, y: MARGIN.top, w: INNER_W, h: INNER_H }, 3, HEATMAP_LOSS_RGB);
+    } else {
+      ctx.fillStyle = "rgba(255,23,69,0.9)";
+      for (const l of computed.losses) {
+        if (l.elevAngleDeg < 0) continue;
+        const x = xScale(l.azDeg);
+        const y = yScale(l.elevAngleDeg);
+        ctx.beginPath();
+        ctx.arc(x, y, 1.3, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     // 항적 — 소실표적 위·실루엣 아래. LoS 단면도와 동일 detection type 색·작은 점.
     //   대상 후방·방위창 내 항적을 깔아 소실표적 분포의 배경(통과 항적 표본)을 시각화.
     //   항적 표시점은 백엔드 일별 최대 5,000점 균등표본(의도 설계)이라 전수가 아님 — 소실표적은 전수.
-    for (const tp of trackDots) {
-      const x = xScale(tp.az);
-      const y = yScale(tp.elev);
-      const col = detectionTypeColor(tp.radarType);
-      ctx.beginPath();
-      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.5)`;
-      ctx.fill();
-      if (PSR_TYPES.has(tp.radarType)) {
-        ctx.lineWidth = 0.6;
-        ctx.strokeStyle = "rgba(255,255,255,0.6)";
-        ctx.stroke();
+    //   히트맵 모드: 동일 투영으로 파랑 램프(밀도 단일 색 — detection type 색·PSR 테두리 미적용). 점 모드는 기존 그대로.
+    if (heatmapMode) {
+      const pts: { x: number; y: number }[] = [];
+      for (const tp of trackDots) {
+        pts.push({ x: xScale(tp.az), y: yScale(tp.elev) });
+      }
+      drawDensityHeatmap(ctx, pts, { x: MARGIN.left, y: MARGIN.top, w: INNER_W, h: INNER_H }, 3, HEATMAP_TRACK_RGB);
+    } else {
+      for (const tp of trackDots) {
+        const x = xScale(tp.az);
+        const y = yScale(tp.elev);
+        const col = detectionTypeColor(tp.radarType);
+        ctx.beginPath();
+        ctx.arc(x, y, 1.3, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.5)`;
+        ctx.fill();
+        if (PSR_TYPES.has(tp.radarType)) {
+          ctx.lineWidth = 0.6;
+          ctx.strokeStyle = "rgba(255,255,255,0.6)";
+          ctx.stroke();
+        }
       }
     }
 
@@ -419,14 +441,24 @@ export default function ReportOMObstacleAzElevChart({
     // 소실표적 재드로우 — '분석 대상 추가 차단'(핑크영역) 안의 점만 실루엣 위 최상층으로.
     //   판정은 분류(classifyObstacleLosses)의 buildingCaused 재사용 — 핑크영역(with−without)과
     //   동일 panorama 샘플러 소스라 픽셀 일치(경계 재계산 불필요).
-    ctx.fillStyle = "rgba(255,23,69,0.9)";
-    for (const l of computed.losses) {
-      if (!l.buildingCaused || l.elevAngleDeg < 0) continue;
-      const x = xScale(l.azDeg);
-      const y = yScale(l.elevAngleDeg);
-      ctx.beginPath();
-      ctx.arc(x, y, 1.3, 0, Math.PI * 2);
-      ctx.fill();
+    //   히트맵 모드: 핑크영역 안 밀도가 실루엣 위로 다시 올라오는 기존 의도 유지 — 부분집합만 빨강 램프.
+    if (heatmapMode) {
+      const pts: { x: number; y: number }[] = [];
+      for (const l of computed.losses) {
+        if (!l.buildingCaused || l.elevAngleDeg < 0) continue;
+        pts.push({ x: xScale(l.azDeg), y: yScale(l.elevAngleDeg) });
+      }
+      drawDensityHeatmap(ctx, pts, { x: MARGIN.left, y: MARGIN.top, w: INNER_W, h: INNER_H }, 3, HEATMAP_LOSS_RGB);
+    } else {
+      ctx.fillStyle = "rgba(255,23,69,0.9)";
+      for (const l of computed.losses) {
+        if (!l.buildingCaused || l.elevAngleDeg < 0) continue;
+        const x = xScale(l.azDeg);
+        const y = yScale(l.elevAngleDeg);
+        ctx.beginPath();
+        ctx.arc(x, y, 1.3, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     // (분석 대상 방위 마커 제거 — 대상 차단각 높이는 연홍색 '추가 차단' 영역이 표현)
@@ -436,18 +468,18 @@ export default function ReportOMObstacleAzElevChart({
     // 축 라벨
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.font = "9px sans-serif";
+    ctx.font = "10.5px sans-serif";
     ctx.fillStyle = "#374151";
     for (const rawDeg of xTicks) {
       const dispDeg = ((rawDeg % 360) + 360) % 360;
       const compass = COMPASS_DIRS[Math.round(dispDeg)];
       const x = xScale(dispDeg);
-      ctx.fillText(`${dispDeg.toFixed(0)}°`, x, CHART_H - MARGIN.bottom + 11);
+      ctx.fillText(`${dispDeg.toFixed(0)}°`, x, CHART_H - MARGIN.bottom + 12);
       if (compass) {
-        ctx.font = "bold 8px sans-serif";
+        ctx.font = "bold 9.5px sans-serif";
         ctx.fillStyle = "#6b7280";
-        ctx.fillText(compass, x, CHART_H - MARGIN.bottom + 20);
-        ctx.font = "9px sans-serif";
+        ctx.fillText(compass, x, CHART_H - MARGIN.bottom + 22);
+        ctx.font = "10.5px sans-serif";
         ctx.fillStyle = "#374151";
       }
     }
@@ -460,14 +492,14 @@ export default function ReportOMObstacleAzElevChart({
 
     ctx.textAlign = "center";
     ctx.fillStyle = "#6b7280";
-    ctx.font = "10px sans-serif";
-    ctx.fillText("방위", MARGIN.left + INNER_W / 2, CHART_H - 2);
+    ctx.font = "11.5px sans-serif";
+    ctx.fillText("방위", MARGIN.left + INNER_W / 2, CHART_H - 6);
     ctx.save();
     ctx.translate(13, MARGIN.top + INNER_H / 2);
     ctx.rotate(-Math.PI / 2);
     ctx.fillText("양각 (°)", 0, 0);
     ctx.restore();
-  }, [computed, sil, trackDots, xTicks, yTicks, yStep, azCenter, azHalfSpan, xScale, xScaleRel, yScale, yRange]);
+  }, [computed, sil, trackDots, xTicks, yTicks, yStep, azCenter, azHalfSpan, xScale, xScaleRel, yScale, yRange, heatmapMode]);
 
   // 인라인 편집키 접두사 — (레이더 × 건물) 페이지마다 독립 편집 (detail.* 헤더 키와 동일 스킴)
   const eid = `azelev.${radarSite.name}_${building.id}`;
@@ -475,22 +507,33 @@ export default function ReportOMObstacleAzElevChart({
   return (
     <div className="mt-2">
       {/* 차트 제목 */}
-      <div className="mb-1 flex items-center justify-between text-[12px]">
+      <div className="mb-1 flex items-center justify-between text-[13px]">
         <OMEditable id={`${eid}.title`} value="LoS 차단 양각 대비 표적소실 분포" tag="span" className="font-semibold text-gray-800" />
-        <span className="text-[10px] text-gray-400">
+        <span className="text-[11px] text-gray-400">
           분석 대상 방위 {computed.bAzDeg.toFixed(0)}° · 건물 각폭 ±{azHalfSpan.toFixed(1)}°
         </span>
       </div>
 
-      <canvas
-        ref={canvasRef}
-        width={CHART_W * DPR}
-        height={CHART_H * DPR}
-        style={{ width: "100%", height: "auto", display: "block" }}
-      />
+      <div className="relative group">
+        {/* 점 표시 ↔ 밀도 히트맵 토글 — print:hidden 필수. 켜짐 시 hover 없이도 보이게(opacity-100). */}
+        <div className="absolute right-1 top-1 z-10 flex items-center gap-1 print:hidden">
+          <button type="button" onClick={() => setHeatmapMode((v) => !v)}
+            className={`rounded px-1.5 py-0.5 text-[9px] text-white transition-opacity ${
+              heatmapMode ? "bg-blue-600/90 opacity-100" : "bg-black/40 opacity-0 group-hover:opacity-100"
+            }`}>
+            {heatmapMode ? "점 표시" : "히트맵"}
+          </button>
+        </div>
+        <canvas
+          ref={canvasRef}
+          width={CHART_W * DPR}
+          height={CHART_H * DPR}
+          style={{ width: "100%", height: "auto", display: "block" }}
+        />
+      </div>
 
       {/* 범례 */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 justify-center mt-1 text-[10px] text-gray-500">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 justify-center mt-1 text-[11px] text-gray-500">
         <span className="flex items-center gap-1">
           <span className="inline-block w-3 h-2.5 rounded-sm" style={{ backgroundColor: "#86efac", opacity: 0.55 }} />
           <OMEditable id={`${eid}.legend.terrain`} value="지형 + 기존 지형지물" tag="span" />
@@ -501,12 +544,23 @@ export default function ReportOMObstacleAzElevChart({
         </span>
         {trackDots.length > 0 && (
           <span className="flex items-center gap-1">
-            <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: "rgba(34,197,94,0.7)" }} />
+            {/* 히트맵 모드: 밀도 색칩(가로 그라데이션 바, 파랑). OMEditable id·value 는 불변. */}
+            {heatmapMode ? (
+              <span className="inline-block w-4 h-2 rounded-sm"
+                style={{ background: `linear-gradient(to right, rgba(${HEATMAP_TRACK_RGB.join(",")},0.15), rgba(${HEATMAP_TRACK_RGB.join(",")},0.9))` }} />
+            ) : (
+              <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: "rgba(34,197,94,0.7)" }} />
+            )}
             <OMEditable id={`${eid}.legend.track`} value="항적 (일별 최대 5,000점 표본)" tag="span" />
           </span>
         )}
         <span className="flex items-center gap-1">
-          <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "rgba(255,23,69,0.9)" }} />
+          {heatmapMode ? (
+            <span className="inline-block w-4 h-2 rounded-sm"
+              style={{ background: `linear-gradient(to right, rgba(${HEATMAP_LOSS_RGB.join(",")},0.15), rgba(${HEATMAP_LOSS_RGB.join(",")},0.9))` }} />
+          ) : (
+            <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "rgba(255,23,69,0.9)" }} />
+          )}
           <OMEditable id={`${eid}.legend.loss`} value="소실표적" tag="span" />
         </span>
       </div>

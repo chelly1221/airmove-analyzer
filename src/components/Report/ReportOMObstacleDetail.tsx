@@ -5,7 +5,7 @@ import ReportPage from "./ReportPage";
 import ReportOMSectionHeader from "./ReportOMSectionHeader";
 import { LosCrossSection, projectPointsToLos } from "./ReportOMLosCrossSection";
 import { buildSiblings, classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
-import BuildingGroupBadge from "./BuildingGroupBadge";
+import { findGroup } from "./BuildingGroupBadge";
 import ReportOMObstacleAzElevChart from "./ReportOMObstacleAzElevChart";
 import ReportOMObstacleSummaryTable from "./ReportOMObstacleSummaryTable";
 import ReportOMRadarBuildingMap from "./ReportOMRadarBuildingMap";
@@ -70,13 +70,16 @@ function ReportOMObstacleDetail({
     [allLossThisRadar, building, panoWith, panoWithout, siblings, radarSite.latitude, radarSite.longitude],
   );
 
+  const groupName = findGroup(building.group_id, buildingGroups)?.name;
+
   return (
     <ReportPage>
       <ReportOMSectionHeader
         sectionNum={sectionNum}
         title="분석 대상 장애물 상세"
         titleSuffix={
-          <span>{"— "}<BuildingGroupBadge groupId={building.group_id} groups={buildingGroups} placement="before" />{building.name || `건물 ${building.id}`}</span>
+          /* 그룹 표기는 배지 대신 평문 "[그룹명]" — 제목 서체 그대로 상속 */
+          <span>{"— "}{groupName ? `[${groupName}] ` : ""}{building.name || `건물 ${building.id}`}</span>
         }
         radarName={radarSite.name}
         editId={`detail.${radarSite.name}_${building.id}.title`}

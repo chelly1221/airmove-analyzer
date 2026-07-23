@@ -3,7 +3,7 @@
  *
  * 판정 헤드라인 바(추가 기인 판정 + 추가 차단 구간 소실율/추세) + 3분할 가로 누적 막대
  * (추가 기인 | 지형·기존지물 | 장애물 무관, Σ = 후방 소실표적 총 이벤트) + 브래킷(LoS 차단 영역) + 레전드
- * + 하단 각주 3단 구성. 핵심 판정은 표 상단 헤드라인 바, 분류 퍼널은 막대·레전드로 시각화한다.
+ * 구성. 핵심 판정은 표 상단 헤드라인 바, 분류 퍼널은 막대·레전드로 시각화한다.
  * (§3 상세 재배치: 영향범위 도면 → 요약표 → LoS 단면도 → Az×Elev 차트 순.)
  * 차트(ReportOMObstacleAzElevChart)와 동일한 classifyObstacleLosses 결과를 사용 → 집계·편집키(azelev.*.tbl.*) 완전 동일.
  *   분류 계산은 ReportOMObstacleDetail 로 리프트되어(② 요약표·상단 메타 스트립 '대상 차단각' 공용) computed props 로 수신.
@@ -11,7 +11,7 @@
  * 집계 단위 — 스키마 계약:
  *   '…건' = 이벤트 건수(distinct event_id), 분류 세그먼트/레전드는 '분자/분모건'(분모 = 후방 소실표적 총 이벤트)으로
  *   표기해 이벤트/이벤트 비율임을 표기 자체로 드러냄(% 병기 없음 — '건/초' 오독 방지, % 는 헤드라인 소실율·막대 세그먼트 폭에만 허용),
- *   소실시간 = Σ share_s(같은 gap 보간점 합 = gap — 점×gap 과대 없음)로 추가 기인 레전드 행에만 병기, 점 개수(표시점)는 하단 각주에 병기(차트 점과 일치).
+ *   소실시간 = Σ share_s(같은 gap 보간점 합 = gap — 점×gap 과대 없음)로 추가 기인 레전드 행에만 병기.
  *   세그먼트 폭 = (ev/totalEv)*100%, Σ ev = totalEv 정확 보존. 3분할: 추가 기인(bldgEv) ⊆ LoS 차단(shadowEv),
  *   지형·기존지물 = shadowEv−bldgEv, 장애물 무관 = totalEv−shadowEv.
  *   ※ 구 4열 표(편집키 tbl.colItem/colVal/colDur/colNote)·구 '↳ 대상 차단각' 행(r5.*)은 누적 막대 전환으로 삭제 —
@@ -36,8 +36,7 @@ interface Props {
 export default function ReportOMObstacleSummaryTable({
   radarSite, building, computed, blockage,
 }: Props) {
-  // 요약 수치 — '…건'은 이벤트(distinct event_id). totalPts(표시점)는 각주 병기용.
-  const totalPts = computed.losses.length;
+  // 요약 수치 — '…건'은 이벤트(distinct event_id).
   const totalEv = computed.totalEventCount;
   const shadowEv = computed.shadowEventCount;
   const bldgEv = computed.buildingEventCount;
@@ -122,14 +121,12 @@ export default function ReportOMObstacleSummaryTable({
           </div>
         ) : (
           <>
-            {/* 헤더 — 좌: 후방 소실표적 총 이벤트, 우(muted): 방위 허용각 · 후방 영역 설명 */}
+            {/* 헤더 — 후방 소실표적 총 이벤트 */}
             <div className="om-cls-head">
               <span>
                 <OMEditable id={`${eid}.tbl.r1.label`} value="후방 소실표적" tag="span" />{" "}
                 <span className="mono strong">{totalEv}건</span>
               </span>
-              {/* 허용각은 건물별 max(±10°, 노출면 반각폭+1°) — classifyAzToleranceDeg(분류와 단일 소스) */}
-              <span className="muted">방위 ±{computed.azTolDeg.toFixed(1)}° · <OMEditable id={`${eid}.tbl.r1.note`} value="분석 대상 후방 영역" tag="span" /></span>
             </div>
 
             {/* 누적 막대 — ev>0 세그먼트만, 폭 = (ev/totalEv)*100%. 세그먼트 간 흰 간격(column-gap)만, 테두리 없음 */}
@@ -169,7 +166,7 @@ export default function ReportOMObstacleSummaryTable({
                   <OMEditable id={`${eid}.tbl.${s.key}.label`} value={s.label} tag="span" className={s.strong ? "strong" : ""} />
                   {/* 소실시간(Σ share_s)은 추가 기인 행에만, bldgEv>0일 때만 병기 */}
                   <span className="mono">{s.ev}/{totalEv}건{s.key === "r3" && bldgEv > 0 ? ` · ${bldgDuration.toFixed(1)}초` : ""}</span>
-                  <span className="muted" style={{ fontSize: "10.5px" }}><OMEditable id={`${eid}.tbl.${s.key}.note`} value={s.note} tag="span" /></span>
+                  <span className="muted" style={{ fontSize: "11.5px" }}><OMEditable id={`${eid}.tbl.${s.key}.note`} value={s.note} tag="span" /></span>
                 </div>
               ))}
             </div>
@@ -184,14 +181,6 @@ export default function ReportOMObstacleSummaryTable({
         )}
       </div>
 
-      {/* (C) 각주 — 표시점 수(차트 점과 일치)·소실시간 정의 + (정상 등급 한정) 방위 통과/추가 차단영역 소실 표본 상세(구 4행 비고 이관) */}
-      <div className="om-tbl-note">
-        ※ 표시점 {totalPts.toLocaleString()}점(Az×Elev 차트 표시점과 일치) · 소실시간 = Σ 이벤트 분담시간(share_s)
-        {blockage && blockage.exposurePointCount > 0
-          ? ` · 방위 통과 ${Math.round(blockage.exposurePointCount).toLocaleString()}pt 중 추가 차단영역 소실 ${Math.round(blockage.lossPointCount).toLocaleString()}pt · ${blockage.daysWithExposure}일`
-          : ""}
-        <br />※ 소실율 = 건물 방위(노출면 각폭) 전체 항적 시간 대비 추가 차단영역 내 소실시간 비율(기준월 동일 방식).
-      </div>
     </div>
   );
 }

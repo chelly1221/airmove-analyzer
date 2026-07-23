@@ -7,6 +7,7 @@ import { bearingDeg, haversineKm } from "../../utils/geo";
 import {
   calcBuildingAzExtent, isTargetBuildingOnPath, excludeTargetBuildings, computeLosBlockage,
 } from "../../utils/obstacleAnalysisHelpers";
+import { drawDensityHeatmap, HEATMAP_TRACK_RGB, HEATMAP_LOSS_RGB } from "./chartDensityHeatmap";
 
 // ── 물리 상수 ──
 const R_EARTH_M = 6_371_000;
@@ -327,6 +328,8 @@ export function LosCrossSection({
   const zoomKey = `loscs.${radarName}_${building.id}`;
   const { editable, zoom, setZoom } = useOMChartZoom(zoomKey);
   const [zoomMode, setZoomMode] = useState(false);
+  // 점 표시 ↔ 밀도 히트맵 토글 — 로컬 상태(영속화 안 함). editable 무관하게 항상 사용 가능.
+  const [heatmapMode, setHeatmapMode] = useState(false);
   // 라이브 줌(로컬) — 드래그/휠 중 전역 omData 갱신에 따른 전체 트리 리렌더 방지.
   //   상호작용이 끝나면(또는 휠 정지 200ms 후) persist(setZoom) 로 1회 커밋한다.
   const [liveZoom, setLiveZoom] = useState<ChartZoom>(zoom);
@@ -564,45 +567,63 @@ export function LosCrossSection({
     };
 
     // 소실표적 포인트 — 최하층 canvas(SVG 아래, z 맨 뒤). 항적점과 동일 크기(r=1.5) + 반투명 테두리.
+    //   히트맵 모드: 동일 투영 좌표로 비닝해 빨강 램프. 점 모드 경로는 기존 그대로.
     const lossCtx = setup(lossCanvas);
     if (lossCtx) {
-      const lr = LOSS_COLOR[0], lg = LOSS_COLOR[1], lb = LOSS_COLOR[2];
-      for (const lp of lossPoints) {
-        const adjAlt = lp.altM - curvDrop43(lp.distKm);
-        const px = xScaleV(lp.distKm);
-        const py = yScaleV(adjAlt);
-        lossCtx.beginPath();
-        lossCtx.arc(px, py, 1.5, 0, Math.PI * 2);
-        lossCtx.fillStyle = `rgba(${lr},${lg},${lb},0.9)`;
-        lossCtx.fill();
-        lossCtx.lineWidth = 0.5;
-        lossCtx.strokeStyle = `rgba(${lr},${lg},${lb},0.5)`;
-        lossCtx.stroke();
+      if (heatmapMode) {
+        const pts: { x: number; y: number }[] = [];
+        for (const lp of lossPoints) {
+          pts.push({ x: xScaleV(lp.distKm), y: yScaleV(lp.altM - curvDrop43(lp.distKm)) });
+        }
+        drawDensityHeatmap(lossCtx, pts, { x: PAD.left, y: PAD.top, w: cw, h: ch }, 4, HEATMAP_LOSS_RGB);
+      } else {
+        const lr = LOSS_COLOR[0], lg = LOSS_COLOR[1], lb = LOSS_COLOR[2];
+        for (const lp of lossPoints) {
+          const adjAlt = lp.altM - curvDrop43(lp.distKm);
+          const px = xScaleV(lp.distKm);
+          const py = yScaleV(adjAlt);
+          lossCtx.beginPath();
+          lossCtx.arc(px, py, 1.5, 0, Math.PI * 2);
+          lossCtx.fillStyle = `rgba(${lr},${lg},${lb},0.9)`;
+          lossCtx.fill();
+          lossCtx.lineWidth = 0.5;
+          lossCtx.strokeStyle = `rgba(${lr},${lg},${lb},0.5)`;
+          lossCtx.stroke();
+        }
       }
       lossCtx.restore();
     }
 
     // 항적 포인트 — SVG 위 canvas. <circle r=1.5 fillOpacity=0.7> + PSR 흰 테두리. SVG 와 동일 cx/cy.
+    //   히트맵 모드: 동일 투영 좌표로 비닝해 파랑 램프(밀도 단일 색 — detection type 색 미적용). 점 모드는 기존 그대로.
     const trackCtx = setup(pointCanvas);
     if (trackCtx) {
-      for (const tp of trackPoints) {
-        const adjAlt = tp.altM - curvDrop43(tp.distKm);
-        const px = xScaleV(tp.distKm);
-        const py = yScaleV(adjAlt);
-        const col = detectionTypeColor(tp.radarType);
-        trackCtx.beginPath();
-        trackCtx.arc(px, py, 1.5, 0, Math.PI * 2);
-        trackCtx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.7)`;
-        trackCtx.fill();
-        if (PSR_TYPES.has(tp.radarType)) {
-          trackCtx.lineWidth = 1;
-          trackCtx.strokeStyle = "rgba(255,255,255,0.6)";
-          trackCtx.stroke();
+      if (heatmapMode) {
+        const pts: { x: number; y: number }[] = [];
+        for (const tp of trackPoints) {
+          pts.push({ x: xScaleV(tp.distKm), y: yScaleV(tp.altM - curvDrop43(tp.distKm)) });
+        }
+        drawDensityHeatmap(trackCtx, pts, { x: PAD.left, y: PAD.top, w: cw, h: ch }, 4, HEATMAP_TRACK_RGB);
+      } else {
+        for (const tp of trackPoints) {
+          const adjAlt = tp.altM - curvDrop43(tp.distKm);
+          const px = xScaleV(tp.distKm);
+          const py = yScaleV(adjAlt);
+          const col = detectionTypeColor(tp.radarType);
+          trackCtx.beginPath();
+          trackCtx.arc(px, py, 1.5, 0, Math.PI * 2);
+          trackCtx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},0.7)`;
+          trackCtx.fill();
+          if (PSR_TYPES.has(tp.radarType)) {
+            trackCtx.lineWidth = 1;
+            trackCtx.strokeStyle = "rgba(255,255,255,0.6)";
+            trackCtx.stroke();
+          }
         }
       }
       trackCtx.restore();
     }
-  }, [chartData, visibleYRange, liveZoom, canvasPx, trackPoints, lossPoints]);
+  }, [chartData, visibleYRange, liveZoom, canvasPx, trackPoints, lossPoints, heatmapMode]);
 
   if (!chartData) return null;
 
@@ -716,30 +737,37 @@ export function LosCrossSection({
       </div>
 
       <div className="relative group">
-        {editable && (
-          <div className="absolute right-1 top-1 z-10 flex items-center gap-1 print:hidden">
-            {zoomMode ? (
-              <>
-                <span className="rounded bg-blue-500/90 px-1.5 py-0.5 text-[9px] font-medium text-white">
-                  휠 확대/축소 · 드래그 이동
-                </span>
-                <button type="button" onClick={resetZoom}
-                  className="rounded border border-gray-300 bg-white px-1.5 py-0.5 text-[9px] text-gray-600 hover:bg-gray-100">
-                  초기화
-                </button>
-                <button type="button" onClick={exitZoomMode}
-                  className="rounded border border-blue-400 bg-blue-50 px-1.5 py-0.5 text-[9px] font-medium text-blue-600 hover:bg-blue-100">
-                  완료
-                </button>
-              </>
-            ) : (
-              <button type="button" onClick={() => setZoomMode(true)}
-                className="rounded bg-black/40 px-1.5 py-0.5 text-[9px] text-white opacity-0 transition-opacity group-hover:opacity-100">
-                클릭하여 줌 편집
+        {/* 오버레이 컨테이너는 항상 렌더 — 히트맵 토글은 editable 무관 항상, 줌 버튼은 종전대로 editable 시만.
+            print:hidden 필수(PDF 인쇄에 버튼 미노출). */}
+        <div className="absolute right-1 top-1 z-10 flex items-center gap-1 print:hidden">
+          {/* 히트맵 토글 — 켜짐 시 hover 없이도 보이게(opacity-100) 상태 인지·해제 가능 */}
+          <button type="button" onClick={() => setHeatmapMode((v) => !v)}
+            className={`rounded px-1.5 py-0.5 text-[9px] text-white transition-opacity ${
+              heatmapMode ? "bg-blue-600/90 opacity-100" : "bg-black/40 opacity-0 group-hover:opacity-100"
+            }`}>
+            {heatmapMode ? "점 표시" : "히트맵"}
+          </button>
+          {editable && (zoomMode ? (
+            <>
+              <span className="rounded bg-blue-500/90 px-1.5 py-0.5 text-[9px] font-medium text-white">
+                휠 확대/축소 · 드래그 이동
+              </span>
+              <button type="button" onClick={resetZoom}
+                className="rounded border border-gray-300 bg-white px-1.5 py-0.5 text-[9px] text-gray-600 hover:bg-gray-100">
+                초기화
               </button>
-            )}
-          </div>
-        )}
+              <button type="button" onClick={exitZoomMode}
+                className="rounded border border-blue-400 bg-blue-50 px-1.5 py-0.5 text-[9px] font-medium text-blue-600 hover:bg-blue-100">
+                완료
+              </button>
+            </>
+          ) : (
+            <button type="button" onClick={() => setZoomMode(true)}
+              className="rounded bg-black/40 px-1.5 py-0.5 text-[9px] text-white opacity-0 transition-opacity group-hover:opacity-100">
+              클릭하여 줌 편집
+            </button>
+          ))}
+        </div>
       {/* 소실표적 canvas — SVG(지형/건물/LoS선)보다 아래(zIndex:0, z 맨 뒤). 지형 fill 이 반투명이라 비쳐 보인다.
           SVG 에 position:relative+zIndex:1 을 줘야 static 흐름 위로 올라가 이 canvas 를 덮는다. */}
       <canvas
@@ -785,7 +813,7 @@ export function LosCrossSection({
           const labelY = yScale(yDisp);
           return (
             <text key={`yl-${y}`} x={PAD.left - 5} y={labelY + 3} textAnchor="end"
-              fill="#6b7280" fontSize={9}>
+              fill="#6b7280" fontSize={11}>
               {Math.round(y * M_TO_FT).toLocaleString()}ft
             </text>
           );
@@ -793,7 +821,7 @@ export function LosCrossSection({
         {/* X축 라벨 */}
         {xTicks.map((x) => (
           <text key={`xl-${x.toFixed(3)}`} x={xScale(x)} y={H - PAD.bottom + 14} textAnchor="middle"
-            fill="#6b7280" fontSize={9}>
+            fill="#6b7280" fontSize={11}>
             {(x * KM_TO_NM).toFixed(x * KM_TO_NM >= 10 ? 0 : 1)}NM
           </text>
         ))}
@@ -887,7 +915,7 @@ export function LosCrossSection({
 
           {/* 레이더 위치 라벨 */}
           <text x={xScale(0) + 4} y={PAD.top + 12}
-            fill="#6b7280" fontSize={8}>
+            fill="#6b7280" fontSize={10}>
             {radarName} ({Math.round(radarHeight * M_TO_FT).toLocaleString()}ft)
           </text>
 
@@ -925,8 +953,20 @@ export function LosCrossSection({
           zIndex: 2,
         }}
       >
+        {/* 히트맵 모드 범례 스와치용 가로 그라데이션 (알파 0.15→0.9) — id 는 idSuffix 로 유니크화 */}
+        <defs>
+          <linearGradient id={`hm-track-${idSuffix}`} x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stopColor={`rgb(${HEATMAP_TRACK_RGB.join(",")})`} stopOpacity={0.15} />
+            <stop offset="1" stopColor={`rgb(${HEATMAP_TRACK_RGB.join(",")})`} stopOpacity={0.9} />
+          </linearGradient>
+          <linearGradient id={`hm-loss-${idSuffix}`} x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stopColor={`rgb(${HEATMAP_LOSS_RGB.join(",")})`} stopOpacity={0.15} />
+            <stop offset="1" stopColor={`rgb(${HEATMAP_LOSS_RGB.join(",")})`} stopOpacity={0.9} />
+          </linearGradient>
+        </defs>
         {/* 범례 (좌상단 — TrackMap 방식) */}
-        <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5})`}>
+        {/* 범례 전체 1.3배 확대 — viewBox 축소 렌더(×0.765)로 fontSize 8 이 실표시 ~6px 라 과소, 개별 좌표 유지한 채 통째 스케일 */}
+        <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5}) scale(1.3)`}>
           <rect x={-4} y={-6} width={200} height={legendH} rx={4}
             fill="rgba(255,255,255,0.9)" stroke="rgba(0,0,0,0.1)" strokeWidth={0.5} />
           <line x1={0} y1={0} x2={20} y2={0} stroke="#f59e0b" strokeWidth={1.8} />
@@ -998,7 +1038,11 @@ export function LosCrossSection({
             }
             items.push(
               <g key="leg-tp">
-                <circle cx={9} cy={legendY} r={1.5} fill="rgb(34,197,94)" fillOpacity={0.7} />
+                {heatmapMode ? (
+                  <rect x={1} y={legendY - 3} width={16} height={6} fill={`url(#hm-track-${idSuffix})`} />
+                ) : (
+                  <circle cx={9} cy={legendY} r={1.5} fill="rgb(34,197,94)" fillOpacity={0.7} />
+                )}
                 <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
                   {/* 차트 점 수 — '건'은 이벤트(distinct event_id) 전용 단위라 '점'으로 표기.
                       항적은 백엔드 일별 최대 5,000점 균등표본(track_points_geo) — 소실표적은 전수 */}
@@ -1009,8 +1053,12 @@ export function LosCrossSection({
             legendY += 14;
             items.push(
               <g key="leg-loss">
-                <circle cx={9} cy={legendY} r={2.5}
-                  fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.9} />
+                {heatmapMode ? (
+                  <rect x={1} y={legendY - 3} width={16} height={6} fill={`url(#hm-loss-${idSuffix})`} />
+                ) : (
+                  <circle cx={9} cy={legendY} r={2.5}
+                    fill={`rgb(${LOSS_COLOR[0]},${LOSS_COLOR[1]},${LOSS_COLOR[2]})`} fillOpacity={0.9} />
+                )}
                 <text x={24} y={legendY + 3} fill="#374151" fontSize={8}>
                   {/* 보간점 수(차트 점과 일치) — 이벤트 건수 아님. §3 요약표 'N건 · M점'의 M과 동단위 */}
                   소실표적 ({lossPoints.length.toLocaleString()}점)

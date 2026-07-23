@@ -37,7 +37,7 @@ const R_KM = 6371;
 export const BACK_W = 760;
 export const BACK_H = 416;
 /** 화면/PDF 표시 폭(px) — 백킹의 절반(고밀도). 높이는 종횡비 자동(≈ 197px). */
-const DISP_W = 360;
+const DISP_W = 372;
 
 /** CARTO voyager 래스터 타일 (앱 베이스맵과 동일 출처 — 온라인). 오프라인이면 폴백 격자. */
 const tileUrl = (z: number, x: number, y: number) =>
@@ -593,9 +593,9 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
 
   return (
     <div className="mt-2">
-      <div className="mb-1 flex items-center justify-between text-[12px]">
+      <div className="mb-1 flex items-center justify-between text-[13px]">
         <OMEditable id={`${eid}.title`} value="영향 범위 — 위에서 본 도면 (레이더 → 건물 양끝 부채꼴)" tag="span" className="font-semibold text-gray-800" />
-        <span className="text-[10px] text-gray-400">
+        <span className="text-[11px] text-gray-400">
           방위 {geom.startAz.toFixed(0)}°–{geom.endAz.toFixed(0)}° · 각폭 {geom.sweep.toFixed(1)}°
         </span>
       </div>
@@ -612,7 +612,7 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
         />
 
         {/* 범례 + 부채꼴 수치 */}
-        <div className="flex-1 text-[10px] text-gray-600">
+        <div className="flex-1 text-[11px] text-gray-600">
           <div className="mb-1.5 flex flex-col gap-1">
             <span className="flex items-center gap-1.5">
               <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: "#1d4ed8", boxShadow: "0 0 0 1px #fff" }} />
@@ -628,7 +628,7 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
             </span>
           </div>
 
-          <table className="om-table sm-table" style={{ marginTop: 4 }}>
+          <table className="om-table sm-table" style={{ marginTop: 4, fontSize: "12.5px" }}>
             <tbody>
               <tr>
                 <td><OMEditable id={`${eid}.tbl.az`} value="분석 대상 방위" tag="span" /></td>
@@ -644,7 +644,7 @@ export default function ReportOMRadarBuildingMap({ radarSite, building, building
               </tr>
             </tbody>
           </table>
-          <div className="mt-1 text-[9px] text-gray-400 leading-snug">
+          <div className="mt-1 text-[10px] text-gray-400 leading-snug">
             <OMEditable id={`${eid}.tbl.note`} value="부채꼴은 레이더에서 건물 양쪽 끝 방위로 뻗는 차폐 방위 구간 — 이 구간 후방의 표적이 차폐 영향을 받는다." tag="span" />
           </div>
         </div>
