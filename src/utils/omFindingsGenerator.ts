@@ -11,7 +11,6 @@ import type {
 import type { AddedBlockageResult } from "../types/obstacle";
 import {
   weightedLossAvg,
-  BLOCKAGE_DELTA_WATCH_PP, BLOCKAGE_DELTA_CAUTION_PP, BLOCKAGE_DELTA_ALERT_PP, BLOCKAGE_DELTA_SEVERE_PP,
   BLOCKAGE_NONE_LABEL,
 } from "./omStats";
 
@@ -51,15 +50,13 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
     let worst = "", worstName = "", worstRate = 0;
     let worstW: AddedBlockageResult | null = null; // 최악 등급 항목 — delta 표현 구성용
     let blockageCount = 0, noneCount = 0; // 사유 분리용 — 추가 차단 구간 미형성 전부 여부
-    let anyDelta = false; // 기준월 대비 편차(Δ%p) 판정 항목 존재 여부 — 임계 각주 분기용
     const norefRadars = new Set<string>(); // 기준데이터 미적용(noref) 레이더 — 각주 안내용
     for (const rr of radarResults) {
       for (const b of selectedBuildings) {
         const w = addedBlockageByKey[`${rr.radar_name}_${b.id}`];
         if (!w) continue;
         blockageCount++;
-        if (w.gradingMode === "delta") anyDelta = true;
-        else norefRadars.add(rr.radar_name); // delta 아님 → 기준 미적용(레거시 "absolute" 포함)
+        if (w.gradingMode !== "delta") norefRadars.add(rr.radar_name); // delta 아님 → 기준 미적용(레거시 "absolute" 포함)
         if (w.grade.label === BLOCKAGE_NONE_LABEL) noneCount++;
         if (!(w.grade.label in order)) continue;
         // 동률 등급은 lossRatePct 최대치로 갱신(타이브레이크) — '최고 …%' 문구가 추가 차단 구간 표의
@@ -93,9 +90,6 @@ export function generateOMFindingsText(params: GenerateOMFindingsParams): string
       lines.push(`분석 대상 장애물이 지형·기존지물 위로 새로 가리는 구간을 형성하지 않아(추가 차단 구간 없음), 장애물에 의한 추가 탐지 영향은 없는 것으로 판단된다.`);
     } else {
       lines.push(`분석 대상 장애물의 추가 차단영역을 지나는 유효 항적이 거의 없거나 추가 차단 구간 자체가 형성되지 않아, 장애물 인과 영향은 확인되지 않았다.`);
-    }
-    if (anyDelta) {
-      lines.push(`※ 추가 차단영역 등급 임계(기준월 대비 편차 Δ%p) — 관심 +${BLOCKAGE_DELTA_WATCH_PP}%p / 주의 +${BLOCKAGE_DELTA_CAUTION_PP}%p / 경계 +${BLOCKAGE_DELTA_ALERT_PP}%p / 심각 +${BLOCKAGE_DELTA_SEVERE_PP}%p 이상.`);
     }
     if (norefRadars.size > 0) {
       lines.push(`※ 기준데이터 미등록(${[...norefRadars].join(", ")}): 등급 판정 제외 — 기준데이터 등록 후 Δ 판정 가능.`);

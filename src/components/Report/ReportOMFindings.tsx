@@ -42,7 +42,10 @@ const GRADE_BADGE: Record<string, { color: string; bg: string }> = {
 };
 const GRADE_BADGE_FALLBACK = { color: "#6b7280", bg: "#f3f4f6" };
 
-/** delta 판정된 '실제 등급' 라벨 — 이 라벨의 delta 행만 기준 소실율·Δ 컬럼에 값을 표시한다. */
+/**
+ * delta 판정된 '실제 등급' 라벨. 기준 소실율·Δ 컬럼 값 표시는 실제 등급 + 미형성(BLOCKAGE_NONE_LABEL,
+ * 밴드 소실 0 → 0.00%/Δ+0.00%p 정합 표기) — "항적 없음"만 "—" 유지.
+ */
 const REAL_GRADES = new Set(["양호", "관심", "주의", "경계", "심각"]);
 
 /** 페이지 분할용 청크당 최대 행수 — 초과 시 건물 경계에서 다음 bldg-strip 블록으로 넘긴다. */
@@ -52,7 +55,7 @@ const CHUNK_ROWS = 18;
 interface BRow {
   radarName: string;
   w: AddedBlockageResult;
-  /** delta 실제 등급 행 — 기준 소실율·Δ 컬럼 값 표시 대상 */
+  /** delta 값 표시 행(실제 등급 + 미형성) — 기준 소실율·Δ 컬럼 값 표시 대상 */
   isDelta: boolean;
   /** 추가 차단 구간 미형성 (BLOCKAGE_NONE_LABEL) */
   isNone: boolean;
@@ -102,8 +105,9 @@ function ReportOMFindings({
       for (const rs of radarSites) {
         const w = addedBlockageByKey[`${rs.name}_${b.id}`];
         if (!w) continue;
-        const isDelta = w.gradingMode === "delta" && REAL_GRADES.has(w.grade.label)
-          && w.refLossRatePct !== undefined && w.deltaPp !== undefined;
+        const isDelta = w.gradingMode === "delta"
+          && w.refLossRatePct !== undefined && w.deltaPp !== undefined
+          && (REAL_GRADES.has(w.grade.label) || w.grade.label === BLOCKAGE_NONE_LABEL);
         rows.push({
           radarName: rs.name,
           w,
@@ -213,24 +217,16 @@ function ReportOMFindings({
         </tbody>
       </table>
       {/* 각주는 마지막 청크에만 */}
-      {ci === chunks.length - 1 && (
+      {ci === chunks.length - 1 && hasDelta && (
         <div className="om-blockage-notes">
           <p>
-            추가 차단 구간 소실율 = 건물 방위(노출면 각폭) 전체 항적 시간 대비, 분석 대상 장애물이 새로 가리는 양각 밴드(지형·기존지물 차단각~대상 차단각) 안에서 소실된 시간의 비율.
+            판정 기준 — {refMonthText} 대비 Δ%p:
+            {legendItems.map((it, i) => (
+              <span key={i} className="om-legend-item">
+                <span className="om-legend-chip" style={{ background: it.color }} />{it.text}
+              </span>
+            ))}
           </p>
-          <p>
-            판정 순서 — 추가 차단 구간 미형성 시 0.00%(추가 차단 없음) · 통과 항적 없으면 "항적 없음" · 기준데이터 미적용 행은 등급 없이 "기준데이터 없음".
-          </p>
-          {hasDelta && (
-            <p>
-              판정 기준 — {refMonthText} 대비 Δ%p:
-              {legendItems.map((it, i) => (
-                <span key={i} className="om-legend-item">
-                  <span className="om-legend-chip" style={{ background: it.color }} />{it.text}
-                </span>
-              ))}
-            </p>
-          )}
         </div>
       )}
     </div>
