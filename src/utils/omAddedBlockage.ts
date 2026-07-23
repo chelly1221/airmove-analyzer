@@ -15,11 +15,11 @@
  * 방위 중첩 인접 분석 대상의 한계기여가 양쪽 건물에 중복 귀속되던 v1 한계 해소(차트 핑크영역과 계속 일치).
  */
 import type { PanoramaMergeResult } from "../types";
-import type { AzSector, AzElevCell, AddedBlockageResult, AddedBlockageDay, RefFallbackReason } from "../types/obstacle";
+import type { AzSector, AzElevCell, AddedBlockageResult, AddedBlockageDay } from "../types/obstacle";
 import { makePanoramaSampler } from "./obstacleAnalysisHelpers";
 import {
-  gradeAddedBlockage, gradeAddedBlockageDelta, weightedTrendSlope,
-  BLOCKAGE_MIN_EXPOSURE_POINTS,
+  gradeAddedBlockageDelta, weightedTrendSlope,
+  BLOCKAGE_NONE_LABEL, BLOCKAGE_NO_REF_LABEL,
 } from "./omStats";
 
 // Rust HIST_* 상수와 반드시 일치 (obstacle_monthly.rs)
@@ -90,15 +90,12 @@ function accumulateBand(
  * 건물별 추가 차단영역 소실율 산출.
  * @param histogramsByDay  레이더의 일별 az×elev 히스토그램 (모든 관측일 포함, 빈 날은 cells=[])
  * @param panoWith         지형+기존지물+'해당' 분석대상 파노라마 — 호출부가 panoWithForBuilding 으로 건물별로
- *                         좁혀 전달. 없으면 밴드 판정 불가 → 노출 기반 등급 폴백.
+ *                         좁혀 전달. 없으면 밴드 기하 판정을 생략하고 노출>0 여부로 폴백.
  * @param panoWithout      분석대상 제외 파노라마 (없으면 panoWith.terrain 으로 폴백 → without==terrain)
  * @param buildingExtent   대상 건물의 방위 노출 구간 (calcBuildingAzExtent)
- * @param reference        기준데이터(참조 달) — 있으면 동일 샘플러·밴드·frac 가중으로 기준 소실율을
- *                         산출해 편차(Δ%p) 판정. 없거나 기준 표본 부족이면 절대 임계 폴백.
- * @param refFallback      호출부(ReportApp)가 수집한 '기준데이터 미적용' 사유 — reference 가 없을 때
- *                         결과 refFallback 로 그대로 전달(none/mismatch/load_failed). reference 가
- *                         주어진 경로(있으나 표본 부족·히스토그램 없음)는 내부에서 "ref_insufficient" 로
- *                         산출하므로 이 인자는 무시된다. delta 모드로 확정되면 결과 refFallback 는 undefined.
+ * @param reference        기준데이터(참조 달) — 있으면(히스토그램 존재) 동일 샘플러·밴드·frac 가중으로
+ *                         기준 소실율을 산출해 편차(Δ%p) 판정(delta). 없으면(미등록·로드 실패·정합성
+ *                         불일치는 호출부가 null 로 전달) 또는 히스토그램이 비면 기준 미적용(noref).
  */
 export function computeAddedBlockage(
   histogramsByDay: BlockageDayHist[],
@@ -106,7 +103,6 @@ export function computeAddedBlockage(
   panoWithout: PanoramaMergeResult | undefined,
   buildingExtent: AzSector,
   reference?: BlockageReference | null,
-  refFallback?: RefFallbackReason,
 ): AddedBlockageResult {
   // 컷오프 샘플러 — classifyObstacleLosses(차트 빨강영역)와 정확히 동일한 폴백 규칙.
   //   panoWith 없으면 차단각 0(추가 차단영역 없음 → 노출 0).
@@ -122,8 +118,8 @@ export function computeAddedBlockage(
   //   · 빈 중심 azC = az_bin·0.1 + 0.05 (Rust az_bin=floor(az/0.1) 와 정렬) + azInSector 필터 = 노출 루프와 동일
   //   · 조건 angleWith − angleWithout > BAND_EPS (노출 overlap>0 의 필요조건) — 폭 하한 없음
   //   · panoWithout 없음(sWo=sW, 제외대상 0) → without==with → 차이 0 → 미형성.
-  //   · panoWith 없음(sW=null) → 밴드 기하 판정 불가 → 폴백 true (기존 노출 기반 로직 유지).
-  let geometricBand = !sW; // panoWith 없으면 판정 불가 → true 폴백
+  //   · panoWith 없음(sW=null) → 밴드 기하 판정 생략 → 폴백 true (노출>0 로 재판정).
+  let geometricBand = !sW; // panoWith 없으면 밴드 기하 미상 → true 폴백
   if (sW) {
     const startBin = Math.floor(buildingExtent.start_deg / HIST_AZ_BIN_DEG);
     const extentWidth = (((buildingExtent.end_deg - buildingExtent.start_deg) % 360) + 360) % 360;
@@ -168,40 +164,35 @@ export function computeAddedBlockage(
   const hasBlockageBand = geometricBand || totalExposure > 0;
 
   // ── 기준데이터 대비 편차(Δ%p) 판정 ──
-  // 기준데이터가 있고(정합성 게이트는 호출부에서 통과) 기준 표본이 충분하면(refExposureCount > 10,000pt)
-  // 동일 샘플러·동일 밴드·동일 frac 가중으로 기준월 소실율을 산출해 편차 임계로 판정한다(delta 모드).
-  // 그 외(기준 없음/기준 표본 부족)는 절대 임계 폴백(absolute 모드). 현재 노출 게이트는 등급 함수 내부가 처리.
-  let gradingMode: "delta" | "absolute" = "absolute";
+  // 기준데이터가 있고(정합성 게이트는 호출부에서 통과) 기준 히스토그램이 있으면 동일 샘플러·동일 밴드·
+  // 동일 frac 가중으로 기준월 소실율을 산출해 편차 임계로 판정한다(delta 모드). 표본 게이트는 폐지 —
+  // 기준 노출 0이면 refRate=0 을 그대로 쓴다. 기준이 없거나 히스토그램이 비면 기준 미적용(noref).
+  let gradingMode: "delta" | "noref" = "noref";
   let refLossRatePct: number | undefined;
   let deltaPp: number | undefined;
   let refExposureCount: number | undefined;
   let refMonthLabel: string | undefined;
-  // absolute 로 확정되는 각 경로에서 '기준데이터 미적용' 사유를 산출 — delta 모드면 undefined.
-  let refFallbackOut: RefFallbackReason | undefined;
   let g: { label: string; color: string };
 
   if (reference && reference.histogram.length > 0) {
+    // 기준 히스토그램이 있으면 무조건 delta — 기준 노출 0이면 refRate=0 을 그대로 사용(표본 게이트 폐지).
     const ref = accumulateBand(reference.histogram, angleWithAt, angleWithoutAt, buildingExtent);
     const refRate = ref.exposure > 0 ? (ref.loss / ref.exposure) * 100 : 0;
-    if (ref.exposureCount > BLOCKAGE_MIN_EXPOSURE_POINTS) {
-      gradingMode = "delta";
-      refLossRatePct = refRate;
-      refExposureCount = ref.exposureCount;
-      refMonthLabel = reference.monthLabel;
-      deltaPp = lossRatePct - refRate;
-      g = gradeAddedBlockageDelta(deltaPp, totalExposureCount, hasBlockageBand);
-      // delta 모드 — 기준데이터 적용됨 → refFallbackOut undefined 유지
-    } else {
-      // 기준 표본 부족 → 절대 임계 폴백 (분모 대표성 없어 편차 신뢰 불가)
-      refFallbackOut = "ref_insufficient";
-      g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
-    }
+    gradingMode = "delta";
+    refLossRatePct = refRate;
+    refExposureCount = ref.exposureCount;
+    refMonthLabel = reference.monthLabel;
+    deltaPp = lossRatePct - refRate;
+    g = gradeAddedBlockageDelta(deltaPp, totalExposureCount, hasBlockageBand);
   } else {
-    // 기준데이터 없음(또는 기준 히스토그램 비었음) → 절대 임계 폴백. 표본 게이트는 통과 항적
-    //   포인트 수(totalExposureCount) 단일 기준. 사유는: reference 객체는 있으나 히스토그램이 비었으면
-    //   '기준 표본 부족', reference 자체가 없으면 호출부 수집 사유(없음/불일치/로드실패) ?? "none".
-    refFallbackOut = reference ? "ref_insufficient" : (refFallback ?? "none");
-    g = gradeAddedBlockage(lossRatePct, totalExposureCount, hasBlockageBand);
+    // 기준데이터 없음(미등록·로드 실패·정합성 불일치는 호출부가 reference=null 로 전달) 또는 기준
+    //   히스토그램이 비었음 → 기준 미적용(noref). 우선순위 게이트만 적용: 미형성 → "추가 차단 구간 없음",
+    //   노출 0 → "항적 없음", 그 외 → 회색 "기준데이터 없음"(Δ 판정 근거 부재). 전부 회색(#6b7280).
+    gradingMode = "noref";
+    const norefLabel = !hasBlockageBand ? BLOCKAGE_NONE_LABEL
+      : totalExposureCount <= 0 ? "항적 없음"
+      : BLOCKAGE_NO_REF_LABEL;
+    g = { label: norefLabel, color: "#6b7280" };
   }
 
   return {
@@ -220,6 +211,5 @@ export function computeAddedBlockage(
     deltaPp,
     refExposureCount,
     refMonthLabel,
-    refFallback: refFallbackOut,
   };
 }

@@ -574,7 +574,7 @@ export default function ObstacleMonthlyConfigModal({
               <div className="space-y-1.5 rounded-xl border border-gray-200 p-3">
                 {customRadarSites.map((r) => {
                   const checked = checkedRadars.has(r.name);
-                  // 판정 모드 예고 — 기준데이터 유무·정합성으로 Δ 판정/절대 임계 예고.
+                  // 판정 모드 예고 — 기준데이터 유무·정합성으로 Δ 판정/기준 미적용 예고.
                   const refMeta = omReferences.find((m) => m.radar_name === r.name);
                   const coh = refMeta ? checkRefCoherence(refMeta, r) : null;
                   let statusText: string;
@@ -583,10 +583,10 @@ export default function ObstacleMonthlyConfigModal({
                     statusText = `기준데이터 ${refMeta.month_label} · Δ 판정 적용`;
                     statusTone = checked ? "text-white/70" : "text-gray-400";
                   } else if (refMeta && coh) {
-                    statusText = `기준데이터 ${refMeta.month_label} · 정합성 불일치(${coh.reasonText}) — 절대 임계`;
+                    statusText = `기준데이터 ${refMeta.month_label} · 정합성 불일치(${coh.reasonText}) — 기준 미적용(기준데이터 없음 표기)`;
                     statusTone = checked ? "text-amber-200" : "text-amber-600";
                   } else {
-                    statusText = "기준데이터 없음 — 절대 임계";
+                    statusText = "기준데이터 없음 — 등급 미판정";
                     statusTone = checked ? "text-white/70" : "text-gray-400";
                   }
                   return (

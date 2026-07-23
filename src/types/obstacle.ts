@@ -87,15 +87,6 @@ export interface AddedBlockageDay {
 }
 
 /**
- * 기준데이터 미적용(absolute 폴백) 사유 — 보고서 표기·각주 분기용.
- * - none: 저장된 기준데이터 없음
- * - mismatch: 레이더 좌표·안테나고 정합성 불일치 (utils/omReference.checkRefCoherence)
- * - load_failed: 기준데이터 파일 로드 실패
- * - ref_insufficient: 기준 표본 부족 (해당 쐐기 기준 노출 ≤ 게이트) 또는 기준 히스토그램 없음
- */
-export type RefFallbackReason = "none" | "mismatch" | "load_failed" | "ref_insufficient";
-
-/**
  * 건물별 추가 차단영역 소실율 결과 (헤드라인 심각도 지표).
  * 노출 조건부 소실율 = Σ(추가 차단영역 내 소실시간) / Σ(추가 차단영역 내 노출시간) × 100%.
  */
@@ -118,13 +109,14 @@ export interface AddedBlockageResult {
   daysWithExposure: number;
   /** 일별 시계열 */
   series: AddedBlockageDay[];
-  /** 등급 (gradeAddedBlockage / gradeAddedBlockageDelta) */
+  /** 등급 (gradeAddedBlockageDelta, 또는 회색 게이트 라벨) */
   grade: { label: string; color: string };
   /**
-   * 판정 방식 — 'delta': 기준데이터(참조 달) 대비 편차(Δ%p) 기준, 'absolute': 절대 임계 기준.
-   * 정합성 통과한 기준데이터가 로드되고 기준 표본이 충분할 때만 'delta'. 그 외는 'absolute' 폴백.
+   * 판정 방식 — 'delta': 기준데이터(참조 달) 대비 편차(Δ%p) 기준, 'noref': 기준데이터 미적용(회색 "기준데이터 없음").
+   * 정합성 통과한 기준데이터가 로드되고 기준 히스토그램이 있을 때만 'delta'. 그 외는 'noref'.
+   * ※ 레거시 직렬화 스냅샷에 'absolute' 가 남아 있을 수 있어, 소비처는 !== "delta" 를 전부 기준 미적용으로 취급한다.
    */
-  gradingMode: "delta" | "absolute";
+  gradingMode: "delta" | "noref";
   /** (delta 모드) 기준월 추가 차단영역 소실율 (%) */
   refLossRatePct?: number;
   /** (delta 모드) 편차 = 분석월 소실율 − 기준월 소실율 (%p). 음수면 기준보다 개선. */
@@ -133,8 +125,6 @@ export interface AddedBlockageResult {
   refExposureCount?: number;
   /** (delta 모드) 기준월 라벨 ("YYYY-MM") */
   refMonthLabel?: string;
-  /** (absolute 폴백 시) 기준데이터 미적용 사유 — delta 모드면 undefined */
-  refFallback?: RefFallbackReason;
 }
 
 // ─── OM 기준데이터 (참조 달 1달치, 헤드라인 Δ 판정용) ───

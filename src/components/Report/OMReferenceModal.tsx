@@ -368,7 +368,7 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
                             <>
                               <span className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[9px] text-gray-500">기준월 {existing.month_label}</span>
                               {coh && !coh.ok ? (
-                                <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-600" title="빌드 시점과 현재 레이더 좌표·안테나고가 달라 편차 판정이 절대 임계로 폴백됩니다.">
+                                <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-600" title="빌드 시점과 현재 레이더 좌표·안테나고가 달라 기준 미적용 — 보고서에 등급 없이 '기준데이터 없음'으로 표기됩니다.">
                                   미적용 · {coh.reasonText}
                                 </span>
                               ) : (

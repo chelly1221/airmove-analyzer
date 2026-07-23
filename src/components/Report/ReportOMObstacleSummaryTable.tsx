@@ -20,8 +20,7 @@
 import type { ManualBuilding, RadarSite } from "../../types";
 import type { AddedBlockageResult } from "../../types/obstacle";
 import { classifyObstacleLosses } from "../../utils/obstacleAnalysisHelpers";
-import { BLOCKAGE_NONE_LABEL } from "../../utils/omStats";
-import { REF_FALLBACK_LABELS } from "../../utils/omReference";
+import { BLOCKAGE_NONE_LABEL, BLOCKAGE_NO_REF_LABEL } from "../../utils/omStats";
 import OMEditable from "./OMEditable";
 
 interface Props {
@@ -69,13 +68,6 @@ export default function ReportOMObstacleSummaryTable({
     : bldgRatio > 5 ? { label: "부분 영향", color: "#d97706" }
     : { label: "영향 미미", color: "#16a34a" };
 
-  // 정상 등급 = 추가 차단영역이 형성된 실제 소실율 등급('항적 없음'·'판정 불가'·미형성 제외).
-  //   헤드라인 우측 추세 표기·각주 표본 상세는 정상 등급에서만 노출.
-  const isNormalGrade = !!blockage
-    && blockage.grade.label !== "항적 없음"
-    && blockage.grade.label !== "판정 불가"
-    && blockage.grade.label !== BLOCKAGE_NONE_LABEL;
-
   return (
     <div className="mt-2">
       {/* (A) 판정 헤드라인 바 — 좌: 추가 기인 판정 배지, 우: 추가 차단 구간 소실율·추세(구 4행 값 이관) */}
@@ -89,8 +81,6 @@ export default function ReportOMObstacleSummaryTable({
             {/* 추가 차단 구간 소실율(비율 지표)만 % 허용 — 분류 행 이벤트 열엔 % 금지 */}
             {blockage.grade.label === "항적 없음" ? (
               <OMEditable id={`${eid}.tbl.blockage.note0`} value="통과 항적 거의 없음 → 영향 없음" tag="span" />
-            ) : blockage.grade.label === "판정 불가" ? (
-              <>통과 {Math.round(blockage.exposurePointCount).toLocaleString()}pt · 표본 부족</>
             ) : blockage.grade.label === BLOCKAGE_NONE_LABEL ? (
               <>
                 <span className="mono">{blockage.lossRatePct.toFixed(2)}%</span> ·{" "}
@@ -109,14 +99,14 @@ export default function ReportOMObstacleSummaryTable({
                 ) : ""}
               </>
             ) : (
-              /* absolute 폴백 — 기존 표시 유지 + 기준데이터 미적용 소자 */
+              /* noref — 기준 미적용: 실측 소실율 + 추세 + '기준데이터 없음' */
               <>
                 <OMEditable id={`${eid}.tbl.blockage.label`} value="추가 차단 구간 소실율" tag="span" />{" "}
                 <span className="mono">{blockage.lossRatePct.toFixed(2)}%</span> · 추세 {blockage.trendDir}
                 {blockage.trendDir !== "안정" ? (
                   <span className="mono">{` (일당 ${blockage.trendSlopePctPerDay > 0 ? "+" : ""}${blockage.trendSlopePctPerDay.toFixed(3)}%p)`}</span>
                 ) : ""}
-                <span className="muted">{` · 기준데이터 미적용(${REF_FALLBACK_LABELS[blockage.refFallback ?? "none"]})`}</span>
+                <span className="muted">{` · ${BLOCKAGE_NO_REF_LABEL}`}</span>
               </>
             )}
           </span>
@@ -197,7 +187,7 @@ export default function ReportOMObstacleSummaryTable({
       {/* (C) 각주 — 표시점 수(차트 점과 일치)·소실시간 정의 + (정상 등급 한정) 통과/소실 표본 상세(구 4행 비고 이관) */}
       <div className="om-tbl-note">
         ※ 표시점 {totalPts.toLocaleString()}점(Az×Elev 차트 표시점과 일치) · 소실시간 = Σ 이벤트 분담시간(share_s)
-        {isNormalGrade && blockage
+        {blockage && blockage.exposurePointCount > 0
           ? ` · 통과 ${Math.round(blockage.exposurePointCount).toLocaleString()}pt 중 소실 ${Math.round(blockage.lossPointCount).toLocaleString()}pt · ${blockage.daysWithExposure}일`
           : ""}
       </div>

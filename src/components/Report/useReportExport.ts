@@ -34,7 +34,7 @@ async function exportViaNative(
   //   [data-om-mounting]  §3 상세(빌딩×레이더) 페이지 점진 마운트(ReportPreviewContent detailPairs)
   //                       진행 중 — 미마운트 페이지가 PDF 에서 빠짐 (쌍당 ~120ms, 수 초 내 완료)
   //   [data-om-computing] 추가 차단영역 산출(ReportApp addedBlockage 비동기 루프) 진행 중 —
-  //                       §1 추가소실율·§3 심각도·소견 프로즈가 '판정 불가'로 인쇄됨 (수 초~수십 초)
+  //                       §1 추가소실율·§3 심각도·소견 프로즈가 잠정(이벤트 비율 폴백)/공란으로 인쇄됨 (수 초~수십 초)
   //   30초는 초대형 구성 안전 여유. 타임아웃 시엔 현재 상태로 진행.
   const READY_SENTINELS = "[data-om-mounting],[data-om-computing]";
   const mountDeadline = Date.now() + 30_000;

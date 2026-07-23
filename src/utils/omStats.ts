@@ -22,12 +22,6 @@
  *   σ_w = √( Σ(w_i · (x_i - x̄_w)²) / Σ(w_i) )
  *   - 관측량 기반 빈도성(frequency) 가중치 + 대표본(관측일수)이라 Bessel 보정(N-1) 영향이
  *     무시 가능 → 기술통계용 모표준편차(분모 Σw) 채택. (reliability weight 의 불편분산 보정과는 구분)
- *
- * ── 판정 불가 기준 ──
- * 관측일수 < 7일이면 "판정 불가":
- *   - 주간 주기(요일별 트래픽 패턴)를 최소 1회전 포함해야
- *     평일/주말 편향 없는 대표 통계가 산출된다.
- *   - 표본 크기가 충분해야 σ가 의미 있는 산포를 반영한다.
  */
 import type { DailyStats } from "../types";
 
@@ -103,26 +97,6 @@ export function weightedBaselineLossStdDev(stats: DailyStats[]): number {
 }
 
 /**
- * 판정 등급 (관측일수 < 7이면 판정 불가)
- *
- * 임계값 근거:
- *   - 양호 (< 0.5%): 자연 환경(기상, 지형)에 의한 배경 소실율 수준
- *   - 주의 (0.5–2.0%): 장애물 영향 가능성, 모니터링 필요
- *   - 경고 (≥ 2.0%): 운용 영향 우려, 대책 검토 필요
- */
-export function gradeWithConfidence(
-  avgLoss: number,
-  dayCount: number,
-): { label: string; color: string; bg: string; border: string } {
-  if (dayCount < 7) {
-    return { label: "판정 불가", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
-  }
-  if (avgLoss < 0.5) return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
-  if (avgLoss < 2.0) return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
-  return { label: "경고", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
-}
-
-/**
  * 가중 최소자승 회귀 기울기 (일별 추세 등).
  * x̄_w·ȳ_w 가중평균 후 slope = Σw(x−x̄)(y−ȳ) / Σw(x−x̄)².
  * omFindingsGenerator(레이더 일별 추세)·omAddedBlockage(추가 차단영역 시계열)이 공유.
@@ -144,67 +118,26 @@ export function weightedTrendSlope(
   return den > 0 ? num / den : 0;
 }
 
-// ─── 추가 차단영역 소실율 등급 ───
-//
-// 헤드라인 심각도 = 분석 대상 건물의 추가 차단영역 내 노출 조건부 소실율.
-// gradeWithConfidence(전구간 소실율)와 달리, 얇은 추가 차단영역 내부의 조건부 비율이라
-// 스케일이 다르다(전구간 0.5/2.0 재사용 금지).
-//
-// 등급 4단계는 국가 위기경보(관심-주의-경계-심각) 체계를 차용하고, 임계 미만은 "양호"로 둔다.
-// (관심 파랑 · 주의 노랑 · 경계 주황 · 심각 빨강 — 위기경보 색상 관례)
-export const BLOCKAGE_MIN_EXPOSURE_POINTS = 10000; // 통과 항적(노출 스캔 포인트) ≤ 10,000 → 표본 부족 판정 불가
-export const BLOCKAGE_WATCH_PCT = 10.0;   // 양호/관심 경계 (%)
-export const BLOCKAGE_CAUTION_PCT = 20.0; // 관심/주의 경계 (%)
-export const BLOCKAGE_ALERT_PCT = 30.0;   // 주의/경계 경계 (%)
-export const BLOCKAGE_SEVERE_PCT = 40.0;  // 경계/심각 경계 (%)
-
 /** 추가 차단영역 자체가 형성되지 않은 경우(지형·기존지물 이하)의 등급 라벨 — 비율 개념이 성립하지 않음. */
 export const BLOCKAGE_NONE_LABEL = "추가 차단 구간 없음";
 
-/**
- * 추가 차단영역 소실율 등급 — 밴드 존재 게이트 + 표본 게이트(통과 항적 유무·표본량) 후 임계 판정.
- *
- * 판정 순서:
- *   0) 추가 차단 밴드 미형성(분석 대상이 지형·기존지물 위로 올라오지 않음) → "추가 차단 구간 없음"
- *      — 밴드 기하는 표본량과 무관하므로 다른 게이트보다 먼저 판정한다(panoWith 없어 판정 불가면 hasBlockageBand=true 로 폴백).
- *   1) 통과 항적 전무(노출 0pt) → "항적 없음"
- *   2) 통과 항적 ≤ 10,000pt → "판정 불가" (표본 부족)
- * 관측일수·노출 발생일 게이트는 폐지 — 표본 충분성은 통과 항적 포인트 수 단일 기준으로 판정한다.
- * 임계 통과 시 소실율(%)로 관심/주의/경계/심각(임계 미만은 양호)을 부여한다.
- */
-export function gradeAddedBlockage(
-  lossRatePct: number,
-  exposurePointCount: number,
-  hasBlockageBand: boolean = true,
-): { label: string; color: string; bg: string; border: string } {
-  if (!hasBlockageBand) {
-    // 분석 대상 장애물이 지형·기존지물 차단각 위로 추가 차단영역을 형성하지 않음 → 소실율(노출 조건부 비율) 정의 불가.
-    return { label: BLOCKAGE_NONE_LABEL, color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
-  }
-  if (exposurePointCount <= 0) {
-    // 차단영역을 통과한 항적이 전무 → 비율 산출 불가(정직 표기).
-    return { label: "항적 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
-  }
-  if (exposurePointCount <= BLOCKAGE_MIN_EXPOSURE_POINTS) {
-    // 통과 항적 표본 부족(≤ 10,000pt) → 대표성 부족으로 판정 불가.
-    return { label: "판정 불가", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
-  }
-  if (lossRatePct < BLOCKAGE_WATCH_PCT)   return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
-  if (lossRatePct < BLOCKAGE_CAUTION_PCT) return { label: "관심", color: "#1d4ed8", bg: "#dbeafe", border: "border-blue-200" };
-  if (lossRatePct < BLOCKAGE_ALERT_PCT)   return { label: "주의", color: "#b45309", bg: "#fef3c7", border: "border-yellow-200" };
-  if (lossRatePct < BLOCKAGE_SEVERE_PCT)  return { label: "경계", color: "#c2410c", bg: "#ffedd5", border: "border-orange-200" };
-  return { label: "심각", color: "#b91c1c", bg: "#fee2e2", border: "border-red-200" };
-}
+/** 기준데이터(참조 달) 미적용 시의 등급 라벨 — 등급 판정 근거(기준월 소실율) 부재로 Δ 등급 산출 불가(회색). */
+export const BLOCKAGE_NO_REF_LABEL = "기준데이터 없음";
 
 // ─── 추가 차단영역 소실율 — 기준데이터 대비 편차(Δ%p) 등급 ───
 //
-// 절대 임계(gradeAddedBlockage)는 소실율 스케일 자체가 사이트·지형·트래픽에 좌우돼 임계 보정이 어렵다.
-// 임의 참조 달(기준데이터) 1달치 대비 편차(Δ%p = 분석월 소실율 − 기준월 소실율)로 판정하면 사이트 고유
-// 배경 소실이 상쇄되어 '장애물 준공 등 변화에 의한 순증분'만 남는다.
+// 소실율 절대값은 사이트·지형·트래픽에 좌우돼 고정 임계 보정이 어렵다. 임의 참조 달(기준데이터)
+// 1달치 대비 편차(Δ%p = 분석월 소실율 − 기준월 소실율)로만 판정하면 사이트 고유 배경 소실이
+// 상쇄되어 '장애물 준공 등 변화에 의한 순증분'만 남는다. (관심-주의-경계-심각 4단계 위기경보
+// 색상 관례를 따르되, 스케일은 '%p 편차'라 별도 상수로 둔다. 음수 Δ(기준보다 개선)도 양호.)
 //
-// ※ 초기 임계값 — 운영 데이터로 보정 예정. (절대 임계 BLOCKAGE_*_PCT 와 동일하게 관심-주의-경계-심각
-//    4단계 위기경보 색상 관례를 따르되, 스케일은 '%p 편차'라 별도 상수로 둔다.)
-//   음수 Δ(기준보다 개선)도 양호로 판정한다.
+// ※ 실측 보정 완료 (2026-07-24) — 기준월 2026-04 김포#1/#2 원시 아카이브 재집계(20.6M점)로
+//    추가 차단 밴드와 같은 꼴(방위 2° 웨지 × 저양각 0.3° 밴드, 레이더당 360웨지)의 노출 조건부
+//    소실율에 대해 같은 밴드의 반월 분할 |Δ| 노이즈를 측정:
+//      노출≥2h/half: p90 6.3 · p95 10.1 · p99 17.9 %p
+//      노출≥4h/half: p90 5.0 · p95 6.1 · p99 8.1 %p (홀짝일 분할(드리프트 제거) p95 4.9 %p)
+//    → 관심 +5%p ≈ 고노출 노이즈 상단(p90), 주의 +10%p ≈ 전형 노출 p95(실변화 개연),
+//      경계 +20%p > p99(명확한 변화), 심각 +30%p ≫ 노이즈. 음수 Δ(개선)는 양호.
 export const BLOCKAGE_DELTA_WATCH_PP = 5.0;   // 양호/관심 경계 (Δ %p)
 export const BLOCKAGE_DELTA_CAUTION_PP = 10.0; // 관심/주의 경계 (Δ %p)
 export const BLOCKAGE_DELTA_ALERT_PP = 20.0;   // 주의/경계 경계 (Δ %p)
@@ -213,9 +146,10 @@ export const BLOCKAGE_DELTA_SEVERE_PP = 30.0;  // 경계/심각 경계 (Δ %p)
 /**
  * 추가 차단영역 소실율 등급 (기준데이터 대비 편차 Δ%p 기준).
  *
- * 게이트(밴드 미형성·항적 없음·표본 부족 ≤ 10,000pt)는 gradeAddedBlockage 와 완전 동일 —
- * 게이트 통과 시에만 편차 임계로 판정한다. 반환 형태({label,color,bg,border})도 동일해
- * 소비처(요약표·소견표)가 delta/absolute 를 구분 없이 렌더할 수 있다.
+ * 게이트(밴드 미형성 → "추가 차단 구간 없음" · 노출 0pt → "항적 없음")만 우선 판정하고, 통과 시
+ * 편차 임계로 등급화한다. 표본 게이트(구 표본 부족 라벨)는 폐지 — 통과 항적 수와 무관하게 실측 Δ 를 그대로
+ * 등급화한다. 반환 형태({label,color,bg,border})는 회색 게이트 라벨과 Δ 등급이 동일해 소비처
+ * (요약표·소견표)가 구분 없이 렌더한다.
  *   Δ < 5 양호(음수 포함) / < 10 관심 / < 20 주의 / < 30 경계 / ≥ 30 심각.
  */
 export function gradeAddedBlockageDelta(
@@ -228,9 +162,6 @@ export function gradeAddedBlockageDelta(
   }
   if (exposurePointCount <= 0) {
     return { label: "항적 없음", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
-  }
-  if (exposurePointCount <= BLOCKAGE_MIN_EXPOSURE_POINTS) {
-    return { label: "판정 불가", color: "#6b7280", bg: "#f3f4f6", border: "border-gray-300" };
   }
   if (deltaPp < BLOCKAGE_DELTA_WATCH_PP)   return { label: "양호", color: "#15803d", bg: "#dcfce7", border: "border-green-200" };
   if (deltaPp < BLOCKAGE_DELTA_CAUTION_PP) return { label: "관심", color: "#1d4ed8", bg: "#dbeafe", border: "border-blue-200" };

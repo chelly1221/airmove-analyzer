@@ -500,6 +500,37 @@
   color: #374151;
 }
 
+/* §6 추가 차단 구간 표 — 등급 배지(라벨→색은 인라인 style) */
+.kac-report .om-grade-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 700;
+  font-size: 11px;
+}
+/* §6 각주 줄 컨테이너 — 기존 muted 9px 유지, 줄 간격만 부여 */
+.kac-report .om-blockage-notes {
+  margin-top: 4px;
+  font-size: 9px;
+  color: #9ca3af;
+  line-height: 1.5;
+}
+.kac-report .om-blockage-notes p { margin: 2px 0 0; }
+.kac-report .om-blockage-notes p:first-child { margin-top: 0; }
+/* 판정 기준 색칩 범례 */
+.kac-report .om-legend-item {
+  margin-left: 8px;
+  white-space: nowrap;
+}
+.kac-report .om-legend-chip {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 1px;
+  vertical-align: middle;
+  margin-right: 3px;
+}
+
 .kac-report .findings-text {
   border: 1px solid var(--om-border);
   background: #fff;

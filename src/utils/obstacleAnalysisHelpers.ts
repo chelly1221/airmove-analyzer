@@ -849,7 +849,7 @@ export const BLDG_EFFECT_EPS_DEG = 0.005;
  * §1 요약표(obstacleInfoByKey)·§3 AzElevChart 의 hasBldgEffect(angleTotalDeg > angleTerrainDeg + 0.005°)와
  * 동일 산식: 대상 방위(bAzDeg, bearingDeg)에서 with(지형+기존지물+'해당' 건물, panoWithForBuilding) 차단각과
  * without 차단각을 같은 makePanoramaSampler 로 샘플해 비교 — classifyObstacleLosses 의 두 각과 값이 일치한다.
- * panoWith 미가용(해당 레이더 파노라마 계산 실패/미준비) 시 null — 호출부는 '판정 불가'로 처리.
+ * panoWith 미가용(해당 레이더 파노라마 계산 실패/미준비) 시 null — 호출부는 'LoS 영향' 판정을 보류(미상)로 처리.
  * 소견 프로즈(omFindingsGenerator hasBldgEffectByKey)·§3 배지가 §1 열과 같은 판정을 쓰기 위한 단일 소스.
  */
 export function hasBldgEffectFromPanorama(
