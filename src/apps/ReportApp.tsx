@@ -31,7 +31,7 @@ import type {
   LoSProfileData, ReportMetadata,
   PanoramaMergeResult, PanoramaMergeDualResult, ManualBuilding, BuildingGroup, RadarSite, AzSector,
   ObstacleMonthlyResult, OMReportData,
-  AddedBlockageResult,
+  AddedBlockageResult, AzElevCell,
 } from "../types";
 import type { CoverageLayer } from "../utils/radarCoverage";
 import SourceOverlay from "../dev/SourceOverlay";
@@ -964,6 +964,7 @@ export default function ReportApp() {
     const buildings = omData.selectedBuildings;
     const panoWithTargets = omData.panoWithTargets;
     const panoWithoutTargets = omData.panoWithoutTargets;
+    const analysisMonth = omData.analysisMonth; // 같은 월 패리티 자가진단 조건(기준월==분석월) 비교용
 
     (async () => {
       try {
@@ -985,6 +986,11 @@ export default function ReportApp() {
           const radarRef = reference && reference.daily.length > 0
             ? { daysCells: reference.daily.map((d) => d.az_elev_histogram), monthLabel: reference.month_label }
             : null;
+          // 같은 월 패리티 자가진단 — 기준월==분석월일 때만 기록, om_reference/debug/parity_*.json.
+          //   건물 루프에서 extent(calcBuildingAzExtent 결과)를 재사용 수집하고, 루프 완료 후 레이더당
+          //   1회 요약 JSON 을 invoke("write_om_parity_debug") fire-and-forget 로 남긴다.
+          const parityDebug = !!radarRef && radarRef.monthLabel === analysisMonth;
+          const parityExtents: { name: string; key: string; extent: AzSector }[] = [];
           for (const b of buildings) {
             if (flowEpoch !== loadEpochRef.current) return; // reload — stale 산출 폐기
             const extent = calcBuildingAzExtent(radar.latitude, radar.longitude, b);
@@ -994,8 +1000,43 @@ export default function ReportApp() {
             addedBlockageByKey[key] = computeAddedBlockage(
               histByDay, panoWithForBuilding(pWith, pWithout, b.id), pWithout, extent, radarRef,
             );
+            if (parityDebug) parityExtents.push({ name: b.name, key, extent });
             // 쌍 사이 이벤트 루프 양보 — 프리뷰 점진 마운트/페인트와 교차 실행
             await new Promise((r) => setTimeout(r, 0));
+          }
+          // ── 같은 월 패리티 자가진단 기록 (레이더당 1회, 건물 루프 뒤) ──
+          //   전체를 try/catch 로 감싸 진단 실패가 보고서 생성에 절대 영향 없게 한다.
+          if (parityDebug && radarRef && reference) {
+            try {
+              const r6 = (n: number) => Math.round(n * 1e6) / 1e6; // tt/lt 소수 6자리 반올림(파일 크기·가독성)
+              const sumCells = (cells: AzElevCell[]) => {
+                let tt = 0, lt = 0, tc = 0, lc = 0;
+                for (const c of cells) { tt += c.track_time_s; lt += c.loss_time_s; tc += c.track_count; lc += c.loss_count; }
+                return { cells: cells.length, tt: r6(tt), lt: r6(lt), tc, lc };
+              };
+              const parityJson = JSON.stringify({
+                radar: radar.name, analysisMonth, refMonth: radarRef.monthLabel, generatedAt: new Date().toISOString(),
+                // 분석월: rr.daily_stats 의 일별 히스토그램 합계 (date=daily_stats.date)
+                analysisDaily: rr.daily_stats.map((d) => ({ date: d.date, ...sumCells(d.az_elev_histogram ?? []) })),
+                // 기준월: rr.reference.daily 의 일별 히스토그램 합계 (동일 형식)
+                referenceDaily: reference.daily.map((d) => ({ date: d.date, ...sumCells(d.az_elev_histogram ?? []) })),
+                // 건물별 슬라이스 결과 (addedBlockageByKey 산출 후)
+                buildings: parityExtents.map(({ name, key, extent }) => {
+                  const ab = addedBlockageByKey[key];
+                  return {
+                    key, name,
+                    extent: { start_deg: extent.start_deg, end_deg: extent.end_deg },
+                    lossRatePct: ab?.lossRatePct, refLossRatePct: ab?.refLossRatePct, deltaPp: ab?.deltaPp,
+                    exposureTrackTimeS: ab ? r6(ab.exposureTrackTimeS) : undefined,
+                    exposurePointCount: ab?.exposurePointCount, lossPointCount: ab?.lossPointCount,
+                  };
+                }),
+              });
+              invoke("write_om_parity_debug", { radarName: radar.name, json: parityJson })
+                .catch((e) => console.warn("[OMParity] 자가진단 기록 실패(무시):", e));
+            } catch (e) {
+              console.warn("[OMParity] 자가진단 JSON 생성 실패(무시):", e);
+            }
           }
         }
         if (flowEpoch !== loadEpochRef.current) return; // reload — stale 산출 폐기

@@ -1153,7 +1153,9 @@ pub struct OmReferenceMeta {
 /// 기준월 재집계 결과 (RadarMonthlyResult.reference 로 직렬화 — 프론트 BlockageReference 원천).
 /// 분석월과 완전히 동일한 쐐기 파이프라인으로 기준월 ASS 를 재집계한 산출물.
 /// **일별 히스토그램을 그대로 담는다**(월간 합산하지 않음) — 분석월 daily_stats 와 동일 직렬화
-/// (일별 ser_s3·hist_to_sorted_cells 정렬 셀). 프론트가 분석월과 동일 코드·동일 순서로 일별
+/// (일별 ser_s3·hist_to_sorted_cells 정렬 셀). **daily 는 month_label 월의 날짜만 담는다**
+/// (월경계 파일 내부의 타월 데이터 제외 — 분석월 filteredResult date-필터와 대칭, 같은 월 →
+/// 동일 날짜 집합 → Δ=0). 프론트가 분석월과 동일 코드·동일 순서로 일별
 /// accumulateBand 합산 → 표시 정밀도까지 비트 동일(같은 월 → Δ=0 이 구조적으로 보장).
 /// totals(track/loss time·day_count·source_file_count)는 로그·유지 목적으로 존치.
 /// Deserialize 는 디스크 캐시(<hash>.json) 역직렬화용.
@@ -1237,11 +1239,14 @@ fn date_is_2days_older(d: &str, latest: &str) -> bool {
 
 /// 기준월(참조 달) 재집계 — 보관된 ASS 를 분석월과 **완전히 동일한 쐐기 파이프라인**으로
 /// 재집계한다. 파싱·필터 시퀀스(검사기 제외 → 60NM 컷 → min_obstacle_distance 컷 → sector 필터
-/// → 일별 버킷)와 일별 집계(accumulate_wedge_day, 컬렉터 None)를 분석월과 공유하므로, 같은 월
-/// 입력이면 분석월 히스토그램과 비트 동일(Δ=0 불변식). geo 수집 없음(loss/track_points_geo/
-/// heatmap/baseline 전부 생략) — 쐐기 통과 포인트만 일별 버킷 → 히스토그램·시간 집계.
+/// → month_label date-필터 → 일별 버킷)와 일별 집계(accumulate_wedge_day, 컬렉터 None)를 분석월과
+/// 공유하므로, 같은 월 입력이면 분석월 히스토그램과 비트 동일(Δ=0 불변식). geo 수집 없음
+/// (loss/track_points_geo/heatmap/baseline 전부 생략) — 쐐기 통과 포인트만 일별 버킷 → 히스토그램·시간 집계.
 /// **일별 히스토그램을 월간 합산하지 않고 그대로 daily 에 담는다**(분석월 daily_stats 와 동일 직렬화) —
 /// 프론트가 분석월과 같은 코드·같은 순서로 일별 합산해 표시 정밀도까지 비트 동일하게 만들기 위함.
+/// **daily 는 month_label 월의 날짜만 담는다**(월경계 파일 내부의 전월 말일·익월 초일 등 타월 데이터
+/// 제외 — 분석월 filteredResult date-필터와 대칭, 같은 월 → 동일 날짜 집합 → Δ=0). 이 필터가 없으면
+/// 월경계 파일의 타월 날짜가 기준월에만 추가로 들어가 같은 월 테스트에서도 Δ 가 어긋난다.
 /// 메모리는 baseline 패턴과 같은 일 단위 플러시(2일 버퍼)로 제한. 취소는 공유 AtomicBool.
 ///
 /// `radar` 는 분석월 RadarFileSet(현재 좌표·안테나고·sector·min_obstacle_distance) — file_paths 는
@@ -1341,6 +1346,7 @@ pub fn compute_reference_wedge(
                 continue;
             }
             let date = timestamp_to_date(tp.timestamp);
+            if !date.starts_with(month_label) { continue; } // 월경계 파일의 전월 말일·익월 초일 제외 — 분석월 date-필터(ObstacleMonthlyConfigModal filteredResult)와 대칭
             if date > latest_date_seen {
                 latest_date_seen = date.clone();
             }
@@ -1416,7 +1422,9 @@ pub fn compute_reference_wedge(
 
 /// 기준월 재집계 캐시 버전 — 파이프라인/캐시 포맷이 바뀌면 +1 하여 기존 캐시를 무효화한다.
 /// v2: OmRefWedge 캐시 포맷을 월간 합산(az_elev_histogram) → 일별(daily: OmRefDayHist)로 변경.
-pub const OM_REF_PIPELINE_VERSION: u32 = 2;
+/// v3: daily 에 month_label date-필터 추가(월경계 파일의 타월 날짜 제외 — 분석월 filteredResult 와 대칭).
+///     정의 변경 → 구 v2 캐시(타월 날짜 포함분)를 자동 무효화한다.
+pub const OM_REF_PIPELINE_VERSION: u32 = 3;
 
 /// 기준월 재집계 캐시 키 (16진 문자열) — 같은 입력·같은 설정이면 같은 키(같은 월 재집계는 캐시 히트).
 /// 구성: 수동 버전 상수 + 파이프라인 상수 실측값 + month_label + 보관 ASS(이름,바이트) 정렬 +
@@ -1572,9 +1580,16 @@ mod parity_tests {
         // 같은 월 입력이면 분석월 daily_stats 와 기준월 daily 는 날짜 집합·각 날짜의 셀 배열이
         // 정렬 포함 완전 동일해야 한다(full precision 값·카운트 exact). r3 시뮬레이션은 이제
         // 정의상 0이라 폐지 — 직접 exact assert 로 대체.
+        //
+        // Path A(분석월)는 앱과 동일하게 만들기 위해 filteredResult 를 미러한다:
+        // res.daily_stats 에서 "2026-04" 로 시작하는 날짜만 비교 대상으로 남긴다
+        // (ObstacleMonthlyConfigModal filteredResult: d.date.startsWith(effectiveMonth) 미러 —
+        //  월경계 파일의 3/31·5/1 등 타월 날짜 제외). Path B(compute_reference_wedge)는 R1(v3)
+        // month_label date-필터로 이미 4월 날짜만 담으므로 별도 필터 불필요 → 두 경로 날짜 집합 대칭.
         let a_by_date: BTreeMap<&str, &Vec<AzElevCell>> = res
             .daily_stats
             .iter()
+            .filter(|d| d.date.starts_with("2026-04"))
             .map(|d| (d.date.as_str(), &d.az_elev_histogram))
             .collect();
         let b_by_date: BTreeMap<&str, &Vec<AzElevCell>> = wedge
@@ -1592,14 +1607,22 @@ mod parity_tests {
 
         // 각 날짜의 셀 배열이 정렬 포함 완전 동일:
         //   · az_bin/elev_bin/track_count/loss_count — exact (정렬 셀 정합 + 정수합은 순서 무관).
-        //   · track_time_s/loss_time_s — **직렬화(ser_s3) 표시 정밀도로 exact**.
+        //   · track_time_s/loss_time_s — **직렬화(ser_s3) 표시 정밀도로 exact**(단, 아래 sub-ULP 경계 예외).
         // 왜 full precision(to_bits)이 아니라 표시 정밀도인가: accumulate_wedge_day 의 mode_s 그룹핑
-        // HashMap 반복 순서가 인스턴스마다 무작위라, 3개 이상 그룹이 같은 셀에 기여하면 f64 덧셈의
-        // 비결합성으로 두 경로의 셀 값이 sub-ULP(~1e-14) 어긋날 수 있다(그룹 순서만 다름 — 알고리즘은
-        // 동일). 이 차이는 ser_s3(0.001s 양자화, 프론트가 실제 소비하는 직렬화 값) 밑이라 직렬화 후 JSON 은
-        // 완전 동일 → TS 일별 합산·Δ 가 비트 동일(=0). 즉 '표시 정밀도 exact'가 곧 Δ=0 불변식의 증명이다.
-        // (accumulate_wedge_day 그룹 순서는 '분석월 산출 수치 불변' 규칙상 변경 금지 → 여기서 표시 정밀도로 검증.)
+        // HashMap 반복 순서가 인스턴스마다 무작위라, 여러 그룹이 같은 셀에 기여하면 f64 덧셈의
+        // 비결합성으로 두 경로의 셀 값이 sub-ULP(1 ULP≈1e-15) 어긋날 수 있다(그룹 순서만 다름 — 알고리즘은
+        // 동일). 이 차이는 보통 ser_s3(0.001s 양자화, 프론트가 실제 소비하는 직렬화 값) 밑이라 직렬화 후 동일.
+        //
+        // **단 하나의 예외 — ser_s3 반올림 경계(x.xxx5)**: 값이 정확히 0.0005 배수 경계에 걸리면
+        // (예: 25.6875 vs 25.687499999999996) 1-ULP 섭동이 반올림을 뒤집어 ser_s3 후 0.001s 차이를 낸다.
+        // 이는 월경계 데이터 차이(초 단위)가 아니라 순수 부동소수 비결합성 산물이므로 허용한다:
+        // ser_s3 값이 같거나(주 경로) **full-precision |Δ| < 1e-6**(경계 뒤집힘 증명 — 실 데이터 차이는
+        // ser_s3 퀀텀 1e-3 이상이라 1e-6 문턱을 넘지 못함)이면 일치로 본다. 이로써 월경계 회귀
+        // (날짜 집합·포인트 셋 차이 → 초 단위 Δ)는 여전히 잡히고, 결정적 그룹순서(변경 금지 — '분석월
+        // 산출 수치 불변' 규칙)에 의존하지 않는다.
         fn r3(v: f64) -> f64 { (v * 1e3).round() / 1e3 }
+        // ser_s3 표시 정밀도 일치 OR sub-ULP 경계 뒤집힘(full-precision 1e-6 이내)이면 true.
+        fn s3_eq(a: f64, b: f64) -> bool { r3(a) == r3(b) || (a - b).abs() < 1e-6 }
         let mut total_cells = 0usize;
         let mut max_dtt = 0.0f64; // full precision 최대 |Δ| (진단 — sub-ULP 확인용)
         let mut max_dlt = 0.0f64;
@@ -1614,16 +1637,18 @@ mod parity_tests {
                 assert_eq!(ca.elev_bin, cb.elev_bin, "[{}] #{} elev_bin 불일치", date, i);
                 assert_eq!(ca.track_count, cb.track_count, "[{}] #{} track_count 불일치", date, i);
                 assert_eq!(ca.loss_count, cb.loss_count, "[{}] #{} loss_count 불일치", date, i);
-                // 표시 정밀도(ser_s3) exact — 직렬화 후 JSON·TS 소비값이 비트 동일함을 보증(Δ=0)
-                assert_eq!(
-                    r3(ca.track_time_s), r3(cb.track_time_s),
-                    "[{}] #{} (az={} elev={}) track_time_s ser_s3 불일치 A={} B={}",
-                    date, i, ca.az_bin, ca.elev_bin, ca.track_time_s, cb.track_time_s
+                // 표시 정밀도(ser_s3) 일치 — 직렬화 후 JSON·TS 소비값 동일 보증(Δ=0). sub-ULP 경계 예외 허용(위 주석).
+                assert!(
+                    s3_eq(ca.track_time_s, cb.track_time_s),
+                    "[{}] #{} (az={} elev={}) track_time_s 불일치(경계 예외 초과) A={} B={} |Δ|={:.3e}",
+                    date, i, ca.az_bin, ca.elev_bin, ca.track_time_s, cb.track_time_s,
+                    (ca.track_time_s - cb.track_time_s).abs()
                 );
-                assert_eq!(
-                    r3(ca.loss_time_s), r3(cb.loss_time_s),
-                    "[{}] #{} (az={} elev={}) loss_time_s ser_s3 불일치 A={} B={}",
-                    date, i, ca.az_bin, ca.elev_bin, ca.loss_time_s, cb.loss_time_s
+                assert!(
+                    s3_eq(ca.loss_time_s, cb.loss_time_s),
+                    "[{}] #{} (az={} elev={}) loss_time_s 불일치(경계 예외 초과) A={} B={} |Δ|={:.3e}",
+                    date, i, ca.az_bin, ca.elev_bin, ca.loss_time_s, cb.loss_time_s,
+                    (ca.loss_time_s - cb.loss_time_s).abs()
                 );
                 max_dtt = max_dtt.max((ca.track_time_s - cb.track_time_s).abs());
                 max_dlt = max_dlt.max((ca.loss_time_s - cb.loss_time_s).abs());
@@ -1631,7 +1656,7 @@ mod parity_tests {
             total_cells += a_cells.len();
         }
         eprintln!(
-            "[parity] 일별·셀별 일치 확인: {} days, {} cells | 표시정밀도(ser_s3)·카운트 exact | full-precision max|Δtt|={:.2e} max|Δlt|={:.2e} (sub-ULP — HashMap 그룹순서 무관, 직렬화 후 동일)",
+            "[parity] 일별·셀별 일치 확인: {} days, {} cells | 카운트·bin exact, 시간 ser_s3 일치(sub-ULP 경계 예외 허용) | full-precision max|Δtt|={:.2e} max|Δlt|={:.2e} (1 ULP 수준 — HashMap 그룹순서 산물, 월경계 데이터 차이 아님)",
             a_by_date.len(), total_cells, max_dtt, max_dlt
         );
     }

@@ -157,6 +157,8 @@ export interface OmReferenceMeta {
  * 기준월 재집계 결과 (RadarMonthlyResult.reference, Rust OmRefWedge 미러).
  * 분석월과 동일 쐐기 파이프라인으로 기준월 ASS 를 재집계한 **일별** 히스토그램을 그대로 전달한다 —
  * 월간 합산하지 않고 분석월 daily_stats 와 동일 직렬화(일별 ser_s3·hist_to_sorted_cells 정렬 셀)로 담는다.
+ * daily 는 **자기 월(month_label) 날짜만** 담는다(Rust 의 month_label date-필터로 월경계 파일의
+ * 전월 말일·익월 초일 제외 — 분석월 filteredResult date-필터와 대칭).
  * computeAddedBlockage 가 분석월과 동일 코드·동일 순서로 일별 accumulateBand 합산 →
  * 표시 정밀도까지 비트 동일(같은 월 → Δ=0). totals 는 로그·유지 목적.
  */

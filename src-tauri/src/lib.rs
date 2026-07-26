@@ -1753,6 +1753,25 @@ async fn delete_om_reference(radar_name: String, app_handle: tauri::AppHandle) -
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// 같은 월 패리티 자가진단 기록 — 기준월==분석월 테스트에서 프론트(ReportApp)가 분석월(daily_stats)·
+/// 기준월(reference.daily) 양쪽 데이터 요약을 om_reference/debug/parity_<sanitized>.json 으로 남긴다.
+/// 파일명은 reference_dirname(=sanitized_stem) 재사용해 안전화. 단순 fs::write — json 은 수백 KB 수준
+/// 요약만(대용량 응답 아님·요청 방향이라 CLAUDE.md 위배 아님). 실패는 Err(호출측 fire-and-forget).
+#[tauri::command]
+fn write_om_parity_debug(
+    radar_name: String,
+    json: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let debug_dir = om_reference_dir(&state)?.join("debug");
+    fs::create_dir_all(&debug_dir).map_err(|e| format!("parity debug 디렉토리 생성 실패: {}", e))?;
+    let dirname = analysis::obstacle_monthly::reference_dirname(&radar_name);
+    let path = debug_dir.join(format!("parity_{}.json", dirname));
+    fs::write(&path, json.as_bytes()).map_err(|e| format!("parity debug 저장 실패: {}", e))?;
+    info!("[OmParity] 패리티 자가진단 기록: {}", path.display());
+    Ok(())
+}
+
 /// 캐시 디렉토리에서 mtime 기준 최신 `keep` 개만 남기고 삭제 (LRU 근사).
 fn prune_cache_dir(cache_dir: &std::path::Path, keep: usize) {
     let Ok(rd) = fs::read_dir(cache_dir) else { return; };
@@ -2725,6 +2744,7 @@ pub fn run() {
             register_om_reference,
             list_om_references,
             delete_om_reference,
+            write_om_parity_debug,
             compute_coverage_terrain_profile_excluding,
             compute_coverage_layers_batch_excluded,
             // 토지이용계획도 타일

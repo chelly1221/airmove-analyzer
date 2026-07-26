@@ -419,7 +419,9 @@ export default function ObstacleMonthlyConfigModal({
         console.warn(`[OM 진단] ⚠ 백엔드에서 daily_stats가 전혀 없음 — 파싱/필터링 단계 확인 필요`);
       }
 
-      // 날짜 필터링
+      // 날짜 필터링 — 월경계 파일이 담는 전월 말일·익월 초일 daily_stats 를 제외해 분석월 날짜만 남긴다.
+      // 기준월(reference.daily)은 Rust compute_reference_wedge 가 month_label 로 동일 필터를 이미 적용(대칭)
+      // — 여기선 daily_stats 만 거른다(reference 는 그대로 통과해도 이미 자기 월 날짜만 담고 있음 → Δ 대칭).
       const filteredResult: ObstacleMonthlyResult = {
         ...result,
         radar_results: result.radar_results.map((rr) => {

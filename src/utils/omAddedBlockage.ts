@@ -63,6 +63,8 @@ export interface BlockageDayHist {
  * 히스토그램(분석월 daily_stats 와 동일 직렬화·정렬 셀) + 기준월 라벨. 호출부(ReportApp)가
  * rr.reference.daily 에서 넘긴다. 분석월 총계와 **같은 코드·같은 순서**(sumBandOverDays)로 합산 →
  * 같은 월이면 refRate 가 lossRatePct 와 비트 동일 → Δ=0 불변식.
+ * daily 는 **자기 월(month_label) 날짜만** 담는다(Rust compute_reference_wedge 의 month_label date-필터로
+ * 월경계 파일의 전월 말일·익월 초일 제외 — 분석월 filteredResult date-필터와 대칭).
  */
 export interface BlockageReference {
   /** 일별 az×elev 셀 배열 (date 오름차순 — 분석월 histogramsByDay 와 동일 순서) */
