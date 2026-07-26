@@ -42,6 +42,11 @@ const GRADE_BADGE: Record<string, { color: string; bg: string }> = {
 };
 const GRADE_BADGE_FALLBACK = { color: "#6b7280", bg: "#f3f4f6" };
 
+// 추세 부호 강조색 — ReportOMCombinedDailyChart 의 TREND_UP/DOWN_COLOR 팔레트 재사용.
+// 증가(악화)=적색, 감소(개선)=녹색. 안정·"—"는 무색(잉크 기본).
+const TREND_UP_COLOR = "#dc2626";   // 증가(slope>0, trendDir==="증가") — 적색
+const TREND_DOWN_COLOR = "#16a34a"; // 감소 — 녹색
+
 /**
  * delta 판정된 '실제 등급' 라벨. 기준 소실율·Δ 컬럼 값 표시는 실제 등급 + 미형성(BLOCKAGE_NONE_LABEL,
  * 밴드 소실 0 → 0.00%/Δ+0.00%p 정합 표기) — "항적 없음"만 "—" 유지.
@@ -202,12 +207,21 @@ function ReportOMFindings({
                   <td className="ta-c">
                     <span className="om-grade-badge" style={{ color: badge.color, background: badge.bg }}>{w.grade.label}</span>
                   </td>
-                  {/* 추세 — 노출>0 이면 표시 */}
-                  <td className="ta-c mono">
+                  {/* 추세 — 노출>0 이면 표시. 증가/감소는 단어 없이 숫자만(부호+소수3), 증가=적색·감소=녹색. 안정·"—"는 무색 */}
+                  <td
+                    className="ta-c mono"
+                    style={
+                      hasExposure && w.trendDir === "증가"
+                        ? { color: TREND_UP_COLOR }
+                        : hasExposure && w.trendDir === "감소"
+                        ? { color: TREND_DOWN_COLOR }
+                        : undefined
+                    }
+                  >
                     {hasExposure
                       ? (w.trendDir === "안정"
                         ? "안정"
-                        : `${w.trendDir} ${w.trendSlopePctPerDay > 0 ? "+" : ""}${w.trendSlopePctPerDay.toFixed(3)}%p`)
+                        : `${w.trendSlopePctPerDay > 0 ? "+" : ""}${w.trendSlopePctPerDay.toFixed(3)}%p`)
                       : "—"}
                   </td>
                 </tr>
