@@ -119,7 +119,8 @@ pub struct TrackPointGeo {
 /// 건물-무관 원자료 — 프론트가 건물별 angleWith/angleWithout 컷오프로
 /// 추가 차단영역 밴드 셀을 합산해 소실율을 산출한다.
 /// 양각은 ITU 4/3 유효지구 곡률(k=4/3) 기준 — 프론트 pointElevAngleDeg·panorama 실루엣과 동일 프레임.
-#[derive(Serialize, Clone, Debug)]
+/// Deserialize — 기준월 재집계 캐시(OmRefWedge)에 담겨 디스크 캐시로 round-trip 되므로 필요.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AzElevCell {
     /// floor(normalize(az)/0.1), 0..3600
     pub az_bin: u16,
@@ -198,6 +199,11 @@ pub struct RadarMonthlyResult {
     /// 전체표적 히트맵 (남한 전역 bbox 전수 밀도, 표시 전용 — 통계 스코프 60NM 와 무관).
     /// Option — 구버전 캐시 역직렬화 호환.
     pub track_heatmap: Option<TrackHeatmap>,
+    /// 기준월(참조 달) 재집계 결과 — analyze_obstacle_monthly 가 보관 ASS 를 분석월과 동일
+    /// 쐐기 파이프라인으로 재집계해 채운다(같은 월 → Δ=0 불변식). 미등록/실패 시 None(noref).
+    /// 별도 invoke 없이 레이더별 bulk 직렬화에 자연 포함(대용량 invoke 응답 금지 규칙 준수).
+    #[serde(default)]
+    pub reference: Option<OmRefWedge>,
 }
 
 /// 전체 결과
@@ -499,6 +505,182 @@ fn is_psr_combined(rt: &RadarDetectionType) -> bool {
     rt.has_psr()
 }
 
+/// 일별 쐐기(방위 구간) 집계 공용 헬퍼 — 분석월(analyze_radar_monthly 일별 루프)과
+/// 기준월(compute_reference_wedge)이 **문자 그대로 동일한 코드**로 mode_s 그룹핑 →
+/// 스캔주기/최대범위(p95) 추정 → gap 탐지 → 히스토그램/시간 누적을 수행한다.
+/// (복붙 이중화 금지 — 두 경로의 1차 판정을 구조적으로 일치시킨다.)
+///
+/// day_hist 는 호출부가 준비한 일별 누적기(packed key=(az_bin<<16)|elev_bin)에 in-place 누적.
+/// 반환: (day_track_time, day_loss_time).
+///
+/// 분석월 전용 수집물은 Option 컬렉터로 분리 — 기준월 경로는 전부 None 을 넘긴다.
+/// **컬렉터 유무는 track_time/loss_time/day_hist 수치에 영향을 주지 않는다**(부가 side-effect 만):
+///   · loss_points     : 소실 gap 의 스캔별 보간점(LossPointGeo) push
+///   · next_event_id   : 소실 이벤트 고유번호 카운터(1씩 증가, 같은 gap 보간점 공유)
+///   · loss_alt_sum    : 소실 gap 평균고도(ft) 합 (avg_loss_altitude_ft 용)
+///   · loss_alt_count  : 소실 gap 건수
+fn accumulate_wedge_day(
+    points: &[LightPoint],
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_h: f64,
+    day_hist: &mut HashMap<u32, (f64, f64, u32, u32)>,
+    mut loss_points: Option<&mut Vec<LossPointGeo>>,
+    mut next_event_id: Option<&mut u32>,
+    mut loss_alt_sum: Option<&mut f64>,
+    mut loss_alt_count: Option<&mut u32>,
+) -> (f64, f64) {
+    // Loss 분석: mode_s별 그룹 → 기존 loss 알고리즘 재활용
+    let mut mode_s_groups: HashMap<&str, Vec<&LightPoint>> = HashMap::new();
+    for p in points {
+        mode_s_groups.entry(&p.mode_s).or_default().push(p);
+    }
+
+    let mut day_track_time = 0.0f64;
+    let mut day_loss_time = 0.0f64;
+
+    for (_ms, mut all_pts) in mode_s_groups {
+        if all_pts.len() < 2 {
+            continue;
+        }
+        all_pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+
+        let pts = &all_pts;
+        if pts.len() < 2 {
+            continue;
+        }
+
+        // 스캔 간격 추정 (median)
+        let mut gaps: Vec<f64> = pts.windows(2)
+            .map(|w| w[1].timestamp - w[0].timestamp)
+            .filter(|&g| g > 0.5 && g < 30.0)
+            .collect();
+        if gaps.len() < 3 {
+            // 유효 gap이 부족하면 Loss 계산 불가 — track_time도 누적하지 않음
+            continue;
+        }
+
+        // 비행 시간 (gap 유효성 확인 후 누적) — 부재 구간 포함 전체 경과시간(첫~마지막 포인트)
+        let track_time = pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
+        day_track_time += track_time;
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let scan_interval = gaps[gaps.len() / 2];
+
+        // 최대 레이더 범위 추정 (95th percentile)
+        let mut distances: Vec<f64> = pts.iter()
+            .map(|p| calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude))
+            .collect();
+        distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let range_idx = ((distances.len() as f64 * 0.95) as usize).min(distances.len() - 1);
+        let max_range = distances[range_idx].max(50.0);
+
+        let threshold = OM_LOSS_THRESHOLD_SECS; // 7초 고정 — TrackMap loss.rs/Worker 와 동일 (종전 scan_interval×1.4)
+        let boundary = max_range * 1.0; // OUT_OF_RANGE_THRESHOLD
+
+        // Gap 탐지
+        for window in pts.windows(2) {
+            let prev = window[0];
+            let next = window[1];
+            let gap = next.timestamp - prev.timestamp;
+
+            // ── 추가 차단영역 히스토그램: 정상 추적 노출시간 (prev 셀) ──
+            // threshold 이하의 연속 스캔만 '추적시간'으로 집계 (손실 gap과 disjoint).
+            if gap > 0.5 && gap <= threshold {
+                let pa = crate::geo::bearing_deg(radar_lat, radar_lon, prev.latitude, prev.longitude);
+                let pd = calculate_haversine_distance(radar_lat, radar_lon, prev.latitude, prev.longitude);
+                if let Some((ab, eb)) = hist_cell(pa, elev_angle_deg(pd, prev.altitude, radar_h)) {
+                    let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
+                    cell.0 += gap;      // 노출시간
+                    cell.2 += 1;        // 정상 추적 스캔 포인트 1건
+                }
+            }
+
+            if gap > threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
+                let start_dist = calculate_haversine_distance(
+                    radar_lat, radar_lon, prev.latitude, prev.longitude,
+                );
+                let end_dist = calculate_haversine_distance(
+                    radar_lat, radar_lon, next.latitude, next.longitude,
+                );
+
+                let missed = gap / scan_interval;
+                let dist = calculate_haversine_distance(prev.latitude, prev.longitude, next.latitude, next.longitude);
+                let implied_speed = (dist / gap) * 3600.0 / 1.852;
+                let speed_dev = if prev.speed > 10.0 {
+                    (implied_speed - prev.speed).abs() / prev.speed
+                } else {
+                    0.0
+                };
+
+                // gap 전후 실제 보고 속도 변화율 (트랙 스왑/그룹핑 오류 탐지)
+                let speed_change = if prev.speed > 10.0 && next.speed > 10.0 {
+                    let avg_spd = (prev.speed + next.speed) / 2.0;
+                    (next.speed - prev.speed).abs() / avg_spd
+                } else {
+                    0.0
+                };
+
+                let is_oor = gap_straddles_analysis_cut(start_dist, end_dist, prev.speed, scan_interval)
+                    || (start_dist >= boundary && end_dist >= boundary)
+                    || (missed >= 15.0 && (start_dist >= boundary || end_dist >= boundary))
+                    || speed_dev > 0.5
+                    || speed_change > OM_SPEED_CHANGE_RATIO;
+
+                if !is_oor {
+                    // signal_loss
+                    day_loss_time += gap;
+                    // ── 분석월 전용: 소실 gap 평균고도(ft) 합·건수 ──
+                    if let Some(sum) = loss_alt_sum.as_deref_mut() {
+                        *sum += ((prev.altitude + next.altitude) / 2.0) * 3.28084;
+                    }
+                    if let Some(cnt) = loss_alt_count.as_deref_mut() {
+                        *cnt += 1;
+                    }
+                    // 스캔별 보간 포인트 생성 (TrackMap Worker와 동일)
+                    // 같은 gap 의 보간점들은 event_id 를 공유 — 이벤트 건수는 distinct event_id
+                    // ── 분석월 전용: 이벤트 id (기준월은 None → 0, 소실 보간점 미수집이라 무의미) ──
+                    let event_id = if let Some(nid) = next_event_id.as_deref_mut() {
+                        *nid += 1;
+                        *nid
+                    } else {
+                        0
+                    };
+                    let total_missed = ((gap / scan_interval).round() as u32).saturating_sub(1).max(1);
+                    // 소실시간 분배 (보간점들에 균등 분배 → 합 = gap) — share_s·히스토그램 공용
+                    let loss_per_pt = gap / total_missed as f64;
+                    for si in 1..=total_missed {
+                        let t = si as f64 / (total_missed as f64 + 1.0);
+                        let ilat = prev.latitude + (next.latitude - prev.latitude) * t;
+                        let ilon = prev.longitude + (next.longitude - prev.longitude) * t;
+                        let ialt = prev.altitude + (next.altitude - prev.altitude) * t; // meters
+                        // ── 분석월 전용: 소실 보간점 수집 ──
+                        if let Some(lp) = loss_points.as_deref_mut() {
+                            lp.push(LossPointGeo {
+                                lat: ilat,
+                                lon: ilon,
+                                alt_ft: ialt * 3.28084,
+                                duration_s: gap,        // 이벤트 전체 시간 (표시용 — 합산 금지)
+                                event_id,
+                                share_s: loss_per_pt,   // 균등 분배 시간 — Σ share_s = gap
+                            });
+                        }
+                        // ── 추가 차단영역 히스토그램: 소실시간 (보간점 셀) ──
+                        let la = crate::geo::bearing_deg(radar_lat, radar_lon, ilat, ilon);
+                        let ld = calculate_haversine_distance(radar_lat, radar_lon, ilat, ilon);
+                        if let Some((ab, eb)) = hist_cell(la, elev_angle_deg(ld, ialt, radar_h)) {
+                            let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
+                            cell.1 += loss_per_pt;  // 소실시간 (균등 분배)
+                            cell.3 += 1;            // 보간 소실 포인트 1건
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (day_track_time, day_loss_time)
+}
+
 /// 단일 레이더의 월간 분석 실행
 pub fn analyze_radar_monthly(
     radar: &RadarFileSet,
@@ -795,144 +977,23 @@ pub fn analyze_radar_monthly(
             0.0
         };
 
-        // Loss 분석: mode_s별 그룹 → 기존 loss 알고리즘 재활용
-        let mut mode_s_groups: HashMap<&str, Vec<&LightPoint>> = HashMap::new();
-        for p in points {
-            mode_s_groups.entry(&p.mode_s).or_default().push(p);
-        }
-
-        let mut day_track_time = 0.0f64;
-        let mut day_loss_time = 0.0f64;
+        // Loss 분석 + 추가 차단영역 히스토그램: 공용 헬퍼(accumulate_wedge_day)로 위임 —
+        // 기준월(compute_reference_wedge)과 동일 코드 경로. 분석월 전용 수집물(소실 보간점·
+        // 이벤트 id·소실고도 합/건수)은 Some(&mut …) 컬렉터로 넘긴다(컬렉터 유무는 수치 무영향).
         let mut day_loss_points: Vec<LossPointGeo> = Vec::new();
         // 추가 차단영역 히스토그램 누적기: key=(az_bin<<16)|elev_bin, val=(track_time, loss_time, track_count, loss_count)
         let mut day_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
-
-        for (_ms, mut all_pts) in mode_s_groups {
-            if all_pts.len() < 2 {
-                continue;
-            }
-            all_pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
-
-            let pts = &all_pts;
-            if pts.len() < 2 {
-                continue;
-            }
-
-            // 스캔 간격 추정 (median)
-            let mut gaps: Vec<f64> = pts.windows(2)
-                .map(|w| w[1].timestamp - w[0].timestamp)
-                .filter(|&g| g > 0.5 && g < 30.0)
-                .collect();
-            if gaps.len() < 3 {
-                // 유효 gap이 부족하면 Loss 계산 불가 — track_time도 누적하지 않음
-                continue;
-            }
-
-            // 비행 시간 (gap 유효성 확인 후 누적) — 부재 구간 포함 전체 경과시간(첫~마지막 포인트)
-            let track_time = pts.last().expect("pts has at least 2 elements").timestamp - pts.first().expect("pts has at least 2 elements").timestamp;
-            day_track_time += track_time;
-            gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let scan_interval = gaps[gaps.len() / 2];
-
-            // 최대 레이더 범위 추정 (95th percentile)
-            let mut distances: Vec<f64> = pts.iter()
-                .map(|p| calculate_haversine_distance(radar.radar_lat, radar.radar_lon, p.latitude, p.longitude))
-                .collect();
-            distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let range_idx = ((distances.len() as f64 * 0.95) as usize).min(distances.len() - 1);
-            let max_range = distances[range_idx].max(50.0);
-
-            let threshold = OM_LOSS_THRESHOLD_SECS; // 7초 고정 — TrackMap loss.rs/Worker 와 동일 (종전 scan_interval×1.4)
-            let boundary = max_range * 1.0; // OUT_OF_RANGE_THRESHOLD
-
-            // Gap 탐지
-            for window in pts.windows(2) {
-                let prev = window[0];
-                let next = window[1];
-                let gap = next.timestamp - prev.timestamp;
-
-                // ── 추가 차단영역 히스토그램: 정상 추적 노출시간 (prev 셀) ──
-                // threshold 이하의 연속 스캔만 '추적시간'으로 집계 (손실 gap과 disjoint).
-                if gap > 0.5 && gap <= threshold {
-                    let pa = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
-                    let pd = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude);
-                    if let Some((ab, eb)) = hist_cell(pa, elev_angle_deg(pd, prev.altitude, radar_h)) {
-                        let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
-                        cell.0 += gap;      // 노출시간
-                        cell.2 += 1;        // 정상 추적 스캔 포인트 1건
-                    }
-                }
-
-                if gap > threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
-                    let start_dist = calculate_haversine_distance(
-                        radar.radar_lat, radar.radar_lon, prev.latitude, prev.longitude,
-                    );
-                    let end_dist = calculate_haversine_distance(
-                        radar.radar_lat, radar.radar_lon, next.latitude, next.longitude,
-                    );
-
-                    let missed = gap / scan_interval;
-                    let dist = calculate_haversine_distance(prev.latitude, prev.longitude, next.latitude, next.longitude);
-                    let implied_speed = (dist / gap) * 3600.0 / 1.852;
-                    let speed_dev = if prev.speed > 10.0 {
-                        (implied_speed - prev.speed).abs() / prev.speed
-                    } else {
-                        0.0
-                    };
-
-                    // gap 전후 실제 보고 속도 변화율 (트랙 스왑/그룹핑 오류 탐지)
-                    let speed_change = if prev.speed > 10.0 && next.speed > 10.0 {
-                        let avg_spd = (prev.speed + next.speed) / 2.0;
-                        (next.speed - prev.speed).abs() / avg_spd
-                    } else {
-                        0.0
-                    };
-
-                    let is_oor = gap_straddles_analysis_cut(start_dist, end_dist, prev.speed, scan_interval)
-                        || (start_dist >= boundary && end_dist >= boundary)
-                        || (missed >= 15.0 && (start_dist >= boundary || end_dist >= boundary))
-                        || speed_dev > 0.5
-                        || speed_change > OM_SPEED_CHANGE_RATIO;
-
-                    if !is_oor {
-                        // signal_loss
-                        day_loss_time += gap;
-                        let avg_alt_ft = ((prev.altitude + next.altitude) / 2.0) * 3.28084;
-                        all_loss_alt_sum += avg_alt_ft;
-                        all_loss_alt_count += 1;
-                        // 스캔별 보간 포인트 생성 (TrackMap Worker와 동일)
-                        // 같은 gap 의 보간점들은 event_id 를 공유 — 이벤트 건수는 distinct event_id
-                        next_event_id += 1;
-                        let event_id = next_event_id;
-                        let total_missed = ((gap / scan_interval).round() as u32).saturating_sub(1).max(1);
-                        // 소실시간 분배 (보간점들에 균등 분배 → 합 = gap) — share_s·히스토그램 공용
-                        let loss_per_pt = gap / total_missed as f64;
-                        for si in 1..=total_missed {
-                            let t = si as f64 / (total_missed as f64 + 1.0);
-                            let ilat = prev.latitude + (next.latitude - prev.latitude) * t;
-                            let ilon = prev.longitude + (next.longitude - prev.longitude) * t;
-                            let ialt = prev.altitude + (next.altitude - prev.altitude) * t; // meters
-                            day_loss_points.push(LossPointGeo {
-                                lat: ilat,
-                                lon: ilon,
-                                alt_ft: ialt * 3.28084,
-                                duration_s: gap,        // 이벤트 전체 시간 (표시용 — 합산 금지)
-                                event_id,
-                                share_s: loss_per_pt,   // 균등 분배 시간 — Σ share_s = gap
-                            });
-                            // ── 추가 차단영역 히스토그램: 소실시간 (보간점 셀) ──
-                            let la = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, ilat, ilon);
-                            let ld = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, ilat, ilon);
-                            if let Some((ab, eb)) = hist_cell(la, elev_angle_deg(ld, ialt, radar_h)) {
-                                let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
-                                cell.1 += loss_per_pt;  // 소실시간 (균등 분배)
-                                cell.3 += 1;            // 보간 소실 포인트 1건
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (day_track_time, day_loss_time) = accumulate_wedge_day(
+            points,
+            radar.radar_lat,
+            radar.radar_lon,
+            radar_h,
+            &mut day_hist,
+            Some(&mut day_loss_points),
+            Some(&mut next_event_id),
+            Some(&mut all_loss_alt_sum),
+            Some(&mut all_loss_alt_count),
+        );
 
         let loss_rate = if day_track_time > 0.0 {
             (day_loss_time / day_track_time) * 100.0
@@ -1035,31 +1096,34 @@ pub fn analyze_radar_monthly(
         total_points_filtered: total_filtered,
         failed_files,
         track_heatmap,
+        // 기준월 재집계는 호출부(analyze_obstacle_monthly)가 채운다 — 여기선 None 초기화.
+        reference: None,
     })
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 기준데이터(참조 달) 집계 — OM 보고서 심각성 판정의 편차 기준선
+// 기준데이터(참조 달) — 등록 = 원본 ASS 사본 보관 + 메타만 / 재집계 = 보고서 생성 시
 // ════════════════════════════════════════════════════════════════════════════
 //
-// 참조 달 1달치 ASS 를 "전방위(0~360°) 60NM" 로 집계해 영구 저장한다.
-// 원시 track point 는 절대 저장하지 않고, 집계 산출물(일별 요약 + 월간 합산
-// az×elev 히스토그램)만 저장한다. 분석월과의 공정 비교를 위해 PSR/소실 판정
-// 로직(임계 7s·오탐 제외 규칙·양각 4/3·히스토그램 빈)은 analyze_radar_monthly 와
-// 동일하게 유지하고, 방위/장애물후방/최소거리 필터만 제거한다(전방위).
+// 재설계(구 전방위 사전집계 폐지): 기준데이터 등록(register_om_reference)은 원본 ASS 를
+// 복사 보관하고 메타만 남긴다. 심각성 판정용 az×elev 히스토그램은 **보고서 생성 시**
+// (analyze_obstacle_monthly) 분석월과 **완전히 동일한 쐐기 파이프라인**(동일 sector·최소거리·
+// 검사기 제외·현재 좌표/안테나고)으로 기준월 ASS 를 재집계해 산출한다(compute_reference_wedge).
+// 같은 월 입력 → accumulate_wedge_day 공용 코드로 비트 동일 히스토그램 → Δ=0 이 구조적으로 보장된다.
+// 재집계 결과는 설정 해시 키로 디스크 캐시한다. 좌표·안테나고 정합성 게이트는 항상 현재 설정으로
+// 재계산하므로 폐지됨(구 checkRefCoherence).
 //
-// ── 리팩토링 안전성 ──
-// analyze_radar_monthly / analyze_obstacle_monthly 경로는 일절 수정하지 않는다.
-// 아래는 그 파이프라인을 "재사용"하되(공유 헬퍼·상수·LightPoint·필터·히스토그램
-// 함수 그대로 호출) 전용 함수(process_reference_day / build_reference_for_radar)로
-// 분리해 기존 동작을 바이트 단위로 보존한다. 소실/PSR 판정 코드는 위 일별 루프에서
-// 그대로 옮겨왔으므로 두 경로의 1차 판정이 일치한다.
+// 이 파일이 소유하는 것: 직렬화 구조체(메타·레지스트리·재집계 결과) + 재집계 로직 + 캐시 키.
+// 등록/캐시 IO·registry 저장은 호출부(lib.rs)가 담당한다.
 
 // ─── 기준데이터 직렬화 구조체 (프론트 계약 고정 — snake_case JSON) ───
 
-/// 기준데이터 메타 (레지스트리·목록·로드에 공통). Serialize+Deserialize —
+/// 기준데이터 메타 (레지스트리·목록에 공통). Serialize+Deserialize —
 /// 레지스트리(settings JSON)에서 역직렬화되고 list 커맨드로 직렬화 반환된다.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// 재설계 개편: 집계 산출물(track/loss time·total_points·archive_bytes) 필드 삭제 —
+/// 등록은 원본 ASS 보관 + 메타만이고, 히스토그램은 보고서 생성 시 재집계하기 때문.
+/// Default — OmReferenceRegistryEntry 의 derive(Default) (구버전 마이그레이션 기본값)용.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct OmReferenceMeta {
     pub radar_name: String,
     pub month_label: String,
@@ -1071,59 +1135,51 @@ pub struct OmReferenceMeta {
     pub radar_lon: f64,
     pub radar_altitude: f64,
     pub antenna_height: f64,
-    pub total_track_time_secs: f64,
-    pub total_loss_time_secs: f64,
-    /// 아카이브된 총 원시 레코드 수 (points/*.omp 합계) — ASS 원본 없이 재집계 가능한 원시 보관.
-    pub total_points: u64,
-    /// 아카이브 일자 파일 바이트 합계
-    pub archive_bytes: u64,
-    /// 별도 보관된 원본 ASS 합계 바이트 — 0=미보관(구버전 빌드/보관 실패), 재계산 불가.
+    /// 보관된 원본 ASS 합계 바이트 — 0=미보관(구버전 빌드/보관 실패), 재집계 불가 → 프론트 "재등록 필요".
     #[serde(default)]
     pub ass_bytes: u64,
 }
 
-/// 기준데이터 일별 요약 (전방위 60NM)
+/// 기준월 재집계 결과 (RadarMonthlyResult.reference 로 직렬화 — 프론트 BlockageReference 원천).
+/// 분석월과 완전히 동일한 쐐기 파이프라인으로 기준월 ASS 를 재집계한 산출물.
+/// 같은 월 입력이면 분석월 히스토그램과 비트 동일 → Δ=0 이 구조적으로 보장된다.
+/// Deserialize 는 디스크 캐시(<hash>.json) 역직렬화용.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct OmReferenceDaily {
-    pub date: String,
-    pub psr_rate: f64,
-    pub loss_rate: f64,
-    pub track_time_secs: f64,
-    pub ssr_points: u64,
-}
-
-/// 저장/로드되는 기준데이터 전체 (version=1). 파일(수십 MB 가능)로 기록되고,
-/// load 커맨드는 이 파일을 bulk:// 경유 원시 바이트로 프론트에 전달한다
-/// (Rust 에서 역직렬화하지 않으므로 Serialize 만 필요).
-#[derive(Serialize, Clone, Debug)]
-pub struct OmReferenceData {
-    pub version: u32,
-    pub meta: OmReferenceMeta,
-    pub daily: Vec<OmReferenceDaily>,
+pub struct OmRefWedge {
+    pub month_label: String,
+    /// 월간 합산 방위×양각 시간 히스토그램 (쐐기 필터 통과분 — 분석월과 동일 정의).
     pub az_elev_histogram: Vec<AzElevCell>,
+    pub total_track_time_secs: f64,
+    pub total_loss_time_secs: f64,
+    pub day_count: u32,
+    pub source_file_count: u32,
 }
 
 /// 레지스트리 항목 (settings `om_reference_registry` JSON: radar_name → 이 값).
-/// 메타 + 저장 파일 경로. flatten 으로 메타 필드가 최상위에 펼쳐진다.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// 메타 + 원본 ASS 보관 디렉토리. flatten 으로 메타 필드가 최상위에 펼쳐진다.
+/// 재설계 개편: file_path/points_dir 제거(집계 JSON·포인트 아카이브 폐지) — 단 구버전 registry
+/// 역직렬화 호환을 위해 serde(default) 로 남겨두고, 로드 시 1회 lazy cleanup 으로 비운다.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct OmReferenceRegistryEntry {
     #[serde(flatten)]
     pub meta: OmReferenceMeta,
-    /// 기준데이터 JSON 파일 절대경로 (om_reference/ 디렉토리)
-    pub file_path: String,
-    /// 원시 포인트 아카이브 디렉토리 절대경로 (om_reference/points/<dir>/)
-    pub points_dir: String,
-    /// 원본 ASS 보관 디렉토리 절대경로 (om_reference/ass/<dir>/) — 빈 문자열=미보관.
-    /// registry 는 settings JSON 에서 역직렬화되므로 serde(default) 로 구버전 호환.
+    /// 원본 ASS 보관 디렉토리 절대경로 (om_reference/ass/<dir>/) — 빈 문자열=미보관(재등록 필요).
     #[serde(default)]
     pub ass_dir: String,
+    /// (구버전 마이그레이션) 집계 JSON 파일 경로 — 새 시스템 미사용. 로드 시 발견하면 파일 삭제 후 비움.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_path: String,
+    /// (구버전 마이그레이션) 원시 포인트 아카이브 디렉토리 — 새 시스템 미사용. 로드 시 발견하면 삭제 후 비움.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub points_dir: String,
 }
 
-// ─── 기준데이터 집계 헬퍼 ───
+// ─── 기준데이터 헬퍼 ───
 
 /// 현재 UTC 시각을 ISO-8601 문자열로 (chrono 미의존 — std 로 생성).
 /// 예: "2026-07-22T03:14:07Z". days_to_ymd(Howard Hinnant) 재사용.
-fn now_iso8601() -> String {
+/// 등록 커맨드(register_om_reference)의 created_at 생성에 lib.rs 에서 재사용 → pub.
+pub fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1172,226 +1228,46 @@ fn merge_hist(
     }
 }
 
-/// 기준데이터 하루치 처리 결과 (전방위 60NM)
-struct ReferenceDayResult {
-    daily: OmReferenceDaily,
-    /// meta.total_loss_time_secs 합산용 (OmReferenceDaily 엔 loss_rate 만 있음)
-    loss_time_secs: f64,
-    /// 방위×양각 히스토그램 누적기 (packed key = (az_bin<<16)|elev_bin)
-    hist: HashMap<u32, (f64, f64, u32, u32)>,
-}
-
-/// 하루치 전방위(60NM) 포인트로 PSR율·소실율·방위×양각 히스토그램을 산출.
-/// 소실/PSR 판정 로직은 analyze_radar_monthly 의 일별 루프와 **동일**해야 한다
-/// (임계 7s·오탐 제외 규칙·양각 4/3·히스토그램 빈) — 기준월↔분석월 비교의 공정성 조건.
-/// 차이점: 방위/장애물후방/최소거리 필터 없음(전방위), loss_points_geo·track_points_geo·
-/// track_heatmap 미수집(전방위라 메모리 폭증 위험 — 반드시 생략).
-fn process_reference_day(
-    date: &str,
-    points: &[LightPoint],
-    radar_lat: f64,
-    radar_lon: f64,
-    radar_h: f64,
-) -> ReferenceDayResult {
-    // PSR 통계 (60NM 이내) — analyze_radar_monthly 일별 루프와 동일
-    let ssr_combined = points
-        .iter()
-        .filter(|p| {
-            let dist = calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude);
-            dist <= PSR_RANGE_KM && is_ssr_combined(&p.radar_type)
-        })
-        .count() as u32;
-    let psr_combined = points
-        .iter()
-        .filter(|p| {
-            let dist = calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude);
-            dist <= PSR_RANGE_KM && is_psr_combined(&p.radar_type)
-        })
-        .count() as u32;
-    let psr_rate = if ssr_combined > 0 {
-        psr_combined as f64 / ssr_combined as f64
-    } else {
-        0.0
-    };
-
-    // Loss 분석: mode_s별 그룹 → analyze_radar_monthly 일별 루프와 동일 알고리즘
-    let mut mode_s_groups: HashMap<&str, Vec<&LightPoint>> = HashMap::new();
-    for p in points {
-        mode_s_groups.entry(&p.mode_s).or_default().push(p);
-    }
-
-    let mut day_track_time = 0.0f64;
-    let mut day_loss_time = 0.0f64;
-    let mut day_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
-
-    for (_ms, mut all_pts) in mode_s_groups {
-        if all_pts.len() < 2 {
-            continue;
-        }
-        all_pts.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
-        let pts = &all_pts;
-        if pts.len() < 2 {
-            continue;
-        }
-
-        // 스캔 간격 추정 (median)
-        let mut gaps: Vec<f64> = pts
-            .windows(2)
-            .map(|w| w[1].timestamp - w[0].timestamp)
-            .filter(|&g| g > 0.5 && g < 30.0)
-            .collect();
-        if gaps.len() < 3 {
-            continue;
-        }
-
-        // 비행 시간 — 부재 구간 포함 전체 경과시간(첫~마지막 포인트)
-        let track_time = pts.last().unwrap().timestamp - pts.first().unwrap().timestamp;
-        day_track_time += track_time;
-        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let scan_interval = gaps[gaps.len() / 2];
-
-        // 최대 레이더 범위 추정 (95th percentile)
-        let mut distances: Vec<f64> = pts
-            .iter()
-            .map(|p| calculate_haversine_distance(radar_lat, radar_lon, p.latitude, p.longitude))
-            .collect();
-        distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let range_idx = ((distances.len() as f64 * 0.95) as usize).min(distances.len() - 1);
-        let max_range = distances[range_idx].max(50.0);
-
-        let threshold = OM_LOSS_THRESHOLD_SECS; // 7초 고정 — analyze_radar_monthly 와 동일
-        let boundary = max_range * 1.0;
-
-        for window in pts.windows(2) {
-            let prev = window[0];
-            let next = window[1];
-            let gap = next.timestamp - prev.timestamp;
-
-            // ── 정상 추적 노출시간 (prev 셀) ──
-            if gap > 0.5 && gap <= threshold {
-                let pa = crate::geo::bearing_deg(radar_lat, radar_lon, prev.latitude, prev.longitude);
-                let pd = calculate_haversine_distance(radar_lat, radar_lon, prev.latitude, prev.longitude);
-                if let Some((ab, eb)) = hist_cell(pa, elev_angle_deg(pd, prev.altitude, radar_h)) {
-                    let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
-                    cell.0 += gap; // 노출시간
-                    cell.2 += 1; // 정상 추적 스캔 포인트 1건
-                }
-            }
-
-            if gap > threshold && gap <= MAX_OM_LOSS_DURATION_SECS {
-                let start_dist = calculate_haversine_distance(radar_lat, radar_lon, prev.latitude, prev.longitude);
-                let end_dist = calculate_haversine_distance(radar_lat, radar_lon, next.latitude, next.longitude);
-                let missed = gap / scan_interval;
-                let dist = calculate_haversine_distance(prev.latitude, prev.longitude, next.latitude, next.longitude);
-                let implied_speed = (dist / gap) * 3600.0 / 1.852;
-                let speed_dev = if prev.speed > 10.0 {
-                    (implied_speed - prev.speed).abs() / prev.speed
-                } else {
-                    0.0
-                };
-                let speed_change = if prev.speed > 10.0 && next.speed > 10.0 {
-                    let avg_spd = (prev.speed + next.speed) / 2.0;
-                    (next.speed - prev.speed).abs() / avg_spd
-                } else {
-                    0.0
-                };
-                let is_oor = gap_straddles_analysis_cut(start_dist, end_dist, prev.speed, scan_interval)
-                    || (start_dist >= boundary && end_dist >= boundary)
-                    || (missed >= 15.0 && (start_dist >= boundary || end_dist >= boundary))
-                    || speed_dev > 0.5
-                    || speed_change > OM_SPEED_CHANGE_RATIO;
-                if !is_oor {
-                    // signal_loss — loss_points_geo 는 수집하지 않고 시간·히스토그램만 누적
-                    day_loss_time += gap;
-                    let total_missed = ((gap / scan_interval).round() as u32).saturating_sub(1).max(1);
-                    let loss_per_pt = gap / total_missed as f64;
-                    for si in 1..=total_missed {
-                        let t = si as f64 / (total_missed as f64 + 1.0);
-                        let ilat = prev.latitude + (next.latitude - prev.latitude) * t;
-                        let ilon = prev.longitude + (next.longitude - prev.longitude) * t;
-                        let ialt = prev.altitude + (next.altitude - prev.altitude) * t; // meters
-                        // ── 추가 차단영역 히스토그램: 소실시간 (보간점 셀) ──
-                        let la = crate::geo::bearing_deg(radar_lat, radar_lon, ilat, ilon);
-                        let ld = calculate_haversine_distance(radar_lat, radar_lon, ilat, ilon);
-                        if let Some((ab, eb)) = hist_cell(la, elev_angle_deg(ld, ialt, radar_h)) {
-                            let cell = day_hist.entry(((ab as u32) << 16) | eb as u32).or_insert((0.0, 0.0, 0, 0));
-                            cell.1 += loss_per_pt; // 소실시간 (균등 분배)
-                            cell.3 += 1; // 보간 소실 포인트 1건
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let loss_rate = if day_track_time > 0.0 {
-        (day_loss_time / day_track_time) * 100.0
-    } else {
-        0.0
-    };
-
-    ReferenceDayResult {
-        daily: OmReferenceDaily {
-            date: date.to_string(),
-            psr_rate,
-            loss_rate,
-            track_time_secs: day_track_time,
-            ssr_points: ssr_combined as u64,
-        },
-        loss_time_secs: day_loss_time,
-        hist: day_hist,
-    }
-}
-
-/// 단일 레이더의 기준데이터(참조 달) 빌드: 파싱 → 전방위 60NM 필터 → 일별 버킷
-/// (일 단위 플러시로 메모리 제한) → PSR/소실/히스토그램 집계 → 월간 합산.
-/// 취소는 analyze_radar_monthly 와 동일한 AtomicBool 플래그로 동작.
-pub fn build_reference_for_radar(
+/// 기준월(참조 달) 재집계 — 보관된 ASS 를 분석월과 **완전히 동일한 쐐기 파이프라인**으로
+/// 재집계한다. 파싱·필터 시퀀스(검사기 제외 → 60NM 컷 → min_obstacle_distance 컷 → sector 필터
+/// → 일별 버킷)와 일별 집계(accumulate_wedge_day, 컬렉터 None)를 분석월과 공유하므로, 같은 월
+/// 입력이면 분석월 히스토그램과 비트 동일(Δ=0 불변식). geo 수집 없음(loss/track_points_geo/
+/// heatmap/baseline 전부 생략) — 쐐기 통과 포인트만 일별 버킷 → 히스토그램·시간 집계.
+/// 메모리는 baseline 패턴과 같은 일 단위 플러시(2일 버퍼)로 제한. 취소는 공유 AtomicBool.
+///
+/// `radar` 는 분석월 RadarFileSet(현재 좌표·안테나고·sector·min_obstacle_distance) — file_paths 는
+/// 무시하고 `ass_files`(보관 ASS 절대경로, 정렬)를 파싱한다. 진행은 stage "ref" 로 emit(기준월 명시).
+pub fn compute_reference_wedge(
     radar: &RadarFileSet,
     exclude_mode_s: &[String],
+    ass_files: &[String],
     month_label: &str,
     mag_dec_deg: f64,
-    points_dir: &std::path::Path,
     cancel: &std::sync::atomic::AtomicBool,
     progress_fn: &dyn Fn(ObstacleMonthlyProgress),
-) -> Result<OmReferenceData, String> {
+) -> Result<OmRefWedge, String> {
     use std::sync::atomic::Ordering;
 
-    let total_files = radar.file_paths.len();
+    let total_files = ass_files.len();
     info!(
-        "[OmReference] 레이더 '{}' 기준데이터 빌드 시작: {} files (전방위 60NM, month={})",
+        "[OmReference] 레이더 '{}' 기준월 재집계 시작: {} files (동일 쐐기 파이프라인, month={})",
         radar.radar_name, total_files, month_label
     );
 
-    // 안테나 해발고 (양각 계산용)
+    // 안테나 해발고 (양각 계산용) — 분석월과 동일
     let radar_h = radar.radar_altitude + radar.antenna_height;
 
-    // ── 원시 포인트 아카이브 디렉토리 준비 ──
-    // 재빌드 시 이전 달 잔재 일자 파일이 섞이지 않도록 먼저 비우고 재작성한다.
-    // 실패/취소로 반쯤 쓰인 디렉토리는 호출측(lib.rs)이 정리하고 registry 에 등록하지 않는다.
-    if points_dir.exists() {
-        std::fs::remove_dir_all(points_dir)
-            .map_err(|e| format!("아카이브 디렉토리 정리 실패: {}", e))?;
-    }
-    std::fs::create_dir_all(points_dir)
-        .map_err(|e| format!("아카이브 디렉토리 생성 실패: {}", e))?;
-    // 아카이브 누적 집계 (일 단위 플러시로 기록 — 월 전체 축적 없음)
-    let mut total_points: u64 = 0;
-    let mut archive_bytes: u64 = 0;
-
-    // 일별 버킷 (전방위 60NM) — 일 단위 플러시로 메모리 2~3일치로 제한
-    // (전체 누적 시 51M × 80B ≈ 4GB OOM — analyze_radar_monthly baseline 패턴과 동일)
+    // 일별 버킷 (쐐기 통과 포인트) — 일 단위 플러시로 메모리 2~3일치로 제한
     let mut daily_points: HashMap<String, Vec<LightPoint>> = HashMap::with_capacity(4);
-    let mut daily_results: HashMap<String, OmReferenceDaily> = HashMap::with_capacity(31);
     // 월간 합산 히스토그램 누적기 (packed key = (az_bin<<16)|elev_bin)
     let mut monthly_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
     let mut total_track_time = 0.0f64;
     let mut total_loss_time = 0.0f64;
+    let mut day_count = 0u32;
     let mut latest_date_seen = String::new();
-    let mut failed_files = 0usize;
 
     // 파일 정렬 (시간순 보장 — 일 단위 플러시 정확도)
-    let mut sorted_paths = radar.file_paths.clone();
+    let mut sorted_paths = ass_files.to_vec();
     sorted_paths.sort();
 
     for (i, path) in sorted_paths.iter().enumerate() {
@@ -1400,17 +1276,17 @@ pub fn build_reference_for_radar(
         }
         progress_fn(ObstacleMonthlyProgress {
             radar_name: radar.radar_name.clone(),
-            stage: "parsing".to_string(),
+            stage: "ref".to_string(),
             current: i + 1,
             total: total_files,
             message: format!(
-                "{} 파싱 중... ({}/{})",
-                path.split(['/', '\\']).last().unwrap_or(path),
+                "기준월 재집계 중... ({}/{})",
                 i + 1,
                 total_files
             ),
         });
 
+        // 파싱 (분석월과 동일 시퀀스 — 포함/제외 없이 전량 파싱 후 아래에서 필터)
         let parsed = match parser::ass::parse_ass_file(
             path,
             radar.radar_lat,
@@ -1424,8 +1300,8 @@ pub fn build_reference_for_radar(
         ) {
             Ok(p) => p,
             Err(e) => {
-                info!("[OmReference] 파일 파싱 실패: {} — {}", path, e);
-                failed_files += 1;
+                // 파싱 실패 파일은 건너뛴다(분석월과 동일 관용 — 보고서 생성 차단 금지).
+                info!("[OmReference] 기준월 파일 파싱 실패(건너뜀): {} — {}", path, e);
                 continue;
             }
         };
@@ -1436,16 +1312,25 @@ pub fn build_reference_for_radar(
             if inner_count % 10_000 == 0 && cancel.load(Ordering::Relaxed) {
                 return Err("분석이 취소되었습니다".to_string());
             }
-            // 비행검사기 제외 (분석월과 동일)
+            // 비행검사기 제외 — 분석월과 동일
             if exclude_mode_s.iter().any(|ex| ex.eq_ignore_ascii_case(&tp.mode_s)) {
                 continue;
             }
-            // 거리 상한 60NM — 전방위(방위/장애물후방/최소거리 필터 없음)
-            let dist = calculate_haversine_distance(radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude);
+            // 거리 필터 (장애물 후방 min ~ 60NM) — 분석월과 동일 (heatmap 누적만 생략)
+            let dist = calculate_haversine_distance(
+                radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude,
+            );
             if dist > OM_MAX_RANGE_KM {
                 continue;
             }
-
+            if radar.min_obstacle_distance_km > 0.0 && dist < radar.min_obstacle_distance_km {
+                continue;
+            }
+            // 방위 필터 — 분석월과 동일 (sector 통과분만; baseline 누적은 생략)
+            let az = crate::geo::bearing_deg(radar.radar_lat, radar.radar_lon, tp.latitude, tp.longitude);
+            if !in_any_sector(az, &radar.azimuth_sectors) {
+                continue;
+            }
             let date = timestamp_to_date(tp.timestamp);
             if date > latest_date_seen {
                 latest_date_seen = date.clone();
@@ -1465,15 +1350,16 @@ pub fn build_reference_for_radar(
                 .collect();
             for fd in flush_dates {
                 if let Some(pts) = daily_points.remove(&fd) {
-                    // 원시 포인트 아카이브 기록 (집계 통계와 동일 모집단 — 플러시 시점 스트리밍 후 해제)
-                    let (cnt, bytes) = write_day_archive(points_dir, &fd, &pts)?;
-                    total_points += cnt;
-                    archive_bytes += bytes;
-                    let r = process_reference_day(&fd, &pts, radar.radar_lat, radar.radar_lon, radar_h);
-                    total_track_time += r.daily.track_time_secs;
-                    total_loss_time += r.loss_time_secs;
-                    merge_hist(&mut monthly_hist, &r.hist);
-                    daily_results.insert(fd, r.daily);
+                    let mut day_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
+                    // 공용 헬퍼 — 분석월과 동일 코드, 컬렉터는 전부 None(geo 미수집)
+                    let (tt, lt) = accumulate_wedge_day(
+                        &pts, radar.radar_lat, radar.radar_lon, radar_h, &mut day_hist,
+                        None, None, None, None,
+                    );
+                    total_track_time += tt;
+                    total_loss_time += lt;
+                    merge_hist(&mut monthly_hist, &day_hist);
+                    day_count += 1;
                     // pts drop → 메모리 해제
                 }
             }
@@ -1487,23 +1373,17 @@ pub fn build_reference_for_radar(
             return Err("분석이 취소되었습니다".to_string());
         }
         if let Some(pts) = daily_points.remove(&fd) {
-            let (cnt, bytes) = write_day_archive(points_dir, &fd, &pts)?;
-            total_points += cnt;
-            archive_bytes += bytes;
-            let r = process_reference_day(&fd, &pts, radar.radar_lat, radar.radar_lon, radar_h);
-            total_track_time += r.daily.track_time_secs;
-            total_loss_time += r.loss_time_secs;
-            merge_hist(&mut monthly_hist, &r.hist);
-            daily_results.insert(fd, r.daily);
+            let mut day_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
+            let (tt, lt) = accumulate_wedge_day(
+                &pts, radar.radar_lat, radar.radar_lon, radar_h, &mut day_hist,
+                None, None, None, None,
+            );
+            total_track_time += tt;
+            total_loss_time += lt;
+            merge_hist(&mut monthly_hist, &day_hist);
+            day_count += 1;
         }
     }
-
-    // 일별 정렬
-    let mut daily: Vec<OmReferenceDaily> = daily_results.into_values().collect();
-    daily.sort_by(|a, b| a.date.cmp(&b.date));
-
-    let first_date = daily.first().map(|d| d.date.clone()).unwrap_or_default();
-    let last_date = daily.last().map(|d| d.date.clone()).unwrap_or_default();
 
     // 월간 합산 히스토그램 → 직렬화용 Vec<AzElevCell>
     let az_elev_histogram: Vec<AzElevCell> = monthly_hist
@@ -1519,48 +1399,94 @@ pub fn build_reference_for_radar(
         .collect();
 
     info!(
-        "[OmReference] 레이더 '{}' 빌드 완료: {} days ({}~{}), track {:.0}s loss {:.0}s, hist {} cells, 아카이브 {} pts / {:.1}MB, 실패 {}개",
-        radar.radar_name,
-        daily.len(),
-        first_date,
-        last_date,
-        total_track_time,
-        total_loss_time,
-        az_elev_histogram.len(),
-        total_points,
-        archive_bytes as f64 / 1024.0 / 1024.0,
-        failed_files
+        "[OmReference] 레이더 '{}' 기준월 재집계 완료: {} days, track {:.0}s loss {:.0}s, hist {} cells (files {})",
+        radar.radar_name, day_count, total_track_time, total_loss_time, az_elev_histogram.len(), total_files
     );
 
-    let meta = OmReferenceMeta {
-        radar_name: radar.radar_name.clone(),
+    Ok(OmRefWedge {
         month_label: month_label.to_string(),
-        file_count: total_files as u32,
-        first_date,
-        last_date,
-        created_at: now_iso8601(),
-        radar_lat: radar.radar_lat,
-        radar_lon: radar.radar_lon,
-        radar_altitude: radar.radar_altitude,
-        antenna_height: radar.antenna_height,
+        az_elev_histogram,
         total_track_time_secs: total_track_time,
         total_loss_time_secs: total_loss_time,
-        total_points,
-        archive_bytes,
-        // 원본 ASS 별도 보관은 호출부(lib.rs)의 책임 — 여기선 0 초기화.
-        ass_bytes: 0,
-    };
-
-    Ok(OmReferenceData {
-        version: 1,
-        meta,
-        daily,
-        az_elev_histogram,
+        day_count,
+        source_file_count: total_files as u32,
     })
 }
 
+/// 기준월 재집계 캐시 버전 — 파이프라인/캐시 포맷이 바뀌면 +1 하여 기존 캐시를 무효화한다.
+pub const OM_REF_PIPELINE_VERSION: u32 = 1;
+
+/// 기준월 재집계 캐시 키 (16진 문자열) — 같은 입력·같은 설정이면 같은 키(같은 월 재집계는 캐시 히트).
+/// 구성: 수동 버전 상수 + 파이프라인 상수 실측값 + month_label + 보관 ASS(이름,바이트) 정렬 +
+///       현재 좌표(6자리)/안테나고·해발고(2자리)/최소거리(3자리)/sector(6자리) 정렬/제외Mode-S(소문자 정렬).
+/// 파이프라인 상수를 넣는 이유: 임계·빈 상수가 바뀌면 히스토그램이 달라지므로 캐시를 자동 무효화.
+/// `files_meta`: (파일명, 바이트) 목록 — 호출부(lib.rs)가 ass_dir 을 읽어 전달.
+/// 해시: 새 crate 없이 FNV-1a 64bit 2개(오프셋 상수 상이) 조합 = 128bit(충돌 확률 무시 가능).
+pub fn reference_cache_key(
+    month_label: &str,
+    files_meta: &[(String, u64)],
+    radar: &RadarFileSet,
+    exclude_mode_s: &[String],
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(1024);
+    let _ = write!(s, "v{}", OM_REF_PIPELINE_VERSION);
+    let _ = write!(
+        s, "|lt{}|md{}|sc{}",
+        OM_LOSS_THRESHOLD_SECS, MAX_OM_LOSS_DURATION_SECS, OM_SPEED_CHANGE_RATIO
+    );
+    let _ = write!(
+        s, "|az{}|eb{}|emin{}|emax{}",
+        HIST_AZ_BIN_DEG, HIST_ELEV_BIN_DEG, HIST_ELEV_MIN_DEG, HIST_ELEV_MAX_DEG
+    );
+    let _ = write!(s, "|mr{}", OM_MAX_RANGE_KM);
+    let _ = write!(s, "|mon{}", month_label);
+    let _ = write!(s, "|lat{:.6}|lon{:.6}", radar.radar_lat, radar.radar_lon);
+    let _ = write!(s, "|alt{:.2}|ah{:.2}", radar.radar_altitude, radar.antenna_height);
+    let _ = write!(s, "|mind{:.3}", radar.min_obstacle_distance_km);
+    // sectors 정렬 (start,end 6자리)
+    let mut secs: Vec<(String, String)> = radar
+        .azimuth_sectors
+        .iter()
+        .map(|a| (format!("{:.6}", a.start_deg), format!("{:.6}", a.end_deg)))
+        .collect();
+    secs.sort();
+    s.push_str("|sec");
+    for (a, b) in &secs {
+        let _ = write!(s, "{}:{};", a, b);
+    }
+    // exclude_mode_s 소문자 정렬
+    let mut exc: Vec<String> = exclude_mode_s.iter().map(|e| e.to_ascii_lowercase()).collect();
+    exc.sort();
+    s.push_str("|exc");
+    for e in &exc {
+        let _ = write!(s, "{},", e);
+    }
+    // files (이름, 바이트) 정렬
+    let mut fm: Vec<&(String, u64)> = files_meta.iter().collect();
+    fm.sort_by(|a, b| a.0.cmp(&b.0));
+    s.push_str("|files");
+    for (n, b) in fm {
+        let _ = write!(s, "{}:{};", n, b);
+    }
+
+    // FNV-1a 64bit × 2 (오프셋 상수 상이) → 128bit hex
+    fn fnv1a(bytes: &[u8], basis: u64) -> u64 {
+        let mut h = basis;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let bytes = s.as_bytes();
+    let h1 = fnv1a(bytes, 0xcbf2_9ce4_8422_2325);
+    let h2 = fnv1a(bytes, 0x8422_2325_cbf2_9ce4);
+    format!("{:016x}{:016x}", h1, h2)
+}
+
 /// radar_name → 파일시스템 안전 스템: 영숫자 외 문자를 '_' 로 치환 + 결정적 짧은 해시 접미사.
-/// 같은 radar_name 은 항상 같은 스템을 생성(재빌드 upsert 시 동일 파일/디렉토리 교체) —
+/// 같은 radar_name 은 항상 같은 스템을 생성(재등록 시 동일 디렉토리 교체) —
 /// DefaultHasher::new() 는 고정 초기상태라 실행 간 결정적.
 fn sanitized_stem(radar_name: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -1574,92 +1500,7 @@ fn sanitized_stem(radar_name: &str) -> String {
     format!("omref_{}_{:08x}", safe, hash)
 }
 
-/// 집계 JSON 파일명 (om_reference/<name>.json)
-pub fn reference_filename(radar_name: &str) -> String {
-    format!("{}.json", sanitized_stem(radar_name))
-}
-
-/// 원시 포인트 아카이브 디렉토리명 (om_reference/points/<name>/)
+/// 원본 ASS 보관·캐시 디렉토리명 (om_reference/ass/<name>/, om_reference/cache/<name>/)
 pub fn reference_dirname(radar_name: &str) -> String {
     sanitized_stem(radar_name)
-}
-
-/// mode_s 문자열(ICAO 24bit hex, 예 "A1B2C3") → u32(24bit 마스킹). 빈 문자열/파싱불가 = 0.
-fn mode_s_to_u32(s: &str) -> u32 {
-    let t = s.trim();
-    if t.is_empty() {
-        return 0;
-    }
-    u32::from_str_radix(t, 16).unwrap_or(0) & 0x00FF_FFFF
-}
-
-/// RadarDetectionType → u8 discriminant (아카이브 포맷). radar_type_str 과 1:1 대응.
-fn radar_type_discriminant(rt: &RadarDetectionType) -> u8 {
-    match rt {
-        RadarDetectionType::ModeAC => 0,
-        RadarDetectionType::ModeACPsr => 1,
-        RadarDetectionType::ModeSAllCall => 2,
-        RadarDetectionType::ModeSRollCall => 3,
-        RadarDetectionType::ModeSAllCallPsr => 4,
-        RadarDetectionType::ModeSRollCallPsr => 5,
-    }
-}
-
-/// 일별 원시 포인트 아카이브(.omp)를 packed 바이너리로 스트리밍 기록.
-/// ASS 원본 없이도 추후 재집계/재분석이 가능하도록 원시 포인트를 그대로 보관한다.
-///
-/// 파일 포맷 (little-endian):
-///   ── 헤더 (12B) ──
-///     magic  "OMP1"  (4B)
-///     u32    version (=1)
-///     u32    point_count  — 레코드 전량 기록 후 seek(오프셋 8)로 실제 개수 패치
-///                           (스트리밍 — 사전 카운트/월 전체 축적 불필요)
-///   ── 레코드 (37B 고정, point_count 개 연속) ──
-///     f64  timestamp  (UTC초, 파서 자정보정 반영)
-///     u32  mode_s     (ICAO 24bit hex→u32; 빈 문자열/파싱불가 = 0)
-///     f64  latitude
-///     f64  longitude
-///     f32  altitude   (LightPoint.altitude 단위 그대로 = meters)
-///     f32  speed      (LightPoint.speed 단위 그대로 = knots)
-///     u8   radar_type (RadarDetectionType discriminant, radar_type_discriminant)
-///   heading 은 미보관 — LightPoint 에 필드가 없고 OM 파이프라인에서 사용하지 않음.
-///
-/// 반환: (기록 레코드 수, 파일 바이트 크기). 월 전체를 메모리에 담지 않도록
-/// 일 단위 플러시 시점에 해당 일 포인트만 기록하고 즉시 해제한다(BufWriter 스트리밍).
-fn write_day_archive(
-    points_dir: &std::path::Path,
-    date: &str,
-    pts: &[LightPoint],
-) -> Result<(u64, u64), String> {
-    use std::io::{BufWriter, Seek, SeekFrom, Write};
-    let path = points_dir.join(format!("{}.omp", date));
-    let file = std::fs::File::create(&path)
-        .map_err(|e| format!("아카이브 파일 생성 실패 ({}): {}", date, e))?;
-    let mut w = BufWriter::with_capacity(1 << 20, file);
-    // 헤더
-    w.write_all(b"OMP1").map_err(|e| format!("아카이브 기록 실패: {}", e))?;
-    w.write_all(&1u32.to_le_bytes()).map_err(|e| format!("아카이브 기록 실패: {}", e))?;
-    w.write_all(&0u32.to_le_bytes()).map_err(|e| format!("아카이브 기록 실패: {}", e))?; // point_count placeholder
-    // 레코드 스트리밍
-    let mut count: u64 = 0;
-    let mut rec = [0u8; 37];
-    for p in pts {
-        rec[0..8].copy_from_slice(&p.timestamp.to_le_bytes());
-        rec[8..12].copy_from_slice(&mode_s_to_u32(&p.mode_s).to_le_bytes());
-        rec[12..20].copy_from_slice(&p.latitude.to_le_bytes());
-        rec[20..28].copy_from_slice(&p.longitude.to_le_bytes());
-        rec[28..32].copy_from_slice(&(p.altitude as f32).to_le_bytes());
-        rec[32..36].copy_from_slice(&(p.speed as f32).to_le_bytes());
-        rec[36] = radar_type_discriminant(&p.radar_type);
-        w.write_all(&rec).map_err(|e| format!("아카이브 기록 실패: {}", e))?;
-        count += 1;
-    }
-    w.flush().map_err(|e| format!("아카이브 flush 실패: {}", e))?;
-    // point_count 패치 (헤더 오프셋 8)
-    let mut file = w.into_inner().map_err(|e| format!("아카이브 into_inner 실패: {}", e))?;
-    file.seek(SeekFrom::Start(8)).map_err(|e| format!("아카이브 seek 실패: {}", e))?;
-    file.write_all(&(count as u32).to_le_bytes()).map_err(|e| format!("아카이브 count 패치 실패: {}", e))?;
-    file.flush().map_err(|e| format!("아카이브 최종 flush 실패: {}", e))?;
-    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    Ok((count, bytes))
 }

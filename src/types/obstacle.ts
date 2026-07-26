@@ -130,12 +130,14 @@ export interface AddedBlockageResult {
 
 // ─── OM 기준데이터 (참조 달 1달치, 헤드라인 Δ 판정용) ───
 //
-// 임의 참조 달(예: 준공 전 기준 달) 1달치를 전방위 처리해 저장한 뒤, 월간 보고서의
-// 추가 차단영역 소실율을 이 기준 대비 편차(Δ%p)로 판정한다.
-// build_om_reference 가 파싱·집계·저장까지 수행하고 메타만 반환, load_om_reference 로 라이브 로드.
-// (라이브 세션 한정 소비 — SerializedOMData/보고서 창 전송 대상 아님. 보고서 창에서 직접 로드.)
+// 재설계: 등록(register_om_reference)은 원본 ASS 사본을 보관하고 메타만 남긴다. 심각성 판정용
+// az×elev 히스토그램은 보고서 생성 시(analyze_obstacle_monthly)에 분석월과 완전히 동일한 쐐기
+// 파이프라인으로 기준월 ASS 를 재집계해 산출하며, 각 레이더 결과의 reference(OmRefWedge)로 실려 온다.
+// 같은 월 입력이면 분석월 히스토그램과 비트 동일 → Δ=0 이 구조적으로 보장된다.
+// 커맨드: register_om_reference(등록=복사만) / list_om_references / delete_om_reference.
+// (좌표·안테나고 정합성 게이트는 재집계가 항상 현재 설정을 쓰므로 폐지됨.)
 
-/** OM 기준데이터 메타 (list_om_references·build_om_reference 반환, snake_case Rust 미러) */
+/** OM 기준데이터 메타 (list_om_references·register_om_reference 반환, snake_case Rust 미러) */
 export interface OmReferenceMeta {
   radar_name: string;
   month_label: string;
@@ -147,31 +149,22 @@ export interface OmReferenceMeta {
   radar_lon: number;
   radar_altitude: number;
   antenna_height: number;
-  total_track_time_secs: number;
-  total_loss_time_secs: number;
-  /** 함께 보관된 원시 포인트 수 (ASS 원본 없이 재집계 가능) */
-  total_points: number;
-  /** 아카이브 파일 합계 바이트 (원시 포인트 바이너리) */
-  archive_bytes: number;
-  /** 별도 보관된 원본 ASS 파일 합계 바이트 — 0이면 미보관(구버전 빌드/보관 실패), 재계산 불가 */
+  /** 보관된 원본 ASS 파일 합계 바이트 — 0이면 미보관(구버전/보관 실패), 재집계 불가 → "재등록 필요" */
   ass_bytes: number;
 }
 
-/** OM 기준데이터 일별 요약 */
-export interface OmReferenceDaily {
-  date: string;
-  psr_rate: number;
-  loss_rate: number;
-  track_time_secs: number;
-  ssr_points: number;
-}
-
-/** OM 기준데이터 본문 (load_om_reference → readBulkJson 로 수신). 월간 합산·전방위 히스토그램. */
-export interface OmReferenceData {
-  version: number;
-  meta: OmReferenceMeta;
-  daily: OmReferenceDaily[];
+/**
+ * 기준월 재집계 결과 (RadarMonthlyResult.reference, Rust OmRefWedge 미러).
+ * 분석월과 동일 쐐기 파이프라인으로 기준월 ASS 를 재집계한 월간 합산 히스토그램.
+ * computeAddedBlockage 의 BlockageReference 원천 — 같은 월이면 Δ=0.
+ */
+export interface OmRefWedge {
+  month_label: string;
   az_elev_histogram: AzElevCell[];
+  total_track_time_secs: number;
+  total_loss_time_secs: number;
+  day_count: number;
+  source_file_count: number;
 }
 
 /**
@@ -204,6 +197,11 @@ export interface RadarMonthlyResult {
   failed_files: string[];
   /** 전체표적 히트맵 (±150NM 전방위 전수 밀도, 표시 전용 — 통계 스코프 60NM 와 무관) — 구버전 캐시엔 없을 수 있음 */
   track_heatmap?: TrackHeatmap | null;
+  /**
+   * 기준월(참조 달) 재집계 결과 — 보고서 생성 시 백엔드가 분석월과 동일 쐐기 파이프라인으로 재집계해 실어 보낸다.
+   * 있으면(히스토그램 존재) computeAddedBlockage 가 Δ 판정, 없으면 noref. 미등록/미보관/재집계 실패 시 null/undefined.
+   */
+  reference?: OmRefWedge | null;
 }
 
 /** 장애물 월간 분석 전체 결과 */

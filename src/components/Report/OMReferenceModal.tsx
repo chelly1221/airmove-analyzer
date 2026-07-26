@@ -2,20 +2,20 @@
  * OM 기준데이터 관리 모달
  *
  * 헤드라인 심각도 판정(추가 차단영역 소실율)을 "기준데이터(임의 참조 달 1달치) 대비 편차 Δ%p"로
- * 판정하기 위한 기준데이터를 관리한다. 레이더 단위 행 목록 하나로 저장 데이터·신규/재계산을 통합하고,
+ * 판정하기 위한 기준데이터를 관리한다. 레이더 단위 행 목록 하나로 저장 데이터·신규 등록을 통합하고,
  * 파일·기준월 선택은 레이더별 설정 서브모달로 분리한다(파일 선택 시 펼쳐지던 드럼휠이 본 모달을 늘리지 않게).
  *
- * 빌드 오케스트레이션은 이 모달이 아니라 스토어(useOmReferenceBuildStore)가 소유한다 —
- * 모달을 닫아도 빌드는 백그라운드로 계속된다(수십 분 빌드가 메인 창을 인질로 잡지 않게).
+ * 재설계: 등록은 원본 ASS 사본을 보관하고 메타만 남긴다(집계·재계산 없음). 심각도 판정용 히스토그램은
+ * 보고서 생성 시 분석월과 동일 쐐기 파이프라인으로 **현재 설정으로 재집계**되므로, 좌표·안테나고 정합성
+ * 배지가 필요 없다(같은 월 → Δ=0). 등록 오케스트레이션은 이 모달이 아니라 스토어(useOmReferenceBuildStore)가
+ * 소유한다 — 모달을 닫아도 복사(수 GB 가능)는 백그라운드로 계속된다.
  *
- * - build_om_reference: 파싱·집계·저장까지 백엔드가 수행(전방위 — azimuth_sectors/building_* 무시).
- *   부분 성공 계약 — 실패 레이더는 반환 목록에서 제외되며, 스토어가 이를 job.status="error" 로 판정한다.
- * - rebuild_om_reference: 보관된 원본 ASS 로 파일 재선택 없이 재계산(현재 좌표·안테나고 반영 → 정합성 해소).
- * - 원시 포인트 아카이브 + 원본 ASS 가 별도 경로에 보관되어 원본 없이도 재계산 가능(meta.ass_bytes>0).
- * - 동일 radar_name 재빌드는 덮어쓰기다.
+ * - register_om_reference: 원본 ASS 복사(stage "copy")만 수행. 부분 성공 계약 — 실패 레이더는 반환 목록에서
+ *   제외되며, 스토어가 job.status="error" 로 판정한다. 동일 radar_name 재등록은 덮어쓰기(캐시 무효화).
+ * - meta.ass_bytes===0 = 원본 미보관(구버전) → "재등록 필요"(재집계 불가).
  *
  * 폼 상태(forms Map)는 이 부모가 소유 — 설정 서브모달은 뷰일 뿐이다.
- * 레이더 A 설정 → 닫기 → B 설정 후 본 모달의 일괄 빌드가 유지되도록.
+ * 레이더 A 설정 → 닫기 → B 설정 후 본 모달의 일괄 등록이 유지되도록.
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { format } from "date-fns";
@@ -25,15 +25,13 @@ import { Radio, FolderOpen, Trash2, Loader2, Database, TriangleAlert, RefreshCw,
 import Modal from "../common/Modal";
 import MonthPicker from "../common/MonthPicker";
 import { extractDateFromFilename, filterFilesByMonth } from "../../utils/omFiles";
-import { checkRefCoherence } from "../../utils/omReference";
 import { useOmReferenceBuildStore, type OmRefJobStatus } from "../../store/omReferenceBuild";
-import type { RadarSite, Aircraft, OmReferenceMeta } from "../../types";
+import type { RadarSite, OmReferenceMeta } from "../../types";
 
 interface OMReferenceModalProps {
   open: boolean;
   onClose: () => void;
   customRadarSites: RadarSite[];
-  aircraft: Aircraft[];
 }
 
 /** 레이더별 폼 상태 */
@@ -176,7 +174,7 @@ function RadarConfigForm({
   );
 }
 
-export default function OMReferenceModal({ open, onClose, customRadarSites, aircraft }: OMReferenceModalProps) {
+export default function OMReferenceModal({ open, onClose, customRadarSites }: OMReferenceModalProps) {
   // 저장된 기준데이터 목록
   const [references, setReferences] = useState<OmReferenceMeta[]>([]);
   const [loadingList, setLoadingList] = useState(false);
@@ -196,11 +194,8 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
   const jobs = useOmReferenceBuildStore((s) => s.jobs);
   const progress = useOmReferenceBuildStore((s) => s.progress);
   const startBuild = useOmReferenceBuildStore((s) => s.startBuild);
-  const startRebuild = useOmReferenceBuildStore((s) => s.startRebuild);
   const requestCancel = useOmReferenceBuildStore((s) => s.requestCancel);
   const clearJobs = useOmReferenceBuildStore((s) => s.clearJobs);
-
-  const excludeModeS = useMemo(() => aircraft.map((a) => a.mode_s_code).filter(Boolean), [aircraft]);
 
   const refreshList = useCallback(async () => {
     setLoadingList(true);
@@ -288,13 +283,8 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
 
   const handleBuild = useCallback(() => {
     if (buildItems.length === 0 || building) return;
-    startBuild(buildItems, excludeModeS);
-  }, [buildItems, building, startBuild, excludeModeS]);
-
-  const handleRebuild = useCallback((site: RadarSite, monthLabel: string) => {
-    if (building) return;
-    startRebuild(site, monthLabel, excludeModeS);
-  }, [building, startRebuild, excludeModeS]);
+    startBuild(buildItems);
+  }, [buildItems, building, startBuild]);
 
   const handleDelete = useCallback(async (radarName: string) => {
     try { await invoke("delete_om_reference", { radarName }); }
@@ -325,8 +315,8 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
           <div className="flex items-start gap-2 rounded-lg bg-[#a60739]/5 px-3.5 py-2.5">
             <Database size={15} className="mt-0.5 shrink-0 text-[#a60739]" />
             <p className="text-[11px] leading-relaxed text-gray-500">
-              기준데이터는 임의 참조 달 1달치를 전방위로 집계한 자료로, 헤드라인 심각도를 기준월 대비 편차(Δ%p)로 판정하는 데 쓰입니다.
-              {" "}원시 포인트 아카이브와 함께 원본 ASS 파일이 별도 경로에 보관되어, 파일을 다시 선택하지 않아도 재계산할 수 있습니다.
+              기준데이터는 임의 참조 달 1달치의 원본 ASS 사본으로, 헤드라인 심각도를 기준월 대비 편차(Δ%p)로 판정하는 데 쓰입니다.
+              {" "}기준월 재집계는 보고서 생성 시 현재 레이더 설정으로 수행되므로, 좌표·안테나고를 바꿔도 재등록 없이 반영됩니다.
             </p>
           </div>
 
@@ -349,8 +339,8 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
                 {/* 등록 레이더 행 */}
                 {customRadarSites.map((radar) => {
                   const existing = references.find((r) => r.radar_name === radar.name);
-                  const coh = existing ? checkRefCoherence(existing, radar) : null;
-                  const canRebuild = !building && !!existing && existing.ass_bytes > 0;
+                  // 원본 보관(ass_bytes>0)이면 적용 가능 — 재집계는 생성 시 현재 설정으로 수행되므로 정합성 게이트 없음.
+                  const hasStored = !!existing && existing.ass_bytes > 0;
                   const form = forms.get(radar.name);
                   const files = form?.files ?? [];
                   const month = form?.month ?? "";
@@ -367,12 +357,12 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
                           {existing ? (
                             <>
                               <span className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[9px] text-gray-500">기준월 {existing.month_label}</span>
-                              {coh && !coh.ok ? (
-                                <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-600" title="빌드 시점과 현재 레이더 좌표·안테나고가 달라 기준 미적용 — 보고서에 등급 없이 '기준데이터 없음'으로 표기됩니다.">
-                                  미적용 · {coh.reasonText}
-                                </span>
-                              ) : (
+                              {hasStored ? (
                                 <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[9px] text-emerald-600">적용 가능</span>
+                              ) : (
+                                <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-600" title="원본 ASS 미보관(구버전 등록) — 기준월 재집계 불가. 파일을 다시 선택해 재등록하세요.">
+                                  원본 미보관 · 재등록 필요
+                                </span>
                               )}
                             </>
                           ) : (
@@ -392,25 +382,14 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
 
                         <div className="ml-auto flex items-center gap-0.5">
                           {existing && (
-                            <>
-                              <button
-                                onClick={() => handleRebuild(radar, existing.month_label)}
-                                disabled={!canRebuild}
-                                className="rounded-md p-1 text-gray-300 hover:bg-[#a60739]/5 hover:text-[#a60739] disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-gray-300"
-                                title={existing.ass_bytes === 0
-                                  ? "원본 미보관(구버전 빌드) — 파일을 다시 선택해 재계산하세요"
-                                  : "보관된 원본 ASS로 재계산 — 현재 레이더 좌표·안테나고 반영"}>
-                                <RefreshCw size={13} />
-                              </button>
-                              <button onClick={() => setDeleteTarget(existing)} disabled={building}
-                                className="rounded-md p-1 text-gray-300 hover:bg-red-50 hover:text-red-500 disabled:opacity-40" title="삭제">
-                                <Trash2 size={13} />
-                              </button>
-                            </>
+                            <button onClick={() => setDeleteTarget(existing)} disabled={building}
+                              className="rounded-md p-1 text-gray-300 hover:bg-red-50 hover:text-red-500 disabled:opacity-40" title="삭제">
+                              <Trash2 size={13} />
+                            </button>
                           )}
                           <button onClick={() => setConfigTarget(radar.name)}
                             className="flex items-center gap-1 rounded-lg bg-[#a60739] px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e]">
-                            <Settings size={12} /> 설정
+                            <Settings size={12} /> {existing ? "재등록" : "설정"}
                           </button>
                         </div>
                       </div>
@@ -418,8 +397,7 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
                       {/* 2행(부, 저장 데이터 있을 때만): 상세 */}
                       {existing && (
                         <p className="mt-1.5 pl-[22px] font-mono text-[10px] text-gray-400">
-                          기간 {existing.first_date} ~ {existing.last_date} · 파일 {existing.file_count}개 · 포인트 {existing.total_points.toLocaleString()}
-                          {" · "}아카이브 {formatBytes(existing.archive_bytes)}
+                          기간 {existing.first_date} ~ {existing.last_date} · 파일 {existing.file_count}개
                           {" · "}원본 ASS {existing.ass_bytes > 0 ? formatBytes(existing.ass_bytes) : "미보관"}
                           {" · "}생성 {existing.created_at.slice(0, 10)}
                         </p>
@@ -446,8 +424,7 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
                       </div>
                     </div>
                     <p className="mt-1.5 pl-[22px] font-mono text-[10px] text-gray-400">
-                      기간 {r.first_date} ~ {r.last_date} · 파일 {r.file_count}개 · 포인트 {r.total_points.toLocaleString()}
-                      {" · "}아카이브 {formatBytes(r.archive_bytes)}
+                      기간 {r.first_date} ~ {r.last_date} · 파일 {r.file_count}개
                       {" · "}원본 ASS {r.ass_bytes > 0 ? formatBytes(r.ass_bytes) : "미보관"}
                       {" · "}생성 {r.created_at.slice(0, 10)}
                     </p>
@@ -569,8 +546,8 @@ export default function OMReferenceModal({ open, onClose, customRadarSites, airc
               <p className="text-center text-sm text-gray-500">
                 <span className="font-semibold text-gray-700">{deleteTarget.radar_name}</span>의 기준데이터({deleteTarget.month_label})를 삭제하시겠습니까?<br />
                 {deleteTarget.ass_bytes > 0
-                  ? <>보관된 원본 ASS({formatBytes(deleteTarget.ass_bytes)})와 원시 포인트 아카이브({formatBytes(deleteTarget.archive_bytes)})도 함께 삭제됩니다.</>
-                  : <>보관된 원시 포인트 아카이브({formatBytes(deleteTarget.archive_bytes)})도 함께 삭제됩니다.</>}
+                  ? <>보관된 원본 ASS({formatBytes(deleteTarget.ass_bytes)})와 재집계 캐시가 함께 삭제됩니다.</>
+                  : <>재집계 캐시가 함께 삭제됩니다.</>}
               </p>
             </div>
             <div className="flex gap-2 border-t border-gray-200 px-6 py-4">

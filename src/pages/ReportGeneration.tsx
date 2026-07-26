@@ -110,7 +110,6 @@ export default function ReportGeneration() {
         open={referenceModalOpen}
         onClose={() => setReferenceModalOpen(false)}
         customRadarSites={customRadarSites}
-        aircraft={aircraft}
       />
     </div>
   );

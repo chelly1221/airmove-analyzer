@@ -13,6 +13,7 @@
  *   분자 = Σ(추가 차단영역 밴드 셀의 소실시간)                            — 밴드 소실시간
  *   소실율(%) = 분자 / 분모 × 100
  *   Δ = 동일 정의(방위 전체 대비)로 산출한 기준월 소실율 대비 편차(%p).
+ *       기준 히스토그램은 보고서 생성 시 분석월과 동일 쐐기 파이프라인으로 재집계된 것(같은 월 → Δ=0 불변식).
  *
  * panoWith 는 호출부(ReportApp)가 건물별로 좁혀(panoWithForBuilding = without ∪ {해당 건물}) 넘긴다 —
  * 방위 중첩 인접 분석 대상의 한계기여가 양쪽 건물에 중복 귀속되던 v1 한계 해소(차트 핑크영역과 계속 일치).
@@ -54,7 +55,10 @@ export interface BlockageDayHist {
   cells: AzElevCell[];
 }
 
-/** 기준데이터 참조 (헤드라인 Δ 판정용) — 월간 합산·전방위 히스토그램 + 기준월 라벨. */
+/**
+ * 기준데이터 참조 (헤드라인 Δ 판정용) — 보고서 생성 시 동일 쐐기 파이프라인으로 재집계한 월간 합산
+ * 히스토그램 + 기준월 라벨(같은 월 → Δ=0 불변식). 호출부(ReportApp)가 rr.reference 에서 넘긴다.
+ */
 export interface BlockageReference {
   histogram: AzElevCell[];
   monthLabel: string;

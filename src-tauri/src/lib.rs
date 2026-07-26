@@ -1411,7 +1411,19 @@ async fn analyze_obstacle_monthly(
             };
 
             match om::analyze_radar_monthly(radar, &exclude_mode_s, mag_dec, &cancel, &progress_fn) {
-                Ok(result) => {
+                Ok(mut result) => {
+                    // ── 기준월(참조 달) 재집계 + 캐시 통합 ──
+                    // registry 에 이 레이더의 보관 ASS 가 있으면, 분석월과 완전히 동일한 쐐기
+                    // 파이프라인(현재 sector·최소거리·좌표/안테나고·검사기 제외)으로 기준월 ASS 를
+                    // 재집계해 result.reference 에 싣는다(같은 월 → Δ=0 불변식). 설정 해시로 디스크 캐시.
+                    // 실패(파일 소실·파싱 에러)는 warn + noref — 보고서 생성을 막지 않는다.
+                    match compute_radar_reference(&handle, radar, &exclude_mode_s, mag_dec, &cancel, &progress_fn) {
+                        Ok(opt) => { result.reference = opt; }
+                        Err(e) if e.contains("취소") => { return Err(e); }
+                        Err(e) => {
+                            log::warn!("[OmReference] 레이더 '{}' 기준월 재집계 실패 — 기준 미적용(noref): {}", radar.radar_name, e);
+                        }
+                    }
                     // 레이더 1개 결과를 개별 bulk 파일로 즉시 기록 → 메모리도 즉시 해제
                     let r = bulk::write_json(&handle, &result)?;
                     info!(
@@ -1455,13 +1467,14 @@ async fn analyze_obstacle_monthly(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// OM 기준데이터(참조 달) — 집계 산출물 영구 저장/로드
+// OM 기준데이터(참조 달) — 등록(원본 ASS 사본 보관) + 보고서 생성 시 재집계·캐시
 // ════════════════════════════════════════════════════════════════════════════
 //
-// 원시 track point 는 저장하지 않고, 집계 산출물(일별 요약 + 월간 합산 az×elev
-// 히스토그램)만 앱데이터 루트 아래 om_reference/ 에 레이더별 1파일로 보관한다.
-// 이 디렉토리는 bulk_ipc 의 10분 sweep 대상이 아니다(영구 보관) — bulk.rs 와
-// 동일한 app_data_dir 루트를 사용하되 별도 하위 디렉토리.
+// 재설계: 등록(register_om_reference)은 원본 ASS 를 om_reference/ass/<dir>/ 에 복사하고
+// 메타만 registry(settings)에 남긴다. 히스토그램은 보고서 생성 시(analyze_obstacle_monthly →
+// compute_radar_reference)에 분석월과 동일 쐐기 파이프라인으로 재집계하고 om_reference/cache/<dir>/
+// <hash>.json 에 디스크 캐시한다. 이 디렉토리들은 bulk_ipc 의 10분 sweep 대상이 아니다(영구
+// 보관) — bulk.rs 와 동일한 app_data_dir 루트를 사용하되 별도 하위 디렉토리.
 
 /// om_reference 영구 디렉토리 (app_data/om_reference) — bulk sweep 비대상
 fn om_reference_dir(state: &AppState) -> Result<PathBuf, String> {
@@ -1477,11 +1490,14 @@ fn om_reference_dir(state: &AppState) -> Result<PathBuf, String> {
     Ok(d)
 }
 
-/// 레지스트리: radar_name → {메타 + 파일경로}. settings 키 om_reference_registry 에 JSON 저장.
+/// 레지스트리: radar_name → {메타 + 원본 ASS 보관 디렉토리}. settings 키 om_reference_registry 에 JSON 저장.
 type OmReferenceRegistry =
     std::collections::HashMap<String, analysis::obstacle_monthly::OmReferenceRegistryEntry>;
 
-/// 레지스트리 로드 (없으면 빈 맵, 파싱 실패해도 빈 맵으로 복구 — 기능 브릭 방지)
+/// 레지스트리 로드 (없으면 빈 맵, 파싱 실패해도 빈 맵으로 복구 — 기능 브릭 방지).
+/// 구버전 마이그레이션(1회 lazy cleanup): 구버전 엔트리의 집계 JSON 파일(file_path)·원시 포인트
+/// 아카이브(points_dir)를 발견하면 삭제하고 필드를 비워 저장한다. ass_dir 은 그대로 유지 —
+/// 구버전이 원본 ASS 를 보관했다면 새 시스템(재집계)에서 그대로 사용 가능하다.
 fn load_om_registry(state: &AppState) -> Result<OmReferenceRegistry, String> {
     let conn = state
         .db
@@ -1490,13 +1506,35 @@ fn load_om_registry(state: &AppState) -> Result<OmReferenceRegistry, String> {
         .get()
         .map_err(|e| format!("DB pool: {}", e))?;
     let raw = db::get_setting(&conn, "om_reference_registry").map_err(|e| format!("DB error: {}", e))?;
-    match raw {
-        Some(s) => Ok(serde_json::from_str(&s).unwrap_or_else(|e| {
+    let mut registry: OmReferenceRegistry = match raw {
+        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
             log::warn!("[OmReference] 레지스트리 파싱 실패(빈 맵으로 복구): {}", e);
             OmReferenceRegistry::new()
-        })),
-        None => Ok(OmReferenceRegistry::new()),
+        }),
+        None => OmReferenceRegistry::new(),
+    };
+    // conn 을 먼저 반납해야 save 경로가 다시 lock 할 수 있음
+    drop(conn);
+
+    // ── 구버전 잔재 lazy cleanup (1회) ──
+    let mut dirty = false;
+    for entry in registry.values_mut() {
+        if !entry.file_path.is_empty() {
+            let _ = fs::remove_file(&entry.file_path);
+            entry.file_path.clear();
+            dirty = true;
+        }
+        if !entry.points_dir.is_empty() {
+            let _ = fs::remove_dir_all(&entry.points_dir);
+            entry.points_dir.clear();
+            dirty = true;
+        }
     }
+    if dirty {
+        log::info!("[OmReference] 구버전 잔재 정리(집계 JSON·포인트 아카이브 삭제) 후 레지스트리 갱신");
+        let _ = save_om_registry(state, &registry);
+    }
+    Ok(registry)
 }
 
 /// 레지스트리 저장
@@ -1511,36 +1549,25 @@ fn save_om_registry(state: &AppState, reg: &OmReferenceRegistry) -> Result<(), S
     db::set_setting(&conn, "om_reference_registry", &json).map_err(|e| format!("DB error: {}", e))
 }
 
-/// 기준데이터 빌드: 파싱→집계(전방위 60NM)→om_reference/ 파일 저장→레지스트리 upsert.
-/// 대용량 IPC 없음 — 소형 메타 목록만 직접 반환. 진행률은 om-reference-progress 이벤트.
+/// 기준데이터 등록 — 파싱·집계 없이 원본 ASS 사본만 om_reference/ass/<dir>/ 에 보관 + 메타/레지스트리 upsert.
+/// 심각성 판정용 히스토그램은 보고서 생성 시(analyze_obstacle_monthly)에 현재 설정으로 재집계하므로
+/// 여기선 좌표·안테나고 정합성 게이트가 불필요하다. 진행 이벤트 stage "copy". 대용량 IPC 없음.
+/// 복사 실패/취소 = 등록 실패(반쯤 복사된 dest 제거). 재등록 시 해당 레이더 캐시 디렉토리 삭제.
 #[tauri::command]
-async fn build_om_reference(
+async fn register_om_reference(
     app_handle: tauri::AppHandle,
     radar_file_sets: Vec<analysis::obstacle_monthly::RadarFileSet>,
-    exclude_mode_s: Vec<String>,
     month_label: String,
 ) -> Result<Vec<analysis::obstacle_monthly::OmReferenceMeta>, String> {
     use analysis::obstacle_monthly::{self as om, ObstacleMonthlyProgress};
 
     info!(
-        "Command: build_om_reference({} radars, month={}, exclude={:?})",
+        "Command: register_om_reference({} radars, month={})",
         radar_file_sets.len(),
-        month_label,
-        exclude_mode_s
+        month_label
     );
 
-    // 편각: 첫 레이더의 첫 파일 기준 (analyze_obstacle_monthly 와 동일)
-    let mag_dec = if let Some(rfs) = radar_file_sets.first() {
-        if let Some(first_path) = rfs.file_paths.first() {
-            resolve_declination(&app_handle, first_path, rfs.radar_lat, rfs.radar_lon).await
-        } else {
-            -8.5
-        }
-    } else {
-        -8.5
-    };
-
-    // 취소 토큰 초기화 (analyze 경로와 동일한 플래그 재사용 — cancel_analysis 로 중단 가능)
+    // 취소 토큰 초기화 (analyze/register 공유 플래그 — cancel_analysis 로 중단 가능)
     let cancel = {
         let state = app_handle.state::<AppState>();
         state.analysis_cancel.store(false, Ordering::Relaxed);
@@ -1559,203 +1586,128 @@ async fn build_om_reference(
                 return Err("분석이 취소되었습니다".to_string());
             }
 
-            // JSON 집계 파일 + 원시 포인트 아카이브 디렉토리 경로 (결정적 스템)
-            let filename = om::reference_filename(&radar.radar_name);
-            let json_path = ref_dir.join(&filename);
-            let points_dir = ref_dir.join("points").join(om::reference_dirname(&radar.radar_name));
+            let dirname = om::reference_dirname(&radar.radar_name);
+            let ass_dest = ref_dir.join("ass").join(&dirname);
+            let cache_dir = ref_dir.join("cache").join(&dirname);
 
             let h = handle.clone();
             let progress_fn = move |p: ObstacleMonthlyProgress| {
                 let _ = h.emit("om-reference-progress", p);
             };
 
-            match om::build_reference_for_radar(radar, &exclude_mode_s, &month_label, mag_dec, &points_dir, &cancel, &progress_fn) {
-                Ok(data) => {
-                    // 원본 ASS 보관 디렉토리 (om_reference/ass/<dir>/) — 결정적 스템
-                    let ass_dest = ref_dir.join("ass").join(om::reference_dirname(&radar.radar_name));
+            // first/last date — 파일명 날짜 추출(Rust extract_date_from_filename, omFiles.ts 미러). 추출 실패 파일 무시.
+            let mut dates: Vec<String> = radar
+                .file_paths
+                .iter()
+                .filter_map(|p| parser::ass::extract_date_from_filename(p))
+                .collect();
+            dates.sort();
+            let first_date = dates.first().cloned().unwrap_or_default();
+            let last_date = dates.last().cloned().unwrap_or_default();
 
-                    // 기존 등록 파일/디렉토리가 다른 경로면 제거 (upsert 시 고아 정리)
-                    if let Some(prev) = registry.get(&radar.radar_name) {
-                        if prev.file_path != json_path.to_string_lossy() {
-                            let _ = fs::remove_file(&prev.file_path);
-                        }
-                        if prev.points_dir != points_dir.to_string_lossy() {
-                            let _ = fs::remove_dir_all(&prev.points_dir);
-                        }
-                        // 원본 ASS 보관 디렉토리 고아 정리 (경로 규칙이 바뀐 구버전 잔재 — file_path/points_dir 정리와 나란히)
-                        if !prev.ass_dir.is_empty() && prev.ass_dir != ass_dest.to_string_lossy() {
-                            let _ = fs::remove_dir_all(&prev.ass_dir);
-                        }
+            // ── 원본 ASS 복사 (build 의 복사 루프 재사용 — 충돌명·진행 이벤트·취소 처리) ──
+            if ass_dest.exists() {
+                let _ = fs::remove_dir_all(&ass_dest);
+            }
+            fs::create_dir_all(&ass_dest)
+                .map_err(|e| format!("레이더 '{}' 보관 디렉토리 생성 실패: {}", radar.radar_name, e))?;
+
+            let n = radar.file_paths.len();
+            let mut copied_bytes: u64 = 0;
+            let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (i, src) in radar.file_paths.iter().enumerate() {
+                // 취소: 반쯤 복사된 dest 제거 후 등록 실패 반환
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = fs::remove_dir_all(&ass_dest);
+                    return Err("분석이 취소되었습니다".to_string());
+                }
+                let basename = std::path::Path::new(src)
+                    .file_name()
+                    .map(|nm| nm.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("file_{:03}", i));
+                // basename 충돌 시 3자리 인덱스 접두 (날짜 추출은 '_' split 후 len==6 토큰 탐색 → 접두 무해)
+                let name = if used_names.contains(&basename) {
+                    format!("{:03}_{}", i, basename)
+                } else {
+                    basename
+                };
+                let dst = ass_dest.join(&name);
+                progress_fn(ObstacleMonthlyProgress {
+                    radar_name: radar.radar_name.clone(),
+                    stage: "copy".to_string(),
+                    message: format!("원본 ASS 보관 중 ({}/{})", i + 1, n),
+                    current: i + 1,
+                    total: n,
+                });
+                match fs::copy(src, &dst) {
+                    Ok(nbytes) => {
+                        copied_bytes += nbytes;
+                        used_names.insert(name);
                     }
-                    // 스트리밍 직렬화 (수십 MB — 전체 문자열 복제 없음)
-                    let file = fs::File::create(&json_path).map_err(|e| format!("기준데이터 파일 생성 실패: {}", e))?;
-                    let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
-                    serde_json::to_writer(&mut w, &data).map_err(|e| format!("기준데이터 직렬화 실패: {}", e))?;
-                    {
-                        use std::io::Write;
-                        w.flush().map_err(|e| format!("기준데이터 flush 실패: {}", e))?;
-                    }
-
-                    let mut meta = data.meta.clone();
-
-                    // ── 원본 ASS 파일 별도 보관 (파일 재선택 없이 재계산 지원) ──
-                    // JSON 집계 저장 성공 이후에만 시작한다(집계 실패/취소 arm 에선 dest 미생성).
-                    // 보관 실패는 기준데이터 등록을 무효화하지 않는다 — ass_dir 을 비워 재계산 불가로만 표시.
-                    let mut ass_dir_str = String::new();
-                    if ass_dest.exists() {
+                    Err(e) => {
+                        // 복사 IO 실패 = 등록 실패(반쯤 복사된 dest 제거).
                         let _ = fs::remove_dir_all(&ass_dest);
+                        return Err(format!("레이더 '{}' 원본 ASS 보관 실패: {}", radar.radar_name, e));
                     }
-                    match fs::create_dir_all(&ass_dest) {
-                        Ok(_) => {
-                            let n = radar.file_paths.len();
-                            let mut copied_bytes: u64 = 0;
-                            let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-                            let mut copy_failed = false;
-                            let mut copy_cancelled = false;
-                            for (i, src) in radar.file_paths.iter().enumerate() {
-                                // 취소: 반쯤 복사된 dest 제거 후 아래에서 미보관으로 등록(집계는 유효) 후 종료
-                                if cancel.load(Ordering::Relaxed) {
-                                    let _ = fs::remove_dir_all(&ass_dest);
-                                    copy_cancelled = true;
-                                    break;
-                                }
-                                let basename = std::path::Path::new(src)
-                                    .file_name()
-                                    .map(|nm| nm.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| format!("file_{:03}", i));
-                                // basename 충돌 시 3자리 인덱스 접두 (날짜 추출은 '_' split 후 len==6 토큰 탐색 →
-                                // 3자리 접두 토큰은 무해)
-                                let name = if used_names.contains(&basename) {
-                                    format!("{:03}_{}", i, basename)
-                                } else {
-                                    basename
-                                };
-                                let dst = ass_dest.join(&name);
-                                progress_fn(ObstacleMonthlyProgress {
-                                    radar_name: radar.radar_name.clone(),
-                                    stage: "copy".to_string(),
-                                    message: format!("원본 ASS 보관 중 ({}/{})", i + 1, n),
-                                    current: i + 1,
-                                    total: n,
-                                });
-                                match fs::copy(src, &dst) {
-                                    Ok(nbytes) => {
-                                        copied_bytes += nbytes;
-                                        used_names.insert(name);
-                                    }
-                                    Err(e) => {
-                                        // 복사 IO 실패: 반쯤 복사된 dest 제거 + 에러 이벤트 후 미보관으로 계속 진행
-                                        let _ = fs::remove_dir_all(&ass_dest);
-                                        progress_fn(ObstacleMonthlyProgress {
-                                            radar_name: radar.radar_name.clone(),
-                                            stage: "error".to_string(),
-                                            message: format!(
-                                                "레이더 '{}' 원본 ASS 보관 실패: {} — 재계산 시 파일을 다시 선택해야 합니다",
-                                                radar.radar_name, e
-                                            ),
-                                            current: 0,
-                                            total: 0,
-                                        });
-                                        copy_failed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if copy_cancelled {
-                                // 집계 자체는 유효하므로 미보관(ass_dir="")으로 등록을 완료한 뒤 취소 반환.
-                                meta.ass_bytes = 0;
-                                registry.insert(
-                                    radar.radar_name.clone(),
-                                    om::OmReferenceRegistryEntry {
-                                        meta: meta.clone(),
-                                        file_path: json_path.to_string_lossy().to_string(),
-                                        points_dir: points_dir.to_string_lossy().to_string(),
-                                        ass_dir: String::new(),
-                                    },
-                                );
-                                let _ = save_om_registry(&state, &registry);
-                                return Err("분석이 취소되었습니다".to_string());
-                            }
-                            if copy_failed {
-                                meta.ass_bytes = 0; // 미보관 — ass_dir_str 은 빈 채로 유지
-                            } else {
-                                meta.ass_bytes = copied_bytes;
-                                ass_dir_str = ass_dest.to_string_lossy().to_string();
-                            }
-                        }
-                        Err(e) => {
-                            // 보관 디렉토리 생성 실패: 에러 이벤트 후 미보관으로 계속 진행
-                            progress_fn(ObstacleMonthlyProgress {
-                                radar_name: radar.radar_name.clone(),
-                                stage: "error".to_string(),
-                                message: format!(
-                                    "레이더 '{}' 원본 ASS 보관 실패: {} — 재계산 시 파일을 다시 선택해야 합니다",
-                                    radar.radar_name, e
-                                ),
-                                current: 0,
-                                total: 0,
-                            });
-                            meta.ass_bytes = 0;
-                        }
-                    }
-
-                    registry.insert(
-                        radar.radar_name.clone(),
-                        om::OmReferenceRegistryEntry {
-                            meta: meta.clone(),
-                            file_path: json_path.to_string_lossy().to_string(),
-                            points_dir: points_dir.to_string_lossy().to_string(),
-                            ass_dir: ass_dir_str,
-                        },
-                    );
-                    // 부분 진행 영속화 — 레이더 1개 끝날 때마다 레지스트리 저장
-                    save_om_registry(&state, &registry)?;
-
-                    let bytes = fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
-                    info!(
-                        "[OmReference] 레이더 '{}' 저장: {} ({:.1}MB) + 아카이브 {} pts / {:.1}MB + 원본 ASS {:.1}MB",
-                        radar.radar_name,
-                        filename,
-                        bytes as f64 / 1024.0 / 1024.0,
-                        meta.total_points,
-                        meta.archive_bytes as f64 / 1024.0 / 1024.0,
-                        meta.ass_bytes as f64 / 1024.0 / 1024.0
-                    );
-                    metas.push(meta);
-                }
-                Err(e) if e.contains("취소") => {
-                    // 반쯤 쓰인 아카이브 정리 (registry 미등록 → 다음 빌드가 어차피 재작성하지만 즉시 정리)
-                    let _ = fs::remove_dir_all(&points_dir);
-                    return Err(e);
-                }
-                Err(e) => {
-                    info!("[OmReference] 레이더 '{}' 빌드 실패: {}", radar.radar_name, e);
-                    // 실패한 레이더의 반쯤 쓰인 아카이브 정리 (JSON 은 미생성, registry 미등록)
-                    let _ = fs::remove_dir_all(&points_dir);
-                    let h2 = handle.clone();
-                    let _ = h2.emit(
-                        "om-reference-progress",
-                        ObstacleMonthlyProgress {
-                            radar_name: radar.radar_name.clone(),
-                            stage: "error".to_string(),
-                            message: format!("레이더 '{}' 기준데이터 빌드 실패: {}", radar.radar_name, e),
-                            current: 0,
-                            total: 0,
-                        },
-                    );
                 }
             }
+
+            // 재등록: 이전 캐시 무효화 (보관 ASS 가 교체되었으므로) + 경로 규칙이 바뀐 구버전 잔재 정리
+            let _ = fs::remove_dir_all(&cache_dir);
+            if let Some(prev) = registry.get(&radar.radar_name) {
+                if !prev.file_path.is_empty() {
+                    let _ = fs::remove_file(&prev.file_path);
+                }
+                if !prev.points_dir.is_empty() {
+                    let _ = fs::remove_dir_all(&prev.points_dir);
+                }
+                if !prev.ass_dir.is_empty() && prev.ass_dir != ass_dest.to_string_lossy() {
+                    let _ = fs::remove_dir_all(&prev.ass_dir);
+                }
+            }
+
+            let meta = om::OmReferenceMeta {
+                radar_name: radar.radar_name.clone(),
+                month_label: month_label.clone(),
+                file_count: n as u32,
+                first_date,
+                last_date,
+                created_at: om::now_iso8601(),
+                radar_lat: radar.radar_lat,
+                radar_lon: radar.radar_lon,
+                radar_altitude: radar.radar_altitude,
+                antenna_height: radar.antenna_height,
+                ass_bytes: copied_bytes,
+            };
+            registry.insert(
+                radar.radar_name.clone(),
+                om::OmReferenceRegistryEntry {
+                    meta: meta.clone(),
+                    ass_dir: ass_dest.to_string_lossy().to_string(),
+                    file_path: String::new(),
+                    points_dir: String::new(),
+                },
+            );
+            // 부분 진행 영속화 — 레이더 1개 끝날 때마다 레지스트리 저장
+            save_om_registry(&state, &registry)?;
+            info!(
+                "[OmReference] 레이더 '{}' 등록: 원본 ASS {} files / {:.1}MB",
+                radar.radar_name,
+                n,
+                copied_bytes as f64 / 1024.0 / 1024.0
+            );
+            metas.push(meta);
         }
         Ok(metas)
     })
     .await
-    .map_err(|e| format!("빌드 스레드 오류: {}", e))??;
+    .map_err(|e| format!("등록 스레드 오류: {}", e))??;
 
-    info!("[OmReference] 완료: {} 레이더 저장", metas.len());
+    info!("[OmReference] 등록 완료: {} 레이더", metas.len());
     Ok(metas)
 }
 
-/// 저장된 기준데이터 메타 목록 (소형 JSON — 직접 반환)
+/// 저장된 기준데이터 메타 목록 (소형 JSON — 직접 반환). ass_bytes=0 = 원본 미보관(재등록 필요).
 #[tauri::command]
 async fn list_om_references(
     app_handle: tauri::AppHandle,
@@ -1771,21 +1723,29 @@ async fn list_om_references(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-/// 기준데이터 삭제 (파일 + 레지스트리)
+/// 기준데이터 삭제 (원본 ASS 보관본 + 캐시 디렉토리 + 레지스트리 엔트리 + 구버전 잔재)
 #[tauri::command]
 async fn delete_om_reference(radar_name: String, app_handle: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
+        let ref_dir = om_reference_dir(&state)?;
+        let dirname = analysis::obstacle_monthly::reference_dirname(&radar_name);
         let mut registry = load_om_registry(&state)?;
         if let Some(entry) = registry.remove(&radar_name) {
-            let _ = fs::remove_file(&entry.file_path);
-            let _ = fs::remove_dir_all(&entry.points_dir);
-            // 원본 ASS 보관본도 함께 제거 (미보관이면 빈 문자열 → no-op)
             if !entry.ass_dir.is_empty() {
                 let _ = fs::remove_dir_all(&entry.ass_dir);
             }
+            // 구버전 잔재 (있으면 — load 시점 cleanup 을 못 탄 경로 방어)
+            if !entry.file_path.is_empty() {
+                let _ = fs::remove_file(&entry.file_path);
+            }
+            if !entry.points_dir.is_empty() {
+                let _ = fs::remove_dir_all(&entry.points_dir);
+            }
+            // 재집계 캐시 디렉토리
+            let _ = fs::remove_dir_all(ref_dir.join("cache").join(&dirname));
             save_om_registry(&state, &registry)?;
-            info!("[OmReference] 레이더 '{}' 기준데이터 삭제 (집계 + 아카이브 + 원본 ASS)", radar_name);
+            info!("[OmReference] 레이더 '{}' 기준데이터 삭제 (원본 ASS + 캐시)", radar_name);
         }
         Ok(())
     })
@@ -1793,203 +1753,121 @@ async fn delete_om_reference(radar_name: String, app_handle: tauri::AppHandle) -
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-/// 기준데이터 로드: 저장 파일(수십 MB 가능)을 bulk:// 경유로 반환.
-/// CLAUDE.md 규칙상 대용량/String 직접 반환 금지 — 영구 파일을 bulk_ipc 로 복사 후 BulkRef 반환.
-#[tauri::command]
-async fn load_om_reference(
-    radar_name: String,
-    app_handle: tauri::AppHandle,
-) -> Result<Option<bulk::BulkRef>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let registry = load_om_registry(&state)?;
-        let Some(entry) = registry.get(&radar_name) else {
-            return Ok(None);
-        };
-        let bytes = match fs::read(&entry.file_path) {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!(
-                    "[OmReference] '{}' 파일 읽기 실패({}): {}",
-                    radar_name,
-                    entry.file_path,
-                    e
-                );
-                return Ok(None);
-            }
-        };
-        // 영구 파일 → bulk_ipc 로 복사 후 BulkRef 반환 (프론트가 bulk:// 프로토콜로 스트리밍 수신)
-        let bulk_ref = bulk::write_bytes(&app_handle, &bytes, "json")?;
-        Ok(Some(bulk_ref))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {}", e))?
+/// 캐시 디렉토리에서 mtime 기준 최신 `keep` 개만 남기고 삭제 (LRU 근사).
+fn prune_cache_dir(cache_dir: &std::path::Path, keep: usize) {
+    let Ok(rd) = fs::read_dir(cache_dir) else { return; };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            let t = e.metadata().ok().and_then(|m| m.modified().ok())?;
+            Some((t, e.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // 최신 우선
+    for (_, p) in files.into_iter().skip(keep) {
+        let _ = fs::remove_file(p);
+    }
 }
 
-/// 보관된 원본 ASS 로 기준데이터 재계산 (파일 재선택 불필요).
-/// 좌표·안테나고는 radar_file_set(현재 사이트 설정)의 최신값을 반영해 정합성 불일치를 해소한다.
-/// file_paths 는 빈 배열로 들어와 무시하고, 보관 디렉토리(entry.ass_dir)의 ASS 파일을 사용한다.
-/// 소형 메타만 직접 반환 — 대용량 IPC 없음. 진행률은 om-reference-progress 이벤트.
-#[tauri::command]
-async fn rebuild_om_reference(
-    app_handle: tauri::AppHandle,
-    radar_file_set: analysis::obstacle_monthly::RadarFileSet,
-    exclude_mode_s: Vec<String>,
-) -> Result<analysis::obstacle_monthly::OmReferenceMeta, String> {
+/// 레이더 1개의 기준월 재집계 결과를 반환 — registry 에 보관 ASS 가 있으면 분석월과 동일 쐐기
+/// 파이프라인으로 재집계(설정 해시 캐시). 미등록/미보관/캐시손상은 Ok(None)(noref), 취소만 Err.
+/// analyze_obstacle_monthly 의 레이더 루프에서 분석월 분석 직후 호출된다.
+fn compute_radar_reference(
+    handle: &tauri::AppHandle,
+    radar: &analysis::obstacle_monthly::RadarFileSet,
+    exclude_mode_s: &[String],
+    mag_dec: f64,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress_fn: &dyn Fn(analysis::obstacle_monthly::ObstacleMonthlyProgress),
+) -> Result<Option<analysis::obstacle_monthly::OmRefWedge>, String> {
     use analysis::obstacle_monthly::{self as om, ObstacleMonthlyProgress};
 
-    info!(
-        "Command: rebuild_om_reference(radar={}, exclude={:?})",
-        radar_file_set.radar_name, exclude_mode_s
-    );
-
-    // ── registry lookup + 보관 ASS 파일 수집 (동기, lock/IO — await 이전에 완료) ──
-    let (ass_dir, ass_files, month_label) = {
-        let state = app_handle.state::<AppState>();
-        let registry = load_om_registry(&state)?;
-        let entry = registry
-            .get(&radar_file_set.radar_name)
-            .ok_or_else(|| "저장된 기준데이터가 없습니다".to_string())?;
-        if entry.ass_dir.is_empty() || !std::path::Path::new(&entry.ass_dir).is_dir() {
-            return Err(
-                "보관된 원본 ASS 파일이 없습니다 — 파일을 직접 선택해 재계산하세요.".to_string(),
-            );
-        }
-        // 확장자 ass(대소문자 무시) 파일 수집 + 파일명 정렬 (build 정렬 규칙과 일치)
-        let mut files: Vec<String> = Vec::new();
-        let rd = std::fs::read_dir(&entry.ass_dir)
-            .map_err(|e| format!("보관 디렉토리 읽기 실패: {}", e))?;
-        for de in rd.flatten() {
-            let p = de.path();
-            if p.is_file()
-                && p.extension()
-                    .and_then(|x| x.to_str())
-                    .map(|x| x.eq_ignore_ascii_case("ass"))
-                    .unwrap_or(false)
-            {
-                files.push(p.to_string_lossy().to_string());
-            }
-        }
-        files.sort();
-        if files.is_empty() {
-            return Err(
-                "보관된 원본 ASS 파일이 없습니다 — 파일을 직접 선택해 재계산하세요.".to_string(),
-            );
-        }
-        (
-            entry.ass_dir.clone(),
-            files,
-            entry.meta.month_label.clone(),
-        )
+    let state = handle.state::<AppState>();
+    let ref_dir = om_reference_dir(&state)?;
+    let registry = load_om_registry(&state)?;
+    let Some(entry) = registry.get(&radar.radar_name) else {
+        return Ok(None); // 미등록 → noref
     };
+    if entry.ass_dir.is_empty() || !std::path::Path::new(&entry.ass_dir).is_dir() {
+        return Ok(None); // 원본 미보관 → noref (재등록 필요)
+    }
+    let month_label = entry.meta.month_label.clone();
+    let ass_dir = entry.ass_dir.clone();
+    let dirname = om::reference_dirname(&radar.radar_name);
+    let cache_dir = ref_dir.join("cache").join(&dirname);
 
-    // 편각: 첫 보관 파일 기준 (build_om_reference 와 동일 패턴)
-    let mag_dec = resolve_declination(
-        &app_handle,
-        &ass_files[0],
-        radar_file_set.radar_lat,
-        radar_file_set.radar_lon,
-    )
-    .await;
+    // 보관 ASS 목록(정렬) + (이름, 바이트) — 캐시 키·파싱 입력
+    let mut files: Vec<String> = Vec::new();
+    let mut files_meta: Vec<(String, u64)> = Vec::new();
+    let rd = std::fs::read_dir(&ass_dir).map_err(|e| format!("보관 디렉토리 읽기 실패: {}", e))?;
+    for de in rd.flatten() {
+        let p = de.path();
+        if p.is_file()
+            && p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("ass"))
+                .unwrap_or(false)
+        {
+            let name = p.file_name().map(|nm| nm.to_string_lossy().to_string()).unwrap_or_default();
+            let bytes = de.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push(p.to_string_lossy().to_string());
+            files_meta.push((name, bytes));
+        }
+    }
+    if files.is_empty() {
+        return Ok(None); // 보관 디렉토리에 ASS 없음 → noref
+    }
+    files.sort();
 
-    // 취소 토큰 초기화 (analyze/build 경로와 동일 플래그 — cancel_analysis 로 중단 가능)
-    let cancel = {
-        let state = app_handle.state::<AppState>();
-        state.analysis_cancel.store(false, Ordering::Relaxed);
-        Arc::clone(&state.analysis_cancel)
-    };
+    let key = om::reference_cache_key(&month_label, &files_meta, radar, exclude_mode_s);
+    let cache_path = cache_dir.join(format!("{}.json", key));
 
-    let handle = app_handle.clone();
-    let meta = tauri::async_runtime::spawn_blocking(move || -> Result<om::OmReferenceMeta, String> {
-        let state = handle.state::<AppState>();
-        let ref_dir = om_reference_dir(&state)?;
+    // ── 캐시 히트 ──
+    if cache_path.is_file() {
+        if let Some(w) = fs::read(&cache_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<om::OmRefWedge>(&b).ok())
+        {
+            // 프론트 진행바가 ref 구간을 건너뛰도록 1회 emit
+            progress_fn(ObstacleMonthlyProgress {
+                radar_name: radar.radar_name.clone(),
+                stage: "ref".to_string(),
+                message: "기준월 캐시 적용".to_string(),
+                current: 1,
+                total: 1,
+            });
+            info!("[OmReference] 레이더 '{}' 기준월 캐시 히트 ({})", radar.radar_name, key);
+            return Ok(Some(w));
+        }
+        // 캐시 손상 → 미스로 처리(재집계)
+    }
 
-        // 보관 파일 목록으로 재구성 (좌표·안테나고는 현재 사이트 설정 최신값, file_paths 는 무시)
-        let mut rebuilt = radar_file_set;
-        rebuilt.file_paths = ass_files;
+    // ── 캐시 미스 → 재집계 ──
+    let wedge = om::compute_reference_wedge(radar, exclude_mode_s, &files, &month_label, mag_dec, cancel, progress_fn)?;
 
-        let radar_name = rebuilt.radar_name.clone();
-        // points_dir 경로 규칙은 build 와 동일 (결정적 스템)
-        let json_path = ref_dir.join(om::reference_filename(&radar_name));
-        let points_dir = ref_dir.join("points").join(om::reference_dirname(&radar_name));
-
-        let h = handle.clone();
-        let progress_fn = move |p: ObstacleMonthlyProgress| {
-            let _ = h.emit("om-reference-progress", p);
-        };
-
-        match om::build_reference_for_radar(
-            &rebuilt,
-            &exclude_mode_s,
-            &month_label,
-            mag_dec,
-            &points_dir,
-            &cancel,
-            &progress_fn,
-        ) {
-            Ok(data) => {
-                // 스트리밍 직렬화 (build 와 동일 경로·방식)
-                let file = fs::File::create(&json_path)
-                    .map_err(|e| format!("기준데이터 파일 생성 실패: {}", e))?;
-                let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
-                serde_json::to_writer(&mut w, &data)
-                    .map_err(|e| format!("기준데이터 직렬화 실패: {}", e))?;
-                {
+    // 캐시 저장 + prune (실패는 warn — 결과엔 영향 없음)
+    match fs::create_dir_all(&cache_dir) {
+        Ok(_) => match fs::File::create(&cache_path) {
+            Ok(f) => {
+                let mut w = std::io::BufWriter::new(f);
+                if let Err(e) = serde_json::to_writer(&mut w, &wedge) {
+                    log::warn!("[OmReference] 캐시 직렬화 실패(무시): {}", e);
+                } else {
                     use std::io::Write;
-                    w.flush().map_err(|e| format!("기준데이터 flush 실패: {}", e))?;
+                    let _ = w.flush();
+                    prune_cache_dir(&cache_dir, 4);
                 }
-
-                // ass_bytes 재산정 (보관 원본 크기 합) — 보관 디렉토리는 절대 건드리지 않음
-                let mut meta = data.meta.clone();
-                let mut ass_bytes: u64 = 0;
-                for f in &rebuilt.file_paths {
-                    ass_bytes += fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                }
-                meta.ass_bytes = ass_bytes;
-
-                // registry upsert — ass_dir 그대로 유지 (보관 원본은 절대 삭제/이동/재복사 금지)
-                let mut registry = load_om_registry(&state)?;
-                registry.insert(
-                    radar_name.clone(),
-                    om::OmReferenceRegistryEntry {
-                        meta: meta.clone(),
-                        file_path: json_path.to_string_lossy().to_string(),
-                        points_dir: points_dir.to_string_lossy().to_string(),
-                        ass_dir: ass_dir.clone(),
-                    },
-                );
-                save_om_registry(&state, &registry)?;
-
-                info!(
-                    "[OmReference] 레이더 '{}' 재계산 완료 (ass_dir 보존, 원본 {:.1}MB)",
-                    radar_name,
-                    ass_bytes as f64 / 1024.0 / 1024.0
-                );
-                Ok(meta)
             }
-            Err(e) => {
-                // 실패/취소: points_dir 정리, ass_dir(보관 원본)은 불변.
-                // 주의: build_reference_for_radar 는 시작 시 기존 points 아카이브를 제거하므로
-                // 재계산 실패 시 이전 아카이브는 소실된다(기존 덮어쓰기 실패 의미론과 동일).
-                let _ = fs::remove_dir_all(&points_dir);
-                if !e.contains("취소") {
-                    progress_fn(ObstacleMonthlyProgress {
-                        radar_name: radar_name.clone(),
-                        stage: "error".to_string(),
-                        message: format!("레이더 '{}' 기준데이터 재계산 실패: {}", radar_name, e),
-                        current: 0,
-                        total: 0,
-                    });
-                }
-                Err(e)
-            }
-        }
-    })
-    .await
-    .map_err(|e| format!("재계산 스레드 오류: {}", e))??;
+            Err(e) => log::warn!("[OmReference] 캐시 파일 생성 실패(무시): {}", e),
+        },
+        Err(e) => log::warn!("[OmReference] 캐시 디렉토리 생성 실패(무시): {}", e),
+    }
 
-    info!("[OmReference] 재계산 완료: {}", meta.radar_name);
-    Ok(meta)
+    Ok(Some(wedge))
 }
 
 /// 건물 제외 커버리지 프로파일 계산 (장애물 월간 보고서용)
@@ -2843,12 +2721,10 @@ pub fn run() {
             // 장애물 월간 분석
             analyze_obstacle_monthly,
             cancel_analysis,
-            // OM 기준데이터(참조 달) 집계 저장/로드
-            build_om_reference,
-            rebuild_om_reference,
+            // OM 기준데이터(참조 달) — 등록(원본 ASS 보관) + 목록/삭제 (재집계는 analyze 통합)
+            register_om_reference,
             list_om_references,
             delete_om_reference,
-            load_om_reference,
             compute_coverage_terrain_profile_excluding,
             compute_coverage_layers_batch_excluded,
             // 토지이용계획도 타일

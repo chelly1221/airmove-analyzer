@@ -17,7 +17,6 @@ import { extractDateFromFilename, filterFilesByMonth } from "../../utils/omFiles
 import { readBulkJson } from "../../utils/bulkIpc";
 import type { BulkRef } from "../../utils/bulkIpc";
 import { computeLosBatch, calcBuildingAzExtent, mergeAzSectors } from "../../utils/obstacleAnalysisHelpers";
-import { checkRefCoherence } from "../../utils/omReference";
 import type { CoverageLayer } from "../../utils/radarCoverage";
 import type {
   RadarSite, Aircraft as AircraftType, ReportMetadata, ManualBuilding, BuildingGroup,
@@ -254,9 +253,10 @@ export default function ObstacleMonthlyConfigModal({
 
     let unlistenFn: (() => void) | null = null;
     try {
-      // 레이더마다 Rust 가 "parsing"(파일 i/N) → "analyzing"(일 d/D)로 current/total 을 리셋하며
-      // emit 하므로, 그대로 쓰면 파싱 구간에서 바가 톱니처럼 왕복한다. 레이더 인덱스 + 스테이지
-      // 가중(파일 75% / 일별 집계 25%)으로 전역 0~100 단조 매핑한다.
+      // 레이더마다 Rust 가 "parsing"(파일 i/N) → "analyzing"(일 d/D) → "ref"(기준월 재집계 파일 i/N)로
+      // current/total 을 리셋하며 emit 하므로, 그대로 쓰면 구간마다 바가 톱니처럼 왕복한다. 레이더 인덱스 +
+      // 스테이지 가중(분석월 파싱 0~55% / 일별 집계 55~70% / 기준월 재집계 70~100%)으로 전역 0~100 단조
+      // 매핑한다. 캐시 히트 시 ref 는 current=total=1 로 1회 emit → 그 레이더의 ref 구간 즉시 점프(단조 유지).
       const radarIndexByName = new Map(selectedRadars.map((r, i) => [r.name, i]));
       const radarCount = Math.max(1, selectedRadars.length);
       unlistenFn = await listen<ObstacleMonthlyProgress>("obstacle-monthly-progress", (e) => {
@@ -266,7 +266,10 @@ export default function ObstacleMonthlyConfigModal({
         if (e.payload.stage === "error" || e.payload.total <= 0) return;
         const ri = radarIndexByName.get(e.payload.radar_name) ?? 0;
         const within = Math.min(1, e.payload.current / e.payload.total);
-        const radarFrac = e.payload.stage === "analyzing" ? 0.75 + 0.25 * within : 0.75 * within;
+        const radarFrac =
+          e.payload.stage === "ref" ? 0.70 + 0.30 * within
+          : e.payload.stage === "analyzing" ? 0.55 + 0.15 * within
+          : 0.55 * within;
         setProgressPct(((ri + radarFrac) / radarCount) * 100);
       });
       const excludeMs = aircraft.map((a) => a.mode_s_code).filter(Boolean);
@@ -574,16 +577,17 @@ export default function ObstacleMonthlyConfigModal({
               <div className="space-y-1.5 rounded-xl border border-gray-200 p-3">
                 {customRadarSites.map((r) => {
                   const checked = checkedRadars.has(r.name);
-                  // 판정 모드 예고 — 기준데이터 유무·정합성으로 Δ 판정/기준 미적용 예고.
+                  // 판정 모드 예고 — 기준데이터(원본 ASS 보관) 유무로 Δ 판정/기준 미적용 예고.
+                  //   기준월 히스토그램은 생성 시 현재 설정으로 재집계하므로 정합성 게이트가 없다.
                   const refMeta = omReferences.find((m) => m.radar_name === r.name);
-                  const coh = refMeta ? checkRefCoherence(refMeta, r) : null;
+                  const hasRef = !!refMeta && refMeta.ass_bytes > 0;
                   let statusText: string;
                   let statusTone: string;
-                  if (refMeta && coh?.ok) {
-                    statusText = `기준데이터 ${refMeta.month_label} · Δ 판정 적용`;
+                  if (hasRef) {
+                    statusText = `기준데이터 ${refMeta!.month_label} · Δ 판정 적용 (생성 시 재집계)`;
                     statusTone = checked ? "text-white/70" : "text-gray-400";
-                  } else if (refMeta && coh) {
-                    statusText = `기준데이터 ${refMeta.month_label} · 정합성 불일치(${coh.reasonText}) — 기준 미적용(기준데이터 없음 표기)`;
+                  } else if (refMeta) {
+                    statusText = `기준데이터 ${refMeta.month_label} · 원본 미보관 — 재등록 필요(기준 미적용)`;
                     statusTone = checked ? "text-amber-200" : "text-amber-600";
                   } else {
                     statusText = "기준데이터 없음 — 등급 미판정";
@@ -604,16 +608,16 @@ export default function ObstacleMonthlyConfigModal({
                   );
                 })}
               </div>
-              {/* 기준월 == 분석월 경고 — Δ 판정이 무의미(Δ≈0). 체크된 레이더 중 정합성 ok & month_label===analysisMonth 이면 노출. */}
+              {/* 기준월 == 분석월 경고 — 재집계가 같은 월이면 Δ=0(구조적). 체크된 레이더 중 원본 보관 & month_label===analysisMonth 이면 노출. */}
               {customRadarSites.some((r) => {
                 if (!checkedRadars.has(r.name)) return false;
                 const m = omReferences.find((x) => x.radar_name === r.name);
-                return !!m && checkRefCoherence(m, r).ok && m.month_label === analysisMonth;
+                return !!m && m.ass_bytes > 0 && m.month_label === analysisMonth;
               }) && (
                 <div className="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
                   <TriangleAlert size={14} className="mt-0.5 shrink-0 text-amber-500" />
                   <p className="text-[10.5px] leading-snug text-amber-700">
-                    분석월이 기준월({analysisMonth})과 동일한 레이더가 있습니다 — Δ 판정이 무의미합니다(Δ≈0). 기준데이터 관리에서 참조 달을 다른 달로 재생성하거나 분석월을 확인하세요.
+                    분석월이 기준월({analysisMonth})과 동일한 레이더가 있습니다 — 동일 월 재집계라 Δ=0 이 됩니다(판정 무의미). 기준데이터 관리에서 참조 달을 다른 달로 재등록하거나 분석월을 확인하세요.
                   </p>
                 </div>
               )}
