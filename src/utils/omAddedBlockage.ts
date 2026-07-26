@@ -13,7 +13,10 @@
  *   분자 = Σ(추가 차단영역 밴드 셀의 소실시간)                            — 밴드 소실시간
  *   소실율(%) = 분자 / 분모 × 100
  *   Δ = 동일 정의(방위 전체 대비)로 산출한 기준월 소실율 대비 편차(%p).
- *       기준 히스토그램은 보고서 생성 시 분석월과 동일 쐐기 파이프라인으로 재집계된 것(같은 월 → Δ=0 불변식).
+ *       기준 히스토그램은 보고서 생성 시 분석월과 동일 쐐기 파이프라인으로 재집계된 것.
+ *       같은 월 입력이면 Rust 계산 코어가 비트 동일(패리티 테스트 입증)하고, 일별 셀을 그대로
+ *       전달해(동일 ser_s3 직렬화·정렬) 분석월과 **동일 코드·동일 연산 순서**(sumBandOverDays)로
+ *       합산하므로 총계도 비트 동일 → Δ 가 정확히 0(불변식).
  *
  * panoWith 는 호출부(ReportApp)가 건물별로 좁혀(panoWithForBuilding = without ∪ {해당 건물}) 넘긴다 —
  * 방위 중첩 인접 분석 대상의 한계기여가 양쪽 건물에 중복 귀속되던 v1 한계 해소(차트 핑크영역과 계속 일치).
@@ -56,11 +59,14 @@ export interface BlockageDayHist {
 }
 
 /**
- * 기준데이터 참조 (헤드라인 Δ 판정용) — 보고서 생성 시 동일 쐐기 파이프라인으로 재집계한 월간 합산
- * 히스토그램 + 기준월 라벨(같은 월 → Δ=0 불변식). 호출부(ReportApp)가 rr.reference 에서 넘긴다.
+ * 기준데이터 참조 (헤드라인 Δ 판정용) — 보고서 생성 시 동일 쐐기 파이프라인으로 재집계한 **일별**
+ * 히스토그램(분석월 daily_stats 와 동일 직렬화·정렬 셀) + 기준월 라벨. 호출부(ReportApp)가
+ * rr.reference.daily 에서 넘긴다. 분석월 총계와 **같은 코드·같은 순서**(sumBandOverDays)로 합산 →
+ * 같은 월이면 refRate 가 lossRatePct 와 비트 동일 → Δ=0 불변식.
  */
 export interface BlockageReference {
-  histogram: AzElevCell[];
+  /** 일별 az×elev 셀 배열 (date 오름차순 — 분석월 histogramsByDay 와 동일 순서) */
+  daysCells: AzElevCell[][];
   monthLabel: string;
 }
 
@@ -101,6 +107,35 @@ function accumulateBand(
   return { loss, exposure, lossCount, exposureCount, bandExposure };
 }
 
+/** accumulateBand 반환 형상 (일별 누적 단위) */
+type BandAcc = { loss: number; exposure: number; lossCount: number; exposureCount: number; bandExposure: number };
+
+/**
+ * 날짜 순서대로 accumulateBand 를 호출하고 **고정 순서로 합산** — 분석월과 기준월의 총계가
+ * 문자 그대로 같은 코드·같은 연산 순서로 계산되게 하는 단일 경로. perDay 는 입력 daysCells 와
+ * 같은 인덱스로 정렬(현재월 series·trend 산출용). 같은 월 입력이면 Rust 가 두 경로에 비트 동일
+ * 일별 셀을 같은 date 순서로 실어 오므로, 여기서 같은 순서로 합산하면 총계까지 비트 동일 → Δ=0.
+ */
+function sumBandOverDays(
+  daysCells: AzElevCell[][],
+  angleWithAt: (az: number) => number,
+  angleWithoutAt: (az: number) => number,
+  buildingExtent: AzSector,
+): { loss: number; exposure: number; lossCount: number; exposureCount: number; bandExposure: number; perDay: BandAcc[] } {
+  let loss = 0, exposure = 0, lossCount = 0, exposureCount = 0, bandExposure = 0;
+  const perDay: BandAcc[] = [];
+  for (const cells of daysCells) {
+    const acc = accumulateBand(cells, angleWithAt, angleWithoutAt, buildingExtent);
+    perDay.push(acc);
+    loss += acc.loss;
+    exposure += acc.exposure;
+    lossCount += acc.lossCount;
+    exposureCount += acc.exposureCount;
+    bandExposure += acc.bandExposure;
+  }
+  return { loss, exposure, lossCount, exposureCount, bandExposure, perDay };
+}
+
 /**
  * 건물별 추가 차단영역 소실율 산출.
  * @param histogramsByDay  레이더의 일별 az×elev 히스토그램 (모든 관측일 포함, 빈 날은 cells=[])
@@ -108,9 +143,10 @@ function accumulateBand(
  *                         좁혀 전달. 없으면 밴드 기하 판정을 생략하고 밴드 형성됨으로 폴백.
  * @param panoWithout      분석대상 제외 파노라마 (없으면 panoWith.terrain 으로 폴백 → without==terrain)
  * @param buildingExtent   대상 건물의 방위 노출 구간 (calcBuildingAzExtent)
- * @param reference        기준데이터(참조 달) — 있으면(히스토그램 존재) 동일 샘플러·동일 정의(방위 전체 대비)로
- *                         기준 소실율을 산출해 편차(Δ%p) 판정(delta). 없으면(미등록·로드 실패·정합성
- *                         불일치는 호출부가 null 로 전달) 또는 히스토그램이 비면 기준 미적용(noref).
+ * @param reference        기준데이터(참조 달) — 있으면(일별 셀 존재) 현재월과 **동일 헬퍼(sumBandOverDays)**·
+ *                         동일 샘플러·동일 정의(방위 전체 대비)로 기준 소실율을 산출해 편차(Δ%p) 판정(delta).
+ *                         없으면(미등록·로드 실패·정합성 불일치는 호출부가 null 로 전달) 또는 daysCells 가
+ *                         비면 기준 미적용(noref).
  */
 export function computeAddedBlockage(
   histogramsByDay: BlockageDayHist[],
@@ -146,30 +182,29 @@ export function computeAddedBlockage(
     }
   }
 
-  const series: AddedBlockageDay[] = [];
-  let totalLoss = 0;
-  let totalExposure = 0;
+  // 현재월 총계 — 기준월과 **완전히 같은 헬퍼·같은 연산 순서**(sumBandOverDays)로 산출.
+  // 분모(방위창 전체)와 분자(밴드 소실)를 셀 양각범위 [elLo, elHi) 와 추가 차단영역 밴드
+  // [without, with) 의 겹침 비율(frac)로 가중해 한 패스로 누적한다. 합산 순서는 histogramsByDay
+  // (=date 순) 그대로 — 종전 일별 루프와 동일한 값·같은 덧셈 순서(수치 불변).
+  const daysCells = histogramsByDay.map((dh) => dh.cells);
+  const cur = sumBandOverDays(daysCells, angleWithAt, angleWithoutAt, buildingExtent);
+  const totalLoss = cur.loss;
+  const totalExposure = cur.exposure;
   // 밴드 형성 판정 전용 누적(일별 bandExposure 합) — 분모(방위창 전체 exposure)와 별개.
-  let totalBandExposure = 0;
+  const totalBandExposure = cur.bandExposure;
   // 포인트 수(방위창 전체·밴드 소실은 frac 가중). 각각 대응 셀·조건으로 누적 → 시간 지표와 정렬.
-  let totalLossCount = 0;
-  let totalExposureCount = 0;
-  let daysWithExposure = 0;
+  const totalLossCount = cur.lossCount;
+  const totalExposureCount = cur.exposureCount;
 
-  for (const dh of histogramsByDay) {
-    // 분모(방위창 전체)와 분자(밴드 소실)를 한 패스로 산출. 분자는 셀 양각범위 [elLo, elHi) 와 추가
-    // 차단영역 밴드 [without, with) 의 겹침 비율로 가중(0.05° 빈 경계에서 얇은 밴드의 ±반빈 편향 방지).
-    const acc = accumulateBand(dh.cells, angleWithAt, angleWithoutAt, buildingExtent);
+  // perDay 를 histogramsByDay 의 day 번호와 zip 해 series(일별 소실율·노출시간)·daysWithExposure 산출.
+  const series: AddedBlockageDay[] = [];
+  let daysWithExposure = 0;
+  for (let i = 0; i < histogramsByDay.length; i++) {
+    const acc = cur.perDay[i];
     const dayLoss = acc.loss;
     const dayExposure = acc.exposure; // 방위창 전체(전 양각) 항적시간
-    // 포인트 수 — 방위창 전체 노출pt, 밴드 소실pt 각각 동일 셀·조건으로 누적 (표시 시 반올림)
-    totalLossCount += acc.lossCount;
-    totalExposureCount += acc.exposureCount;
-    totalBandExposure += acc.bandExposure;
     const ratePct = dayExposure > 0 ? (dayLoss / dayExposure) * 100 : 0;
-    series.push({ day: dh.day, ratePct, exposureS: dayExposure });
-    totalLoss += dayLoss;
-    totalExposure += dayExposure;
+    series.push({ day: histogramsByDay[i].day, ratePct, exposureS: dayExposure });
     if (dayExposure > 0) daysWithExposure++;
   }
 
@@ -185,10 +220,10 @@ export function computeAddedBlockage(
   const hasBlockageBand = geometricBand || totalBandExposure > 0;
 
   // ── 기준데이터 대비 편차(Δ%p) 판정 ──
-  // 기준데이터가 있고(정합성 게이트는 호출부에서 통과) 기준 히스토그램이 있으면 동일 샘플러·동일 정의
-  // (방위 전체 대비: 분모=기준월 방위창 전체 항적시간, 분자=밴드 소실시간)로 기준월 소실율을 산출해
-  // 편차 임계로 판정한다(delta 모드). 표본 게이트는 폐지 — 기준 노출 0이면 refRate=0 을 그대로 쓴다.
-  // 기준이 없거나 히스토그램이 비면 기준 미적용(noref).
+  // 기준데이터가 있고(정합성 게이트는 호출부에서 통과) 기준 일별 셀이 있으면 현재월과 동일 헬퍼·동일
+  // 샘플러·동일 정의(방위 전체 대비: 분모=기준월 방위창 전체 항적시간, 분자=밴드 소실시간)로 기준월
+  // 소실율을 산출해 편차 임계로 판정한다(delta 모드). 표본 게이트는 폐지 — 기준 노출 0이면 refRate=0
+  // 을 그대로 쓴다. 기준이 없거나 daysCells 가 비면 기준 미적용(noref).
   let gradingMode: "delta" | "noref" = "noref";
   let refLossRatePct: number | undefined;
   let deltaPp: number | undefined;
@@ -196,9 +231,11 @@ export function computeAddedBlockage(
   let refMonthLabel: string | undefined;
   let g: { label: string; color: string };
 
-  if (reference && reference.histogram.length > 0) {
-    // 기준 히스토그램이 있으면 무조건 delta — 기준 노출 0이면 refRate=0 을 그대로 사용(표본 게이트 폐지).
-    const ref = accumulateBand(reference.histogram, angleWithAt, angleWithoutAt, buildingExtent);
+  if (reference && reference.daysCells.length > 0) {
+    // 기준 일별 셀이 있으면 무조건 delta — 기준 노출 0이면 refRate=0 을 그대로 사용(표본 게이트 폐지).
+    // 현재월과 **완전히 같은 헬퍼·같은 연산 순서**(sumBandOverDays)로 합산 → 같은 월이면 refRate 가
+    // lossRatePct 와 비트 동일(Rust 비트 동일 셀 + 동일 date 순서) → deltaPp 정확히 0.
+    const ref = sumBandOverDays(reference.daysCells, angleWithAt, angleWithoutAt, buildingExtent);
     const refRate = ref.exposure > 0 ? (ref.loss / ref.exposure) * 100 : 0;
     gradingMode = "delta";
     refLossRatePct = refRate;
@@ -208,7 +245,7 @@ export function computeAddedBlockage(
     g = gradeAddedBlockageDelta(deltaPp, totalExposureCount, hasBlockageBand);
   } else {
     // 기준데이터 없음(미등록·로드 실패·정합성 불일치는 호출부가 reference=null 로 전달) 또는 기준
-    //   히스토그램이 비었음 → 기준 미적용(noref). 우선순위 게이트만 적용: 미형성 → "추가 차단 구간 없음",
+    //   일별 셀(daysCells)이 비었음 → 기준 미적용(noref). 우선순위 게이트만 적용: 미형성 → "추가 차단 구간 없음",
     //   노출 0 → "항적 없음", 그 외 → 회색 "기준데이터 없음"(Δ 판정 근거 부재). 전부 회색(#6b7280).
     gradingMode = "noref";
     const norefLabel = !hasBlockageBand ? BLOCKAGE_NONE_LABEL

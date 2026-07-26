@@ -155,12 +155,15 @@ export interface OmReferenceMeta {
 
 /**
  * 기준월 재집계 결과 (RadarMonthlyResult.reference, Rust OmRefWedge 미러).
- * 분석월과 동일 쐐기 파이프라인으로 기준월 ASS 를 재집계한 월간 합산 히스토그램.
- * computeAddedBlockage 의 BlockageReference 원천 — 같은 월이면 Δ=0.
+ * 분석월과 동일 쐐기 파이프라인으로 기준월 ASS 를 재집계한 **일별** 히스토그램을 그대로 전달한다 —
+ * 월간 합산하지 않고 분석월 daily_stats 와 동일 직렬화(일별 ser_s3·hist_to_sorted_cells 정렬 셀)로 담는다.
+ * computeAddedBlockage 가 분석월과 동일 코드·동일 순서로 일별 accumulateBand 합산 →
+ * 표시 정밀도까지 비트 동일(같은 월 → Δ=0). totals 는 로그·유지 목적.
  */
 export interface OmRefWedge {
   month_label: string;
-  az_elev_histogram: AzElevCell[];
+  /** 일별 방위×양각 시간 히스토그램 (date 오름차순 — 분석월 daily_stats 와 동일 순서·직렬화) */
+  daily: { date: string; az_elev_histogram: AzElevCell[] }[];
   total_track_time_secs: number;
   total_loss_time_secs: number;
   day_count: number;
@@ -199,7 +202,7 @@ export interface RadarMonthlyResult {
   track_heatmap?: TrackHeatmap | null;
   /**
    * 기준월(참조 달) 재집계 결과 — 보고서 생성 시 백엔드가 분석월과 동일 쐐기 파이프라인으로 재집계해 실어 보낸다.
-   * 있으면(히스토그램 존재) computeAddedBlockage 가 Δ 판정, 없으면 noref. 미등록/미보관/재집계 실패 시 null/undefined.
+   * 있으면(daily 존재) computeAddedBlockage 가 Δ 판정, 없으면 noref. 미등록/미보관/재집계 실패 시 null/undefined.
    */
   reference?: OmRefWedge | null;
 }

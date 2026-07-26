@@ -971,7 +971,7 @@ export default function ReportApp() {
         // 재설계: 백엔드가 보고서 생성 시(analyze_obstacle_monthly) 분석월과 동일 쐐기 파이프라인으로
         // 기준월 ASS 를 재집계해 rr.reference(OmRefWedge)로 실어 보낸다(같은 월 → Δ=0 불변식).
         // 좌표·안테나고 정합성 게이트는 재집계가 항상 현재 설정을 쓰므로 폐지됨.
-        // 미등록·미보관·재집계 실패는 rr.reference 부재 또는 히스토그램 빈 것 → 기준 미적용(noref).
+        // 미등록·미보관·재집계 실패는 rr.reference 부재 또는 daily 빈 것 → 기준 미적용(noref).
         const addedBlockageByKey: Record<string, AddedBlockageResult> = {};
         for (const radar of radars) {
           const rr = result.radar_results.find((r) => r.radar_name === radar.name);
@@ -979,10 +979,11 @@ export default function ReportApp() {
           const histByDay = rr.daily_stats.map((d) => ({ day: d.day_of_month, cells: d.az_elev_histogram ?? [] }));
           const pWith = panoWithTargets.get(radar.name);
           const pWithout = panoWithoutTargets.get(radar.name);
-          // 기준 히스토그램이 있을 때만 delta 판정 대상 — 없으면 null(noref).
+          // 기준 일별 히스토그램이 있을 때만 delta 판정 대상 — 없으면 null(noref).
+          // 일별 셀을 그대로(date 순) 넘겨 현재월과 동일 코드·동일 순서로 합산 → 같은 월이면 Δ=0.
           const reference = rr.reference;
-          const radarRef = reference && reference.az_elev_histogram.length > 0
-            ? { histogram: reference.az_elev_histogram, monthLabel: reference.month_label }
+          const radarRef = reference && reference.daily.length > 0
+            ? { daysCells: reference.daily.map((d) => d.az_elev_histogram), monthLabel: reference.month_label }
             : null;
           for (const b of buildings) {
             if (flowEpoch !== loadEpochRef.current) return; // reload — stale 산출 폐기

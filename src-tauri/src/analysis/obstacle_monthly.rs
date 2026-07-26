@@ -681,6 +681,26 @@ fn accumulate_wedge_day(
     (day_track_time, day_loss_time)
 }
 
+/// 일별 히스토그램 누적기(packed key=(az_bin<<16)|elev_bin) → **packed key 오름차순 정렬** 셀 Vec.
+/// 분석월 일별 직렬화(analyze_radar_monthly)와 기준월 일별 변환(compute_reference_wedge) 양쪽이
+/// 공유한다 — 직렬화 셀 순서를 결정화해, TS f64 합산 순서까지 두 경로를 완전 일치(비트 동일)시킨다.
+/// 셀 소비처는 전부 순서 무관(TS accumulateBand·차트·지도) — 정렬은 순서만 바꿀 뿐 값·집합 불변.
+fn hist_to_sorted_cells(hist: HashMap<u32, (f64, f64, u32, u32)>) -> Vec<AzElevCell> {
+    let mut entries: Vec<(u32, (f64, f64, u32, u32))> = hist.into_iter().collect();
+    entries.sort_by_key(|(k, _)| *k);
+    entries
+        .into_iter()
+        .map(|(k, (tt, lt, tc, lc))| AzElevCell {
+            az_bin: (k >> 16) as u16,
+            elev_bin: (k & 0xFFFF) as u16,
+            track_time_s: tt,
+            loss_time_s: lt,
+            track_count: tc,
+            loss_count: lc,
+        })
+        .collect()
+}
+
 /// 단일 레이더의 월간 분석 실행
 pub fn analyze_radar_monthly(
     radar: &RadarFileSet,
@@ -1015,18 +1035,8 @@ pub fn analyze_radar_monthly(
         // 날짜에서 day_of_month 추출
         let dom: u8 = date[8..10].parse().unwrap_or(1);
 
-        // 히스토그램 맵 → 직렬화용 Vec
-        let az_elev_histogram: Vec<AzElevCell> = day_hist
-            .into_iter()
-            .map(|(k, (tt, lt, tc, lc))| AzElevCell {
-                az_bin: (k >> 16) as u16,
-                elev_bin: (k & 0xFFFF) as u16,
-                track_time_s: tt,
-                loss_time_s: lt,
-                track_count: tc,
-                loss_count: lc,
-            })
-            .collect();
+        // 히스토그램 맵 → 직렬화용 Vec (packed key 오름차순 정렬 — 기준월 일별 변환과 동일 순서).
+        let az_elev_histogram = hist_to_sorted_cells(day_hist);
 
         daily_stats.push(DailyStats {
             date: date.clone(),
@@ -1142,17 +1152,28 @@ pub struct OmReferenceMeta {
 
 /// 기준월 재집계 결과 (RadarMonthlyResult.reference 로 직렬화 — 프론트 BlockageReference 원천).
 /// 분석월과 완전히 동일한 쐐기 파이프라인으로 기준월 ASS 를 재집계한 산출물.
-/// 같은 월 입력이면 분석월 히스토그램과 비트 동일 → Δ=0 이 구조적으로 보장된다.
+/// **일별 히스토그램을 그대로 담는다**(월간 합산하지 않음) — 분석월 daily_stats 와 동일 직렬화
+/// (일별 ser_s3·hist_to_sorted_cells 정렬 셀). 프론트가 분석월과 동일 코드·동일 순서로 일별
+/// accumulateBand 합산 → 표시 정밀도까지 비트 동일(같은 월 → Δ=0 이 구조적으로 보장).
+/// totals(track/loss time·day_count·source_file_count)는 로그·유지 목적으로 존치.
 /// Deserialize 는 디스크 캐시(<hash>.json) 역직렬화용.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OmRefWedge {
     pub month_label: String,
-    /// 월간 합산 방위×양각 시간 히스토그램 (쐐기 필터 통과분 — 분석월과 동일 정의).
-    pub az_elev_histogram: Vec<AzElevCell>,
+    /// 일별 방위×양각 시간 히스토그램 (date 오름차순 — 분석월 daily_stats 와 동일 순서·동일 직렬화).
+    pub daily: Vec<OmRefDayHist>,
     pub total_track_time_secs: f64,
     pub total_loss_time_secs: f64,
     pub day_count: u32,
     pub source_file_count: u32,
+}
+
+/// 기준월 일별 히스토그램 (OmRefWedge.daily 요소). 셀은 분석월과 동일한 ser_s3 직렬화·
+/// hist_to_sorted_cells 정렬 순서 — TS 일별 합산 순서가 분석월과 완전히 일치하도록.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OmRefDayHist {
+    pub date: String,
+    pub az_elev_histogram: Vec<AzElevCell>,
 }
 
 /// 레지스트리 항목 (settings `om_reference_registry` JSON: radar_name → 이 값).
@@ -1214,25 +1235,13 @@ fn date_is_2days_older(d: &str, latest: &str) -> bool {
     false
 }
 
-/// 일별 히스토그램 누적기를 월간 누적기에 합산 (packed key = (az_bin<<16)|elev_bin).
-fn merge_hist(
-    dst: &mut HashMap<u32, (f64, f64, u32, u32)>,
-    src: &HashMap<u32, (f64, f64, u32, u32)>,
-) {
-    for (&k, &(tt, lt, tc, lc)) in src {
-        let e = dst.entry(k).or_insert((0.0, 0.0, 0, 0));
-        e.0 += tt;
-        e.1 += lt;
-        e.2 += tc;
-        e.3 += lc;
-    }
-}
-
 /// 기준월(참조 달) 재집계 — 보관된 ASS 를 분석월과 **완전히 동일한 쐐기 파이프라인**으로
 /// 재집계한다. 파싱·필터 시퀀스(검사기 제외 → 60NM 컷 → min_obstacle_distance 컷 → sector 필터
 /// → 일별 버킷)와 일별 집계(accumulate_wedge_day, 컬렉터 None)를 분석월과 공유하므로, 같은 월
 /// 입력이면 분석월 히스토그램과 비트 동일(Δ=0 불변식). geo 수집 없음(loss/track_points_geo/
 /// heatmap/baseline 전부 생략) — 쐐기 통과 포인트만 일별 버킷 → 히스토그램·시간 집계.
+/// **일별 히스토그램을 월간 합산하지 않고 그대로 daily 에 담는다**(분석월 daily_stats 와 동일 직렬화) —
+/// 프론트가 분석월과 같은 코드·같은 순서로 일별 합산해 표시 정밀도까지 비트 동일하게 만들기 위함.
 /// 메모리는 baseline 패턴과 같은 일 단위 플러시(2일 버퍼)로 제한. 취소는 공유 AtomicBool.
 ///
 /// `radar` 는 분석월 RadarFileSet(현재 좌표·안테나고·sector·min_obstacle_distance) — file_paths 는
@@ -1259,8 +1268,8 @@ pub fn compute_reference_wedge(
 
     // 일별 버킷 (쐐기 통과 포인트) — 일 단위 플러시로 메모리 2~3일치로 제한
     let mut daily_points: HashMap<String, Vec<LightPoint>> = HashMap::with_capacity(4);
-    // 월간 합산 히스토그램 누적기 (packed key = (az_bin<<16)|elev_bin)
-    let mut monthly_hist: HashMap<u32, (f64, f64, u32, u32)> = HashMap::new();
+    // 일별 히스토그램 수집 (월간 합산 안 함 — 분석월 daily_stats 와 동일 직렬화로 그대로 전달)
+    let mut daily: Vec<OmRefDayHist> = Vec::new();
     let mut total_track_time = 0.0f64;
     let mut total_loss_time = 0.0f64;
     let mut day_count = 0u32;
@@ -1358,7 +1367,8 @@ pub fn compute_reference_wedge(
                     );
                     total_track_time += tt;
                     total_loss_time += lt;
-                    merge_hist(&mut monthly_hist, &day_hist);
+                    // 일별 히스토그램을 정렬 셀로 변환해 그대로 수집(분석월과 동일 직렬화)
+                    daily.push(OmRefDayHist { date: fd, az_elev_histogram: hist_to_sorted_cells(day_hist) });
                     day_count += 1;
                     // pts drop → 메모리 해제
                 }
@@ -1380,32 +1390,23 @@ pub fn compute_reference_wedge(
             );
             total_track_time += tt;
             total_loss_time += lt;
-            merge_hist(&mut monthly_hist, &day_hist);
+            daily.push(OmRefDayHist { date: fd, az_elev_histogram: hist_to_sorted_cells(day_hist) });
             day_count += 1;
         }
     }
 
-    // 월간 합산 히스토그램 → 직렬화용 Vec<AzElevCell>
-    let az_elev_histogram: Vec<AzElevCell> = monthly_hist
-        .into_iter()
-        .map(|(k, (tt, lt, tc, lc))| AzElevCell {
-            az_bin: (k >> 16) as u16,
-            elev_bin: (k & 0xFFFF) as u16,
-            track_time_s: tt,
-            loss_time_s: lt,
-            track_count: tc,
-            loss_count: lc,
-        })
-        .collect();
+    // daily 를 date 오름차순 정렬 — 분석월 daily_stats 도 date 정렬이므로 두 경로의 일별 순서 일치
+    // (TS 일별 합산 순서까지 동일 → 같은 월이면 총계 비트 동일).
+    daily.sort_by(|a, b| a.date.cmp(&b.date));
 
     info!(
-        "[OmReference] 레이더 '{}' 기준월 재집계 완료: {} days, track {:.0}s loss {:.0}s, hist {} cells (files {})",
-        radar.radar_name, day_count, total_track_time, total_loss_time, az_elev_histogram.len(), total_files
+        "[OmReference] 레이더 '{}' 기준월 재집계 완료: {} days, track {:.0}s loss {:.0}s, {} daily hist (files {})",
+        radar.radar_name, day_count, total_track_time, total_loss_time, daily.len(), total_files
     );
 
     Ok(OmRefWedge {
         month_label: month_label.to_string(),
-        az_elev_histogram,
+        daily,
         total_track_time_secs: total_track_time,
         total_loss_time_secs: total_loss_time,
         day_count,
@@ -1414,7 +1415,8 @@ pub fn compute_reference_wedge(
 }
 
 /// 기준월 재집계 캐시 버전 — 파이프라인/캐시 포맷이 바뀌면 +1 하여 기존 캐시를 무효화한다.
-pub const OM_REF_PIPELINE_VERSION: u32 = 1;
+/// v2: OmRefWedge 캐시 포맷을 월간 합산(az_elev_histogram) → 일별(daily: OmRefDayHist)로 변경.
+pub const OM_REF_PIPELINE_VERSION: u32 = 2;
 
 /// 기준월 재집계 캐시 키 (16진 문자열) — 같은 입력·같은 설정이면 같은 키(같은 월 재집계는 캐시 히트).
 /// 구성: 수동 버전 상수 + 파이프라인 상수 실측값 + month_label + 보관 ASS(이름,바이트) 정렬 +
@@ -1503,4 +1505,134 @@ fn sanitized_stem(radar_name: &str) -> String {
 /// 원본 ASS 보관·캐시 디렉토리명 (om_reference/ass/<name>/, om_reference/cache/<name>/)
 pub fn reference_dirname(radar_name: &str) -> String {
     sanitized_stem(radar_name)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 패리티 진단 테스트 (동일 입력 → 분석월 경로 vs 기준월 재집계 경로 히스토그램 일치 검증)
+// cargo test --release parity -- --ignored --nocapture, 환경변수 PARITY_DIR=ASS 폴더
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    #[ignore]
+    fn verify_reference_parity() {
+        let dir = std::env::var("PARITY_DIR").expect("PARITY_DIR 환경변수 필요");
+        // 4월 파일 + 전월 마지막날(0331) — filterFilesByMonth 규칙 미러
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let name = p.file_name()?.to_string_lossy().to_string();
+                if !name.to_ascii_lowercase().ends_with(".ass") {
+                    return None;
+                }
+                let d = crate::parser::ass::extract_date_from_filename(&name)?;
+                if d.starts_with("2026-04") || d == "2026-03-31" {
+                    Some(p.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "PARITY_DIR 에 4월 파일 없음");
+        eprintln!("[parity] {} files", files.len());
+
+        let radar = RadarFileSet {
+            radar_name: "PARITY".to_string(),
+            radar_lat: 37.558,
+            radar_lon: 126.794,
+            radar_altitude: 20.0,
+            antenna_height: 15.0,
+            file_paths: files.clone(),
+            azimuth_sectors: vec![
+                AzSector { start_deg: 195.0, end_deg: 215.0 },
+                AzSector { start_deg: 300.0, end_deg: 308.0 },
+            ],
+            min_obstacle_distance_km: 1.5,
+            building_bearings_deg: vec![],
+            building_az_half_extents_deg: vec![],
+        };
+        let exclude: Vec<String> = vec![];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let noop = |_p: ObstacleMonthlyProgress| {};
+
+        // ── Path A: 분석월 경로 (analyze_radar_monthly → 일별 히스토그램) ──
+        let res = analyze_radar_monthly(&radar, &exclude, -8.0, &cancel, &noop).expect("analyze 실패");
+        // ── Path B: 기준월 재집계 경로 (compute_reference_wedge → 일별 히스토그램) ──
+        let wedge = compute_reference_wedge(&radar, &exclude, &files, "2026-04", -8.0, &cancel, &noop)
+            .expect("reference 실패");
+
+        // ── 일별·셀별 exact 비교 ──
+        // 재설계 후 기준월도 일별 히스토그램을 그대로 담으므로(hist_to_sorted_cells 정렬 셀),
+        // 같은 월 입력이면 분석월 daily_stats 와 기준월 daily 는 날짜 집합·각 날짜의 셀 배열이
+        // 정렬 포함 완전 동일해야 한다(full precision 값·카운트 exact). r3 시뮬레이션은 이제
+        // 정의상 0이라 폐지 — 직접 exact assert 로 대체.
+        let a_by_date: BTreeMap<&str, &Vec<AzElevCell>> = res
+            .daily_stats
+            .iter()
+            .map(|d| (d.date.as_str(), &d.az_elev_histogram))
+            .collect();
+        let b_by_date: BTreeMap<&str, &Vec<AzElevCell>> = wedge
+            .daily
+            .iter()
+            .map(|d| (d.date.as_str(), &d.az_elev_histogram))
+            .collect();
+
+        eprintln!("[parity] A days={} B days={}", a_by_date.len(), b_by_date.len());
+
+        // 날짜 집합 일치 (BTreeMap 이라 키는 정렬 순)
+        let a_dates: Vec<&str> = a_by_date.keys().copied().collect();
+        let b_dates: Vec<&str> = b_by_date.keys().copied().collect();
+        assert_eq!(a_dates, b_dates, "날짜 집합 불일치");
+
+        // 각 날짜의 셀 배열이 정렬 포함 완전 동일:
+        //   · az_bin/elev_bin/track_count/loss_count — exact (정렬 셀 정합 + 정수합은 순서 무관).
+        //   · track_time_s/loss_time_s — **직렬화(ser_s3) 표시 정밀도로 exact**.
+        // 왜 full precision(to_bits)이 아니라 표시 정밀도인가: accumulate_wedge_day 의 mode_s 그룹핑
+        // HashMap 반복 순서가 인스턴스마다 무작위라, 3개 이상 그룹이 같은 셀에 기여하면 f64 덧셈의
+        // 비결합성으로 두 경로의 셀 값이 sub-ULP(~1e-14) 어긋날 수 있다(그룹 순서만 다름 — 알고리즘은
+        // 동일). 이 차이는 ser_s3(0.001s 양자화, 프론트가 실제 소비하는 직렬화 값) 밑이라 직렬화 후 JSON 은
+        // 완전 동일 → TS 일별 합산·Δ 가 비트 동일(=0). 즉 '표시 정밀도 exact'가 곧 Δ=0 불변식의 증명이다.
+        // (accumulate_wedge_day 그룹 순서는 '분석월 산출 수치 불변' 규칙상 변경 금지 → 여기서 표시 정밀도로 검증.)
+        fn r3(v: f64) -> f64 { (v * 1e3).round() / 1e3 }
+        let mut total_cells = 0usize;
+        let mut max_dtt = 0.0f64; // full precision 최대 |Δ| (진단 — sub-ULP 확인용)
+        let mut max_dlt = 0.0f64;
+        for (date, a_cells) in &a_by_date {
+            let b_cells = b_by_date.get(date).expect("date exists in B");
+            assert_eq!(
+                a_cells.len(), b_cells.len(),
+                "[{}] 셀 수 불일치 A={} B={}", date, a_cells.len(), b_cells.len()
+            );
+            for (i, (ca, cb)) in a_cells.iter().zip(b_cells.iter()).enumerate() {
+                assert_eq!(ca.az_bin, cb.az_bin, "[{}] #{} az_bin 불일치", date, i);
+                assert_eq!(ca.elev_bin, cb.elev_bin, "[{}] #{} elev_bin 불일치", date, i);
+                assert_eq!(ca.track_count, cb.track_count, "[{}] #{} track_count 불일치", date, i);
+                assert_eq!(ca.loss_count, cb.loss_count, "[{}] #{} loss_count 불일치", date, i);
+                // 표시 정밀도(ser_s3) exact — 직렬화 후 JSON·TS 소비값이 비트 동일함을 보증(Δ=0)
+                assert_eq!(
+                    r3(ca.track_time_s), r3(cb.track_time_s),
+                    "[{}] #{} (az={} elev={}) track_time_s ser_s3 불일치 A={} B={}",
+                    date, i, ca.az_bin, ca.elev_bin, ca.track_time_s, cb.track_time_s
+                );
+                assert_eq!(
+                    r3(ca.loss_time_s), r3(cb.loss_time_s),
+                    "[{}] #{} (az={} elev={}) loss_time_s ser_s3 불일치 A={} B={}",
+                    date, i, ca.az_bin, ca.elev_bin, ca.loss_time_s, cb.loss_time_s
+                );
+                max_dtt = max_dtt.max((ca.track_time_s - cb.track_time_s).abs());
+                max_dlt = max_dlt.max((ca.loss_time_s - cb.loss_time_s).abs());
+            }
+            total_cells += a_cells.len();
+        }
+        eprintln!(
+            "[parity] 일별·셀별 일치 확인: {} days, {} cells | 표시정밀도(ser_s3)·카운트 exact | full-precision max|Δtt|={:.2e} max|Δlt|={:.2e} (sub-ULP — HashMap 그룹순서 무관, 직렬화 후 동일)",
+            a_by_date.len(), total_cells, max_dtt, max_dlt
+        );
+    }
 }

@@ -32,6 +32,7 @@ src/dev/babelPluginSourceAttrs.d.ts
 
 # Rust
 src-tauri/target/
+src-tauri/target-parity/
 
 # Reference ASS data files (large binary)
 ass/
