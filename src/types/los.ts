@@ -10,7 +10,7 @@ export interface ElevationPoint {
 
 /** LoS 수직 단면 커튼 샘플 (지도 평면 프레임: z = AMSL m, 곡률 미적용 raw)
  *  단면도(LoSProfilePanel) 디스플레이 프레임(곡률 처짐)을 지도 평면(raw AMSL)으로 역변환한 값 —
- *  각 필드는 단면도 차트의 동명 선이며, TrackMap 이 레이더→타겟(0..D) 구간 3D 수직 평면상
+ *  각 필드는 단면도 차트의 동명 선이며, TrackMap 이 차트 가시 구간(단면도 X줌 동기) 3D 수직 평면상
  *  폴리라인(지형·최저탐지 LoS·프레넬·BRA·CoS·4/3 레이)으로 그대로 표출한다. */
 export interface LosCurtainSample {
   lat: number; lon: number; distKm: number;

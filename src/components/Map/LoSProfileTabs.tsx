@@ -77,8 +77,9 @@ export default function LoSProfileTabs({ views, onLoaded, searchedAddress, ...re
         {...rest}
         targetLat={active.lat}
         targetLon={active.lon}
-        // 가장자리 탭은 150m 자동선택이 다른 건물을 잡을 수 있어 중앙 탭에서만 전달
-        searchedAddress={safeActive === centerIdx ? searchedAddress : null}
+        // 모든 탭에 전달 — 자동선택(클릭 상태 강제)이 폐지돼 오선택 우려가 없고,
+        //   좌/우끝 탭에서도 대상 건물을 목록에 강제 포함시키고 파란색으로 구분하려면 필요
+        searchedAddress={searchedAddress}
         onLoaded={handleLoaded}
       />
     </div>

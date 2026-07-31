@@ -65,7 +65,7 @@ const TrackPointIcon = ({ size = 16 }: { size?: number }) => (
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath } from "../types";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
 import LoSProfileTabs from "../components/Map/LoSProfileTabs";
@@ -477,8 +477,10 @@ export default function TrackMap() {
   const [losSimBuilding, setLosSimBuilding] = useState<{ lat: number; lon: number; groundElevM: number; heightM: number; name: string | null } | null>(null);
   // 시뮬레이션 결과(허용높이·초과량) — LoSProfilePanel onSimStats 수신
   const [losSimStats, setLosSimStats] = useState<{ allowableAglM: number; allowableTopAmslM: number; excessM: number; distKm: number } | null>(null);
-  // LoS 수직 단면 커튼 샘플 — LoSProfilePanel onCurtainData 수신 (레이더→타겟 0..D 3D 표출)
+  // LoS 수직 단면 커튼 샘플 — LoSProfilePanel onCurtainData 수신 (차트 가시 구간 3D 표출)
   const [losCurtain, setLosCurtain] = useState<LosCurtainSample[] | null>(null);
+  // 단면도 경로상 건물 — 대상(파랑)/차단(빨강) 지도 하이라이트. LoSProfilePanel onPathBuildings 수신
+  const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[] } | null>(null);
   // 건물모드 방위 한계 — 건물 양끝 방위(offset 도메인, 0/360 랩 안전). launchBuildingLoS valid 시 설정
   const [losBldgAzBounds, setLosBldgAzBounds] = useState<{ center: number; minOff: number; maxOff: number } | null>(null);
   // 건물 스윕 최초 1회 줌인 플래그 (launchBuildingLoS 시 리셋)
@@ -1551,6 +1553,91 @@ export default function TrackMap() {
     return cleanup;
   }, [addressMarker, addressBuilding]);
 
+  // ── LoS 단면도 경로상 건물 → 지도 3D 하이라이트 (대상=파랑 #3b82f6, 차단=빨강 #ef4444) ──
+  //   단면도 차트의 대상/차단 건물 색과 1:1 대응. 주소검색 골드 건물과 동일하게
+  //   buildings3dMode·showBuildings·줌 게이트와 무관하게 LoS 분석 중엔 상시 표출.
+  //   base/height 는 지도면(terrain 활성 시 지형 표면) 위 상대 오프셋이므로 base=0·height=건물높이 —
+  //   AMSL 지반고를 base 로 주면 그만큼 공중부양(커밋 16e137c 불변식).
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (!map || !map.isStyleLoaded()) return;
+
+    const tgtSrcId = "los-path-target-src", tgtFillId = "los-path-target-fill";
+    const blkSrcId = "los-path-block-src", blkFillId = "los-path-block-fill";
+    const fpSrcId = "los-path-fp-src", fpFillId = "los-path-fp-fill", fpLineId = "los-path-fp-line";
+    const cleanup = () => {
+      for (const id of [tgtFillId, blkFillId, fpFillId, fpLineId]) if (map.getLayer(id)) map.removeLayer(id);
+      for (const id of [tgtSrcId, blkSrcId, fpSrcId]) if (map.getSource(id)) map.removeSource(id);
+    };
+    cleanup();
+
+    if (!losMode || !losPathBldgs) return;
+
+    // BuildingOnPath.polygon 은 [[lat,lon],...] — GeoJSON 은 [lon,lat] 이므로 뒤집고 링 폐합
+    const toFeature = (b: BuildingOnPath): GeoJSON.Feature | null => {
+      if (!b.polygon || b.polygon.length < 3) return null;
+      const coords = b.polygon.map(([lat, lon]) => [lon, lat]);
+      const first = coords[0], last = coords[coords.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+      return {
+        type: "Feature",
+        properties: { height: b.height_m },
+        geometry: { type: "Polygon", coordinates: [coords] },
+      };
+    };
+
+    const target = losPathBldgs.target;
+    const tgtFeat = target ? toFeature(target) : null;
+    if (tgtFeat) {
+      map.addSource(tgtSrcId, { type: "geojson", data: { type: "FeatureCollection", features: [tgtFeat] } });
+      map.addLayer({
+        id: tgtFillId,
+        type: "fill-extrusion",
+        source: tgtSrcId,
+        paint: {
+          "fill-extrusion-color": "#3b82f6", // 대상 건물 파랑 (단면도 차트와 동일)
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": 0.9,
+        },
+      });
+    }
+
+    // 차단 건물 — polygon 없는 건물(선형 수동건물 등)은 스킵
+    const blkFeats: GeoJSON.Feature[] = [];
+    for (const b of losPathBldgs.blocking) {
+      const f = toFeature(b);
+      if (f) blkFeats.push(f);
+    }
+    if (blkFeats.length > 0) {
+      map.addSource(blkSrcId, { type: "geojson", data: { type: "FeatureCollection", features: blkFeats } });
+      map.addLayer({
+        id: blkFillId,
+        type: "fill-extrusion",
+        source: blkSrcId,
+        paint: {
+          "fill-extrusion-color": "#ef4444", // 차단 건물 빨강
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": 0.9,
+        },
+      });
+    }
+
+    // 대상 건물이 목록에 없으면(코리도 조회 미포함·polygon 없음) 분석 대상 footprint 를 2D 파란 면으로 폴백
+    if (!tgtFeat && losFootprint && losFootprint.length >= 3) {
+      const coords = losFootprint.map(([lat, lon]) => [lon, lat]);
+      const first = coords[0], last = coords[coords.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+      const data: GeoJSON.Feature = { type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [coords] } };
+      map.addSource(fpSrcId, { type: "geojson", data });
+      map.addLayer({ id: fpFillId, type: "fill", source: fpSrcId, paint: { "fill-color": "#3b82f6", "fill-opacity": 0.35 } });
+      map.addLayer({ id: fpLineId, type: "line", source: fpSrcId, paint: { "line-color": "#3b82f6", "line-width": 2 } });
+    }
+
+    return cleanup;
+  }, [losPathBldgs, losFootprint, losMode, mapLoaded]);
+
 
   // ESC 키로 LoS 커서 모드 해제
   useEffect(() => {
@@ -2105,10 +2192,17 @@ export default function TrackMap() {
       if (ang > angMax) angMax = ang;
     }
     const valid = Number.isFinite(angMin) && angMin < angMax && (angMax - angMin) > 2e-4; // ≳0.01°
+    // 좌/우끝 방위는 footprint 꼭짓점 '접선' — 그대로 쓰면 Rust line_polygon_intersections 의 정확 교차가
+    //   수치오차로 빗나가 대상 건물이 코리도 조회에서 통째로 탈락한다(단면도에 대상 건물 미표시).
+    //   방위를 도형 안쪽으로 미세 인셋해 접선 스침 대신 확실히 관통시킨다(폭의 1%, 최소 2e-5 rad ≈ 0.001°).
+    const span = angMax - angMin;
+    const inset = Math.min(span * 0.25, Math.max(2e-5, span * 0.01));
+    const azLeft = wrap(centerAz + (angMin + inset) * 180 / Math.PI);
+    const azRight = wrap(centerAz + (angMax - inset) * 180 / Math.PI);
     const views = valid ? [
-      { ...proj(wrap(centerAz + angMin * 180 / Math.PI)), label: "좌끝", az: wrap(centerAz + angMin * 180 / Math.PI) },
+      { ...proj(azLeft), label: "좌끝", az: azLeft },
       { ...proj(centerAz), label: "중앙", az: centerAz },
-      { ...proj(wrap(centerAz + angMax * 180 / Math.PI)), label: "우끝", az: wrap(centerAz + angMax * 180 / Math.PI) },
+      { ...proj(azRight), label: "우끝", az: azRight },
     ] : null;
 
     setLosFromAzDist(centerAz, targetKm); // losMode 진입 + losTarget=중앙
@@ -2116,7 +2210,8 @@ export default function TrackMap() {
     setLosAzViews(views);
     setLosSearchedAddress({ lat: centerLat, lon: centerLon });
     setLosAzFineCenter(centerAz);
-    // 건물 양끝 방위(offset)로 방위 슬라이더 한계 설정 — valid(폴리곤 좌우폭 유효) 일 때만
+    // 건물 양끝 방위(offset)로 방위 슬라이더 한계 설정 — valid(폴리곤 좌우폭 유효) 일 때만.
+    //   스윕 한계는 실제 건물 경계여야 하므로 위 인셋을 적용하지 않은 원래 접선값 사용
     setLosBldgAzBounds(valid ? { center: centerAz, minOff: angMin * 180 / Math.PI, maxOff: angMax * 180 / Math.PI } : null);
     bldgSweepZoomedRef.current = false; // 새 건물 → 최초 스윕 줌인 재무장
     setLosCursorPicking(false);
@@ -2164,6 +2259,7 @@ export default function TrackMap() {
     setLosSimStats(null);
     setLosBldgAzBounds(null);
     setLosCurtain(null);
+    setLosPathBldgs(null);
     const map = mapRef.current?.getMap();
     if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
   }, []);
@@ -2289,9 +2385,9 @@ export default function TrackMap() {
       ? [radarInfo.lon, radarInfo.lat]
       : [radarSite.longitude, radarSite.latitude];
 
-    // ── LoS 수직 단면 커튼 (레이더→타겟 0..D) ── 단면도 프로파일 로드 후 상시 표출.
+    // ── LoS 수직 단면 커튼 (차트 가시 구간) ── 단면도 프로파일 로드 후 상시 표출.
     //   단면도 차트의 각 선(지형·최저탐지 LoS·프레넬·BRA·CoS·4/3 레이)을 3D 수직 리본면(커튼 월)+상단
-    //   강조선으로 재현: 인접 샘플쌍마다 반투명 수직 quad(SolidPolygonLayer)를 먼저 깔고, 기존 PathLayer 선을
+    //   강조선으로 재현: 인접 샘플쌍마다 불투명 수직 quad(SolidPolygonLayer)를 먼저 깔고, 기존 PathLayer 선을
     //   그 위에 상단 모서리로 얹음. 지형 메시가 1.5배 과장이라 커튼 전체 z 에 동일 배율(EX)을 곱해 지형 표면과 정합.
     //   수직 폴리곤은 2D 테셀레이터에서 선으로 퇴화하므로 SolidPolygonLayer 는 _full3d:true 필수(최대면적 평면 테셀레이션).
     //   pitch 0(탑다운)에선 면·선 모두 자연히 모서리시점(선)으로 퇴화 → 별도 토글 없음. 색·게이트는 LOS_LAYERS 칩과 동일.
@@ -2320,6 +2416,8 @@ export default function TrackMap() {
       };
       // 면별 SolidPolygonLayer 빌더 — 인접 샘플쌍마다 수직 quad, z 는 선과 동일 EX 배율.
       //   수직 폴리곤은 2D 테셀레이션에서 퇴화하므로 _full3d 필수, material:false 로 조명 음영 없이 플랫 색.
+      //   전 월 불투명(α=255) — 같은 수직 평면에 겹쳐 놓이므로 depthCompare:"less-equal" 로
+      //   나중에 그린 (더 낮은) 월이 코플레이너 z-fighting 없이 앞면을 차지 → 차트의 적층 밴드와 동일한 표현.
       const pushCurtainWall = (
         id: string,
         bottom: (s: LosCurtainSample) => number,
@@ -2352,19 +2450,20 @@ export default function TrackMap() {
             _full3d: true,   // 수직 폴리곤 필수 — 미지정 시 2D 테셀레이터가 선으로 퇴화
             material: false, // 조명 음영 없이 플랫 색
             pickable: false,
+            // 코플레이너 quad 는 depth 동률 — less-equal 이라야 나중 push 한 월이 앞을 차지(z-fighting 제거)
+            parameters: { depthCompare: "less-equal" as const },
           })
         );
       };
-      // 지형 면 하단: 전 샘플 최저 지형고와 0 중 작은 값 상수 (지형이 해수면 위여도 0까지 채움)
-      let terrainFloorM = 0;
-      for (const s of curtain) if (s.terrainM < terrainFloorM) terrainFloorM = s.terrainM;
       // 면들을 먼저(아래층), 선들을 나중(위 상단 강조선)에 push — 게이트는 대응 선과 동일.
-      if (losLayers.terrain) pushCurtainWall("los-curtain-wall-terrain", () => terrainFloorM, (s) => s.terrainM, [34, 197, 94, 60]);
-      if (losLayers.los43)   pushCurtainWall("los-curtain-wall-los43", (s) => s.terrainM, (s) => s.los43M, [245, 158, 11, 45]);
-      if (losLayers.fresnel) pushCurtainWall("los-curtain-wall-fresnel", (s) => s.terrainM, (s) => s.fresnelM, [236, 72, 153, 35]);
-      if (losLayers.bra)     pushCurtainWall("los-curtain-wall-bra", (s) => s.terrainM, (s) => s.braM, [34, 211, 238, 35]);
-      if (losLayers.cos)     pushCurtainWall("los-curtain-wall-cos", (s) => s.terrainM, (s) => s.cosM, [168, 85, 247, 35]);
-      pushCurtainWall("los-curtain-wall-ray", (s) => s.terrainM, (s) => s.rayM, [233, 69, 96, 50]);
+      //   월 push 순서 = top 높은 것부터(cos → bra → fresnel → los43 → ray): 같은 수직 평면에서
+      //   나중에 그린 낮은 월이 depthCompare less-equal 로 이겨 차트처럼 아래부터 색 밴드가 쌓여 보인다.
+      //   지형 면(초록)은 지형 메시와 겹쳐 이중 표출되므로 미표출 — 지형 상단선(los-curtain-line-terrain)만 유지.
+      if (losLayers.cos)     pushCurtainWall("los-curtain-wall-cos", (s) => s.terrainM, (s) => s.cosM, [168, 85, 247, 255]);
+      if (losLayers.bra)     pushCurtainWall("los-curtain-wall-bra", (s) => s.terrainM, (s) => s.braM, [34, 211, 238, 255]);
+      if (losLayers.fresnel) pushCurtainWall("los-curtain-wall-fresnel", (s) => s.terrainM, (s) => s.fresnelM, [236, 72, 153, 255]);
+      if (losLayers.los43)   pushCurtainWall("los-curtain-wall-los43", (s) => s.terrainM, (s) => s.los43M, [245, 158, 11, 255]);
+      pushCurtainWall("los-curtain-wall-ray", (s) => s.terrainM, (s) => s.rayM, [233, 69, 96, 255]);
       if (losLayers.terrain) pushCurtainLine("los-curtain-line-terrain", (s) => s.terrainM, [34, 197, 94, 255], 2);
       if (losLayers.los43)   pushCurtainLine("los-curtain-line-los43", (s) => s.los43M, [245, 158, 11, 255], 2);
       if (losLayers.fresnel) pushCurtainLine("los-curtain-line-fresnel", (s) => s.fresnelM, [236, 72, 153, 200], 1.5);
@@ -4341,7 +4440,7 @@ export default function TrackMap() {
         <LoSProfileTabs
           views={losAzViews ?? [{ lat: losTarget.lat, lon: losTarget.lon, label: "중앙", az: losAzimuth }]}
           radarSite={radarSite}
-          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosCursorPicking(true); }}
+          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosPathBldgs(null); setLosCursorPicking(true); }}
           searchedAddress={losSearchedAddress}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
@@ -4365,6 +4464,7 @@ export default function TrackMap() {
           simBuilding={losSimBuilding}
           onSimStats={setLosSimStats}
           onCurtainData={setLosCurtain}
+          onPathBuildings={setLosPathBldgs}
         />
         </div>
       )}

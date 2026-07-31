@@ -713,7 +713,9 @@ pub fn query_buildings_along_path(
                 usage: None,
                 lat: rep_lat,
                 lon: rep_lon,
-                polygon: None,
+                // ring 은 (lon, lat) 튜플 — BuildingOnPath.polygon 계약은 [lat, lon] 이라 뒤집어 담는다
+                //   (프론트 지도 하이라이트가 수동 건물도 커버하도록)
+                polygon: Some(ring.iter().map(|&(lon, lat)| [lat, lon]).collect()),
                 is_manual: true,
             });
         } else if geo_type_str == "line" {
