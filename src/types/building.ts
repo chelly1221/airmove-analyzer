@@ -25,7 +25,7 @@ export interface Building3D {
   lon: number;
   /** 건물 자체 높이 (m) */
   height_m: number;
-  /** 지반 표고 (m, AMSL) — fill-extrusion base */
+  /** 지반 표고 (m, AMSL) — 팝업 표시·LoS 계산용 (fill-extrusion base 로는 사용 금지: base 는 지도면 위 상대 오프셋) */
   ground_elev_m: number;
   /** 건물 폴리곤 좌표 [[lat,lon],...] (WGS84) */
   polygon: [number, number][];

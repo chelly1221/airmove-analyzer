@@ -295,7 +295,7 @@ export function buildingsToGeoJSON(buildings: Building3D[]): GeoJSON.FeatureColl
       type: "Feature",
       properties: {
         height: b.height_m,
-        base: b.ground_elev_m,
+        base: b.ground_elev_m, // AMSL 지반고 — 팝업 표시용 (fill-extrusion base 는 지도면 위 상대 오프셋이라 사용 금지)
         name: b.name || "",
         usage: b.usage || "",
         source: b.source,

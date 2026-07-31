@@ -635,7 +635,7 @@ export default function BuildingModal({
       if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
       features.push({
         type: "Feature",
-        properties: { base: foundBuilding.ground_elev_m, height: foundBuilding.height_m },
+        properties: { height: foundBuilding.height_m },
         geometry: { type: "Polygon", coordinates: [coords] },
       });
     }
@@ -821,10 +821,11 @@ export default function BuildingModal({
               {/* 검색 건물 footprint 3D 표출 (pitch 0 에선 자연히 2D). fill-extrusion 은 작도용 queryRenderedFeatures 목록에 없어 간섭 없음 */}
               {foundBuildingGeoJson && (
                 <Source id="found-building" type="geojson" data={foundBuildingGeoJson as any}>
+                  {/* base/height 는 지도면(terrain 시 지형 표면) 위 상대 오프셋 — AMSL 지반고를 주면 그만큼 부양됨 */}
                   <Layer id="found-building-fill" type="fill-extrusion" paint={{
                     "fill-extrusion-color": "#fbbf24",
-                    "fill-extrusion-base": ["get", "base"],
-                    "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
+                    "fill-extrusion-base": 0,
+                    "fill-extrusion-height": ["get", "height"],
                     "fill-extrusion-opacity": 0.85,
                   }} />
                   <Layer id="found-building-line" type="line" paint={{ "line-color": "#f59e0b", "line-width": 2 }} />

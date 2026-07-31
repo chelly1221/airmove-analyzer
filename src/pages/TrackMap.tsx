@@ -1209,9 +1209,9 @@ export default function TrackMap() {
               "#e5e7eb",
               "#ef4444",
             ],
-            // AMSL 옥상 높이 = 지반 표고 + 건물 높이
-            "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
-            "fill-extrusion-base": ["get", "base"],
+            // base/height 는 지도면(terrain 시 지형 표면) 위 상대 오프셋 — AMSL 지반고(base 프로퍼티)는 팝업 표시용으로만 유지
+            "fill-extrusion-height": ["get", "height"],
+            "fill-extrusion-base": 0,
             "fill-extrusion-opacity": buildingOpacity,
           },
         });
@@ -1400,8 +1400,8 @@ export default function TrackMap() {
       source: hlSourceId,
       paint: {
         "fill-extrusion-color": "#f97316",  // 주황색
-        "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
-        "fill-extrusion-base": ["get", "base"],
+        "fill-extrusion-height": ["get", "height"],
+        "fill-extrusion-base": 0,
         "fill-extrusion-opacity": 0.9,
       },
     });
@@ -1442,8 +1442,8 @@ export default function TrackMap() {
       source: selSourceId,
       paint: {
         "fill-extrusion-color": "#fbbf24", // 골드 glow
-        "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
-        "fill-extrusion-base": ["get", "base"],
+        "fill-extrusion-height": ["get", "height"],
+        "fill-extrusion-base": 0,
         "fill-extrusion-opacity": 0.95,
       },
     });
@@ -1484,7 +1484,7 @@ export default function TrackMap() {
     const hasFootprint = !!addressBuilding && addressBuilding.polygons.length > 0;
 
     if (hasFootprint && addressBuilding) {
-      // 3D 골드 fill-extrusion — 링별 폴리곤 폐합, base=지반·height=지반+건물높이(기존 선택 하이라이트와 동일 프로퍼티 방식)
+      // 3D 골드 fill-extrusion — 링별 폴리곤 폐합. base/height 는 terrain 표면 위 상대 오프셋(MapLibre 가 centroid 지형고를 자동 가산)이라 base=0·height=건물높이 — AMSL 지반고를 주면 그만큼 부양됨
       const features: GeoJSON.Feature[] = [];
       for (const ring of addressBuilding.polygons) {
         if (ring.length < 3) continue;
@@ -1493,7 +1493,7 @@ export default function TrackMap() {
         if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
         features.push({
           type: "Feature",
-          properties: { base: addressBuilding.ground_elev_m, height: addressBuilding.height_m },
+          properties: { height: addressBuilding.height_m },
           geometry: { type: "Polygon", coordinates: [coords] },
         });
       }
@@ -1506,8 +1506,8 @@ export default function TrackMap() {
         source: srcId,
         paint: {
           "fill-extrusion-color": "#fbbf24", // 검색 건물 골드 (선택 하이라이트와 동일 컨벤션)
-          "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
-          "fill-extrusion-base": ["get", "base"],
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-base": 0,
           "fill-extrusion-opacity": 0.9,
         },
       });
@@ -2710,8 +2710,8 @@ export default function TrackMap() {
           source: sourceId,
           paint: {
             "fill-extrusion-color": panoramaPinned ? "#dc2626" : "#ef4444",
-            "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
-            "fill-extrusion-base": ["get", "base"],
+            "fill-extrusion-height": ["get", "height"],
+            "fill-extrusion-base": 0,
             "fill-extrusion-opacity": panoramaPinned ? 0.95 : 0.8,
           },
         });
