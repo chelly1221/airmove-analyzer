@@ -240,6 +240,255 @@ pub fn query_fac_building_detail(
     Ok(None)
 }
 
+/// 주소검색 좌표 인근 건물 1건 (footprint 포함) — 주소검색→3D 표출용
+#[derive(Serialize, Clone, Debug)]
+pub struct BuildingNearPoint {
+    pub name: Option<String>,
+    pub usage: Option<String>,        // fac 전용, manual 은 None
+    pub source: String,               // "fac" | "manual"
+    pub height_m: f64,
+    pub ground_elev_m: f64,
+    pub lat: f64,                     // centroid
+    pub lon: f64,
+    /// footprint 링 목록 [[lat,lon],...] — 도형 없는 수동건물은 빈 벡터
+    pub polygons: Vec<Vec<[f64; 2]>>,
+    pub contained: bool,              // 검색점이 폴리곤 내부
+    pub distance_m: f64,              // 검색점→centroid (contained 면 0)
+}
+
+/// [[lat,lon],...] JSON 배열 → 링 [[lat,lon],...] (3점 미만이면 None)
+fn json_array_to_ring(val: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
+    let arr = val.as_array()?;
+    let pts: Vec<[f64; 2]> = arr
+        .iter()
+        .filter_map(|p| {
+            let lat = p.get(0)?.as_f64()?;
+            let lon = p.get(1)?.as_f64()?;
+            Some([lat, lon])
+        })
+        .collect();
+    if pts.len() >= 3 { Some(pts) } else { None }
+}
+
+/// 수동 건물 geometry_json → footprint 링 목록 [[lat,lon],...] (주소검색 3D 표출용)
+/// "polygon" = 단일 링, "multi" = [{type,json},...] 복수 링. 도형 없으면 빈 벡터.
+fn manual_building_rings(geo_type: Option<&str>, geo_json: Option<&str>) -> Vec<Vec<[f64; 2]>> {
+    let mut rings: Vec<Vec<[f64; 2]>> = Vec::new();
+    let gt = match geo_type {
+        Some(t) => t,
+        None => return rings,
+    };
+    let json_str = match geo_json {
+        Some(s) if !s.is_empty() => s,
+        _ => return rings,
+    };
+    let val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return rings,
+    };
+    match gt {
+        "polygon" => {
+            if let Some(ring) = json_array_to_ring(&val) {
+                rings.push(ring);
+            }
+        }
+        "multi" => {
+            // [{type, json}, ...] — 각 서브 도형의 json 은 [[lat,lon],...] 문자열
+            if let Some(arr) = val.as_array() {
+                for item in arr {
+                    if item.get("type").and_then(|v| v.as_str()) != Some("polygon") {
+                        continue;
+                    }
+                    if let Some(sj) = item.get("json").and_then(|v| v.as_str()) {
+                        if let Ok(sv) = serde_json::from_str::<serde_json::Value>(sj) {
+                            if let Some(ring) = json_array_to_ring(&sv) {
+                                rings.push(ring);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    rings
+}
+
+/// 주소검색 좌표 인근 건물 1건 조회 (fac + manual, footprint 포함).
+/// 1) 폴리곤 내부 포함 건물 우선(다수면 fac 우선·동일소스면 최근접),
+/// 2) 없으면 fac+manual 통틀어 centroid 최근접(반경 radius_m 이내). 그 외 None.
+pub fn query_building_near_point(
+    conn: &Connection,
+    // GIS(건물통합정보) 건물을 centroid SRTM 으로 '지형 위'에 앉히기 위함(along_path 와 동일 소스).
+    srtm: &mut crate::srtm::SrtmReader,
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+) -> Result<Option<BuildingNearPoint>, String> {
+    let eff_radius = radius_m.max(80.0);
+    let buf = eff_radius / 111_000.0;
+    // 수동 건물은 centroid 가 폴리곤 중심이라, 큰 도형이면 검색점이 내부여도 centroid 가 bbox 밖일 수 있다.
+    // 포함 판정(우선순위 1)을 놓치지 않도록 수동 후보 bbox 는 최소 ~330m 로 넉넉히.
+    let manual_buf = buf.max(330.0 / 111_000.0);
+
+    // 후보(fac + manual) 를 하나의 벡터에 모아 포함/최근접 판정.
+    struct Cand {
+        source: &'static str,
+        name: Option<String>,
+        usage: Option<String>,
+        height_m: f64,
+        ground_elev_m: f64,
+        clat: f64,
+        clon: f64,
+        polygons: Vec<Vec<[f64; 2]>>,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+
+    // ── FAC 건물 후보 ──
+    // fac 지반 = centroid SRTM(live). ground_elev 캐시 컬럼은 미백필 행이 많아 사용 금지(프로젝트 불변식).
+    let mut stmt = conn.prepare(
+        "SELECT building_name, usability, height, centroid_lat, centroid_lon, polygon_json
+         FROM fac_buildings
+         WHERE centroid_lat BETWEEN ?1 AND ?2
+           AND centroid_lon BETWEEN ?3 AND ?4"
+    ).map_err(|e| format!("건물 근접 FAC 쿼리 준비 실패: {}", e))?;
+    let rows = stmt.query_map(
+        params![lat - buf, lat + buf, lon - buf, lon + buf],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        },
+    ).map_err(|e| format!("건물 근접 FAC 쿼리 실행 실패: {}", e))?;
+    for row in rows {
+        let (name, usage, height, clat, clon, polygon_json) =
+            row.map_err(|e| format!("건물 근접 FAC 행 읽기 실패: {}", e))?;
+        let mut polygons: Vec<Vec<[f64; 2]>> = Vec::new();
+        if let Some(s) = polygon_json.as_deref() {
+            if let Ok(poly) = serde_json::from_str::<Vec<[f64; 2]>>(s) {
+                if poly.len() >= 3 {
+                    polygons.push(poly);
+                }
+            }
+        }
+        let ground_elev = srtm.get_elevation(clat, clon).unwrap_or(0.0);
+        cands.push(Cand {
+            source: "fac",
+            name,
+            usage,
+            height_m: height,
+            ground_elev_m: ground_elev,
+            clat,
+            clon,
+            polygons,
+        });
+    }
+
+    // ── 수동 건물 후보 ──
+    // 그룹 enabled 게이트는 적용하지 않는다(명시적 주소검색이므로 활성/비활성 무관하게 항상 대상).
+    // manual 지반 = 저장된 ground_elev(사용자 입력값) 그대로 사용.
+    let mut stmt2 = conn.prepare(
+        "SELECT name, latitude, longitude, height, ground_elev, geometry_type, geometry_json
+         FROM manual_buildings
+         WHERE latitude BETWEEN ?1 AND ?2
+           AND longitude BETWEEN ?3 AND ?4"
+    ).map_err(|e| format!("건물 근접 수동 쿼리 준비 실패: {}", e))?;
+    let manual_rows = stmt2.query_map(
+        params![lat - manual_buf, lat + manual_buf, lon - manual_buf, lon + manual_buf],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        },
+    ).map_err(|e| format!("건물 근접 수동 쿼리 실행 실패: {}", e))?;
+    for row in manual_rows {
+        let (name, mlat, mlon, height, ground_elev, geo_type, geo_json) =
+            row.map_err(|e| format!("건물 근접 수동 행 읽기 실패: {}", e))?;
+        let polygons = manual_building_rings(geo_type.as_deref(), geo_json.as_deref());
+        cands.push(Cand {
+            source: "manual",
+            name,
+            usage: None,
+            height_m: height,
+            ground_elev_m: ground_elev,
+            clat: mlat,
+            clon: mlon,
+            polygons,
+        });
+    }
+
+    // 판정: ① 폴리곤 내부 포함(다수면 fac 우선·동일소스면 최근접) ② 없으면 centroid 최근접(반경 이내)
+    let mut best_contained: Option<(bool, f64, usize)> = None; // (is_fac, dist_km, idx)
+    let mut best_near: Option<(f64, usize)> = None;            // (dist_km, idx)
+
+    for (i, c) in cands.iter().enumerate() {
+        let d_km = crate::geo::haversine_km(lat, lon, c.clat, c.clon);
+        // 포함 판정 — ring 은 (lon,lat) 좌표계로 변환 후 ray casting
+        let mut contained = false;
+        for ring in &c.polygons {
+            let ring_ll: Vec<(f64, f64)> = ring.iter().map(|p| (p[1], p[0])).collect();
+            if point_in_polygon_2d(lon, lat, &ring_ll) {
+                contained = true;
+                break;
+            }
+        }
+        if contained {
+            let is_fac = c.source == "fac";
+            let better = match &best_contained {
+                None => true,
+                // fac 우선(승격만 허용), 동일 소스면 최근접
+                Some((bf, bd, _)) => (is_fac && !*bf) || (is_fac == *bf && d_km < *bd),
+            };
+            if better {
+                best_contained = Some((is_fac, d_km, i));
+            }
+        }
+        if best_near.as_ref().map_or(true, |(bd, _)| d_km < *bd) {
+            best_near = Some((d_km, i));
+        }
+    }
+
+    let chosen: Option<(usize, bool, f64)> = if let Some((_, _, i)) = best_contained {
+        Some((i, true, 0.0)) // contained → distance 0
+    } else if let Some((d, i)) = best_near {
+        if d * 1000.0 <= eff_radius {
+            Some((i, false, d * 1000.0))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((idx, contained, dist_m)) = chosen {
+        let c = &cands[idx];
+        return Ok(Some(BuildingNearPoint {
+            name: c.name.clone(),
+            usage: c.usage.clone(),
+            source: c.source.to_string(),
+            height_m: c.height_m,
+            ground_elev_m: c.ground_elev_m,
+            lat: c.clat,
+            lon: c.clon,
+            polygons: c.polygons.clone(),
+            contained,
+            distance_m: dist_m,
+        }));
+    }
+    Ok(None)
+}
+
 /// LoS 경로(레이더→타겟) 상의 건물 조회
 pub fn query_buildings_along_path(
     conn: &Connection,

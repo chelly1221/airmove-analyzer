@@ -51,6 +51,21 @@ export interface FacBuildingDetail {
   lon: number;
 }
 
+/** 주소검색 좌표 인근 건물 1건 — find_building_near_point 결과 (footprint 포함, 3D 자동 표출용) */
+export interface AddressBuildingHit {
+  name: string | null;
+  usage: string | null;
+  source: "fac" | "manual";
+  height_m: number;
+  ground_elev_m: number;
+  lat: number;
+  lon: number;
+  /** footprint 링 목록 [[lat,lon],...] — 도형 없는 수동건물은 빈 배열 */
+  polygons: [number, number][][];
+  contained: boolean;
+  distance_m: number;
+}
+
 /** 인근 산봉우리 (query_nearby_peaks 결과) */
 export interface NearbyPeak {
   name: string;

@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import Modal from "./common/Modal";
 import { Dropdown } from "./common/Dropdown";
 import AddressSearch, { AddressMarker } from "./Map/AddressSearch";
-import type { BuildingGroup, GeometryType, ManualBuilding, BuildingFormData, BuildingModalDraft } from "../types";
+import type { BuildingGroup, GeometryType, ManualBuilding, BuildingFormData, BuildingModalDraft, AddressBuildingHit } from "../types";
 import { useAppStore } from "../store";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
 
@@ -101,6 +101,14 @@ export function shapeTypeLabel(type: string): string {
     case "multi": return "복합";
     default: return type;
   }
+}
+
+/** footprint 링 [[lat,lon],...] 을 닫힌 링(첫점==끝점)으로 정규화 — 모달 도형 포맷 */
+function closeRing(ring: [number, number][]): [number, number][] {
+  if (ring.length < 3) return ring;
+  const first = ring[0], last = ring[ring.length - 1];
+  if (first[0] === last[0] && first[1] === last[1]) return ring;
+  return [...ring, [first[0], first[1]]];
 }
 
 function shapeToGeoJsonFeature(shape: { type: GeometryType; json: string | null }, index?: number): GeoJSON.Feature | null {
@@ -509,16 +517,132 @@ export default function BuildingModal({
   const mapCenter = hasMarker ? { latitude: markerLat, longitude: markerLon } : { latitude: 37.55, longitude: 126.99 };
 
   const [addressMarker, setAddressMarker] = useState<{ lat: number; lon: number; label: string } | null>(null);
-  const handleAddressSelect = useCallback((lat: number, lon: number, label: string) => {
-    if (lat !== 0 && lon !== 0) {
-      miniMapRef.current?.flyTo({ center: [lon, lat], zoom: 17, duration: 600 });
-      setAddressMarker({ lat, lon, label });
-    } else {
-      setAddressMarker(null);
+  // 주소검색으로 찾은 로컬 건물(footprint 3D 표출용) + 레이스 방지 시퀀스
+  const [foundBuilding, setFoundBuilding] = useState<AddressBuildingHit | null>(null);
+  const addressReqSeq = useRef(0);
+  const foundLabelRef = useRef("");
+  // 검색 건물이 표출됐지만 (기존 작도물이 있어) 아직 폼에 적용되지 않은 상태 → "도형 적용" 버튼 노출
+  const [pendingApply, setPendingApply] = useState(false);
+  // 미니맵 3D(pitch) 토글 상태
+  const [is3d, setIs3d] = useState(false);
+
+  // footprint bbox 로 미니맵 맞춤 (도형 없으면 중심 flyTo)
+  const fitFoundBuilding = useCallback((hit: AddressBuildingHit) => {
+    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+    for (const ring of hit.polygons) {
+      for (const [la, lo] of ring) {
+        if (la < minLat) minLat = la; if (la > maxLat) maxLat = la;
+        if (lo < minLon) minLon = lo; if (lo > maxLon) maxLon = lo;
+      }
     }
+    if (minLat === Infinity) { miniMapRef.current?.flyTo({ center: [hit.lon, hit.lat], zoom: 17, duration: 600 }); return; }
+    miniMapRef.current?.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 60, maxZoom: 18, duration: 600 });
   }, []);
 
-  useEffect(() => { if (!isOpen) setAddressMarker(null); }, [isOpen]);
+  // 검색 건물 footprint → 등록 폼 자동 프리필 (첫 링=활성 도형, 나머지=확정 도형).
+  //   name/height 는 비어있을 때만 채우고, latitude/longitude=centroid.
+  const applyFoundBuilding = useCallback((hit: AddressBuildingHit, label: string) => {
+    const rings = hit.polygons.map(closeRing).filter((r) => r.length >= 4);
+    if (rings.length === 0) return;
+    const firstJson = JSON.stringify(rings[0]);
+    setForm((f) => ({
+      ...f,
+      name: f.name.trim() ? f.name : (hit.name ?? label),
+      height: f.height ? f.height : hit.height_m.toFixed(1),
+      latitude: hit.lat.toFixed(6),
+      longitude: hit.lon.toFixed(6),
+      geometry_type: "polygon",
+      geometry_json: firstJson,
+    }));
+    if (rings.length > 1) {
+      setConfirmedShapes((prev) => [
+        ...prev,
+        ...rings.slice(1).map((r) => ({ type: "polygon" as GeometryType, json: JSON.stringify(r) })),
+      ]);
+    }
+    setClickPts([]);
+  }, [setForm, setConfirmedShapes]);
+
+  const handleAddressSelect = useCallback((lat: number, lon: number, label: string) => {
+    if (lat === 0 && lon === 0) {
+      addressReqSeq.current++;
+      setAddressMarker(null);
+      setFoundBuilding(null);
+      setPendingApply(false);
+      return;
+    }
+    setAddressMarker({ lat, lon, label });
+    foundLabelRef.current = label;
+    const seq = ++addressReqSeq.current;
+    setFoundBuilding(null);
+    setPendingApply(false);
+    // 검색 좌표 인근 로컬 건물(footprint) 조회
+    invoke<AddressBuildingHit | null>("find_building_near_point", { lat, lon })
+      .then(async (hit) => {
+        if (seq !== addressReqSeq.current) return; // 최신 요청만 반영
+        if (hit && hit.polygons.length > 0) {
+          setFoundBuilding(hit);
+          // 작도물이 전혀 없을 때만 자동 프리필. 있으면 표출만(버튼으로 수동 적용).
+          const canPrefill = clickPts.length === 0 && !form.geometry_json && confirmedShapes.length === 0;
+          if (canPrefill) {
+            // geometry_json 설정 → 기존 fitBounds effect 가 footprint 로 맞추므로 별도 fitBounds 생략
+            applyFoundBuilding(hit, label);
+            setPendingApply(false);
+          } else {
+            fitFoundBuilding(hit);
+            setPendingApply(true); // 기존 작도물 보존 → 버튼으로 수동 적용
+          }
+        } else {
+          // 미히트(또는 폴리곤 없는 히트): 기존 flyTo + 마커 유지(지반 2D)
+          setFoundBuilding(null);
+          miniMapRef.current?.flyTo({ center: [lon, lat], zoom: 17, duration: 600 });
+          // best-effort 온라인 건물대장(vworld) — 성공 시 빈 필드만 프리필, 실패는 조용히 무시
+          try {
+            const info = await invoke<{ name: string; height: string } | null>("get_vworld_building_info", { lat, lon });
+            if (seq !== addressReqSeq.current || !info) return;
+            const h = parseFloat(info.height);
+            setForm((f) => ({
+              ...f,
+              height: (!f.height && !isNaN(h) && h > 0) ? h.toFixed(1) : f.height,
+              name: (!f.name.trim() && info.name) ? info.name : f.name,
+            }));
+          } catch { /* 조용히 무시 */ }
+        }
+      })
+      .catch(() => {
+        if (seq !== addressReqSeq.current) return;
+        setFoundBuilding(null);
+        miniMapRef.current?.flyTo({ center: [lon, lat], zoom: 17, duration: 600 });
+      });
+  }, [clickPts.length, form.geometry_json, confirmedShapes.length, applyFoundBuilding, fitFoundBuilding, setForm]);
+
+  // 작도물이 이미 있을 때 "검색 건물 도형 적용" — 현재 도형을 확정 목록으로 넘긴 뒤 프리필
+  const handleApplyFoundBuilding = useCallback(() => {
+    if (!foundBuilding || foundBuilding.polygons.length === 0) return;
+    if (form.geometry_json) addShapeToList();
+    applyFoundBuilding(foundBuilding, foundLabelRef.current);
+    setPendingApply(false);
+  }, [foundBuilding, form.geometry_json, addShapeToList, applyFoundBuilding]);
+
+  // 검색 건물 footprint → 미니맵 declarative 표출용 GeoJSON
+  const foundBuildingGeoJson = useMemo<GeoJSON.FeatureCollection | null>(() => {
+    if (!foundBuilding || foundBuilding.polygons.length === 0) return null;
+    const features: GeoJSON.Feature[] = [];
+    for (const ring of foundBuilding.polygons) {
+      if (ring.length < 3) continue;
+      const coords = ring.map(([lat, lon]) => [lon, lat]);
+      const first = coords[0], last = coords[coords.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+      features.push({
+        type: "Feature",
+        properties: { base: foundBuilding.ground_elev_m, height: foundBuilding.height_m },
+        geometry: { type: "Polygon", coordinates: [coords] },
+      });
+    }
+    return features.length > 0 ? { type: "FeatureCollection", features } : null;
+  }, [foundBuilding]);
+
+  useEffect(() => { if (!isOpen) { setAddressMarker(null); setFoundBuilding(null); setPendingApply(false); setIs3d(false); } }, [isOpen]);
 
   const [elevMode, setElevMode] = useState<"auto" | "manual">("auto");
   const [elevLoading, setElevLoading] = useState(false);
@@ -646,6 +770,9 @@ export default function BuildingModal({
             {clickPts.length === 0 && !form.geometry_json && confirmedShapes.length === 0 && (
               <span className="text-[10px] text-gray-400">클릭하여 다각형 그리기 시작 · 더블클릭으로 완료 · Ctrl+Z 실행취소</span>
             )}
+            {pendingApply && foundBuilding && foundBuilding.polygons.length > 0 && (
+              <button onClick={handleApplyFoundBuilding} className="rounded-lg bg-[#a60739] px-2.5 py-1.5 text-xs font-medium text-white hover:bg-[#85062e] transition-colors">검색 건물 도형 적용</button>
+            )}
           </div>
 
           {confirmedShapes.length > 0 && (
@@ -662,7 +789,7 @@ export default function BuildingModal({
 
           <div className="relative h-80 w-full overflow-hidden rounded-xl border border-gray-200">
             <MapGL ref={miniMapRef} initialViewState={{ ...mapCenter, zoom: hasMarker ? 14 : 7, pitch: 0 }}
-              maxPitch={0} mapStyle={MAP_STYLE_URL} style={{ width: "100%", height: "100%" }} cursor="crosshair"
+              maxPitch={60} mapStyle={MAP_STYLE_URL} style={{ width: "100%", height: "100%" }} cursor="crosshair"
               onClick={handleMapClick} onDblClick={handleMapDblClick} onMouseMove={handleMapMouseMove}
               attributionControl={false} doubleClickZoom={false} onLoad={handleMiniMapLoad}>
               {form.group_id != null && (() => {
@@ -691,6 +818,18 @@ export default function BuildingModal({
                 <Layer id="preview-outline" type="line" paint={{ "line-color": "#a60739", "line-width": 2, "line-dasharray": (previewGeoJson || linePreviewGeoJson?.geometry?.type === "Polygon") ? [1, 0] : [4, 3] }} filter={["==", ["geometry-type"], "Polygon"]} />
                 <Layer id="preview-line" type="line" paint={{ "line-color": "#a60739", "line-width": 2.5, "line-dasharray": linePreviewGeoJson && !previewGeoJson ? [4, 3] : [1, 0] }} filter={["==", ["geometry-type"], "LineString"]} />
               </Source>
+              {/* 검색 건물 footprint 3D 표출 (pitch 0 에선 자연히 2D). fill-extrusion 은 작도용 queryRenderedFeatures 목록에 없어 간섭 없음 */}
+              {foundBuildingGeoJson && (
+                <Source id="found-building" type="geojson" data={foundBuildingGeoJson as any}>
+                  <Layer id="found-building-fill" type="fill-extrusion" paint={{
+                    "fill-extrusion-color": "#fbbf24",
+                    "fill-extrusion-base": ["get", "base"],
+                    "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
+                    "fill-extrusion-opacity": 0.85,
+                  }} />
+                  <Layer id="found-building-line" type="line" paint={{ "line-color": "#f59e0b", "line-width": 2 }} />
+                </Source>
+              )}
               {clickPts.map(([lat, lon], i) => (
                 <Marker key={`cp-${i}`} latitude={lat} longitude={lon}>
                   <div className={i === 0 && clickPts.length >= 3 ? "h-3.5 w-3.5 rounded-full border-2 border-[#a60739] bg-[#a60739]/30 ring-2 ring-[#a60739]/20" : "h-2.5 w-2.5 rounded-full border-2 border-[#a60739] bg-white"} />
@@ -709,10 +848,24 @@ export default function BuildingModal({
                 </Marker>
               )}
               {addressMarker && (
-                <AddressMarker marker={addressMarker} onClose={() => setAddressMarker(null)} />
+                <AddressMarker marker={addressMarker} onClose={() => { addressReqSeq.current++; setAddressMarker(null); setFoundBuilding(null); setPendingApply(false); }} />
               )}
             </MapGL>
             <AddressSearch onSelect={handleAddressSelect} />
+            {/* 3D(pitch) 토글 칩 */}
+            <button
+              type="button"
+              onClick={() => {
+                const map = miniMapRef.current?.getMap();
+                if (!map) return;
+                const next = !is3d;
+                setIs3d(next);
+                map.easeTo({ pitch: next ? 55 : 0, duration: 500 });
+              }}
+              className={`absolute right-2 top-2 z-10 rounded-md px-2 py-1 text-[11px] font-medium shadow border transition-colors ${is3d ? "bg-[#a60739] text-white border-[#a60739]" : "bg-white/90 text-gray-600 border-gray-200 hover:bg-gray-100"}`}
+            >
+              3D
+            </button>
           </div>
         </div>
       </div>

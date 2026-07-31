@@ -11,6 +11,12 @@ export const G = {
 } as const;
 
 const wrapAz = (v: number) => (((v % 360) + 360) % 360);
+// 각도 차이를 (−180, 180] 로 정규화 (0°/360° 랩 안전)
+const wrapDelta = (v: number) => { const m = ((v % 360) + 360) % 360; return m > 180 ? m - 360 : m; };
+const clampN = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+// 건물폭 스케일용 nice 눈금 후보 — target 이하 최대값(내림) 선택
+const NICE_STEPS = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5];
+const pickNiceStep = (target: number) => { let best = NICE_STEPS[0]; for (const s of NICE_STEPS) if (s <= target) best = s; return best; };
 
 // ── 토글 스위치 (36×20, thumb 14) ──
 export function Toggle({ on, onClick, color = ACCENT, size = 1, disabled = false }: {
@@ -114,16 +120,28 @@ export function ToolButton({ icon: Icon, label, active, onClick }: {
 
 // ── 아날로그 헤딩 테이프 (눈금이 좌우로 흐름, 중앙 고정 지침) ──
 // precise=true → 눈금 0.05°, 한 칸 확대(정밀 조정), 라벨 0.5°
-export function HeadingTape({ azimuth, onChange, precise }: {
+// bounds → 건물모드: 건물 양끝 방위(offset 도메인)로 슬라이더 한계 제한 + 정밀 스케일 자동
+export function HeadingTape({ azimuth, onChange, precise, bounds }: {
   azimuth: number; onChange: (v: number) => void; precise: boolean;
+  bounds?: { center: number; minOff: number; maxOff: number } | null;
 }) {
   const ref = useRef<SVGSVGElement>(null);
   const W = 256, H = 50, cx = W / 2;
-  const ppd = precise ? 70 : 8;       // viewBox 단위 / 도(°)
-  const unit = precise ? 0.05 : 1;    // 최소 눈금 간격(°)
-  const majorN = 10;                  // 라벨 눈금 (정밀 0.5° / 일반 10°)
-  const medN = precise ? 2 : 5;       // 중간 눈금
-  const wheelStep = precise ? 0.05 : 1;
+  const b = bounds ?? null;
+  // 건물모드 스케일: 건물폭(span)이 테이프의 ~75%를 차지하되 정밀(70)~초정밀(400) ppd 사이로
+  const span = b ? Math.max(b.maxOff - b.minOff, 1e-6) : 0;
+  const ppd = b ? clampN((W * 0.75) / span, 70, 400) : (precise ? 70 : 8);     // viewBox 단위 / 도(°)
+  const unit = b ? pickNiceStep(span / 30) : (precise ? 0.05 : 1);              // 최소 눈금 간격(°)
+  const majorN = b ? Math.max(1, Math.round((span / 6) / unit)) : 10;          // 라벨 눈금 간격(=unit×majorN≈span/6)
+  const medN = b ? Math.max(1, Math.round(majorN / 2)) : (precise ? 2 : 5);    // 중간 눈금
+  const wheelStep = b ? unit : (precise ? 0.05 : 1);
+  const labelFixed = b ? 2 : (precise ? 1 : 0);
+
+  // 값 산출 → bounds 있으면 [minOff,maxOff] 로 랩 안전 클램프 (테이프 자체 정지)
+  const applyBounds = useCallback((v: number): number => {
+    if (!b) return wrapAz(v);
+    return wrapAz(b.center + clampN(wrapDelta(v - b.center), b.minOff, b.maxOff));
+  }, [b?.center, b?.minOff, b?.maxOff]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 드래그/터치 스크럽
   const cur = useRef(azimuth); cur.current = azimuth;
@@ -134,7 +152,7 @@ export function HeadingTape({ azimuth, onChange, precise }: {
       const pt = "touches" in e ? e.touches[0] : e;
       const rect = ref.current.getBoundingClientRect();
       const dx = pt.clientX - start.current.lastX;
-      onChange(wrapAz(cur.current - dx * (W / rect.width) / ppd));
+      onChange(applyBounds(cur.current - dx * (W / rect.width) / ppd));
       start.current.lastX = pt.clientX;
       e.preventDefault();
     };
@@ -149,7 +167,7 @@ export function HeadingTape({ azimuth, onChange, precise }: {
       window.removeEventListener("mouseup", up);
       window.removeEventListener("touchend", up);
     };
-  }, [onChange, ppd]);
+  }, [onChange, ppd, applyBounds]);
   const down = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     const pt = "touches" in e ? e.touches[0] : e;
     start.current = { lastX: pt.clientX };
@@ -157,8 +175,8 @@ export function HeadingTape({ azimuth, onChange, precise }: {
     e.preventDefault();
   }, []);
   const wheel = useCallback((e: React.WheelEvent) => {
-    onChange(wrapAz(cur.current + Math.sign(e.deltaY || e.deltaX) * wheelStep));
-  }, [onChange, wheelStep]);
+    onChange(applyBounds(cur.current + Math.sign(e.deltaY || e.deltaX) * wheelStep));
+  }, [onChange, wheelStep, applyBounds]);
 
   const half = (W / 2) / ppd + 2 * unit;
   const lo = Math.ceil((azimuth - half) / unit);
@@ -170,19 +188,33 @@ export function HeadingTape({ azimuth, onChange, precise }: {
     const isMajor = ((n % majorN) + majorN) % majorN === 0;
     const isMed = ((n % medN) + medN) % medN === 0;
     const len = isMajor ? 16 : isMed ? 10 : 6;
+    // 건물모드: 경계 밖 눈금은 회색조 감쇠 ("밖은 못 감" 시각화)
+    const off = b ? wrapDelta(d - b.center) : 0;
+    const inBounds = b ? (off >= b.minOff - 1e-9 && off <= b.maxOff + 1e-9) : true;
     lines.push(
       <line key={n} x1={x} y1={10} x2={x} y2={10 + len}
-        stroke={isMajor ? G[500] : G[300]} strokeWidth={isMajor ? 1.1 : 0.7} />
+        stroke={isMajor ? G[500] : G[300]} strokeWidth={isMajor ? 1.1 : 0.7}
+        strokeOpacity={inBounds ? 1 : 0.25} />
     );
     if (isMajor) {
       const dd = (((Math.round(d * 100) / 100) % 360) + 360) % 360;
       const r0 = Math.round(dd);
       const card = r0 === 0 ? "N" : r0 === 90 ? "E" : r0 === 180 ? "S" : r0 === 270 ? "W" : null;
-      const lbl = (card && Math.abs(dd - r0) < 1e-6) ? card : (precise ? (Math.round(dd * 10) / 10).toFixed(1) : String(r0));
+      const lbl = (card && Math.abs(dd - r0) < 1e-6) ? card : dd.toFixed(labelFixed);
       lines.push(
-        <text key={"t" + n} x={x} y={44} textAnchor="middle" fontSize={precise ? 7.5 : 8}
-          fontWeight="600" fill={G[400]} fontFamily="ui-monospace, monospace">{lbl}</text>
+        <text key={"t" + n} x={x} y={44} textAnchor="middle" fontSize={precise || b ? 7.5 : 8}
+          fontWeight="600" fill={G[400]} fillOpacity={inBounds ? 1 : 0.3} fontFamily="ui-monospace, monospace">{lbl}</text>
       );
+    }
+  }
+  // 건물모드: 양끝 방위 포스트 (accent 세로선). 화면 밖이면 생략.
+  const posts: React.ReactNode[] = [];
+  if (b) {
+    for (const off of [b.minOff, b.maxOff]) {
+      const x = wrapDelta((b.center + off) - azimuth) * ppd + cx;
+      if (x >= 0 && x <= W) {
+        posts.push(<line key={`post-${off}`} x1={x} y1={6} x2={x} y2={H - 2} stroke={ACCENT} strokeWidth={1.6} />);
+      }
     }
   }
   return (
@@ -198,6 +230,7 @@ export function HeadingTape({ azimuth, onChange, precise }: {
         </linearGradient>
       </defs>
       {lines}
+      {posts}
       <rect x="0" y="0" width={W} height={H} fill="url(#ds-tapeFade)" pointerEvents="none" />
       {/* 중앙 고정 지침 */}
       <line x1={cx} y1={8} x2={cx} y2={30} stroke={ACCENT} strokeWidth="1.6" />

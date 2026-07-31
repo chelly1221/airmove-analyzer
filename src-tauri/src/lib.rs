@@ -943,6 +943,25 @@ async fn get_fac_building_detail(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// 주소검색 좌표 인근 건물 1건 (footprint 포함) — 주소검색→3D 자동 표출용.
+/// 응답은 폴리곤 1건 수 KB 수준이라 일반 invoke 반환 OK(bulk:// 불필요).
+#[tauri::command]
+async fn find_building_near_point(
+    app_handle: tauri::AppHandle,
+    lat: f64,
+    lon: f64,
+    radius_m: Option<f64>,
+) -> Result<Option<building::BuildingNearPoint>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        building::query_building_near_point(&conn, &mut srtm, lat, lon, radius_m.unwrap_or(80.0))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 // ---------- 건물통합정보 (F_FAC_BUILDING) ----------
 
 #[tauri::command]
@@ -2710,6 +2729,7 @@ pub fn run() {
             query_buildings_along_path,
             query_buildings_3d_binary,
             get_fac_building_detail,
+            find_building_near_point,
             // 건물통합정보 (F_FAC_BUILDING)
             import_fac_building_data,
             get_fac_building_import_status,

@@ -8,6 +8,7 @@ export type {
   BuildingOnPath,
   Building3D,
   FacBuildingDetail,
+  AddressBuildingHit,
   NearbyPeak,
   PeakImportStatus,
   GeometryType,

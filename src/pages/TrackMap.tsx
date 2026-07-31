@@ -62,7 +62,7 @@ const TrackPointIcon = ({ size = 16 }: { size?: number }) => (
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, BuildingOnPath } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, BuildingOnPath, AddressBuildingHit } from "../types";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
 import LoSProfileTabs from "../components/Map/LoSProfileTabs";
@@ -552,14 +552,86 @@ export default function TrackMap() {
 
   // 주소 검색 마커 (AddressSearch 컴포넌트에서 관리, 마커만 부모에서 유지)
   const [addressMarker, setAddressMarker] = useState<{ lat: number; lon: number; label: string } | null>(null);
+  // 주소검색 좌표 인근 로컬 건물(3D 자동 표출) — 없으면 지반 2D 폴백
+  const [addressBuilding, setAddressBuilding] = useState<AddressBuildingHit | null>(null);
+  // 연속 검색 레이스 방지: 최신 요청 결과만 반영
+  const addressReqSeq = useRef(0);
+  // 주소검색 건물 LoS 시뮬레이션 — 카드 입력(지반고/높이)으로 평가할 대상
+  const [losSimBuilding, setLosSimBuilding] = useState<{ lat: number; lon: number; groundElevM: number; heightM: number; name: string | null } | null>(null);
+  // 시뮬레이션 결과(허용높이·초과량) — LoSProfilePanel onSimStats 수신
+  const [losSimStats, setLosSimStats] = useState<{ allowableAglM: number; allowableTopAmslM: number; excessM: number; distKm: number } | null>(null);
+  // 건물모드 방위 한계 — 건물 양끝 방위(offset 도메인, 0/360 랩 안전). launchBuildingLoS valid 시 설정
+  const [losBldgAzBounds, setLosBldgAzBounds] = useState<{ center: number; minOff: number; maxOff: number } | null>(null);
+  // 건물 스윕 최초 1회 줌인 플래그 (launchBuildingLoS 시 리셋)
+  const bldgSweepZoomedRef = useRef(false);
+  // 카드 입력값 (문자열) — 지반고 / 건물높이
+  const [simGroundInput, setSimGroundInput] = useState("");
+  const [simHeightInput, setSimHeightInput] = useState("");
   const handleAddressSelect = useCallback((lat: number, lon: number, label: string) => {
+    // 새 검색·클리어 모두 이전 시뮬레이션 초기화 (건물 문맥 전환)
+    setLosSimBuilding(null);
+    setLosSimStats(null);
+    setLosBldgAzBounds(null);
     if (lat !== 0 && lon !== 0) {
       setViewState((v) => ({ ...v, latitude: lat, longitude: lon, zoom: 15 }));
       setAddressMarker({ lat, lon, label });
+      // 검색 좌표 인근 로컬 건물(footprint) 비동기 조회 → 히트 시 3D 표출 + 접근
+      const seq = ++addressReqSeq.current;
+      setAddressBuilding(null);
+      invoke<AddressBuildingHit | null>("find_building_near_point", { lat, lon })
+        .then((hit) => {
+          if (seq !== addressReqSeq.current) return; // 최신 요청만 반영
+          if (hit) {
+            setAddressBuilding(hit);
+            const map = mapRef.current?.getMap();
+            if (map) {
+              const curZoom = map.getZoom();
+              map.easeTo({ center: [hit.lon, hit.lat], zoom: Math.max(curZoom, 16.5), duration: 600 });
+            }
+          } else {
+            setAddressBuilding(null);
+          }
+        })
+        .catch(() => {
+          if (seq === addressReqSeq.current) setAddressBuilding(null);
+        });
     } else {
+      addressReqSeq.current++;
       setAddressMarker(null);
+      setAddressBuilding(null);
     }
   }, []);
+
+  // 카드 입력 프리필: 히트면 DB 지반고/높이, 미히트면 SRTM 지반고·높이 빈칸
+  useEffect(() => {
+    if (!addressMarker) { setSimGroundInput(""); setSimHeightInput(""); return; }
+    if (addressBuilding) {
+      setSimGroundInput(addressBuilding.ground_elev_m.toFixed(1));
+      setSimHeightInput(addressBuilding.height_m > 0 ? addressBuilding.height_m.toFixed(1) : "");
+      return;
+    }
+    // 미히트: 지반고 SRTM 1점 프리필, 높이 빈칸
+    setSimHeightInput("");
+    let cancelled = false;
+    invoke<number[]>("fetch_elevation", { latitudes: [addressMarker.lat], longitudes: [addressMarker.lon] })
+      .then((elevs) => { if (!cancelled) setSimGroundInput(String(Math.round(elevs[0] ?? 0))); })
+      .catch(() => { if (!cancelled) setSimGroundInput("0"); });
+    return () => { cancelled = true; };
+  }, [addressMarker, addressBuilding]);
+
+  // 카드 입력 변경 → 패널 열림 상태(losSimBuilding 존재)면 300ms 디바운스로 sim 갱신 (라이브 반영)
+  useEffect(() => {
+    if (!losSimBuilding) return;
+    const g = parseFloat(simGroundInput);
+    const h = parseFloat(simHeightInput);
+    const groundElevM = isNaN(g) ? 0 : g;
+    const heightM = isNaN(h) ? 0 : h;
+    if (groundElevM === losSimBuilding.groundElevM && heightM === losSimBuilding.heightM) return;
+    const t = setTimeout(() => {
+      setLosSimBuilding((prev) => (prev ? { ...prev, groundElevM, heightM } : prev));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [simGroundInput, simHeightInput, losSimBuilding]);
 
   // 선택된 레이더용 비행만 필터 (radar_name이 없는 레거시 데이터는 항상 표시)
   const radarFilteredFlights = useMemo(() => {
@@ -1385,6 +1457,96 @@ export default function TrackMap() {
     return cleanup;
   }, [bldgPopup?.pinned, bldgPopup?.lat, bldgPopup?.lon, buildings3dMode, buildings3dData]);
 
+  // 주소검색 건물 → 3D 골드 표출(히트) / 지반 2D 폴백(미히트).
+  //   buildings3dMode·showBuildings·줌 게이트와 무관하게 addressMarker 존재 동안 항상 표시.
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (!map || !map.isStyleLoaded()) return;
+
+    const srcId = "address-bldg-src";
+    const fillId = "address-bldg-fill";
+    const lineId = "address-bldg-line";
+    const groundSrcId = "address-ground-src";
+    const groundFillId = "address-ground-fill";
+    const groundLineId = "address-ground-line";
+    const cleanup = () => {
+      if (map.getLayer(lineId)) map.removeLayer(lineId);
+      if (map.getLayer(fillId)) map.removeLayer(fillId);
+      if (map.getSource(srcId)) map.removeSource(srcId);
+      if (map.getLayer(groundLineId)) map.removeLayer(groundLineId);
+      if (map.getLayer(groundFillId)) map.removeLayer(groundFillId);
+      if (map.getSource(groundSrcId)) map.removeSource(groundSrcId);
+    };
+    cleanup();
+
+    if (!addressMarker) return;
+
+    const hasFootprint = !!addressBuilding && addressBuilding.polygons.length > 0;
+
+    if (hasFootprint && addressBuilding) {
+      // 3D 골드 fill-extrusion — 링별 폴리곤 폐합, base=지반·height=지반+건물높이(기존 선택 하이라이트와 동일 프로퍼티 방식)
+      const features: GeoJSON.Feature[] = [];
+      for (const ring of addressBuilding.polygons) {
+        if (ring.length < 3) continue;
+        const coords = ring.map(([lat, lon]) => [lon, lat]);
+        const first = coords[0], last = coords[coords.length - 1];
+        if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
+        features.push({
+          type: "Feature",
+          properties: { base: addressBuilding.ground_elev_m, height: addressBuilding.height_m },
+          geometry: { type: "Polygon", coordinates: [coords] },
+        });
+      }
+      if (features.length === 0) return;
+      const data: GeoJSON.FeatureCollection = { type: "FeatureCollection", features };
+      map.addSource(srcId, { type: "geojson", data });
+      map.addLayer({
+        id: fillId,
+        type: "fill-extrusion",
+        source: srcId,
+        paint: {
+          "fill-extrusion-color": "#fbbf24", // 검색 건물 골드 (선택 하이라이트와 동일 컨벤션)
+          "fill-extrusion-height": ["+", ["get", "base"], ["get", "height"]],
+          "fill-extrusion-base": ["get", "base"],
+          "fill-extrusion-opacity": 0.9,
+        },
+      });
+      map.addLayer({
+        id: lineId,
+        type: "line",
+        source: srcId,
+        paint: { "line-color": "#fde68a", "line-width": 2.5, "line-blur": 1.5, "line-opacity": 0.95 },
+      });
+    } else {
+      // 2D 폴백 — 폴리곤 없음(미히트/도형 없는 수동건물): 검색점 중심 반경 14m 원형을 지반에 표출(terrain 위 드레이프)
+      const R_M = 14;
+      const lat0 = addressMarker.lat, lon0 = addressMarker.lon;
+      const dLat = R_M / 111_000;
+      const dLon = R_M / (111_000 * Math.cos((lat0 * Math.PI) / 180)); // 위도보정 lon 스케일
+      const ring: number[][] = [];
+      for (let i = 0; i <= 40; i++) {
+        const a = (i / 40) * 2 * Math.PI;
+        ring.push([lon0 + dLon * Math.cos(a), lat0 + dLat * Math.sin(a)]);
+      }
+      const data: GeoJSON.Feature = { type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [ring] } };
+      map.addSource(groundSrcId, { type: "geojson", data });
+      map.addLayer({
+        id: groundFillId,
+        type: "fill",
+        source: groundSrcId,
+        paint: { "fill-color": "#a60739", "fill-opacity": 0.25 },
+      });
+      map.addLayer({
+        id: groundLineId,
+        type: "line",
+        source: groundSrcId,
+        paint: { "line-color": "#a60739", "line-width": 2, "line-dasharray": [4, 3] },
+      });
+    }
+
+    return cleanup;
+  }, [addressMarker, addressBuilding]);
+
 
   // ESC 키로 LoS 커서 모드 해제
   useEffect(() => {
@@ -1817,6 +1979,9 @@ export default function TrackMap() {
       setLosSearchedAddress(null);
       setLosFootprint(null);
       setLosAzViews(null);
+      setLosSimBuilding(null);
+      setLosSimStats(null);
+      setLosBldgAzBounds(null);
       setLosCursorPicking(false);
     },
     [losMode, losCursorPicking, losTarget]
@@ -1825,10 +1990,17 @@ export default function TrackMap() {
   // LoS 단면도 로딩 완료 → 카메라 자동 정렬
   const losTargetRef = useRef(losTarget);
   losTargetRef.current = losTarget;
+  const losFootprintRef = useRef(losFootprint);
+  losFootprintRef.current = losFootprint;
+  const losBldgAzBoundsRef = useRef(losBldgAzBounds);
+  losBldgAzBoundsRef.current = losBldgAzBounds;
   const handleLosLoaded = useCallback(() => {
     const map = mapRef.current?.getMap();
     const target = losTargetRef.current;
     if (!map || !target) return;
+    // 건물 스윕 중(이미 건물 줌인 후)에는 카메라 재정렬 억제 — 슬라이더 스윕이 건물 줌을 유지.
+    //   (losAzViews=null 로 단일뷰 전환 시 viewsKey 변화가 onLoaded 게이트를 재무장해 매 스윕 재정렬되는 것 차단)
+    if (losFootprintRef.current && losBldgAzBoundsRef.current && bldgSweepZoomedRef.current) return;
     const rLat = radarSite.latitude;
     const rLon = radarSite.longitude;
     const cosLat = Math.cos(((rLat + target.lat) / 2) * Math.PI / 180);
@@ -1940,6 +2112,9 @@ export default function TrackMap() {
     setLosAzViews(views);
     setLosSearchedAddress({ lat: centerLat, lon: centerLon });
     setLosAzFineCenter(centerAz);
+    // 건물 양끝 방위(offset)로 방위 슬라이더 한계 설정 — valid(폴리곤 좌우폭 유효) 일 때만
+    setLosBldgAzBounds(valid ? { center: centerAz, minOff: angMin * 180 / Math.PI, maxOff: angMax * 180 / Math.PI } : null);
+    bldgSweepZoomedRef.current = false; // 새 건물 → 최초 스윕 줌인 재무장
     setLosCursorPicking(false);
   }, [radarSite.latitude, radarSite.longitude, radarSite.range_nm, setLosFromAzDist]);
 
@@ -1947,6 +2122,22 @@ export default function TrackMap() {
   const setLosToObstacle = useCallback((b: ManualBuilding) => {
     launchBuildingLoS(buildingFootprintVertices(b), b.latitude, b.longitude);
   }, [launchBuildingLoS]);
+
+  // 주소검색 카드의 "LoS 단면도" — 검색 건물로 LoS 진입 + 시뮬레이션 대상 설정 (카드가 sim 유지하는 예외 경로)
+  const handleOpenSimLoS = useCallback(() => {
+    const g = parseFloat(simGroundInput);
+    const h = parseFloat(simHeightInput);
+    const groundElevM = isNaN(g) ? 0 : g;
+    const heightM = isNaN(h) ? 0 : h;
+    if (addressBuilding && addressBuilding.polygons.length > 0) {
+      launchBuildingLoS(addressBuilding.polygons[0], addressBuilding.lat, addressBuilding.lon);
+      setLosSimBuilding({ lat: addressBuilding.lat, lon: addressBuilding.lon, groundElevM, heightM, name: addressBuilding.name ?? addressMarker?.label ?? null });
+    } else if (addressMarker) {
+      // 폴리곤 없음 → 빈 footprint(valid=false, 단일 중앙 뷰). 마커 좌표를 sim 기준점으로.
+      launchBuildingLoS([], addressMarker.lat, addressMarker.lon);
+      setLosSimBuilding({ lat: addressMarker.lat, lon: addressMarker.lon, groundElevM, heightM, name: addressMarker.label });
+    }
+  }, [simGroundInput, simHeightInput, addressBuilding, addressMarker, launchBuildingLoS]);
 
   // LoS 도구 드로어 열 때 등록 장애물/그룹 최신화 (자료관리에서 추가/수정된 내용 반영)
   useEffect(() => {
@@ -1965,6 +2156,9 @@ export default function TrackMap() {
     setLosSearchedAddress(null);
     setLosFootprint(null);
     setLosAzViews(null);
+    setLosSimBuilding(null);
+    setLosSimStats(null);
+    setLosBldgAzBounds(null);
     const map = mapRef.current?.getMap();
     if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
   }, []);
@@ -3134,6 +3328,11 @@ export default function TrackMap() {
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <LosAddressSearch onSelect={async (lat, lon) => {
                     if (lat === 0 && lon === 0) return;
+                    // 다른 LoS 진입(드로어 주소검색) → 지도 카드 시뮬레이션·건물모드 초기화
+                    //   (건물 경로면 이어지는 launchBuildingLoS 가 bounds 재설정)
+                    setLosSimBuilding(null);
+                    setLosSimStats(null);
+                    setLosBldgAzBounds(null);
                     // 주소점 인근 건물 footprint 조회 → 있으면 중앙/좌끝/우끝 3탭, 없으면 단일 단면도
                     let footprint: [number, number][] = [];
                     let bLat = lat, bLon = lon;
@@ -3171,20 +3370,63 @@ export default function TrackMap() {
                   <LosObstaclePicker buildings={manualBuildings} groups={buildingGroups} onSelect={setLosToObstacle} />
                 </div>
               </div>
-              {/* 방위 카드 */}
-              <div style={card}>
+              {/* 방위 카드 — 건물 선택 상태(losFootprint+bounds)면 자동 건물모드 */}
+              {(() => {
+                const bldgMode = !!(losFootprint && losBldgAzBounds);
+                return (
+                <div style={card}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span style={head}>방위</span>
-                    <button onClick={() => setLosPrecise((p) => !p)} title="정밀 조정"
-                      style={{ padding: "3px 9px", borderRadius: 6, cursor: "pointer", fontSize: 9.5, fontWeight: 700, letterSpacing: ".02em", lineHeight: 1.4,
-                        border: losPrecise ? "1px solid #a60739" : "1px solid #d1d5db", background: losPrecise ? "#a60739" : "#fff", color: losPrecise ? "#fff" : "#6b7280" }}>정밀</button>
+                    {bldgMode ? (
+                      <>
+                        <span title="건물 양끝 방위로 한계·정밀 조정"
+                          style={{ padding: "3px 9px", borderRadius: 6, fontSize: 9.5, fontWeight: 700, letterSpacing: ".02em", lineHeight: 1.4,
+                            border: "1px solid #a60739", background: "#a60739", color: "#fff" }}>건물</span>
+                        <span style={{ fontSize: 9, color: "#9ca3af", fontWeight: 600 }}>폭 {(losBldgAzBounds!.maxOff - losBldgAzBounds!.minOff).toFixed(2)}°</span>
+                      </>
+                    ) : (
+                      <button onClick={() => setLosPrecise((p) => !p)} title="정밀 조정"
+                        style={{ padding: "3px 9px", borderRadius: 6, cursor: "pointer", fontSize: 9.5, fontWeight: 700, letterSpacing: ".02em", lineHeight: 1.4,
+                          border: losPrecise ? "1px solid #a60739" : "1px solid #d1d5db", background: losPrecise ? "#a60739" : "#fff", color: losPrecise ? "#fff" : "#6b7280" }}>정밀</button>
+                    )}
                   </div>
-                  <span style={big}>{losAzimuth.toFixed(losPrecise ? 2 : 1)}<span style={unit}>°</span></span>
+                  <span style={big}>{bldgMode ? losAzimuth.toFixed(2) : losAzimuth.toFixed(losPrecise ? 2 : 1)}<span style={unit}>°</span></span>
                 </div>
-                <HeadingTape azimuth={losAzimuth} precise={losPrecise}
-                  onChange={(v) => { setLosFromAzDist(+v.toFixed(losPrecise ? 2 : 1), losDistanceKm); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosAzFineCenter(v); }} />
+                <HeadingTape azimuth={losAzimuth} precise={losPrecise} bounds={bldgMode ? losBldgAzBounds : null}
+                  onChange={(v) => {
+                    if (bldgMode && losFootprint && losBldgAzBounds) {
+                      // 건물모드: 컨텍스트 유지, 랩 안전 클램프 후 단일 단면도 연속 스윕
+                      const { center, minOff, maxOff } = losBldgAzBounds;
+                      const dLt = ((v - center) % 360 + 540) % 360 - 180; // wrapDelta ∈ (−180,180]
+                      const delta = Math.max(minOff, Math.min(maxOff, dLt));
+                      const az = (((center + delta) % 360) + 360) % 360;
+                      setLosFromAzDist(+az.toFixed(2), losDistanceKm);
+                      setLosAzViews(null);       // 탭 → 단일뷰(슬라이더 추종) 전환
+                      setLosAzFineCenter(az);
+                      // 최초 1회만 해당 건물로 줌인 (현재 방위·피치 유지)
+                      if (!bldgSweepZoomedRef.current) {
+                        bldgSweepZoomedRef.current = true;
+                        const map = mapRef.current?.getMap();
+                        if (map) {
+                          let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+                          for (const [la, lo] of losFootprint) { if (la < minLat) minLat = la; if (la > maxLat) maxLat = la; if (lo < minLon) minLon = lo; if (lo > maxLon) maxLon = lo; }
+                          if (minLat !== Infinity) {
+                            map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 80, maxZoom: 17.5, duration: 600, bearing: map.getBearing(), pitch: map.getPitch() });
+                          }
+                        }
+                      }
+                      // losFootprint/losSearchedAddress/losSimBuilding/losSimStats/losBldgAzBounds 유지
+                    } else {
+                      // 비건물모드: 기존 그대로 전부 클리어
+                      setLosFromAzDist(+v.toFixed(losPrecise ? 2 : 1), losDistanceKm);
+                      setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null);
+                      setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosAzFineCenter(v);
+                    }
+                  }} />
               </div>
+                );
+              })()}
             </div>
           </div>
 
@@ -3634,11 +3876,64 @@ export default function TrackMap() {
           <DeckGLOverlay layers={deckLayers} />
           <NavigationControl position="top-right" showZoom={false} />
           {addressMarker && (
-            <AddressMarker marker={addressMarker} onClose={() => setAddressMarker(null)} />
+            <AddressMarker marker={addressMarker} onClose={() => { addressReqSeq.current++; setAddressMarker(null); setAddressBuilding(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); }} />
           )}
         </MapGL>
 
         <AddressSearch onSelect={handleAddressSelect} offsetLeft={activeTool ? 312 : 8} />
+
+        {/* 주소검색 건물 상세 카드 — 지반고/높이 입력 + LoS 단면도 진입 + 허용높이 결과 */}
+        {addressMarker && (
+          <div className="absolute z-[650]" style={{ top: 52, left: activeTool ? 312 : 8, width: 280 }}>
+            <div className="rounded-lg border border-gray-200 bg-white/95 shadow-lg backdrop-blur-sm p-2.5 text-xs text-gray-700">
+              {/* 헤더: 건물명 + 출처 배지 */}
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="truncate font-semibold text-gray-800" title={addressBuilding?.name ?? addressMarker.label}>
+                  {addressBuilding?.name ?? addressMarker.label}
+                </span>
+                <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${addressBuilding ? "bg-[#a60739]/10 text-[#a60739]" : "bg-gray-100 text-gray-500"}`}>
+                  {addressBuilding ? (addressBuilding.source === "fac" ? "GIS" : "수동") : "미등록"}
+                </span>
+              </div>
+              {/* 입력: 지반고 / 건물높이 */}
+              <div className="mb-2 flex gap-2">
+                <label className="flex-1">
+                  <span className="mb-0.5 block text-[10px] text-gray-500">지반고 (m)</span>
+                  <input type="number" value={simGroundInput} onChange={(e) => setSimGroundInput(e.target.value)}
+                    className="w-full rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs text-gray-800 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30" />
+                </label>
+                <label className="flex-1">
+                  <span className="mb-0.5 block text-[10px] text-gray-500">건물높이 (m)</span>
+                  <input type="number" value={simHeightInput} onChange={(e) => setSimHeightInput(e.target.value)} placeholder="0"
+                    className="w-full rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs text-gray-800 placeholder:text-gray-400 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30" />
+                </label>
+              </div>
+              {/* LoS 단면도 버튼 */}
+              <button onClick={handleOpenSimLoS}
+                className="w-full rounded-md bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#85062e]">
+                LoS 단면도
+              </button>
+              {/* 결과: 허용높이 / 초과·여유 */}
+              {losSimBuilding ? (
+                losSimStats ? (
+                  <div className="mt-2 space-y-0.5 border-t border-gray-100 pt-2">
+                    <div>LoS 허용높이(지상): <b className="text-gray-900">{losSimStats.allowableAglM.toFixed(1)} m</b></div>
+                    <div>
+                      {losSimStats.excessM > 0
+                        ? <span style={{ color: "#e94560" }} className="font-semibold">현재 초과높이 +{losSimStats.excessM.toFixed(1)} m</span>
+                        : <span className="font-semibold text-emerald-600">여유 {(-losSimStats.excessM).toFixed(1)} m</span>}
+                    </div>
+                    <div className="text-[10px] text-gray-400">허용 상한 {Math.round(losSimStats.allowableTopAmslM)} m AMSL · {(losSimStats.distKm / 1.852).toFixed(1)} NM</div>
+                  </div>
+                ) : (
+                  <div className="mt-2 border-t border-gray-100 pt-2 text-gray-400">허용높이 계산 중…</div>
+                )
+              ) : (
+                <div className="mt-2 border-t border-gray-100 pt-2 text-[11px] text-gray-400">단면도를 열면 허용높이가 계산됩니다</div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Hover tooltip */}
         {hoverInfo && (
@@ -3989,7 +4284,7 @@ export default function TrackMap() {
         <LoSProfileTabs
           views={losAzViews ?? [{ lat: losTarget.lat, lon: losTarget.lon, label: "중앙", az: losAzimuth }]}
           radarSite={radarSite}
-          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosCursorPicking(true); }}
+          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCursorPicking(true); }}
           searchedAddress={losSearchedAddress}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
@@ -4010,6 +4305,8 @@ export default function TrackMap() {
           onCustomAngleChange={setCustomAngleDeg}
           showLegend={false}
           onStats={handleLosStats}
+          simBuilding={losSimBuilding}
+          onSimStats={setLosSimStats}
         />
         </div>
       )}
