@@ -7,6 +7,7 @@ import Fuse from "fuse.js";
 interface AddressResult {
   display_name: string;
   jibun_addr?: string;
+  resultType?: string;
   lat: number;
   lon: number;
 }
@@ -59,6 +60,7 @@ export default function AddressSearch({ onSelect, offsetLeft = 8 }: Props) {
       const mapped: AddressResult[] = res.map((r) => ({
         display_name: r.result_type === "place" && r.building_name ? r.building_name : r.address,
         jibun_addr: r.result_type === "place" ? r.address : (r.building_name || ""),
+        resultType: r.result_type,
         lat: r.latitude,
         lon: r.longitude,
       }));
@@ -122,7 +124,7 @@ export default function AddressSearch({ onSelect, offsetLeft = 8 }: Props) {
             if (e.key === "Enter") { e.preventDefault(); search(query); setOpen(true); }
             if (e.key === "Escape") setOpen(false);
           }}
-          placeholder="주소/건물명 검색..."
+          placeholder="주소/지번/건물명 검색..."
           className="flex-1 bg-transparent text-xs text-gray-700 outline-none placeholder:text-gray-400"
         />
         {searching && <Loader2 size={12} className="animate-spin text-gray-400" />}
@@ -142,7 +144,10 @@ export default function AddressSearch({ onSelect, offsetLeft = 8 }: Props) {
             >
               <MapPin size={12} className="mt-0.5 shrink-0 text-[#a60739]" />
               <div className="min-w-0">
-                <div className="line-clamp-2">{r.display_name}</div>
+                <div className="line-clamp-2">
+                  {r.display_name}
+                  {r.resultType === "jibun" && <span className="ml-1 rounded bg-gray-100 px-1 py-px text-[9px] text-gray-500 align-middle">지번</span>}
+                </div>
                 {r.jibun_addr && <div className="text-[10px] text-gray-400 mt-0.5 line-clamp-1">{r.jibun_addr}</div>}
               </div>
             </button>

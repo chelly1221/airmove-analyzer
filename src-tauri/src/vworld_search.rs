@@ -1,7 +1,7 @@
 //! vworld 통합검색 스크래핑 기반 주소/장소 검색 + 건물 상세정보
 //!
 //! map.vworld.kr 지도의 통합검색 엔드포인트(unifiedSearch2.do)를 사용하여
-//! 도로명주소 + 장소/건물명 검색 + 좌표(WGS84) 반환. API 키 불필요.
+//! 도로명주소 + 지번주소 + 장소/건물명 검색 + 좌표(WGS84) 반환. API 키 불필요.
 //! 건물 상세정보는 po_buildMetaInfoGIS.do 엔드포인트에서 HTML 파싱.
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ pub struct VWorldSearchResult {
     pub zip_code: String,
     pub latitude: f64,
     pub longitude: f64,
-    /// "juso" | "place"
+    /// "juso" | "jibun" | "place"
     pub result_type: String,
 }
 
@@ -107,9 +107,13 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<VWorldSearchResult>
     let client = build_client()?;
     let encoded_q = percent_encode(q);
 
-    // Juso, Place 카테고리 병렬 요청
+    // Juso, Jibun, Place 카테고리 병렬 요청
     let juso_url = format!(
         "{}?q={}&output=json&qType=map&category=Juso&count={}",
+        SEARCH_URL, encoded_q, limit,
+    );
+    let jibun_url = format!(
+        "{}?q={}&output=json&qType=map&category=Jibun&count={}",
         SEARCH_URL, encoded_q, limit,
     );
     let place_url = format!(
@@ -117,8 +121,9 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<VWorldSearchResult>
         SEARCH_URL, encoded_q, limit,
     );
 
-    let (juso_res, place_res) = tokio::join!(
+    let (juso_res, jibun_res, place_res) = tokio::join!(
         fetch_json(&client, &juso_url),
+        fetch_json(&client, &jibun_url),
         fetch_json(&client, &place_url),
     );
 
@@ -138,6 +143,30 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<VWorldSearchResult>
                     latitude: lat,
                     longitude: lon,
                     result_type: "juso".to_string(),
+                });
+            }
+        }
+    }
+
+    // Jibun 결과 (Juso 와 동일 구조, BLD_NM/ZIP_CL 없음 → serde default)
+    if let Ok(text) = jibun_res {
+        if let Ok(api) = serde_json::from_str::<ApiResponse>(&text) {
+            for it in api.list.unwrap_or_default() {
+                let lat: f64 = match it.ypos.parse() { Ok(v) => v, Err(_) => continue };
+                let lon: f64 = match it.xpos.parse() { Ok(v) => v, Err(_) => continue };
+                if lat == 0.0 || lon == 0.0 { continue; }
+                // 중복 제거: 동일 좌표 결과가 이미 있으면 스킵
+                let dup = results.iter().any(|r| {
+                    (r.latitude - lat).abs() < 1e-6 && (r.longitude - lon).abs() < 1e-6
+                });
+                if dup { continue; }
+                results.push(VWorldSearchResult {
+                    address: it.juso,
+                    building_name: it.bld_nm,
+                    zip_code: it.zip_cl,
+                    latitude: lat,
+                    longitude: lon,
+                    result_type: "jibun".to_string(),
                 });
             }
         }
