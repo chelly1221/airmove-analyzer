@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { X, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../../store";
-import type { ElevationPoint, RadarSite, BuildingOnPath, NearbyPeak } from "../../types";
+import type { ElevationPoint, RadarSite, BuildingOnPath, NearbyPeak, LosCurtainSample } from "../../types";
 import { GPU2D, type CircleData } from "../../utils/gpu2d";
 import { haversineKm, bearingDeg, LOS_PROFILE_MAX_KM } from "../../utils/geo";
 import { detectionTypeColor, PSR_TYPES } from "../../utils/radarConstants";
@@ -66,6 +66,9 @@ interface Props {
   simBuilding?: { lat: number; lon: number; groundElevM: number; heightM: number; name?: string | null } | null;
   /** 시뮬레이션 결과 보고 (허용높이·초과량). simBuilding 없으면 null */
   onSimStats?: (s: { allowableAglM: number; allowableTopAmslM: number; excessM: number; distKm: number } | null) => void;
+  /** LoS 수직 단면 커튼 샘플 방출 (지도 3D 표출용, 레이더→타겟 0..D 구간). 프로파일 없음/로딩 중엔 null.
+   *  차트 렌더에는 전혀 영향 없음 — chartData 확정 후 별도 useEffect 에서 프레임 역변환만 수행. */
+  onCurtainData?: (data: LosCurtainSample[] | null) => void;
 }
 
 
@@ -97,7 +100,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   showBuildings: showBuildingsProp, onToggleBuildings,
   showCustomAngle: showCustomAngleProp, onToggleCustomAngle,
   customAngleDeg: customAngleDegProp, onCustomAngleChange,
-  showLegend = true, onStats, simBuilding, onSimStats }: Props) {
+  showLegend = true, onStats, simBuilding, onSimStats, onCurtainData }: Props) {
   const manualBuildings = useAppStore((s) => s.manualBuildings);
   const buildingGroups = useAppStore((s) => s.buildingGroups);
   const [loading, setLoading] = useState(true);
@@ -738,6 +741,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       maxDistance: profileMaxKm, // 차트 x축 도메인은 200NM(또는 타겟거리) — 스크롤 줌아웃 한계
       adjTarget,
       targetElev,
+      adjTarget43, // 4/3 프레임 타겟 현 종점 — 커튼 4/3 레이 재구성용(렌더 미사용, 비트 불변)
       sim, // 주소검색 건물 시뮬레이션 결과 (계산 전용, 렌더 미사용)
     };
   }, [profile, radarHeight, totalDist, profileMaxKm, peakNames, buildings, showBuildings, searchedAddress, fresnelClearance, simBuilding]);
@@ -758,6 +762,96 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (!simBuilding || !s) { onSimStats(null); return; }
     onSimStats({ allowableAglM: s.allowableAglM, allowableTopAmslM: s.allowableTopAmslM, excessM: s.excessM, distKm: s.simD });
   }, [chartData, onSimStats, simBuilding]);
+
+  // ── LoS 수직 단면 커튼 데이터 방출 (지도 3D 표출용 — 차트 렌더 불변) ──
+  //   차트 디스플레이 프레임(곡률 처짐)을 지도 평면(raw AMSL)으로 역변환해 레이더→타겟(0..D) 구간의
+  //   차트 선(지형·최저탐지 LoS·프레넬·BRA·CoS·4/3 레이)을 그대로 방출 → TrackMap 이 3D 폴리라인으로 렌더.
+  //   chartData 가 이미 반환한 배열(minDetStraight·minDetFresnel·braLine·cosLine)에서 읽음 — 수식 중복 금지.
+  //   deps 최소화(chartData·profile·loading·radarHeight·totalDist) + 콜백 ref 로 무한루프 차단.
+  const onCurtainDataRef = useRef(onCurtainData);
+  onCurtainDataRef.current = onCurtainData;
+  useEffect(() => {
+    const emit = onCurtainDataRef.current;
+    if (!emit) return;
+    if (loading || !chartData || profile.length < 2) { emit(null); return; }
+    const D = totalDist;
+    if (D <= 0) { emit(null); return; }
+    const { minDetStraight, minDetFresnel, braLine, cosLine, adjTarget43 } = chartData;
+
+    // uniqueDists 기준 선(minDetStraight·minDetFresnel)을 임의 거리에서 선형보간 — 각기 별도 포인터
+    //   (호출이 거리 오름차순 단조라 O(n) 전진; 두 배열 모두 거리 오름차순).
+    const makeInterp = (arr: { distance: number; height: number }[]) => {
+      let si = 0;
+      return (d: number): number => {
+        if (d <= arr[0].distance) return arr[0].height;
+        const last = arr[arr.length - 1];
+        if (d >= last.distance) return last.height;
+        while (si < arr.length - 1 && arr[si + 1].distance < d) si++;
+        const denom = arr[si + 1].distance - arr[si].distance;
+        const t = denom > 1e-9 ? (d - arr[si].distance) / denom : 0;
+        return arr[si].height + t * (arr[si + 1].height - arr[si].height);
+      };
+    };
+    const interpLos = makeInterp(minDetStraight);
+    const interpFresnel = makeInterp(minDetFresnel);
+    // 4/3 현(디스플레이 직선) → 지도 평면 raw AMSL: d=0 → radarHeight, d=D → 타겟 지면고
+    const chord43H = (d: number) => radarHeight + (adjTarget43 - radarHeight) * (d / D);
+    const rayAt = (d: number) => chord43H(d) + curvDrop43(d);
+
+    // braLine·cosLine 은 profile.map — profile 인덱스와 정렬. 각 차트 선(디스플레이)에 curvDrop(d) 를
+    //   더해 지도 평면 raw AMSL 로 환원. 레이더 지점(d≤0)은 모든 선이 안테나 AMSL(radarHeight)에서 출발.
+    const samples: LosCurtainSample[] = [];
+    for (let i = 0; i < profile.length; i++) {
+      const p = profile[i];
+      if (p.distance > D) break; // 0..D 만 (200NM 연장 금지)
+      if (p.distance <= 0) {
+        samples.push({
+          lat: p.latitude, lon: p.longitude, distKm: p.distance,
+          terrainM: p.elevation, los43M: radarHeight, fresnelM: radarHeight,
+          braM: radarHeight, cosM: radarHeight, rayM: radarHeight,
+        });
+        continue;
+      }
+      const cd = curvDrop(p.distance);
+      samples.push({
+        lat: p.latitude, lon: p.longitude, distKm: p.distance,
+        terrainM: p.elevation,
+        los43M: interpLos(p.distance) + cd,
+        fresnelM: interpFresnel(p.distance) + cd,
+        braM: braLine[i].height + cd,
+        cosM: cosLine[i].height + cd,
+        rayM: rayAt(p.distance),
+      });
+    }
+    // 타겟 지점(d=D) 1점 — lat/lon·지형고·BRA·CoS 는 이웃 profile 선형보간, rayM 은 타겟 지면고에 수렴
+    let tLat = targetLat, tLon = targetLon;
+    let tElev = profile[profile.length - 1].elevation;
+    let tBra = braLine[braLine.length - 1].height;
+    let tCos = cosLine[cosLine.length - 1].height;
+    for (let i = 1; i < profile.length; i++) {
+      if (profile[i].distance >= D) {
+        const denom = profile[i].distance - profile[i - 1].distance;
+        const t = denom > 1e-9 ? (D - profile[i - 1].distance) / denom : 0;
+        tLat = profile[i - 1].latitude + t * (profile[i].latitude - profile[i - 1].latitude);
+        tLon = profile[i - 1].longitude + t * (profile[i].longitude - profile[i - 1].longitude);
+        tElev = profile[i - 1].elevation + t * (profile[i].elevation - profile[i - 1].elevation);
+        tBra = braLine[i - 1].height + t * (braLine[i].height - braLine[i - 1].height);
+        tCos = cosLine[i - 1].height + t * (cosLine[i].height - cosLine[i - 1].height);
+        break;
+      }
+    }
+    const cdD = curvDrop(D);
+    samples.push({
+      lat: tLat, lon: tLon, distKm: D,
+      terrainM: tElev,
+      los43M: interpLos(D) + cdD,
+      fresnelM: interpFresnel(D) + cdD,
+      braM: tBra + cdD,
+      cosM: tCos + cdD,
+      rayM: rayAt(D),
+    });
+    emit(samples);
+  }, [chartData, profile, loading, radarHeight, totalDist, targetLat, targetLon]);
 
   // 주소 검색 결과 건물을 단면도에서 자동 선택
   const autoSelectedSearchedRef = useRef<number | null>(null);
@@ -1450,8 +1544,9 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 stroke="white" strokeWidth={1} />
               <text
                 x={xScale(peak.distance)}
-                y={yScale(peak.adjHeight) - 10}
+                y={PAD.top + ch - 5}
                 textAnchor="middle" fill="#374151" fontSize={9} fontWeight="bold">
+                {/* 산 이름은 표시영역 최하단 고정(Y줌 무관) — 지형·선과 겹침 방지 */}
                 {`${peak.name} (${Math.round(peak.realElevation * M_TO_FT).toLocaleString()}ft)`}
               </text>
             </g>

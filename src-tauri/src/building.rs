@@ -1067,12 +1067,14 @@ pub struct ManualBuilding {
     pub geometry_json: Option<String>,
     /// 소속 그룹 ID (null이면 미분류)
     pub group_id: Option<i64>,
+    /// 지면 표고 입력 모드 'auto'|'manual'|''(레거시)
+    pub elev_mode: String,
 }
 
 /// 수동 건물 전체 조회
 pub fn list_manual_buildings(conn: &Connection) -> Result<Vec<ManualBuilding>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id FROM manual_buildings ORDER BY id"
+        "SELECT id, name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id, elev_mode FROM manual_buildings ORDER BY id"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -1087,6 +1089,7 @@ pub fn list_manual_buildings(conn: &Connection) -> Result<Vec<ManualBuilding>, S
             geometry_type: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "polygon".to_string()),
             geometry_json: row.get(8)?,
             group_id: row.get(9)?,
+            elev_mode: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
         })
     }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
 
@@ -1102,14 +1105,15 @@ pub fn add_manual_building(
     longitude: f64,
     height: f64,
     ground_elev: f64,
+    elev_mode: &str,
     memo: &str,
     geometry_type: &str,
     geometry_json: Option<&str>,
     group_id: Option<i64>,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO manual_buildings (name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id],
+        "INSERT INTO manual_buildings (name, latitude, longitude, height, ground_elev, elev_mode, memo, geometry_type, geometry_json, group_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![name, latitude, longitude, height, ground_elev, elev_mode, memo, geometry_type, geometry_json, group_id],
     ).map_err(|e| format!("INSERT 실패: {}", e))?;
     Ok(conn.last_insert_rowid())
 }
@@ -1123,14 +1127,15 @@ pub fn update_manual_building(
     longitude: f64,
     height: f64,
     ground_elev: f64,
+    elev_mode: &str,
     memo: &str,
     geometry_type: &str,
     geometry_json: Option<&str>,
     group_id: Option<i64>,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE manual_buildings SET name=?1, latitude=?2, longitude=?3, height=?4, ground_elev=?5, memo=?6, geometry_type=?7, geometry_json=?8, group_id=?9 WHERE id=?10",
-        params![name, latitude, longitude, height, ground_elev, memo, geometry_type, geometry_json, group_id, id],
+        "UPDATE manual_buildings SET name=?1, latitude=?2, longitude=?3, height=?4, ground_elev=?5, elev_mode=?6, memo=?7, geometry_type=?8, geometry_json=?9, group_id=?10 WHERE id=?11",
+        params![name, latitude, longitude, height, ground_elev, elev_mode, memo, geometry_type, geometry_json, group_id, id],
     ).map_err(|e| format!("UPDATE 실패: {}", e))?;
     Ok(())
 }

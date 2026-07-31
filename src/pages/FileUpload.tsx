@@ -12,37 +12,13 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre";
-import maplibregl from "maplibre-gl";
 import Modal from "../components/common/Modal";
 import { SrtmDownloadSection, FacBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
 import type { BuildingGroup, ManualBuilding } from "../types";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
+import { ensureLanduseProtocol } from "../utils/landuseProtocol";
 import BuildingModal, { shapeTypeLabel, makeInitialDraft, type BuildingFormData } from "../components/BuildingModal";
 import { useAppStore } from "../store";
-
-// ─── landuse 타일 프로토콜 ──────────────────────────────────────
-let landuseProtocolRegistered = false;
-function ensureLanduseProtocol() {
-  if (landuseProtocolRegistered) return;
-  landuseProtocolRegistered = true;
-  maplibregl.addProtocol('landuse', async (params) => {
-    const parts = params.url.replace('landuse://', '').split('/');
-    const [z, x, y] = parts.map(Number);
-    try {
-      const base64 = await invoke<string | null>('get_landuse_tile', { z, x, y });
-      if (!base64) return { data: new ArrayBuffer(0) };
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return { data: bytes.buffer };
-    } catch {
-      return { data: new ArrayBuffer(0) };
-    }
-  });
-}
-
-
-
 
 // ─── 건물 목록 패널 ──────────────────────────────────────────────
 
@@ -98,6 +74,7 @@ function ManualBuildingPanel() {
           longitude: parseFloat(data.longitude),
           height: parseFloat(data.height),
           groundElev: parseFloat(data.ground_elev) || 0,
+          elevMode: data.elev_mode || "manual", // 추론 전 '' → 'manual'(화면 표시와 일치)
           memo: data.memo,
           geometryType: data.geometry_type || "polygon",
           geometryJson: data.geometry_json || null,
@@ -110,6 +87,7 @@ function ManualBuildingPanel() {
           longitude: parseFloat(data.longitude),
           height: parseFloat(data.height),
           groundElev: parseFloat(data.ground_elev) || 0,
+          elevMode: data.elev_mode || "manual", // 추론 전 '' → 'manual'(화면 표시와 일치)
           memo: data.memo,
           geometryType: data.geometry_type || "polygon",
           geometryJson: data.geometry_json || null,

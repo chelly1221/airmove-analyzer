@@ -1200,6 +1200,7 @@ async fn add_manual_building(
     longitude: f64,
     height: f64,
     ground_elev: f64,
+    elev_mode: String,
     memo: String,
     geometry_type: Option<String>,
     geometry_json: Option<String>,
@@ -1210,7 +1211,7 @@ async fn add_manual_building(
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         let gt = geometry_type.as_deref().unwrap_or("polygon");
         let gj = geometry_json.as_deref();
-        building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
+        building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &elev_mode, &memo, gt, gj, group_id)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1225,6 +1226,7 @@ async fn update_manual_building(
     longitude: f64,
     height: f64,
     ground_elev: f64,
+    elev_mode: String,
     memo: String,
     geometry_type: Option<String>,
     geometry_json: Option<String>,
@@ -1235,7 +1237,7 @@ async fn update_manual_building(
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         let gt = geometry_type.as_deref().unwrap_or("polygon");
         let gj = geometry_json.as_deref();
-        building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &memo, gt, gj, group_id)
+        building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &elev_mode, &memo, gt, gj, group_id)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?

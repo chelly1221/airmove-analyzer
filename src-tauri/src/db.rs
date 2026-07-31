@@ -243,6 +243,9 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 수동 건물에 그룹 컬럼 추가
     let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN group_id INTEGER REFERENCES building_groups(id) ON DELETE SET NULL", []);
 
+    // 지면 표고 입력 모드: 'auto'(SRTM 자동) | 'manual'(수동 입력) | ''(레거시 미기록)
+    let _ = conn.execute("ALTER TABLE manual_buildings ADD COLUMN elev_mode TEXT NOT NULL DEFAULT ''", []);
+
     // 건물 그룹에 토지이용계획도 컬럼 추가
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_image BLOB", []);
     let _ = conn.execute("ALTER TABLE building_groups ADD COLUMN plan_bounds_json TEXT", []);

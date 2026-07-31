@@ -127,6 +127,8 @@ export interface ManualBuilding {
   geometry_json: string | null;
   /** 소속 그룹 ID (null이면 미분류) */
   group_id: number | null;
+  /** 지면 표고 입력 모드, '' = 레거시 미기록 */
+  elev_mode: "auto" | "manual" | "";
 }
 
 /** 건물 수동 등록/수정 모달 폼 데이터 */
@@ -140,6 +142,8 @@ export interface BuildingFormData {
   geometry_type: GeometryType;
   geometry_json: string | null;
   group_id: number | null;
+  /** 지면 표고 입력 모드, '' = 레거시 미기록 */
+  elev_mode: "auto" | "manual" | "";
 }
 
 /** 건물 모달 작성 중 상태 (페이지 이동에도 유지) */

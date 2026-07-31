@@ -8,31 +8,9 @@ import AddressSearch, { AddressMarker } from "./Map/AddressSearch";
 import type { BuildingGroup, GeometryType, ManualBuilding, BuildingFormData, BuildingModalDraft, AddressBuildingHit } from "../types";
 import { useAppStore } from "../store";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
+import { ensureLanduseProtocol } from "../utils/landuseProtocol";
 
 export type { BuildingFormData };
-
-// ─── landuse 프로토콜 (BuildingModal 전용) ──────────────────────
-import maplibregl from "maplibre-gl";
-
-let landuseProtocolRegistered = false;
-function ensureLanduseProtocol() {
-  if (landuseProtocolRegistered) return;
-  landuseProtocolRegistered = true;
-  maplibregl.addProtocol('landuse', async (params) => {
-    const parts = params.url.replace('landuse://', '').split('/');
-    const [z, x, y] = parts.map(Number);
-    try {
-      const base64 = await invoke<string | null>('get_landuse_tile', { z, x, y });
-      if (!base64) return { data: new ArrayBuffer(0) };
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return { data: bytes.buffer };
-    } catch {
-      return { data: new ArrayBuffer(0) };
-    }
-  });
-}
 
 // ─── 타입 & 유틸 ──────────────────────────────────────────────
 
@@ -46,6 +24,7 @@ const emptyForm: BuildingFormData = {
   geometry_type: "polygon",
   geometry_json: null,
   group_id: null,
+  elev_mode: "auto", // 신규 등록 기본 자동(SRTM)
 };
 
 /** 편집 대상/그룹으로부터 초기 작성 상태(draft) 생성 — 모달 오픈 시 1회 시드 */
@@ -70,6 +49,7 @@ export function makeInitialDraft(
         geometry_type: isMulti ? "polygon" : (initial.geometry_type || "polygon"),
         geometry_json: isMulti ? null : (initial.geometry_json || null),
         group_id: initial.group_id ?? null,
+        elev_mode: initial.elev_mode ?? "", // ''=레거시 → 오픈 후 1회 추론
       },
       shapes,
     };
@@ -181,6 +161,18 @@ export default function BuildingModal({
   );
   const miniMapRef = useRef<MapRef>(null);
   const [miniMapReady, setMiniMapReady] = useState(false);
+  // 토지이용계획도 표시 토글 (기본 ON, localStorage 영속화)
+  const [showLanduse, setShowLanduse] = useState<boolean>(() => localStorage.getItem('buildingModal.landuse') !== '0');
+  const toggleLanduse = useCallback(() => {
+    setShowLanduse((v) => {
+      const next = !v;
+      localStorage.setItem('buildingModal.landuse', next ? '1' : '0');
+      return next;
+    });
+  }, []);
+  // 자동(SRTM) 재조회 가드: 마지막으로 조회한 좌표 키 "lat,lon".
+  //   오픈/재마운트 시 현재 좌표로 시드 → 오픈 직후에는 좌표가 같아 fetch 안 함 = 저장값 그대로 표시.
+  const lastAutoCoordsRef = useRef<string | null>(null);
 
   const groupBuildingsGeoJson = useMemo(() => {
     if (form.group_id == null) return null;
@@ -208,7 +200,7 @@ export default function BuildingModal({
       : null;
   }, [form.group_id, allBuildings, initial]);
 
-  // 토지이용계획도 타일 레이어
+  // 토지이용계획도 타일 레이어 (add-once — showLanduse 는 별도 effect 로 visibility 만 토글)
   useEffect(() => {
     const map = miniMapRef.current?.getMap();
     if (!map || !miniMapReady) return;
@@ -225,10 +217,19 @@ export default function BuildingModal({
         id: 'landuse-layer',
         type: 'raster',
         source: 'landuse-tiles',
+        layout: { visibility: showLanduse ? 'visible' : 'none' },
         paint: { 'raster-opacity': 0.6 },
       });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [miniMapReady]);
+
+  // 토지이용 표시 토글 → 레이어 visibility 반영 (add-once 유지 위해 별도 effect)
+  useEffect(() => {
+    const map = miniMapRef.current?.getMap();
+    if (!map || !map.getLayer('landuse-layer')) return;
+    map.setLayoutProperty('landuse-layer', 'visibility', showLanduse ? 'visible' : 'none');
+  }, [showLanduse, miniMapReady]);
 
   const [clickPts, setClickPts] = useState<[number, number][]>([]);
   const [mousePt, setMousePt] = useState<[number, number] | null>(null);
@@ -243,6 +244,9 @@ export default function BuildingModal({
     setHoveredShapeIdx(null);
     setNoGeomWarning(false);
     setMiniMapReady(false);
+    // 오픈(재마운트 포함) 시 현재 좌표로 시드 → 자동 모드라도 오픈 직후 재조회 억제(저장값 유지)
+    lastAutoCoordsRef.current = form.latitude + "," + form.longitude;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, initial, defaultGroupId]);
 
   const handleSubmit = () => {
@@ -644,19 +648,40 @@ export default function BuildingModal({
 
   useEffect(() => { if (!isOpen) { setAddressMarker(null); setFoundBuilding(null); setPendingApply(false); setIs3d(false); } }, [isOpen]);
 
-  const [elevMode, setElevMode] = useState<"auto" | "manual">("auto");
+  // 모드의 단일 원천은 form.elev_mode(draft에 보관 → 페이지 이동 후 복귀에도 유지).
+  //   표시용 유효 모드: 레거시('')는 추론 완료 전까지 수동처럼 값 고정 표시.
+  const elevMode = form.elev_mode === "" ? "manual" : form.elev_mode;
   const [elevLoading, setElevLoading] = useState(false);
 
+  // 레거시(elev_mode 미기록) 편집 시 오픈 후 1회 모드 추론 — form.elev_mode 만 갱신, ground_elev 는 불변.
+  //   자동 등록값은 String(Math.round(elevs[0])) 로 저장됐으므로 SRTM 정수 재조회값과의 정수 일치 비교가 신뢰 가능.
   useEffect(() => {
-    if (initial && initial.ground_elev > 0) setElevMode("manual");
-    else setElevMode("auto");
-  }, [initial, isOpen]);
+    if (!isOpen || !initial || form.elev_mode !== "") return;
+    const lat = parseFloat(form.latitude);
+    const lon = parseFloat(form.longitude);
+    if (isNaN(lat) || isNaN(lon)) { setForm((f) => ({ ...f, elev_mode: "manual" })); return; }
+    let cancelled = false;
+    invoke<number[]>("fetch_elevation", { latitudes: [lat], longitudes: [lon] })
+      .then((elevs) => {
+        if (cancelled) return;
+        const matched = Math.round(elevs[0] ?? 0) === initial.ground_elev;
+        setForm((f) => ({ ...f, elev_mode: matched ? "auto" : "manual" }));
+      })
+      .catch(() => { if (!cancelled) setForm((f) => ({ ...f, elev_mode: "manual" })); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, initial]);
 
+  // 자동(SRTM) 모드에서 좌표가 바뀔 때만 재조회.
+  //   오픈/재마운트 시 lastAutoCoordsRef 가 현재 좌표로 시드돼 있어 오픈 직후엔 fetch 안 함 = 저장값 그대로 표시.
   useEffect(() => {
     if (elevMode !== "auto") return;
     const lat = parseFloat(form.latitude);
     const lon = parseFloat(form.longitude);
     if (isNaN(lat) || isNaN(lon)) return;
+    const key = form.latitude + "," + form.longitude;
+    if (key === lastAutoCoordsRef.current) return;
+    lastAutoCoordsRef.current = key; // fetch 시작 시점에 갱신 → 중복 fetch 방지
     let cancelled = false;
     setElevLoading(true);
     invoke<number[]>("fetch_elevation", { latitudes: [lat], longitudes: [lon] })
@@ -674,10 +699,10 @@ export default function BuildingModal({
   ];
 
   return (
-    <Modal open={isOpen} onClose={onClose} title={initial ? "건물 정보 수정" : "건물 수동 등록"} width="max-w-3xl">
+    <Modal open={isOpen} onClose={onClose} title={initial ? "건물 정보 수정" : "건물 수동 등록"} width="max-w-[min(1600px,96vw)]">
       <div className="flex gap-4">
         {/* 왼쪽: 입력 폼 */}
-        <div className="w-64 shrink-0 space-y-2.5">
+        <div className="w-80 shrink-0 space-y-2.5">
           {groups.length > 0 && (
             <div>
               <label className="mb-0.5 block text-xs font-medium text-gray-600">그룹</label>
@@ -721,9 +746,9 @@ export default function BuildingModal({
             <div className="mb-0.5 flex items-center justify-between">
               <label className="text-xs font-medium text-gray-600">지면 표고 (m)</label>
               <div className="flex rounded-md border border-gray-200 overflow-hidden">
-                <button type="button" onClick={() => setElevMode("auto")}
+                <button type="button" onClick={() => { lastAutoCoordsRef.current = null; setForm((f) => ({ ...f, elev_mode: "auto" })); }}
                   className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${elevMode === "auto" ? "bg-[#a60739] text-white" : "bg-gray-50 text-gray-400 hover:bg-gray-100"}`}>자동</button>
-                <button type="button" onClick={() => setElevMode("manual")}
+                <button type="button" onClick={() => setForm((f) => ({ ...f, elev_mode: "manual" }))}
                   className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${elevMode === "manual" ? "bg-[#a60739] text-white" : "bg-gray-50 text-gray-400 hover:bg-gray-100"}`}>수동</button>
               </div>
             </div>
@@ -787,7 +812,7 @@ export default function BuildingModal({
             </div>
           )}
 
-          <div className="relative h-80 w-full overflow-hidden rounded-xl border border-gray-200">
+          <div className="relative h-[65vh] min-h-80 w-full overflow-hidden rounded-xl border border-gray-200">
             <MapGL ref={miniMapRef} initialViewState={{ ...mapCenter, zoom: hasMarker ? 14 : 7, pitch: 0 }}
               maxPitch={60} mapStyle={MAP_STYLE_URL} style={{ width: "100%", height: "100%" }} cursor="crosshair"
               onClick={handleMapClick} onDblClick={handleMapDblClick} onMouseMove={handleMapMouseMove}
@@ -853,20 +878,29 @@ export default function BuildingModal({
               )}
             </MapGL>
             <AddressSearch onSelect={handleAddressSelect} />
-            {/* 3D(pitch) 토글 칩 */}
-            <button
-              type="button"
-              onClick={() => {
-                const map = miniMapRef.current?.getMap();
-                if (!map) return;
-                const next = !is3d;
-                setIs3d(next);
-                map.easeTo({ pitch: next ? 55 : 0, duration: 500 });
-              }}
-              className={`absolute right-2 top-2 z-10 rounded-md px-2 py-1 text-[11px] font-medium shadow border transition-colors ${is3d ? "bg-[#a60739] text-white border-[#a60739]" : "bg-white/90 text-gray-600 border-gray-200 hover:bg-gray-100"}`}
-            >
-              3D
-            </button>
+            {/* 토글 칩 그룹: 3D(pitch) · 토지이용 표시 */}
+            <div className="absolute right-2 top-2 z-10 flex gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  const map = miniMapRef.current?.getMap();
+                  if (!map) return;
+                  const next = !is3d;
+                  setIs3d(next);
+                  map.easeTo({ pitch: next ? 55 : 0, duration: 500 });
+                }}
+                className={`rounded-md px-2 py-1 text-[11px] font-medium shadow border transition-colors ${is3d ? "bg-[#a60739] text-white border-[#a60739]" : "bg-white/90 text-gray-600 border-gray-200 hover:bg-gray-100"}`}
+              >
+                3D
+              </button>
+              <button
+                type="button"
+                onClick={toggleLanduse}
+                className={`rounded-md px-2 py-1 text-[11px] font-medium shadow border transition-colors ${showLanduse ? "bg-[#a60739] text-white border-[#a60739]" : "bg-white/90 text-gray-600 border-gray-200 hover:bg-gray-100"}`}
+              >
+                토지이용
+              </button>
+            </div>
           </div>
         </div>
       </div>
