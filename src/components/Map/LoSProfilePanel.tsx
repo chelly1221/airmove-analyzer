@@ -70,7 +70,7 @@ interface Props {
    *  차트 렌더에는 전혀 영향 없음 — chartData 확정 후 별도 useEffect 에서 프레임 역변환만 수행. */
   onCurtainData?: (data: LosCurtainSample[] | null) => void;
   /** 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강). 로딩 중엔 직전 값 유지.
-   *  all = 드로어 영향 건물 리스트용 전체 목록(차폐 기여 + 차단 건물). */
+   *  all = 드로어 리스트용 전체 목록(최저탐지선 꺾음 기여(비차단) + 차단 건물). */
   onPathBuildings?: (d: { target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null) => void;
 }
 
@@ -691,8 +691,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       if (maxY < minMaxYFor40Pct) maxY = minMaxYFor40Pct;
     }
 
-    // 차폐에 영향을 주는 건물만 필터링:
-    // 건물 꼭대기가 지형만으로 생성된 shadow보다 높으면 = 실질 차폐 기여
+    // 최저탐지선(los43)에 실제로 영향을 주는 건물만 필터링:
+    // 4/3 프레임에서 자기 앞 장애물(지형+타 건물) 그림자 위로 상단이 올라와 선을 꺾으면 = 유의미 건물
     const significantBuildings: (BuildingOnPath & { isBlocking: boolean })[] = [];
     // 주소 검색으로 지정된 건물 찾기 (검색 좌표에 가장 가까운 건물, 150m 이내)
     let searchedBldg: BuildingOnPath | null = null;
@@ -745,7 +745,6 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         //   아래 교집합(s0>s1)에서 자동으로 비차단 처리된다.
         if (bDist <= 0 || bDist >= profileMaxKm) continue;
         const bTop = b.ground_elev_m + b.height_m;
-        const bAdj = bTop - curvDrop(bDist);
 
         // 건물별 차단 판정 — 이중 조건(현 관통 AND 선 꺾음):
         //   ① 4/3 현(chord43H) 관통 = 레이더↔타겟 직선 시야를 실제로 가로막음. 상단 AMSL 이 일정하고
@@ -769,17 +768,19 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           }
         }
 
-        // 지형만으로 생성된 shadow (실제지구 프레임)
-        let terrainShadow = radarHeight;
-        for (const p of profile) {
-          if (p.distance <= 0 || p.distance >= bDist) continue;
-          const adjH = p.elevation - curvDrop(p.distance);
-          const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
-          if (shadow > terrainShadow) terrainShadow = shadow;
-        }
+        // 최저탐지선(los43) 꺾음 판정 — 4/3 프레임, 자기 near 엣지 이전 장애물(지형+타 건물)의
+        //   running max angle 을 상단 앙각(near/far 엣지, 상단 AMSL 일정이라 극값은 경계)이 초과하면
+        //   실제로 선을 꺾는 건물. 지형·타건물 그림자에 묻힌 건물은 선에 닿지 않으므로 제외
+        //   (구 기준은 지형만의 그림자(실제지구 프레임)라 타건물 그림자에 묻힌 건물이 대량 회색 오탐 — 2026-08-03 수정).
+        const e0 = Math.max(bNearD, 0.001);
+        const e1 = Math.max(bFarD, e0);
+        const angAtEdge = (d: number) => (bTop - curvDrop43(d) - radarHeight) / (d * 1000);
+        const bendsLine = Math.max(angAtEdge(e0), angAtEdge(e1)) > maxAngleBefore(bNearD);
+
         const isSearched = searchedBldg !== null && b === searchedBldg;
-        // 실제 차단 건물(isBlk)은 지형 그림자에 묻혀도 목록에 포함 — 누락 시 지도 빨강 표시가 사라진다
-        if (bAdj > terrainShadow || isSearched || isBlk) {
+        // isBlk 는 이론상 bendsLine 에 포함되나(0..D 클램프 차이) 방어적으로 OR 유지.
+        //   isSearched 건물은 선에 닿지 않아도 항상 포함(주소검색 시뮬레이션 대상).
+        if (bendsLine || isBlk || isSearched) {
           if (isSearched) searchedBldgIdx = significantBuildings.length;
           significantBuildings.push({ ...b, isBlocking: isBlk });
         }
@@ -960,7 +961,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
   // ── 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강) ──
   //   커튼과 동일 원칙: 재조회(loading) 중엔 방출하지 않고 직전 값 유지, 언마운트 시에만 해제.
-  //   all = 드로어 영향 건물 리스트용 전체 목록(significantBuildings 원본 — 차폐 기여 + 차단 건물).
+  //   all = 드로어 리스트용 전체 목록(significantBuildings 원본 — 최저탐지선 꺾음 기여(비차단) + 차단 건물).
   const onPathBuildingsRef = useRef(onPathBuildings);
   onPathBuildingsRef.current = onPathBuildings;
   useEffect(() => () => { onPathBuildingsRef.current?.(null); }, []);
@@ -1511,7 +1512,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           </>
         )}
 
-        {/* 건물 실루엣 (차폐 기여 건물만) — 점 건물: 세로선, 도형 건물: 채워진 사각형 */}
+        {/* 건물 실루엣 (최저탐지선 꺾음 기여 건물만) — 점 건물: 세로선, 도형 건물: 채워진 사각형 */}
         {showBuildings && chartData.significantBuildings.map((b, bi) => {
           const nearD = b.near_dist_km ?? b.distance_km;
           const farD = b.far_dist_km ?? b.distance_km;
@@ -1901,7 +1902,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 <tspan fill="#374151" fontWeight="bold">{Math.round(b.ground_elev_m + b.height_m)}m AMSL</tspan>
               </text>
               <text x={tooltipX + 8} y={(lineY += 14, lineY)} fill={b.isBlocking ? "#ef4444" : "#6b7280"} fontSize={8} fontWeight={b.isBlocking ? "bold" : "normal"}>
-                {b.isBlocking ? "⚠ LoS 차단 기여" : "차폐 영향"}
+                {b.isBlocking ? "⚠ LoS 차단" : "비차단 · 최저탐지선 기여"}
               </text>
               {isClicked && (
                 <text x={tooltipX + tooltipW - 8} y={lineY} textAnchor="end"

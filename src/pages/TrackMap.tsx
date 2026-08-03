@@ -480,7 +480,7 @@ export default function TrackMap() {
   // LoS 수직 단면 커튼 샘플 — LoSProfilePanel onCurtainData 수신 (차트 가시 구간 3D 표출)
   const [losCurtain, setLosCurtain] = useState<LosCurtainSample[] | null>(null);
   // 단면도 경로상 건물 — 대상(파랑)/차단(빨강) 지도 하이라이트. LoSProfilePanel onPathBuildings 수신
-  //   all = 드로어 "LoS 영향 건물" 리스트용 전체 목록(차폐 기여 + 차단)
+  //   all = 드로어 리스트 입력용 전체 목록(최저탐지선 꺾음 기여(비차단) + 차단). 리스트는 차단만 필터해 표시
   const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null>(null);
   // 건물모드 방위 한계 — 건물 양끝 방위(offset 도메인, 0/360 랩 안전). launchBuildingLoS valid 시 설정
   const [losBldgAzBounds, setLosBldgAzBounds] = useState<{ center: number; minOff: number; maxOff: number } | null>(null);
@@ -3788,33 +3788,30 @@ export default function TrackMap() {
             </button>
           </div>
 
-          {/* LoS 영향 건물 — 출처: LoSProfilePanel chartData.significantBuildings → onPathBuildings.all (차폐 기여 + 차단 건물).
-              색 계약은 지도/차트와 동일: 대상=파랑(#3b82f6) · 차단=빨강(#ef4444) · 차폐=회색(#9ca3af). */}
+          {/* LoS 차단 건물 — 출처: LoSProfilePanel chartData.significantBuildings → onPathBuildings.all
+              (최저탐지선 꺾음 기여(비차단) + 차단 건물) 중 차단(isBlocking)만 필터해 표시.
+              색 계약은 지도/차트와 동일: 대상=파랑(#3b82f6) · 차단=빨강(#ef4444). */}
           {(() => {
             const list = losPathBldgs?.all ?? [];
             const target = losPathBldgs?.target ?? null;
-            // 차단 먼저, 각 그룹 내 거리 오름차순 (원본 mutate 금지)
-            const sorted = list.slice().sort((a, b) =>
-              (a.isBlocking === b.isBlocking ? a.distance_km - b.distance_km : (a.isBlocking ? -1 : 1)));
-            const blockCnt = sorted.filter((b) => b.isBlocking).length;
-            const shadeCnt = sorted.length - blockCnt;
+            // 차단 건물만, 거리 오름차순 (filter 가 새 배열 — 원본 mutate 없음)
+            const sorted = list.filter((b) => b.isBlocking).sort((a, b) => a.distance_km - b.distance_km);
             const empty = !losTarget ? "분석 지점을 선택하세요"
               : !losShowBuildings ? "건물 표시를 켜면 목록이 계산됩니다"
-              : sorted.length === 0 ? "LoS 에 영향을 주는 건물 없음"
+              : sorted.length === 0 ? "LoS 차단 건물 없음"
               : null;
             return (
               <div style={{ padding: "9px 11px", flex: 1, minHeight: 150, display: "flex", flexDirection: "column" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
-                  <span style={{ ...micro, flex: 1, minWidth: 0 }}>Impact Buildings · LoS 영향 건물</span>
-                  <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>차단 {blockCnt}</span>
-                  <span style={{ ...num, fontSize: 9.5, color: "#9ca3af" }}>차폐 {shadeCnt}</span>
+                  <span style={{ ...micro, flex: 1, minWidth: 0 }}>Blocking Buildings · LoS 차단 건물</span>
+                  <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>차단 {sorted.length}</span>
                 </div>
                 {empty ? (
                   <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", fontSize: 10, color: "#9ca3af" }}>{empty}</div>
                 ) : (
                   <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
                     {sorted.map((b) => {
-                      const dot = b === target ? "#3b82f6" : b.isBlocking ? "#ef4444" : "#9ca3af";
+                      const dot = b === target ? "#3b82f6" : "#ef4444";
                       return (
                         <div key={`${b.lat},${b.lon},${b.distance_km}`}
                           onClick={() => setDetailBuilding(b)}
