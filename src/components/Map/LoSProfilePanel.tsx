@@ -69,8 +69,9 @@ interface Props {
   /** LoS 수직 단면 커튼 샘플 방출 (지도 3D 표출용, 차트 가시 구간). 프로파일 없으면 null(로딩 중엔 직전 값 유지).
    *  차트 렌더에는 전혀 영향 없음 — chartData 확정 후 별도 useEffect 에서 프레임 역변환만 수행. */
   onCurtainData?: (data: LosCurtainSample[] | null) => void;
-  /** 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강). 로딩 중엔 직전 값 유지. */
-  onPathBuildings?: (d: { target: BuildingOnPath | null; blocking: BuildingOnPath[] } | null) => void;
+  /** 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강). 로딩 중엔 직전 값 유지.
+   *  all = 드로어 영향 건물 리스트용 전체 목록(차폐 기여 + 차단 건물). */
+  onPathBuildings?: (d: { target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null) => void;
 }
 
 
@@ -846,7 +847,6 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       maxDistance: profileMaxKm, // 차트 x축 도메인은 200NM(또는 타겟거리) — 스크롤 줌아웃 한계
       adjTarget,
       targetElev,
-      adjTarget43, // 4/3 프레임 타겟 현 종점 — 커튼 4/3 레이 재구성용(렌더 미사용, 비트 불변)
       sim, // 주소검색 건물 시뮬레이션 결과 (계산 전용, 렌더 미사용)
     };
   }, [profile, radarHeight, totalDist, profileMaxKm, peakNames, buildings, showBuildings, searchedAddress, fresnelClearance, simBuilding]);
@@ -870,7 +870,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
   // ── LoS 수직 단면 커튼 데이터 방출 (지도 3D 표출용 — 차트 렌더 불변) ──
   //   차트 디스플레이 프레임(곡률 처짐)을 지도 평면(raw AMSL)으로 역변환해 차트 가시 구간
-  //   [xZoom0, xZoom1]×maxDistance 의 차트 선(지형·최저탐지 LoS·프레넬·BRA·CoS·4/3 레이)을 방출
+  //   [xZoom0, xZoom1]×maxDistance 의 차트 선(지형·최저탐지 LoS·프레넬·BRA·CoS)을 방출
   //   → TrackMap 이 3D 폴리라인/리본면으로 렌더 (단면도 줌 ↔ 지도 커튼 거리 동기화).
   //   chartData 가 이미 반환한 배열(minDetStraight·minDetFresnel·braLine·cosLine)에서 읽음 — 수식 중복 금지.
   //   deps 최소화(chartData·profile·loading·radarHeight·totalDist·xZoom) + 콜백 ref 로 무한루프 차단.
@@ -886,7 +886,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (!chartData || profile.length < 2) { emit(null); return; }
     const D = totalDist;
     if (D <= 0) { emit(null); return; }
-    const { minDetStraight, minDetFresnel, braLine, cosLine, adjTarget43, maxDistance } = chartData;
+    const { minDetStraight, minDetFresnel, braLine, cosLine, maxDistance } = chartData;
 
     // uniqueDists 기준 선(minDetStraight·minDetFresnel)을 임의 거리에서 선형보간 — 각기 별도 포인터
     //   (호출이 거리 오름차순 단조라 O(n) 전진; 두 배열 모두 거리 오름차순).
@@ -904,9 +904,6 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     };
     const interpLos = makeInterp(minDetStraight);
     const interpFresnel = makeInterp(minDetFresnel);
-    // 4/3 현(디스플레이 직선) → 지도 평면 raw AMSL: d=0 → radarHeight, d=D → 타겟 지면고
-    const chord43H = (d: number) => radarHeight + (adjTarget43 - radarHeight) * (d / D);
-    const rayAt = (d: number) => chord43H(d) + curvDrop43(d);
 
     // ── 차트 가시 구간 [startKm, endKm] 산출 (xZoom 은 maxDistance 도메인의 %) ──
     //   프로파일 종점을 넘어서면 lat/lon 외삽이 되므로 종점으로 클램프.
@@ -923,8 +920,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     // braLine·cosLine 은 profile.map — profile 인덱스와 정렬. 각 차트 선(디스플레이)에 curvDrop(d) 를
     //   더해 지도 평면 raw AMSL 로 환원. 레이더 지점(d≤0)은 모든 선이 안테나 AMSL(radarHeight)에서 출발.
-    //   경계·타겟 샘플은 이웃 profile 선형보간(lat/lon/지형/BRA/CoS), los43·fresnel 은 interp 함수,
-    //   rayM 은 rayAt(d)(현 연장이라 D 너머도 연속·선형).
+    //   경계·타겟 샘플은 이웃 profile 선형보간(lat/lon/지형/BRA/CoS), los43·fresnel 은 interp 함수.
     let pi = 1; // profile 브래킷 단조 포인터 (dists 오름차순 호출 전제)
     const sampleAt = (d: number): LosCurtainSample => {
       while (pi < profile.length - 1 && profile[pi].distance < d) pi++;
@@ -939,7 +935,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         return {
           lat, lon, distKm: 0, terrainM,
           los43M: radarHeight, fresnelM: radarHeight,
-          braM: radarHeight, cosM: radarHeight, rayM: radarHeight,
+          braM: radarHeight, cosM: radarHeight,
         };
       }
       const cd = curvDrop(d);
@@ -950,7 +946,6 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         fresnelM: interpFresnel(d) + cd,
         braM: lerp(braLine[pi - 1].height, braLine[pi].height) + cd,
         cosM: lerp(cosLine[pi - 1].height, cosLine[pi].height) + cd,
-        rayM: rayAt(d),
       };
     };
     const samples: LosCurtainSample[] = [];
@@ -965,6 +960,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
   // ── 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강) ──
   //   커튼과 동일 원칙: 재조회(loading) 중엔 방출하지 않고 직전 값 유지, 언마운트 시에만 해제.
+  //   all = 드로어 영향 건물 리스트용 전체 목록(significantBuildings 원본 — 차폐 기여 + 차단 건물).
   const onPathBuildingsRef = useRef(onPathBuildings);
   onPathBuildingsRef.current = onPathBuildings;
   useEffect(() => () => { onPathBuildingsRef.current?.(null); }, []);
@@ -977,7 +973,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const idx = chartData.searchedBldgIdx;
     const target = idx != null ? (list[idx] ?? null) : null;
     const blocking = list.filter((b) => b.isBlocking && b !== target);
-    emit({ target, blocking });
+    emit({ target, blocking, all: list });
   }, [chartData, loading]);
 
   // ── Y축 가시 범위 자동조정 (줌인 시 보이는 구간의 데이터만 기준) ──

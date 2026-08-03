@@ -480,7 +480,8 @@ export default function TrackMap() {
   // LoS 수직 단면 커튼 샘플 — LoSProfilePanel onCurtainData 수신 (차트 가시 구간 3D 표출)
   const [losCurtain, setLosCurtain] = useState<LosCurtainSample[] | null>(null);
   // 단면도 경로상 건물 — 대상(파랑)/차단(빨강) 지도 하이라이트. LoSProfilePanel onPathBuildings 수신
-  const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[] } | null>(null);
+  //   all = 드로어 "LoS 영향 건물" 리스트용 전체 목록(차폐 기여 + 차단)
+  const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null>(null);
   // 건물모드 방위 한계 — 건물 양끝 방위(offset 도메인, 0/360 랩 안전). launchBuildingLoS valid 시 설정
   const [losBldgAzBounds, setLosBldgAzBounds] = useState<{ center: number; minOff: number; maxOff: number } | null>(null);
   // 건물 스윕 최초 1회 줌인 플래그 (launchBuildingLoS 시 리셋)
@@ -2393,7 +2394,7 @@ export default function TrackMap() {
       : [radarSite.longitude, radarSite.latitude];
 
     // ── LoS 수직 단면 커튼 (차트 가시 구간) ── 단면도 프로파일 로드 후 상시 표출.
-    //   단면도 차트의 각 선(지형·최저탐지 LoS·프레넬·BRA·CoS·4/3 레이)을 3D 수직 리본면(커튼 월)+상단
+    //   단면도 차트의 각 선(지형·최저탐지 LoS·프레넬·BRA·CoS)을 3D 수직 리본면(커튼 월)+상단
     //   강조선으로 재현: 인접 샘플쌍마다 불투명 수직 quad(SolidPolygonLayer)를 먼저 깔고, 기존 PathLayer 선을
     //   그 위에 상단 모서리로 얹음. 지형 메시가 1.5배 과장이라 커튼 전체 z 에 동일 배율(EX)을 곱해 지형 표면과 정합.
     //   수직 폴리곤은 2D 테셀레이터에서 선으로 퇴화하므로 SolidPolygonLayer 는 _full3d:true 필수(최대면적 평면 테셀레이션).
@@ -2404,11 +2405,11 @@ export default function TrackMap() {
       const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
       // 커튼 천장(ceilM) — CoS 보완면의 상단이자 CoS 상단선 절단 기준.
       //   CoS(70°) 선은 20km 에서 5만 m 를 넘게 발산하므로 천장 산출에서 제외하고, 나머지 컨텐츠
-      //   최대고(지형·4/3 LoS·프레넬·BRA·레이) 위로 고저차의 15%(최소 200m) 여유를 얹는다.
+      //   최대고(지형·4/3 LoS·프레넬·BRA) 위로 고저차의 15%(최소 200m) 여유를 얹는다.
       let ceilContent = -Infinity;
       let ceilMinTerrain = Infinity;
       for (const s of curtain) {
-        const m = Math.max(s.terrainM, s.los43M, s.fresnelM, s.braM, s.rayM);
+        const m = Math.max(s.terrainM, s.los43M, s.fresnelM, s.braM);
         if (m > ceilContent) ceilContent = m;
         if (s.terrainM < ceilMinTerrain) ceilMinTerrain = s.terrainM;
       }
@@ -2474,7 +2475,7 @@ export default function TrackMap() {
       //   아래 refined(교차점 세그먼트 분할)로 해소 — 슬리버 틈·잘못된 색 쐐기 제거(2026-08-03).
       //   지형 면(초록)은 지형 메시와 겹쳐 이중 표출되므로 미표출 — 지형 상단선(los-curtain-line-terrain)만 유지.
       //   BRA 를 배열 맨 뒤(구 최하층)에 둔 고정 순서 배치는 동적 정렬로 대체 — 산악 지형에서 bra 가
-      //   상층이면 밴드가 퇴화·소실되던 문제도, 레이더 근방에서 bra 가 최하층이면 실제 최하선(ray/los43)이
+      //   상층이면 밴드가 퇴화·소실되던 문제도, 레이더 근방에서 bra 가 최하층이면 실제 최하선(los43)이
       //   소실되던 문제도 이제 구간별 실제 높이 순서로 함께 해소된다(2026-08-03).
       //   CoS 는 침묵원추 보완면 — 70° 선 "위쪽"(cosM ~ 천장 ceilM)이 원추 내부이므로 bottomLine 으로
       //   자기 바닥을 cosM 에 고정하고 top 은 상수 ceilM(정렬 제외·항상 최상단). bottomLine 은 ceilM 로
@@ -2485,7 +2486,6 @@ export default function TrackMap() {
         { key: "cos",     top: () => ceilM,       color: [168, 85, 247, 255], on: losLayers.cos, bottomLine: (s) => Math.min(s.cosM, ceilM) },
         { key: "fresnel", top: (s) => s.fresnelM, color: [236, 72, 153, 255], on: losLayers.fresnel },
         { key: "los43",   top: (s) => s.los43M,   color: [245, 158, 11, 255], on: losLayers.los43 },
-        { key: "ray",     top: (s) => s.rayM,     color: [233, 69, 96, 255],  on: true }, // 4/3 레이 상시
         { key: "bra",     top: (s) => s.braM,     color: [34, 211, 238, 255], on: losLayers.bra },
       ];
       const activeWalls = wallDefs.filter((w) => w.on);
@@ -2497,7 +2497,7 @@ export default function TrackMap() {
       //   다음 샘플까지 이어져 아래층 상단선 위로 잘못된 색 쐐기가 그려졌다.
       //   → 밴드 경계에 관여하는 선들의 쌍별 교차점에서 세그먼트를 미리 쪼개 두면 분할 구간 내에선 어떤
       //   두 선도 교차하지 않아 max 선택이 구간 전체에서 일정 → 밴드 경계가 정확한 직선이 되고 퇴화 클램프
-      //   삼각형은 정확히 교차점에서 끝난다. 상하 순서가 중간에 몇 번이고 뒤바뀌어도(예: ray↔los43,
+      //   삼각형은 정확히 교차점에서 끝난다. 상하 순서가 중간에 몇 번이고 뒤바뀌어도(예: fresnel↔los43,
       //   지형↔bra) 각 교차마다 밴드가 정확히 넘겨진다(2026-08-03).
       //   비용: 샘플은 차트 가시 구간만 방출(수백 개)이고 관련 선 ≤7개 → 쌍 ≤21/세그먼트라 부하 무시 수준.
       const boundaryLines: ((s: LosCurtainSample) => number)[] = [
@@ -2515,7 +2515,6 @@ export default function TrackMap() {
         fresnelM: a.fresnelM + (b.fresnelM - a.fresnelM) * t,
         braM: a.braM + (b.braM - a.braM) * t,
         cosM: a.cosM + (b.cosM - a.cosM) * t,
-        rayM: a.rayM + (b.rayM - a.rayM) * t,
       });
       const refined: LosCurtainSample[] = [curtain[0]];
       for (let i = 0; i < curtain.length - 1; i++) {
@@ -2541,11 +2540,11 @@ export default function TrackMap() {
         refined.push(b); // 세그먼트 끝은 원본 객체 참조 그대로 (교차 없으면 복사 0)
       }
       // ── 동적 최하선 우선(lowest-first) 밴드 적층 ──
-      //   각 refined 구간에서 컨텐츠 선(fresnel/los43/ray/bra 중 활성)을 실제 높이 오름차순으로 정렬해
+      //   각 refined 구간에서 컨텐츠 선(fresnel/los43/bra 중 활성)을 실제 높이 오름차순으로 정렬해
       //   낮은 선부터 [floor, top] 밴드를 채운다 → 프래그먼트 색 = 바로 위에 있는 "가장 낮은 활성 선"의 색.
-      //   고정 순서(cos→fresnel→los43→ray→bra, 뒤=아래층) 적층은 bra≤ray≤los43≤fresnel 전제가 깨지는
-      //   구간에서 무너진다: 레이더 근방 초반부는 지형 그림자가 작아 los43M·rayM 이 0.25° braM 보다 낮은데,
-      //   bra 풀 밴드 [지형, braM]이 아래를 통째로 덮고 실제 최하선(ray/los43) 밴드는 bottom≥top 퇴화로
+      //   고정 순서(cos→fresnel→los43→bra, 뒤=아래층) 적층은 bra≤los43≤fresnel 전제가 깨지는
+      //   구간에서 무너진다: 레이더 근방 초반부는 지형 그림자가 작아 los43M 이 0.25° braM 보다 낮은데,
+      //   bra 풀 밴드 [지형, braM]이 아래를 통째로 덮고 실제 최하선(los43) 밴드는 bottom≥top 퇴화로
       //   skip 되어 사라졌다(2026-08-03 수정). 실제 순서가 고정 순서와 일치하는 구간에선 결과 동일.
       //   refined 는 관련 선들의 쌍별 교차점에서 이미 쪼개져 있어 구간 내 높이 순서가 불변 → 구간마다 1회 정렬로 충분.
       const wallQuads = new Map<string, CurtainQuad[]>(activeWalls.map((w): [string, CurtainQuad[]] => [w.key, []]));
@@ -2622,12 +2621,10 @@ export default function TrackMap() {
           })
         );
       }
-      // 4/3 레이 (#e94560) — 상시 표출 (차트 blocked 판정선).
-      pushCurtainLine("los-curtain-ray", (s) => s.rayM, [233, 69, 96, 230], 2);
     }
 
     if (losPreviewTarget) {
-      // 커튼 로드 시 평면 기준선(los-preview-line)은 3D 4/3 레이(los-curtain-ray)로 대체.
+      // 커튼 로드 시 평면 기준선(los-preview-line)은 3D 커튼(면·상단선)으로 대체.
       //   커튼 로딩 전·커서 프리뷰(타겟 미확정)는 기존 2D 직선 유지(깜빡임 방지).
       if (!curtain) layers.push(
         new LineLayer({
@@ -3790,6 +3787,64 @@ export default function TrackMap() {
               <span style={{ ...num, fontSize: 9.5, color: "#9ca3af" }}>비차단 {losStats.nonBlocking}</span>
             </button>
           </div>
+
+          {/* LoS 영향 건물 — 출처: LoSProfilePanel chartData.significantBuildings → onPathBuildings.all (차폐 기여 + 차단 건물).
+              색 계약은 지도/차트와 동일: 대상=파랑(#3b82f6) · 차단=빨강(#ef4444) · 차폐=회색(#9ca3af). */}
+          {(() => {
+            const list = losPathBldgs?.all ?? [];
+            const target = losPathBldgs?.target ?? null;
+            // 차단 먼저, 각 그룹 내 거리 오름차순 (원본 mutate 금지)
+            const sorted = list.slice().sort((a, b) =>
+              (a.isBlocking === b.isBlocking ? a.distance_km - b.distance_km : (a.isBlocking ? -1 : 1)));
+            const blockCnt = sorted.filter((b) => b.isBlocking).length;
+            const shadeCnt = sorted.length - blockCnt;
+            const empty = !losTarget ? "분석 지점을 선택하세요"
+              : !losShowBuildings ? "건물 표시를 켜면 목록이 계산됩니다"
+              : sorted.length === 0 ? "LoS 에 영향을 주는 건물 없음"
+              : null;
+            return (
+              <div style={{ padding: "9px 11px", flex: 1, minHeight: 150, display: "flex", flexDirection: "column" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                  <span style={{ ...micro, flex: 1, minWidth: 0 }}>Impact Buildings · LoS 영향 건물</span>
+                  <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>차단 {blockCnt}</span>
+                  <span style={{ ...num, fontSize: 9.5, color: "#9ca3af" }}>차폐 {shadeCnt}</span>
+                </div>
+                {empty ? (
+                  <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", fontSize: 10, color: "#9ca3af" }}>{empty}</div>
+                ) : (
+                  <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+                    {sorted.map((b) => {
+                      const dot = b === target ? "#3b82f6" : b.isBlocking ? "#ef4444" : "#9ca3af";
+                      return (
+                        <div key={`${b.lat},${b.lon},${b.distance_km}`}
+                          onClick={() => setDetailBuilding(b)}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.background = "#f9fafb";
+                            setLosBuildingHighlight({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.background = "transparent";
+                            setLosBuildingHighlight(null);
+                          }}
+                          style={{ padding: "4px 5px", borderRadius: 4, cursor: "pointer" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ width: 6, height: 6, borderRadius: 3, background: dot, flexShrink: 0 }} />
+                            <span style={{ fontSize: 10.5, fontWeight: 600, color: "#374151", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {b.name ?? b.address ?? "이름 없음"}
+                            </span>
+                            <span style={{ ...num, fontSize: 9.5, color: "#6b7280", flexShrink: 0 }}>{(b.distance_km / 1.852).toFixed(1)}NM</span>
+                          </div>
+                          <div style={{ fontSize: 9, color: "#9ca3af", paddingLeft: 12 }}>
+                            높이 {b.height_m.toFixed(0)}m · 꼭대기 {Math.round(b.ground_elev_m + b.height_m)}m AMSL{b.is_manual ? " · 수동" : ""}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       </>
     );
