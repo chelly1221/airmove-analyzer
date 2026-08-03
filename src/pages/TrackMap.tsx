@@ -473,6 +473,9 @@ export default function TrackMap() {
   const [addressBuilding, setAddressBuilding] = useState<AddressBuildingHit | null>(null);
   // 연속 검색 레이스 방지: 최신 요청 결과만 반영
   const addressReqSeq = useRef(0);
+  // 지도 건물클릭 → 선택 전환용 현재 선택 스냅샷 (맵 이벤트 핸들러의 stale closure 회피)
+  const addressSelRef = useRef<{ lat: number; lon: number } | null>(null);
+  addressSelRef.current = addressMarker ? { lat: (addressBuilding ?? addressMarker).lat, lon: (addressBuilding ?? addressMarker).lon } : null;
   // 주소검색 건물 LoS 시뮬레이션 — 카드 입력(지반고/높이)으로 평가할 대상
   const [losSimBuilding, setLosSimBuilding] = useState<{ lat: number; lon: number; groundElevM: number; heightM: number; name: string | null } | null>(null);
   // 시뮬레이션 결과(허용높이·초과량) — LoSProfilePanel onSimStats 수신
@@ -489,40 +492,50 @@ export default function TrackMap() {
   // 카드 입력값 (문자열) — 지반고 / 건물높이
   const [simGroundInput, setSimGroundInput] = useState("");
   const [simHeightInput, setSimHeightInput] = useState("");
-  const handleAddressSelect = useCallback((lat: number, lon: number, label: string) => {
-    // 새 검색·클리어 모두 이전 시뮬레이션 초기화 (건물 문맥 전환)
+  // 좌표 지점의 건물 선택 — 주소검색·지도 건물클릭 공용. moveCamera=false 면 카메라 유지(화면 내 건물 클릭 전환용)
+  const selectBuildingAt = useCallback((lat: number, lon: number, label: string, moveCamera: boolean) => {
+    // 이전 시뮬레이션 초기화 (건물 문맥 전환)
     setLosSimBuilding(null);
     setLosSimStats(null);
     setLosBldgAzBounds(null);
-    if (lat !== 0 && lon !== 0) {
-      setViewState((v) => ({ ...v, latitude: lat, longitude: lon, zoom: 15 }));
-      setAddressMarker({ lat, lon, label });
-      // 검색 좌표 인근 로컬 건물(footprint) 비동기 조회 → 히트 시 3D 표출 + 접근
-      const seq = ++addressReqSeq.current;
-      setAddressBuilding(null);
-      invoke<AddressBuildingHit | null>("find_building_near_point", { lat, lon })
-        .then((hit) => {
-          if (seq !== addressReqSeq.current) return; // 최신 요청만 반영
-          if (hit) {
-            setAddressBuilding(hit);
+    if (moveCamera) setViewState((v) => ({ ...v, latitude: lat, longitude: lon, zoom: 15 }));
+    setAddressMarker({ lat, lon, label });
+    // 좌표 인근 로컬 건물(footprint) 비동기 조회 → 히트 시 3D 표출 + 접근
+    const seq = ++addressReqSeq.current;
+    setAddressBuilding(null);
+    invoke<AddressBuildingHit | null>("find_building_near_point", { lat, lon })
+      .then((hit) => {
+        if (seq !== addressReqSeq.current) return; // 최신 요청만 반영
+        if (hit) {
+          setAddressBuilding(hit);
+          if (moveCamera) {
             const map = mapRef.current?.getMap();
             if (map) {
               const curZoom = map.getZoom();
               map.easeTo({ center: [hit.lon, hit.lat], zoom: Math.max(curZoom, 16.5), duration: 600 });
             }
-          } else {
-            setAddressBuilding(null);
           }
-        })
-        .catch(() => {
-          if (seq === addressReqSeq.current) setAddressBuilding(null);
-        });
+        } else {
+          setAddressBuilding(null);
+        }
+      })
+      .catch(() => {
+        if (seq === addressReqSeq.current) setAddressBuilding(null);
+      });
+  }, []);
+  const handleAddressSelect = useCallback((lat: number, lon: number, label: string) => {
+    if (lat !== 0 && lon !== 0) {
+      selectBuildingAt(lat, lon, label, true);
     } else {
+      // 클리어도 이전 시뮬레이션 초기화 (건물 문맥 해제)
+      setLosSimBuilding(null);
+      setLosSimStats(null);
+      setLosBldgAzBounds(null);
       addressReqSeq.current++;
       setAddressMarker(null);
       setAddressBuilding(null);
     }
-  }, []);
+  }, [selectBuildingAt]);
 
   // 카드 입력 프리필: 히트면 DB 지반고/높이, 미히트면 SRTM 지반고·높이 빈칸
   useEffect(() => {
@@ -1314,6 +1327,11 @@ export default function TrackMap() {
               pinned: true,
             };
           });
+          // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
+          const sel = addressSelRef.current;
+          if (sel && (Math.abs(sel.lat - lat) > 1e-6 || Math.abs(sel.lon - lon) > 1e-6)) {
+            selectBuildingAt(lat, lon, (p.name as string) || "선택 건물", false);
+          }
         }
       } else {
         setBldgPopup(null);
@@ -2891,6 +2909,11 @@ export default function TrackMap() {
                 pinned: true,
               };
             });
+            // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
+            const sel = addressSelRef.current;
+            if (sel && (Math.abs(sel.lat - d.lat) > 1e-6 || Math.abs(sel.lon - d.lon) > 1e-6)) {
+              selectBuildingAt(d.lat, d.lon, d.name || "선택 건물", false);
+            }
           }
         },
         onHover: buildingHover,
