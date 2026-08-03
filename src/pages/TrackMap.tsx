@@ -446,7 +446,7 @@ export default function TrackMap() {
   }, [bldgPopup?.x, bldgPopup?.y, bldgPopup?.loading, bldgPopup?.info, bldgPopup?.facDetail, activeTool, settingsDrawer]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // LoS 단면도 레이어 표시 / 프레넬 클리어런스 / 사용자 각도선 (드로어에서 제어)
-  const [losLayers, setLosLayers] = useState({ terrain: true, los43: true, fresnel: true, bra: false, cos: false });
+  const [losLayers, setLosLayers] = useState({ terrain: true, los43: true, fresnel: true, bra: true, cos: false });
   const [fresnelPct, setFresnelPct] = useState(80);
   const [losShowBuildings, setLosShowBuildings] = useState(true);
   const [showCustomAngle, setShowCustomAngle] = useState(false);
@@ -2228,6 +2228,7 @@ export default function TrackMap() {
     const h = parseFloat(simHeightInput);
     const groundElevM = isNaN(g) ? 0 : g;
     const heightM = isNaN(h) ? 0 : h;
+    setActiveTool("los"); // 좌측 LoS 도구 드로어 자동 오픈 (건물 팝업 경로와 동일)
     if (addressBuilding && addressBuilding.polygons.length > 0) {
       launchBuildingLoS(addressBuilding.polygons[0], addressBuilding.lat, addressBuilding.lon);
       setLosSimBuilding({ lat: addressBuilding.lat, lon: addressBuilding.lon, groundElevM, heightM, name: addressBuilding.name ?? addressMarker?.label ?? null });
@@ -2416,8 +2417,9 @@ export default function TrackMap() {
       };
       // 면별 SolidPolygonLayer 빌더 — 인접 샘플쌍마다 수직 quad, z 는 선과 동일 EX 배율.
       //   수직 폴리곤은 2D 테셀레이션에서 퇴화하므로 _full3d 필수, material:false 로 조명 음영 없이 플랫 색.
-      //   전 월 불투명(α=255) — 같은 수직 평면에 겹쳐 놓이므로 depthCompare:"less-equal" 로
-      //   나중에 그린 (더 낮은) 월이 코플레이너 z-fighting 없이 앞면을 차지 → 차트의 적층 밴드와 동일한 표현.
+      //   전 월 불투명(α=255)이되 서로 겹치지 않는 비중첩 밴드(아래 wallDefs)로 쌓으므로 프래그먼트마다
+      //   속하는 월이 유일 → depth 경합 없음. depthCompare:"less-equal" 은 인접 밴드가 공유하는
+      //   모서리(경계 픽셀) 이음새용으로만 유지.
       const pushCurtainWall = (
         id: string,
         bottom: (s: LosCurtainSample) => number,
@@ -2450,20 +2452,36 @@ export default function TrackMap() {
             _full3d: true,   // 수직 폴리곤 필수 — 미지정 시 2D 테셀레이터가 선으로 퇴화
             material: false, // 조명 음영 없이 플랫 색
             pickable: false,
-            // 코플레이너 quad 는 depth 동률 — less-equal 이라야 나중 push 한 월이 앞을 차지(z-fighting 제거)
+            // 인접 밴드가 공유하는 경계 모서리 픽셀 이음새 대비 — 동률 depth 허용
             parameters: { depthCompare: "less-equal" as const },
           })
         );
       };
       // 면들을 먼저(아래층), 선들을 나중(위 상단 강조선)에 push — 게이트는 대응 선과 동일.
-      //   월 push 순서 = top 높은 것부터(cos → bra → fresnel → los43 → ray): 같은 수직 평면에서
-      //   나중에 그린 낮은 월이 depthCompare less-equal 로 이겨 차트처럼 아래부터 색 밴드가 쌓여 보인다.
+      //   겹침 없는 비중첩 밴드 — i번째 월 bottom = 나중 push 활성 월 top 들의 max(+지형).
+      //   즉 각 월은 자기보다 아래층 월들의 위부터 자기 top 까지만 채워 프래그먼트가 한 월에만 속한다.
+      //   겹침 의존 depth 트릭(전 월 bottom=지형 + less-equal 로 낮은 월이 앞을 차지)은 월마다 top 정점이
+      //   달라 프래그먼트 보간 depth 가 미세하게 갈리고, 특정 줌(투영행렬)에서 판정이 뒤집혀 밴드 전체가
+      //   z-fighting 으로 뒤섞여 폐기(2026-08-03).
+      //   샘플 사이에서 두 곡선이 교차하는 세그먼트는 per-sample max 보간이라 미세 슬리버가 생길 수 있으나 무시.
       //   지형 면(초록)은 지형 메시와 겹쳐 이중 표출되므로 미표출 — 지형 상단선(los-curtain-line-terrain)만 유지.
-      if (losLayers.cos)     pushCurtainWall("los-curtain-wall-cos", (s) => s.terrainM, (s) => s.cosM, [168, 85, 247, 255]);
-      if (losLayers.bra)     pushCurtainWall("los-curtain-wall-bra", (s) => s.terrainM, (s) => s.braM, [34, 211, 238, 255]);
-      if (losLayers.fresnel) pushCurtainWall("los-curtain-wall-fresnel", (s) => s.terrainM, (s) => s.fresnelM, [236, 72, 153, 255]);
-      if (losLayers.los43)   pushCurtainWall("los-curtain-wall-los43", (s) => s.terrainM, (s) => s.los43M, [245, 158, 11, 255]);
-      pushCurtainWall("los-curtain-wall-ray", (s) => s.terrainM, (s) => s.rayM, [233, 69, 96, 255]);
+      const wallDefs: { key: string; top: (s: LosCurtainSample) => number; color: [number, number, number, number]; on: boolean }[] = [
+        { key: "cos",     top: (s) => s.cosM,     color: [168, 85, 247, 255], on: losLayers.cos },
+        { key: "bra",     top: (s) => s.braM,     color: [34, 211, 238, 255], on: losLayers.bra },
+        { key: "fresnel", top: (s) => s.fresnelM, color: [236, 72, 153, 255], on: losLayers.fresnel },
+        { key: "los43",   top: (s) => s.los43M,   color: [245, 158, 11, 255], on: losLayers.los43 },
+        { key: "ray",     top: (s) => s.rayM,     color: [233, 69, 96, 255],  on: true }, // 4/3 레이 상시
+      ];
+      const activeWalls = wallDefs.filter((w) => w.on);
+      activeWalls.forEach((w, i) => {
+        const lower = activeWalls.slice(i + 1); // 자기보다 나중 push(아래층) 활성 월들
+        const bottom = (s: LosCurtainSample) => {
+          let b = s.terrainM;
+          for (const l of lower) { const t = l.top(s); if (t > b) b = t; }
+          return b;
+        };
+        pushCurtainWall(`los-curtain-wall-${w.key}`, bottom, w.top, w.color);
+      });
       if (losLayers.terrain) pushCurtainLine("los-curtain-line-terrain", (s) => s.terrainM, [34, 197, 94, 255], 2);
       if (losLayers.los43)   pushCurtainLine("los-curtain-line-los43", (s) => s.los43M, [245, 158, 11, 255], 2);
       if (losLayers.fresnel) pushCurtainLine("los-curtain-line-fresnel", (s) => s.fresnelM, [236, 72, 153, 200], 1.5);
@@ -4031,7 +4049,7 @@ export default function TrackMap() {
           )}
         </MapGL>
 
-        <AddressSearch onSelect={handleAddressSelect} offsetLeft={activeTool ? 312 : 8} />
+        <AddressSearch onSelect={handleAddressSelect} offsetLeft={activeTool ? 312 : 8} withManualBuildings />
 
         {/* 주소검색 건물 상세 카드 — 지반고/높이 입력 + LoS 단면도 진입 + 허용높이 결과 */}
         {addressMarker && (

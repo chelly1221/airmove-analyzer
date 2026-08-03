@@ -62,7 +62,7 @@ interface Props {
   showLegend?: boolean;
   /** 차단 여부 + 건물 차단/비차단 수 보고 (드로어 헤더/건물 행 갱신용) */
   onStats?: (s: { blocked: boolean; blocking: number; nonBlocking: number }) => void;
-  /** 주소검색 건물 LoS 시뮬레이션 — 지반고/높이 사용자 지정값으로 평가 (계산·보고 전용, 차트 렌더 불변) */
+  /** 주소검색 건물 LoS 시뮬레이션 — 지반고/높이 사용자 지정값을 단면도 계산에 반영(매칭 건물 덮어쓰기·미매칭 시 가상 건물 주입). 허용높이 산출은 자기 제외 */
   simBuilding?: { lat: number; lon: number; groundElevM: number; heightM: number; name?: string | null } | null;
   /** 시뮬레이션 결과 보고 (허용높이·초과량). simBuilding 없으면 null */
   onSimStats?: (s: { allowableAglM: number; allowableTopAmslM: number; excessM: number; distKm: number } | null) => void;
@@ -376,6 +376,61 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const D = totalDist; // 타겟(클릭 지점)까지의 거리 — 차단 판정·LoS 직선 기준
     // targetElev는 interpTerrainElev 정의 후 보간으로 계산 (프로파일이 타겟 너머 200NM까지 확장됨)
 
+    // ── 주소검색 시뮬레이션 값의 차트 반영 (2026-08-03) ──
+    //   카드에서 수정한 지반고/건물높이를 단면도 계산 전체(장애물·최저탐지선·차단판정·건물 막대·커튼)에 반영.
+    //   ① simBuilding 좌표 15m 이내 최근접 건물이 있으면 그 건물의 지반고/높이만 덮어쓰기(도형·거리 유지)
+    //   ② 매칭 건물이 없으면(미등록 지점) 해당 지점에 폭 20m 가상 점 건물을 주입
+    //   simD 는 아래 허용높이(sim) 블록과 공유 — 차트 x축(t→haversine 재라벨) 프레임 투영, 기존 sim 식과 동일.
+    //   허용 상한(sim) 산출은 여전히 '자기 자신 15m 제외' 경로라 자기참조 오염 없음(가상 건물도 좌표 일치로 제외).
+    let simD: number | null = null;
+    let effBuildings = buildings;
+    if (simBuilding && profile.length > 1) {
+      const simB = simBuilding;
+      const far = profile[profile.length - 1];
+      const DEG2RAD = Math.PI / 180;
+      const mPerDegLat = DEG2RAD * R_EARTH_M;
+      const mPerDegLon = mPerDegLat * Math.cos(radarSite.latitude * DEG2RAD);
+      const dLatM = (far.latitude - radarSite.latitude) * mPerDegLat;
+      const dLonM = (far.longitude - radarSite.longitude) * mPerDegLon;
+      const farM = Math.hypot(dLatM, dLonM) || 1;
+      const ux = dLatM / farM, uy = dLonM / farM;
+      const sLatM = (simB.lat - radarSite.latitude) * mPerDegLat;
+      const sLonM = (simB.lon - radarSite.longitude) * mPerDegLon;
+      const along = sLatM * ux + sLonM * uy; // radar→far 축상 along 거리(m)
+      const t = Math.max(0, Math.min(1, along / farM));
+      const [iLat, iLon] = interpolate(radarSite.latitude, radarSite.longitude, far.latitude, far.longitude, t);
+      simD = haversineKm(radarSite.latitude, radarSite.longitude, iLat, iLon);
+
+      const heightM = isNaN(simB.heightM) ? 0 : simB.heightM;
+      const groundElevM = isNaN(simB.groundElevM) ? 0 : simB.groundElevM;
+      let bestIdx = -1, bestM = 15; // 15m — 아래 sim 자기제외와 동일 기준(양쪽이 같은 건물을 가리켜야 함)
+      for (let i = 0; i < buildings.length; i++) {
+        const m = haversineKm(buildings[i].lat, buildings[i].lon, simB.lat, simB.lon) * 1000;
+        if (m < bestM) { bestM = m; bestIdx = i; }
+      }
+      if (bestIdx >= 0) {
+        effBuildings = buildings.slice();
+        const b = effBuildings[bestIdx];
+        effBuildings[bestIdx] = { ...b, ground_elev_m: groundElevM, height_m: heightM, total_height_m: groundElevM + heightM };
+      } else if (simD > 0.001) {
+        const HALF_W = 0.01; // 가상 건물 반폭 10m
+        effBuildings = buildings.concat([{
+          distance_km: simD,
+          near_dist_km: Math.max(0, simD - HALF_W),
+          far_dist_km: simD + HALF_W,
+          height_m: heightM,
+          ground_elev_m: groundElevM,
+          total_height_m: groundElevM + heightM,
+          name: simB.name ?? null,
+          address: null,
+          usage: null,
+          lat: simB.lat,
+          lon: simB.lon,
+          is_manual: false,
+        }]);
+      }
+    }
+
     // 1) 조정 지형 (실제 지구곡률 반영 → 지형이 거리에 따라 아래로 처짐)
     const adjTerrain = profile.map((p) => ({
       distance: p.distance,
@@ -389,8 +444,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     for (const p of profile) {
       obstacles.push({ distance: p.distance, elevation: p.elevation });
     }
-    if (showBuildings && buildings.length > 0) {
-      for (const b of buildings) {
+    if (showBuildings && effBuildings.length > 0) {
+      for (const b of effBuildings) {
         const bTop = b.ground_elev_m + b.height_m;
         const nearD = b.near_dist_km ?? b.distance_km;
         const farD = b.far_dist_km ?? b.distance_km;
@@ -406,8 +461,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     // 건물 경계 거리 목록 (쉐도잉 라인에 건물 경계점 삽입용)
     interface BuildingEdge { nearD: number; farD: number; topElev: number; groundElev: number; }
     const buildingEdges: BuildingEdge[] = [];
-    if (showBuildings && buildings.length > 0) {
-      for (const b of buildings) {
+    if (showBuildings && effBuildings.length > 0) {
+      for (const b of effBuildings) {
         const nearD = b.near_dist_km ?? b.distance_km;
         const farD = b.far_dist_km ?? b.distance_km;
         buildingEdges.push({
@@ -622,10 +677,10 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const significantBuildings: (BuildingOnPath & { isBlocking: boolean })[] = [];
     // 주소 검색으로 지정된 건물 찾기 (검색 좌표에 가장 가까운 건물, 150m 이내)
     let searchedBldg: BuildingOnPath | null = null;
-    if (searchedAddress && buildings.length > 0) {
+    if (searchedAddress && effBuildings.length > 0) {
       let bestD2 = Infinity;
       const cosLat = Math.cos(searchedAddress.lat * Math.PI / 180);
-      for (const b of buildings) {
+      for (const b of effBuildings) {
         const dLat = (b.lat - searchedAddress.lat) * 111.32;
         const dLon = (b.lon - searchedAddress.lon) * 111.32 * cosLat;
         const d2 = dLat * dLat + dLon * dLon;
@@ -635,8 +690,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       if (Math.sqrt(bestD2) > 0.15) searchedBldg = null;
     }
     let searchedBldgIdx: number | null = null;
-    if (showBuildings && buildings.length > 0) {
-      for (const b of buildings) {
+    if (showBuildings && effBuildings.length > 0) {
+      for (const b of effBuildings) {
         const bDist = b.distance_km;
         // 단면도 전체 길이(profileMaxKm, 기본 200NM)까지 건물 표시 — 줌아웃 시 타겟 너머 건물도 함께.
         //   차단(isBlocking)은 레이더→타겟(0..D) 구간에서만 성립하므로 near≥D 인 타겟 너머 건물은
@@ -674,23 +729,24 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       }
     }
 
-    // ── 주소검색 건물 LoS 시뮬레이션 (계산·보고 전용 — 차트 렌더에 영향 없음) ──
-    //   위 obstacles/buildings/minDetStraight/significantBuildings 는 일절 건드리지 않는다(차트 비트 불변).
-    //   허용 상한 산출만 '자기 자신(15m 이내) 제외'한 별도 장애물 경로(simObstacles)로 계산해
-    //   "그 건물이 없을 때의 최저탐지선(4/3)"을 구한다(자기참조 오염 방지).
+    // ── 주소검색 건물 LoS 허용높이 시뮬레이션 ──
+    //   차트 장애물은 위 effBuildings(사용자 지정값 반영)를 사용. 허용 상한 산출만 '자기 자신(15m 이내) 제외'한
+    //   별도 장애물 경로(simObstacles)로 계산해 "그 건물이 없을 때의 최저탐지선(4/3)"을 구한다(자기참조 오염 방지).
     let sim: {
       simD: number;
       allowableTopAmslM: number;
       allowableAglM: number;
       excessM: number;
     } | null = null;
-    if (simBuilding && profile.length > 1) {
+    if (simBuilding && simD != null) {
       const simB = simBuilding;
+      const sd = simD; // non-null 좁히기 (아래 클로저·비교에서 number 로 사용)
       // sim 전용 장애물: 지형(전부) + 건물(showBuildings 시, 단 sim 건물 15m 제외)
+      //   덮어쓴 건물/가상 건물 모두 simB 좌표와 일치하므로 자동 제외된다.
       const simObstacles: Obstacle[] = [];
       for (const p of profile) simObstacles.push({ distance: p.distance, elevation: p.elevation });
-      if (showBuildings && buildings.length > 0) {
-        for (const b of buildings) {
+      if (showBuildings && effBuildings.length > 0) {
+        for (const b of effBuildings) {
           if (haversineKm(b.lat, b.lon, simB.lat, simB.lon) * 1000 < 15) continue; // 자기 자신 제외
           const bTop = b.ground_elev_m + b.height_m;
           const nearD = b.near_dist_km ?? b.distance_km;
@@ -699,38 +755,23 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           if (farD - nearD > 0.001) simObstacles.push({ distance: farD, elevation: bTop });
         }
       }
-      // simD: 차트 x축(t→haversine 재라벨) 프레임으로 투영 — 프로파일 종점(far)을 far 앵커로 평면투영
-      const far = profile[profile.length - 1];
-      const DEG2RAD = Math.PI / 180;
-      const mPerDegLat = DEG2RAD * R_EARTH_M;
-      const mPerDegLon = mPerDegLat * Math.cos(radarSite.latitude * DEG2RAD);
-      const dLatM = (far.latitude - radarSite.latitude) * mPerDegLat;
-      const dLonM = (far.longitude - radarSite.longitude) * mPerDegLon;
-      const farM = Math.hypot(dLatM, dLonM) || 1;
-      const ux = dLatM / farM, uy = dLonM / farM;
-      const sLatM = (simB.lat - radarSite.latitude) * mPerDegLat;
-      const sLonM = (simB.lon - radarSite.longitude) * mPerDegLon;
-      const along = sLatM * ux + sLonM * uy; // radar→far 축상 along 거리(m)
-      const t = Math.max(0, Math.min(1, along / farM));
-      const [iLat, iLon] = interpolate(radarSite.latitude, radarSite.longitude, far.latitude, far.longitude, t);
-      const simD = haversineKm(radarSite.latitude, radarSite.longitude, iLat, iLon);
 
       const groundElevM = simB.groundElevM;
       const heightM = isNaN(simB.heightM) ? 0 : simB.heightM;
       // 허용 상한: sim 제외 장애물에서 (simD 직전 30m 까지) 4/3 프레임 최대 앙각
       let maxAngle = -Infinity;
       for (const ob of simObstacles) {
-        if (ob.distance > 0 && ob.distance < simD - 0.03) {
+        if (ob.distance > 0 && ob.distance < sd - 0.03) {
           const angle = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
           if (angle > maxAngle) maxAngle = angle;
         }
       }
-      const rayTopAmsl = radarHeight + maxAngle * simD * 1000 + curvDrop43(simD);
+      const rayTopAmsl = radarHeight + maxAngle * sd * 1000 + curvDrop43(sd);
       // 지면 클램프: 지면이 이미 보이면 허용높이 0 (maxAngle=-Infinity 케이스도 이 클램프로 처리)
       const allowableTopAmslM = Math.max(rayTopAmsl, groundElevM);
       const allowableAglM = allowableTopAmslM - groundElevM; // ≥0
       const excessM = (groundElevM + heightM) - allowableTopAmslM; // 양수=초과, 음수=여유
-      sim = { simD, allowableTopAmslM, allowableAglM, excessM };
+      sim = { simD: sd, allowableTopAmslM, allowableAglM, excessM };
     }
 
     return {
