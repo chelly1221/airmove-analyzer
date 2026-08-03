@@ -691,6 +691,34 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     }
     let searchedBldgIdx: number | null = null;
     if (showBuildings && effBuildings.length > 0) {
+      // ── 건물 앞쪽 장애물의 4/3 running max angle prefix (아래 '선 꺾음' 판정용) ──
+      //   obstacles 는 지형 프로파일 + 전 건물 near/far 상단이 distance 오름차순으로 정렬된 상태.
+      //   obsPrefixAng[i] = obstacles[0..i] 의 4/3 프레임 최대 앙각 (distance<=0 항목은 각도 갱신 제외).
+      const obsDist = new Float64Array(obstacles.length);
+      const obsPrefixAng = new Float64Array(obstacles.length);
+      let prefAng43 = -Infinity;
+      for (let i = 0; i < obstacles.length; i++) {
+        const ob = obstacles[i];
+        obsDist[i] = ob.distance;
+        if (ob.distance > 0) {
+          const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
+          if (ang > prefAng43) prefAng43 = ang;
+        }
+        obsPrefixAng[i] = prefAng43;
+      }
+      // 거리 d 보다 엄격히(strict) 앞에 있는 장애물들의 4/3 최대 앙각 (없으면 -Infinity).
+      //   strict 비교라 자기 자신의 near 경계 장애물 항목(정확히 bNearD 위치)은 자동 제외된다.
+      const maxAngleBefore = (d: number): number => {
+        const lim = d - 1e-6;
+        let lo = 0, hi = obstacles.length - 1, res = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (obsDist[mid] < lim) { res = mid; lo = mid + 1; }
+          else hi = mid - 1;
+        }
+        return res >= 0 ? obsPrefixAng[res] : -Infinity;
+      };
+
       for (const b of effBuildings) {
         const bDist = b.distance_km;
         // 단면도 전체 길이(profileMaxKm, 기본 200NM)까지 건물 표시 — 줌아웃 시 타겟 너머 건물도 함께.
@@ -700,16 +728,26 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         const bTop = b.ground_elev_m + b.height_m;
         const bAdj = bTop - curvDrop(bDist);
 
-        // 건물별 차단 판정 — 4/3 현(chord43H) 관통 여부. maxBlockPoint 근접 귀속은
-        //   ① 최대 차단점 옆의 무관 건물을 빨강으로 오탐, ② 현을 관통하지만 최대점이 아닌 건물을 누락시킨다.
-        //   건물 상단이 레이더→타겟 구간 교집합의 어느 한 끝에서라도 현 위로 올라오면 차단 기여(선형이라 양끝 검사로 충분).
+        // 건물별 차단 판정 — 이중 조건(현 관통 AND 선 꺾음):
+        //   ① 4/3 현(chord43H) 관통 = 레이더↔타겟 직선 시야를 실제로 가로막음. 상단 AMSL 이 일정하고
+        //      현이 선형이라 레이더→타겟 구간 교집합의 양끝 검사만으로 충분.
+        //   ② AND 자기 near 경계 이전 장애물(지형+타 건물)의 4/3 running max angle 그림자 위로 상단이
+        //      올라옴 = 최저탐지선(los43)을 실제로 꺾는 건물.
+        //   ② 가 없으면: 타겟 고도가 지면이라 현이 지면까지 내려가므로, 앞쪽 지형·건물 그림자에 완전히
+        //   묻혀 선을 전혀 꺾지 못하는 건물까지 현 위로만 올라오면 전부 빨강으로 대량 오탐된다 (2026-08-03 수정).
+        //   (구 maxBlockPoint 근접 귀속 방식은 최대 차단점 옆 무관 건물 오탐·비최대 관통 건물 누락으로 폐기)
         const bNearD = b.near_dist_km ?? b.distance_km;
         const bFarD = b.far_dist_km ?? b.distance_km;
         const s0 = Math.max(bNearD, 0.001), s1 = Math.min(bFarD, D - 0.001);
         let isBlk = false;
         if (s0 <= s1) {
           const excessAt = (d: number) => (bTop - curvDrop43(d)) - chord43H(d);
-          isBlk = Math.max(excessAt(s0), excessAt(s1)) > 0;
+          const penetratesChord = Math.max(excessAt(s0), excessAt(s1)) > 0;
+          if (penetratesChord) {
+            // 4/3 프레임 상단 앙각 — near/far 양끝 중 큰 값 (상단 AMSL 일정이라 극값은 경계에서 발생)
+            const angAt = (d: number) => (bTop - curvDrop43(d) - radarHeight) / (d * 1000);
+            isBlk = Math.max(angAt(s0), angAt(s1)) > maxAngleBefore(bNearD);
+          }
         }
 
         // 지형만으로 생성된 shadow (실제지구 프레임)

@@ -250,9 +250,56 @@ export function LosCrossSection({
 
     // 차단점 산출 — computeLosBlockage 단일 소스(4/3 chord 식). 지형 base = 순수 SRTM(baseTerrain),
     //   건물 = 분석 대상 제외(buildingsWithoutTarget) — 대상 자신의 near/far 엣지·top 스파이크가
-    //   self-block 을 만들지 않는다. maxBlockPoint 는 아래 차단 건물(적색) 실루엣 판정에 사용.
+    //   self-block 을 만들지 않는다. maxBlockPoint 는 차단점 마커용(차단 건물 적색 판정은 아래 이중 조건).
     //   표시(지형선·건물 실루엣·최저탐지선·significantBuildings)는 기존대로 대상 포함.
     const { maxBlockPoint } = computeLosBlockage(baseTerrain, buildingsWithoutTarget, radarHeight, D, targetElev);
+
+    // 차단 건물(적색) 판정용 4/3 현(chord) — computeLosBlockage 내부 losStraightH 와 동일 식
+    //   (레이더 → 대상 상단 직선, 표적단은 4/3 곡률 강하 반영). 순수 4/3 프레임이라 추가 변환 없음.
+    const adjTarget43 = targetElev - curvDrop43(D);
+    const chord43H = (d: number) => radarHeight + (adjTarget43 - radarHeight) * (d / D);
+
+    // 차단 건물 판정 '선 꺾음' 조건용 prefix — 거리 오름차순 running max 앙각(4/3).
+    //   장애물 집합은 가시 최저탐지선(computeMinDet(baseTerrain, buildings))과 동일하게
+    //   지형 전체 + 모든 건물(대상 포함) near/far 상단 — '이 건물이 선을 꺾는가'를 묻는 판정이므로
+    //   그림자에는 대상 건물 실루엣도 그대로 포함되어야 한다.
+    const shadowObs: Obstacle[] = [];
+    for (const p of baseTerrain) shadowObs.push({ distance: p.distance, elevation: p.elevation });
+    for (const b of buildings) {
+      const bTop = b.ground_elev_m + b.height_m;
+      const nearD = b.near_dist_km ?? b.distance_km;
+      const farD = b.far_dist_km ?? b.distance_km;
+      shadowObs.push({ distance: nearD, elevation: bTop });
+      if (farD - nearD > 0.001) shadowObs.push({ distance: farD, elevation: bTop });
+    }
+    shadowObs.sort((a, b) => a.distance - b.distance);
+    const obsDist = new Float64Array(shadowObs.length);
+    const obsPrefixAng = new Float64Array(shadowObs.length);
+    let prefAng43 = -Infinity;
+    for (let i = 0; i < shadowObs.length; i++) {
+      const ob = shadowObs[i];
+      obsDist[i] = ob.distance;
+      if (ob.distance > 0) {
+        const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
+        if (ang > prefAng43) prefAng43 = ang;
+      }
+      obsPrefixAng[i] = prefAng43;
+    }
+    /** 거리 d '이전'(strict, 1e-6 여유) 장애물들의 running max 앙각 — 없으면 -Infinity. 이분탐색 O(log N). */
+    const maxAngleBefore = (d: number): number => {
+      const lim = d - 1e-6;
+      let lo = 0, hi = shadowObs.length - 1, res = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (obsDist[mid] < lim) { res = mid; lo = mid + 1; }
+        else hi = mid - 1;
+      }
+      return res >= 0 ? obsPrefixAng[res] : -Infinity;
+    };
+    // 차단 판정 후보 게이트 — 대상 건물 자신과 대상 footprint 에 겹친 중복 폴리곤은 차단 배지
+    //   (computeLosBlockage) 입력에서도 빠지므로 빨강에서도 제외해야 배지↔차트가 일치한다.
+    //   excludeTargetBuildings 는 원본 배열의 filter 라 요소 identity 가 보존됨 → Set 참조 매칭 성립.
+    const judgeSet = new Set(buildingsWithoutTarget);
 
     // 5) 차폐 기여 빌딩 — 지형만 shadow 보다 빌딩 꼭대기가 높으면 실질 차폐 기여.
     //    단, 분석 대상 건물은 음영 여부와 무관하게 항상 포함(앞쪽 지형에 가려도 표시) — isTarget 표시.
@@ -273,16 +320,32 @@ export function LosCrossSection({
         const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
         if (shadow > terrainShadow) terrainShadow = shadow;
       }
-      if (bAdj > terrainShadow || isTarget) {
-        // 차단 건물(적색) 판정 — maxBlockPoint.distance 는 건물 near/far '엣지' 또는 지형 샘플 거리이므로,
-        //   건물 '중심'(bDist)±0.1km 고정 허용치가 아닌 footprint 구간(near−ε ~ far+ε) 포함 여부로 판정.
-        //   (경로방향 span>0.2km 건물이 near 엣지에서 최대 차단을 만들면 종전 식은 자기 차단점을 놓쳤음.)
-        const nearD = b.near_dist_km ?? b.distance_km;
-        const farD = b.far_dist_km ?? b.distance_km;
-        const isBlk = !!(maxBlockPoint &&
-          maxBlockPoint.distance >= nearD - 0.05 &&
-          maxBlockPoint.distance <= farD + 0.05 &&
-          bAdj > maxBlockPoint.adjHeight - 5);
+      // 차단 건물(적색) 판정 — 이중 조건 (TrackMap LoSProfilePanel 과 동일 의미론, 2026-08-03 동기화):
+      //   ① 4/3 현(chord43H) 관통: 건물 상단이 레이더↔대상 상단 직선 시야를 실제로 가로막는가.
+      //   ② AND near 엣지 '이전' 장애물들의 running max 앙각(maxAngleBefore) 그림자 위로 상단이
+      //      올라오는가 = 최저탐지선을 실제로 꺾는가 (앞선 지형·건물에 이미 묻힌 건물은 차단 기여 0).
+      //   두 식 모두 거리에 대해 선형/단조라 footprint 양 끝(s0,s1)만 검사하면 충분.
+      //   judgeSet(=buildingsWithoutTarget) 밖 건물(대상 자신·대상 footprint 겹침 중복 폴리곤)은
+      //   차단 배지(computeLosBlockage) 입력에서도 제외되므로 빨강에서도 제외 — 배지↔차트 정합.
+      //   구 maxBlockPoint 근접 귀속은 최대 차단점 옆 무관 건물 오탐·비최대 관통 건물 누락으로 폐기.
+      const nearD = b.near_dist_km ?? b.distance_km;
+      const farD = b.far_dist_km ?? b.distance_km;
+      let isBlk = false;
+      if (judgeSet.has(b)) {
+        const s0 = Math.max(nearD, 0.001);
+        const s1 = Math.min(farD, D - 0.001);
+        if (s0 <= s1) {
+          const excessAt = (d: number) => (bTop - curvDrop43(d)) - chord43H(d);
+          const penetratesChord = Math.max(excessAt(s0), excessAt(s1)) > 0;
+          if (penetratesChord) {
+            const angAt = (d: number) => (bTop - curvDrop43(d) - radarHeight) / (d * 1000);
+            isBlk = Math.max(angAt(s0), angAt(s1)) > maxAngleBefore(nearD);
+          }
+        }
+      }
+      // isBlk 포함 — 실제 차단 건물이 지형 그림자에 묻혀도 목록·빨강 실루엣에서 누락되지 않게
+      //   (terrainShadow 는 centroid 거리 bDist 기준, 선 꺾음은 near 엣지 기준이라 경계에서 어긋날 수 있음).
+      if (bAdj > terrainShadow || isTarget || isBlk) {
         significantBuildings.push({ ...b, isBlocking: isBlk, isTarget });
       }
     }
