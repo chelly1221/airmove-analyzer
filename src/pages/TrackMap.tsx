@@ -540,19 +540,25 @@ export default function TrackMap() {
     return () => { cancelled = true; };
   }, [addressMarker, addressBuilding]);
 
-  // 카드 입력 변경 → 패널 열림 상태(losSimBuilding 존재)면 300ms 디바운스로 sim 갱신 (라이브 반영)
-  useEffect(() => {
-    if (!losSimBuilding) return;
+  // 카드 입력 수정 → 즉시 반영하지 않고 dirty 시 입력 행 끝 "적용" 버튼 노출, 클릭 시 반영
+  // (2026-08-03 300ms 라이브 디바운스 교체 — 타이핑 중 무거운 단면도 재계산 방지).
+  // 단면도 열기 전(losSimBuilding null)에는 handleOpenSimLoS 가 클릭 시점 입력값을 직접 읽으므로 버튼 불필요.
+  const simDirty = useMemo(() => {
+    if (!losSimBuilding) return false;
+    const g = parseFloat(simGroundInput);
+    const h = parseFloat(simHeightInput);
+    const groundElevM = isNaN(g) ? 0 : g; // 기존 디바운스와 동일 시맨틱 (NaN → 0)
+    const heightM = isNaN(h) ? 0 : h;
+    return groundElevM !== losSimBuilding.groundElevM || heightM !== losSimBuilding.heightM;
+  }, [simGroundInput, simHeightInput, losSimBuilding]);
+
+  const applySimInputs = useCallback(() => {
     const g = parseFloat(simGroundInput);
     const h = parseFloat(simHeightInput);
     const groundElevM = isNaN(g) ? 0 : g;
     const heightM = isNaN(h) ? 0 : h;
-    if (groundElevM === losSimBuilding.groundElevM && heightM === losSimBuilding.heightM) return;
-    const t = setTimeout(() => {
-      setLosSimBuilding((prev) => (prev ? { ...prev, groundElevM, heightM } : prev));
-    }, 300);
-    return () => clearTimeout(t);
-  }, [simGroundInput, simHeightInput, losSimBuilding]);
+    setLosSimBuilding((prev) => (prev ? { ...prev, groundElevM, heightM } : prev));
+  }, [simGroundInput, simHeightInput]);
 
   // 선택된 레이더용 비행만 필터 (radar_name이 없는 레거시 데이터는 항상 표시)
   const radarFilteredFlights = useMemo(() => {
@@ -2431,6 +2437,8 @@ export default function TrackMap() {
       //   전 월 불투명(α=255)이되 서로 겹치지 않는 비중첩 밴드(아래 wallDefs)로 쌓으므로 프래그먼트마다
       //   속하는 월이 유일 → depth 경합 없음. depthCompare:"less-equal" 은 인접 밴드가 공유하는
       //   모서리(경계 픽셀) 이음새용으로만 유지.
+      //   순회 대상은 원본 curtain 이 아니라 교차점 분할본 refined (아래에서 구축 — 호출은 refined
+      //   초기화 이후라 클로저 참조 안전). 분할 이유는 refined 구축부 주석 참조.
       const pushCurtainWall = (
         id: string,
         bottom: (s: LosCurtainSample) => number,
@@ -2438,8 +2446,8 @@ export default function TrackMap() {
         color: [number, number, number, number],
       ) => {
         const quads: { polygon: [number, number, number][] }[] = [];
-        for (let i = 0; i < curtain.length - 1; i++) {
-          const a = curtain[i], b = curtain[i + 1];
+        for (let i = 0; i < refined.length - 1; i++) {
+          const a = refined[i], b = refined[i + 1];
           const botA = bottom(a), botB = bottom(b);
           // top 은 bottom 밑으로 내려가지 않게 클램프 (선이 지형 아래로 내려가는 구간 quad 자기교차 방지)
           const topA = Math.max(top(a), botA), topB = Math.max(top(b), botB);
@@ -2474,7 +2482,8 @@ export default function TrackMap() {
       //   겹침 의존 depth 트릭(전 월 bottom=지형 + less-equal 로 낮은 월이 앞을 차지)은 월마다 top 정점이
       //   달라 프래그먼트 보간 depth 가 미세하게 갈리고, 특정 줌(투영행렬)에서 판정이 뒤집혀 밴드 전체가
       //   z-fighting 으로 뒤섞여 폐기(2026-08-03).
-      //   샘플 사이에서 두 곡선이 교차하는 세그먼트는 per-sample max 보간이라 미세 슬리버가 생길 수 있으나 무시.
+      //   샘플 사이에서 두 곡선이 교차하는 세그먼트는 per-sample max 보간만으로는 밴드 경계가 어긋나므로
+      //   아래 refined(교차점 세그먼트 분할)로 해소 — 슬리버 틈·잘못된 색 쐐기 제거(2026-08-03).
       //   지형 면(초록)은 지형 메시와 겹쳐 이중 표출되므로 미표출 — 지형 상단선(los-curtain-line-terrain)만 유지.
       //   BRA 는 최하층(배열 맨 뒤) — 밴드 [지형, braM] 풀 밴드. 예전엔 bra 가 상층이라 산악 지형에서
       //   지형 그림자 선(los43/프레넬)이 0.25° BRA 선보다 거의 항상 높아 밴드가 퇴화·skip 되어 면이
@@ -2492,6 +2501,57 @@ export default function TrackMap() {
         { key: "bra",     top: (s) => s.braM,     color: [34, 211, 238, 255], on: losLayers.bra },
       ];
       const activeWalls = wallDefs.filter((w) => w.on);
+      // ── 밴드 경계 교차점 세그먼트 분할 (refined) ──
+      //   비중첩 밴드의 bottom 은 per-sample max(지형, 아래층 top들)이고 인접 샘플 사이는 quad 로 직선
+      //   보간된다. 그런데 샘플 사이에서 두 선의 상하 순서가 뒤바뀌면(교차) max 선택이 샘플점에서만
+      //   갱신되어 ① 밴드 경계가 코너를 잘라 슬리버 틈/겹침이 생기고, ② 자기 top 이 아래층 top 밑으로
+      //   내려가는 퇴화 세그먼트에선 top=max(top,bottom) 클램프 삼각형의 상단 모서리가 교차점이 아닌
+      //   다음 샘플까지 이어져 아래층 상단선 위로 잘못된 색 쐐기가 그려졌다.
+      //   → 밴드 경계에 관여하는 선들의 쌍별 교차점에서 세그먼트를 미리 쪼개 두면 분할 구간 내에선 어떤
+      //   두 선도 교차하지 않아 max 선택이 구간 전체에서 일정 → 밴드 경계가 정확한 직선이 되고 퇴화 클램프
+      //   삼각형은 정확히 교차점에서 끝난다. 상하 순서가 중간에 몇 번이고 뒤바뀌어도(예: ray↔los43,
+      //   지형↔bra) 각 교차마다 밴드가 정확히 넘겨진다(2026-08-03).
+      //   비용: 샘플은 차트 가시 구간만 방출(수백 개)이고 관련 선 ≤7개 → 쌍 ≤21/세그먼트라 부하 무시 수준.
+      const boundaryLines: ((s: LosCurtainSample) => number)[] = [
+        (s) => s.terrainM,                // 모든 월 bottom 의 하한
+        ...activeWalls.map((w) => w.top), // 활성 월 top (cos 는 상수 ceilM)
+      ];
+      // CoS bottomLine = min(cosM, ceilM) 구성요소 — ceilM 은 cos top 으로 이미 포함(클램프 꺾임점도 분할됨).
+      if (losLayers.cos) boundaryLines.push((s) => s.cosM);
+      const lerpSample = (a: LosCurtainSample, b: LosCurtainSample, t: number): LosCurtainSample => ({
+        lat: a.lat + (b.lat - a.lat) * t,
+        lon: a.lon + (b.lon - a.lon) * t,
+        distKm: a.distKm + (b.distKm - a.distKm) * t,
+        terrainM: a.terrainM + (b.terrainM - a.terrainM) * t,
+        los43M: a.los43M + (b.los43M - a.los43M) * t,
+        fresnelM: a.fresnelM + (b.fresnelM - a.fresnelM) * t,
+        braM: a.braM + (b.braM - a.braM) * t,
+        cosM: a.cosM + (b.cosM - a.cosM) * t,
+        rayM: a.rayM + (b.rayM - a.rayM) * t,
+      });
+      const refined: LosCurtainSample[] = [curtain[0]];
+      for (let i = 0; i < curtain.length - 1; i++) {
+        const a = curtain[i], b = curtain[i + 1];
+        const ts: number[] = [];
+        for (let p = 0; p < boundaryLines.length - 1; p++) {
+          for (let q = p + 1; q < boundaryLines.length; q++) {
+            const da = boundaryLines[p](a) - boundaryLines[q](a);
+            const db = boundaryLines[p](b) - boundaryLines[q](b);
+            // 부호가 실제로 뒤집힌 쌍만 (접촉만 하는 da·db=0 은 순서가 안 바뀌므로 분할 불필요)
+            if (da * db < 0) ts.push(da / (da - db));
+          }
+        }
+        if (ts.length > 0) {
+          ts.sort((x, y) => x - y);
+          let prev = 0; // 직전 채택 t (초기 0 = 세그먼트 시작점)
+          for (const t of ts) {
+            if (t - prev < 1e-4 || 1 - t < 1e-4) continue; // 근접·양끝 t 제거 — 제로폭 quad 방지
+            refined.push(lerpSample(a, b, t));
+            prev = t;
+          }
+        }
+        refined.push(b); // 세그먼트 끝은 원본 객체 참조 그대로 (교차 없으면 복사 0)
+      }
       activeWalls.forEach((w, i) => {
         const lower = activeWalls.slice(i + 1); // 자기보다 나중 push(아래층) 활성 월들
         const bottom = (s: LosCurtainSample) => {
@@ -4111,7 +4171,7 @@ export default function TrackMap() {
                   {addressBuilding ? (addressBuilding.source === "fac" ? "GIS" : "수동") : "미등록"}
                 </span>
               </div>
-              {/* 입력: 지반고 / 건물높이 */}
+              {/* 입력: 지반고 / 건물높이 — 수정(dirty) 시 행 끝에 작은 적용 버튼 노출 */}
               <div className="mb-2 flex gap-2">
                 <label className="flex-1">
                   <span className="mb-0.5 block text-[10px] text-gray-500">지반고 (m)</span>
@@ -4123,6 +4183,12 @@ export default function TrackMap() {
                   <input type="number" value={simHeightInput} onChange={(e) => setSimHeightInput(e.target.value)} placeholder="0"
                     className="w-full rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs text-gray-800 placeholder:text-gray-400 focus:border-[#a60739] focus:outline-none focus:ring-1 focus:ring-[#a60739]/30" />
                 </label>
+                {simDirty && (
+                  <button onClick={applySimInputs}
+                    className="self-end shrink-0 rounded-md bg-[#a60739] px-2 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[#85062e]">
+                    적용
+                  </button>
+                )}
               </div>
               {/* LoS 단면도 버튼 */}
               <button onClick={handleOpenSimLoS}
