@@ -2396,6 +2396,17 @@ export default function TrackMap() {
     const curtain = losCurtain && losCurtain.length > 1 ? losCurtain : null;
     if (curtain) {
       const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
+      // 커튼 천장(ceilM) — CoS 보완면의 상단이자 CoS 상단선 절단 기준.
+      //   CoS(70°) 선은 20km 에서 5만 m 를 넘게 발산하므로 천장 산출에서 제외하고, 나머지 컨텐츠
+      //   최대고(지형·4/3 LoS·프레넬·BRA·레이) 위로 고저차의 15%(최소 200m) 여유를 얹는다.
+      let ceilContent = -Infinity;
+      let ceilMinTerrain = Infinity;
+      for (const s of curtain) {
+        const m = Math.max(s.terrainM, s.los43M, s.fresnelM, s.braM, s.rayM);
+        if (m > ceilContent) ceilContent = m;
+        if (s.terrainM < ceilMinTerrain) ceilMinTerrain = s.terrainM;
+      }
+      const ceilM = ceilContent + Math.max(200, (ceilContent - ceilMinTerrain) * 0.15);
       // 라인별 PathLayer 빌더 — positions [lon, lat, hM·EX], widthUnits pixels
       const pushCurtainLine = (
         id: string,
@@ -2465,12 +2476,20 @@ export default function TrackMap() {
       //   z-fighting 으로 뒤섞여 폐기(2026-08-03).
       //   샘플 사이에서 두 곡선이 교차하는 세그먼트는 per-sample max 보간이라 미세 슬리버가 생길 수 있으나 무시.
       //   지형 면(초록)은 지형 메시와 겹쳐 이중 표출되므로 미표출 — 지형 상단선(los-curtain-line-terrain)만 유지.
-      const wallDefs: { key: string; top: (s: LosCurtainSample) => number; color: [number, number, number, number]; on: boolean }[] = [
-        { key: "cos",     top: (s) => s.cosM,     color: [168, 85, 247, 255], on: losLayers.cos },
-        { key: "bra",     top: (s) => s.braM,     color: [34, 211, 238, 255], on: losLayers.bra },
+      //   BRA 는 최하층(배열 맨 뒤) — 밴드 [지형, braM] 풀 밴드. 예전엔 bra 가 상층이라 산악 지형에서
+      //   지형 그림자 선(los43/프레넬)이 0.25° BRA 선보다 거의 항상 높아 밴드가 퇴화·skip 되어 면이
+      //   통째로 사라지고 선만 남았다(2026-08-03 수정).
+      //   CoS 는 침묵원추 보완면 — 70° 선 "위쪽"(cosM ~ 천장 ceilM)이 원추 내부이므로 bottomLine 으로
+      //   자기 바닥을 cosM 에 고정하고 top 은 상수 ceilM. bottomLine 은 ceilM 로 클램프 — 미클램프 시
+      //   천장 교차 세그먼트에서 pushCurtainWall 의 top=max(top,bottom) 상향 클램프가 다음 샘플 cosM
+      //   높이(샘플 간격만큼 천장 위 수 km)까지 스파이크 삼각형을 만든다. 클램프하면 교차 세그먼트가
+      //   천장에서 평평하게 잘리고 그 너머는 bottom=top=ceilM 퇴화 skip → 레이더 근방 쐐기면만 남는다(의도).
+      const wallDefs: { key: string; top: (s: LosCurtainSample) => number; color: [number, number, number, number]; on: boolean; bottomLine?: (s: LosCurtainSample) => number }[] = [
+        { key: "cos",     top: () => ceilM,       color: [168, 85, 247, 255], on: losLayers.cos, bottomLine: (s) => Math.min(s.cosM, ceilM) },
         { key: "fresnel", top: (s) => s.fresnelM, color: [236, 72, 153, 255], on: losLayers.fresnel },
         { key: "los43",   top: (s) => s.los43M,   color: [245, 158, 11, 255], on: losLayers.los43 },
         { key: "ray",     top: (s) => s.rayM,     color: [233, 69, 96, 255],  on: true }, // 4/3 레이 상시
+        { key: "bra",     top: (s) => s.braM,     color: [34, 211, 238, 255], on: losLayers.bra },
       ];
       const activeWalls = wallDefs.filter((w) => w.on);
       activeWalls.forEach((w, i) => {
@@ -2478,6 +2497,8 @@ export default function TrackMap() {
         const bottom = (s: LosCurtainSample) => {
           let b = s.terrainM;
           for (const l of lower) { const t = l.top(s); if (t > b) b = t; }
+          // 보완면(CoS): 자기 바닥선도 하한에 포함 — 배열 첫 항목이라 자기 top(=ceilM)은 남의 bottom 에 새지 않는다.
+          if (w.bottomLine) { const bl = w.bottomLine(s); if (bl > b) b = bl; }
           return b;
         };
         pushCurtainWall(`los-curtain-wall-${w.key}`, bottom, w.top, w.color);
@@ -2486,8 +2507,34 @@ export default function TrackMap() {
       if (losLayers.los43)   pushCurtainLine("los-curtain-line-los43", (s) => s.los43M, [245, 158, 11, 255], 2);
       if (losLayers.fresnel) pushCurtainLine("los-curtain-line-fresnel", (s) => s.fresnelM, [236, 72, 153, 200], 1.5);
       if (losLayers.bra)     pushCurtainLine("los-curtain-line-bra", (s) => s.braM, [34, 211, 238, 200], 1.5);
-      if (losLayers.cos)     pushCurtainLine("los-curtain-line-cos", (s) => s.cosM, [168, 85, 247, 200], 1.5);
-      // 4/3 레이 (#e94560) — 상시 표출 (차트 blocked 판정선). CoS(70°)는 매우 가파르나 칩 기본 off 이므로 클램프 없이 그대로.
+      if (losLayers.cos) {
+        // CoS(70°) 상단선은 천장(ceilM) 교차점에서 절단 — 그대로 두면 수 km 만에 수만 m 로 발산해 화면 밖으로 뻗는다.
+        //   cosM < ceilM 인 동안 경로에 담고, 처음 천장을 넘는 샘플에서 직전 샘플과 선형보간(lat/lon 동일 t)한
+        //   교차점(높이 ceilM)을 마지막 점으로 넣고 중단. 보완면(los-curtain-wall-cos) 상단 모서리와 일치.
+        const cosPath: [number, number, number][] = [];
+        for (let i = 0; i < curtain.length; i++) {
+          const s = curtain[i];
+          if (s.cosM < ceilM) { cosPath.push([s.lon, s.lat, s.cosM * EX]); continue; }
+          const p = i > 0 ? curtain[i - 1] : null;
+          if (p) {
+            const t = (ceilM - p.cosM) / (s.cosM - p.cosM); // p.cosM < ceilM ≤ s.cosM 이라 분모 > 0
+            cosPath.push([p.lon + (s.lon - p.lon) * t, p.lat + (s.lat - p.lat) * t, ceilM * EX]);
+          }
+          break;
+        }
+        if (cosPath.length >= 2) layers.push(
+          new PathLayer<{ path: [number, number, number][] }>({
+            id: "los-curtain-line-cos",
+            data: [{ path: cosPath }],
+            getPath: (d) => d.path,
+            getColor: [168, 85, 247, 200],
+            getWidth: 1.5,
+            widthUnits: "pixels" as const,
+            pickable: false,
+          })
+        );
+      }
+      // 4/3 레이 (#e94560) — 상시 표출 (차트 blocked 판정선).
       pushCurtainLine("los-curtain-ray", (s) => s.rayM, [233, 69, 96, 230], 2);
     }
 
