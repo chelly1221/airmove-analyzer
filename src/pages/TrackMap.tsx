@@ -2432,36 +2432,22 @@ export default function TrackMap() {
           })
         );
       };
-      // 면별 SolidPolygonLayer 빌더 — 인접 샘플쌍마다 수직 quad, z 는 선과 동일 EX 배율.
-      //   수직 폴리곤은 2D 테셀레이션에서 퇴화하므로 _full3d 필수, material:false 로 조명 음영 없이 플랫 색.
-      //   전 월 불투명(α=255)이되 서로 겹치지 않는 비중첩 밴드(아래 wallDefs)로 쌓으므로 프래그먼트마다
-      //   속하는 월이 유일 → depth 경합 없음. depthCompare:"less-equal" 은 인접 밴드가 공유하는
-      //   모서리(경계 픽셀) 이음새용으로만 유지.
-      //   순회 대상은 원본 curtain 이 아니라 교차점 분할본 refined (아래에서 구축 — 호출은 refined
-      //   초기화 이후라 클로저 참조 안전). 분할 이유는 refined 구축부 주석 참조.
-      const pushCurtainWall = (
+      // 면별 SolidPolygonLayer 빌더 — 완성된 수직 quad 목록을 그대로 레이어로 push.
+      //   quad 생성(밴드 분할·클램프·퇴화 skip)은 아래 동적 적층 루프가 담당하고 여기선 레이어 옵션만 책임진다.
+      //   z 는 선과 동일 EX 배율. 수직 폴리곤은 2D 테셀레이션에서 퇴화하므로 _full3d 필수,
+      //   material:false 로 조명 음영 없이 플랫 색.
+      //   전 월 불투명(α=255)이되 서로 겹치지 않는 비중첩 밴드로 쌓으므로 프래그먼트마다 속하는 월이
+      //   유일 → depth 경합 없음. depthCompare:"less-equal" 은 인접 밴드가 공유하는 모서리(경계 픽셀)
+      //   이음새용으로만 유지.
+      type CurtainQuad = { polygon: [number, number, number][] };
+      const pushCurtainWallQuads = (
         id: string,
-        bottom: (s: LosCurtainSample) => number,
-        top: (s: LosCurtainSample) => number,
+        quads: CurtainQuad[],
         color: [number, number, number, number],
       ) => {
-        const quads: { polygon: [number, number, number][] }[] = [];
-        for (let i = 0; i < refined.length - 1; i++) {
-          const a = refined[i], b = refined[i + 1];
-          const botA = bottom(a), botB = bottom(b);
-          // top 은 bottom 밑으로 내려가지 않게 클램프 (선이 지형 아래로 내려가는 구간 quad 자기교차 방지)
-          const topA = Math.max(top(a), botA), topB = Math.max(top(b), botB);
-          if (topA - botA < 0.5 && topB - botB < 0.5) continue; // 양끝 모두 퇴화(높이차<0.5m) quad skip
-          quads.push({ polygon: [
-            [a.lon, a.lat, botA * EX],
-            [b.lon, b.lat, botB * EX],
-            [b.lon, b.lat, topB * EX],
-            [a.lon, a.lat, topA * EX],
-          ] });
-        }
         if (quads.length === 0) return;
         layers.push(
-          new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
+          new SolidPolygonLayer<CurtainQuad>({
             id,
             data: quads,
             getPolygon: (d) => d.polygon,
@@ -2477,20 +2463,22 @@ export default function TrackMap() {
         );
       };
       // 면들을 먼저(아래층), 선들을 나중(위 상단 강조선)에 push — 게이트는 대응 선과 동일.
-      //   겹침 없는 비중첩 밴드 — i번째 월 bottom = 나중 push 활성 월 top 들의 max(+지형).
-      //   즉 각 월은 자기보다 아래층 월들의 위부터 자기 top 까지만 채워 프래그먼트가 한 월에만 속한다.
+      //   겹침 없는 비중첩 밴드 — 각 프래그먼트가 정확히 한 월에만 속한다. 밴드 배분은 아래 동적
+      //   최하선 우선(lowest-first) 적층 루프가 refined 구간마다 실제 높이 순으로 수행하므로 이 배열
+      //   순서는 더 이상 적층 우선순위가 아니다: push 순서(이음새 less-equal 동률)와 높이 동률 시
+      //   tiebreak 에만 관여(2026-08-03).
       //   겹침 의존 depth 트릭(전 월 bottom=지형 + less-equal 로 낮은 월이 앞을 차지)은 월마다 top 정점이
       //   달라 프래그먼트 보간 depth 가 미세하게 갈리고, 특정 줌(투영행렬)에서 판정이 뒤집혀 밴드 전체가
       //   z-fighting 으로 뒤섞여 폐기(2026-08-03).
       //   샘플 사이에서 두 곡선이 교차하는 세그먼트는 per-sample max 보간만으로는 밴드 경계가 어긋나므로
       //   아래 refined(교차점 세그먼트 분할)로 해소 — 슬리버 틈·잘못된 색 쐐기 제거(2026-08-03).
       //   지형 면(초록)은 지형 메시와 겹쳐 이중 표출되므로 미표출 — 지형 상단선(los-curtain-line-terrain)만 유지.
-      //   BRA 는 최하층(배열 맨 뒤) — 밴드 [지형, braM] 풀 밴드. 예전엔 bra 가 상층이라 산악 지형에서
-      //   지형 그림자 선(los43/프레넬)이 0.25° BRA 선보다 거의 항상 높아 밴드가 퇴화·skip 되어 면이
-      //   통째로 사라지고 선만 남았다(2026-08-03 수정).
+      //   BRA 를 배열 맨 뒤(구 최하층)에 둔 고정 순서 배치는 동적 정렬로 대체 — 산악 지형에서 bra 가
+      //   상층이면 밴드가 퇴화·소실되던 문제도, 레이더 근방에서 bra 가 최하층이면 실제 최하선(ray/los43)이
+      //   소실되던 문제도 이제 구간별 실제 높이 순서로 함께 해소된다(2026-08-03).
       //   CoS 는 침묵원추 보완면 — 70° 선 "위쪽"(cosM ~ 천장 ceilM)이 원추 내부이므로 bottomLine 으로
-      //   자기 바닥을 cosM 에 고정하고 top 은 상수 ceilM. bottomLine 은 ceilM 로 클램프 — 미클램프 시
-      //   천장 교차 세그먼트에서 pushCurtainWall 의 top=max(top,bottom) 상향 클램프가 다음 샘플 cosM
+      //   자기 바닥을 cosM 에 고정하고 top 은 상수 ceilM(정렬 제외·항상 최상단). bottomLine 은 ceilM 로
+      //   클램프 — 미클램프 시 천장 교차 세그먼트에서 top=max(top,bottom) 상향 클램프가 다음 샘플 cosM
       //   높이(샘플 간격만큼 천장 위 수 km)까지 스파이크 삼각형을 만든다. 클램프하면 교차 세그먼트가
       //   천장에서 평평하게 잘리고 그 너머는 bottom=top=ceilM 퇴화 skip → 레이더 근방 쐐기면만 남는다(의도).
       const wallDefs: { key: string; top: (s: LosCurtainSample) => number; color: [number, number, number, number]; on: boolean; bottomLine?: (s: LosCurtainSample) => number }[] = [
@@ -2552,17 +2540,57 @@ export default function TrackMap() {
         }
         refined.push(b); // 세그먼트 끝은 원본 객체 참조 그대로 (교차 없으면 복사 0)
       }
-      activeWalls.forEach((w, i) => {
-        const lower = activeWalls.slice(i + 1); // 자기보다 나중 push(아래층) 활성 월들
-        const bottom = (s: LosCurtainSample) => {
-          let b = s.terrainM;
-          for (const l of lower) { const t = l.top(s); if (t > b) b = t; }
-          // 보완면(CoS): 자기 바닥선도 하한에 포함 — 배열 첫 항목이라 자기 top(=ceilM)은 남의 bottom 에 새지 않는다.
-          if (w.bottomLine) { const bl = w.bottomLine(s); if (bl > b) b = bl; }
-          return b;
-        };
-        pushCurtainWall(`los-curtain-wall-${w.key}`, bottom, w.top, w.color);
-      });
+      // ── 동적 최하선 우선(lowest-first) 밴드 적층 ──
+      //   각 refined 구간에서 컨텐츠 선(fresnel/los43/ray/bra 중 활성)을 실제 높이 오름차순으로 정렬해
+      //   낮은 선부터 [floor, top] 밴드를 채운다 → 프래그먼트 색 = 바로 위에 있는 "가장 낮은 활성 선"의 색.
+      //   고정 순서(cos→fresnel→los43→ray→bra, 뒤=아래층) 적층은 bra≤ray≤los43≤fresnel 전제가 깨지는
+      //   구간에서 무너진다: 레이더 근방 초반부는 지형 그림자가 작아 los43M·rayM 이 0.25° braM 보다 낮은데,
+      //   bra 풀 밴드 [지형, braM]이 아래를 통째로 덮고 실제 최하선(ray/los43) 밴드는 bottom≥top 퇴화로
+      //   skip 되어 사라졌다(2026-08-03 수정). 실제 순서가 고정 순서와 일치하는 구간에선 결과 동일.
+      //   refined 는 관련 선들의 쌍별 교차점에서 이미 쪼개져 있어 구간 내 높이 순서가 불변 → 구간마다 1회 정렬로 충분.
+      const wallQuads = new Map<string, CurtainQuad[]>(activeWalls.map((w): [string, CurtainQuad[]] => [w.key, []]));
+      const contentWalls = activeWalls.filter((w) => !w.bottomLine); // 동적 정렬 대상
+      const cosWall = activeWalls.find((w) => w.bottomLine);         // CoS 보완면 — 정렬 제외·항상 최상단
+      const wallOrder = new Map(wallDefs.map((w, i) => [w.key, i]));  // 높이 동률 tiebreak 용 원본 순서
+      for (let i = 0; i < refined.length - 1; i++) {
+        const a = refined[i], b = refined[i + 1];
+        // 구간 내 순서 불변(refined 전제) — 양끝 평균 높이로 오름차순 정렬. 동률(선 일치)은 wallDefs
+        //   뒤쪽(구 최하층 우선권)이 먼저 오도록 → 아래 밴드를 차지하고 위쪽 동률 월은 퇴화 skip (기존 거동 보존).
+        const sorted = contentWalls.slice().sort((w1, w2) => {
+          const h1 = (w1.top(a) + w1.top(b)) / 2, h2 = (w2.top(a) + w2.top(b)) / 2;
+          return (h1 - h2) || (wallOrder.get(w2.key)! - wallOrder.get(w1.key)!);
+        });
+        let floorA = a.terrainM, floorB = b.terrainM; // 누적 하한 = max(지형, 지금까지 처리한 선 top 들)
+        for (const w of sorted) {
+          const tA = w.top(a), tB = w.top(b);
+          const topA = Math.max(tA, floorA), topB = Math.max(tB, floorB); // 하한 밑 선은 클램프 → 퇴화
+          if (topA - floorA >= 0.5 || topB - floorB >= 0.5) { // 양끝 모두 퇴화(높이차<0.5m)면 quad skip
+            wallQuads.get(w.key)!.push({ polygon: [
+              [a.lon, a.lat, floorA * EX],
+              [b.lon, b.lat, floorB * EX],
+              [b.lon, b.lat, topB * EX],
+              [a.lon, a.lat, topA * EX],
+            ] });
+          }
+          if (tA > floorA) floorA = tA; // skip 여부와 무관하게 하한 누적 (밴드 연속성)
+          if (tB > floorB) floorB = tB;
+        }
+        if (cosWall) {
+          // 보완면: bottom = max(전 컨텐츠 상한, min(cosM, ceilM)), top = 상수 ceilM
+          const blA = Math.max(floorA, cosWall.bottomLine!(a)), blB = Math.max(floorB, cosWall.bottomLine!(b));
+          const topA = Math.max(ceilM, blA), topB = Math.max(ceilM, blB);
+          if (topA - blA >= 0.5 || topB - blB >= 0.5) {
+            wallQuads.get(cosWall.key)!.push({ polygon: [
+              [a.lon, a.lat, blA * EX],
+              [b.lon, b.lat, blB * EX],
+              [b.lon, b.lat, topB * EX],
+              [a.lon, a.lat, topA * EX],
+            ] });
+          }
+        }
+      }
+      // push 순서는 기존 wallDefs 순서 유지 — 비중첩이라 순서는 이음새 less-equal 동률에만 관여
+      for (const w of activeWalls) pushCurtainWallQuads(`los-curtain-wall-${w.key}`, wallQuads.get(w.key)!, w.color);
       if (losLayers.terrain) pushCurtainLine("los-curtain-line-terrain", (s) => s.terrainM, [34, 197, 94, 255], 2);
       if (losLayers.los43)   pushCurtainLine("los-curtain-line-los43", (s) => s.los43M, [245, 158, 11, 255], 2);
       if (losLayers.fresnel) pushCurtainLine("los-curtain-line-fresnel", (s) => s.fresnelM, [236, 72, 153, 200], 1.5);
