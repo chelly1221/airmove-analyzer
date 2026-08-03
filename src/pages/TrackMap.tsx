@@ -4,6 +4,8 @@ import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
+import { Tile3DLayer } from "@deck.gl/geo-layers";
+import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
 import {
   Mountain,
   Crosshair,
@@ -17,7 +19,7 @@ import {
   CloudRain,
   Settings,
 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { ToolButton, HeadingTape, Toggle as DsToggle, Check, Swatch, DsSlider } from "../components/Map/drawerPrimitives";
 
 /** 표시 행 설정 톱니 버튼 (우측 설정 드로어 토글) */
@@ -271,6 +273,10 @@ export default function TrackMap() {
   const [buildings3dMode, setBuildings3dMode] = useState(false);
   /** 비활성화된 건물 출처 (건물통합정보/수동 개별 토글) */
   const [hiddenBuildingSources, setHiddenBuildingSources] = useState<Set<string>>(new Set());
+  /** 실측 3D 타일(Cesium 3D Tiles) 표출 토글 — 다른 표시 토글처럼 영속화 없음 */
+  const [showTiles3d, setShowTiles3d] = useState(false);
+  /** 등록된 실측 3D 타일셋 폴더 (설정 > 건물 데이터에서 buildings_3d.bin 임포트 시 등록) */
+  const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
   const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
   // 건물 클릭 시 건축물정보 팝업 (로컬 기하 + 로컬 FAC 대장 + 온라인 VWorld)
@@ -2921,6 +2927,30 @@ export default function TrackMap() {
     ];
   }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgPopup?.pinned, bldgPopup?.lat, bldgPopup?.lon]);
 
+  // 등록된 실측 3D 타일셋 폴더 조회 (미등록이면 null → 토글 비활성)
+  useEffect(() => {
+    invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 미등록 */ });
+  }, []);
+
+  // 실측 3D 타일 레이어 — tiles3d 커스텀 프로토콜로 로컬 타일셋(tileset.json/b3dm) 서빙.
+  // DeckGLOverlay 는 overlaid(MapboxOverlay) 모드라 MapLibre fill-extrusion 과 깊이 상호작용 없음.
+  const tiles3dDeckLayers = useMemo(() => {
+    if (!showTiles3d || !tiles3dDir) return [];
+    const tileset = (id: string, file: string) =>
+      new Tile3DLayer({
+        id,
+        data: convertFileSrc(file, "tiles3d"),
+        loader: Tiles3DLoader,
+        pickable: false,
+        onTileError: (err: unknown) => console.warn("실측 3D 타일 로드 실패:", err),
+      });
+    return [
+      tileset("measured-3dtiles", "tileset.json"),
+      // 보충 타일셋 — 없으면 onTileError 로 조용히 무시
+      tileset("measured-3dtiles-cdm", "tileset_cdm.json"),
+    ];
+  }, [showTiles3d, tiles3dDir]);
+
   // CAT008 기상 극좌표 벡터 → 부채꼴 폴리곤 레이어.
   // 시간은 NEC 프레임 분 단위로 양자화 → 재생 시점(visibleMaxTs) 이하의 최신 1분 스냅샷만 표시.
   // (전체 표시 시 44만개 누적 블롭 방지 + 실제 레이더 기상화면처럼 "현재 강수" 표현)
@@ -3333,6 +3363,9 @@ export default function TrackMap() {
     // 건물 2D 오버레이 합성 (별도 useMemo)
     layers.push(...buildingDeckLayers);
 
+    // 실측 3D 타일 합성 (별도 useMemo)
+    layers.push(...tiles3dDeckLayers);
+
     // LoS 단면도 건물 호버/클릭 하이라이트 (건물 오버레이 비활성 상태에서도 표시)
     if (losBuildingHighlight) {
       layers.push(
@@ -3405,7 +3438,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -3918,6 +3951,22 @@ export default function TrackMap() {
             <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb", display: "flex", flexDirection: "column", gap: 10 }}>
               <div style={micro}>표현 방식</div>
               {srcRow("3D 입체", "줌 15+", allow3d, () => setAllow3d((v) => !v))}
+              {tiles3dDir ? (
+                srcRow("실측 3D 타일", "김포 2023", showTiles3d, () => setShowTiles3d((v) => !v))
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", opacity: 0.55 }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 12, color: "#4b5563" }}>실측 3D 타일</span>
+                      <span style={{ fontSize: 9, color: "#d1d5db" }}>김포 2023</span>
+                    </span>
+                    <DsToggle on={false} onClick={() => { /* 타일셋 미등록 */ }} size={0.9} disabled />
+                  </div>
+                  <span style={{ fontSize: 9, color: "#9ca3af", lineHeight: 1.35 }}>
+                    설정 &gt; GIS 건물에서 buildings_3d.bin 임포트 시 활성화
+                  </span>
+                </div>
+              )}
             </div>
             <div style={{ padding: "11px 13px" }}>
               <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 5 }}>
@@ -4394,7 +4443,9 @@ export default function TrackMap() {
                 const dLon = bldgPopup.lon - radarSite.longitude;
                 const az = ((Math.atan2(dLon * cosLat, dLat) * 180 / Math.PI) + 360) % 360;
                 const distKm = Math.sqrt((dLat * 111.32) ** 2 + (dLon * 111.32 * cosLat) ** 2);
-                const height = bldgPopup.localHeight ?? fac?.height_m;
+                // 실측 지붕고(1m DSM)가 있으면 최우선 — 옥상표고 계산도 동일 값 사용
+                const heightMeasured = fac?.height_measured_m ?? null;
+                const height = heightMeasured ?? bldgPopup.localHeight ?? fac?.height_m;
                 const base = bldgPopup.localBase ?? fac?.ground_elev_m;
                 const src = bldgPopup.localSource ?? (fac ? "fac" : undefined);
                 const srcLabel = src === "fac" ? "건물통합정보" : src === "manual" ? "수동 등록" : "-";
@@ -4431,7 +4482,7 @@ export default function TrackMap() {
                     <div className={secLabel + " pt-1"}>기하 정보</div>
                     <table className="w-full border-t border-gray-200 text-[10.5px]">
                       <tbody>
-                        {row("출처", srcLabel, "건물높이", height != null ? `${height.toFixed(1)} m` : "-")}
+                        {row("출처", srcLabel, heightMeasured != null ? "건물높이(실측)" : "건물높이", height != null ? `${height.toFixed(1)} m` : "-")}
                         {row("지반표고", base != null ? `${base.toFixed(1)} m` : "-", "옥상표고", (base != null && height != null) ? `${(base + height).toFixed(1)} m` : "-")}
                         {row("레이더거리", `${(distKm / 1.852).toFixed(1)} NM`, "레이더방위", `${az.toFixed(1)}°`)}
                       </tbody>

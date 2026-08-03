@@ -156,6 +156,8 @@ pub struct FacBuildingDetail {
     pub pnu: Option<String>,
     pub bd_mgt_sn: Option<String>,
     pub height_m: f64,
+    /// 실측(1m DSM) 지붕고 (m) — NULL 이면 실측 데이터 없음, height_m 이 대장 높이
+    pub height_measured_m: Option<f64>,
     pub ground_elev_m: f64,
     pub region: String,
     pub lat: f64,
@@ -173,8 +175,9 @@ pub fn query_fac_building_detail(
 ) -> Result<Option<FacBuildingDetail>, String> {
     let eff_radius = radius_m.max(40.0);
     let buf = eff_radius / 111_000.0;
+    // 상세 카드는 대장 높이(height)와 실측(1m DSM) 지붕고(height_measured)를 모두 보여주므로 둘 다 조회
     let mut stmt = conn.prepare(
-        "SELECT building_name, dong_name, usability, pnu, bd_mgt_sn, height, COALESCE(ground_elev, 0), region, centroid_lat, centroid_lon, polygon_json
+        "SELECT building_name, dong_name, usability, pnu, bd_mgt_sn, height, COALESCE(ground_elev, 0), region, centroid_lat, centroid_lon, polygon_json, height_measured
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4"
@@ -195,6 +198,7 @@ pub fn query_fac_building_detail(
                 row.get::<_, f64>(8)?,
                 row.get::<_, f64>(9)?,
                 row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<f64>>(11)?,
             ))
         },
     ).map_err(|e| format!("FAC 상세 쿼리 실행 실패: {}", e))?;
@@ -203,11 +207,11 @@ pub fn query_fac_building_detail(
     let mut best: Option<(f64, FacBuildingDetail)> = None; // (거리 km, 상세)
 
     for row in rows {
-        let (name, dong_name, usage, pnu, bd_mgt_sn, height, ground_elev, region, clat, clon, polygon_json) =
+        let (name, dong_name, usage, pnu, bd_mgt_sn, height, ground_elev, region, clat, clon, polygon_json, height_measured) =
             row.map_err(|e| format!("FAC 상세 행 읽기 실패: {}", e))?;
         let detail = FacBuildingDetail {
             name, dong_name, usage, pnu, bd_mgt_sn,
-            height_m: height, ground_elev_m: ground_elev,
+            height_m: height, height_measured_m: height_measured, ground_elev_m: ground_elev,
             region, lat: clat, lon: clon,
         };
         // 1) 폴리곤 내부 포함 건물 우선 (정확)
@@ -246,7 +250,10 @@ pub struct BuildingNearPoint {
     pub name: Option<String>,
     pub usage: Option<String>,        // fac 전용, manual 은 None
     pub source: String,               // "fac" | "manual"
+    /// 유효 높이 (m) — fac 은 실측(1m DSM) 지붕고 우선, 없으면 대장 높이
     pub height_m: f64,
+    /// 실측(1m DSM) 지붕고 (m) — 값이 있으면 height_m 이 실측값임을 뜻함(배지 표기용). manual 은 항상 None
+    pub height_measured: Option<f64>,
     pub ground_elev_m: f64,
     pub lat: f64,                     // centroid
     pub lon: f64,
@@ -337,6 +344,7 @@ pub fn query_building_near_point(
         name: Option<String>,
         usage: Option<String>,
         height_m: f64,
+        height_measured: Option<f64>,
         ground_elev_m: f64,
         clat: f64,
         clon: f64,
@@ -346,8 +354,10 @@ pub fn query_building_near_point(
 
     // ── FAC 건물 후보 ──
     // fac 지반 = centroid SRTM(live). ground_elev 캐시 컬럼은 미백필 행이 많아 사용 금지(프로젝트 불변식).
+    // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 3D 표출·상세 카드가 실측 형상과 일치하게.
+    //   height_measured 는 별도로도 읽어 '실측' 배지 표기에 사용.
     let mut stmt = conn.prepare(
-        "SELECT building_name, usability, height, centroid_lat, centroid_lon, polygon_json
+        "SELECT building_name, usability, COALESCE(height_measured, height), centroid_lat, centroid_lon, polygon_json, height_measured
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4"
@@ -362,11 +372,12 @@ pub fn query_building_near_point(
                 row.get::<_, f64>(3)?,
                 row.get::<_, f64>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
             ))
         },
     ).map_err(|e| format!("건물 근접 FAC 쿼리 실행 실패: {}", e))?;
     for row in rows {
-        let (name, usage, height, clat, clon, polygon_json) =
+        let (name, usage, height, clat, clon, polygon_json, height_measured) =
             row.map_err(|e| format!("건물 근접 FAC 행 읽기 실패: {}", e))?;
         let mut polygons: Vec<Vec<[f64; 2]>> = Vec::new();
         if let Some(s) = polygon_json.as_deref() {
@@ -382,6 +393,7 @@ pub fn query_building_near_point(
             name,
             usage,
             height_m: height,
+            height_measured,
             ground_elev_m: ground_elev,
             clat,
             clon,
@@ -421,6 +433,7 @@ pub fn query_building_near_point(
             name,
             usage: None,
             height_m: height,
+            height_measured: None,
             ground_elev_m: ground_elev,
             clat: mlat,
             clon: mlon,
@@ -478,6 +491,7 @@ pub fn query_building_near_point(
             usage: c.usage.clone(),
             source: c.source.to_string(),
             height_m: c.height_m,
+            height_measured: c.height_measured,
             ground_elev_m: c.ground_elev_m,
             lat: c.clat,
             lon: c.clon,
@@ -527,13 +541,14 @@ pub fn query_buildings_along_path(
     //   직선과 무관한 사각형 내부 수십만 동을 전부 폴리곤 파싱/교차해 느렸다(실측: 30NM 대각 47만 후보).
     //   세그먼트 bbox 는 직선에 밀착해 후보를 수십분의 1 로 줄인다(실측: 200NM 대각 595k→23k). centroid 인덱스 활용,
     //   인접 세그먼트 buffer 중첩분은 id 로 1회만 처리.
+    // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — LoS 단면도/차단 판정이 실측 지붕고를 쓰도록.
     let mut stmt = conn.prepare(
-        "SELECT id, centroid_lat, centroid_lon, height, building_name, dong_name, usability, polygon_json
+        "SELECT id, centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, dong_name, usability, polygon_json
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
-           AND height > 0
-           AND height <= ?5"
+           AND COALESCE(height_measured, height) > 0
+           AND COALESCE(height_measured, height) <= ?5"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     // 세그먼트 길이 ~3km — 각 bbox 는 (3km + buffer) 정사각 근방. 짧은 코리도는 1세그먼트(종전과 동일).
@@ -875,14 +890,15 @@ pub fn query_buildings_3d_binary(
 
     // FAC 건물 (fac_buildings 테이블 없을 수 있음 — 실패 시 무시)
     if !skip_fac {
+        // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 3D 건물 렌더 높이/필터/정렬 모두 동일 기준.
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT centroid_lat, centroid_lon, height, building_name, usability, polygon_json, COALESCE(ground_elev, 0)
+            "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, usability, polygon_json, COALESCE(ground_elev, 0)
              FROM fac_buildings
              WHERE centroid_lat BETWEEN ?1 AND ?2
                AND centroid_lon BETWEEN ?3 AND ?4
-               AND height >= ?5
-               AND height <= ?6
-             ORDER BY height DESC
+               AND COALESCE(height_measured, height) >= ?5
+               AND COALESCE(height_measured, height) <= ?6
+             ORDER BY COALESCE(height_measured, height) DESC
              LIMIT ?7"
         ) {
             let remaining = max_count.saturating_sub(metas.len());

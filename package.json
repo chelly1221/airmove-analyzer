@@ -18,8 +18,10 @@
   },
   "dependencies": {
     "@deck.gl/core": "^9.2.11",
+    "@deck.gl/geo-layers": "^9.2.11",
     "@deck.gl/layers": "^9.2.11",
     "@deck.gl/mapbox": "^9.2.11",
+    "@loaders.gl/3d-tiles": "^4.3.4",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",

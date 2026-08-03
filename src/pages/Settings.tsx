@@ -15,8 +15,11 @@ import {
   Save,
   KeyRound,
   ChevronDown,
+  Boxes,
+  Trash2,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import Modal from "../components/common/Modal";
 import { useAppStore } from "../store";
 import type { PeakImportStatus } from "../types";
@@ -546,6 +549,13 @@ export function FacBuildingDataSection() {
   const [zipImporting, setZipImporting] = useState(false);
   const [zipResult, setZipResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
+  // ─── 실측 3D 건물 (1m DSM) — buildings_3d.bin 임포트 + 3D 타일셋 폴더 ───
+  const [measuredImporting, setMeasuredImporting] = useState(false);
+  const [measuredProgress, setMeasuredProgress] = useState<{ total: number; processed: number; status: string } | null>(null);
+  const [measuredResult, setMeasuredResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
+  const [measuredDeleteConfirm, setMeasuredDeleteConfirm] = useState(false);
+
   const handleDownload = async () => {
     await startFacDownload();
     await loadStatus();
@@ -584,6 +594,84 @@ export function FacBuildingDataSection() {
     }
   };
 
+  /** 실측 3D 임포트 — 타일셋 폴더 등록(선택 파일의 상위 폴더) 후 buildings_3d.bin 반영 */
+  const handleMeasuredImport = async () => {
+    let unlisten: (() => void) | null = null;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        title: "실측 3D 건물 가져오기 (buildings_3d.bin)",
+        filters: [{ name: "buildings_3d.bin", extensions: ["bin"] }],
+        multiple: false,
+      });
+      if (!selected) return;
+      const binPath = selected as string;
+      // 선택 경로에서 파일명 제거 → 타일셋 폴더 (Windows \ · POSIX / 모두 처리)
+      const sepIdx = Math.max(binPath.lastIndexOf("\\"), binPath.lastIndexOf("/"));
+      const dir = sepIdx > 0 ? binPath.slice(0, sepIdx) : null;
+
+      setMeasuredImporting(true);
+      setMeasuredProgress(null);
+      setMeasuredResult(null);
+
+      // 3D 타일 폴더 등록 — 실패해도 임포트는 계속 (경고만)
+      if (dir) {
+        try {
+          await invoke("set_tiles3d_dir", { dir });
+          setTiles3dDir(dir);
+        } catch (e) {
+          console.warn("3D 타일 폴더 등록 실패:", e);
+        }
+      }
+
+      try {
+        unlisten = await listen<{ total: number; processed: number; status: string }>(
+          "measured-building-import-progress",
+          (e) => setMeasuredProgress(e.payload),
+        );
+      } catch { /* 리스너 실패 시 진행률 없이 진행 */ }
+
+      const r = await invoke<{ total: number; matched: number; inserted: number; skipped: number }>(
+        "import_measured_buildings",
+        { binPath },
+      );
+      setMeasuredResult({
+        type: "success",
+        message: `실측 건물 반영 완료 — 매칭 ${r.matched.toLocaleString()}건 · 신규 ${r.inserted.toLocaleString()}건 · 제외 ${r.skipped.toLocaleString()}건`,
+      });
+      await loadStatus();
+    } catch (e) {
+      setMeasuredResult({ type: "error", message: `실측 3D 임포트 실패: ${e}` });
+    } finally {
+      if (unlisten) unlisten();
+      setMeasuredImporting(false);
+      setMeasuredProgress(null);
+    }
+  };
+
+  /** 3D 타일 폴더 해제 — 타일 표출만 중지 (실측 높이 데이터는 유지) */
+  const handleClearTilesDir = async () => {
+    try {
+      await invoke("set_tiles3d_dir", { dir: null });
+      setTiles3dDir(null);
+    } catch (e) {
+      console.warn("타일 폴더 해제 실패:", e);
+    }
+  };
+
+  /** 실측 건물 데이터 삭제 — 전용 커맨드 (clear_fac_building_data 아님) */
+  const handleClearMeasured = async () => {
+    try {
+      await invoke("clear_measured_buildings");
+      setMeasuredDeleteConfirm(false);
+      setMeasuredResult({ type: "success", message: "실측 건물 데이터를 삭제했습니다." });
+      await loadStatus();
+    } catch (e) {
+      setMeasuredDeleteConfirm(false);
+      setMeasuredResult({ type: "error", message: `실측 데이터 삭제 실패: ${e}` });
+    }
+  };
+
   // 다운로드 완료 감지 → 테이블 갱신
   const prevDownloading = useRef(facDownloading);
   useEffect(() => {
@@ -606,6 +694,8 @@ export function FacBuildingDataSection() {
 
   useEffect(() => {
     loadStatus();
+    // 등록된 3D 타일셋 폴더 조회 (미등록이면 null)
+    invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 무시 */ });
   }, []);
 
   const handleClear = async (regionKey: string) => {
@@ -624,8 +714,13 @@ export function FacBuildingDataSection() {
     : 0;
 
   const facHasExtra = (facDownloading && facProgress) || facResult || zipResult || (!loading && importStatus.length > 0);
-  const isCollapsible = !loading && totalRecords > 0 && !facDownloading && !zipImporting;
+  const isCollapsible = !loading && totalRecords > 0 && !facDownloading && !zipImporting && !measuredImporting;
   const isExpanded = !isCollapsible || !collapsed;
+  /** 실측3D 임포트 이력 존재 여부 (get_fac_building_import_status 의 "실측3D" 행) */
+  const measuredStatus = importStatus.find((s) => s.region === "실측3D");
+  const measuredPct = measuredProgress && measuredProgress.total > 0
+    ? Math.min(100, Math.round((measuredProgress.processed / measuredProgress.total) * 100))
+    : 0;
 
   return (
     <div className={`px-5 py-[13px] ${isCollapsible ? "cursor-pointer select-none" : ""}`} onClick={(e) => { if (isCollapsible && !(e.target as HTMLElement).closest("button, a")) setCollapsed((c) => !c); }}>
@@ -686,6 +781,91 @@ export function FacBuildingDataSection() {
           </button>
         </div>
       </div>
+
+      {/* ── 실측 3D 건물 (1m DSM) — buildings_3d.bin + 3D 타일셋 ── */}
+      {isExpanded && (
+        <div
+          className="mt-3 rounded-xl border border-gray-200 bg-gray-50/70 px-3 py-2.5 space-y-2"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <Boxes size={14} className="text-[#a60739] shrink-0" />
+              <span className="text-xs font-semibold text-gray-800 whitespace-nowrap">실측 3D 건물 (1m DSM)</span>
+              {measuredStatus ? (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-white/80 px-2 py-0.5 text-[11px] text-gray-600">
+                  <Check size={10} className="text-emerald-500" />
+                  {measuredStatus.record_count.toLocaleString()}건
+                </span>
+              ) : (
+                <span className="truncate text-[11px] text-gray-400">항공 LiDAR 실측 지붕고 · Cesium 3D 타일셋</span>
+              )}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={handleMeasuredImport}
+                disabled={measuredImporting || facDownloading || zipImporting}
+                className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {measuredImporting ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />}
+                {measuredImporting ? "임포트 중..." : "실측 3D 임포트 (buildings_3d.bin)"}
+              </button>
+              {measuredStatus && (
+                <button
+                  onClick={() => setMeasuredDeleteConfirm(true)}
+                  disabled={measuredImporting}
+                  className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-500 transition-colors hover:border-red-300 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Trash2 size={13} />
+                  실측 데이터 삭제
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 등록된 3D 타일셋 폴더 */}
+          {tiles3dDir && (
+            <div className="flex items-center gap-1.5 text-[11px] text-gray-500">
+              <span className="shrink-0 rounded-sm bg-gray-200 px-1.5 py-[1px] text-[9px] font-semibold text-gray-600">타일 폴더</span>
+              <span className="truncate" title={tiles3dDir}>{tiles3dDir}</span>
+              <button
+                onClick={handleClearTilesDir}
+                className="shrink-0 text-[11px] text-gray-400 underline-offset-2 transition-colors hover:text-[#a60739] hover:underline"
+              >
+                해제
+              </button>
+            </div>
+          )}
+
+          {/* 임포트 진행률 */}
+          {measuredImporting && (
+            <div className="space-y-1">
+              {measuredProgress && measuredProgress.total > 0 && (
+                <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                  <div className="h-full rounded-full bg-[#a60739] transition-all duration-300" style={{ width: `${measuredPct}%` }} />
+                </div>
+              )}
+              <p className="text-xs text-gray-500">
+                {measuredProgress
+                  ? `${measuredProgress.status} ${measuredProgress.processed.toLocaleString()} / ${measuredProgress.total.toLocaleString()}`
+                  : "실측 건물 파일 읽는 중..."}
+              </p>
+            </div>
+          )}
+
+          {measuredResult && !measuredImporting && (
+            <div
+              className={`rounded-lg px-3 py-2 text-xs ${
+                measuredResult.type === "success"
+                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                  : "bg-red-50 text-red-600 border border-red-200"
+              }`}
+            >
+              {measuredResult.message}
+            </div>
+          )}
+        </div>
+      )}
 
       {facHasExtra && isExpanded && (
         <div className="mt-3 space-y-2" onClick={(e) => e.stopPropagation()}>
@@ -772,6 +952,34 @@ export function FacBuildingDataSection() {
             </button>
             <button
               onClick={() => deleteConfirm && handleClear(deleteConfirm)}
+              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+            >
+              삭제
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 실측 3D 건물 삭제 확인 모달 */}
+      <Modal
+        open={measuredDeleteConfirm}
+        onClose={() => setMeasuredDeleteConfirm(false)}
+        title="실측 3D 건물 삭제"
+        width="max-w-sm"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            실측 3D 건물(1m DSM) 데이터를 삭제하시겠습니까? 건물통합정보에 반영된 실측 지붕고도 함께 해제됩니다.
+          </p>
+          <div className="flex justify-end gap-3">
+            <button
+              onClick={() => setMeasuredDeleteConfirm(false)}
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              취소
+            </button>
+            <button
+              onClick={handleClearMeasured}
               className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
             >
               삭제

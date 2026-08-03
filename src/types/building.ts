@@ -46,6 +46,8 @@ export interface FacBuildingDetail {
   bd_mgt_sn: string | null;
   height_m: number;
   ground_elev_m: number;
+  /** 실측 지붕고(AGL, m) — 1m DSM 실측 3D 임포트 반영분. null=실측 없음 */
+  height_measured_m?: number | null;
   region: string;
   lat: number;
   lon: number;

@@ -8,6 +8,7 @@ pub mod fac_building;
 pub mod geo;
 pub mod vworld_search;
 pub mod landuse;
+pub mod measured_building;
 pub mod models;
 pub mod parser;
 pub mod peak;
@@ -82,6 +83,9 @@ pub(crate) struct AppState {
     pub(crate) db: Mutex<db::DbPool>,
     pub(crate) srtm: Mutex<srtm::SrtmReader>,
     pub(crate) analysis_cancel: Arc<AtomicBool>,
+    /// Cesium 3D Tiles(실측 건물) 루트 디렉터리 — tiles3d:// 프로토콜 서빙 기준 경로.
+    /// None = 미설정(프로토콜 404). settings 키 "tiles3d_dir" 로 영속화.
+    pub(crate) tiles3d_dir: Mutex<Option<PathBuf>>,
 }
 
 /// 앱 데이터 디렉토리 경로 확보
@@ -1007,6 +1011,99 @@ async fn clear_fac_building_data(
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         fac_building::clear_data(&conn, region.as_deref())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+// ---------- 실측 3D 건물 (1m DSM) ----------
+
+/// 실측 건물 박스(buildings_3d.bin) 임포트 —
+/// 기존 fac_buildings 에 실측 지붕고(height_measured) 반영 + 미매칭 건물 신규 등록.
+/// 진행률은 "measured-building-import-progress" 이벤트로 방출.
+#[tauri::command]
+async fn import_measured_buildings(
+    app_handle: tauri::AppHandle,
+    bin_path: String,
+) -> Result<measured_building::MeasuredImportSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        let handle = app_handle.clone();
+        measured_building::import_from_bin(&conn, &mut srtm, &bin_path, &|progress| {
+            let _ = handle.emit("measured-building-import-progress", progress);
+        })
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// 실측 데이터 초기화 (실측 지붕고 해제 + 실측 신규행 삭제)
+#[tauri::command]
+async fn clear_measured_buildings(app_handle: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        measured_building::clear_measured(&conn)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// Cesium 3D Tiles 루트 디렉터리 설정 (None = 해제). tileset.json 존재를 검증한다.
+#[tauri::command]
+async fn set_tiles3d_dir(
+    app_handle: tauri::AppHandle,
+    dir: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+
+        let resolved: Option<PathBuf> = match dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(d) => {
+                let p = PathBuf::from(d);
+                if !p.is_dir() {
+                    return Err(format!("3D 타일 폴더를 찾을 수 없습니다: {}", d));
+                }
+                if !p.join("tileset.json").is_file() {
+                    return Err("선택한 폴더에 tileset.json 이 없습니다".to_string());
+                }
+                Some(p)
+            }
+            None => None,
+        };
+
+        // 영속화: 해제는 빈 문자열로 저장
+        let value = resolved
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        db::set_setting(&conn, "tiles3d_dir", &value)
+            .map_err(|e| format!("3D 타일 폴더 저장 실패: {}", e))?;
+
+        let mut guard = state
+            .tiles3d_dir
+            .lock()
+            .map_err(|e| format!("tiles3d_dir lock: {}", e))?;
+        *guard = resolved;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// 현재 설정된 3D Tiles 루트 디렉터리 (미설정이면 None)
+#[tauri::command]
+async fn get_tiles3d_dir(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let guard = state
+            .tiles3d_dir
+            .lock()
+            .map_err(|e| format!("tiles3d_dir lock: {}", e))?;
+        Ok(guard.as_ref().map(|p| p.to_string_lossy().to_string()))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -2632,6 +2729,71 @@ pub fn run() {
                 }
             });
         })
+        // 실측 3D 건물 Cesium 3D Tiles 서빙 (tileset.json + *.b3dm).
+        // set_tiles3d_dir 로 지정된 로컬 폴더를 루트로 하는 읽기 전용 정적 서버.
+        // 경로는 화이트리스트 문자셋 + '..' 금지로 디렉터리 탈출을 차단한다.
+        .register_asynchronous_uri_scheme_protocol("tiles3d", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let rel = request.uri().path().trim_start_matches('/').to_string();
+
+            tauri::async_runtime::spawn_blocking(move || {
+                // 응답 빌더 — 본문 없는 에러 응답
+                let err_response = |status: u16| {
+                    tauri::http::Response::builder()
+                        .status(status)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Vec::new())
+                };
+
+                // ── 경로 검증 ── ('%' 등 화이트리스트 밖 문자는 즉시 거부)
+                let path_ok = !rel.is_empty()
+                    && rel.len() < 256
+                    && rel.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-')
+                    })
+                    && rel.split('/').all(|seg| !seg.is_empty() && seg != "..");
+
+                let response = if !path_ok {
+                    err_response(403)
+                } else {
+                    // 루트 디렉터리 미설정이면 404 (setup 이전 요청은 state 부재 → 동일 404)
+                    let base = match app.try_state::<AppState>() {
+                        Some(state) => match state.tiles3d_dir.lock() {
+                            Ok(g) => g.clone(),
+                            Err(_) => {
+                                log::warn!("[Tiles3D] 상태 lock 실패");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    match base {
+                        None => err_response(404),
+                        Some(dir) => match std::fs::read(dir.join(&rel)) {
+                            Ok(data) => {
+                                let ctype = if rel.to_ascii_lowercase().ends_with(".json") {
+                                    "application/json"
+                                } else {
+                                    "application/octet-stream"
+                                };
+                                tauri::http::Response::builder()
+                                    .status(200)
+                                    .header("Content-Type", ctype)
+                                    .header("Access-Control-Allow-Origin", "*")
+                                    .header("Cache-Control", "public, max-age=3600")
+                                    .body(data)
+                            }
+                            Err(_) => err_response(404),
+                        },
+                    }
+                };
+
+                match response {
+                    Ok(r) => responder.respond(r),
+                    Err(e) => log::warn!("[Tiles3D] 프로토콜 응답 빌드 실패: {}", e),
+                }
+            });
+        })
         .setup(|app| {
             let app_data_dir = get_app_data_dir(app.handle())
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -2665,11 +2827,24 @@ pub fn run() {
             }
             info!("SRTM data dir: {:?}", srtm_dir);
 
+            // 실측 3D Tiles 루트 디렉터리 복원 (빈 문자열/미설정 → None)
+            let tiles3d_dir: Option<PathBuf> = db_pool
+                .get()
+                .ok()
+                .and_then(|c| db::get_setting(&c, "tiles3d_dir").ok().flatten())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            if let Some(ref d) = tiles3d_dir {
+                info!("3D Tiles dir: {:?}", d);
+            }
+
             app.manage(AppState {
                 app_data_dir: Mutex::new(app_data_dir.clone()),
                 db: Mutex::new(db_pool),
                 srtm: Mutex::new(srtm::SrtmReader::new(srtm_dir, db_path.clone())),
                 analysis_cancel: Arc::new(AtomicBool::new(false)),
+                tiles3d_dir: Mutex::new(tiles3d_dir),
             });
 
             // 이전 세션 잔여 bulk 전송 파일 정리
@@ -2736,6 +2911,11 @@ pub fn run() {
             import_fac_building_data,
             get_fac_building_import_status,
             clear_fac_building_data,
+            // 실측 3D 건물 (1m DSM) + Cesium 3D Tiles
+            import_measured_buildings,
+            clear_measured_buildings,
+            set_tiles3d_dir,
+            get_tiles3d_dir,
             // 산봉우리 지명
             import_peak_data,
             query_nearby_peaks,

@@ -293,11 +293,12 @@ pub(crate) fn query_buildings_for_coverage(
     let max_lon = radar_lon + range_deg;
 
     // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
+    // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 커버리지 차폐가 실측 지붕고를 쓰도록.
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, polygon_json FROM fac_buildings
+        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
-           AND height >= 3.0 AND height <= 1000.0"
+           AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],
@@ -377,11 +378,12 @@ pub(crate) fn query_buildings_for_coverage_excluding(
     let max_lon = radar_lon + range_deg;
 
     // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
+    // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 커버리지 차폐가 실측 지붕고를 쓰도록.
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, height, polygon_json FROM fac_buildings
+        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
-           AND height >= 3.0 AND height <= 1000.0"
+           AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],
