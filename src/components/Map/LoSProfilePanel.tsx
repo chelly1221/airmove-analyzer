@@ -290,39 +290,57 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         //   백엔드(query_buildings_along_path)가 GIS 건물 지반을 centroid SRTM(live)로, 수동 건물은 사용자 입력값으로 제공함
         if (!cancelled) setBuildings(bldgs);
 
-        // 최저 탐지가능 높이 선을 실질적으로 가장 크게 올린 산 1개 찾기
-        // = 조정 프레임에서 가장 큰 그림자를 만드는 지형점
-        let dominantPeakIdx = -1;
-        let dominantShadowArea = 0;
-        for (let i = 1; i < points.length - 1; i++) {
-          const di = points[i].distance;
-          if (di <= 0) continue;
-          if (di > totalDist) break; // 산 이름은 타겟까지의 차단 지형만 대상 (원거리 확장 구간 제외)
-          // 건물을 포함한 effective elevation 사용 — 산 이름은 "지형+건물 통합 장애물" 모델 기준의
-          //   결정적 값이어야 하므로 showBuildings 토글과 무관하게, 이번 런에서 조회한 bldgs 사용
-          //   (상태 buildings 는 이 effect 의존성 밖이라 타겟 변경 시 이전 타겟 값으로 stale)
-          let elev = points[i].elevation;
+        // 최저탐지선(los43)을 실제로 꺾는(형성하는) 봉우리 중 증분 기여가 가장 큰 1개 찾기 (2026-08-03 재정의)
+        //   ① 후보 = 4/3 앙각이 자기 앞 전체(지형+건물 eff)의 running max 를 초과하는 점만.
+        //      구식은 baseline 을 지형만으로 잡아, 앞 능선 그림자에 완전히 묻혀 선을 전혀 못 꺾는
+        //      봉우리도 자기 가상 그림자 면적만 크면 dominant 로 뽑혀 라벨이 붙는 오탐이 있었다.
+        //   ② 기여도 = 자기 소유 구간(다음 상회점 전까지)에서 선행 그림자선·지형 위로 실제 올린 증분 면적.
+        //   ③ 프레임 = 4/3(curvDrop43) — 차트 los43 선·건물 선꺾음 판정과 동일 프레임.
+        // 건물을 포함한 effective elevation 사전 계산 — 산 이름은 "지형+건물 통합 장애물" 모델 기준의
+        //   결정적 값이어야 하므로 showBuildings 토글과 무관하게, 이번 런에서 조회한 bldgs 사용
+        //   (상태 buildings 는 이 effect 의존성 밖이라 타겟 변경 시 이전 타겟 값으로 stale)
+        const effElevArr = points.map((p) => {
+          let elev = p.elevation;
           for (const b of bldgs) {
             const nearD = b.near_dist_km ?? b.distance_km;
             const farD = b.far_dist_km ?? b.distance_km;
-            if (di >= nearD - 0.05 && di <= farD + 0.05) {
+            if (p.distance >= nearD - 0.05 && p.distance <= farD + 0.05) {
               const bTop = b.ground_elev_m + b.height_m;
               if (bTop > elev) elev = bTop;
             }
           }
-          const adjH = elev - curvDrop(di);
-          if (adjH <= radarHeight) continue;
-          // 이 지형점이 만드는 그림자: 뒤쪽 포인트들에서 얼마나 최저선을 올리는지 합산
-          let shadowSum = 0;
+          return elev;
+        });
+        // 레이더 기준 4/3 앙각(tan, 무차원) — 거리 0 이하는 후보/비교에서 제외되도록 -Infinity
+        const angArr = points.map((p, i) =>
+          p.distance > 0 ? (effElevArr[i] - curvDrop43(p.distance) - radarHeight) / (p.distance * 1000) : -Infinity
+        );
+        let dominantPeakIdx = -1;
+        let dominantLift = 0;
+        let prefMax = -Infinity; // i 이전 점들의 running max 앙각 (= 그 지점까지 선을 형성한 최대 앙각)
+        for (let i = 1; i < points.length - 1; i++) {
+          const di = points[i].distance;
+          const ai = angArr[i];
+          const prevMax = prefMax;
+          if (ai > prefMax) prefMax = ai; // prefix 갱신은 후보 채택 여부와 무관하게 항상 수행
+          if (di <= 0) continue;
+          if (di > totalDist) break; // 산 이름은 타겟까지의 차단 지형만 대상 (원거리 확장 구간 제외)
+          if (ai <= prevMax) continue; // 선을 못 꺾는 점(앞 능선 그림자에 묻힘) — 라벨 후보 제외
+          // 증분 기여: 자기 소유 구간(다음 상회점 직전까지)에서
+          //   (자기 그림자선 − max(선행 그림자선, 지형, 레이더 높이)) 를 합산
+          let lift = 0;
           for (let j = i + 1; j < points.length && points[j].distance <= totalDist; j++) {
+            if (angArr[j] > ai) break; // 이후 구간은 그 상회점이 선을 소유
             const dj = points[j].distance;
-            const shadow = radarHeight + (adjH - radarHeight) * (dj / di);
-            const adjTj = points[j].elevation - curvDrop(dj);
-            const baseline = Math.max(radarHeight, adjTj);
-            if (shadow > baseline) shadowSum += shadow - baseline;
+            const mine = radarHeight + ai * dj * 1000;
+            const prevLine = prevMax > -Infinity ? radarHeight + prevMax * dj * 1000 : radarHeight;
+            const adjT43j = points[j].elevation - curvDrop43(dj);
+            const baseline = Math.max(radarHeight, adjT43j, prevLine);
+            if (mine > baseline) lift += mine - baseline;
           }
-          if (shadowSum > dominantShadowArea) {
-            dominantShadowArea = shadowSum;
+          // 증분이 0 인 봉우리(바로 뒤 더 높은 점이 선을 이어받음)는 라벨 제외
+          if (lift > dominantLift) {
+            dominantLift = lift;
             dominantPeakIdx = i;
           }
         }
