@@ -75,6 +75,7 @@ async function focusWindow(label: string) {
 }
 
 const SCENARIO_REPORT_TRACK = "report-track";
+const SCENARIO_OBSTACLE_LOS = "obstacle-los-review";
 
 // ─── 시나리오 1: 비행검사결과보고서 첨부용 항적자료 ───────────────────
 // main(단일항적분석 창 열기) → drawing(항적도 캡처) → main(지도 창 열기) → trackmap(항적 점 캡처)
@@ -412,6 +413,185 @@ const REPORT_TRACK_PHASES: Record<string, TourStep[]> = {
   ],
 };
 
+// ─── 시나리오 2: 장애물 전파영향성 사전검토 ─────────────────────────────
+// main(지도 창 열기) → trackmap(LoS 분석 도구 → 주소검색 → 건물 카드 → 단면도 → 방위별 확인)
+//
+// 이 시나리오의 관련 상태(activeTool·addressMarker·losTarget·xZoom 등)는 전부 TrackMap 로컬
+// useState 라 스토어 구독(advanceWhen)으로는 감지할 수 없다 — 진행 신호는 전부 DOM 앵커
+// (advanceWhenSelectorAppears / advanceOnTargetClick)로만 잡는다.
+// 주소검색은 VWorld 온라인 API 라 오프라인에서는 결과가 없을 수 있어 대기성 스텝은 전부 showNext 폴백.
+
+const OBSTACLE_LOS_PHASES: Record<string, TourStep[]> = {
+  main: [
+    {
+      id: "ob-intro",
+      title: "장애물 전파영향성 사전검토",
+      body:
+        "신축(계획) 건물이나 기존 장애물이 레이더 전파에 미치는 영향(LoS 차단 여부·허용높이)을 " +
+        "지도 창에서 사전검토하는 과정을 안내합니다. " +
+        "주소검색으로 대상 건물을 찾아 LoS 단면도로 방위별 차단 여부를 확인합니다.",
+      mode: "dim",
+      showNext: true,
+      nextLabel: "시작",
+    },
+    {
+      id: "ob-nav-map",
+      target: '[data-tour="nav-map"]',
+      title: "지도 창 열기",
+      body: "'지도' 메뉴를 클릭하세요. 지도 창이 열립니다.",
+      mode: "interactive",
+      placement: "right",
+      advanceOnTargetClick: true,
+      endsPhase: true,
+      // DB 플래그(새 창 생성 경로) + emit(이미 열려 있는 창 경로) 양쪽 모두 시동
+      onAdvance: async () => {
+        await saveTourState(SCENARIO_OBSTACLE_LOS, "trackmap");
+        await emit("tour:start", { scenario: SCENARIO_OBSTACLE_LOS, phase: "trackmap" });
+      },
+    },
+  ],
+
+  trackmap: [
+    {
+      id: "ob-tool-los",
+      target: '[data-tour="tm-tool-los"]',
+      title: "LoS 분석 도구 열기",
+      body: "사이드바 도구에서 'LoS 분석'을 클릭하세요. 좌측에 LoS 단면도 도구 드로어가 열립니다.",
+      mode: "interactive",
+      placement: "right",
+      advanceWhenSelectorAppears: '[data-tour="tm-los-drawer"]',
+      showNext: true,
+    },
+    {
+      id: "ob-los-drawer",
+      target: '[data-tour="tm-los-drawer"]',
+      title: "LoS 단면도 도구",
+      body:
+        "LoS 단면도 도구입니다. '지점 선택'으로 지도의 임의 지점을, '등록 장애물'로 등록된 장애물을 " +
+        "조준할 수 있습니다. 이번에는 주소검색으로 건물을 찾아보겠습니다.",
+      mode: "interactive",
+      placement: "right",
+      showNext: true,
+    },
+    {
+      id: "ob-address-input",
+      target: '[data-tour="tm-address-search"]',
+      title: "대상 건물 검색",
+      body: "지도 좌상단 검색창에 도로명주소나 건물명을 입력하세요. 예: **개화동로 561**",
+      mode: "interactive",
+      placement: "bottom",
+      advanceWhenSelectorAppears: '[data-tour="tm-address-results"]',
+      showNext: true,
+    },
+    {
+      id: "ob-address-pick",
+      target: '[data-tour="tm-address-results"]',
+      title: "검색 결과 선택",
+      body: "검색 결과에서 대상 주소를 클릭하세요. 지도가 건물 위치로 이동하고 건물 정보 카드가 나타납니다.",
+      mode: "interactive",
+      placement: "bottom",
+      advanceWhenSelectorAppears: '[data-tour="tm-bldg-card"]',
+      retreatToOnTargetLost: "ob-address-input",
+      showNext: true,
+    },
+    {
+      id: "ob-bldg-card",
+      target: '[data-tour="tm-bldg-card"]',
+      title: "건물 정보 확인",
+      body:
+        "건물 정보 카드입니다. GIS 건물이면 지반고·건물높이가 자동으로 채워집니다. " +
+        "**신축 계획 검토라면 계획 높이로 수정 후 '적용'**을 눌러 가상 높이로 검토할 수 있습니다.",
+      mode: "interactive",
+      placement: "right",
+      showNext: true,
+    },
+    {
+      id: "ob-bldg-los-btn",
+      target: '[data-tour="tm-bldg-los-btn"]',
+      title: "LoS 단면도 열기",
+      body: "'LoS 단면도'를 클릭하세요. 레이더에서 이 건물까지의 전파 단면이 하단에 표시됩니다.",
+      mode: "interactive",
+      placement: "right",
+      // 클릭 감지 불요 — 단면도 패널 등장이 완료 신호
+      advanceWhenSelectorAppears: '[data-tour="tm-los-panel"]',
+    },
+    {
+      id: "ob-bldg-results",
+      target: '[data-tour="tm-bldg-card-results"]',
+      title: "허용높이 확인",
+      body:
+        "카드에 LoS·BRA **허용높이**와 초과/여유가 계산됩니다. 계획 높이와 비교해 전파영향성을 사전검토하세요.",
+      mode: "interactive",
+      placement: "right",
+      showNext: true,
+    },
+    {
+      id: "ob-tab-center",
+      target: '[data-tour="tm-los-tab-center"]',
+      title: "중앙 방위 단면",
+      body: "기본으로 건물 **중앙** 방위 단면이 표시됩니다. 헤더의 차단/양호 배지와 단면도를 확인하세요.",
+      mode: "interactive",
+      placement: "bottom",
+      showNext: true,
+    },
+    {
+      id: "ob-tab-left",
+      target: '[data-tour="tm-los-tab-left"]',
+      title: "좌끝 방위 단면",
+      body:
+        "'좌끝' 탭을 클릭하세요 — 건물 좌측 끝 방위의 단면입니다. " +
+        "넓은 건물은 방위별로 차단 여부가 다를 수 있습니다.",
+      mode: "interactive",
+      placement: "bottom",
+      advanceOnTargetClick: true,
+      // 폴리곤 미검출 건물은 단일 뷰라 탭바 자체가 없다 — [다음] 폴백 필수
+      showNext: true,
+    },
+    {
+      id: "ob-tab-right",
+      target: '[data-tour="tm-los-tab-right"]',
+      title: "우끝 방위 단면",
+      body: "'우끝' 탭도 확인하세요.",
+      mode: "interactive",
+      placement: "bottom",
+      advanceOnTargetClick: true,
+      showNext: true,
+    },
+    {
+      id: "ob-chart-zoom",
+      target: '[data-tour="tm-los-chart"]',
+      title: "단면도 확대",
+      body:
+        "차트 위에서 **마우스 휠**을 굴려 건물 주변을 확대해 보세요. " +
+        "드래그로 좌우 이동, 헤더의 배율 배지(✕)로 원래 배율로 돌아옵니다.",
+      mode: "interactive",
+      placement: "bottom",
+      // 줌 리셋 배지는 기본 배율에서 벗어날 때만 렌더 = "줌 했음" 신호
+      advanceWhenSelectorAppears: '[data-tour="tm-los-zoom-badge"]',
+      showNext: true,
+    },
+    {
+      id: "ob-finish",
+      title: "사전검토 완료",
+      body:
+        "건물 높이를 바꿔가며 차단 여부를 재확인하거나, 등록 장애물로 저장해 계속 추적할 수 있습니다.",
+      mode: "dim",
+      showNext: true,
+      nextLabel: "완료",
+      endsPhase: true,
+      onAdvance: async () => {
+        await clearTourState();
+      },
+    },
+  ],
+};
+
+/** 시나리오 id → phase 별 스텝 레지스트리 */
+const SCENARIO_PHASE_MAP: Record<string, Record<string, TourStep[]>> = {
+  [SCENARIO_REPORT_TRACK]: REPORT_TRACK_PHASES,
+  [SCENARIO_OBSTACLE_LOS]: OBSTACLE_LOS_PHASES,
+};
+
 /** 사용방법 페이지 목록용 메타 */
 export const TOUR_SCENARIOS: TourScenarioMeta[] = [
   {
@@ -429,10 +609,22 @@ export const TOUR_SCENARIOS: TourScenarioMeta[] = [
       "항적 점 표시 화면 캡처 (Win + Shift + S)",
     ],
   },
+  {
+    id: SCENARIO_OBSTACLE_LOS,
+    title: "장애물 전파영향성 사전검토",
+    description:
+      "신축 계획 건물이나 기존 장애물이 레이더 전파에 미치는 영향(LoS 차단 여부·허용높이)을 지도에서 " +
+      "사전검토합니다. 주소검색으로 대상 건물을 찾아 LoS 단면도로 중앙·좌끝·우끝 방위의 차단 여부를 확인합니다.",
+    stepsSummary: [
+      "지도 창에서 LoS 분석 도구 열기",
+      "주소검색으로 대상 건물 선택 (예: 개화동로 561)",
+      "건물 카드에서 지반고·건물높이 확인 후 LoS 단면도 열기",
+      "허용높이·차단 여부와 중앙/좌끝/우끝 방위 확인, 차트 휠 줌",
+    ],
+  },
 ];
 
 /** 시나리오·phase 별 스텝 목록 */
 export function getPhaseSteps(scenario: string, phase: string): TourStep[] {
-  if (scenario !== SCENARIO_REPORT_TRACK) return [];
-  return REPORT_TRACK_PHASES[phase] ?? [];
+  return SCENARIO_PHASE_MAP[scenario]?.[phase] ?? [];
 }

@@ -292,10 +292,14 @@ pub(crate) fn query_buildings_for_coverage(
     let min_lon = radar_lon - range_deg;
     let max_lon = radar_lon + range_deg;
 
+    // 레이더 자체 건물(레이더가 올라앉은 구조물) 제외 — 폴리곤 꼭짓점이 첫 샘플 빈에 들어가
+    // 해당 방위 커버리지를 통째로 잘라먹는다(자기 자신에 의한 차폐).
+    let own_ids = crate::building::radar_own_building_ids(conn, radar_lat, radar_lon);
+
     // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 커버리지 차폐가 실측 지붕고를 쓰도록.
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json FROM fac_buildings
+        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json, id FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0"
@@ -307,10 +311,14 @@ pub(crate) fn query_buildings_for_coverage(
                 row.get::<_, f64>(1)?,
                 row.get::<_, f64>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
             )),
         ) {
             for r in rows.flatten() {
-                let (_clat, _clon, height, polygon_json) = r;
+                let (_clat, _clon, height, polygon_json, id) = r;
+                if own_ids.contains(&id) {
+                    continue; // 레이더 자체 건물
+                }
                 let poly_pts: Option<Vec<[f64; 2]>> = polygon_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());
@@ -377,10 +385,13 @@ pub(crate) fn query_buildings_for_coverage_excluding(
     let min_lon = radar_lon - range_deg;
     let max_lon = radar_lon + range_deg;
 
+    // 레이더 자체 건물 제외 — query_buildings_for_coverage 와 동일 규칙
+    let own_ids = crate::building::radar_own_building_ids(conn, radar_lat, radar_lon);
+
     // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 커버리지 차폐가 실측 지붕고를 쓰도록.
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json FROM fac_buildings
+        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json, id FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0"
@@ -392,10 +403,14 @@ pub(crate) fn query_buildings_for_coverage_excluding(
                 row.get::<_, f64>(1)?,
                 row.get::<_, f64>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
             )),
         ) {
             for r in rows.flatten() {
-                let (_clat, _clon, height, polygon_json) = r;
+                let (_clat, _clon, height, polygon_json, id) = r;
+                if own_ids.contains(&id) {
+                    continue; // 레이더 자체 건물
+                }
                 let poly_pts: Option<Vec<[f64; 2]>> = polygon_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());

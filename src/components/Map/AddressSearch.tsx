@@ -163,7 +163,7 @@ export default function AddressSearch({ onSelect, offsetLeft = 8, withManualBuil
   }, []);
 
   return (
-    <div ref={ref} className="absolute top-2 z-[800]" style={{ width: 280, left: offsetLeft, transition: "left .4s cubic-bezier(.4,0,.2,1)" }}>
+    <div ref={ref} data-tour="tm-address-search" className="absolute top-2 z-[800]" style={{ width: 280, left: offsetLeft, transition: "left .4s cubic-bezier(.4,0,.2,1)" }}>
       <div className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white/95 px-2.5 py-1.5 shadow-lg backdrop-blur-sm">
         <Search size={14} className="shrink-0 text-gray-400" />
         <input
@@ -187,7 +187,7 @@ export default function AddressSearch({ onSelect, offsetLeft = 8, withManualBuil
         )}
       </div>
       {open && shown.length > 0 && (
-        <div className="mt-1 max-h-[min(70vh,720px)] overflow-y-auto rounded-lg border border-gray-200 bg-white/95 shadow-lg backdrop-blur-sm">
+        <div data-tour="tm-address-results" className="mt-1 max-h-[min(70vh,720px)] overflow-y-auto rounded-lg border border-gray-200 bg-white/95 shadow-lg backdrop-blur-sm">
           {shown.map((r, i) => (
             <button
               key={i}

@@ -68,6 +68,8 @@ export default function LoSProfileTabs({ views, onLoaded, searchedAddress, onAct
               <button
                 key={i}
                 onClick={() => setActiveTab(i)}
+                // 투어 앵커 — 라벨(중앙/좌끝/우끝)로만 매핑, 그 외 라벨은 앵커 없음
+                data-tour={v.label === "중앙" ? "tm-los-tab-center" : v.label === "좌끝" ? "tm-los-tab-left" : v.label === "우끝" ? "tm-los-tab-right" : undefined}
                 className={`flex items-baseline gap-1 rounded-t-md px-3 py-1.5 text-[11px] font-semibold transition-colors border-b-2 ${
                   on ? "text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"
                 }`}

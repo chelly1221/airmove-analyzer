@@ -87,8 +87,10 @@ export function DsSlider({ value, min, max, step, onChange, color = ACCENT, disa
 }
 
 // ── 도구 드로어 버튼 (solid 변형: 활성=꽉 찬 accent + 셰브런 180°) ──
-export function ToolButton({ icon: Icon, label, active, onClick }: {
+export function ToolButton({ icon: Icon, label, active, onClick, dataTour }: {
   icon: LucideIcon; label: string; active: boolean; onClick: () => void;
+  /** 투어 앵커(src/tour) — 지정 시 button 에 data-tour 속성 부여 (표출·동작 무영향) */
+  dataTour?: string;
 }) {
   const [hover, setHover] = useState(false);
   // 기본: 흰색 배경/회색 아이콘 · hover: 메인 테마색(붉은) 채움 · active(드로어 열림): 동일 붉은 채움 + 셰브런 180°로 구분
@@ -97,6 +99,7 @@ export function ToolButton({ icon: Icon, label, active, onClick }: {
   return (
     <button
       onClick={onClick}
+      data-tour={dataTour}
       onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
       style={{
         position: "relative", display: "flex", alignItems: "center", justifyContent: "space-between",

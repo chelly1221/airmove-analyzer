@@ -61,6 +61,8 @@ export interface AddressBuildingHit {
   usage: string | null;
   source: "fac" | "manual";
   height_m: number;
+  /** 실측(1m DSM) 지붕고 (m) — 값이 있으면 height_m 이 실측값임을 뜻함(배지 표기용). 수동건물은 항상 null */
+  height_measured?: number | null;
   ground_elev_m: number;
   lat: number;
   lon: number;

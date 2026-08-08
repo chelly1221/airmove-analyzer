@@ -288,6 +288,16 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 보고서 저장 기능 폐지 — 기존 DB에 남은 미사용 테이블 제거 (idempotent)
     let _ = conn.execute("DROP TABLE IF EXISTS saved_reports", []);
 
+    // 레이더 자체 건물 제외 도입(building::radar_own_building_ids) 이전에 계산된 파노라마 캐시는
+    // 안테나 발밑 구조물을 초대형 근거리 장애물로 담고 있다. 캐시 키(좌표·높이·version)로는
+    // 걸러지지 않으므로 설정 플래그 기반 1회성 전건 삭제로 무효화한다(파노라마는 온디맨드 재계산이라 저렴).
+    // coverage_cache 는 사용자가 명시적으로 재생성하는 자료라 건드리지 않는다.
+    let ver = get_setting(&conn, "panorama_cache_ver").unwrap_or(None);
+    if ver.as_deref() != Some("2") {
+        let _ = conn.execute("DELETE FROM panorama_cache", []);
+        let _ = set_setting(&conn, "panorama_cache_ver", "2");
+    }
+
     Ok(conn)
 }
 

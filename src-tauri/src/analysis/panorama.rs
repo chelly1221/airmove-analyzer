@@ -195,6 +195,7 @@ pub struct TerrainResult {
 
 /// DB에서 건물 폴리곤 조회 (3D 실루엣 계산용)
 /// 폴리곤이 있는 건물은 BuildingPolygon으로, 없는 건물은 BuildingCandidate(폴백)로 반환
+/// exclude_fac_ids: 레이더 자체 건물(레이더가 올라앉은 구조물) id — 장애물에서 제외
 fn query_building_polygons(
     conn: &Connection,
     min_lat: f64,
@@ -203,6 +204,7 @@ fn query_building_polygons(
     max_lon: f64,
     min_height_m: f64,
     exclude_manual_ids: &[i64],
+    exclude_fac_ids: &[i64],
 ) -> (Vec<BuildingPolygon>, Vec<BuildingCandidate>) {
     let mut polygons = Vec::new();
     let mut point_buildings = Vec::new();
@@ -210,7 +212,7 @@ fn query_building_polygons(
     // 건물통합정보 (fac_buildings) — 폴리곤 단위로 반환
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 파노라마 실루엣/차단각이 실측 지붕고를 쓰도록.
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, dong_name, usability, polygon_json
+        "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, dong_name, usability, polygon_json, id
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
@@ -228,11 +230,17 @@ fn query_building_polygons(
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         ) {
             for row in rows.flatten() {
-                let (clat, clon, height_m, name, address, usage, polygon_json) = row;
+                let (clat, clon, height_m, name, address, usage, polygon_json, id) = row;
+
+                // 레이더 자체 건물 — 안테나 바로 아래 구조물이라 근거리 초대형 실루엣으로 잡힌다
+                if exclude_fac_ids.contains(&id) {
+                    continue;
+                }
 
                 let poly_pts: Option<Vec<[f64; 2]>> = polygon_json
                     .as_deref()
@@ -509,6 +517,10 @@ fn collect_building_obstacles(
     let cos_lat = radar_lat.to_radians().cos().max(0.5);
     let mut results: Vec<BuildingObstacle> = Vec::new();
 
+    // 레이더 자체 건물(레이더가 올라앉은 구조물) 1회 산출 — 티어 전체에 동일 적용.
+    // 안테나 발밑이라 거리 ~0·앙각 극대의 가짜 스카이라인을 만든다.
+    let own_fac_ids = crate::building::radar_own_building_ids(conn, radar_lat, radar_lon);
+
     let tiers: [(f64, f64, f64); 3] = [
         (0.0, 10_000.0, 10.0),
         (10_000.0, 30_000.0, 30.0),
@@ -525,7 +537,7 @@ fn collect_building_obstacles(
         let bb_max_lon = radar_lon + outer_deg_lon;
 
         let (poly_buildings, point_buildings) = query_building_polygons(
-            conn, bb_min_lat, bb_max_lat, bb_min_lon, bb_max_lon, min_h, exclude_manual_ids,
+            conn, bb_min_lat, bb_max_lat, bb_min_lon, bb_max_lon, min_h, exclude_manual_ids, &own_fac_ids,
         );
 
         // ── 폴리곤 건물: 정확한 방위 범위 + 최대 앙각 ──

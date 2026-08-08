@@ -4258,8 +4258,8 @@ export default function TrackMap() {
       : { t: "LoS 양호", c: "#059669", bg: "rgba(5,150,105,.10)" };
     return (
       <>
-        {/* 헤더 */}
-        <div style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb", flexShrink: 0 }}>
+        {/* 헤더 — data-tour: 투어 앵커(드로어 루트는 항상 DOM 에 있어 '열림' 신호가 되지 못함) */}
+        <div data-tour="tm-los-drawer" style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb", flexShrink: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
               <span style={{ fontSize: 13, fontWeight: 700, color: "#1f2937", lineHeight: 1.15 }}>LoS 단면도</span>
@@ -5039,7 +5039,7 @@ export default function TrackMap() {
         <div>
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-gray-400">도구</div>
           <div className="space-y-1.5">
-            <ToolButton icon={Mountain} label="LoS 분석" active={activeTool === "los"} onClick={() => handleToolClick("los")} />
+            <ToolButton icon={Mountain} label="LoS 분석" active={activeTool === "los"} onClick={() => handleToolClick("los")} dataTour="tm-tool-los" />
             <ToolButton icon={Radar} label="커버리지 맵" active={activeTool === "coverage"} onClick={() => handleToolClick("coverage")} />
             <ToolButton icon={Cone} label="BRA 분석" active={activeTool === "bra"} onClick={() => handleToolClick("bra")} />
           </div>
@@ -5110,7 +5110,7 @@ export default function TrackMap() {
 
         {/* 주소검색 건물 상세 카드 — 지반고/높이 입력 + LoS 단면도 진입 + 허용높이 결과 */}
         {addressMarker && (
-          <div className="absolute z-[650]" style={{ top: 52, left: activeTool ? 312 : 8, width: 280 }}>
+          <div data-tour="tm-bldg-card" className="absolute z-[650]" style={{ top: 52, left: activeTool ? 312 : 8, width: 280 }}>
             <div className="rounded-lg border border-gray-200 bg-white/95 shadow-lg backdrop-blur-sm p-2.5 text-xs text-gray-700">
               {/* 헤더: 건물명 + 출처 배지 */}
               <div className="mb-2 flex items-center justify-between gap-2">
@@ -5141,7 +5141,7 @@ export default function TrackMap() {
                 )}
               </div>
               {/* LoS 단면도 버튼 */}
-              <button onClick={handleOpenSimLoS}
+              <button onClick={handleOpenSimLoS} data-tour="tm-bldg-los-btn"
                 className="w-full rounded-md bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#85062e]">
                 LoS 단면도
               </button>
@@ -5155,8 +5155,9 @@ export default function TrackMap() {
                   const braDm = losSimStats.distKm * 1000;
                   const braTopAmslM = radarSite.altitude + radarSite.antenna_height + braDm * Math.tan((braAngleDeg * Math.PI) / 180) + (braDm * braDm) / (2 * 6_371_000);
                   const braExcessM = bTop - braTopAmslM; // 양수=초과, 음수=여유 (지면 클램프 없음)
+                  // data-tour: 결과 블록 투어 앵커 — 아래 3개 분기는 상호 배타라 동시 존재하지 않음
                   return (
-                  <div className="mt-2 space-y-0.5 border-t border-gray-100 pt-2">
+                  <div data-tour="tm-bldg-card-results" className="mt-2 space-y-0.5 border-t border-gray-100 pt-2">
                     <div>LoS 허용높이(지반고포함): <b className="text-gray-900">{losSimStats.allowableTopAmslM.toFixed(1)} m</b></div>
                     <div>
                       {losSimStats.excessM > 0
@@ -5173,10 +5174,10 @@ export default function TrackMap() {
                   </div>
                   );
                 })() : (
-                  <div className="mt-2 border-t border-gray-100 pt-2 text-gray-400">허용높이 계산 중…</div>
+                  <div data-tour="tm-bldg-card-results" className="mt-2 border-t border-gray-100 pt-2 text-gray-400">허용높이 계산 중…</div>
                 )
               ) : (
-                <div className="mt-2 border-t border-gray-100 pt-2 text-[11px] text-gray-400">단면도를 열면 허용높이가 계산됩니다</div>
+                <div data-tour="tm-bldg-card-results" className="mt-2 border-t border-gray-100 pt-2 text-[11px] text-gray-400">단면도를 열면 허용높이가 계산됩니다</div>
               )}
             </div>
           </div>

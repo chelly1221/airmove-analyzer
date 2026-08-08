@@ -503,6 +503,105 @@ pub fn query_building_near_point(
     Ok(None)
 }
 
+/// 레이더점 ↔ 폴리곤 변(선분) 최단거리 (m)
+/// 등거리원통 근사 — 레이더를 원점으로 Δlon 은 cos(lat) 로 축소해 m 로 환산.
+/// 수백 m 스케일(자체 건물 판정)에서 투영 오차는 무시 가능.
+fn point_seg_dist_m(
+    plat: f64,
+    plon: f64,
+    cos_lat: f64,
+    a: (f64, f64), // (lon, lat)
+    b: (f64, f64), // (lon, lat)
+) -> f64 {
+    let ax = (a.0 - plon) * cos_lat * 111_000.0;
+    let ay = (a.1 - plat) * 111_000.0;
+    let bx = (b.0 - plon) * cos_lat * 111_000.0;
+    let by = (b.1 - plat) * 111_000.0;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-12 {
+        // 퇴화 변(중복 꼭짓점) → 점거리
+        return (ax * ax + ay * ay).sqrt();
+    }
+    // 원점(레이더)을 선분에 투영한 파라미터 t = −(A·d)/|d|² 를 [0,1] 로 클램프
+    let t = (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0);
+    let cx = ax + t * dx;
+    let cy = ay + t * dy;
+    (cx * cx + cy * cy).sqrt()
+}
+
+/// 레이더 좌표를 footprint 가 포함하거나 footprint 변까지 5m 이내인 fac 건물 id 목록 — "레이더 자체 건물".
+/// 레이더가 설치된 구조물 자신이 해당 방위 LoS/커버리지/파노라마/BRA 를 가리는 오탐 방지용.
+/// 실측3D blob 행(region='실측3D')과 대장 행이 같은 자리에 겹치면 모두 반환(보통 0~2건).
+/// 조회 실패 시 빈 벡터(제외 없음, fail-open).
+///
+/// id 영속화 없이 매 호출 레이더 좌표로 재판정한다 — fac id 는 재임포트마다 바뀌므로 저장하면 곧 무효.
+pub fn radar_own_building_ids(conn: &Connection, radar_lat: f64, radar_lon: f64) -> Vec<i64> {
+    // 자체 건물 인정 여유 (m) — 4자리 반올림 레거시 좌표(≈11m 격자)가 좁은 타워 footprint 밖으로
+    // 살짝 벗어나는 경우까지 흡수. 인접 동을 잘못 삼키지 않도록 최소값 유지.
+    const SELF_BUF_M: f64 = 5.0;
+    // 사전 필터 250m — footprint 가 centroid 에서 벗어나는 폭(대형 격납고·활주로변 구조물)을 감안.
+    // centroid 인덱스를 그대로 타는 bbox 조회 (코드베이스 공통 관례). 높이 필터는 두지 않는다
+    // (자체 건물은 대장 높이 0/NULL 이거나 실측3D blob 뿐일 수 있음).
+    let buf = 250.0 / 111_000.0;
+
+    let mut ids: Vec<i64> = Vec::new();
+
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, polygon_json FROM fac_buildings
+         WHERE centroid_lat BETWEEN ?1 AND ?2
+           AND centroid_lon BETWEEN ?3 AND ?4",
+    ) else {
+        return ids; // 준비 실패 → 제외 없음(fail-open)
+    };
+
+    let Ok(rows) = stmt.query_map(
+        params![radar_lat - buf, radar_lat + buf, radar_lon - buf, radar_lon + buf],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+    ) else {
+        return ids; // 실행 실패 → 제외 없음(fail-open)
+    };
+
+    let cos_lat = radar_lat.to_radians().cos();
+
+    for row in rows.flatten() {
+        let (id, polygon_json) = row;
+        // polygon_json 은 [[lat,lon],...] 단일 링 (전 코드 공통 관례) → (lon,lat) 로 변환
+        let Some(pts) = polygon_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<[f64; 2]>>(s).ok())
+        else {
+            continue;
+        };
+        if pts.len() < 3 {
+            continue;
+        }
+        let ring: Vec<(f64, f64)> = pts.iter().map(|p| (p[1], p[0])).collect();
+
+        if point_in_polygon_2d(radar_lon, radar_lat, &ring) {
+            ids.push(id);
+            continue;
+        }
+
+        // 포함은 아니지만 변까지 5m 이내면 같은 구조물로 본다
+        let n = ring.len();
+        let mut min_d = f64::INFINITY;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let d = point_seg_dist_m(radar_lat, radar_lon, cos_lat, ring[i], ring[j]);
+            if d < min_d {
+                min_d = d;
+            }
+        }
+        if min_d <= SELF_BUF_M {
+            ids.push(id);
+        }
+    }
+
+    ids
+}
+
 /// LoS 경로(레이더→타겟) 상의 건물 조회
 pub fn query_buildings_along_path(
     conn: &Connection,
@@ -556,6 +655,10 @@ pub fn query_buildings_along_path(
     let n_seg = ((total_dist / SEG_KM).ceil() as usize).max(1);
     let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
+    // 레이더 자체 건물(레이더가 올라앉은 구조물) 제외 목록 — 1회 산출.
+    // 레이더점이 그 footprint 안이라 모든 방위에서 거리 0 차폐로 잡혀 자기 자신을 가린다.
+    let own_ids = radar_own_building_ids(conn, radar_lat, radar_lon);
+
     for s in 0..n_seg {
         let t0 = s as f64 / n_seg as f64;
         let t1 = (s + 1) as f64 / n_seg as f64;
@@ -587,6 +690,12 @@ pub fn query_buildings_along_path(
                 row.map_err(|e| format!("행 읽기 실패: {}", e))?;
             // 인접 세그먼트 bbox 가 buffer 만큼 겹치므로 id 로 중복 제거 (한 건물 1회만 처리)
             if !seen_ids.insert(id) {
+                continue;
+            }
+            // 레이더 자체 건물은 장애물이 아니다 — 아래 "시작점이 폴리곤 내부" 분기에서
+            // hit 0.0 이 들어가 전 방위가 거리 0 에서 차단되는 것을 원천 차단.
+            // (타겟측 포함 판정 total_dist 는 그대로 — 타겟 건물 분석이 그 경로를 쓴다)
+            if own_ids.contains(&id) {
                 continue;
             }
 

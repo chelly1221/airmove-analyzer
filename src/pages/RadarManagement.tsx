@@ -5,12 +5,54 @@ import {
   Trash2,
   Radio,
   MapPin,
+  Building2,
+  Check,
 } from "lucide-react";
 import maplibregl from "maplibre-gl";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { MapboxOverlay } from "@deck.gl/mapbox";
+import { Tile3DLayer } from "@deck.gl/geo-layers";
+import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
 import Modal from "../components/common/Modal";
 import DataTable from "../components/common/DataTable";
 import { useAppStore } from "../store";
-import type { RadarSite } from "../types";
+import type { RadarSite, AddressBuildingHit } from "../types";
+
+/**
+ * 실측 3D 메시 표출 줌 임계 — TrackMap 의 `BUILDINGS_3D_MIN_ZOOM`(=14) 과 같은 값을 이 화면에서
+ * 독립 정의(창·페이지 간 결합 회피). 광역 줌에서 타일셋 전역이 순회·로드 대상이 되는 것을 막는다.
+ */
+const MESH_MIN_ZOOM = 14;
+/** 실측 3D 타일 레이어 id — 클릭 시 GPU 픽(pickObject) 대상 */
+const MESH_LAYER_IDS = ["radar-pick-3dtiles", "radar-pick-3dtiles-cdm"];
+/** 선택 건물 footprint 윤곽선 소스/레이어 id */
+const OUTLINE_SRC = "picked-building-outline";
+const OUTLINE_LAYER = "picked-building-outline-line";
+/** 좌표 선택 지도의 고정 SSE — TrackMap 과 달리 피치 적응 램프 없이 기본값 사용 */
+const MESH_SSE = 8;
+
+/** footprint 링 [[lat,lon],...] → GeoJSON 폴리곤 좌표(경도 우선, 닫힌 링) */
+function ringToCoords(ring: [number, number][]): [number, number][] {
+  const coords: [number, number][] = ring.map(([la, lo]) => [lo, la]);
+  const first = coords[0];
+  const last = coords[coords.length - 1];
+  if (first[0] !== last[0] || first[1] !== last[1]) coords.push([first[0], first[1]]);
+  return coords;
+}
+
+/** 선택 건물 → 윤곽선 GeoJSON (없으면 빈 FeatureCollection) */
+function outlineData(hit: AddressBuildingHit | null) {
+  return {
+    type: "FeatureCollection" as const,
+    features: (hit?.polygons ?? [])
+      .filter((ring) => ring.length >= 3)
+      .map((ring) => ({
+        type: "Feature" as const,
+        properties: {},
+        geometry: { type: "Polygon" as const, coordinates: [ringToCoords(ring)] },
+      })),
+  };
+}
 
 export default function RadarManagement() {
   const customRadarSites = useAppStore((s) => s.customRadarSites);
@@ -31,57 +73,231 @@ export default function RadarManagement() {
   const [rangeNm, setRangeNm] = useState("60");
   const [active, setActive] = useState(true);
   const [pickMode, setPickMode] = useState(false);
+  /** 등록된 실측 3D 타일셋 폴더 (미등록이면 null → 2D 평면 지도 그대로) */
+  const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
+  /** 지도에서 클릭해 선택한 건물 (레이더 위치 지정 후보) */
+  const [pickedBuilding, setPickedBuilding] = useState<AddressBuildingHit | null>(null);
+  /** 선택 건물을 폼에 반영했는지 (카드의 "적용됨" 표시용) */
+  const [pickedApplied, setPickedApplied] = useState(false);
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const markerRef = useRef<maplibregl.Marker | null>(null);
+  /** deck.gl MapboxOverlay 인스턴스 — 클릭 시점 실측 메시 pickObject 용 */
+  const deckOverlayRef = useRef<MapboxOverlay | null>(null);
+  /** onTilesetLoad 로 수집한 Tileset3D 인스턴스(main + cdm 최대 2개) — 줌 게이트 라이브 반영 대상 */
+  const meshTilesetsRef = useRef<any[]>([]);
+  /** 윤곽선 소스·레이어 준비 완료(스타일 load 이후) 여부 */
+  const outlineReadyRef = useRef(false);
+  /** 최신 클릭 시퀀스 — 늦게 도착한 이전 클릭의 건물 조회 응답 무시 */
+  const pickSeqRef = useRef(0);
 
   const latRef = useRef(lat);
   const lonRef = useRef(lon);
   latRef.current = lat;
   lonRef.current = lon;
+  const pickedBuildingRef = useRef(pickedBuilding);
+  pickedBuildingRef.current = pickedBuilding;
+
+  // 등록된 실측 3D 타일셋 폴더 조회 (미등록이면 null 유지 → 메시 오버레이 미부착)
+  useEffect(() => {
+    invoke<string | null>("get_tiles3d_dir")
+      .then(setTiles3dDir)
+      .catch(() => { /* 미등록 */ });
+  }, []);
+
+  /** 마커를 해당 좌표로 이동(없으면 생성) */
+  const placeMarker = (lng: number, latitude: number) => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (markerRef.current) {
+      markerRef.current.setLngLat([lng, latitude]);
+    } else {
+      const marker = new maplibregl.Marker({ color: "#a60739" })
+        .setLngLat([lng, latitude])
+        .addTo(map);
+      // deck MapboxOverlay(overlaid) 캔버스는 maplibre 컨트롤 코너(z-index:2)에 부착돼 HTML 마커
+      // (z-index auto)를 덮는다 — 캔버스 컨테이너가 스태킹 컨텍스트가 아니므로 마커에 3 을 주면
+      // 실측 3D 메시 위에도 마커가 항상 보인다 (AddressSearch 와 동일 계약).
+      marker.getElement().style.zIndex = "3";
+      markerRef.current = marker;
+    }
+  };
 
   useEffect(() => {
     if (!pickMode || !mapContainerRef.current) return;
 
     const parsedLat = parseFloat(latRef.current);
     const parsedLon = parseFloat(lonRef.current);
+    const hasCoord = !isNaN(parsedLat) && !isNaN(parsedLon);
+    // 실측 메시가 등록돼 있고 시작 좌표가 있으면 메시가 곧바로 보이는 근접·기울임 시점으로 시작
+    const meshStart = hasCoord && !!tiles3dDir;
 
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
       style: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-      center: [
-        !isNaN(parsedLon) ? parsedLon : 127.0,
-        !isNaN(parsedLat) ? parsedLat : 36.5,
-      ],
-      zoom: 6,
+      center: [hasCoord ? parsedLon : 127.0, hasCoord ? parsedLat : 36.5],
+      zoom: meshStart ? 16 : 6,
+      pitch: meshStart ? 45 : 0,
     });
+    mapRef.current = map;
 
-    if (!isNaN(parsedLat) && !isNaN(parsedLon)) {
-      markerRef.current = new maplibregl.Marker({ color: "#a60739" })
-        .setLngLat([parsedLon, parsedLat])
-        .addTo(map);
+    if (hasCoord) placeMarker(parsedLon, parsedLat);
+
+    // ── 실측 3D 메시(3D Tiles) 오버레이 ─────────────────────────────────────────
+    // overlaid(MapboxOverlay) 모드 — deck 캔버스가 별도라 maplibre 클릭 이벤트와 충돌 없음.
+    let overlay: MapboxOverlay | null = null;
+    let zoomOk = map.getZoom() >= MESH_MIN_ZOOM;
+    // 최신 게이트 목표값. 타일셋 로드는 비동기라 게이트가 먼저 바뀔 수 있고, 늦게 도착한
+    // 타일셋도 로드 시점에 현재 목표값을 반영해야 초기 1회 과로드를 피한다.
+    const meshTune = { load: zoomOk };
+
+    if (tiles3dDir) {
+      // Tile3DLayer 는 Tileset3D 옵션을 생성자로 전달하지 않아 onTilesetLoad 에서 주입
+      const tuneTileset = (ts: any) => {
+        ts.setProps({
+          debounceTime: 150,
+          memoryAdjustedScreenSpaceError: true,
+          maximumScreenSpaceError: MESH_SSE,
+          loadTiles: meshTune.load,
+        });
+        ts._cacheBytes = 256 * 1024 * 1024;
+        ts._cacheOverflowBytes = 64 * 1024 * 1024;
+        meshTilesetsRef.current.push(ts);
+      };
+      const makeLayers = (visible: boolean) =>
+        MESH_LAYER_IDS.map((id, i) =>
+          new Tile3DLayer({
+            id,
+            // TrackMap 과 동일한 데이터 URL 구성 (tiles3d 커스텀 프로토콜로 로컬 타일셋 서빙)
+            data: convertFileSrc(i === 0 ? "tileset.json" : "tileset_cdm.json", "tiles3d"),
+            loader: Tiles3DLoader,
+            // 줌 게이트 — visible:false 는 드로우만 막고 순회 라이프사이클은 계속 돌기 때문에
+            // 실제 로드 차단은 아래 loadTiles:false 와 페어로만 성립한다(동결 → 캐시 유지).
+            visible,
+            pickable: true, // 클릭 시점 pickObject(메시 표면 좌표)용
+            onTilesetLoad: tuneTileset,
+            onTileError: (err: unknown) => console.warn("실측 3D 타일 로드 실패:", err),
+          }),
+        );
+
+      overlay = new MapboxOverlay({ interleaved: false, layers: makeLayers(zoomOk) });
+      map.addControl(overlay as unknown as maplibregl.IControl);
+      deckOverlayRef.current = overlay;
+
+      // 줌 변화 시 게이트 라이브 반영 — 레이어 재생성(id·data 동일 → deck 이 tileset state 승계)
+      // + 로드된 타일셋 loadTiles 토글. 레이어를 제거하지 않으므로 재진입 시 재요청·재파싱 없음.
+      const applyGate = () => {
+        const ok = map.getZoom() >= MESH_MIN_ZOOM;
+        if (ok === zoomOk) return;
+        zoomOk = ok;
+        meshTune.load = ok;
+        overlay?.setProps({ layers: makeLayers(ok) });
+        for (const ts of meshTilesetsRef.current) {
+          ts.setProps({ maximumScreenSpaceError: MESH_SSE, loadTiles: ok });
+          if (ok) ts.update(); // 게이트 재진입 시 즉시 재순회
+        }
+      };
+      map.on("move", applyGate); // 줌 조작도 move 를 발화시킴
+      map.on("zoom", applyGate);
     }
 
-    map.on("click", (e) => {
-      const { lng, lat: clickLat } = e.lngLat;
-      setLat(clickLat.toFixed(4));
-      setLon(lng.toFixed(4));
-
-      if (markerRef.current) {
-        markerRef.current.setLngLat([lng, clickLat]);
-      } else {
-        markerRef.current = new maplibregl.Marker({ color: "#a60739" })
-          .setLngLat([lng, clickLat])
-          .addTo(map);
-      }
+    // ── 선택 건물 footprint 윤곽선 ────────────────────────────────────────────
+    map.on("load", () => {
+      map.addSource(OUTLINE_SRC, { type: "geojson", data: outlineData(null) });
+      map.addLayer({
+        id: OUTLINE_LAYER,
+        type: "line",
+        source: OUTLINE_SRC,
+        paint: { "line-color": "#a60739", "line-width": 2 },
+      });
+      outlineReadyRef.current = true;
+      // 스타일 로드 전에 선택된 건물이 있으면 즉시 반영
+      const src = map.getSource(OUTLINE_SRC) as maplibregl.GeoJSONSource | undefined;
+      src?.setData(outlineData(pickedBuildingRef.current));
     });
 
-    mapRef.current = map;
+    map.on("click", (e) => {
+      // ① 실측 메시 표출 중이면 GPU 픽 우선 — 화면에 보이는 실측 지붕면을 그대로 클릭 대상으로
+      let lng = e.lngLat.lng;
+      let clickLat = e.lngLat.lat;
+      let meshHit = false;
+      if (overlay) {
+        try {
+          const coord = overlay.pickObject({
+            x: e.point.x,
+            y: e.point.y,
+            layerIds: MESH_LAYER_IDS,
+          })?.coordinate;
+          if (coord) {
+            lng = coord[0];
+            clickLat = coord[1];
+            meshHit = true;
+          }
+        } catch { /* deck 미초기화 등 — 평면 좌표 폴백 */ }
+      }
+
+      // ② 기본 동작(변경 없음): 입력란 좌표 갱신 + 마커 이동
+      setLat(clickLat.toFixed(4));
+      setLon(lng.toFixed(4));
+      placeMarker(lng, clickLat);
+
+      // ③ 클릭 지점 인근 건물 조회 — 내부 포함이거나 메시를 직접 맞춘 경우만 선택 후보로 채택
+      pickSeqRef.current += 1;
+      const seq = pickSeqRef.current;
+      invoke<AddressBuildingHit | null>("find_building_near_point", {
+        lat: clickLat,
+        lon: lng,
+        radiusM: 40,
+      })
+        .then((hit) => {
+          if (seq !== pickSeqRef.current) return; // 이후 클릭이 있었으면 폐기
+          if (hit && (hit.contained || meshHit)) {
+            setPickedBuilding(hit);
+            setPickedApplied(false);
+          } else {
+            setPickedBuilding(null);
+          }
+        })
+        .catch(() => {
+          if (seq === pickSeqRef.current) setPickedBuilding(null);
+        });
+    });
+
     return () => {
       markerRef.current = null;
+      outlineReadyRef.current = false;
+      if (overlay) {
+        try {
+          map.removeControl(overlay as unknown as maplibregl.IControl);
+        } catch { /* 이미 제거됨 */ }
+      }
+      deckOverlayRef.current = null;
+      meshTilesetsRef.current = [];
       map.remove();
+      mapRef.current = null;
     };
-  }, [pickMode]);
+  }, [pickMode, tiles3dDir]);
+
+  // 선택 건물 윤곽선 갱신 (스타일 load 이후에만 — 그 전 선택분은 load 핸들러가 반영)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !outlineReadyRef.current) return;
+    const src = map.getSource(OUTLINE_SRC) as maplibregl.GeoJSONSource | undefined;
+    src?.setData(outlineData(pickedBuilding));
+  }, [pickedBuilding]);
+
+  /** 선택 건물을 레이더 위치로 지정 — 좌표·해발고도·안테나 높이 폼 반영 */
+  const applyPickedBuilding = () => {
+    const b = pickedBuilding;
+    if (!b) return;
+    // centroid 는 소수 6자리로 — 좁은 footprint 안쪽에 좌표가 유지돼야 백엔드 포함 판정(자동 제외)이 성립
+    setLat(b.lat.toFixed(6));
+    setLon(b.lon.toFixed(6));
+    setAlt(b.ground_elev_m.toFixed(1));
+    setAntH((b.height_measured ?? b.height_m).toFixed(1));
+    placeMarker(b.lon, b.lat);
+    setPickedApplied(true);
+  };
 
   const openAdd = () => {
     setEditingSite(undefined);
@@ -93,6 +309,8 @@ export default function RadarManagement() {
     setRangeNm("60");
     setActive(true);
     setPickMode(false);
+    setPickedBuilding(null);
+    setPickedApplied(false);
     setModalOpen(true);
   };
 
@@ -109,6 +327,8 @@ export default function RadarManagement() {
     setRangeNm(site.range_nm?.toString() ?? "60");
     setActive(site.active !== false);
     setPickMode(false);
+    setPickedBuilding(null);
+    setPickedApplied(false);
     setModalOpen(true);
   };
 
@@ -312,7 +532,14 @@ export default function RadarManagement() {
 
           {/* 지도 좌표 선택 */}
           <button
-            onClick={() => setPickMode(!pickMode)}
+            onClick={() => {
+              const next = !pickMode;
+              setPickMode(next);
+              if (!next) {
+                setPickedBuilding(null);
+                setPickedApplied(false);
+              }
+            }}
             className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
               pickMode
                 ? "bg-[#a60739] text-white"
@@ -324,10 +551,61 @@ export default function RadarManagement() {
           </button>
 
           {pickMode && (
-            <div
-              ref={mapContainerRef}
-              className="h-64 w-full rounded-lg overflow-hidden border border-gray-200"
-            />
+            <div className="space-y-2">
+              <div
+                ref={mapContainerRef}
+                className="h-80 w-full rounded-lg overflow-hidden border border-gray-200"
+              />
+              <p className="text-[11px] text-gray-400">
+                {tiles3dDir
+                  ? "줌 14 이상에서 실측 3D 표시 · 우클릭 드래그로 기울이기 · 건물을 클릭하면 레이더 위치로 지정할 수 있습니다"
+                  : "지도를 클릭하여 좌표를 선택하세요 (실측 3D 자료 미등록)"}
+              </p>
+
+              {/* 선택 건물 카드 */}
+              {pickedBuilding && (
+                <div className="space-y-2 rounded-lg border border-gray-200 bg-[#f8f9fa] p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <Building2 size={14} className="shrink-0 text-[#a60739]" />
+                        <span className="truncate text-sm font-medium text-gray-800">
+                          {pickedBuilding.name || "이름 없음"}
+                        </span>
+                        {pickedBuilding.height_measured != null && (
+                          <span className="shrink-0 rounded bg-[#a60739]/10 px-1.5 py-0.5 text-[10px] font-medium text-[#a60739]">
+                            실측
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 text-xs text-gray-500">
+                        {pickedBuilding.usage || "용도 미상"}
+                      </p>
+                      <p className="mt-0.5 font-mono text-xs text-gray-500">
+                        지반고 {pickedBuilding.ground_elev_m.toFixed(1)}m · 높이{" "}
+                        {(pickedBuilding.height_measured ?? pickedBuilding.height_m).toFixed(1)}m
+                      </p>
+                    </div>
+                    {pickedApplied && (
+                      <span className="flex shrink-0 items-center gap-1 rounded bg-green-100 px-1.5 py-0.5 text-[10px] font-medium text-green-700">
+                        <Check size={10} />
+                        적용됨
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    onClick={applyPickedBuilding}
+                    className="w-full rounded-lg bg-[#a60739] px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-[#85062e]"
+                  >
+                    이 건물을 레이더 위치로 지정
+                  </button>
+                  <p className="text-[11px] leading-relaxed text-gray-500">
+                    레이더 좌표가 건물 내부에 있으면 해당 건물은 LoS·커버리지 분석에서 자동
+                    제외됩니다. 안테나 높이는 필요시 조정하세요.
+                  </p>
+                </div>
+              )}
+            </div>
           )}
 
           {/* 고도 / 안테나 */}

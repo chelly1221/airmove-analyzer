@@ -1533,7 +1533,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       <div className="relative">
       {/* GPU 캔버스: 항적 포인트 (SVG 아래에 배치, 범례/툴팁이 위에 표시) */}
       <canvas ref={trackCanvasRef} className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }} />
-      <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full relative"
+      {/* data-tour: 투어 앵커 — 휠 줌 리스너가 이 svg 에 바인딩되므로 하이라이트 링과 실조작 대상이 일치 */}
+      <svg ref={svgRef} data-tour="tm-los-chart" viewBox={`0 0 ${W} ${H}`} className="w-full relative"
         style={{ minHeight: 220, cursor: xZoom[0] !== 0 || xZoom[1] !== 100 ? "grab" : undefined }}
         onMouseMove={handleSvgMouseMove} onMouseLeave={handleSvgMouseLeave} onClick={handleSvgClick}>
         <defs>
@@ -2105,7 +2106,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   };
 
   return (
-    <div className="border-t border-gray-200 bg-white/95 backdrop-blur-sm shadow-lg">
+    <div data-tour="tm-los-panel" className="border-t border-gray-200 bg-white/95 backdrop-blur-sm shadow-lg">
       {/* Header */}
       <div className="flex items-center gap-3 border-b border-gray-200 px-4 py-2">
         <span className="text-xs font-semibold text-gray-800">LoS 단면도</span>
@@ -2124,6 +2125,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           {(Math.abs(xZoom[0] - fitZoom[0]) > 0.5 || Math.abs(xZoom[1] - fitZoom[1]) > 0.5) ? (
             <button
               onClick={() => { xZoomRef.current = fitZoom; setXZoom(fitZoom); }}
+              data-tour="tm-los-zoom-badge"
               className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500 hover:bg-gray-200 transition-colors"
               title="타겟 거리로 줌 리셋"
             >

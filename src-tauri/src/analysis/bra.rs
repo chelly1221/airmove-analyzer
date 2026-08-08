@@ -166,6 +166,10 @@ pub fn analyze_penetration(
         max_lon.floor() as i32,
     );
 
+    // 레이더 자체 건물(레이더가 올라앉은 구조물) — 안테나 발밑이라 원추면 시작점을 항상 뚫는다.
+    // BRA 침범 목록에 자기 자신이 오르는 것을 막는다.
+    let own_ids = crate::building::radar_own_building_ids(conn, radar_lat, radar_lon);
+
     // ── Pass 1: 건물통합정보(fac) 후보 좁히기 — 폴리곤 JSON 미포함 ──
     let mut candidates: Vec<FacCandidate> = Vec::new();
     {
@@ -201,6 +205,10 @@ pub fn analyze_penetration(
             let (id, clat, clon, height_m, measured) =
                 row.map_err(|e| format!("BRA 후보 행 읽기 실패: {}", e))?;
             scanned += 1;
+
+            if own_ids.contains(&id) {
+                continue; // 레이더 자체 건물
+            }
 
             let d_c = enu_dist_m(cos_lat, radar_lat, radar_lon, clat, clon);
             if d_c > d_max + FOOTPRINT_SLACK_M {
