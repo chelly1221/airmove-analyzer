@@ -115,6 +115,21 @@ const WEATHER_COLORS: [number, number, number][] = [
 /** 기상 강도 범례 라벨 */
 const WEATHER_LEVEL_LABELS = ["", "약", "", "중", "", "강", "매우강"];
 
+/** 3D 건물 fill-extrusion 색 표현식.
+ *  meshOn(실측 메시 타일 표출 중)이면 실측 보유 건물 박스를 최우선 분기로 근투명 처리해
+ *  메시가 시각적으로 대신하게 한다("메시 우선"). 나머지 분기는 기존 색 계약 그대로. */
+const fillColorExpr = (meshOn: boolean): any => [
+  "case",
+  // 메시 표출 중 실측 건물 박스는 근투명(rgba alpha 0.02) — 시각적으로 메시가 대신하되,
+  // MapLibre 히트테스트는 기하 기반이라 클릭/호버(건축물정보 팝업)는 그대로 동작
+  ...(meshOn ? [["==", ["get", "measured"], true], "rgba(229,231,235,0.02)"] : []),
+  ["!=", ["get", "group_color"], null],
+  ["get", "group_color"],
+  ["==", ["get", "source"], "fac"],
+  "#e5e7eb",
+  "#ef4444",
+];
+
 /** LoS 분석용 등록 장애물(수동 건물) 선택 — 그룹별 + 이름 검색 */
 function LosObstaclePicker({ buildings, groups, onSelect }: {
   buildings: ManualBuilding[];
@@ -273,10 +288,14 @@ export default function TrackMap() {
   const [buildings3dMode, setBuildings3dMode] = useState(false);
   /** 비활성화된 건물 출처 (건물통합정보/수동 개별 토글) */
   const [hiddenBuildingSources, setHiddenBuildingSources] = useState<Set<string>>(new Set());
-  /** 실측 3D 타일(Cesium 3D Tiles) 표출 토글 — 다른 표시 토글처럼 영속화 없음 */
-  const [showTiles3d, setShowTiles3d] = useState(false);
+  /** 실측 3D 타일(Cesium 3D Tiles) 표출 토글 — 기본 ON.
+   *  타일셋 미등록(tiles3dDir=null)이면 tiles3dDeckLayers 가 빈 배열이라 무해.
+   *  다른 표시 토글처럼 영속화 없음 */
+  const [showTiles3d, setShowTiles3d] = useState(true);
   /** 등록된 실측 3D 타일셋 폴더 (설정 > 건물 데이터에서 buildings_3d.bin 임포트 시 등록) */
   const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
+  /** 실측 메시 실제 표출 중 — 이때 같은 건물의 extrusion 박스는 근투명 처리("메시 우선") */
+  const meshActive = showTiles3d && !!tiles3dDir;
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
   const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
   // 건물 클릭 시 건축물정보 팝업 (로컬 기하 + 로컬 FAC 대장 + 온라인 VWorld)
@@ -1233,14 +1252,7 @@ export default function TrackMap() {
           type: "fill-extrusion",
           source: sourceId,
           paint: {
-            "fill-extrusion-color": [
-              "case",
-              ["!=", ["get", "group_color"], null],
-              ["get", "group_color"],
-              ["==", ["get", "source"], "fac"],
-              "#e5e7eb",
-              "#ef4444",
-            ],
+            "fill-extrusion-color": fillColorExpr(meshActive),
             // base/height 는 지도면(terrain 시 지형 표면) 위 상대 오프셋 — AMSL 지반고(base 프로퍼티)는 팝업 표시용으로만 유지
             "fill-extrusion-height": ["get", "height"],
             "fill-extrusion-base": 0,
@@ -1248,10 +1260,11 @@ export default function TrackMap() {
           },
         });
       }
-      // 레이어 표시 + 채움 투명도 반영
+      // 레이어 표시 + 채움 투명도/색 표현식 반영
       if (map.getLayer(layerId)) {
         map.setLayoutProperty(layerId, "visibility", "visible");
         map.setPaintProperty(layerId, "fill-extrusion-opacity", buildingOpacity);
+        map.setPaintProperty(layerId, "fill-extrusion-color", fillColorExpr(meshActive));
       }
     } else {
       // 3D 모드 아닐 때 레이어 숨김
@@ -1259,7 +1272,7 @@ export default function TrackMap() {
         map.setLayoutProperty(layerId, "visibility", "none");
       }
     }
-  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity]);
+  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive]);
 
   // showBuildings=false 시 fill-extrusion 레이어 제거
   useEffect(() => {

@@ -38,7 +38,7 @@ function minHeight(zoom: number): number {
 
 interface Buildings3DBinaryResult {
   coords: string;      // base64-encoded Float64Array (LE)
-  meta: { name: string | null; usage: string | null; source: string; group_color?: string }[];
+  meta: { name: string | null; usage: string | null; source: string; group_color?: string; measured?: boolean }[];
   count: number;
 }
 
@@ -67,7 +67,7 @@ try{
     var poly=[];
     for(var v=0;v<vc;v++){var vlon=floats[offset++];var vlat=floats[offset++];poly.push([vlat,vlon]);}
     var m=meta[i];
-    buildings.push({lat:lat,lon:lon,height_m:h,ground_elev_m:g,polygon:poly,name:m.name,usage:m.usage,source:m.source,group_color:m.group_color});
+    buildings.push({lat:lat,lon:lon,height_m:h,ground_elev_m:g,polygon:poly,name:m.name,usage:m.usage,source:m.source,group_color:m.group_color,measured:!!m.measured});
   }
   postMessage(buildings);
 }catch(err){postMessage({error:String(err)})}
@@ -360,6 +360,8 @@ export function buildingsToGeoJSON(buildings: Building3D[]): GeoJSON.FeatureColl
         usage: b.usage || "",
         source: b.source,
         group_color: b.group_color || null,
+        // 실측(1m DSM) 보유 여부 — 메시 타일 표출 중 박스를 근투명 처리하는 표현식 조건
+        measured: !!b.measured,
         lat: b.lat,
         lon: b.lon,
       },

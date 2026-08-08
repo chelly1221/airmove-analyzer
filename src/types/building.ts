@@ -35,6 +35,8 @@ export interface Building3D {
   source: string;
   /** 건물 그룹 색상 (수동 건물만, 예: "#ef4444") */
   group_color?: string;
+  /** 실측(1m DSM) 높이 보유 건물 — 메시 타일 표출 시 박스 숨김 대상 */
+  measured?: boolean;
 }
 
 /** 건물통합정보(FAC) 단건 상세 — get_fac_building_detail 결과 (로컬 DB, 오프라인) */

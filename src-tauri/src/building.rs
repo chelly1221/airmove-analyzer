@@ -796,6 +796,8 @@ pub struct Building3DMeta {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_color: Option<String>,
+    /// 실측(1m DSM) 데이터 보유 건물 — 실측 3D 메시 타일 표출 시 박스 숨김 대상
+    pub measured: bool,
 }
 
 /// Binary 패킹된 3D 건물 데이터
@@ -883,7 +885,7 @@ pub fn query_buildings_3d_binary(
             }
 
             metas.push(Building3DMeta {
-                name, usage: None, source: "manual".to_string(), group_color,
+                name, usage: None, source: "manual".to_string(), group_color, measured: false,
             });
         }
     }
@@ -892,7 +894,8 @@ pub fn query_buildings_3d_binary(
     if !skip_fac {
         // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 3D 건물 렌더 높이/필터/정렬 모두 동일 기준.
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, usability, polygon_json, COALESCE(ground_elev, 0)
+            "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, usability, polygon_json, COALESCE(ground_elev, 0),
+                    (height_measured IS NOT NULL OR region = '실측3D')
              FROM fac_buildings
              WHERE centroid_lat BETWEEN ?1 AND ?2
                AND centroid_lon BETWEEN ?3 AND ?4
@@ -913,11 +916,12 @@ pub fn query_buildings_3d_binary(
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, f64>(6)?,
+                        row.get::<_, bool>(7)?,
                     ))
                 },
             ) {
                 for row in rows {
-                    let (lat, lon, height, name, usage, poly_json, ground_elev) = match row {
+                    let (lat, lon, height, name, usage, poly_json, ground_elev, measured) = match row {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
@@ -939,7 +943,7 @@ pub fn query_buildings_3d_binary(
                     }
 
                     metas.push(Building3DMeta {
-                        name, usage, source: "fac".to_string(), group_color: None,
+                        name, usage, source: "fac".to_string(), group_color: None, measured,
                     });
                 }
             }
