@@ -474,6 +474,14 @@ pub fn clear_panorama_cache(
     Ok(())
 }
 
+/// 파노라마 캐시 전건 삭제 — 건물 데이터(실측/GIS) 임포트·삭제 시 호출.
+/// 캐시 키(레이더 좌표·높이·알고리즘 버전)에 건물 데이터 세대가 없어
+/// 건물 높이가 바뀌면 모든 레이더의 캐시가 무효하다 (건물 데이터는 전역).
+pub fn clear_panorama_cache_all(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM panorama_cache", [])?;
+    Ok(())
+}
+
 // ========== 커버리지 캐시 ==========
 
 /// 커버리지 캐시 저장

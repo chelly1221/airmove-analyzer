@@ -1387,6 +1387,9 @@ async fn import_fac_building_data(
         let _ = handle.emit("fac-building-import-progress", progress);
     })?;
 
+    // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+    let _ = db::clear_panorama_cache_all(&conn);
+
     Ok(format!("{} 건물통합정보 {}건 임포트 완료", region_clone, count))
 }
 
@@ -1412,7 +1415,10 @@ async fn clear_fac_building_data(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        fac_building::clear_data(&conn, region.as_deref())
+        fac_building::clear_data(&conn, region.as_deref())?;
+        // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+        let _ = db::clear_panorama_cache_all(&conn);
+        Ok(())
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1433,9 +1439,12 @@ async fn import_measured_buildings(
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
         let handle = app_handle.clone();
-        measured_building::import_from_bin(&conn, &mut srtm, &bin_path, &|progress| {
+        let summary = measured_building::import_from_bin(&conn, &mut srtm, &bin_path, &|progress| {
             let _ = handle.emit("measured-building-import-progress", progress);
-        })
+        })?;
+        // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+        let _ = db::clear_panorama_cache_all(&conn);
+        Ok(summary)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1447,7 +1456,10 @@ async fn clear_measured_buildings(app_handle: tauri::AppHandle) -> Result<(), St
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        measured_building::clear_measured(&conn)
+        measured_building::clear_measured(&conn)?;
+        // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+        let _ = db::clear_panorama_cache_all(&conn);
+        Ok(())
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
