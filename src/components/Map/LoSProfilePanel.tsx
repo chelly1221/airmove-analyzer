@@ -70,8 +70,14 @@ interface Props {
    *  차트 렌더에는 전혀 영향 없음 — chartData 확정 후 별도 useEffect 에서 프레임 역변환만 수행. */
   onCurtainData?: (data: LosCurtainSample[] | null) => void;
   /** 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강). 로딩 중엔 직전 값 유지.
-   *  all = 드로어 리스트용 전체 목록 — 경로 통과 건물 전수(isBlocking 플래그 포함). */
-  onPathBuildings?: (d: { target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null) => void;
+   *  all = 드로어 리스트용 전체 목록 — 경로 통과 건물 전수(isBlocking 플래그 포함).
+   *  peaks = 4/3 현을 관통하는 지형 봉우리(산) — 드로어 차단 장애물 리스트 전용(지도 하이라이트 없음). */
+  onPathBuildings?: (d: {
+    target: BuildingOnPath | null;
+    blocking: BuildingOnPath[];
+    all: (BuildingOnPath & { isBlocking: boolean })[];
+    peaks: { name: string | null; distance_km: number; lat: number; lon: number; elevation_m: number; excess_m: number }[];
+  } | null) => void;
 }
 
 
@@ -109,6 +115,9 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<ElevationPoint[]>([]);
   const [peakNames, setPeakNames] = useState<Map<number, string>>(new Map());
+  // 차단 봉우리 이름 (프로파일 idx → 이름) — 최저탐지선을 꺾는 dominant 1개만 담는 peakNames 와 별도 경로.
+  //   4/3 현을 관통하는 산 전부(최대 20개)를 차트 빨강 라벨·드로어 리스트에 표시하기 위한 조회 결과
+  const [blockingPeakNames, setBlockingPeakNames] = useState<Map<number, string>>(new Map());
   const [buildings, setBuildings] = useState<BuildingOnPath[]>([]);
   const [showBuildingsInternal, setShowBuildingsInternal] = useState(true);
   const showBuildings = showBuildingsProp ?? showBuildingsInternal;
@@ -655,6 +664,52 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       }
     }
 
+    // ── 차단 봉우리(산) 전수 산출 — 차트 빨강 마커·드로어 차단 장애물 리스트용 ──
+    //   maxBlockPoint 는 최대 초과 1점뿐이라 여러 능선이 현을 관통해도 하나만 보였다.
+    //   판정 프레임은 위 건물 차단과 동일한 4/3 현(chord43H) — 신규 식 없음.
+    //   장애물 집합은 '순수 지형'만(profile.elevation): 건물 유효고를 섞으면 건물 차단이
+    //   산으로 중복 계상되므로, 건물은 기존 pathBuildings 경로가 단독으로 담당한다.
+    //   excess>0 연속 런마다 초과 최대점 1개를 그 능선의 대표 봉우리로 채택.
+    const blockingPeaks: {
+      idx: number; distance: number; lat: number; lon: number;
+      realElevation: number; excessM: number; adjHeight: number;
+    }[] = [];
+    {
+      let runIdx = -1;   // 현재 런의 최대 초과점 프로파일 인덱스
+      let runExcess = 0; // 그 지점의 초과량(m)
+      const flushRun = () => {
+        if (runIdx < 0) return;
+        const p = profile[runIdx];
+        blockingPeaks.push({
+          idx: runIdx,
+          distance: p.distance,
+          lat: p.latitude,
+          lon: p.longitude,
+          realElevation: p.elevation,
+          excessM: runExcess,
+          // 마커 y 좌표는 차트 디스플레이(실제지구) 프레임 — maxBlockPoint.adjHeight 와 동일 규약
+          adjHeight: p.elevation - curvDrop(p.distance),
+        });
+        runIdx = -1;
+        runExcess = 0;
+      };
+      for (let i = 0; i < profile.length; i++) {
+        const p = profile[i];
+        if (p.distance <= 0 || p.distance >= D) { flushRun(); continue; }
+        const excess = (p.elevation - curvDrop43(p.distance)) - chord43H(p.distance);
+        if (excess > 0) {
+          if (runIdx < 0 || excess > runExcess) { runIdx = i; runExcess = excess; }
+        } else flushRun();
+      }
+      flushRun();
+      // 들쭉날쭉한 지형에서 런이 과다 분할될 때 방어 — 초과량 상위 20개만 남기고 거리순 복원
+      if (blockingPeaks.length > 20) {
+        blockingPeaks.sort((a, b) => b.excessM - a.excessM);
+        blockingPeaks.splice(20);
+        blockingPeaks.sort((a, b) => a.distance - b.distance);
+      }
+    }
+
     // 이름이 있는 모든 산 (차트에 표시용)
     const namedPeaks: { idx: number; distance: number; adjHeight: number; realElevation: number; name: string }[] = [];
     for (const [idx, name] of peakNames.entries()) {
@@ -824,6 +879,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       blocked,
       maxBlockPoint,
       namedPeaks,
+      blockingPeaks,
       pathBuildings,
       searchedBldgIdx,
       minY,
@@ -834,6 +890,40 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       sim, // 주소검색 건물 시뮬레이션 결과 (계산 전용, 렌더 미사용)
     };
   }, [profile, radarHeight, totalDist, profileMaxKm, peakNames, buildings, showBuildings, searchedAddress, fresnelClearance, simBuilding]);
+
+  // ── 차단 봉우리 이름 조회 (로컬 peak DB) ──
+  //   dominant 1개만 조회하는 위 peakNames 경로와 독립 — 이쪽은 차단 판정된 봉우리 전부(≤20개).
+  //   봉우리 idx 목록이 바뀔 때만 재조회하고, 전부 끝난 뒤 새 Map 으로 통째 교체(이전 타겟 잔류 방지).
+  //   결과가 없거나 실패한 idx 는 미수록 — 라벨/리스트에서 "무명봉" 폴백.
+  //   키에 좌표를 함께 넣는 이유: 타겟이 바뀌어도 프로파일 idx 목록만 우연히 같으면 이전 타겟의
+  //   산 이름이 남는다(idx 는 프로파일 상대 인덱스라 타겟마다 가리키는 지점이 다름).
+  const blockingPeakKey = (chartData?.blockingPeaks ?? [])
+    .map((p) => `${p.idx}@${p.lat.toFixed(4)},${p.lon.toFixed(4)}`).join(",");
+  useEffect(() => {
+    const peaks = chartData?.blockingPeaks ?? [];
+    if (peaks.length === 0) {
+      setBlockingPeakNames((prev) => (prev.size === 0 ? prev : new Map()));
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const names = new Map<number, string>();
+      for (const pk of peaks) {
+        if (cancelled) return;
+        try {
+          const found = await invoke<NearbyPeak[]>("query_nearby_peaks", {
+            lat: pk.lat, lon: pk.lon, radiusKm: 3.0,
+          });
+          const nm = found[0]?.name;
+          if (nm) names.set(pk.idx, nm);
+        } catch {
+          // 산 이름 조회 실패 - 비치명적(무명봉으로 표시)
+        }
+      }
+      if (!cancelled) setBlockingPeakNames(names);
+    })();
+    return () => { cancelled = true; };
+  }, [blockingPeakKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 차단 여부 + 건물 차단/비차단 수를 상위(드로어)로 보고
   useEffect(() => {
@@ -957,8 +1047,17 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const idx = chartData.searchedBldgIdx;
     const target = idx != null ? (list[idx] ?? null) : null;
     const blocking = list.filter((b) => b.isBlocking && b !== target);
-    emit({ target, blocking, all: list });
-  }, [chartData, loading]);
+    // 차단 봉우리(산) — 리스트 표시 전용. 이름은 늦게 도착할 수 있어 blockingPeakNames 갱신 시 재방출
+    const peaks = chartData.blockingPeaks.map((p) => ({
+      name: blockingPeakNames.get(p.idx) ?? null,
+      distance_km: p.distance,
+      lat: p.lat,
+      lon: p.lon,
+      elevation_m: p.realElevation,
+      excess_m: p.excessM,
+    }));
+    emit({ target, blocking, all: list, peaks });
+  }, [chartData, loading, blockingPeakNames]);
 
   // ── Y축 가시 범위 자동조정 (줌인 시 보이는 구간의 데이터만 기준) ──
   const visibleYRange = useMemo(() => {
@@ -1362,8 +1461,10 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (!chartData || !visibleYRange) return null;
     const {
       adjTerrain, minDetStraight, minDetFresnel, braLine, cosLine,
-      maxBlockPoint, maxDistance,
+      maxBlockPoint, maxDistance, blockingPeaks,
     } = chartData;
+    // 차단 봉우리는 아래에서 빨강으로 그리므로, 같은 idx 의 namedPeaks(주황) 렌더는 생략 — 이중 라벨 방지
+    const blockingPeakIdxSet = new Set(blockingPeaks.map((p) => p.idx));
     const { minY, maxY } = visibleYRange;
 
     const zoomStart = (xZoom[0] / 100) * maxDistance;
@@ -1649,6 +1750,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
         {/* 이름 있는 산들 */}
         {chartData.namedPeaks.map((peak, i) => {
+          if (blockingPeakIdxSet.has(peak.idx)) return null; // 차단 봉우리는 아래 빨강 렌더가 담당
           const isMaxBlock = maxBlockPoint && Math.abs(peak.distance - maxBlockPoint.distance) < 0.5;
           return (
             <g key={`peak-${i}`}>
@@ -1668,6 +1770,36 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
             </g>
           );
         })}
+
+        {/* 차단 봉우리(산) — 4/3 현을 관통하는 지형. 색은 차단=빨강 계약(건물 차단·지도와 동일).
+            라벨은 namedPeaks 와 동일하게 표시영역 최하단 고정(Y줌 무관) */}
+        {(() => {
+          let lastLabelX = -Infinity;
+          return blockingPeaks.map((peak, i) => {
+            const cx = xScale(peak.distance);
+            // 라벨 겹침 방지 — 직전 라벨과 60px 미만이면 마커만 그리고 라벨 생략
+            const showLabel = cx - lastLabelX >= 60;
+            if (showLabel) lastLabelX = cx;
+            return (
+              <g key={`bpeak-${i}`}>
+                <circle
+                  cx={cx}
+                  cy={yScale(peak.adjHeight)}
+                  r={3.5}
+                  fill="#ef4444"
+                  stroke="white" strokeWidth={1} />
+                {showLabel && (
+                  <text
+                    x={cx}
+                    y={PAD.top + ch - 5}
+                    textAnchor="middle" fill="#ef4444" fontSize={9} fontWeight="bold">
+                    {`${blockingPeakNames.get(peak.idx) ?? "무명봉"} (${Math.round(peak.realElevation * M_TO_FT).toLocaleString()}ft)`}
+                  </text>
+                )}
+              </g>
+            );
+          });
+        })()}
 
         {/* 사용자 조절 각도선 */}
         {showCustomAngle && (() => {

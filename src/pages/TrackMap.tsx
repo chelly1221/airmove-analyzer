@@ -110,9 +110,6 @@ function buildingFootprintVertices(b: ManualBuilding): [number, number][] {
   }
 }
 
-/** 기상 강도 범례 라벨 */
-const WEATHER_LEVEL_LABELS = ["", "약", "", "중", "", "강", "매우강"];
-
 /** [r,g,b] → #rrggbb (input[type=color] value용) */
 const rgbToHex = ([r, g, b]: [number, number, number]): string =>
   "#" + [r, g, b].map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("");
@@ -270,6 +267,17 @@ function LosObstaclePicker({ buildings, groups, onSelect }: {
       )}
     </div>
   );
+}
+
+/** LoS 단면도가 방출하는 차단 지형 봉우리(산) — 드로어 차단 장애물 리스트 전용.
+ *  건물과 달리 footprint 가 없어 지도 하이라이트 대상이 아님 (LoSProfilePanel onPathBuildings.peaks) */
+interface LosBlockingPeak {
+  name: string | null;
+  distance_km: number;
+  lat: number;
+  lon: number;
+  elevation_m: number;
+  excess_m: number;
 }
 
 interface TrackPath {
@@ -470,7 +478,8 @@ export default function TrackMap() {
   const [braLoading, setBraLoading] = useState(false);
   const [braError, setBraError] = useState<string | null>(null);
   /** 원추면 표시 반경 (km) — 표출 전용, 판정 반경(레이더 제원)과 무관. 미영속. */
-  const [braConeRadiusKm, setBraConeRadiusKm] = useState(30);
+  const [braConeRadiusKm, setBraConeRadiusKm] = useState(10);
+  const [braConeOpacity, setBraConeOpacity] = useState(0.2); // 원추면 채움 불투명도 (기본 0.2 ≈ 종전 고정 알파 45/255)
   /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
   const braReqSeq = useRef(0);
   // ── 표시 설정 드로어 (우측 도킹) — 건물 / 기상 ──
@@ -517,7 +526,8 @@ export default function TrackMap() {
   const [losCurtain, setLosCurtain] = useState<LosCurtainSample[] | null>(null);
   // 단면도 경로상 건물 — 대상(파랑)/차단(빨강) 지도 하이라이트. LoSProfilePanel onPathBuildings 수신
   //   all = 드로어 리스트 입력용 전체 목록(경로 통과 건물 전수). 리스트는 차단만 필터해 표시
-  const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null>(null);
+  //   peaks = 4/3 현을 관통하는 지형 봉우리(산) — 리스트에만 병합 표시(지도 하이라이트 대상 아님)
+  const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[]; peaks: LosBlockingPeak[] } | null>(null);
   // 건물모드 방위 한계 — 건물 양끝 방위(offset 도메인, 0/360 랩 안전). launchBuildingLoS valid 시 설정
   const [losBldgAzBounds, setLosBldgAzBounds] = useState<{ center: number; minOff: number; maxOff: number } | null>(null);
   // 건물모드 3탭(좌끝/중앙/우끝) 활성 인덱스 — 지도 방위 마커 강조 동기 (LoSProfileTabs onActiveViewChange 수신)
@@ -2618,16 +2628,12 @@ export default function TrackMap() {
     if (curtain) {
       const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
       // 커튼 천장(ceilM) — CoS 보완면의 상단이자 CoS 상단선 절단 기준.
-      //   CoS(70°) 선은 20km 에서 5만 m 를 넘게 발산하므로 천장 산출에서 제외하고, 나머지 컨텐츠
-      //   최대고(지형·4/3 LoS·프레넬·BRA) 위로 고저차의 15%(최소 200m) 여유를 얹는다.
-      let ceilContent = -Infinity;
-      let ceilMinTerrain = Infinity;
-      for (const s of curtain) {
-        const m = Math.max(s.terrainM, s.los43M, s.fresnelM, s.braM);
-        if (m > ceilContent) ceilContent = m;
-        if (s.terrainM < ceilMinTerrain) ceilMinTerrain = s.terrainM;
-      }
-      const ceilM = ceilContent + Math.max(200, (ceilContent - ceilMinTerrain) * 0.15);
+      //   커버리지 상한(COVERAGE_MAX_ALT_FT=30,000ft) 고정 — 3D 침묵원추(cosDeckLayers)·커버리지 맵과
+      //   표시 스코프를 통일해 CoS 상단선 절단점이 3D 원추 림과 일치한다(종전 컨텐츠 최대고+15% 가변
+      //   천장 → 고정 천장, 2026-08-08). 컨텐츠 선(los43 등)이 장거리에서 천장을 넘는 구간은 CoS 보완면
+      //   quad 가 top=max(ceilM, bottom) 상향 클램프로 퇴화(skip)해 자연 소멸 — refined 가 상수 ceilM
+      //   (cos top)과 컨텐츠 선의 교차점도 분할하므로 스파이크 삼각형은 생기지 않는다.
+      const ceilM = COVERAGE_MAX_ALT_FT * 0.3048; // 30,000ft → m (AMSL)
       // 라인별 PathLayer 빌더 — positions [lon, lat, hM·EX], widthUnits pixels
       const pushCurtainLine = (
         id: string,
@@ -3385,7 +3391,7 @@ export default function TrackMap() {
         id: "bra-cone",
         data: coneFaces,
         getPolygon: (d) => d.polygon,
-        getFillColor: [34, 211, 238, 45], // LOS_LAYERS bra 색(#22d3ee) 반투명
+        getFillColor: [34, 211, 238, Math.round(braConeOpacity * 255)], // LOS_LAYERS bra 색(#22d3ee) × 사용자 불투명도
         filled: true,
         extruded: false,
         _full3d: true,   // 경사 폴리곤 필수 — 미지정 시 2D 테셀레이터가 퇴화
@@ -3467,7 +3473,7 @@ export default function TrackMap() {
     }
 
     return layers;
-  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
+  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
@@ -4295,29 +4301,64 @@ export default function TrackMap() {
             </button>
           </div>
 
-          {/* LoS 차단 건물 — 출처: LoSProfilePanel chartData.pathBuildings → onPathBuildings.all
-              (경로 통과 건물 전수) 중 차단(isBlocking)만 필터해 표시.
+          {/* LoS 차단 장애물 — 출처: LoSProfilePanel chartData.pathBuildings → onPathBuildings.all
+              (경로 통과 건물 전수) 중 차단(isBlocking)인 건물 + 4/3 현을 관통하는 지형 봉우리(peaks)를
+              거리 오름차순으로 병합해 한 리스트로 표시.
               색 계약은 지도/차트와 동일: 대상=파랑(#3b82f6) · 차단=빨강(#ef4444). */}
           {(() => {
             const list = losPathBldgs?.all ?? [];
             const target = losPathBldgs?.target ?? null;
-            // 차단 건물만, 거리 오름차순 (filter 가 새 배열 — 원본 mutate 없음)
-            const sorted = list.filter((b) => b.isBlocking).sort((a, b) => a.distance_km - b.distance_km);
+            const peaks = losPathBldgs?.peaks ?? [];
+            // 차단 건물 + 차단 봉우리를 거리 오름차순 병합 (원본 mutate 없이 새 배열 구성)
+            type Row =
+              | { kind: "bldg"; dist: number; b: BuildingOnPath & { isBlocking: boolean } }
+              | { kind: "peak"; dist: number; p: LosBlockingPeak };
+            const rows: Row[] = [];
+            for (const b of list) if (b.isBlocking) rows.push({ kind: "bldg", dist: b.distance_km, b });
+            for (const p of peaks) rows.push({ kind: "peak", dist: p.distance_km, p });
+            rows.sort((a, b) => a.dist - b.dist);
+            // 산 행은 건물 표시 토글과 무관하게 계산되므로, 1건이라도 있으면 리스트를 보여준다
             const empty = !losTarget ? "분석 지점을 선택하세요"
+              : rows.length > 0 ? null
               : !losShowBuildings ? "건물 표시를 켜면 목록이 계산됩니다"
-              : sorted.length === 0 ? "LoS 차단 건물 없음"
-              : null;
+              : "LoS 차단 장애물 없음";
             return (
               <div style={{ padding: "9px 11px", flex: 1, minHeight: 150, display: "flex", flexDirection: "column" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
-                  <span style={{ ...micro, flex: 1, minWidth: 0 }}>Blocking Buildings · LoS 차단 건물</span>
-                  <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>차단 {sorted.length}</span>
+                  <span style={{ ...micro, flex: 1, minWidth: 0 }}>Blocking Obstacles · LoS 차단 장애물</span>
+                  <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>차단 {rows.length}</span>
                 </div>
                 {empty ? (
                   <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", fontSize: 10, color: "#9ca3af" }}>{empty}</div>
                 ) : (
                   <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
-                    {sorted.map((b) => {
+                    {rows.map((r) => {
+                      // ── 산(지형 봉우리) 행 — footprint 가 없어 지도 하이라이트 없이 클릭 이동만 ──
+                      if (r.kind === "peak") {
+                        const p = r.p;
+                        return (
+                          <div key={`peak-${p.lat},${p.lon}`}
+                            onClick={() => {
+                              const map = mapRef.current?.getMap();
+                              if (map) map.easeTo({ center: [p.lon, p.lat], zoom: Math.max(map.getZoom(), 13), duration: 600 });
+                            }}
+                            onMouseEnter={(e) => (e.currentTarget.style.background = "#f9fafb")}
+                            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                            style={{ padding: "4px 5px", borderRadius: 4, cursor: "pointer" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ width: 6, height: 6, borderRadius: 3, background: "#ef4444", flexShrink: 0 }} />
+                              <span style={{ fontSize: 10.5, fontWeight: 600, color: "#374151", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {p.name ?? "무명봉"}
+                              </span>
+                              <span style={{ ...num, fontSize: 9.5, color: "#6b7280", flexShrink: 0 }}>{(p.distance_km / 1.852).toFixed(1)}NM</span>
+                            </div>
+                            <div style={{ fontSize: 9, color: "#9ca3af", paddingLeft: 12 }}>
+                              표고 {Math.round(p.elevation_m)}m AMSL · 초과 +{p.excess_m.toFixed(p.excess_m >= 10 ? 0 : 1)}m · 산
+                            </div>
+                          </div>
+                        );
+                      }
+                      const b = r.b;
                       const dot = b === target ? "#3b82f6" : "#ef4444";
                       return (
                         <div key={`${b.lat},${b.lon},${b.distance_km}`}
@@ -4413,7 +4454,14 @@ export default function TrackMap() {
                 <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>원추 표시 반경</span>
                 <span style={{ ...num, fontSize: 10, color: "#22d3ee" }}>{braConeRadiusKm}km</span>
               </div>
-              <DsSlider value={braConeRadiusKm} min={5} max={100} step={5} onChange={setBraConeRadiusKm} color="#22d3ee" />
+              <DsSlider value={braConeRadiusKm} min={1} max={10} step={1} onChange={setBraConeRadiusKm} color="#22d3ee" />
+            </div>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>원추 불투명도</span>
+                <span style={{ ...num, fontSize: 10, color: "#22d3ee" }}>{Math.round(braConeOpacity * 100)}%</span>
+              </div>
+              <DsSlider value={braConeOpacity} min={0.05} max={1} step={0.05} onChange={setBraConeOpacity} color="#22d3ee" />
             </div>
             <button
               onClick={runBraAnalysis} disabled={braLoading}
@@ -4600,7 +4648,7 @@ export default function TrackMap() {
                       style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer", padding: 0, border: "none" }}
                     />
                   </div>
-                  <span style={{ fontSize: 8, color: "#9ca3af" }}>{WEATHER_LEVEL_LABELS[lv] || lv}</span>
+                  <span style={{ fontSize: 8, color: "#9ca3af" }}>{lv}</span>
                 </div>
               ))}
             </div>

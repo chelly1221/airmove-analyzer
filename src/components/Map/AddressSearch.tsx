@@ -33,10 +33,13 @@ function manualToResult(b: ManualBuilding): AddressResult {
   };
 }
 
-/** 주소 마커 (MapGL 내부에 렌더링) */
+/** 주소 마커 (MapGL 내부에 렌더링).
+ *  zIndex 3 — deck MapboxOverlay(overlaid) 캔버스는 maplibre 컨트롤 코너(.maplibregl-ctrl-*, z-index:2)에
+ *  부착되어 HTML 마커(z-index auto)를 덮는다. 캔버스 컨테이너는 스태킹 컨텍스트가 아니므로 마커에
+ *  z-index 3 을 주면 실측 3D 메시·LoS 커튼 등 deck 3D 표출 위에 아이콘/툴팁이 항상 보인다. */
 export function AddressMarker({ marker, onClose }: { marker: { lat: number; lon: number; label: string }; onClose: () => void }) {
   return (
-    <Marker longitude={marker.lon} latitude={marker.lat} anchor="bottom">
+    <Marker longitude={marker.lon} latitude={marker.lat} anchor="bottom" style={{ zIndex: 3 }}>
       <div className="flex flex-col items-center">
         <div className="relative mb-1 max-w-[200px] rounded-md bg-white/95 px-2 py-1 text-[10px] leading-tight text-gray-700 shadow-lg backdrop-blur-sm border border-gray-200">
           <div className="line-clamp-2">{marker.label}</div>
