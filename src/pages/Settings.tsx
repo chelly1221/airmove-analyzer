@@ -549,13 +549,6 @@ export function FacBuildingDataSection() {
   const [zipImporting, setZipImporting] = useState(false);
   const [zipResult, setZipResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
-  // ─── 실측 3D 건물 (1m DSM) — buildings_3d.bin 임포트 + 3D 타일셋 폴더 ───
-  const [measuredImporting, setMeasuredImporting] = useState(false);
-  const [measuredProgress, setMeasuredProgress] = useState<{ total: number; processed: number; status: string } | null>(null);
-  const [measuredResult, setMeasuredResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
-  const [measuredDeleteConfirm, setMeasuredDeleteConfirm] = useState(false);
-
   const handleDownload = async () => {
     await startFacDownload();
     await loadStatus();
@@ -593,6 +586,241 @@ export function FacBuildingDataSection() {
       setZipImporting(false);
     }
   };
+
+  // 다운로드 완료 감지 → 테이블 갱신
+  const prevDownloading = useRef(facDownloading);
+  useEffect(() => {
+    if (prevDownloading.current && !facDownloading && facResult?.type === "success") {
+      loadStatus();
+    }
+    prevDownloading.current = facDownloading;
+  }, [facDownloading]);
+
+  const loadStatus = async () => {
+    try {
+      const status = await invoke<FacBuildingImportStatus[]>("get_fac_building_import_status");
+      setImportStatus(status);
+    } catch {
+      // 무시
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadStatus();
+  }, []);
+
+  const handleClear = async (regionKey: string) => {
+    try {
+      await invoke("clear_fac_building_data", { region: regionKey });
+      setDeleteConfirm(null);
+      await loadStatus();
+    } catch (e) {
+      console.warn("삭제 실패:", e);
+    }
+  };
+
+  /** 실측3D 행은 별도 섹션(MeasuredBuildingDataSection)이 표시 — 이중 표시 방지 위해 제외 */
+  const facStatus = importStatus.filter((s) => s.region !== "실측3D");
+
+  const totalRecords = facStatus.reduce((sum, s) => sum + s.record_count, 0);
+  const latestImport = facStatus.length > 0
+    ? Math.max(...facStatus.map((s) => s.imported_at))
+    : 0;
+
+  const facHasExtra = (facDownloading && facProgress) || facResult || zipResult || (!loading && facStatus.length > 0);
+  const isCollapsible = !loading && totalRecords > 0 && !facDownloading && !zipImporting;
+  const isExpanded = !isCollapsible || !collapsed;
+
+  return (
+    <div className={`px-5 py-[13px] ${isCollapsible ? "cursor-pointer select-none" : ""}`} onClick={(e) => { if (isCollapsible && !(e.target as HTMLElement).closest("button, a")) setCollapsed((c) => !c); }}>
+      <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
+        <div
+          className="flex items-center gap-2"
+        >
+          {isCollapsible && (
+            <ChevronDown
+              size={14}
+              className={`text-gray-400 shrink-0 transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`}
+            />
+          )}
+          <Building2 size={16} className="text-[#a60739] shrink-0" />
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">건물 데이터 (건물통합정보)</h2>
+        </div>
+        <div className="flex items-center gap-2 min-w-0">
+          {!loading && totalRecords > 0 ? (
+            <>
+              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {totalRecords.toLocaleString()}건</span>
+              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{new Date(latestImport * 1000).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\.$/, "")}</span>
+            </>
+          ) : (
+            <span className="text-xs text-gray-400">F_FAC_BUILDING SHP · 3D 건물 시각화</span>
+          )}
+          <a
+            href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EA%B1%B4%EB%AC%BC%ED%86%B5%ED%95%A9%EC%A0%95%EB%B3%B4&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30524&listPageIndex=1"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-0.5 text-xs text-blue-500 hover:text-blue-700 transition-colors shrink-0"
+            onClick={(e) => {
+              e.preventDefault();
+              import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
+                openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EA%B1%B4%EB%AC%BC%ED%86%B5%ED%95%A9%EC%A0%95%EB%B3%B4&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30524&listPageIndex=1")
+              );
+            }}
+          >
+            <ExternalLink size={11} />
+            vworld
+          </a>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleZipImport}
+            disabled={zipImporting || facDownloading}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Upload size={13} />
+            {zipImporting ? "임포트 중..." : "ZIP 가져오기"}
+          </button>
+          <button
+            onClick={handleDownload}
+            disabled={facDownloading || zipImporting}
+            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {facDownloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+            {facDownloading ? "다운로드 중..." : "다운로드"}
+          </button>
+        </div>
+      </div>
+
+      {facHasExtra && isExpanded && (
+        <div className="mt-3 space-y-2" onClick={(e) => e.stopPropagation()}>
+          {facDownloading && facProgress && (
+            <div className="space-y-1">
+              <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#a60739] transition-all duration-300"
+                  style={{
+                    width: `${Math.round((facProgress.current / facProgress.total) * 100)}%`,
+                  }}
+                />
+              </div>
+              <p className="text-xs text-gray-500">{facProgress.message}</p>
+            </div>
+          )}
+
+          {facResult && !facDownloading && (
+            <div
+              className={`rounded-lg px-3 py-2 text-xs ${
+                facResult.type === "success"
+                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                  : "bg-red-50 text-red-600 border border-red-200"
+              }`}
+            >
+              {facResult.message}
+            </div>
+          )}
+
+          {zipResult && !zipImporting && (
+            <div
+              className={`rounded-lg px-3 py-2 text-xs ${
+                zipResult.type === "success"
+                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                  : "bg-red-50 text-red-600 border border-red-200"
+              }`}
+            >
+              {zipResult.message}
+            </div>
+          )}
+
+          {!loading && facStatus.length > 0 && (
+            <div className="rounded-xl border border-gray-200 overflow-hidden">
+              <div className="grid grid-cols-[minmax(120px,1fr)_80px_100px] gap-2 bg-gray-100 px-4 py-1 text-[11px] font-normal text-gray-500 uppercase tracking-wider">
+                <span>지역</span>
+                <span className="text-right">건물 수</span>
+                <span className="text-right">업로드 일자</span>
+              </div>
+              {facStatus.map((s, idx) => (
+                <div key={s.region}>
+                  <div className={`grid grid-cols-[minmax(120px,1fr)_80px_100px] items-center gap-2 px-4 py-1 ${idx % 2 === 0 ? "bg-white" : "bg-gray-50"}`}>
+                    <span className="text-xs font-normal text-gray-800">{s.region}</span>
+                    <span className="text-right text-xs tabular-nums text-gray-700">
+                      {s.record_count.toLocaleString()}
+                    </span>
+                    <span className="text-right text-xs text-gray-500">
+                      {new Date(s.imported_at * 1000).toLocaleDateString("ko-KR")}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 삭제 확인 모달 */}
+      <Modal
+        open={deleteConfirm !== null}
+        onClose={() => setDeleteConfirm(null)}
+        title="건물통합정보 삭제"
+        width="max-w-sm"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            {deleteConfirm} 지역의 건물통합정보를 삭제하시겠습니까?
+          </p>
+          <div className="flex justify-end gap-3">
+            <button
+              onClick={() => setDeleteConfirm(null)}
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              취소
+            </button>
+            <button
+              onClick={() => deleteConfirm && handleClear(deleteConfirm)}
+              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+            >
+              삭제
+            </button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ─── 실측 3D 건물 (1m DSM) — buildings_3d.bin 임포트 + 3D 타일셋 폴더 ───
+
+export function MeasuredBuildingDataSection() {
+  const [importStatus, setImportStatus] = useState<FacBuildingImportStatus[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [collapsed, setCollapsed] = useState(true); // 데이터 있으면 접힌 상태 기본
+
+  const [measuredImporting, setMeasuredImporting] = useState(false);
+  const [measuredProgress, setMeasuredProgress] = useState<{ total: number; processed: number; status: string } | null>(null);
+  const [measuredResult, setMeasuredResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
+  const [measuredDeleteConfirm, setMeasuredDeleteConfirm] = useState(false);
+
+  // 실측 임포트는 fac_buildings 테이블에 쓰므로 vworld 다운로드 중에는 금지
+  const facDownloading = useAppStore((s) => s.facBuildingDownloading);
+
+  const loadStatus = async () => {
+    try {
+      const status = await invoke<FacBuildingImportStatus[]>("get_fac_building_import_status");
+      setImportStatus(status);
+    } catch {
+      // 무시
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadStatus();
+    // 등록된 3D 타일셋 폴더 조회 (미등록이면 null)
+    invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 무시 */ });
+  }, []);
 
   /** 실측 3D 임포트 — 타일셋 폴더 등록(선택 파일의 상위 폴더) 후 buildings_3d.bin 반영 */
   const handleMeasuredImport = async () => {
@@ -672,157 +900,63 @@ export function FacBuildingDataSection() {
     }
   };
 
-  // 다운로드 완료 감지 → 테이블 갱신
-  const prevDownloading = useRef(facDownloading);
-  useEffect(() => {
-    if (prevDownloading.current && !facDownloading && facResult?.type === "success") {
-      loadStatus();
-    }
-    prevDownloading.current = facDownloading;
-  }, [facDownloading]);
-
-  const loadStatus = async () => {
-    try {
-      const status = await invoke<FacBuildingImportStatus[]>("get_fac_building_import_status");
-      setImportStatus(status);
-    } catch {
-      // 무시
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    loadStatus();
-    // 등록된 3D 타일셋 폴더 조회 (미등록이면 null)
-    invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 무시 */ });
-  }, []);
-
-  const handleClear = async (regionKey: string) => {
-    try {
-      await invoke("clear_fac_building_data", { region: regionKey });
-      setDeleteConfirm(null);
-      await loadStatus();
-    } catch (e) {
-      console.warn("삭제 실패:", e);
-    }
-  };
-
-  const totalRecords = importStatus.reduce((sum, s) => sum + s.record_count, 0);
-  const latestImport = importStatus.length > 0
-    ? Math.max(...importStatus.map((s) => s.imported_at))
-    : 0;
-
-  const facHasExtra = (facDownloading && facProgress) || facResult || zipResult || (!loading && importStatus.length > 0);
-  const isCollapsible = !loading && totalRecords > 0 && !facDownloading && !zipImporting && !measuredImporting;
-  const isExpanded = !isCollapsible || !collapsed;
   /** 실측3D 임포트 이력 존재 여부 (get_fac_building_import_status 의 "실측3D" 행) */
   const measuredStatus = importStatus.find((s) => s.region === "실측3D");
   const measuredPct = measuredProgress && measuredProgress.total > 0
     ? Math.min(100, Math.round((measuredProgress.processed / measuredProgress.total) * 100))
     : 0;
 
+  const measuredHasExtra = !!tiles3dDir || measuredImporting || !!measuredResult;
+  const isCollapsible = !loading && !!measuredStatus && !measuredImporting;
+  const isExpanded = !isCollapsible || !collapsed;
+
   return (
     <div className={`px-5 py-[13px] ${isCollapsible ? "cursor-pointer select-none" : ""}`} onClick={(e) => { if (isCollapsible && !(e.target as HTMLElement).closest("button, a")) setCollapsed((c) => !c); }}>
       <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
-        <div
-          className="flex items-center gap-2"
-        >
+        <div className="flex items-center gap-2">
           {isCollapsible && (
             <ChevronDown
               size={14}
               className={`text-gray-400 shrink-0 transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`}
             />
           )}
-          <Building2 size={16} className="text-[#a60739] shrink-0" />
-          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">건물 데이터 (건물통합정보)</h2>
+          <Boxes size={16} className="text-[#a60739] shrink-0" />
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">실측 3D 건물 (1m DSM)</h2>
         </div>
         <div className="flex items-center gap-2 min-w-0">
-          {!loading && totalRecords > 0 ? (
+          {measuredStatus ? (
             <>
-              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {totalRecords.toLocaleString()}건</span>
-              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{new Date(latestImport * 1000).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\.$/, "")}</span>
+              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {measuredStatus.record_count.toLocaleString()}건</span>
+              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{new Date(measuredStatus.imported_at * 1000).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).replace(/\.$/, "")}</span>
             </>
           ) : (
-            <span className="text-xs text-gray-400">F_FAC_BUILDING SHP · 3D 건물 시각화</span>
+            <span className="text-xs text-gray-400">항공 LiDAR 실측 지붕고 · Cesium 3D 타일셋</span>
           )}
-          <a
-            href="https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EA%B1%B4%EB%AC%BC%ED%86%B5%ED%95%A9%EC%A0%95%EB%B3%B4&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30524&listPageIndex=1"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-0.5 text-xs text-blue-500 hover:text-blue-700 transition-colors shrink-0"
-            onClick={(e) => {
-              e.preventDefault();
-              import("@tauri-apps/plugin-opener").then(({ openUrl }) =>
-                openUrl("https://www.vworld.kr/dtmk/dtmk_ntads_s002.do?searchKeyword=%EA%B1%B4%EB%AC%BC%ED%86%B5%ED%95%A9%EC%A0%95%EB%B3%B4&searchSvcCde=&searchOrganization=&searchBrmCode=&searchTagList=&searchFrm=&pageIndex=1&gidmCd=&gidsCd=&sortType=00&svcCde=MK&dsId=30524&listPageIndex=1")
-              );
-            }}
-          >
-            <ExternalLink size={11} />
-            vworld
-          </a>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button
-            onClick={handleZipImport}
-            disabled={zipImporting || facDownloading}
-            className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={handleMeasuredImport}
+            disabled={measuredImporting || facDownloading}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            <Upload size={13} />
-            {zipImporting ? "임포트 중..." : "ZIP 가져오기"}
+            {measuredImporting ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />}
+            {measuredImporting ? "임포트 중..." : "실측 3D 임포트 (buildings_3d.bin)"}
           </button>
-          <button
-            onClick={handleDownload}
-            disabled={facDownloading || zipImporting}
-            className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {facDownloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
-            {facDownloading ? "다운로드 중..." : "다운로드"}
-          </button>
+          {measuredStatus && (
+            <button
+              onClick={() => setMeasuredDeleteConfirm(true)}
+              disabled={measuredImporting}
+              className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-500 transition-colors hover:border-red-300 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Trash2 size={13} />
+              실측 데이터 삭제
+            </button>
+          )}
         </div>
       </div>
 
-      {/* ── 실측 3D 건물 (1m DSM) — buildings_3d.bin + 3D 타일셋 ── */}
-      {isExpanded && (
-        <div
-          className="mt-3 rounded-xl border border-gray-200 bg-gray-50/70 px-3 py-2.5 space-y-2"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 min-w-0">
-              <Boxes size={14} className="text-[#a60739] shrink-0" />
-              <span className="text-xs font-semibold text-gray-800 whitespace-nowrap">실측 3D 건물 (1m DSM)</span>
-              {measuredStatus ? (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-white/80 px-2 py-0.5 text-[11px] text-gray-600">
-                  <Check size={10} className="text-emerald-500" />
-                  {measuredStatus.record_count.toLocaleString()}건
-                </span>
-              ) : (
-                <span className="truncate text-[11px] text-gray-400">항공 LiDAR 실측 지붕고 · Cesium 3D 타일셋</span>
-              )}
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                onClick={handleMeasuredImport}
-                disabled={measuredImporting || facDownloading || zipImporting}
-                className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                {measuredImporting ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />}
-                {measuredImporting ? "임포트 중..." : "실측 3D 임포트 (buildings_3d.bin)"}
-              </button>
-              {measuredStatus && (
-                <button
-                  onClick={() => setMeasuredDeleteConfirm(true)}
-                  disabled={measuredImporting}
-                  className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-500 transition-colors hover:border-red-300 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  <Trash2 size={13} />
-                  실측 데이터 삭제
-                </button>
-              )}
-            </div>
-          </div>
-
+      {measuredHasExtra && isExpanded && (
+        <div className="mt-3 space-y-2" onClick={(e) => e.stopPropagation()}>
           {/* 등록된 3D 타일셋 폴더 */}
           {tiles3dDir && (
             <div className="flex items-center gap-1.5 text-[11px] text-gray-500">
@@ -866,99 +1000,6 @@ export function FacBuildingDataSection() {
           )}
         </div>
       )}
-
-      {facHasExtra && isExpanded && (
-        <div className="mt-3 space-y-2" onClick={(e) => e.stopPropagation()}>
-          {facDownloading && facProgress && (
-            <div className="space-y-1">
-              <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-[#a60739] transition-all duration-300"
-                  style={{
-                    width: `${Math.round((facProgress.current / facProgress.total) * 100)}%`,
-                  }}
-                />
-              </div>
-              <p className="text-xs text-gray-500">{facProgress.message}</p>
-            </div>
-          )}
-
-          {facResult && !facDownloading && (
-            <div
-              className={`rounded-lg px-3 py-2 text-xs ${
-                facResult.type === "success"
-                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                  : "bg-red-50 text-red-600 border border-red-200"
-              }`}
-            >
-              {facResult.message}
-            </div>
-          )}
-
-          {zipResult && !zipImporting && (
-            <div
-              className={`rounded-lg px-3 py-2 text-xs ${
-                zipResult.type === "success"
-                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                  : "bg-red-50 text-red-600 border border-red-200"
-              }`}
-            >
-              {zipResult.message}
-            </div>
-          )}
-
-          {!loading && importStatus.length > 0 && (
-            <div className="rounded-xl border border-gray-200 overflow-hidden">
-              <div className="grid grid-cols-[minmax(120px,1fr)_80px_100px] gap-2 bg-gray-100 px-4 py-1 text-[11px] font-normal text-gray-500 uppercase tracking-wider">
-                <span>지역</span>
-                <span className="text-right">건물 수</span>
-                <span className="text-right">업로드 일자</span>
-              </div>
-              {importStatus.map((s, idx) => (
-                <div key={s.region}>
-                  <div className={`grid grid-cols-[minmax(120px,1fr)_80px_100px] items-center gap-2 px-4 py-1 ${idx % 2 === 0 ? "bg-white" : "bg-gray-50"}`}>
-                    <span className="text-xs font-normal text-gray-800">{s.region}</span>
-                    <span className="text-right text-xs tabular-nums text-gray-700">
-                      {s.record_count.toLocaleString()}
-                    </span>
-                    <span className="text-right text-xs text-gray-500">
-                      {new Date(s.imported_at * 1000).toLocaleDateString("ko-KR")}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* 삭제 확인 모달 */}
-      <Modal
-        open={deleteConfirm !== null}
-        onClose={() => setDeleteConfirm(null)}
-        title="건물통합정보 삭제"
-        width="max-w-sm"
-      >
-        <div className="space-y-4">
-          <p className="text-sm text-gray-600">
-            {deleteConfirm} 지역의 건물통합정보를 삭제하시겠습니까?
-          </p>
-          <div className="flex justify-end gap-3">
-            <button
-              onClick={() => setDeleteConfirm(null)}
-              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
-            >
-              취소
-            </button>
-            <button
-              onClick={() => deleteConfirm && handleClear(deleteConfirm)}
-              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
-            >
-              삭제
-            </button>
-          </div>
-        </div>
-      </Modal>
 
       {/* 실측 3D 건물 삭제 확인 모달 */}
       <Modal
