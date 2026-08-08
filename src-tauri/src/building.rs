@@ -145,6 +145,9 @@ pub struct BuildingOnPath {
     pub polygon: Option<Vec<[f64; 2]>>,
     /// 수동 등록 건물 여부 (true이면 ground_elev_m은 사용자 입력값)
     pub is_manual: bool,
+    /// fac_buildings 행 id — 타겟 자체 건물 제외 판정용 (수동 건물은 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fac_id: Option<i64>,
 }
 
 /// 건물통합정보(FAC) 단건 상세 — 클릭 좌표 인근 건물의 대장성 필드 (오프라인 로컬 DB)
@@ -753,6 +756,7 @@ pub fn query_buildings_along_path(
                     lon: rep_lon,
                     polygon: Some(poly_pts.clone()),
                     is_manual: false,
+                    fac_id: Some(id),
                 });
             } else {
                 // 폴리곤 없는 GIS 건물은 제외
@@ -841,6 +845,7 @@ pub fn query_buildings_along_path(
                 //   (프론트 지도 하이라이트가 수동 건물도 커버하도록)
                 polygon: Some(ring.iter().map(|&(lon, lat)| [lat, lon]).collect()),
                 is_manual: true,
+                fac_id: None,
             });
         } else if geo_type_str == "line" {
             // 선형 건물 (벽/담) — LoS 직선과 각 세그먼트 교차 테스트
@@ -883,6 +888,7 @@ pub fn query_buildings_along_path(
                 lon: rep_lon,
                 polygon: None,
                 is_manual: true,
+                fac_id: None,
             });
         } else {
             // point 타입 등 geometry 없는 수동 건물은 제외
@@ -893,6 +899,114 @@ pub fn query_buildings_along_path(
     buildings.sort_by(|a, b| a.distance_km.partial_cmp(&b.distance_km).unwrap_or(std::cmp::Ordering::Equal));
 
     Ok(buildings)
+}
+
+/// 타겟 지점의 LoS 기준선(최저탐지선) 산출 결과 — 타겟 자체 건물 제외.
+#[derive(Serialize, Clone, Debug)]
+pub struct LosBaselineResult {
+    pub distance_km: f64,
+    /// 타겟 거리에서의 기준선 높이 (AMSL m)
+    pub baseline_amsl_m: f64,
+    /// 기준선 앙각 (deg, 4/3 프레임)
+    pub angle_deg: f64,
+    /// 타겟 자체 건물로 제외된 fac 행 수 (검증용 — 프론트 미사용)
+    pub excluded_count: usize,
+}
+
+/// 4/3 유효지구 곡률 강하 (m) — 단면도 curvDrop43 와 동일 식.
+fn curv_drop43(d_km: f64) -> f64 {
+    let d_m = d_km * 1000.0;
+    d_m * d_m / (2.0 * (crate::geo::EARTH_RADIUS_M * 4.0 / 3.0))
+}
+
+/// 타겟 지점의 LoS 기준선(최저탐지선) — 타겟 자체 건물 제외.
+/// BRA 호버 툴팁용: "이 건물이 없을 때의 LoS 선"이 타겟 거리에서 갖는 높이(AMSL).
+/// 단면도(LoSProfilePanel minDetStraight)와 동일한 4/3 유효지구 running max 앙각 방식.
+pub fn query_los_baseline(
+    conn: &Connection,
+    srtm: &mut crate::srtm::SrtmReader,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_h_amsl: f64, // 안테나 AMSL = altitude + antenna_height (프론트에서 계산해 전달)
+    target_lat: f64,
+    target_lon: f64,
+) -> Result<LosBaselineResult, String> {
+    let total_d = crate::geo::haversine_km(radar_lat, radar_lon, target_lat, target_lon);
+    if total_d < 0.001 {
+        return Err("타겟이 레이더와 동일 지점".to_string());
+    }
+
+    // 타겟 자체 건물(호버한 건물 자신) id — 함수명은 radar 용이지만 좌표 순수 함수라 타겟 좌표에 그대로 유효.
+    //   footprint 포함 or 변 5m 이내(실측3D blob 겹침 포함) 판정이 그대로 "이 건물 자신"을 잡는다.
+    let own = radar_own_building_ids(conn, target_lat, target_lon);
+
+    // 경로 건물 — 단면도와 동일 코리도 폭 100m·그룹 활성화(enabled) 존중
+    let path_buildings = query_buildings_along_path(
+        conn, srtm, radar_lat, radar_lon, target_lat, target_lon, 100.0, false,
+    )?;
+    let mut excluded_count = 0usize;
+    let buildings: Vec<&BuildingOnPath> = path_buildings
+        .iter()
+        .filter(|b| {
+            let is_own = b.fac_id.map(|id| own.contains(&id)).unwrap_or(false);
+            if is_own {
+                excluded_count += 1;
+            }
+            !is_own
+        })
+        .collect();
+
+    // running max slope (slope = 높이차/수평거리 비율 — 단면도와 동일하게 tan 아닌 비율)
+    let mut max_slope = f64::NEG_INFINITY;
+
+    // 지형 샘플: 단면도와 동일한 0.5km 간격 + 타겟 지점(정확히 total_d).
+    //   lat/lon 은 레이더→타겟 선형 보간 — query_buildings_along_path 의 파라메트릭 t 와 동일 프레임
+    //   (건물 near/far 거리와 축 정합)
+    let d_lat = target_lat - radar_lat;
+    let d_lon = target_lon - radar_lon;
+    let mut sample_ds: Vec<f64> = Vec::new();
+    let mut k = 1usize;
+    while (k as f64) * 0.5 < total_d - 1e-9 {
+        sample_ds.push((k as f64) * 0.5);
+        k += 1;
+    }
+    sample_ds.push(total_d); // 마지막은 정확히 타겟 지점 (위 루프가 total_d 직전까지만 담아 중복 없음)
+
+    for d_k in sample_ds {
+        let t = d_k / total_d;
+        let s_lat = radar_lat + t * d_lat;
+        let s_lon = radar_lon + t * d_lon;
+        // 조회 실패/타일 없음은 0.0 — 단면도의 Math.max(0, elev) 클램프 미러
+        let elev = srtm.get_elevation(s_lat, s_lon).unwrap_or(0.0).max(0.0);
+        let ang = (elev - curv_drop43(d_k) - radar_h_amsl) / (d_k * 1000.0);
+        if ang > max_slope {
+            max_slope = ang;
+        }
+    }
+
+    // 건물(자체 제외 후): 단면도 obstacles 배열이 건물 양끝 엣지를 넣는 것의 미러
+    for b in &buildings {
+        let b_top = b.ground_elev_m + b.height_m;
+        for d_e in [b.near_dist_km, b.far_dist_km] {
+            if d_e <= 0.0 || d_e > total_d + 1e-9 {
+                continue;
+            }
+            let ang = (b_top - curv_drop43(d_e) - radar_h_amsl) / (d_e * 1000.0);
+            if ang > max_slope {
+                max_slope = ang;
+            }
+        }
+    }
+
+    // 지형 샘플이 최소 1개(타겟 지점) 있으므로 max_slope 는 항상 유한
+    let baseline_amsl_m = radar_h_amsl + max_slope * (total_d * 1000.0) + curv_drop43(total_d);
+
+    Ok(LosBaselineResult {
+        distance_km: total_d,
+        baseline_amsl_m,
+        angle_deg: max_slope.atan().to_degrees(),
+        excluded_count,
+    })
 }
 
 // ─── 타일 기반 Binary 건물 조회 ──────────────────────────────────

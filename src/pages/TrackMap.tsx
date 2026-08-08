@@ -392,6 +392,10 @@ export default function TrackMap() {
   /** 건물 호버 간단 툴팁 (커서 옆) — 디바운스/상세조회 없이 즉시 표시 */
   // lat/lon/base(AMSL 지반고) 는 BRA 도구 활성 중 초과·여유고도 즉시 산출용 (아래 툴팁 렌더 참조)
   const [bldgHoverTip, setBldgHoverTip] = useState<{ x: number; y: number; name?: string; height?: number; measured?: boolean; lat?: number; lon?: number; base?: number } | null>(null);
+  /** BRA 호버 툴팁 LoS 기준선(단면도 최저탐지선, 호버 건물 제외) 좌표 키 캐시 — 실패는 미기록(재호버 시 재시도) */
+  const losBaseCacheRef = useRef<Map<string, { baselineAmsl: number; angleDeg: number }>>(new Map());
+  /** 현재 호버 지점의 LoS 기준선 — key 가 호버 좌표와 일치할 때만 툴팁에 반영 */
+  const [losBaseline, setLosBaseline] = useState<{ key: string; baselineAmsl: number; angleDeg: number } | null>(null);
   /** deck.gl MapboxOverlay 인스턴스 — 클릭 시점 실측 메시 pickObject 용 */
   const deckOverlayRef = useRef<MapboxOverlay | null>(null);
   // 클릭 핸들러(이벤트 effect)에서 최신 뷰포트 건물 목록 참조용 — deps 재등록 churn 방지
@@ -498,6 +502,55 @@ export default function TrackMap() {
   const [braConeOpacity, setBraConeOpacity] = useState(1); // 원추면 채움 불투명도 (기본 1 = 불투명, 슬라이더로 0.05까지 하향)
   /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
   const braReqSeq = useRef(0);
+
+  // 이펙트에서 최신 레이더 제원 참조용 (호버 조회 deps 에 radarSite 를 넣지 않기 위함)
+  const radarSiteRef = useRef(radarSite);
+  radarSiteRef.current = radarSite;
+
+  // LoS 기준선 캐시 무효화 — 레이더 제원(좌표/표고/안테나고) 변경 시 + BRA 도구 활성/해제 전환 시.
+  //   세션 중 수동 건물 추가·그룹 토글 변경은 도구를 껐다 켜는 시점의 무효화로 커버한다.
+  const braToolActive = activeTool === "bra";
+  useEffect(() => {
+    losBaseCacheRef.current.clear();
+    setLosBaseline(null);
+  }, [braToolActive, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height]);
+
+  // BRA 호버 툴팁용 LoS 기준선(단면도 최저탐지선, 호버 건물 자신 제외) 조회 — 200ms 디바운스 + 좌표 키 캐시.
+  //   deps 에 x/y(마우스 좌표)를 넣지 않으므로 같은 건물 위에서 커서만 움직이면 재발화하지 않는다.
+  const bldgHoverLat = bldgHoverTip?.lat;
+  const bldgHoverLon = bldgHoverTip?.lon;
+  useEffect(() => {
+    if (activeTool !== "bra" || bldgHoverLat == null || bldgHoverLon == null) {
+      setLosBaseline(null);
+      return;
+    }
+    const key = `${bldgHoverLat.toFixed(6)},${bldgHoverLon.toFixed(6)}`;
+    const cached = losBaseCacheRef.current.get(key);
+    if (cached) {
+      setLosBaseline({ key, ...cached });
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      const rs = radarSiteRef.current;
+      invoke<{ baseline_amsl_m: number; angle_deg: number }>("query_los_baseline", {
+        radarLat: rs.latitude,
+        radarLon: rs.longitude,
+        radarHAmsl: rs.altitude + rs.antenna_height,
+        targetLat: bldgHoverLat,
+        targetLon: bldgHoverLon,
+      })
+        .then((res) => {
+          const val = { baselineAmsl: res.baseline_amsl_m, angleDeg: res.angle_deg };
+          losBaseCacheRef.current.set(key, val); // 캐시엔 항상 기록 (커서가 이미 떠났어도 재호버 시 즉시 표시)
+          if (!cancelled) setLosBaseline({ key, ...val });
+        })
+        .catch(() => {
+          // 조회 실패는 무기록·무반영 — 재호버 시 재시도 (파노라마 산이름 호버 조회와 동일 계약)
+        });
+    }, 200);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [activeTool, bldgHoverLat, bldgHoverLon]);
   // ── 표시 설정 드로어 (우측 도킹) — 건물 / 기상 ──
   const [settingsDrawer, setSettingsDrawer] = useState<"building" | "weather" | null>(null);
   const lastSettingsRef = useRef<"building" | "weather">("building");
@@ -5249,10 +5302,12 @@ export default function TrackMap() {
               // 각도는 오버레이(braResult 스냅샷 angle_deg)와 달리 라이브 braAngleDeg 사용 — LoS 시뮬 카드와 동일 계약(BRA 분석 설정 공유)
               const braAllow = hAnt + dM * Math.tan((braAngleDeg * Math.PI) / 180) + (dM * dM) / (2 * 6_371_000);
               const braExcess = bTop - braAllow; // 양수=초과, 음수=여유
-              // LoS 0° 수평 가시선 — LoS 차단 계열이라 4/3 유효지구(CLAUDE.md 프레임 규칙).
-              // 지형 그림자(러닝맥스 최저탐지선) 미반영 — 호버 간이 툴팁 계약(상세조회 invoke 금지, b4e7748)상 경로 프로파일 조회가 불가해 순수 기하만
-              const losAllow = hAnt + (dM * dM) / (2 * ((6_371_000 * 4) / 3));
-              const losExcess = bTop - losAllow;
+              // LoS 기준선 = 단면도 최저탐지선(4/3 running max)에서 호버 건물 자신을 제외한 값(query_los_baseline).
+              // BRA 활성 중 건물 호버에만 200ms 디바운스 1회 경량 invoke(응답 수십 B) + 좌표 키 캐시 —
+              //   b4e7748 호버 0비용 계약의 명시적 예외(파노라마 산이름 호버 조회와 동일 패턴).
+              // bTop 지반고는 여전히 GeoJSON 간이값 — 정밀 전수 판정은 bra.rs 리스트 기준.
+              const losKey = `${bldgHoverTip.lat.toFixed(6)},${bldgHoverTip.lon.toFixed(6)}`;
+              const losBase = losBaseline && losBaseline.key === losKey ? losBaseline : null;
               const excessSpan = (v: number) => v > 0
                 ? <span style={{ color: "#e94560" }} className="font-semibold">초과 +{v.toFixed(1)} m</span>
                 : <span className="font-semibold text-emerald-600">여유 {(-v).toFixed(1)} m</span>;
@@ -5263,8 +5318,17 @@ export default function TrackMap() {
                     {excessSpan(braExcess)}
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="text-gray-500">LoS(0°)</span>
-                    {excessSpan(losExcess)}
+                    {losBase ? (
+                      <>
+                        <span className="text-gray-500">LoS({losBase.angleDeg.toFixed(1)}°)</span>
+                        {excessSpan(bTop - losBase.baselineAmsl)}
+                      </>
+                    ) : (
+                      <>
+                        <span className="text-gray-500">LoS</span>
+                        <span className="text-gray-400">산출 중…</span>
+                      </>
+                    )}
                   </div>
                   <div className="text-[10px] text-gray-400">거리 {(dM / 1000).toFixed(1)} km · 상단 {bTop.toFixed(1)} m AMSL</div>
                 </div>

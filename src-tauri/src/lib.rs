@@ -1333,6 +1333,26 @@ async fn query_buildings_along_path(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// BRA 호버 툴팁: 타겟 건물 제외 LoS 기준선 — 응답 수십 바이트라 bulk:// 비대상
+#[tauri::command]
+async fn query_los_baseline(
+    app_handle: tauri::AppHandle,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_h_amsl: f64,
+    target_lat: f64,
+    target_lon: f64,
+) -> Result<building::LosBaselineResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        building::query_los_baseline(&conn, &mut srtm, radar_lat, radar_lon, radar_h_amsl, target_lat, target_lon)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// BRA(Building Restricted Area) 침범 검사 — 원추면(0.25° 기본)을 관통하는 건물 전수 조회.
 /// 결과는 침범 건물 폴리곤을 포함해 수 MB 가능 → bulk:// 파일 매개 전송 (BulkRef 반환, bulk.rs 참조)
 #[tauri::command]
@@ -3360,6 +3380,7 @@ pub fn run() {
             get_srtm_status,
             download_srtm_korea,
             query_buildings_along_path,
+            query_los_baseline,
             query_buildings_3d_binary,
             analyze_bra_penetration,
             get_fac_building_detail,
