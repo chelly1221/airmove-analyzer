@@ -20,6 +20,13 @@ export type TourMode = "dim" | "interactive" | "floating";
 /** 툴팁 카드 배치 우선순위 — 드롭다운 대상은 "right"(팝업을 가리지 않도록) */
 export type TourPlacement = "right" | "bottom";
 
+/**
+ * 스텝 동안 띄우는 시뮬레이션 오버레이
+ * - fileDialog: 가상 ASS 파일 선택 화면 (TourFakeFileDialog)
+ * - parseFilter: 실제 ParseFilterModal 을 데모 렌더 (파싱 미수행)
+ */
+export type TourOverlay = "fileDialog" | "parseFilter";
+
 export interface TourStep {
   id: string;
   /** 대상 CSS 셀렉터. 없으면 중앙(dim)/우하단(floating) 카드 */
@@ -33,6 +40,16 @@ export interface TourStep {
   placement?: TourPlacement;
   /** 대상 클릭 감지 시 자동 진행 */
   advanceOnTargetClick?: boolean;
+  /** 이 셀렉터가 DOM 에 나타나면 자동 진행 (드롭다운 패널 등장 감지) */
+  advanceWhenSelectorAppears?: string;
+  /** 대상 클릭을 가로채 실제 핸들러 실행을 막고 진행 (네이티브 다이얼로그 억제) */
+  interceptClick?: boolean;
+  /** 대상이 DOM 에서 사라지면(드롭다운 닫힘) 지정 스텝 id 로 복귀 */
+  retreatToOnTargetLost?: string;
+  /** 이 스텝 동안 띄울 시뮬레이션 오버레이 */
+  overlay?: TourOverlay;
+  /** 오버레이 취소(취소 버튼/ESC/배경 클릭) 시 점프할 스텝 id */
+  overlayCancelGoTo?: string;
   /** 클릭 후 우하단 대기 카드로 전환 (advanceWhen 충족까지 대기) */
   waitAfterClick?: boolean;
   /**

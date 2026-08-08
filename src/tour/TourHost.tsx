@@ -3,10 +3,13 @@ import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { X } from "lucide-react";
+import ParseFilterModal from "../components/common/ParseFilterModal";
 import { useAppStore } from "../store";
 import { useTourStore } from "./tourStore";
+import TourFakeFileDialog from "./TourFakeFileDialog";
 import { clearTourState, getPhaseSteps, phaseWindow, readTourState } from "./scenarios";
 import type { TourPlacement, TourWindow } from "./types";
+import type { Aircraft } from "../types";
 
 const CARD_W = 340;
 /** 배치 계산용 카드 높이 추정치 — 실측 없이 뷰포트 클램프에만 사용 */
@@ -14,6 +17,24 @@ const CARD_H_EST = 180;
 const MARGIN = 8;
 /** 대상 위치 재측정 주기 — 포탈 1프레임 지연·레이아웃 변화 양쪽을 커버 */
 const MEASURE_MS = 200;
+/** 셀렉터 등장 감지 폴링 주기 (드롭다운 패널) */
+const APPEAR_MS = 150;
+/** 대상 소실 후 복귀까지 디바운스 — 재렌더 순간 공백 오탐 방지 */
+const RETREAT_MS = 400;
+
+/** 등록 기체가 없을 때 파싱 필터 데모에 쓰는 예시 기체 */
+const DEMO_AIRCRAFT: Aircraft[] = [
+  {
+    id: "tour-demo",
+    name: "비행검사기(예시)",
+    registration: "HL0000",
+    model: "Embraer Praetor 600",
+    mode_s_code: "71BF79",
+    organization: "비행점검센터",
+    memo: "투어 시뮬레이션용 예시 자료",
+    active: true,
+  },
+];
 
 interface Rect {
   top: number;
@@ -106,18 +127,38 @@ export default function TourHost({ window: win }: { window: TourWindow }) {
     };
   }, [win]);
 
-  // ─── 대상 측정 (없으면 나타날 때까지 폴링) ──────────────────────────
+  // ─── 대상 측정 (없으면 나타날 때까지 폴링) + 대상 소실 시 복귀 ───────
   useEffect(() => {
     const target = step?.target;
     if (!active || !target || step?.mode !== "interactive" || waiting) {
       setRect(null);
       return;
     }
+    // 복귀 판정은 rect state 가 아니라 측정 루프 지역 변수로 — state 는 한 렌더 지연돼 오탐한다
+    const retreatId = step.retreatToOnTargetLost;
+    let seen = false;
+    let lostAt = 0;
+    let retreated = false;
     const measure = () => {
       const el = document.querySelector(target);
       const r = el ? el.getBoundingClientRect() : null;
       const next: Rect | null = r ? { top: r.top, left: r.left, width: r.width, height: r.height } : null;
       setRect((prev) => (sameRect(prev, next) ? prev : next));
+      if (!retreatId || retreated) return;
+      if (next) {
+        seen = true;
+        lostAt = 0;
+        return;
+      }
+      if (!seen) return; // 아직 한 번도 못 잡음 — 등장 대기 중
+      if (!lostAt) {
+        lostAt = Date.now();
+        return;
+      }
+      if (Date.now() - lostAt >= RETREAT_MS) {
+        retreated = true;
+        useTourStore.getState().goTo(retreatId);
+      }
     };
     measure();
     const timer = window.setInterval(measure, MEASURE_MS);
@@ -128,10 +169,27 @@ export default function TourHost({ window: win }: { window: TourWindow }) {
     };
   }, [active, step, waiting]);
 
+  // ─── 셀렉터 등장 자동 진행 (드롭다운 패널 열림 감지) ─────────────────
+  useEffect(() => {
+    const selector = step?.advanceWhenSelectorAppears;
+    if (!active || !selector) return;
+    let done = false;
+    const check = () => {
+      if (done) return;
+      if (!document.querySelector(selector)) return;
+      done = true;
+      useTourStore.getState().advance();
+    };
+    const timer = window.setInterval(check, APPEAR_MS);
+    return () => window.clearInterval(timer);
+  }, [active, step]);
+
   // ─── 대상 클릭 감지 자동 진행 ───────────────────────────────────────
   useEffect(() => {
-    if (!active || !step?.advanceOnTargetClick || !step.target || waiting) return;
+    if (!active || !step?.target || waiting) return;
+    if (!step.advanceOnTargetClick && !step.interceptClick) return;
     const target = step.target;
+    const intercept = !!step.interceptClick;
     // 더블클릭(빠른 2연타)이면 setTimeout advance 가 2회 예약돼 다음 스텝이 스킵된다 —
     // 스텝당 1회만 발화 (스텝 변경 시 이펙트 재등록으로 자연 리셋)
     let fired = false;
@@ -140,6 +198,14 @@ export default function TourHost({ window: win }: { window: TourWindow }) {
       const el = e.target as Element | null;
       if (!el?.closest?.(target)) return;
       fired = true;
+      if (intercept) {
+        // document 캡처는 React 루트 리스너보다 먼저 실행 — 전파를 끊으면 실제 onClick
+        // (네이티브 파일 다이얼로그 open)이 실행되지 않는다. 대신 시뮬레이션으로 진행.
+        e.stopPropagation();
+        e.preventDefault();
+        useTourStore.getState().advance();
+        return;
+      }
       // 캡처 단계라 원래 핸들러보다 먼저 실행됨 — 다음 틱으로 미뤄 실제 동작을 보장
       window.setTimeout(() => {
         if (step.waitAfterClick) useTourStore.getState().setWaiting(true);
@@ -168,15 +234,45 @@ export default function TourHost({ window: win }: { window: TourWindow }) {
     });
   }, [active, step]);
 
-  // ─── ESC 종료 ───────────────────────────────────────────────────────
+  // ─── ESC 종료 (오버레이 스텝은 오버레이 자신의 취소 경로가 처리) ─────
   useEffect(() => {
-    if (!active) return;
+    if (!active || step?.overlay) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") useTourStore.getState().end();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active]);
+  }, [active, step]);
+
+  // ─── 시뮬레이션 오버레이 ────────────────────────────────────────────
+  const overlay = active ? step?.overlay : undefined;
+  const overlayCancelGoTo = step?.overlayCancelGoTo;
+
+  // 등록 기체가 없으면 예시 기체로 데모 (오버레이 표시 시점에 1회 평가 — 대량 데이터 접근 없음)
+  const demoAircraft = useMemo<Aircraft[]>(() => {
+    if (overlay !== "parseFilter") return DEMO_AIRCRAFT;
+    const list = useAppStore.getState().aircraft;
+    return list.some((a) => a.active) ? list : DEMO_AIRCRAFT;
+  }, [overlay]);
+
+  /** 오버레이 취소 → 지정 스텝으로 복귀 (없으면 투어 종료) */
+  const cancelOverlay = () => {
+    if (overlayCancelGoTo) useTourStore.getState().goTo(overlayCancelGoTo);
+    else useTourStore.getState().end();
+  };
+
+  /** 파싱 시작(데모) → 파싱 없이 parseFilter 구간 다음 스텝으로 점프 */
+  const confirmParseFilter = () => {
+    const st = useTourStore.getState();
+    const list = st.scenario && st.phase ? getPhaseSteps(st.scenario, st.phase) : [];
+    let last = -1;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].overlay === "parseFilter") last = i;
+    }
+    const next = list[last + 1];
+    if (next) st.goTo(next.id);
+    else st.advance();
+  };
 
   if (!active || !step) return null;
 
@@ -194,6 +290,25 @@ export default function TourHost({ window: win }: { window: TourWindow }) {
 
   return createPortal(
     <>
+      {/* 시뮬레이션 오버레이 — key 를 overlay 값으로 두어 연속 스텝에서는 상태를 보존 */}
+      {overlay === "fileDialog" && (
+        <TourFakeFileDialog
+          key="fileDialog"
+          onPick={() => useTourStore.getState().advance()}
+          onOpen={() => useTourStore.getState().advance()}
+          onCancel={cancelOverlay}
+        />
+      )}
+      {overlay === "parseFilter" && (
+        <ParseFilterModal
+          key="parseFilter"
+          open
+          onClose={cancelOverlay}
+          onConfirm={confirmParseFilter}
+          aircraft={demoAircraft}
+        />
+      )}
+
       {/* 인트로/완료 카드 — 전체 딤 */}
       {step.mode === "dim" && <div className="fixed inset-0 z-[10010] bg-black/45" />}
 

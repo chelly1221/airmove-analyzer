@@ -251,7 +251,7 @@ export default function DrawingApp() {
               <ChevronDown size={12} className={`transition-transform ${dropdownOpen ? "rotate-180" : ""}`} />
             </button>
             {dropdownOpen && (
-              <div className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+              <div data-tour="drawing-aircraft-list" className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
                 <div className="max-h-56 overflow-y-auto py-1 px-1">
                   <button
                     onClick={() => { setSelectedModeS(null); setDropdownOpen(false); }}
@@ -308,7 +308,7 @@ export default function DrawingApp() {
               <ChevronDown size={12} className={`transition-transform ${radarDropOpen ? "rotate-180" : ""}`} />
             </button>
             {radarDropOpen && (
-              <div className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+              <div data-tour="drawing-radar-list" className="absolute left-0 top-full z-[2000] mt-1 w-56 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
                 <div className="max-h-56 overflow-y-auto py-1 px-1">
                   {customRadarSites.map((site) => (
                     <button

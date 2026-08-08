@@ -183,7 +183,7 @@ export default function ParseFilterModal({ open, onClose, onConfirm, aircraft }:
       <div className="flex flex-col gap-3">
         {/* ━━ 비행검사기 ━━ */}
         {activeAircraft.length > 0 && (
-          <div className={`rounded-lg border border-gray-200 overflow-hidden transition-opacity ${dimmed ? "opacity-40 pointer-events-none" : ""}`}>
+          <div data-tour="pf-aircraft" className={`rounded-lg border border-gray-200 overflow-hidden transition-opacity ${dimmed ? "opacity-40 pointer-events-none" : ""}`}>
             <div className="flex items-center gap-2 bg-gray-50 px-3 py-2 border-b border-gray-100">
               <Plane size={14} className="text-gray-500" />
               <span className="text-xs font-medium text-gray-600">비행검사기</span>
@@ -221,7 +221,7 @@ export default function ParseFilterModal({ open, onClose, onConfirm, aircraft }:
         )}
 
         {/* ━━ 포함 조건 ━━ */}
-        <div className={`rounded-lg border border-gray-200 overflow-hidden transition-opacity ${dimmed ? "opacity-40 pointer-events-none" : ""}`}>
+        <div data-tour="pf-include" className={`rounded-lg border border-gray-200 overflow-hidden transition-opacity ${dimmed ? "opacity-40 pointer-events-none" : ""}`}>
           <button
             onClick={() => setIncludeExpanded(!includeExpanded)}
             className="flex items-center gap-2 w-full bg-gray-50 px-3 py-2 border-b border-gray-100 hover:bg-gray-100 transition-colors"
@@ -317,7 +317,7 @@ export default function ParseFilterModal({ open, onClose, onConfirm, aircraft }:
         </div>
 
         {/* ━━ 제외 조건 ━━ */}
-        <div className={`rounded-lg border border-gray-200 overflow-hidden transition-opacity ${dimmed ? "opacity-40 pointer-events-none" : ""}`}>
+        <div data-tour="pf-exclude" className={`rounded-lg border border-gray-200 overflow-hidden transition-opacity ${dimmed ? "opacity-40 pointer-events-none" : ""}`}>
           <button
             onClick={() => setExcludeExpanded(!excludeExpanded)}
             className="flex items-center gap-2 w-full bg-gray-50 px-3 py-2 border-b border-gray-100 hover:bg-gray-100 transition-colors"
@@ -425,7 +425,7 @@ export default function ParseFilterModal({ open, onClose, onConfirm, aircraft }:
           {/* 확인/취소 */}
           <div className="flex items-center gap-2 pt-2 border-t border-gray-100">
             {/* 전체 데이터 체크박스 */}
-            <label className="flex items-center gap-1.5 cursor-pointer">
+            <label data-tour="pf-nofilter" className="flex items-center gap-1.5 cursor-pointer">
               <input
                 type="checkbox"
                 checked={noFilter}
@@ -444,6 +444,7 @@ export default function ParseFilterModal({ open, onClose, onConfirm, aircraft }:
               취소
             </button>
             <button
+              data-tour="pf-confirm"
               onClick={handleConfirm}
               disabled={!canConfirm}
               className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white hover:bg-[#8a062f] disabled:opacity-40 transition-colors"

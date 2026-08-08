@@ -14,6 +14,8 @@ interface TourState {
   waiting: boolean;
   start: (scenario: string, phase: string) => void;
   advance: () => void;
+  /** 현재 phase 안에서 스텝 id 로 점프 (없으면 무시) */
+  goTo: (stepId: string) => void;
   setWaiting: (v: boolean) => void;
   end: () => void;
 }
@@ -48,6 +50,14 @@ export const useTourStore = create<TourState>((set, get) => ({
       return;
     }
     set({ stepIndex: stepIndex + 1, waiting: false });
+  },
+
+  goTo: (stepId) => {
+    const { active, scenario, phase } = get();
+    if (!active || !scenario || !phase) return;
+    const idx = getPhaseSteps(scenario, phase).findIndex((s) => s.id === stepId);
+    if (idx < 0) return;
+    set({ stepIndex: idx, waiting: false });
   },
 
   setWaiting: (v) => set({ waiting: v }),

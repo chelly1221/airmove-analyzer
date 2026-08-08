@@ -4818,7 +4818,7 @@ export default function TrackMap() {
             <ChevronDown size={12} className={`shrink-0 transition-transform ${aircraftDropOpen ? "rotate-180" : ""}`} />
           </button>
           {aircraftDropOpen && (
-            <div className="absolute left-0 right-0 top-full z-[2000] mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+            <div data-tour="tm-aircraft-list" className="absolute left-0 right-0 top-full z-[2000] mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
               <div className="px-2 pt-2 pb-1">
                 <input
                   type="text"
@@ -4891,7 +4891,7 @@ export default function TrackMap() {
             <ChevronDown size={12} className={`shrink-0 transition-transform ${radarDropOpen ? "rotate-180" : ""}`} />
           </button>
           {radarDropOpen && (
-            <div className="absolute left-0 right-0 top-full z-[2000] mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
+            <div data-tour="tm-radar-list" className="absolute left-0 right-0 top-full z-[2000] mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-xl backdrop-blur-sm">
               <div className="max-h-56 overflow-y-auto py-1 px-1">
                 {allRadarSites.map((site) => (
                   <button
