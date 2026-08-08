@@ -40,6 +40,12 @@ const GearButton = ({ active, onClick }: { active: boolean; onClick: () => void 
  *  커튼 지형선이 1.5배 과장된 지형 메시 표면과 일치. 값 변경 시 커튼도 자동 정합. */
 const TERRAIN_EXAGGERATION = 1.5;
 
+/** 3D 건물 표출 최소 줌 — 이 미만이면 fill-extrusion 3D 모드가 꺼지고(2D 점 전환) 실측 3D 메시도
+ *  게이트 오프(visible:false + loadTiles:false). 두 표출 경로가 같은 임계를 공유해야 줌 인/아웃 시
+ *  "건물은 사라졌는데 메시만 남는" 불일치가 없다. (buildingTileCache 의 줌 임계값은 타일 조회 격자
+ *  단위라 의미가 다르므로 공유 대상 아님) */
+const BUILDINGS_3D_MIN_ZOOM = 14;
+
 /** CoS(침묵원추) 기준각 — LoSProfilePanel COS_DEG·CoveragePanel MAX_ELEV_DEG 와 동일 의미 (70° 최고탐지각) */
 const COS_DEG = 70;
 /** CoS 원추 측면 분할 세그먼트 수 */
@@ -2507,7 +2513,7 @@ export default function TrackMap() {
   useEffect(() => {
     const map = mapRef.current?.getMap();
     const z = map ? map.getZoom() : 0;
-    const want = allow3d && z >= 14;
+    const want = allow3d && z >= BUILDINGS_3D_MIN_ZOOM;
     setBuildings3dMode((prev) => (prev !== want ? want : prev));
   }, [allow3d]);
 
@@ -3169,6 +3175,29 @@ export default function TrackMap() {
     invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 미등록 */ });
   }, []);
 
+  // 실측 메시 줌 게이트 — fill-extrusion 3D 건물과 동일 임계(BUILDINGS_3D_MIN_ZOOM).
+  // 광역 줌에서 김포 타일셋 전역이 순회·로드 대상이 되는 것을 막아 표출 스코프를 건물과 일치시킨다.
+  const meshZoomOk = viewState.zoom >= BUILDINGS_3D_MIN_ZOOM;
+
+  // 피치 적응 SSE 목표값 — fill-extrusion 쪽 앵커 반경 클램프(고피치에서 지평선까지 bounds 가
+  // 폭주해 건물 조회량이 터지는 것을 막는 방어)의 메시 대응물. 메시는 뷰포트 반경을 직접 자를
+  // 수단이 없으므로 전역 SSE 를 올려 원거리 refine 깊이를 줄인다(Cesium dynamicScreenSpaceError
+  // 의 전역 근사 — 거리별 차등이 아닌 전역 상향이라 근거리도 함께 완만히 강등되는 건 감수).
+  // 40° 이하 = loaders.gl 기본 8(무손실), 40→85° 선형 램프로 8→24. 짝수 계단 양자화는
+  // 드래그 중 pitch 가 연속 변하며 아래 이펙트가 매 프레임 발화하는 것을 억제하기 위함.
+  const meshTargetSse = useMemo(() => {
+    const pitch = viewState.pitch ?? 0;
+    if (pitch <= 40) return 8;
+    const t = Math.min(1, (pitch - 40) / 45); // 40→85°
+    return Math.round((8 + t * 16) / 2) * 2;
+  }, [viewState.pitch]);
+
+  // onTilesetLoad 로 수집한 Tileset3D 인스턴스(main + cdm 최대 2개) — setProps 라이브 갱신 대상.
+  const tilesetsRef = useRef<any[]>([]);
+  // 최신 게이트 목표값. 타일셋 로드는 비동기라 게이트가 먼저 바뀔 수 있고, 이때 늦게 도착한
+  // 타일셋도 tuneTileset 시점에 현재 목표값을 곧바로 반영해야 초기 1회 과로드를 피한다.
+  const meshTuneRef = useRef({ sse: 8, load: true });
+
   // 실측 3D 타일 레이어 — tiles3d 커스텀 프로토콜로 로컬 타일셋(tileset.json/b3dm) 서빙.
   // DeckGLOverlay 는 overlaid(MapboxOverlay) 모드라 MapLibre fill-extrusion 과 깊이 상호작용 없음.
   const tiles3dDeckLayers = useMemo(() => {
@@ -3178,29 +3207,66 @@ export default function TrackMap() {
     // · _cacheBytes 512MB: 타일 캐시 예산 상향 (기본 32MB — 김포 타일셋 648MB 대비 과소해
     //   화면 밖 타일이 언로드→재로드→재파싱 스래시로 버벅임 유발; 생성자에서 굳는 멤버라 직접 대입)
     // · memoryAdjustedScreenSpaceError: 예산 초과 시 SSE 자동 상향(원거리 세부 LOD 강등)으로
-    //   스래시 대신 품질을 낮추는 안전판 — 예산 이내 복귀 시 원 품질(SSE 8)로 자동 회복
+    //   스래시 대신 품질을 낮추는 안전판 — 예산 이내 복귀 시 원 품질(base SSE)로 자동 회복
     // · _cacheOverflowBytes 64MB: 강등 판정 여유폭 (기본 1MB 는 경계에서 강등/복귀 진동)
+    // · maximumScreenSpaceError/loadTiles: 현재 게이트 목표값 즉시 반영 (아래 이펙트와 동일 계약)
     const tuneTileset = (ts: any) => {
-      ts.setProps({ debounceTime: 150, memoryAdjustedScreenSpaceError: true });
+      ts.setProps({
+        debounceTime: 150,
+        memoryAdjustedScreenSpaceError: true,
+        maximumScreenSpaceError: meshTuneRef.current.sse,
+        loadTiles: meshTuneRef.current.load,
+      });
       ts._cacheBytes = 512 * 1024 * 1024;
       ts._cacheOverflowBytes = 64 * 1024 * 1024;
+      tilesetsRef.current.push(ts); // 이후 게이트 변화 시 setProps 로 라이브 갱신
     };
     const tileset = (id: string, file: string) =>
       new Tile3DLayer({
         id,
         data: convertFileSrc(file, "tiles3d"),
         loader: Tiles3DLoader,
+        // 줌 게이트 — visible:false 면 타일 드로우 전부 스킵(CompositeLayer 가 서브레이어로 포워딩).
+        // 단 visible 은 그리기만 막고 updateState→순회 라이프사이클은 계속 도므로, 실제 로드 차단은
+        // 아래 이펙트의 loadTiles:false 와 페어로만 성립한다.
+        visible: meshZoomOk,
         // 클릭 시점 pickObject(메시 표면 → 건물 해석)용. deck 호버 픽은 프레임당 1회로 합쳐지고
         // 버튼 드래그(카메라 조작) 중엔 스킵되므로 타일 튜닝(debounce/캐시)과 충돌 없음
         pickable: true,
         onTilesetLoad: tuneTileset,
         onTileError: (err: unknown) => console.warn("실측 3D 타일 로드 실패:", err),
       });
+    // meshZoomOk 로 인스턴스를 재생성해도 id·data 가 동일하면 deck 이 id 매칭으로 기존 state(tileset3d)
+    // 를 이어받고, Tile3DLayer.updateState 는 data 가 바뀔 때만 _loadTileset 하므로 재로드는 없다.
     return [
       tileset("measured-3dtiles", "tileset.json"),
       // 보충 타일셋 — 없으면 onTileError 로 조용히 무시
       tileset("measured-3dtiles-cdm", "tileset_cdm.json"),
     ];
+  }, [showTiles3d, tiles3dDir, meshZoomOk]);
+
+  // 게이트 적용 — 로드된 타일셋에 SSE/loadTiles 라이브 반영.
+  // loadTiles:false 는 Tileset3D.doUpdate 를 조기 반환시켜 순회·신규 로드를 완전 동결하되
+  // 이미 로드된 타일 캐시(512MB)는 그대로 남긴다 → 레이어를 제거·재생성하는 대신 "동결"이라
+  // 줌 14 재진입 시 b3dm 재요청·재파싱 없이 즉시 복귀. 동결 중 selectedTiles 는 게이트 오프
+  // 시점 스냅샷으로 남지만 visible:false 라 드로우되지 않고, 재진입 시 update() 재순회로 교체된다.
+  useEffect(() => {
+    meshTuneRef.current = { sse: meshTargetSse, load: meshZoomOk };
+    for (const ts of tilesetsRef.current) {
+      ts.setProps({ maximumScreenSpaceError: meshTargetSse, loadTiles: meshZoomOk });
+      // 트래버서는 options 가 아니라 memoryAdjustedScreenSpaceError 멤버를 직접 읽는다 —
+      // 캐시 예산 초과 상태에선 base 상향이 무시되므로 멤버도 동기 상향해 결정적으로 적용
+      // (하향은 라이브러리의 회복 경로 max(adjusted/1.02, base) 에 위임 — 급락 시 순간 과로드 방지)
+      if (ts.memoryAdjustedScreenSpaceError < meshTargetSse) ts.memoryAdjustedScreenSpaceError = meshTargetSse;
+      if (meshZoomOk) ts.update(); // 게이트 재진입 시 즉시 재순회 (줌 이징 중이면 viewportChanged 로도 재순회)
+    }
+  }, [meshTargetSse, meshZoomOk]);
+
+  // 타일셋 표출 자체가 꺼지면(memo 가 [] 반환 → 레이어·tileset3d 폐기) 죽은 참조 정리.
+  // 주의: 게이트 플립(meshZoomOk 변화)으로는 절대 비우면 안 된다 — onTilesetLoad 는 최초 로드 시
+  // 1회만 발화하므로, 살아있는 타일셋 참조를 비우면 다시 채울 기회가 영영 없다.
+  useEffect(() => {
+    if (!showTiles3d || !tiles3dDir) tilesetsRef.current = [];
   }, [showTiles3d, tiles3dDir]);
 
   // CAT008 기상 극좌표 벡터 → 부채꼴 폴리곤 레이어.
@@ -4962,7 +5028,7 @@ export default function TrackMap() {
           {...viewState}
           onMove={(evt) => {
             setViewState(evt.viewState);
-            const is3d = allow3d && evt.viewState.zoom >= 14;
+            const is3d = allow3d && evt.viewState.zoom >= BUILDINGS_3D_MIN_ZOOM;
             if (is3d !== buildings3dMode) setBuildings3dMode(is3d);
           }}
           onLoad={onMapLoad}
