@@ -265,6 +265,13 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // fac_buildings 실측 지붕고 컬럼 (1m DSM 임포트, NULL = 실측값 없음 → 기존 height 사용)
     let _ = conn.execute("ALTER TABLE fac_buildings ADD COLUMN height_measured REAL", []);
 
+    // 과거 실측 임포트가 usability(용도)에 '실측(1m DSM)' 표기를 저장했던 것을 NULL 환원 (idempotent)
+    // — 용도 컬럼은 실제 용도만, 실측 여부는 height_measured 기준(팝업 '실측자료' 별도 항목 표시)
+    let _ = conn.execute(
+        "UPDATE fac_buildings SET usability = NULL WHERE usability = '실측(1m DSM)'",
+        [],
+    );
+
     // 파노라마 캐시 알고리즘 버전 컬럼 (기존 행은 0 → 로드 시 버전 불일치로 자연 미스)
     let _ = conn.execute("ALTER TABLE panorama_cache ADD COLUMN version INTEGER NOT NULL DEFAULT 0", []);
 

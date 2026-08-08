@@ -28,9 +28,6 @@ use crate::srtm::SrtmReader;
 /// 실측 임포트 전용 region 태그 (선정리·신규행 식별자)
 const MEASURED_REGION: &str = "실측3D";
 
-/// 실측 신규 건물 usability 표기
-const MEASURED_USABILITY: &str = "실측(1m DSM)";
-
 /// 유효 건물 최소 높이 (m) — 지반고 대비 이보다 낮으면 노이즈로 간주하고 스킵
 const MIN_HEIGHT_M: f64 = 0.5;
 
@@ -480,7 +477,9 @@ pub fn import_from_bin(
                         h,
                         name,
                         None::<String>,
-                        MEASURED_USABILITY,
+                        // usability(용도)는 NULL — 실측 표기를 용도로 오염시키지 않는다
+                        // (실측 여부는 height_measured 로 판별, 팝업엔 '실측자료' 항목으로 별도 표시)
+                        None::<String>,
                         None::<String>,
                         None::<String>,
                         polygon_json,

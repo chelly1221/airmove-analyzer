@@ -205,7 +205,7 @@ export default function TrackMapApp() {
   return (
     <div className="flex h-full flex-col bg-white">
       {/* 상단바 — ASS 파일 열기 + 통계 */}
-      <div className="flex h-8 shrink-0 items-center bg-white">
+      <div className="relative flex h-8 shrink-0 items-center bg-white">
         <div data-tauri-drag-region className="flex flex-1 h-full items-center pl-4 gap-2">
           <button
             onClick={pickFiles}
@@ -224,7 +224,9 @@ export default function TrackMapApp() {
           {/* TrackMap 툴바 포탈: 통계 */}
           <div id="trackmap-toolbar-right" className="pointer-events-auto flex items-center gap-2" />
         </div>
-        <Titlebar controlsOnly />
+        <Titlebar controlsOnly noBorder />
+        {/* 하단 border — 사이드바(232px) 연결 구간 제외 */}
+        <div className="pointer-events-none absolute bottom-0 left-[232px] right-0 h-px bg-gray-200" />
       </div>
 
       {/* 메인: 사이드바 + 지도 */}

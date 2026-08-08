@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
+import type { MapboxOverlay } from "@deck.gl/mapbox";
 import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
@@ -115,19 +116,50 @@ const hexToRgb = (hex: string): [number, number, number] => {
 };
 
 /** 3D 건물 fill-extrusion 색 표현식.
- *  meshOn(실측 메시 타일 표출 중)이면 실측 보유 건물 박스를 최우선 분기로 근투명 처리해
- *  메시가 시각적으로 대신하게 한다("메시 우선"). 나머지 분기는 기존 색 계약 그대로. */
-const fillColorExpr = (meshOn: boolean): any => [
+ *  실측 메시 우선 처리는 색 알파가 아닌 별도 레이어(buildings-3d-fill-measured)의
+ *  layer-level opacity 로 수행 — fill-extrusion-color 의 rgba 알파는 셰이더에서 무시되고
+ *  RGB 만 프리멀티플라이돼 근투명 의도가 불투명 검은 박스로 렌더되기 때문(MapLibre Color premultiply). */
+const FILL_COLOR_EXPR: any = [
   "case",
-  // 메시 표출 중 실측 건물 박스는 근투명(rgba alpha 0.02) — 시각적으로 메시가 대신하되,
-  // MapLibre 히트테스트는 기하 기반이라 클릭/호버(건축물정보 팝업)는 그대로 동작
-  ...(meshOn ? [["==", ["get", "measured"], true], "rgba(229,231,235,0.02)"] : []),
   ["!=", ["get", "group_color"], null],
   ["get", "group_color"],
   ["==", ["get", "source"], "fac"],
   "#e5e7eb",
   "#ef4444",
 ];
+
+/** 실측 메시 픽 좌표 → 로드된 실측 건물 매칭.
+ *  폴리곤([lat,lon] 순서, bbox 프리필터 + ray casting) 포함 우선, 실패 시 최근접 centroid ≤ 30m. */
+function resolveMeasuredBuildingAt(lat: number, lon: number, buildings: Building3D[]): Building3D | null {
+  let nearest: Building3D | null = null;
+  let nearestM = Infinity;
+  const mPerLat = 111_320;
+  const mPerLon = 111_320 * Math.cos((lat * Math.PI) / 180);
+  for (const b of buildings) {
+    if (!b.measured) continue;
+    const poly = b.polygon;
+    if (poly.length >= 3) {
+      // bbox 프리필터
+      let minLa = Infinity, maxLa = -Infinity, minLo = Infinity, maxLo = -Infinity;
+      for (const [la, lo] of poly) {
+        if (la < minLa) minLa = la; if (la > maxLa) maxLa = la;
+        if (lo < minLo) minLo = lo; if (lo > maxLo) maxLo = lo;
+      }
+      if (lat >= minLa && lat <= maxLa && lon >= minLo && lon <= maxLo) {
+        // ray casting 포함 판정
+        let inside = false;
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+          const [la1, lo1] = poly[i], [la2, lo2] = poly[j];
+          if ((lo1 > lon) !== (lo2 > lon) && lat < ((la2 - la1) * (lon - lo1)) / (lo2 - lo1) + la1) inside = !inside;
+        }
+        if (inside) return b;
+      }
+    }
+    const d = Math.hypot((b.lat - lat) * mPerLat, (b.lon - lon) * mPerLon);
+    if (d < nearestM) { nearestM = d; nearest = b; }
+  }
+  return nearestM <= 30 ? nearest : null;
+}
 
 /** LoS 분석용 등록 장애물(수동 건물) 선택 — 그룹별 + 이름 검색 */
 function LosObstaclePicker({ buildings, groups, onSelect }: {
@@ -316,9 +348,16 @@ export default function TrackMap() {
     localName?: string; localHeight?: number; localUsage?: string;
     /** 지반 표고(AMSL, m) + 출처(fac/manual) — 클릭 시점 로컬 값 */
     localBase?: number; localSource?: string;
+    /** 실측(1m DSM) 자료 보유 건물 — 팝업 '실측자료' 항목 표시용 */
+    localMeasured?: boolean;
     /** true: 클릭으로 고정됨 (호버로 닫히지 않음) */
     pinned: boolean;
   } | null>(null);
+  /** deck.gl MapboxOverlay 인스턴스 — 클릭 시점 실측 메시 pickObject 용 */
+  const deckOverlayRef = useRef<MapboxOverlay | null>(null);
+  // 클릭 핸들러(이벤트 effect)에서 최신 뷰포트 건물 목록 참조용 — deps 재등록 churn 방지
+  const buildings3dDataRef = useRef<Building3D[]>([]);
+  useEffect(() => { buildings3dDataRef.current = buildings3dData; }, [buildings3dData]);
   /** 건축물 팝업 DOM ref + 계산된 위치 (가장자리 자동 회피) */
   const bldgPopupRef = useRef<HTMLDivElement>(null);
   const [bldgPopupPos, setBldgPopupPos] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
@@ -326,7 +365,7 @@ export default function TrackMap() {
   const bldgHoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showBldgPopupForHover = useCallback((args: {
     x: number; y: number; lat: number; lon: number;
-    name?: string; height?: number; usage?: string; base?: number; source?: string;
+    name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean;
   }) => {
     setBldgPopup((prev) => {
       if (prev?.pinned) return prev;
@@ -338,14 +377,14 @@ export default function TrackMap() {
         x: args.x, y: args.y, lat: args.lat, lon: args.lon,
         loading: true, info: null, facDetail: undefined,
         localName: args.name, localHeight: args.height, localUsage: args.usage,
-        localBase: args.base, localSource: args.source,
+        localBase: args.base, localSource: args.source, localMeasured: args.measured,
         pinned: false,
       };
     });
   }, []);
   const scheduleBldgHover = useCallback((args: {
     x: number; y: number; lat: number; lon: number;
-    name?: string; height?: number; usage?: string; base?: number; source?: string;
+    name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean;
   }) => {
     if (bldgHoverTimerRef.current) clearTimeout(bldgHoverTimerRef.current);
     bldgHoverTimerRef.current = setTimeout(() => showBldgPopupForHover(args), 220);
@@ -1241,6 +1280,9 @@ export default function TrackMap() {
 
     const sourceId = "buildings-3d-src";
     const layerId = "buildings-3d-fill";
+    const measuredLayerId = "buildings-3d-fill-measured";
+    // 실측 보유 건물은 메시 표출 중 레이어 opacity 0 (색 알파가 아닌 layer-level 스칼라)
+    const measuredOpacity = meshActive ? 0 : buildingOpacity;
 
     if (buildings3dGeoJSON && buildings3dMode) {
       // GeoJSON 소스 업데이트 또는 생성
@@ -1249,29 +1291,53 @@ export default function TrackMap() {
         source.setData(buildings3dGeoJSON);
       } else {
         map.addSource(sourceId, { type: "geojson", data: buildings3dGeoJSON });
+        // 비실측(fac 미실측 + 수동 등록) 건물 박스
         map.addLayer({
           id: layerId,
           type: "fill-extrusion",
+          filter: ["!=", ["get", "measured"], true],
           source: sourceId,
           paint: {
-            "fill-extrusion-color": fillColorExpr(meshActive),
+            "fill-extrusion-color": FILL_COLOR_EXPR,
             // base/height 는 지도면(terrain 시 지형 표면) 위 상대 오프셋 — AMSL 지반고(base 프로퍼티)는 팝업 표시용으로만 유지
             "fill-extrusion-height": ["get", "height"],
             "fill-extrusion-base": 0,
             "fill-extrusion-opacity": buildingOpacity,
           },
         });
+        // 실측 보유 건물 박스 — 메시 표출 중에는 opacity 0 으로 숨기고 메시가 시각적으로 대신한다("메시 우선").
+        // queryRenderedFeatures 는 레이어 isHidden(minzoom/maxzoom/visibility)만 거르므로
+        // opacity 0 이어도 클릭/호버(건축물정보 팝업) 히트테스트는 그대로 유지된다.
+        map.addLayer({
+          id: measuredLayerId,
+          type: "fill-extrusion",
+          filter: ["==", ["get", "measured"], true],
+          source: sourceId,
+          paint: {
+            "fill-extrusion-color": FILL_COLOR_EXPR,
+            // base/height 는 지도면(terrain 시 지형 표면) 위 상대 오프셋 — AMSL 지반고(base 프로퍼티)는 팝업 표시용으로만 유지
+            "fill-extrusion-height": ["get", "height"],
+            "fill-extrusion-base": 0,
+            "fill-extrusion-opacity": measuredOpacity,
+          },
+        });
       }
-      // 레이어 표시 + 채움 투명도/색 표현식 반영
+      // 레이어 표시 + 채움 투명도 반영 (색 표현식은 상수라 갱신 불필요)
       if (map.getLayer(layerId)) {
         map.setLayoutProperty(layerId, "visibility", "visible");
         map.setPaintProperty(layerId, "fill-extrusion-opacity", buildingOpacity);
-        map.setPaintProperty(layerId, "fill-extrusion-color", fillColorExpr(meshActive));
+      }
+      if (map.getLayer(measuredLayerId)) {
+        map.setLayoutProperty(measuredLayerId, "visibility", "visible");
+        map.setPaintProperty(measuredLayerId, "fill-extrusion-opacity", measuredOpacity);
       }
     } else {
       // 3D 모드 아닐 때 레이어 숨김
       if (map.getLayer(layerId)) {
         map.setLayoutProperty(layerId, "visibility", "none");
+      }
+      if (map.getLayer(measuredLayerId)) {
+        map.setLayoutProperty(measuredLayerId, "visibility", "none");
       }
     }
   }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive]);
@@ -1282,6 +1348,7 @@ export default function TrackMap() {
     const map = mapRef.current?.getMap();
     if (!map) return;
     if (map.getLayer("buildings-3d-fill")) map.removeLayer("buildings-3d-fill");
+    if (map.getLayer("buildings-3d-fill-measured")) map.removeLayer("buildings-3d-fill-measured");
     if (map.getSource("buildings-3d-src")) map.removeSource("buildings-3d-src");
   }, [showBuildings]);
 
@@ -1290,17 +1357,19 @@ export default function TrackMap() {
   useEffect(() => {
     const map = mapRef.current?.getMap();
     if (!map) return;
-    const layerId = "buildings-3d-fill";
+    // 비실측/실측 두 fill-extrusion 레이어를 함께 쿼리 (실측 레이어는 메시 표출 중 opacity 0 이어도 히트테스트 유효)
+    const layerIds = ["buildings-3d-fill", "buildings-3d-fill-measured"];
 
     const onMouseMove = (e: maplibregl.MapMouseEvent) => {
-      if (!map.getLayer(layerId)) {
+      const present = layerIds.filter((id) => map.getLayer(id));
+      if (present.length === 0) {
         if (buildingHoverActiveRef.current) {
           buildingHoverActiveRef.current = false;
           clearBldgHover();
         }
         return;
       }
-      const features = map.queryRenderedFeatures(e.point, { layers: [layerId] });
+      const features = map.queryRenderedFeatures(e.point, { layers: present });
       if (features.length > 0) {
         buildingHoverActiveRef.current = true;
         map.getCanvas().style.cursor = "pointer";
@@ -1314,6 +1383,7 @@ export default function TrackMap() {
           usage: p.usage || undefined,
           base: p.base != null ? Number(p.base) : undefined,
           source: p.source || undefined,
+          measured: p.measured === true || p.measured === "true",
         });
       } else if (buildingHoverActiveRef.current) {
         buildingHoverActiveRef.current = false;
@@ -1322,37 +1392,62 @@ export default function TrackMap() {
       }
     };
 
+    /** 건물 속성 → 팝업 오픈 (박스 쿼리·메시 픽 공용) */
+    const openBldgPopup = (a: { lat: number; lon: number; name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean }, pt: { x: number; y: number }) => {
+      if (losTarget) losPointClickedRef.current = true;
+      if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
+      setBldgPopup((prev) => {
+        // 같은 건물이면 기존 정보 유지하고 pinned만 켠다
+        if (prev && Math.abs(prev.lat - a.lat) < 1e-6 && Math.abs(prev.lon - a.lon) < 1e-6) {
+          return { ...prev, x: pt.x, y: pt.y, pinned: true };
+        }
+        return {
+          x: pt.x, y: pt.y, lat: a.lat, lon: a.lon,
+          loading: true, info: null, facDetail: undefined,
+          localName: a.name, localHeight: a.height, localUsage: a.usage,
+          localBase: a.base, localSource: a.source, localMeasured: a.measured,
+          pinned: true,
+        };
+      });
+      // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
+      const sel = addressSelRef.current;
+      if (sel && (Math.abs(sel.lat - a.lat) > 1e-6 || Math.abs(sel.lon - a.lon) > 1e-6)) {
+        selectBuildingAt(a.lat, a.lon, a.name || "선택 건물", false);
+      }
+    };
+
     const onClick = (e: maplibregl.MapMouseEvent) => {
-      if (!map.getLayer(layerId)) { setBldgPopup(null); return; }
-      const features = map.queryRenderedFeatures(e.point, { layers: [layerId] });
+      // ① 실측 메시 표출 중이면 메시 GPU 픽 우선 — 화면에 보이는(항상 박스 위에 그려지는) 실측 지붕면을 그대로 클릭 대상으로
+      if (meshActive) {
+        let coord: number[] | undefined;
+        try {
+          coord = deckOverlayRef.current?.pickObject({ x: e.point.x, y: e.point.y, layerIds: ["measured-3dtiles", "measured-3dtiles-cdm"] })?.coordinate;
+        } catch { /* deck 미초기화 등 — 박스 경로 폴백 */ }
+        if (coord) {
+          const b = resolveMeasuredBuildingAt(coord[1], coord[0], buildings3dDataRef.current);
+          if (b) {
+            openBldgPopup({ lat: b.lat, lon: b.lon, name: b.name || undefined, height: b.height_m, usage: b.usage || undefined, base: b.ground_elev_m, source: b.source, measured: true }, e.point);
+            return;
+          }
+          // 메시는 맞았지만 매칭 건물 없음(미매칭 메시) → 박스 경로 폴백
+        }
+      }
+      // ② 기존 fill-extrusion 박스 쿼리 경로
+      const present = layerIds.filter((id) => map.getLayer(id));
+      if (present.length === 0) { setBldgPopup(null); return; }
+      const features = map.queryRenderedFeatures(e.point, { layers: present });
       if (features.length > 0) {
-        if (losTarget) losPointClickedRef.current = true;
         const p = features[0].properties;
         if (p) {
-          const lat = Number(p.lat);
-          const lon = Number(p.lon);
-          if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
-          setBldgPopup((prev) => {
-            // 같은 건물이면 기존 정보 유지하고 pinned만 켠다
-            if (prev && Math.abs(prev.lat - lat) < 1e-6 && Math.abs(prev.lon - lon) < 1e-6) {
-              return { ...prev, x: e.point.x, y: e.point.y, pinned: true };
-            }
-            return {
-              x: e.point.x, y: e.point.y, lat, lon,
-              loading: true, info: null, facDetail: undefined,
-              localName: p.name || undefined,
-              localHeight: p.height ? Number(p.height) : undefined,
-              localUsage: p.usage || undefined,
-              localBase: p.base != null ? Number(p.base) : undefined,
-              localSource: p.source || undefined,
-              pinned: true,
-            };
-          });
-          // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
-          const sel = addressSelRef.current;
-          if (sel && (Math.abs(sel.lat - lat) > 1e-6 || Math.abs(sel.lon - lon) > 1e-6)) {
-            selectBuildingAt(lat, lon, (p.name as string) || "선택 건물", false);
-          }
+          openBldgPopup({
+            lat: Number(p.lat), lon: Number(p.lon),
+            name: p.name || undefined,
+            height: p.height != null ? Number(p.height) : undefined,
+            usage: p.usage || undefined,
+            base: p.base != null ? Number(p.base) : undefined,
+            source: p.source || undefined,
+            measured: p.measured === true || p.measured === "true",
+          }, e.point);
         }
       } else {
         setBldgPopup(null);
@@ -1370,7 +1465,7 @@ export default function TrackMap() {
         map.getCanvas().style.cursor = "";
       }
     };
-  }, [losTarget, buildings3dMode, showBuildings]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [losTarget, buildings3dMode, showBuildings, meshActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 커버리지 활성 시 맵 hover → 최저 탐지고도 tooltip
   useEffect(() => {
@@ -2968,7 +3063,9 @@ export default function TrackMap() {
         id,
         data: convertFileSrc(file, "tiles3d"),
         loader: Tiles3DLoader,
-        pickable: false,
+        // 클릭 시점 pickObject(메시 표면 → 건물 해석)용. deck 호버 픽은 프레임당 1회로 합쳐지고
+        // 버튼 드래그(카메라 조작) 중엔 스킵되므로 타일 튜닝(debounce/캐시)과 충돌 없음
+        pickable: true,
         onTilesetLoad: tuneTileset,
         onTileError: (err: unknown) => console.warn("실측 3D 타일 로드 실패:", err),
       });
@@ -4349,7 +4446,7 @@ export default function TrackMap() {
           preserveDrawingBuffer={true}
           powerPreference="high-performance"
         >
-          <DeckGLOverlay layers={deckLayers} />
+          <DeckGLOverlay layers={deckLayers} onOverlay={(o) => { deckOverlayRef.current = o; }} />
           <NavigationControl position="top-right" showZoom={false} />
           {addressMarker && (
             <AddressMarker marker={addressMarker} onClose={() => { addressReqSeq.current++; setAddressMarker(null); setAddressBuilding(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); }} />
@@ -4484,6 +4581,8 @@ export default function TrackMap() {
                   for (const v of vals) if (v != null && v !== "") return v;
                   return "-";
                 };
+                // 과거 DB/구 백업의 usability '실측(1m DSM)' 표기는 용도로 취급하지 않음 (DB 마이그레이션 보조 방어)
+                const realUsage = (v?: string | null) => (v === "실측(1m DSM)" ? null : v);
                 const displayName = pick(fac?.name, bi?.name, bldgPopup.localName);
                 // 레이더 기준 거리/방위
                 const cosLat = Math.cos(radarSite.latitude * Math.PI / 180);
@@ -4531,6 +4630,7 @@ export default function TrackMap() {
                     <table className="w-full border-t border-gray-200 text-[10.5px]">
                       <tbody>
                         {row("출처", srcLabel, heightMeasured != null ? "건물높이(실측)" : "건물높이", height != null ? `${height.toFixed(1)} m` : "-")}
+                        {(heightMeasured != null || bldgPopup.localMeasured) && row("실측자료", "실측 3D (1m DSM)")}
                         {row("지반표고", base != null ? `${base.toFixed(1)} m` : "-", "옥상표고", (base != null && height != null) ? `${(base + height).toFixed(1)} m` : "-")}
                         {row("레이더거리", `${(distKm / 1.852).toFixed(1)} NM`, "레이더방위", `${az.toFixed(1)}°`)}
                       </tbody>
@@ -4543,7 +4643,7 @@ export default function TrackMap() {
                     <table className="w-full border-t border-gray-200 text-[10.5px]">
                       <tbody>
                         {row("건물명칭", pick(fac?.name, bi?.name))}
-                        {row("동명칭", pick(fac?.dong_name, bi?.dong_name), "용도", pick(fac?.usage, bi?.usage, bldgPopup.localUsage))}
+                        {row("동명칭", pick(fac?.dong_name, bi?.dong_name), "용도", pick(realUsage(fac?.usage), bi?.usage, realUsage(bldgPopup.localUsage)))}
                         {row("구조", pick(bi?.structure))}
                         {row("지상층수", bi?.floors_above ? `${bi.floors_above} 층` : "-", "지하층수", bi?.floors_below ? `${bi.floors_below} 층` : "-")}
                         {row("건물면적", bi?.area ? `${bi.area} ㎡` : "-", "연면적", bi?.total_area ? `${bi.total_area} ㎡` : "-")}
