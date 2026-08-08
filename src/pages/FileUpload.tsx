@@ -662,7 +662,7 @@ function ManualBuildingPanel() {
 // ─── 메인 페이지 ─────────────────────────────────────────────────
 
 export default function FileUpload() {
-  // 자료관리는 건물/참조 데이터만 관리. ASS 업로드는 ACAS·3D 지도·2D 항적도에서 수행.
+  // 자료관리는 건물/참조 데이터만 관리. ASS 업로드는 ACAS·지도·단일항적분석에서 수행.
   return (
     <div className="space-y-4">
       {/* ── 수동 등록 건물 ── */}

@@ -265,6 +265,16 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // fac_buildings 실측 지붕고 컬럼 (1m DSM 임포트, NULL = 실측값 없음 → 기존 height 사용)
     let _ = conn.execute("ALTER TABLE fac_buildings ADD COLUMN height_measured REAL", []);
 
+    // 실측 커버리지 extent(MIN/MAX) 전용 파트셜 커버링 인덱스 — height_measured 컬럼 추가 뒤에 생성해야 한다
+    // (CREATE TABLE 배치 시점엔 컬럼이 없어 실패). WHERE 절 텍스트가 measured_building::coverage_bbox 의
+    // 쿼리와 동일해야 플래너가 파트셜 인덱스를 선택한다. 있으면 extent 쿼리가 실측 엔트리(≈152k)
+    // 인덱스 스캔만으로 끝나고, 없으면 fac_buildings 2.1M 행 풀스캔(~30s).
+    // EXPLAIN QUERY PLAN 으로 `SCAN ... USING INDEX idx_fac_buildings_measured_bbox` 확인.
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fac_buildings_measured_bbox ON fac_buildings(bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon) WHERE height_measured IS NOT NULL OR region='실측3D'",
+        [],
+    );
+
     // 과거 실측 임포트가 usability(용도)에 '실측(1m DSM)' 표기를 저장했던 것을 NULL 환원 (idempotent)
     // — 용도 컬럼은 실제 용도만, 실측 여부는 height_measured 기준(팝업 '실측자료' 별도 항목 표시)
     let _ = conn.execute(

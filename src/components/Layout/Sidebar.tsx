@@ -47,8 +47,8 @@ const navSections: NavSection[] = [
     type: "group",
     label: "항적 시각화",
     items: [
-      { id: "map", label: "3D 지도", icon: MapIcon, path: "/map" },
-      { id: "drawing", label: "2D 항적도", icon: PencilRuler, path: "/drawing" },
+      { id: "map", label: "지도", icon: MapIcon, path: "/map" },
+      { id: "drawing", label: "단일항적분석", icon: PencilRuler, path: "/drawing" },
     ],
   },
   {

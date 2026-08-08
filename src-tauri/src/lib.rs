@@ -1493,6 +1493,20 @@ async fn clear_measured_buildings(app_handle: tauri::AppHandle) -> Result<(), St
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// 실측(1m DSM) 커버리지 bbox 조회 — `[min_lat, max_lat, min_lon, max_lon]`, 실측 데이터 없으면 None.
+/// TrackMap 이 메시 표출 중 이 영역 안의 fill-extrusion 박스를 전부 숨기는 데 사용한다.
+/// 응답이 32바이트라 bulk:// 파일 매개 대상 아님(수 MB+ 응답만 해당).
+#[tauri::command]
+async fn get_measured_coverage_bbox(app_handle: tauri::AppHandle) -> Result<Option<[f64; 4]>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        measured_building::coverage_bbox(&conn)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// Cesium 3D Tiles 루트 디렉터리 설정 (None = 해제). tileset.json 존재를 검증한다.
 #[tauri::command]
 async fn set_tiles3d_dir(
@@ -3357,6 +3371,7 @@ pub fn run() {
             // 실측 3D 건물 (1m DSM) + Cesium 3D Tiles
             import_measured_buildings,
             clear_measured_buildings,
+            get_measured_coverage_bbox,
             set_tiles3d_dir,
             get_tiles3d_dir,
             // 산봉우리 지명

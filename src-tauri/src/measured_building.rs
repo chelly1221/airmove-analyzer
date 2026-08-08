@@ -573,6 +573,34 @@ pub fn import_from_bin(
     })
 }
 
+/// 실측(1m DSM) 데이터가 덮는 커버리지 bbox — 반환 순서 `[min_lat, max_lat, min_lon, max_lon]`.
+///
+/// 실측 메시(3D Tiles)가 표출되는 영역을 대장 건물 bbox 의 합집합 extent 로 근사한다.
+/// TrackMap 은 이 영역 안의 fill-extrusion 박스를 실측 보유 여부와 무관하게 전부 숨긴다
+/// (커버리지 내에서는 메시가 유일한 진실 — 미매칭 대장 건물이 메시 위에 겹쳐 렌더되는 것 방지).
+///
+/// 실측 데이터가 전무하면 집계 4값이 모두 NULL 이므로 `Ok(None)`.
+pub fn coverage_bbox(conn: &Connection) -> Result<Option<[f64; 4]>, String> {
+    // WHERE 절 텍스트는 db.rs 의 파트셜 인덱스(idx_fac_buildings_measured_bbox) predicate 와
+    // 반드시 동일하게 유지할 것 — 다르면 플래너가 파트셜 인덱스를 못 쓰고 2.1M 행 풀스캔으로 떨어진다.
+    let row: (Option<f64>, Option<f64>, Option<f64>, Option<f64>) = conn
+        .query_row(
+            "SELECT MIN(bbox_min_lat), MAX(bbox_max_lat), MIN(bbox_min_lon), MAX(bbox_max_lon)
+             FROM fac_buildings WHERE height_measured IS NOT NULL OR region='실측3D'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|e| format!("실측 커버리지 조회 실패: {}", e))?;
+
+    match row {
+        (Some(min_lat), Some(max_lat), Some(min_lon), Some(max_lon)) => {
+            Ok(Some([min_lat, max_lat, min_lon, max_lon]))
+        }
+        // 하나라도 NULL = 실측 데이터 전무
+        _ => Ok(None),
+    }
+}
+
 /// 실측 데이터 초기화 — 실측 지붕고 컬럼 해제 + 실측 신규행/로그 삭제
 pub fn clear_measured(conn: &Connection) -> Result<(), String> {
     conn.execute(

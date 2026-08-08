@@ -128,7 +128,14 @@ const hexToRgb = (hex: string): [number, number, number] => {
 /** 3D 건물 fill-extrusion 색 표현식.
  *  실측 메시 우선 처리는 색 알파가 아닌 별도 레이어(buildings-3d-fill-measured)의
  *  layer-level opacity 로 수행 — fill-extrusion-color 의 rgba 알파는 셰이더에서 무시되고
- *  RGB 만 프리멀티플라이돼 근투명 의도가 불투명 검은 박스로 렌더되기 때문(MapLibre Color premultiply). */
+ *  RGB 만 프리멀티플라이돼 근투명 의도가 불투명 검은 박스로 렌더되기 때문(MapLibre Color premultiply).
+ *
+ *  숨김 대상 판정은 "실측 커버리지 게이트" — 메시 표출 중에는 measured 플래그 보유 건물뿐 아니라
+ *  실측 커버리지 bbox(get_measured_coverage_bbox) 안의 모든 박스를 숨긴다. 커버리지 내 대장 건물
+ *  상당수(90k+)가 DSM blob ↔ 대장 footprint 구조적 미스매치로 measured=false 라, 플래그만으로
+ *  게이트하면 메시 위에 박스가 겹쳐 렌더되기 때문(커버리지 내에서는 메시가 유일한 진실).
+ *  두 레이어 필터는 정확한 여집합이라 전 피처가 둘 중 하나에 반드시 속하고,
+ *  queryRenderedFeatures 는 두 레이어를 합산 조회하므로 클릭/호버 히트테스트는 전 건물 유지된다. */
 const FILL_COLOR_EXPR: any = [
   "case",
   ["!=", ["get", "group_color"], null],
@@ -352,8 +359,10 @@ export default function TrackMap() {
   const [showTiles3d, setShowTiles3d] = useState(true);
   /** 등록된 실측 3D 타일셋 폴더 (설정 > 건물 데이터에서 buildings_3d.bin 임포트 시 등록) */
   const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
-  /** 실측 메시 실제 표출 중 — 이때 같은 건물의 extrusion 박스는 근투명 처리("메시 우선") */
+  /** 실측 메시 실제 표출 중 — 이때 커버리지 영역 내 extrusion 박스는 숨김 처리("메시 우선") */
   const meshActive = showTiles3d && !!tiles3dDir;
+  /** 실측(1m DSM) 커버리지 bbox [minLat, maxLat, minLon, maxLon] — null = 미조회/실측 데이터 없음 */
+  const [meshCoverageBbox, setMeshCoverageBbox] = useState<[number, number, number, number] | null>(null);
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
   const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
   /** 건축물정보 드로어 상태 — 클릭 건물의 로컬 기하 + 대장(로컬 FAC + 온라인 VWorld) 조회 결과 */
@@ -381,7 +390,8 @@ export default function TrackMap() {
   const lastBldgRef = useRef<BldgDrawerState | null>(null);
   if (bldgDrawer) lastBldgRef.current = bldgDrawer;
   /** 건물 호버 간단 툴팁 (커서 옆) — 디바운스/상세조회 없이 즉시 표시 */
-  const [bldgHoverTip, setBldgHoverTip] = useState<{ x: number; y: number; name?: string; height?: number; measured?: boolean } | null>(null);
+  // lat/lon/base(AMSL 지반고) 는 BRA 도구 활성 중 초과·여유고도 즉시 산출용 (아래 툴팁 렌더 참조)
+  const [bldgHoverTip, setBldgHoverTip] = useState<{ x: number; y: number; name?: string; height?: number; measured?: boolean; lat?: number; lon?: number; base?: number } | null>(null);
   /** deck.gl MapboxOverlay 인스턴스 — 클릭 시점 실측 메시 pickObject 용 */
   const deckOverlayRef = useRef<MapboxOverlay | null>(null);
   // 클릭 핸들러(이벤트 effect)에서 최신 뷰포트 건물 목록 참조용 — deps 재등록 churn 방지
@@ -485,7 +495,7 @@ export default function TrackMap() {
   const [braError, setBraError] = useState<string | null>(null);
   /** 원추면 표시 반경 (km) — 표출 전용, 판정 반경(레이더 제원)과 무관. 미영속. */
   const [braConeRadiusKm, setBraConeRadiusKm] = useState(10);
-  const [braConeOpacity, setBraConeOpacity] = useState(0.2); // 원추면 채움 불투명도 (기본 0.2 ≈ 종전 고정 알파 45/255)
+  const [braConeOpacity, setBraConeOpacity] = useState(1); // 원추면 채움 불투명도 (기본 1 = 불투명, 슬라이더로 0.05까지 하향)
   /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
   const braReqSeq = useRef(0);
   // ── 표시 설정 드로어 (우측 도킹) — 건물 / 기상 ──
@@ -1258,6 +1268,9 @@ export default function TrackMap() {
     return buildingsToGeoJSON(buildings3dData);
   }, [showBuildings, buildings3dMode, buildings3dData]);
 
+  /** 마지막으로 적용된 fill-extrusion 필터 키 (JSON) — 변경 시에만 setFilter */
+  const lastFiltersRef = useRef<string>("");
+
   // MapLibre fill-extrusion 레이어 동기화
   useEffect(() => {
     const map = mapRef.current?.getMap();
@@ -1266,8 +1279,23 @@ export default function TrackMap() {
     const sourceId = "buildings-3d-src";
     const layerId = "buildings-3d-fill";
     const measuredLayerId = "buildings-3d-fill-measured";
-    // 실측 보유 건물은 메시 표출 중 레이어 opacity 0 (색 알파가 아닌 layer-level 스칼라)
+    // 메시 대체 대상 건물은 메시 표출 중 레이어 opacity 0 (색 알파가 아닌 layer-level 스칼라)
     const measuredOpacity = meshActive ? 0 : buildingOpacity;
+
+    // 메시 표출 중에는 실측 커버리지 영역 내 모든 박스가 숨김 대상(measured 플래그 무관).
+    // 커버리지 내 미매칭 대장 건물(90k+, bbox 교차 30% 미달 구조적 미스매치)이 measured=false 로
+    // 게이트를 통과해 메시 위에 겹쳐 렌더되는 것 방지 — 커버리지 내에서는 메시가 유일한 진실.
+    // hidden/normal 이 정확히 여집합이라 전 피처가 두 레이어 중 하나에만 속함 →
+    // 호버/클릭 queryRenderedFeatures(두 레이어 합산) 히트테스트는 전 건물 유지.
+    const coveredExpr: any = meshActive && meshCoverageBbox ? ["all",
+      [">=", ["get", "lat"], meshCoverageBbox[0]], ["<=", ["get", "lat"], meshCoverageBbox[1]],
+      [">=", ["get", "lon"], meshCoverageBbox[2]], ["<=", ["get", "lon"], meshCoverageBbox[3]],
+    ] : null;
+    const hiddenFilter: any = coveredExpr
+      ? ["any", ["==", ["get", "measured"], true], coveredExpr]
+      : ["==", ["get", "measured"], true];
+    const normalFilter: any = ["!", hiddenFilter];
+    const filterKey = JSON.stringify(hiddenFilter);
 
     if (buildings3dGeoJSON && buildings3dMode) {
       // GeoJSON 소스 업데이트 또는 생성
@@ -1276,11 +1304,11 @@ export default function TrackMap() {
         source.setData(buildings3dGeoJSON);
       } else {
         map.addSource(sourceId, { type: "geojson", data: buildings3dGeoJSON });
-        // 비실측(fac 미실측 + 수동 등록) 건물 박스
+        // 일반 건물 박스 (메시 대체 대상의 여집합)
         map.addLayer({
           id: layerId,
           type: "fill-extrusion",
-          filter: ["!=", ["get", "measured"], true],
+          filter: normalFilter,
           source: sourceId,
           paint: {
             "fill-extrusion-color": FILL_COLOR_EXPR,
@@ -1290,13 +1318,14 @@ export default function TrackMap() {
             "fill-extrusion-opacity": buildingOpacity,
           },
         });
-        // 실측 보유 건물 박스 — 메시 표출 중에는 opacity 0 으로 숨기고 메시가 시각적으로 대신한다("메시 우선").
+        // 메시 대체 대상 박스(실측 보유 ∪ 실측 커버리지 내) — 메시 표출 중에는 opacity 0 으로 숨기고
+        // 메시가 시각적으로 대신한다("메시 우선").
         // queryRenderedFeatures 는 레이어 isHidden(minzoom/maxzoom/visibility)만 거르므로
         // opacity 0 이어도 클릭/호버(건축물정보 팝업) 히트테스트는 그대로 유지된다.
         map.addLayer({
           id: measuredLayerId,
           type: "fill-extrusion",
-          filter: ["==", ["get", "measured"], true],
+          filter: hiddenFilter,
           source: sourceId,
           paint: {
             "fill-extrusion-color": FILL_COLOR_EXPR,
@@ -1306,6 +1335,15 @@ export default function TrackMap() {
             "fill-extrusion-opacity": measuredOpacity,
           },
         });
+        // 생성 시점 필터가 곧 최신 — 아래 변경 감지에서 중복 setFilter 를 타지 않도록 기록
+        lastFiltersRef.current = filterKey;
+      }
+      // 필터는 변경 시에만 반영 — setFilter 는 레이어 전 피처를 재평가하므로
+      // 뷰포트 타일 로드마다(소스 setData) 무조건 호출하면 안 된다.
+      if (lastFiltersRef.current !== filterKey) {
+        lastFiltersRef.current = filterKey;
+        if (map.getLayer(layerId)) map.setFilter(layerId, normalFilter);
+        if (map.getLayer(measuredLayerId)) map.setFilter(measuredLayerId, hiddenFilter);
       }
       // 레이어 표시 + 채움 투명도 반영 (색 표현식은 상수라 갱신 불필요)
       if (map.getLayer(layerId)) {
@@ -1325,7 +1363,7 @@ export default function TrackMap() {
         map.setLayoutProperty(measuredLayerId, "visibility", "none");
       }
     }
-  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive]);
+  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive, meshCoverageBbox]);
 
   // showBuildings=false 시 fill-extrusion 레이어 제거
   useEffect(() => {
@@ -1361,11 +1399,15 @@ export default function TrackMap() {
         const p = features[0].properties;
         if (!p) return;
         // 호버는 간단 툴팁만 (건물명·높이·실측 배지) — 상세 조회는 클릭(드로어) 전용
+        // lat/lon/base 는 BRA 도구 활성 시 초과·여유고도 계산용 (queryRenderedFeatures 직렬화 방어로 Number())
         setBldgHoverTip({
           x: e.point.x, y: e.point.y,
           name: p.name || undefined,
           height: p.height != null ? Number(p.height) : undefined,
           measured: p.measured === true || p.measured === "true",
+          lat: p.lat != null ? Number(p.lat) : undefined,
+          lon: p.lon != null ? Number(p.lon) : undefined,
+          base: p.base != null ? Number(p.base) : undefined,
         });
       } else if (buildingHoverActiveRef.current) {
         buildingHoverActiveRef.current = false;
@@ -3113,7 +3155,7 @@ export default function TrackMap() {
     const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
       if (info.object) {
         const d = info.object;
-        setBldgHoverTip({ x: info.x, y: info.y, name: d.name || undefined, height: d.height_m, measured: d.measured });
+        setBldgHoverTip({ x: info.x, y: info.y, name: d.name || undefined, height: d.height_m, measured: d.measured, lat: d.lat, lon: d.lon, base: d.ground_elev_m });
       } else {
         setBldgHoverTip(null);
       }
@@ -3174,6 +3216,17 @@ export default function TrackMap() {
   useEffect(() => {
     invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 미등록 */ });
   }, []);
+
+  // 실측 커버리지 bbox 조회 — 메시 표출을 켤 때만 필요(끄면 필터가 커버리지를 안 쓰므로 값 유지해도 무해).
+  // 실패 시 null 유지 → 필터가 기존 measured 플래그 방식으로 자연 폴백.
+  useEffect(() => {
+    if (!meshActive) return;
+    let cancelled = false;
+    invoke<[number, number, number, number] | null>("get_measured_coverage_bbox")
+      .then((bbox) => { if (!cancelled) setMeshCoverageBbox(bbox); })
+      .catch((e) => { console.warn("실측 커버리지 bbox 조회 실패:", e); });
+    return () => { cancelled = true; };
+  }, [meshActive]);
 
   // 실측 메시 줌 게이트 — fill-extrusion 3D 건물과 동일 임계(BUILDINGS_3D_MIN_ZOOM).
   // 광역 줌에서 김포 타일셋 전역이 순회·로드 대상이 되는 것을 막아 표출 스코프를 건물과 일치시킨다.
@@ -5180,6 +5233,39 @@ export default function TrackMap() {
                 <span className="text-gray-600">{bldgHoverTip.height.toFixed(1)} m</span>
               </div>
             )}
+            {/* BRA 도구 활성 중에만 초과·여유고도 표기 — 호버 시에만 도는 경량 산술이라 메모 불요 */}
+            {activeTool === "bra" && bldgHoverTip.lat != null && bldgHoverTip.lon != null
+              && bldgHoverTip.height != null && bldgHoverTip.base != null && (() => {
+              const dM = haversineKm(radarSite.latitude, radarSite.longitude, bldgHoverTip.lat, bldgHoverTip.lon) * 1000;
+              const hAnt = radarSite.altitude + radarSite.antenna_height;
+              // 지반고 base 는 GeoJSON base(ground_elev 캐시 컬럼 — 팝업 표시용 계약)라 표시용 간이값.
+              // 정밀 전수 판정은 bra.rs(centroid 라이브 SRTM) 결과 리스트가 기준.
+              const bTop = bldgHoverTip.base + bldgHoverTip.height; // 건물 상단 AMSL
+              // BRA 원추면 — 실제지구 기하(4/3 굴절 의도적 미적용, bra.rs cone_msl·LoS 시뮬 카드와 동일 정의·동일 상수).
+              // 각도는 오버레이(braResult 스냅샷 angle_deg)와 달리 라이브 braAngleDeg 사용 — LoS 시뮬 카드와 동일 계약(BRA 분석 설정 공유)
+              const braAllow = hAnt + dM * Math.tan((braAngleDeg * Math.PI) / 180) + (dM * dM) / (2 * 6_371_000);
+              const braExcess = bTop - braAllow; // 양수=초과, 음수=여유
+              // LoS 0° 수평 가시선 — LoS 차단 계열이라 4/3 유효지구(CLAUDE.md 프레임 규칙).
+              // 지형 그림자(러닝맥스 최저탐지선) 미반영 — 호버 간이 툴팁 계약(상세조회 invoke 금지, b4e7748)상 경로 프로파일 조회가 불가해 순수 기하만
+              const losAllow = hAnt + (dM * dM) / (2 * ((6_371_000 * 4) / 3));
+              const losExcess = bTop - losAllow;
+              const excessSpan = (v: number) => v > 0
+                ? <span style={{ color: "#e94560" }} className="font-semibold">초과 +{v.toFixed(1)} m</span>
+                : <span className="font-semibold text-emerald-600">여유 {(-v).toFixed(1)} m</span>;
+              return (
+                <div className="mt-1.5 space-y-0.5 border-t border-gray-100 pt-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-gray-500">BRA({braAngleDeg}°)</span>
+                    {excessSpan(braExcess)}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-gray-500">LoS(0°)</span>
+                    {excessSpan(losExcess)}
+                  </div>
+                  <div className="text-[10px] text-gray-400">거리 {(dM / 1000).toFixed(1)} km · 상단 {bTop.toFixed(1)} m AMSL</div>
+                </div>
+              );
+            })()}
           </div>
         )}
 
