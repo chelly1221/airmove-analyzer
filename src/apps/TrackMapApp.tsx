@@ -8,6 +8,7 @@ import TrackMap from "../pages/TrackMap";
 import { useAppStore } from "../store";
 import { ToastContainer } from "../components/common/Toast";
 import SourceOverlay from "../dev/SourceOverlay";
+import TourHost from "../tour/TourHost";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import {
   postPointsToWorker, startConsolidate, getPointSummary,
@@ -214,6 +215,7 @@ export default function TrackMapApp() {
       <div className="relative flex h-8 shrink-0 items-center bg-white">
         <div data-tauri-drag-region className="flex flex-1 h-full items-center pl-4 gap-2">
           <button
+            data-tour="tm-open-ass"
             onClick={pickFiles}
             disabled={parsing || consolidating}
             className="pointer-events-auto flex items-center gap-1.5 rounded bg-[#a60739] px-3 py-1 text-[11px] font-medium text-white hover:bg-[#8a062f] disabled:opacity-50 transition-colors"
@@ -245,6 +247,7 @@ export default function TrackMapApp() {
 
       <SourceOverlay />
       <ToastContainer />
+      <TourHost window="trackmap" />
 
       {/* 파싱 필터 모달 */}
       <ParseFilterModal

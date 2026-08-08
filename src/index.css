@@ -203,6 +203,25 @@ input.coverage-range-thumb::-moz-range-thumb {
   pointer-events: auto;
 }
 
+/* 시나리오 투어 하이라이트 링 (TourHost) — 9999px spread 그림자가 딤 역할.
+   pointer-events:none 이라 대상 클릭을 막지 않는다. 알파만 진동시켜 은은하게 강조. */
+@keyframes tour-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 4px rgba(166, 7, 57, 0.18),
+      0 0 0 9999px rgba(0, 0, 0, 0.28);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px rgba(166, 7, 57, 0.32),
+      0 0 0 9999px rgba(0, 0, 0, 0.28);
+  }
+}
+.tour-ring {
+  animation: tour-pulse 1.8s ease-in-out infinite;
+}
+
 /* Select styling */
 select {
   appearance: none;

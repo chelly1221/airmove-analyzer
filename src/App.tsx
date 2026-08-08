@@ -8,6 +8,7 @@ import Titlebar from "./components/Layout/Titlebar";
 import Sidebar from "./components/Layout/Sidebar";
 import Settings from "./pages/Settings";
 import FileUpload from "./pages/FileUpload";
+import Guide from "./pages/Guide";
 import TrackMap from "./pages/TrackMap";
 import LoSObstacle from "./pages/LoSObstacle";
 import AcasAnalysis from "./pages/AcasAnalysis";
@@ -21,6 +22,7 @@ import { readBulkJson } from "./utils/bulkIpc";
 import type { BulkRef } from "./utils/bulkIpc";
 import SourceOverlay from "./dev/SourceOverlay";
 import { ToastContainer } from "./components/common/Toast";
+import TourHost from "./tour/TourHost";
 import { Loader2 } from "lucide-react";
 import type { Aircraft, RadarSite } from "./types";
 import type { MultiCoverageResult } from "./utils/radarCoverage";
@@ -227,6 +229,7 @@ export default function App() {
             <div className="h-full overflow-auto">
               <Routes>
                 <Route path="/" element={<PageWrapper><FileUpload /></PageWrapper>} />
+                <Route path="/guide" element={<PageWrapper><Guide /></PageWrapper>} />
                 <Route path="/map" element={null} />
                 <Route path="/obstacle" element={<PageWrapper><LoSObstacle /></PageWrapper>} />
                 <Route path="/acas" element={<PageWrapper><AcasAnalysis /></PageWrapper>} />
@@ -243,6 +246,7 @@ export default function App() {
 
       <SourceOverlay />
       <ToastContainer />
+      <TourHost window="main" />
 
       {loading && (
         <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm">

@@ -15,6 +15,7 @@ import {
   Loader2,
   ShieldAlert,
   Binary,
+  BookOpen,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import Modal from "../common/Modal";
@@ -43,6 +44,7 @@ type NavSection = NavEntry | NavGroup;
 
 const navSections: NavSection[] = [
   { type: "item", item: { id: "upload", label: "자료 관리", icon: Upload, path: "/" } },
+  { type: "item", item: { id: "guide", label: "사용방법", icon: BookOpen, path: "/guide" } },
   {
     type: "group",
     label: "항적 시각화",
@@ -55,7 +57,7 @@ const navSections: NavSection[] = [
     type: "group",
     label: "분석",
     items: [
-      { id: "obstacle", label: "LoS 장애물", icon: Eye, path: "/obstacle" },
+      { id: "obstacle", label: "장애물 스카이라인", icon: Eye, path: "/obstacle" },
       { id: "acas", label: "ACAS", icon: ShieldAlert, path: "/acas" },
       { id: "asterix", label: "ASTERIX", icon: Binary, path: "/asterix" },
       { id: "report", label: "보고서", icon: FileText, path: "/report" },
@@ -421,6 +423,7 @@ export default function Sidebar() {
               return (
                 <button
                   key={item.id}
+                  data-tour={`nav-${item.id}`}
                   onClick={() => handleNav(item)}
                   className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all ${
                     active
@@ -444,6 +447,7 @@ export default function Sidebar() {
                     return (
                       <button
                         key={item.id}
+                        data-tour={`nav-${item.id}`}
                         onClick={() => handleNav(item)}
                         className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${
                           active

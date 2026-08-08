@@ -33,6 +33,9 @@ export default function LoSObstacle() {
   const [bldgPinnedIdx, setBldgPinnedIdx] = useState<number | null>(null);
   const panoramaSvgRef = useRef<SVGSVGElement>(null);
   const [panoramaPeakNames, setPanoramaPeakNames] = useState<Map<number, string>>(new Map());
+  // 호버 온디맨드 산 이름 (상위 15개 봉우리 전파 밖 구간 커버) — 툴팁/사이드바 전용, 바닥 라벨엔 미사용
+  const hoverPeakCacheRef = useRef<Map<number, string | null>>(new Map());
+  const [hoverPeakName, setHoverPeakName] = useState<{ idx: number; name: string } | null>(null);
   const [panoramaAzRange, setPanoramaAzRange] = useState<[number, number]>([0, 360]);
   const [radarDropOpen, setRadarDropOpen] = useState(false);
 
@@ -72,12 +75,15 @@ export default function LoSObstacle() {
         });
         if (peaks.length > 0) {
           names.set(target.idx, peaks[0].name);
-          for (let d = 1; d <= 10; d++) {
-            for (const dir of [-1, 1]) {
+          // 인접 bin(같은 산을 가리키는 bin)에도 이름 전파 — 방향별로 독립 진행(한쪽이 끊겨도 반대쪽 계속),
+          // 정점에서 3km 이탈 시 그 방향 종료. 상한 3000빈(=30°)은 무한루프 방지용
+          for (const dir of [-1, 1]) {
+            for (let d = 1; d <= 3000; d++) {
               const adj = (target.idx + dir * d + terrain.length) % terrain.length;
               const adjPt = terrain[adj];
               if (haversineKm(adjPt.lat, adjPt.lon, target.lat, target.lon) < 3) {
-                names.set(adj, peaks[0].name);
+                // targets 는 앙각 내림차순 — 이미 선점된 bin 은 더 높은 봉우리 이름이므로 유지
+                if (!names.has(adj)) names.set(adj, peaks[0].name);
               } else break;
             }
           }
@@ -96,6 +102,9 @@ export default function LoSObstacle() {
     setBldgPinnedIdx(null);
     setBldgHoverIdx(null);
     setPanoramaAzRange([0, 360]);
+    // 지형 배열 교체 → 호버 온디맨드 산 이름 캐시(빈 idx 기준) 무효화
+    hoverPeakCacheRef.current = new Map();
+    setHoverPeakName(null);
     const radarH = radarSite.altitude + radarSite.antenna_height;
     const azStep = 0.01;
     const rangeStep = 200.0;
@@ -211,6 +220,8 @@ export default function LoSObstacle() {
       setBldgPinnedIdx(null);
       setBldgHoverIdx(null);
       setPanoramaPeakNames(new Map());
+      hoverPeakCacheRef.current = new Map();
+      setHoverPeakName(null);
     }
   }, [radarSite.name]);
 
@@ -253,13 +264,15 @@ export default function LoSObstacle() {
           });
           if (peaks.length > 0) {
             names.set(target.idx, peaks[0].name);
-            // 인접 bin(같은 산을 가리키는 bin)에도 이름 전파
-            for (let d = 1; d <= 10; d++) {
-              for (const dir of [-1, 1]) {
+            // 인접 bin(같은 산을 가리키는 bin)에도 이름 전파 — 방향별로 독립 진행(한쪽이 끊겨도 반대쪽 계속),
+            // 정점에서 3km 이탈 시 그 방향 종료. 상한 3000빈(=30°)은 무한루프 방지용
+            for (const dir of [-1, 1]) {
+              for (let d = 1; d <= 3000; d++) {
                 const adj = (target.idx + dir * d + panoramaData.length) % panoramaData.length;
                 const adjPt = panoramaData[adj];
                 if (adjPt.obstacle_type === "terrain" && haversineKm(adjPt.lat, adjPt.lon, target.lat, target.lon) < 3) {
-                  names.set(adj, peaks[0].name);
+                  // targets 는 앙각 내림차순 — 이미 선점된 bin 은 더 높은 봉우리 이름이므로 유지
+                  if (!names.has(adj)) names.set(adj, peaks[0].name);
                 } else break;
               }
             }
@@ -513,12 +526,50 @@ export default function LoSObstacle() {
     return () => { pinMarkerRef.current?.remove(); pinMarkerRef.current = null; };
   }, [activeItem]);
 
+  // 호버한 지형 bin 의 산 이름 온디맨드 조회 (전파 대상 상위 15개 봉우리 밖 산 커버)
+  // 결과는 툴팁·사이드바 전용 — panoramaPeakNames(바닥 라벨 원천)에는 merge 하지 않음
+  useEffect(() => {
+    if (panoramaActiveIdx === null || activeBldg || panoramaData.length === 0) {
+      setHoverPeakName(null);
+      return;
+    }
+    const idx = panoramaActiveIdx;
+    const pt = panoramaData[idx];
+    // 이미 이름이 확정된 bin(장애물 자체 이름 / 전파된 봉우리명)은 조회 불필요
+    if (!pt || pt.name || panoramaPeakNames.has(idx)) {
+      setHoverPeakName(null);
+      return;
+    }
+
+    // 캐시 히트 (null = 조회했으나 3km 내 봉우리 없음)
+    const cached = hoverPeakCacheRef.current.get(idx);
+    if (cached !== undefined) {
+      setHoverPeakName(cached ? { idx, name: cached } : null);
+      return;
+    }
+
+    // 캐시 미스 — 200ms 디바운스 후 조회 (호버 스윕 중 invoke 폭주 방지)
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      invoke<NearbyPeak[]>("query_nearby_peaks", { lat: pt.lat, lon: pt.lon, radiusKm: 3.0 })
+        .then((peaks) => {
+          const name = peaks.length > 0 ? peaks[0].name : null;
+          hoverPeakCacheRef.current.set(idx, name);
+          if (!cancelled) setHoverPeakName(name ? { idx, name } : null);
+        })
+        .catch(() => { /* 실패는 캐시에 기록하지 않음 — 다음 호버에서 재시도 */ });
+    }, 200);
+
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [panoramaActiveIdx, activeBldg, panoramaData, panoramaPeakNames]);
+
   // 활성 포인트를 스토어에 동기화 (사이드바 표시용)
   useEffect(() => {
     if (activeBldg) {
       setPanoramaActivePointStore(activeBldg);
     } else if (panoramaActivePoint && panoramaActiveIdx !== null) {
-      const peakName = panoramaPeakNames.get(panoramaActiveIdx);
+      const peakName = panoramaPeakNames.get(panoramaActiveIdx)
+        ?? (hoverPeakName?.idx === panoramaActiveIdx ? hoverPeakName.name : undefined);
       if (peakName) {
         setPanoramaActivePointStore({ ...panoramaActivePoint, name: peakName });
       } else {
@@ -528,7 +579,7 @@ export default function LoSObstacle() {
       setPanoramaActivePointStore(null);
     }
     setPanoramaPinnedStore(panoramaPinnedIdx !== null || bldgPinnedIdx !== null);
-  }, [activeBldg, panoramaActivePoint, panoramaActiveIdx, panoramaPinnedIdx, bldgPinnedIdx, panoramaPeakNames, setPanoramaActivePointStore, setPanoramaPinnedStore]);
+  }, [activeBldg, panoramaActivePoint, panoramaActiveIdx, panoramaPinnedIdx, bldgPinnedIdx, panoramaPeakNames, hoverPeakName, setPanoramaActivePointStore, setPanoramaPinnedStore]);
 
   // 방위 → SVG x 좌표 변환
   const azToX = useCallback((az: number) => {
@@ -657,7 +708,7 @@ export default function LoSObstacle() {
       {/* Header */}
       <div className="flex shrink-0 items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-800">LoS 장애물</h1>
+          <h1 className="text-2xl font-bold text-gray-800">장애물 스카이라인</h1>
           <p className="mt-1 text-sm text-gray-500">
             360° 파노라마 기반 전파 장애물 분석
             {panoramaData.length > 0 && (
@@ -720,6 +771,8 @@ export default function LoSObstacle() {
               setPanoramaData([]);
               setBuildingObstacles([]);
               setPanoramaPeakNames(new Map());
+              hoverPeakCacheRef.current = new Map();
+              setHoverPeakName(null);
               triggerPanorama();
             }}
             disabled={panoramaLoading}
@@ -906,7 +959,8 @@ export default function LoSObstacle() {
                       const y = panoramaMargin.top + panoramaChartH * (1 - (pt.elevation_angle_deg - panoramaMinAngle) / (panoramaMaxAngle - panoramaMinAngle));
                       const isPinned = panoramaPinnedIdx === panoramaActiveIdx;
                       const peakName = panoramaPeakNames.get(panoramaActiveIdx);
-                      const labelName = pt.name || peakName || null;
+                      const labelName = pt.name || peakName
+                        || (hoverPeakName && hoverPeakName.idx === panoramaActiveIdx ? hoverPeakName.name : null);
                       const line1 = `${pt.azimuth_deg.toFixed(1)}° / ${pt.elevation_angle_deg.toFixed(3)}°`;
                       const line2Parts: string[] = [];
                       if (labelName) line2Parts.push(labelName);

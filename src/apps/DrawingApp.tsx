@@ -8,6 +8,7 @@ import Drawing from "../pages/Drawing";
 import { useAppStore } from "../store";
 import { ToastContainer } from "../components/common/Toast";
 import SourceOverlay from "../dev/SourceOverlay";
+import TourHost from "../tour/TourHost";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import {
   postPointsToWorker, startConsolidate, getPointSummary,
@@ -221,6 +222,7 @@ export default function DrawingApp() {
       <div className="flex h-8 shrink-0 items-center bg-white">
         <div data-tauri-drag-region className="flex flex-1 h-full items-center pl-4 gap-2">
           <button
+            data-tour="drawing-open-ass"
             onClick={pickFiles}
             disabled={parsing || consolidating}
             className="pointer-events-auto flex items-center gap-1.5 rounded bg-[#a60739] px-3 py-1 text-[11px] font-medium text-white hover:bg-[#8a062f] disabled:opacity-50 transition-colors"
@@ -236,6 +238,7 @@ export default function DrawingApp() {
           {/* Mode-S 필터 */}
           <div className="relative pointer-events-auto" ref={dropdownRef}>
             <button
+              data-tour="drawing-aircraft"
               onClick={() => { setDropdownOpen(!dropdownOpen); setRadarDropOpen(false); }}
               className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors ${
                 dropdownOpen
@@ -292,6 +295,7 @@ export default function DrawingApp() {
           {/* 레이더 사이트 선택 드롭다운 */}
           <div ref={radarDropRef} className="relative pointer-events-auto">
             <button
+              data-tour="drawing-radar"
               onClick={() => { setRadarDropOpen(!radarDropOpen); setDropdownOpen(false); }}
               className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition-colors ${
                 radarDropOpen
@@ -338,6 +342,7 @@ export default function DrawingApp() {
 
       <SourceOverlay />
       <ToastContainer />
+      <TourHost window="drawing" />
 
       {/* 파싱 필터 모달 */}
       <ParseFilterModal

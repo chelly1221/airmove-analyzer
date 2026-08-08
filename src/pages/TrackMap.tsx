@@ -4803,6 +4803,7 @@ export default function TrackMap() {
           <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">항공기</div>
           <div ref={aircraftDropRef} className="relative">
           <button
+            data-tour="tm-aircraft"
             onClick={() => { setAircraftDropOpen(!aircraftDropOpen); setRadarDropOpen(false); setModeSSearch(""); }}
             className={`flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors ${
               aircraftDropOpen
@@ -4877,6 +4878,7 @@ export default function TrackMap() {
           <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">레이더</div>
           <div ref={radarDropRef} className="relative">
           <button
+            data-tour="tm-radar"
             onClick={() => { setRadarDropOpen(!radarDropOpen); setAircraftDropOpen(false); }}
             className={`flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors ${
               radarDropOpen
@@ -4939,6 +4941,7 @@ export default function TrackMap() {
             {([["line", "선"], ["points", "점"], ["off", "끄기"]] as const).map(([mode, label]) => (
               <button
                 key={mode}
+                data-tour={mode === "points" ? "tm-track-points" : undefined}
                 onClick={() => setTrackDisplay(mode)}
                 role="radio"
                 aria-checked={trackDisplay === mode}
