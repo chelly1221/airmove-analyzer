@@ -27,7 +27,7 @@ function useRestoreSettings() {
         if (dbAircraft.length > 0) useAppStore.setState({ aircraft: dbAircraft });
       } catch {}
       try {
-        for (const key of ["custom_radar_sites", "selected_radar_site", "dev_mode", "weather_nm_per_bin"]) {
+        for (const key of ["custom_radar_sites", "selected_radar_site", "dev_mode", "weather_nm_per_bin", "weather_colors"]) {
           const value = await invoke<string | null>("load_setting", { key });
           if (!value) continue;
           if (key === "custom_radar_sites") {
@@ -40,6 +40,16 @@ function useRestoreSettings() {
           } else if (key === "weather_nm_per_bin") {
             const v = JSON.parse(value);
             if (typeof v === "number" && v > 0) useAppStore.setState({ weatherNmPerBin: v });
+          } else if (key === "weather_colors") {
+            // 강도 0~6 (7개) × [r,g,b] 0~255 형식일 때만 복원 (손상된 설정 무시)
+            const v = JSON.parse(value);
+            const ok =
+              Array.isArray(v) && v.length === 7 &&
+              v.every((c: unknown) =>
+                Array.isArray(c) && c.length === 3 &&
+                c.every((n: unknown) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 255)
+              );
+            if (ok) useAppStore.setState({ weatherColors: v as [number, number, number][] });
           }
         }
       } catch {}

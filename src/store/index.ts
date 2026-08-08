@@ -27,6 +27,17 @@ function persistSetting(key: string, value: unknown) {
   );
 }
 
+/** CAT008 기상 강도(1~6) 기본 색상 (NWS 스타일 강수 램프). 인덱스 0 미사용. */
+export const DEFAULT_WEATHER_COLORS: [number, number, number][] = [
+  [0, 0, 0],
+  [40, 180, 99],   // 1 약
+  [30, 132, 73],   // 2
+  [241, 196, 15],  // 3 중
+  [230, 126, 34],  // 4
+  [231, 76, 60],   // 5 강
+  [155, 30, 150],  // 6 매우 강
+];
+
 interface AppState {
   // 비행검사기 관리
   aircraft: Aircraft[];
@@ -65,6 +76,10 @@ interface AppState {
   /** 기상 레이어 투명도 (0~1) */
   weatherOpacity: number;
   setWeatherOpacity: (v: number) => void;
+  /** 강도(1~6)별 색상 [r,g,b] (인덱스 0 미사용, 범례 클릭으로 사용자 지정) */
+  weatherColors: [number, number, number][];
+  setWeatherColor: (level: number, rgb: [number, number, number]) => void;
+  resetWeatherColors: () => void;
 
   // 레이더 사이트
   radarSite: RadarSite;
@@ -278,6 +293,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   weatherOpacity: 0.55,
   setWeatherOpacity: (v) => set({ weatherOpacity: v }),
+  weatherColors: DEFAULT_WEATHER_COLORS,
+  setWeatherColor: (level, rgb) => {
+    // 불변 업데이트 — 새 배열 참조여야 useMemo/updateTriggers가 반응
+    const next = get().weatherColors.slice() as [number, number, number][];
+    next[level] = rgb;
+    set({ weatherColors: next });
+    persistSetting("weather_colors", next);
+  },
+  resetWeatherColors: () => {
+    set({ weatherColors: DEFAULT_WEATHER_COLORS });
+    persistSetting("weather_colors", DEFAULT_WEATHER_COLORS);
+  },
 
   // 레이더 사이트 (기본: 김포 #1)
   radarSite: {

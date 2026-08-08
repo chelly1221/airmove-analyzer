@@ -102,18 +102,17 @@ function buildingFootprintVertices(b: ManualBuilding): [number, number][] {
   }
 }
 
-/** CAT008 기상 강도(1~6) → 색상 (NWS 스타일 강수 램프). 인덱스 0 미사용. */
-const WEATHER_COLORS: [number, number, number][] = [
-  [0, 0, 0],
-  [40, 180, 99],   // 1 약
-  [30, 132, 73],   // 2
-  [241, 196, 15],  // 3 중
-  [230, 126, 34],  // 4
-  [231, 76, 60],   // 5 강
-  [155, 30, 150],  // 6 매우 강
-];
 /** 기상 강도 범례 라벨 */
 const WEATHER_LEVEL_LABELS = ["", "약", "", "중", "", "강", "매우강"];
+
+/** [r,g,b] → #rrggbb (input[type=color] value용) */
+const rgbToHex = ([r, g, b]: [number, number, number]): string =>
+  "#" + [r, g, b].map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("");
+/** #rrggbb → [r,g,b] */
+const hexToRgb = (hex: string): [number, number, number] => {
+  const h = hex.replace("#", "");
+  return [parseInt(h.slice(0, 2), 16) || 0, parseInt(h.slice(2, 4), 16) || 0, parseInt(h.slice(4, 6), 16) || 0];
+};
 
 /** 3D 건물 fill-extrusion 색 표현식.
  *  meshOn(실측 메시 타일 표출 중)이면 실측 보유 건물 박스를 최우선 분기로 근투명 처리해
@@ -263,6 +262,9 @@ export default function TrackMap() {
   const setWeatherNmPerBin = useAppStore((s) => s.setWeatherNmPerBin);
   const weatherOpacity = useAppStore((s) => s.weatherOpacity);
   const setWeatherOpacity = useAppStore((s) => s.setWeatherOpacity);
+  const weatherColors = useAppStore((s) => s.weatherColors);
+  const setWeatherColor = useAppStore((s) => s.setWeatherColor);
+  const resetWeatherColors = useAppStore((s) => s.resetWeatherColors);
 
   const [portalReady, setPortalReady] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
@@ -2949,12 +2951,25 @@ export default function TrackMap() {
   // DeckGLOverlay 는 overlaid(MapboxOverlay) 모드라 MapLibre fill-extrusion 과 깊이 상호작용 없음.
   const tiles3dDeckLayers = useMemo(() => {
     if (!showTiles3d || !tiles3dDir) return [];
+    // 성능 튜닝 — Tile3DLayer 는 Tileset3D 성능 옵션을 생성자로 전달하지 않아 onTilesetLoad 에서 주입.
+    // · debounceTime 150ms: 카메라 이동 중 타일 순회·로드 갱신을 150ms 간격으로 합쳐 폭주 억제
+    // · _cacheBytes 512MB: 타일 캐시 예산 상향 (기본 32MB — 김포 타일셋 648MB 대비 과소해
+    //   화면 밖 타일이 언로드→재로드→재파싱 스래시로 버벅임 유발; 생성자에서 굳는 멤버라 직접 대입)
+    // · memoryAdjustedScreenSpaceError: 예산 초과 시 SSE 자동 상향(원거리 세부 LOD 강등)으로
+    //   스래시 대신 품질을 낮추는 안전판 — 예산 이내 복귀 시 원 품질(SSE 8)로 자동 회복
+    // · _cacheOverflowBytes 64MB: 강등 판정 여유폭 (기본 1MB 는 경계에서 강등/복귀 진동)
+    const tuneTileset = (ts: any) => {
+      ts.setProps({ debounceTime: 150, memoryAdjustedScreenSpaceError: true });
+      ts._cacheBytes = 512 * 1024 * 1024;
+      ts._cacheOverflowBytes = 64 * 1024 * 1024;
+    };
     const tileset = (id: string, file: string) =>
       new Tile3DLayer({
         id,
         data: convertFileSrc(file, "tiles3d"),
         loader: Tiles3DLoader,
         pickable: false,
+        onTilesetLoad: tuneTileset,
         onTileError: (err: unknown) => console.warn("실측 3D 타일 로드 실패:", err),
       });
     return [
@@ -3025,17 +3040,17 @@ export default function TrackMap() {
         data,
         getPolygon: (d) => d.polygon,
         getFillColor: (d) => {
-          const c = WEATHER_COLORS[d.intensity] || WEATHER_COLORS[1];
+          const c = weatherColors[d.intensity] || weatherColors[1];
           return [c[0], c[1], c[2], alpha];
         },
         stroked: false,
         filled: true,
         extruded: false,
         pickable: false,
-        updateTriggers: { getFillColor: [alpha] },
+        updateTriggers: { getFillColor: [alpha, weatherColors] },
       }),
     ];
-  }, [weatherVisible, weatherVectors, radarInfo, weatherNmPerBin, weatherOpacity, visibleMaxTs]);
+  }, [weatherVisible, weatherVectors, radarInfo, weatherNmPerBin, weatherOpacity, weatherColors, visibleMaxTs]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
@@ -3999,15 +4014,35 @@ export default function TrackMap() {
         {header("기상 설정", "CAT008 강수 표시")}
         <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column" }}>
           <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb" }}>
-            <div style={{ ...micro, marginBottom: 8 }}>강도 범례</div>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={micro}>강도 범례</span>
+              <button
+                type="button"
+                title="기본 색상으로 복원"
+                onClick={resetWeatherColors}
+                style={{ fontSize: 9, color: "#9ca3af", background: "none", border: "none", padding: 0, cursor: "pointer" }}
+              >
+                기본값
+              </button>
+            </div>
             <div style={{ display: "flex", alignItems: "flex-end", gap: 4 }}>
               {[1, 2, 3, 4, 5, 6].map((lv) => (
                 <div key={lv} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
-                  <div style={{ height: 10, width: "100%", borderRadius: 2, background: `rgb(${WEATHER_COLORS[lv][0]},${WEATHER_COLORS[lv][1]},${WEATHER_COLORS[lv][2]})` }} />
+                  {/* 스와치 클릭 → 투명하게 깔린 input[type=color]가 네이티브 피커를 연다 */}
+                  <div style={{ position: "relative", height: 10, width: "100%", borderRadius: 2, cursor: "pointer", background: `rgb(${weatherColors[lv][0]},${weatherColors[lv][1]},${weatherColors[lv][2]})` }}>
+                    <input
+                      type="color"
+                      value={rgbToHex(weatherColors[lv])}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setWeatherColor(lv, hexToRgb(e.target.value))}
+                      title={"강도 " + lv + " 색상 변경"}
+                      style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer", padding: 0, border: "none" }}
+                    />
+                  </div>
                   <span style={{ fontSize: 8, color: "#9ca3af" }}>{WEATHER_LEVEL_LABELS[lv] || lv}</span>
                 </div>
               ))}
             </div>
+            <div style={{ marginTop: 4, fontSize: 8.5, color: "#9ca3af" }}>색상 클릭 시 변경</div>
           </div>
           <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb" }}>
             <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 5 }}>
