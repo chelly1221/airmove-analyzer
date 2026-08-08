@@ -1333,6 +1333,34 @@ async fn query_buildings_along_path(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// BRA(Building Restricted Area) 침범 검사 — 원추면(0.25° 기본)을 관통하는 건물 전수 조회.
+/// 결과는 침범 건물 폴리곤을 포함해 수 MB 가능 → bulk:// 파일 매개 전송 (BulkRef 반환, bulk.rs 참조)
+#[tauri::command]
+async fn analyze_bra_penetration(
+    app_handle: tauri::AppHandle,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    angle_deg: f64,
+    max_range_km: f64,
+) -> Result<bulk::BulkRef, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = {
+            let state = app_handle.state::<AppState>();
+            let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+            let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+            analysis::bra::analyze_penetration(
+                &mut srtm, &conn,
+                radar_lat, radar_lon, radar_height_m, angle_deg, max_range_km,
+            )?
+        };
+        // lock 해제 후 기록 (panorama_merge_buildings 패턴)
+        bulk::write_json(&app_handle, &result)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// 건물 클릭 좌표 인근 FAC 건물 1건 상세 (로컬 DB, 오프라인 가능)
 #[tauri::command]
 async fn get_fac_building_detail(
@@ -3319,6 +3347,7 @@ pub fn run() {
             download_srtm_korea,
             query_buildings_along_path,
             query_buildings_3d_binary,
+            analyze_bra_penetration,
             get_fac_building_detail,
             find_building_near_point,
             // 건물통합정보 (F_FAC_BUILDING)

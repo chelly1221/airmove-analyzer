@@ -106,7 +106,8 @@ export function LosCrossSection({
     }));
 
     // 통합 장애물 인터페이스 — computeMinDet 가 자체 obstacle 구성에 사용. 차단 판정은 computeLosBlockage(공유 헬퍼)로 일원화.
-    interface Obstacle { distance: number; elevation: number; }
+    //   bIdx: 소유 건물 인덱스 — 아래 shadowObs 실꺾음 귀속 전용(옵션, 지형 항목·computeMinDet 내부 obs 는 undefined).
+    interface Obstacle { distance: number; elevation: number; bIdx?: number; }
 
     // 2) 최저 탐지가능선 (직선 LoS, ITU 4/3 유효지구, Running Max Angle).
     //    지형 base(terrainPts) + 건물(blds) 통합 obstacle 에 대해 running-max 앙각 계산.
@@ -259,43 +260,40 @@ export function LosCrossSection({
     const adjTarget43 = targetElev - curvDrop43(D);
     const chord43H = (d: number) => radarHeight + (adjTarget43 - radarHeight) * (d / D);
 
-    // 차단 건물 판정 '선 꺾음' 조건용 prefix — 거리 오름차순 running max 앙각(4/3).
-    //   장애물 집합은 가시 최저탐지선(computeMinDet(baseTerrain, buildings))과 동일하게
-    //   지형 전체 + 모든 건물(대상 포함) near/far 상단 — '이 건물이 선을 꺾는가'를 묻는 판정이므로
-    //   그림자에는 대상 건물 실루엣도 그대로 포함되어야 한다.
+    // 차단 건물 판정 '선 꺾음' 조건용 장애물 집합 — 가시 최저탐지선(computeMinDet(baseTerrain, buildings))과
+    //   동일하게 지형 전체 + 모든 건물(대상 포함) near/far 상단. '이 건물이 (표시되는) 선을 꺾는가'를 묻는
+    //   판정이므로 그림자에는 대상 건물 실루엣도 그대로 포함되어야 한다.
+    //   bIdx: 소유 건물의 buildings 배열 인덱스 — 아래 실꺾음 귀속용(지형 항목은 undefined).
     const shadowObs: Obstacle[] = [];
     for (const p of baseTerrain) shadowObs.push({ distance: p.distance, elevation: p.elevation });
-    for (const b of buildings) {
+    for (let i = 0; i < buildings.length; i++) {
+      const b = buildings[i];
       const bTop = b.ground_elev_m + b.height_m;
       const nearD = b.near_dist_km ?? b.distance_km;
       const farD = b.far_dist_km ?? b.distance_km;
-      shadowObs.push({ distance: nearD, elevation: bTop });
-      if (farD - nearD > 0.001) shadowObs.push({ distance: farD, elevation: bTop });
+      shadowObs.push({ distance: nearD, elevation: bTop, bIdx: i });
+      if (farD - nearD > 0.001) shadowObs.push({ distance: farD, elevation: bTop, bIdx: i });
     }
+    // 안정 정렬(Array.sort) — 동거리 타이 순서가 표시 실선 computeMinDet 의 obs 스캔 순서와 동일하게 유지된다.
     shadowObs.sort((a, b) => a.distance - b.distance);
-    const obsDist = new Float64Array(shadowObs.length);
-    const obsPrefixAng = new Float64Array(shadowObs.length);
-    let prefAng43 = -Infinity;
-    for (let i = 0; i < shadowObs.length; i++) {
-      const ob = shadowObs[i];
-      obsDist[i] = ob.distance;
-      if (ob.distance > 0) {
-        const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
-        if (ang > prefAng43) prefAng43 = ang;
+
+    // ── 실꺾음 귀속(exact attribution) ── (TrackMap LoSProfilePanel 과 동일 의미론, 2026-08-08 동기화)
+    //   표시 실선(computeMinDet(baseTerrain, buildings))과 동일한 장애물 집합·정렬 순서로 4/3 running max
+    //   앙각을 갱신하며, 자기 near/far 엣지 항목이 최대 앙각을 실제로 끌어올린 건물 인덱스만 수집.
+    //   strict '>' 는 computeMinDet 내부 `if (angle > maxAngle)` 과 동일 조건.
+    //   (구 prefix 방식(maxAngleBefore)은 자기 near 엣지 '이전' 장애물의 running max 와만 비교 — 상단이
+    //    레이더보다 낮은 건물은 4/3 앙각이 far 엣지에서 최대라, near~far 사이 타 건물이 이미 올린 선을
+    //    무시해 실제로는 선을 못 꺾는 건물이 차단(빨강)으로 대량 오탐됐다 → 폐기)
+    const bentBldg = new Set<number>();
+    let runMax43 = -Infinity;
+    for (const ob of shadowObs) {
+      if (ob.distance <= 0) continue;
+      const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
+      if (ang > runMax43) {
+        runMax43 = ang;
+        if (ob.bIdx !== undefined) bentBldg.add(ob.bIdx);
       }
-      obsPrefixAng[i] = prefAng43;
     }
-    /** 거리 d '이전'(strict, 1e-6 여유) 장애물들의 running max 앙각 — 없으면 -Infinity. 이분탐색 O(log N). */
-    const maxAngleBefore = (d: number): number => {
-      const lim = d - 1e-6;
-      let lo = 0, hi = shadowObs.length - 1, res = -1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (obsDist[mid] < lim) { res = mid; lo = mid + 1; }
-        else hi = mid - 1;
-      }
-      return res >= 0 ? obsPrefixAng[res] : -Infinity;
-    };
     // 차단 판정 후보 게이트 — 대상 건물 자신과 대상 footprint 에 겹친 중복 폴리곤은 차단 배지
     //   (computeLosBlockage) 입력에서도 빠지므로 빨강에서도 제외해야 배지↔차트가 일치한다.
     //   excludeTargetBuildings 는 원본 배열의 filter 라 요소 identity 가 보존됨 → Set 참조 매칭 성립.
@@ -307,7 +305,8 @@ export function LosCrossSection({
     //    최근접 그리드 스냅으로 bDist '앞'에 놓일 때(≈50%) 자기그림자를 만들어, 실제 차단 건물이 실루엣·범례
     //    카운트에서 무작위 누락됐다(최저탐지선·차단판정의 baseTerrain 이전 시 이 블록만 리팩토링 누락).
     const significantBuildings: (BuildingOnPath & { isBlocking: boolean; isTarget: boolean })[] = [];
-    for (const b of buildings) {
+    for (let i = 0; i < buildings.length; i++) {
+      const b = buildings[i]; // i = shadowObs 의 bIdx 태깅과 동일한 buildings 배열 인덱스
       const bDist = b.distance_km;
       if (bDist <= 0 || bDist >= D) continue;
       const isTarget = isTargetBuildingOnPath(b, building, D);
@@ -320,11 +319,12 @@ export function LosCrossSection({
         const shadow = radarHeight + (adjH - radarHeight) * (bDist / p.distance);
         if (shadow > terrainShadow) terrainShadow = shadow;
       }
-      // 차단 건물(적색) 판정 — 이중 조건 (TrackMap LoSProfilePanel 과 동일 의미론, 2026-08-03 동기화):
+      // 차단 건물(적색) 판정 — 이중 조건 (TrackMap LoSProfilePanel 과 동일 의미론, 2026-08-08 동기화):
       //   ① 4/3 현(chord43H) 관통: 건물 상단이 레이더↔대상 상단 직선 시야를 실제로 가로막는가.
-      //   ② AND near 엣지 '이전' 장애물들의 running max 앙각(maxAngleBefore) 그림자 위로 상단이
-      //      올라오는가 = 최저탐지선을 실제로 꺾는가 (앞선 지형·건물에 이미 묻힌 건물은 차단 기여 0).
-      //   두 식 모두 거리에 대해 선형/단조라 footprint 양 끝(s0,s1)만 검사하면 충분.
+      //      거리에 대해 선형/단조라 footprint 양 끝(s0,s1)만 검사하면 충분.
+      //   ② AND 표시 최저탐지선을 자기 엣지가 실제로 꺾어 올림(bentBldg 실꺾음 귀속) — 앞선 지형·건물
+      //      그림자에 이미 묻혀 running max 를 못 올린 건물은 차단 기여 0. near/far 어느 엣지가 선을
+      //      올렸는지는 위 1패스 스캔이 그대로 귀속하므로 여기선 집합 조회만 한다.
       //   judgeSet(=buildingsWithoutTarget) 밖 건물(대상 자신·대상 footprint 겹침 중복 폴리곤)은
       //   차단 배지(computeLosBlockage) 입력에서도 제외되므로 빨강에서도 제외 — 배지↔차트 정합.
       //   구 maxBlockPoint 근접 귀속은 최대 차단점 옆 무관 건물 오탐·비최대 관통 건물 누락으로 폐기.
@@ -337,14 +337,12 @@ export function LosCrossSection({
         if (s0 <= s1) {
           const excessAt = (d: number) => (bTop - curvDrop43(d)) - chord43H(d);
           const penetratesChord = Math.max(excessAt(s0), excessAt(s1)) > 0;
-          if (penetratesChord) {
-            const angAt = (d: number) => (bTop - curvDrop43(d) - radarHeight) / (d * 1000);
-            isBlk = Math.max(angAt(s0), angAt(s1)) > maxAngleBefore(nearD);
-          }
+          isBlk = penetratesChord && bentBldg.has(i);
         }
       }
       // isBlk 포함 — 실제 차단 건물이 지형 그림자에 묻혀도 목록·빨강 실루엣에서 누락되지 않게
-      //   (terrainShadow 는 centroid 거리 bDist 기준, 선 꺾음은 near 엣지 기준이라 경계에서 어긋날 수 있음).
+      //   (terrainShadow 는 centroid 거리 bDist 기준, 실꺾음 귀속은 near/far 엣지 항목 기준이라
+      //    경계에서 어긋날 수 있음).
       if (bAdj > terrainShadow || isTarget || isBlk) {
         significantBuildings.push({ ...b, isBlocking: isBlk, isTarget });
       }

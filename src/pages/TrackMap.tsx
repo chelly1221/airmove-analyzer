@@ -4,7 +4,7 @@ import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import type { MapboxOverlay } from "@deck.gl/mapbox";
-import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer, TextLayer } from "@deck.gl/layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
 import {
@@ -19,9 +19,10 @@ import {
   Search,
   CloudRain,
   Settings,
+  Cone,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { ToolButton, HeadingTape, Toggle as DsToggle, Check, Swatch, DsSlider } from "../components/Map/drawerPrimitives";
+import { ToolButton, HeadingTape, Toggle as DsToggle, Check, Swatch, DsSlider, ACCENT, G } from "../components/Map/drawerPrimitives";
 
 /** 표시 행 설정 톱니 버튼 (우측 설정 드로어 토글) */
 const GearButton = ({ active, onClick }: { active: boolean; onClick: () => void }) => (
@@ -38,6 +39,11 @@ const GearButton = ({ active, onClick }: { active: boolean; onClick: () => void 
 /** MapLibre terrain 과장 배율 — setTerrain(2곳)과 LoS 커튼 z 배율(EX)이 공유해야
  *  커튼 지형선이 1.5배 과장된 지형 메시 표면과 일치. 값 변경 시 커튼도 자동 정합. */
 const TERRAIN_EXAGGERATION = 1.5;
+
+/** CoS(침묵원추) 기준각 — LoSProfilePanel COS_DEG·CoveragePanel MAX_ELEV_DEG 와 동일 의미 (70° 최고탐지각) */
+const COS_DEG = 70;
+/** CoS 원추 측면 분할 세그먼트 수 */
+const COS_SEGMENTS = 64;
 
 /** LoS 단면도 레이어 정의 (LoSProfilePanel 범례와 동일 색/의미) */
 const LOS_LAYERS = [
@@ -68,7 +74,8 @@ const TrackPointIcon = ({ size = 16 }: { size?: number }) => (
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult } from "../types";
+import { readBulkJson, type BulkRef } from "../utils/bulkIpc";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
 import LoSProfileTabs from "../components/Map/LoSProfileTabs";
@@ -297,6 +304,9 @@ export default function TrackMap() {
   const weatherColors = useAppStore((s) => s.weatherColors);
   const setWeatherColor = useAppStore((s) => s.setWeatherColor);
   const resetWeatherColors = useAppStore((s) => s.resetWeatherColors);
+  // BRA 기준각 (영속 설정)
+  const braAngleDeg = useAppStore((s) => s.braAngleDeg);
+  const setBraAngleDeg = useAppStore((s) => s.setBraAngleDeg);
 
   const [portalReady, setPortalReady] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
@@ -332,9 +342,9 @@ export default function TrackMap() {
   const meshActive = showTiles3d && !!tiles3dDir;
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
   const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
-  // 건물 클릭 시 건축물정보 팝업 (로컬 기하 + 로컬 FAC 대장 + 온라인 VWorld)
-  const [bldgPopup, setBldgPopup] = useState<{
-    x: number; y: number; lat: number; lon: number;
+  /** 건축물정보 드로어 상태 — 클릭 건물의 로컬 기하 + 대장(로컬 FAC + 온라인 VWorld) 조회 결과 */
+  type BldgDrawerState = {
+    lat: number; lon: number;
     /** 온라인 VWorld 조회 진행 중 */
     loading: boolean;
     info: {
@@ -348,74 +358,44 @@ export default function TrackMap() {
     localName?: string; localHeight?: number; localUsage?: string;
     /** 지반 표고(AMSL, m) + 출처(fac/manual) — 클릭 시점 로컬 값 */
     localBase?: number; localSource?: string;
-    /** 실측(1m DSM) 자료 보유 건물 — 팝업 '실측자료' 항목 표시용 */
+    /** 실측(1m DSM) 자료 보유 건물 — 드로어 '실측자료' 항목 표시용 */
     localMeasured?: boolean;
-    /** true: 클릭으로 고정됨 (호버로 닫히지 않음) */
-    pinned: boolean;
-  } | null>(null);
+  };
+  // 건물 클릭 시 건축물정보 우측 도킹 드로어 (클릭으로만 열림 — 호버는 간단 툴팁만)
+  const [bldgDrawer, setBldgDrawer] = useState<BldgDrawerState | null>(null);
+  /** 닫힘 애니메이션 중 내용 유지용 마지막 드로어 값 */
+  const lastBldgRef = useRef<BldgDrawerState | null>(null);
+  if (bldgDrawer) lastBldgRef.current = bldgDrawer;
+  /** 건물 호버 간단 툴팁 (커서 옆) — 디바운스/상세조회 없이 즉시 표시 */
+  const [bldgHoverTip, setBldgHoverTip] = useState<{ x: number; y: number; name?: string; height?: number; measured?: boolean } | null>(null);
   /** deck.gl MapboxOverlay 인스턴스 — 클릭 시점 실측 메시 pickObject 용 */
   const deckOverlayRef = useRef<MapboxOverlay | null>(null);
   // 클릭 핸들러(이벤트 effect)에서 최신 뷰포트 건물 목록 참조용 — deps 재등록 churn 방지
   const buildings3dDataRef = useRef<Building3D[]>([]);
   useEffect(() => { buildings3dDataRef.current = buildings3dData; }, [buildings3dData]);
-  /** 건축물 팝업 DOM ref + 계산된 위치 (가장자리 자동 회피) */
-  const bldgPopupRef = useRef<HTMLDivElement>(null);
-  const [bldgPopupPos, setBldgPopupPos] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
-  /** 호버 디바운스 타이머 — 250ms 머무르면 팝업 표시 */
-  const bldgHoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showBldgPopupForHover = useCallback((args: {
-    x: number; y: number; lat: number; lon: number;
-    name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean;
-  }) => {
-    setBldgPopup((prev) => {
-      if (prev?.pinned) return prev;
-      // 같은 좌표면 위치만 갱신
-      if (prev && Math.abs(prev.lat - args.lat) < 1e-6 && Math.abs(prev.lon - args.lon) < 1e-6) {
-        return { ...prev, x: args.x, y: args.y };
-      }
-      return {
-        x: args.x, y: args.y, lat: args.lat, lon: args.lon,
-        loading: true, info: null, facDetail: undefined,
-        localName: args.name, localHeight: args.height, localUsage: args.usage,
-        localBase: args.base, localSource: args.source, localMeasured: args.measured,
-        pinned: false,
-      };
-    });
-  }, []);
-  const scheduleBldgHover = useCallback((args: {
-    x: number; y: number; lat: number; lon: number;
-    name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean;
-  }) => {
-    if (bldgHoverTimerRef.current) clearTimeout(bldgHoverTimerRef.current);
-    bldgHoverTimerRef.current = setTimeout(() => showBldgPopupForHover(args), 220);
-  }, [showBldgPopupForHover]);
-  const clearBldgHover = useCallback(() => {
-    if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
-    setBldgPopup((prev) => (prev && !prev.pinned ? null : prev));
-  }, []);
   const [rangeStart, setRangeStart] = useState(0);
   /** 재생 모드 트레일 길이 (초). 0=전체 표시, >0=최근 N초만 표시 */
   const [trailDuration, setTrailDuration] = useState(0);
 
-  // bldgPopup 좌표 설정 시 건물정보 조회 — 로컬 FAC 대장(오프라인) + 온라인 VWorld 병렬
+  // bldgDrawer 좌표 설정 시 건물정보 조회 — 로컬 FAC 대장(오프라인) + 온라인 VWorld 병렬
   useEffect(() => {
-    if (!bldgPopup) return;
-    const lat = bldgPopup.lat, lon = bldgPopup.lon;
+    if (!bldgDrawer) return;
+    const lat = bldgDrawer.lat, lon = bldgDrawer.lon;
     let cancelled = false;
     // 로컬 건물통합정보 대장 (오프라인 가능, 빠름)
-    if (bldgPopup.facDetail === undefined) {
+    if (bldgDrawer.facDetail === undefined) {
       invoke<FacBuildingDetail | null>("get_fac_building_detail", { lat, lon })
-        .then((res) => { if (!cancelled) setBldgPopup((prev) => prev ? { ...prev, facDetail: res ?? null } : null); })
-        .catch(() => { if (!cancelled) setBldgPopup((prev) => prev ? { ...prev, facDetail: null } : null); });
+        .then((res) => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, facDetail: res ?? null } : null); })
+        .catch(() => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, facDetail: null } : null); });
     }
     // 온라인 VWorld 상세 (보조)
-    if (bldgPopup.loading) {
-      invoke<typeof bldgPopup.info>("get_vworld_building_info", { lat, lon })
-        .then((res) => { if (!cancelled) setBldgPopup((prev) => prev ? { ...prev, loading: false, info: res ?? null } : null); })
-        .catch(() => { if (!cancelled) setBldgPopup((prev) => prev ? { ...prev, loading: false, info: null } : null); });
+    if (bldgDrawer.loading) {
+      invoke<BldgDrawerState["info"]>("get_vworld_building_info", { lat, lon })
+        .then((res) => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, loading: false, info: res ?? null } : null); })
+        .catch(() => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, loading: false, info: null } : null); });
     }
     return () => { cancelled = true; };
-  }, [bldgPopup?.lat, bldgPopup?.lon]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bldgDrawer?.lat, bldgDrawer?.lon]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 비행 선택 시 시간 바 리셋 (전체 범위 표시)
   useEffect(() => {
@@ -429,6 +409,8 @@ export default function TrackMap() {
     lines: { label: string; value: string; color?: string }[];
   } | null>(null);
   const [terrainEnabled, setTerrainEnabled] = useState(true);
+  /** CoS(침묵원추) 3D 표출 토글 — 다른 표시 토글처럼 영속화 없음 */
+  const [showCos, setShowCos] = useState(false);
   const [modeSSearch, setModeSSearch] = useState("");
   const [aircraftDropOpen, setAircraftDropOpen] = useState(false);
   const [radarDropOpen, setRadarDropOpen] = useState(false);
@@ -479,37 +461,22 @@ export default function TrackMap() {
   const savedBearingRef = useRef(0);
   const losPointClickedRef = useRef(false); // deck.gl LoS 포인트 클릭 여부 (빈 영역 클릭 구분용)
   const [losCursorPicking, setLosCursorPicking] = useState(false);
-  // ── 도구 드로어 (좌측 도킹) — LoS 분석 / 커버리지 맵 택1 ──
-  const [activeTool, setActiveTool] = useState<"los" | "coverage" | null>(null);
-  const lastToolRef = useRef<"los" | "coverage">("los");
+  // ── 도구 드로어 (좌측 도킹) — LoS 분석 / 커버리지 맵 / BRA 분석 택1 ──
+  const [activeTool, setActiveTool] = useState<"los" | "coverage" | "bra" | null>(null);
+  const lastToolRef = useRef<"los" | "coverage" | "bra">("los");
   if (activeTool) lastToolRef.current = activeTool;
+  // ── BRA 분석 상태 (드로어 로컬) ──
+  const [braResult, setBraResult] = useState<BraResult | null>(null);
+  const [braLoading, setBraLoading] = useState(false);
+  const [braError, setBraError] = useState<string | null>(null);
+  /** 원추면 표시 반경 (km) — 표출 전용, 판정 반경(레이더 제원)과 무관. 미영속. */
+  const [braConeRadiusKm, setBraConeRadiusKm] = useState(30);
+  /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
+  const braReqSeq = useRef(0);
   // ── 표시 설정 드로어 (우측 도킹) — 건물 / 기상 ──
   const [settingsDrawer, setSettingsDrawer] = useState<"building" | "weather" | null>(null);
   const lastSettingsRef = useRef<"building" | "weather">("building");
   if (settingsDrawer) lastSettingsRef.current = settingsDrawer;
-
-  // 건축물 팝업 위치 — 맵 박스 밖으로 안 나가게 가장자리에서 자동 플립/클램프 (열린 드로어도 회피)
-  useLayoutEffect(() => {
-    if (!bldgPopup) return;
-    const el = bldgPopupRef.current;
-    const map = mapRef.current?.getMap();
-    if (!el || !map) return;
-    const cont = map.getContainer().getBoundingClientRect();
-    const W = cont.width, H = cont.height;
-    const w = el.offsetWidth, h = el.offsetHeight;
-    const GAP = 14, M = 8;
-    const leftBound = activeTool ? 308 : M;              // 좌측 도구 드로어(300) 회피
-    const rightBound = settingsDrawer ? W - 232 : W - M; // 우측 설정 드로어(224) 회피
-    // 가로: 기본 커서 오른쪽, 우측 경계 넘치면 왼쪽으로 플립
-    let left = bldgPopup.x + GAP;
-    if (left + w > rightBound) left = bldgPopup.x - GAP - w;
-    left = Math.max(leftBound, Math.min(left, rightBound - w));
-    // 세로: 기본 살짝 위, 하단 넘치면 위로 올림
-    let top = bldgPopup.y - GAP;
-    if (top + h > H - M) top = H - M - h;
-    top = Math.max(M, top);
-    setBldgPopupPos({ left, top });
-  }, [bldgPopup?.x, bldgPopup?.y, bldgPopup?.loading, bldgPopup?.info, bldgPopup?.facDetail, activeTool, settingsDrawer]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // LoS 단면도 레이어 표시 / 프레넬 클리어런스 / 사용자 각도선 (드로어에서 제어)
   const [losLayers, setLosLayers] = useState({ terrain: true, los43: true, fresnel: true, bra: true, cos: false });
@@ -549,10 +516,12 @@ export default function TrackMap() {
   // LoS 수직 단면 커튼 샘플 — LoSProfilePanel onCurtainData 수신 (차트 가시 구간 3D 표출)
   const [losCurtain, setLosCurtain] = useState<LosCurtainSample[] | null>(null);
   // 단면도 경로상 건물 — 대상(파랑)/차단(빨강) 지도 하이라이트. LoSProfilePanel onPathBuildings 수신
-  //   all = 드로어 리스트 입력용 전체 목록(최저탐지선 꺾음 기여(비차단) + 차단). 리스트는 차단만 필터해 표시
+  //   all = 드로어 리스트 입력용 전체 목록(경로 통과 건물 전수). 리스트는 차단만 필터해 표시
   const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null>(null);
   // 건물모드 방위 한계 — 건물 양끝 방위(offset 도메인, 0/360 랩 안전). launchBuildingLoS valid 시 설정
   const [losBldgAzBounds, setLosBldgAzBounds] = useState<{ center: number; minOff: number; maxOff: number } | null>(null);
+  // 건물모드 3탭(좌끝/중앙/우끝) 활성 인덱스 — 지도 방위 마커 강조 동기 (LoSProfileTabs onActiveViewChange 수신)
+  const [losActiveViewIdx, setLosActiveViewIdx] = useState(0);
   // 건물 스윕 최초 1회 줌인 플래그 (launchBuildingLoS 시 리셋)
   const bldgSweepZoomedRef = useRef(false);
   // 카드 입력값 (문자열) — 지반고 / 건물높이
@@ -1365,7 +1334,7 @@ export default function TrackMap() {
       if (present.length === 0) {
         if (buildingHoverActiveRef.current) {
           buildingHoverActiveRef.current = false;
-          clearBldgHover();
+          setBldgHoverTip(null);
         }
         return;
       }
@@ -1375,38 +1344,33 @@ export default function TrackMap() {
         map.getCanvas().style.cursor = "pointer";
         const p = features[0].properties;
         if (!p) return;
-        scheduleBldgHover({
+        // 호버는 간단 툴팁만 (건물명·높이·실측 배지) — 상세 조회는 클릭(드로어) 전용
+        setBldgHoverTip({
           x: e.point.x, y: e.point.y,
-          lat: Number(p.lat), lon: Number(p.lon),
           name: p.name || undefined,
           height: p.height != null ? Number(p.height) : undefined,
-          usage: p.usage || undefined,
-          base: p.base != null ? Number(p.base) : undefined,
-          source: p.source || undefined,
           measured: p.measured === true || p.measured === "true",
         });
       } else if (buildingHoverActiveRef.current) {
         buildingHoverActiveRef.current = false;
         map.getCanvas().style.cursor = "";
-        clearBldgHover();
+        setBldgHoverTip(null);
       }
     };
 
-    /** 건물 속성 → 팝업 오픈 (박스 쿼리·메시 픽 공용) */
-    const openBldgPopup = (a: { lat: number; lon: number; name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean }, pt: { x: number; y: number }) => {
+    /** 건물 속성 → 우측 건축물정보 드로어 오픈 (박스 쿼리·메시 픽 공용) */
+    const openBldgDrawer = (a: { lat: number; lon: number; name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean }) => {
       if (losTarget) losPointClickedRef.current = true;
-      if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
-      setBldgPopup((prev) => {
-        // 같은 건물이면 기존 정보 유지하고 pinned만 켠다
-        if (prev && Math.abs(prev.lat - a.lat) < 1e-6 && Math.abs(prev.lon - a.lon) < 1e-6) {
-          return { ...prev, x: pt.x, y: pt.y, pinned: true };
-        }
+      setBldgHoverTip(null);
+      setSettingsDrawer(null); // 우측 표시 설정 드로어와 택1 상호 배타
+      setBldgDrawer((prev) => {
+        // 같은 건물 재클릭이면 기존 조회 데이터 유지 (재조회 방지)
+        if (prev && Math.abs(prev.lat - a.lat) < 1e-6 && Math.abs(prev.lon - a.lon) < 1e-6) return prev;
         return {
-          x: pt.x, y: pt.y, lat: a.lat, lon: a.lon,
+          lat: a.lat, lon: a.lon,
           loading: true, info: null, facDetail: undefined,
           localName: a.name, localHeight: a.height, localUsage: a.usage,
           localBase: a.base, localSource: a.source, localMeasured: a.measured,
-          pinned: true,
         };
       });
       // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
@@ -1426,7 +1390,7 @@ export default function TrackMap() {
         if (coord) {
           const b = resolveMeasuredBuildingAt(coord[1], coord[0], buildings3dDataRef.current);
           if (b) {
-            openBldgPopup({ lat: b.lat, lon: b.lon, name: b.name || undefined, height: b.height_m, usage: b.usage || undefined, base: b.ground_elev_m, source: b.source, measured: true }, e.point);
+            openBldgDrawer({ lat: b.lat, lon: b.lon, name: b.name || undefined, height: b.height_m, usage: b.usage || undefined, base: b.ground_elev_m, source: b.source, measured: true });
             return;
           }
           // 메시는 맞았지만 매칭 건물 없음(미매칭 메시) → 박스 경로 폴백
@@ -1434,12 +1398,12 @@ export default function TrackMap() {
       }
       // ② 기존 fill-extrusion 박스 쿼리 경로
       const present = layerIds.filter((id) => map.getLayer(id));
-      if (present.length === 0) { setBldgPopup(null); return; }
+      if (present.length === 0) { setBldgDrawer(null); return; }
       const features = map.queryRenderedFeatures(e.point, { layers: present });
       if (features.length > 0) {
         const p = features[0].properties;
         if (p) {
-          openBldgPopup({
+          openBldgDrawer({
             lat: Number(p.lat), lon: Number(p.lon),
             name: p.name || undefined,
             height: p.height != null ? Number(p.height) : undefined,
@@ -1447,10 +1411,10 @@ export default function TrackMap() {
             base: p.base != null ? Number(p.base) : undefined,
             source: p.source || undefined,
             measured: p.measured === true || p.measured === "true",
-          }, e.point);
+          });
         }
       } else {
-        setBldgPopup(null);
+        setBldgDrawer(null);
       }
     };
 
@@ -1463,6 +1427,7 @@ export default function TrackMap() {
       if (buildingHoverActiveRef.current) {
         buildingHoverActiveRef.current = false;
         map.getCanvas().style.cursor = "";
+        setBldgHoverTip(null);
       }
     };
   }, [losTarget, buildings3dMode, showBuildings, meshActive]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1574,10 +1539,10 @@ export default function TrackMap() {
     };
     cleanup();
 
-    if (!bldgPopup?.pinned || !buildings3dMode || buildings3dData.length === 0) return;
+    if (!bldgDrawer || !buildings3dMode || buildings3dData.length === 0) return;
 
     const matched = buildings3dData.find(
-      (b) => Math.abs(b.lat - bldgPopup.lat) < 0.0001 && Math.abs(b.lon - bldgPopup.lon) < 0.0001
+      (b) => Math.abs(b.lat - bldgDrawer.lat) < 0.0001 && Math.abs(b.lon - bldgDrawer.lon) < 0.0001
     );
     if (!matched || matched.polygon.length < 3) return;
 
@@ -1602,7 +1567,8 @@ export default function TrackMap() {
     });
 
     return cleanup;
-  }, [bldgPopup?.pinned, bldgPopup?.lat, bldgPopup?.lon, buildings3dMode, buildings3dData]);
+    // 조회 결과(loading/info/facDetail) 갱신으로 레이어가 재생성되지 않게 열림 여부·좌표만 deps 로
+  }, [bldgDrawer != null, bldgDrawer?.lat, bldgDrawer?.lon, buildings3dMode, buildings3dData]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 주소검색 건물 → 3D 골드 표출(히트) / 지반 2D 폴백(미히트).
   //   buildings3dMode·showBuildings·줌 게이트와 무관하게 addressMarker 존재 동안 항상 표시.
@@ -2358,6 +2324,81 @@ export default function TrackMap() {
     setLosCursorPicking(false);
   }, [radarSite.latitude, radarSite.longitude, radarSite.range_nm, setLosFromAzDist]);
 
+  // 건물모드 방위 마커 — 좌끝/중앙/우끝(탭) 또는 현재 스윕 방위 레이가 대상 건물 footprint를
+  //   관통하는 구간의 중점. 지도에 대상 건물 위 아이콘으로 표출(단면도 대상 건물 핀과 동일 파랑 계약).
+  const losBldgMarkers = useMemo(() => {
+    const out: { lon: number; lat: number; label: string; viewIdx: number }[] = [];
+    const fp = losFootprint;
+    // 건물모드(footprint + 양끝 방위 유효)에서만 표출 — 스윕/탭 공용
+    if (!fp || fp.length < 3 || !losBldgAzBounds) return out;
+
+    const rLat = radarSite.latitude, rLon = radarSite.longitude;
+    const DEG2RAD = Math.PI / 180, R = 6_371_000;
+    // launchBuildingLoS 와 동일 평면 프레임 (x=lat축 m, y=lon축 m)
+    const mPerDegLat = DEG2RAD * R;
+    const mPerDegLon = mPerDegLat * Math.cos(rLat * DEG2RAD);
+    // footprint 꼭짓점의 레이더 기준 평면 좌표 (m)
+    const vx = new Float64Array(fp.length), vy = new Float64Array(fp.length);
+    for (let i = 0; i < fp.length; i++) {
+      vx[i] = (fp[i][0] - rLat) * mPerDegLat;
+      vy[i] = (fp[i][1] - rLon) * mPerDegLon;
+    }
+
+    // 방위 az 의 레이(원점=레이더)와 footprint 변들의 교차 → 관통 구간 중점 거리 t(m)
+    const rayMidT = (azDeg: number): number | null => {
+      const ux = Math.cos(azDeg * DEG2RAD), uy = Math.sin(azDeg * DEG2RAD);
+      let tMin = Infinity, tMax = -Infinity, hits = 0;
+      for (let i = 0; i < fp.length; i++) {
+        const j = (i + 1) % fp.length; // 링 폐합 포함
+        const ax = vx[i], ay = vy[i];
+        const sx = vx[j] - ax, sy = vy[j] - ay;
+        // p = t·u = a + w·s  →  [ux -sx; uy -sy]·[t w]ᵀ = [ax ay]ᵀ
+        const det = -ux * sy + uy * sx;
+        if (Math.abs(det) < 1e-12) continue; // 평행/퇴화 변
+        const t = (-ax * sy + ay * sx) / det;
+        const w = (ux * ay - uy * ax) / det;
+        if (t <= 0 || w < 0 || w > 1) continue;
+        hits++;
+        if (t < tMin) tMin = t;
+        if (t > tMax) tMax = t;
+      }
+      if (hits >= 2) return (tMin + tMax) / 2;
+      if (hits === 1) return tMin;
+      // 좌·우끝 접선이 수치오차로 빗나간 경우 — 레이 수직거리(|across|) 최소인 전방 꼭짓점으로 폴백
+      let bestAcross = Infinity, bestAlong: number | null = null;
+      for (let i = 0; i < fp.length; i++) {
+        const along = vx[i] * ux + vy[i] * uy;
+        if (along <= 0) continue;
+        const across = Math.abs(-vx[i] * uy + vy[i] * ux);
+        if (across < bestAcross) { bestAcross = across; bestAlong = along; }
+      }
+      return bestAlong;
+    };
+    // t(m) → 위경도 환원. t 산출 실패 시 footprint 산술 centroid 로 폴백
+    const toLonLat = (azDeg: number): { lon: number; lat: number } => {
+      const t = rayMidT(azDeg);
+      if (t === null) {
+        let sLat = 0, sLon = 0;
+        for (const [la, lo] of fp) { sLat += la; sLon += lo; }
+        return { lat: sLat / fp.length, lon: sLon / fp.length };
+      }
+      const ux = Math.cos(azDeg * DEG2RAD), uy = Math.sin(azDeg * DEG2RAD);
+      return { lat: rLat + (t * ux) / mPerDegLat, lon: rLon + (t * uy) / mPerDegLon };
+    };
+
+    if (losAzViews) {
+      // 탭 모드 — 좌끝/중앙/우끝 각 방위마다 1개
+      for (let i = 0; i < losAzViews.length; i++) {
+        const v = losAzViews[i];
+        out.push({ ...toLonLat(v.az), label: v.label, viewIdx: i });
+      }
+    } else {
+      // 스윕 모드 — 현재 방위 1개 (라벨 없음)
+      out.push({ ...toLonLat(losAzimuth), label: "", viewIdx: -1 });
+    }
+    return out;
+  }, [losFootprint, losBldgAzBounds, losAzViews, losAzimuth, radarSite.latitude, radarSite.longitude]);
+
   // 등록 장애물 선택 → 해당 건물 footprint로 LoS 분석
   const setLosToObstacle = useCallback((b: ManualBuilding) => {
     launchBuildingLoS(buildingFootprintVertices(b), b.latitude, b.longitude);
@@ -2406,12 +2447,51 @@ export default function TrackMap() {
     if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
   }, []);
 
-  // 도구 버튼 클릭 — 같은 도구 재클릭 시 닫힘, LoS 떠날 때 정리
-  const handleToolClick = useCallback((tool: "los" | "coverage") => {
+  // BRA 모드 해제 — 결과 폐기 + 진행 중 요청 무효화 (seq 증가 → 늦게 도착한 응답 무시)
+  const teardownBra = useCallback(() => {
+    braReqSeq.current += 1;
+    setBraResult(null);
+    setBraError(null);
+    setBraLoading(false);
+  }, []);
+
+  // 도구 버튼 클릭 — 같은 도구 재클릭 시 닫힘, LoS/BRA 떠날 때 정리
+  const handleToolClick = useCallback((tool: "los" | "coverage" | "bra") => {
     const next = activeTool === tool ? null : tool;
     if (activeTool === "los" && next !== "los") teardownLoS();
+    if (activeTool === "bra" && next !== "bra") teardownBra();
     setActiveTool(next);
-  }, [activeTool, teardownLoS]);
+  }, [activeTool, teardownLoS, teardownBra]);
+
+  // 레이더 사이트가 바뀌면 이전 사이트 기준 BRA 결과는 무효
+  useEffect(() => {
+    teardownBra();
+  }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, teardownBra]);
+
+  // BRA 분석 실행 — 결과는 폴리곤 포함 수 MB 가능 → bulk:// 파일 매개 수신
+  const runBraAnalysis = useCallback(async () => {
+    const seq = ++braReqSeq.current;
+    setBraLoading(true);
+    setBraError(null);
+    try {
+      const ref = await invoke<BulkRef>("analyze_bra_penetration", {
+        radarLat: radarSite.latitude,
+        radarLon: radarSite.longitude,
+        radarHeightM: radarSite.altitude + radarSite.antenna_height,
+        angleDeg: braAngleDeg,
+        maxRangeKm: radarSite.range_nm * 1.852,
+      });
+      const res = await readBulkJson<BraResult>(ref);
+      if (seq !== braReqSeq.current) return; // 최신 요청만 반영
+      setBraResult(res);
+    } catch (e) {
+      if (seq !== braReqSeq.current) return;
+      setBraError(String(e));
+      setBraResult(null);
+    } finally {
+      if (seq === braReqSeq.current) setBraLoading(false);
+    }
+  }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, radarSite.range_nm, braAngleDeg]);
 
   // 3D 입체 허용 토글 ↔ 현재 줌에 맞춰 buildings3dMode 재조정
   useEffect(() => {
@@ -2900,8 +2980,52 @@ export default function TrackMap() {
         );
       }
     }
+
+    // 건물모드 방위 마커 (좌끝/중앙/우끝 or 스윕 단면 지점) — overlaid deck 캔버스라 건물 위에 항상 보임.
+    //   정리 경로는 별도 코드 불필요 — teardownLoS/onClose 가 losFootprint·losAzViews·losBldgAzBounds 를
+    //   비우면 losBldgMarkers 가 빈 배열이 되어 레이어가 자동 소멸한다.
+    if (losBldgMarkers.length > 0) {
+      type AzMarker = { lon: number; lat: number; label: string; viewIdx: number };
+      const isActive = (d: AzMarker) => d.viewIdx === losActiveViewIdx || d.viewIdx === -1;
+      layers.push(
+        new ScatterplotLayer<AzMarker>({
+          id: "los-bldg-az-markers",
+          data: losBldgMarkers,
+          getPosition: (d) => [d.lon, d.lat, 0],
+          radiusUnits: "pixels",
+          getRadius: (d) => (isActive(d) ? 6.5 : 4.5),
+          getFillColor: (d) => (isActive(d) ? [59, 130, 246, 255] : [59, 130, 246, 150]),
+          stroked: true,
+          getLineColor: [255, 255, 255, 230],
+          lineWidthMinPixels: 1.5,
+          pickable: false,
+          updateTriggers: { getRadius: losActiveViewIdx, getFillColor: losActiveViewIdx },
+        })
+      );
+      const labeled = losBldgMarkers.filter((d) => d.label);
+      if (labeled.length > 0) {
+        layers.push(
+          new TextLayer<AzMarker>({
+            id: "los-bldg-az-labels",
+            data: labeled,
+            getText: (d) => d.label,
+            getPosition: (d) => [d.lon, d.lat, 0],
+            getPixelOffset: [0, -16],
+            getSize: (d) => (isActive(d) ? 12 : 11),
+            getColor: (d) => (isActive(d) ? [29, 78, 216, 255] : [59, 130, 246, 205]),
+            background: true,
+            getBackgroundColor: [255, 255, 255, 220],
+            backgroundPadding: [4, 2, 4, 2],
+            fontFamily: "'Pretendard Variable', Pretendard, sans-serif",
+            characterSet: ["좌", "끝", "중", "앙", "우"],
+            pickable: false,
+            updateTriggers: { getSize: losActiveViewIdx, getColor: losActiveViewIdx },
+          })
+        );
+      }
+    }
     return layers;
-  }, [losMode, losTarget, losCursor, radarInfo, radarSite.latitude, radarSite.longitude, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, losCurtain, losLayers, terrainEnabled]);
+  }, [losMode, losTarget, losCursor, radarInfo, radarSite.latitude, radarSite.longitude, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, losCurtain, losLayers, terrainEnabled, losBldgMarkers, losActiveViewIdx]);
 
   // Loss 포인트 전용 deck.gl 레이어 (Loss 데이터 변경 시에만 재생성)
   const lossDeckLayers = useMemo(() => {
@@ -2960,7 +3084,7 @@ export default function TrackMap() {
     };
     const isHighlighted = (d: Building3D) =>
       losBuildingHighlight && Math.abs(d.lat - losBuildingHighlight.lat) < 0.0001 && Math.abs(d.lon - losBuildingHighlight.lon) < 0.0001;
-    const sel = bldgPopup?.pinned ? bldgPopup : null;
+    const sel = bldgDrawer;
     const isSelected = (d: Building3D) =>
       sel && Math.abs(d.lat - sel.lat) < 0.0001 && Math.abs(d.lon - sel.lon) < 0.0001;
     const a = (base: number) => Math.round(base * buildingOpacity);
@@ -2973,16 +3097,13 @@ export default function TrackMap() {
         : [209, 213, 219, a(220)];
     };
     const selObj = sel ? buildings3dData.find((d) => isSelected(d)) : null;
+    // 호버는 간단 툴팁만 (건물명·높이·실측 배지) — 상세 조회는 클릭(드로어) 전용
     const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
       if (info.object) {
         const d = info.object;
-        scheduleBldgHover({
-          x: info.x, y: info.y, lat: d.lat, lon: d.lon,
-          name: d.name || undefined, height: d.height_m, usage: d.usage || undefined,
-          base: d.ground_elev_m, source: d.source,
-        });
+        setBldgHoverTip({ x: info.x, y: info.y, name: d.name || undefined, height: d.height_m, measured: d.measured });
       } else {
-        clearBldgHover();
+        setBldgHoverTip(null);
       }
     };
     return [
@@ -3009,20 +3130,20 @@ export default function TrackMap() {
           if (losTarget) losPointClickedRef.current = true;
           if (info.object) {
             const d = info.object;
-            if (bldgHoverTimerRef.current) { clearTimeout(bldgHoverTimerRef.current); bldgHoverTimerRef.current = null; }
-            setBldgPopup((prev) => {
-              if (prev && Math.abs(prev.lat - d.lat) < 1e-6 && Math.abs(prev.lon - d.lon) < 1e-6) {
-                return { ...prev, x: info.x, y: info.y, pinned: true };
-              }
+            setBldgHoverTip(null);
+            setSettingsDrawer(null); // 우측 표시 설정 드로어와 택1 상호 배타
+            setBldgDrawer((prev) => {
+              // 같은 건물 재클릭이면 기존 조회 데이터 유지 (재조회 방지)
+              if (prev && Math.abs(prev.lat - d.lat) < 1e-6 && Math.abs(prev.lon - d.lon) < 1e-6) return prev;
               return {
-                x: info.x, y: info.y, lat: d.lat, lon: d.lon,
+                lat: d.lat, lon: d.lon,
                 loading: true, info: null, facDetail: undefined,
                 localName: d.name || undefined,
                 localHeight: d.height_m,
                 localUsage: d.usage || undefined,
                 localBase: d.ground_elev_m,
                 localSource: d.source,
-                pinned: true,
+                localMeasured: d.measured,
               };
             });
             // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
@@ -3035,7 +3156,7 @@ export default function TrackMap() {
         onHover: buildingHover,
       }),
     ];
-  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgPopup?.pinned, bldgPopup?.lat, bldgPopup?.lon]);
+  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgDrawer?.lat, bldgDrawer?.lon]);
 
   // 등록된 실측 3D 타일셋 폴더 조회 (미등록이면 null → 토글 비활성)
   useEffect(() => {
@@ -3148,6 +3269,205 @@ export default function TrackMap() {
       }),
     ];
   }, [weatherVisible, weatherVectors, radarInfo, weatherNmPerBin, weatherOpacity, weatherColors, visibleMaxTs]);
+
+  // CoS(침묵원추) 3D 레이어 — 레이더 안테나 정점에서 70°(COS_DEG) 기준각 상방으로 벌어지는 역원추.
+  //   70° 를 넘는 앙각은 레이더가 탐지하지 못하므로 이 원추 내부가 곧 침묵 영역.
+  //   천장은 커버리지 상한(COVERAGE_MAX_ALT_FT)과 동일 스코프 — 원추는 무한 발산하므로 같은 고도에서 잘라
+  //   커버리지 맵/CoS 단면과 표시 범위를 맞춘다.
+  //   z 는 LoS 커튼과 동일 규약(AMSL 미터 × EX) — 지형 메시가 1.5배 과장이라 커튼/지형과 정합.
+  const cosDeckLayers = useMemo(() => {
+    if (!showCos) return [];
+    const apexM = radarSite.altitude + radarSite.antenna_height; // 안테나 정점 (AMSL m)
+    const ceilM = COVERAGE_MAX_ALT_FT * 0.3048;                  // 천장 30,000ft → m (AMSL)
+    if (ceilM <= apexM) return [];
+    const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
+    // 70° 앙각 경계 → 정점 위 높이차 / tan70° = 천장에서의 원추 반경
+    const radiusM = (ceilM - apexM) / Math.tan((COS_DEG * Math.PI) / 180);
+    // 도 단위 변환 (파일 내 기존 111.32 km/deg 평면근사와 동일 계열)
+    const dLat = radiusM / 111320;
+    const dLon = radiusM / (111320 * Math.cos((radarSite.latitude * Math.PI) / 180));
+    const apex: [number, number, number] = [radarSite.longitude, radarSite.latitude, apexM * EX];
+    // 상단 림 (닫힌 루프 — 마지막 정점 = 처음)
+    const rim: [number, number, number][] = [];
+    for (let i = 0; i <= COS_SEGMENTS; i++) {
+      const a = (i / COS_SEGMENTS) * Math.PI * 2;
+      rim.push([
+        radarSite.longitude + dLon * Math.sin(a),
+        radarSite.latitude + dLat * Math.cos(a),
+        ceilM * EX,
+      ]);
+    }
+    // 측면 = 정점 기준 삼각형 팬
+    const sides: { polygon: [number, number, number][] }[] = [];
+    for (let i = 0; i < COS_SEGMENTS; i++) {
+      sides.push({ polygon: [apex, rim[i], rim[i + 1]] });
+    }
+    const layers: any[] = [
+      new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
+        id: "cos-cone",
+        data: sides,
+        getPolygon: (d) => d.polygon,
+        getFillColor: [168, 85, 247, 50], // 반투명 보라 (LOS_LAYERS cos 색과 동일 계열)
+        filled: true,
+        extruded: false,
+        _full3d: true,   // 경사 폴리곤 필수 — 미지정 시 2D 테셀레이터가 퇴화
+        material: false, // 조명 음영 없이 플랫 색
+        pickable: false,
+        // depth 미기록 — 반투명 볼륨이 depth 를 남기면 뒤에 그려지는 항적/건물/Loss 마커가
+        // 원추에 가려 사라진다. 블렌드만 수행하면 앞·뒷면이 겹쳐 자연스러운 볼륨감도 얻는다.
+        parameters: { depthWriteEnabled: false },
+      }),
+      new PathLayer<{ path: [number, number, number][] }>({
+        id: "cos-cone-rim",
+        data: [{ path: rim }],
+        getPath: (d) => d.path,
+        getColor: [168, 85, 247, 200], // 상단 림 강조선
+        getWidth: 1.5,
+        widthUnits: "pixels" as const,
+        pickable: false,
+      }),
+    ];
+    return layers;
+  }, [showCos, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
+
+  // BRA 3D 레이어 — ① 원추면(기준각 θ 로 전방위 상승) ② 침범 건물의 원추면 위 돌출부(붉은 프리즘).
+  //   z 규약은 CoS 원추(cosDeckLayers)와 동일: AMSL 미터 × EX (지형 메시가 1.5배 과장이라 정합).
+  //   원추면 해발고는 Rust analysis/bra.rs cone_msl · LoSProfilePanel braAMSL 과 동일한
+  //   실제지구 기하 직선: coneMsl(d) = h_ant + d·tanθ + d²/(2R) (4/3 굴절 미적용).
+  const braDeckLayers = useMemo(() => {
+    if (activeTool !== "bra") return [];
+    const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
+    const R_EARTH_M = 6_371_000;
+    const M_PER_DEG_LAT = 111320; // 파일 내 기존 평면근사와 동일 계열
+    const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
+    const mPerDegLon = M_PER_DEG_LAT * cosLat;
+    const coneMsl = (dM: number, hAnt: number, tanT: number) =>
+      hAnt + dM * tanT + (dM * dM) / (2 * R_EARTH_M);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const layers: any[] = [];
+
+    // ── ① 원추면 (분석 실행 전에도 즉시 표시) ──
+    const apexM = radarSite.altitude + radarSite.antenna_height; // 안테나 정점 (AMSL m)
+    const tanTheta = Math.tan((braAngleDeg * Math.PI) / 180);
+    const AZ_SEG = 72;  // 방위 분할
+    const RINGS = 24;   // 반경 링 (중심 조밀 — r_i ∝ (i/RINGS)²)
+    const R_render = braConeRadiusKm * 1000;
+    // ring[i][j] = 링 i · 방위 j 의 [lon, lat, z]
+    const ring: [number, number, number][][] = [];
+    for (let i = 1; i <= RINGS; i++) {
+      const r = R_render * (i / RINGS) ** 2;
+      const z = coneMsl(r, apexM, tanTheta) * EX;
+      const row: [number, number, number][] = [];
+      for (let j = 0; j <= AZ_SEG; j++) {
+        const a = (j / AZ_SEG) * Math.PI * 2;
+        row.push([
+          radarSite.longitude + (r * Math.sin(a)) / mPerDegLon,
+          radarSite.latitude + (r * Math.cos(a)) / M_PER_DEG_LAT,
+          z,
+        ]);
+      }
+      ring.push(row);
+    }
+    const apex: [number, number, number] = [radarSite.longitude, radarSite.latitude, apexM * EX];
+    const coneFaces: { polygon: [number, number, number][] }[] = [];
+    for (let j = 0; j < AZ_SEG; j++) {
+      // 중심부는 삼각형 팬 (링 0 이 정점으로 퇴화)
+      coneFaces.push({ polygon: [apex, ring[0][j], ring[0][j + 1]] });
+    }
+    for (let i = 0; i < RINGS - 1; i++) {
+      for (let j = 0; j < AZ_SEG; j++) {
+        coneFaces.push({ polygon: [ring[i][j], ring[i + 1][j], ring[i + 1][j + 1], ring[i][j + 1]] });
+      }
+    }
+    layers.push(
+      new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
+        id: "bra-cone",
+        data: coneFaces,
+        getPolygon: (d) => d.polygon,
+        getFillColor: [34, 211, 238, 45], // LOS_LAYERS bra 색(#22d3ee) 반투명
+        filled: true,
+        extruded: false,
+        _full3d: true,   // 경사 폴리곤 필수 — 미지정 시 2D 테셀레이터가 퇴화
+        material: false, // 조명 음영 없이 플랫 색
+        pickable: false,
+        // depth 미기록 — 반투명 면이 depth 를 남기면 뒤에 그려지는 항적/건물/Loss 마커가 가려진다
+        parameters: { depthWriteEnabled: false },
+      }),
+      new PathLayer<{ path: [number, number, number][] }>({
+        id: "bra-cone-rim",
+        data: [{ path: ring[RINGS - 1] }],
+        getPath: (d) => d.path,
+        getColor: [34, 211, 238, 200],
+        getWidth: 1.5,
+        widthUnits: "pixels" as const,
+        pickable: false,
+      }),
+    );
+
+    // ── ② 침범 건물: 원추면 위로 솟은 부분만 붉은 프리즘 ──
+    if (braResult && braResult.buildings.length > 0) {
+      // 판정에 쓰인 값(결과 스냅샷)으로 원추면 재구성 — 입력 슬라이더를 이후 조정해도 오버레이는 결과와 정합
+      const hRes = braResult.radar_height_m;
+      const tanRes = Math.tan((braResult.angle_deg * Math.PI) / 180);
+      const faces: { polygon: [number, number, number][] }[] = [];
+      for (const b of braResult.buildings) {
+        const poly = b.polygon;
+        if (!poly || poly.length < 3) continue;
+        // fill-extrusion 은 지도면(과장 지형) 기준 AGL 압출이라 원추면의 AMSL 프레임과 z 기준이 다르다.
+        // 붉은 띠를 '화면에 보이는 건물 상단'에 앵커하고 띠 두께 = 초과량이 되도록 하는 의도적 설계.
+        const topZ = (terrainEnabled ? b.ground_elev_m * EX : 0) + b.height_m;
+        const n = poly.length;
+        const lonlat: [number, number][] = new Array(n);
+        const t: number[] = new Array(n);
+        for (let i = 0; i < n; i++) {
+          const [la, lo] = poly[i];
+          lonlat[i] = [lo, la];
+          const dx = (lo - radarSite.longitude) * mPerDegLon;
+          const dy = (la - radarSite.latitude) * M_PER_DEG_LAT;
+          const dv = Math.sqrt(dx * dx + dy * dy);
+          const over = b.total_height_m - coneMsl(dv, hRes, tanRes);
+          t[i] = Math.max(0, Math.min(over, b.height_m));
+        }
+        // 상단 캡 (지붕면). 풋프린트 일부만 침범하는 경계 건물은 캡이 다소 과대 표시되나,
+        // 원추 기울기(0.25° ≈ 4.4m/km)에 비해 풋프린트 스팬이 작아 오차는 무시 가능.
+        const cap: [number, number, number][] = new Array(n);
+        for (let i = 0; i < n; i++) cap[i] = [lonlat[i][0], lonlat[i][1], topZ];
+        faces.push({ polygon: cap });
+        // 측벽 — 양끝 초과량이 모두 0 에 가까운 변은 생략
+        for (let i = 0; i < n; i++) {
+          const j = (i + 1) % n;
+          if (t[i] <= 0.01 && t[j] <= 0.01) continue;
+          faces.push({
+            polygon: [
+              [lonlat[i][0], lonlat[i][1], topZ - t[i]],
+              [lonlat[j][0], lonlat[j][1], topZ - t[j]],
+              [lonlat[j][0], lonlat[j][1], topZ],
+              [lonlat[i][0], lonlat[i][1], topZ],
+            ],
+          });
+        }
+      }
+      if (faces.length > 0) {
+        layers.push(
+          new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
+            id: "bra-penetration",
+            data: faces,
+            getPolygon: (d) => d.polygon,
+            getFillColor: [239, 68, 68, 120],
+            filled: true,
+            extruded: false,
+            _full3d: true,
+            material: false,
+            pickable: false,
+            parameters: { depthWriteEnabled: false },
+          }),
+        );
+      }
+    }
+
+    return layers;
+  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
@@ -3491,6 +3811,12 @@ export default function TrackMap() {
     // 실측 3D 타일 합성 (별도 useMemo)
     layers.push(...tiles3dDeckLayers);
 
+    // CoS 침묵원추 합성 (별도 useMemo) — depth 미기록 반투명이라 뒤에 그려지는 Loss/아이콘과 자연 블렌드
+    layers.push(...cosDeckLayers);
+
+    // BRA 원추면 + 침범 건물 오버레이 합성 (별도 useMemo) — CoS 와 동일한 depth 미기록 반투명
+    layers.push(...braDeckLayers);
+
     // LoS 단면도 건물 호버/클릭 하이라이트 (건물 오버레이 비활성 상태에서도 표시)
     if (losBuildingHighlight) {
       layers.push(
@@ -3563,7 +3889,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -3969,8 +4295,8 @@ export default function TrackMap() {
             </button>
           </div>
 
-          {/* LoS 차단 건물 — 출처: LoSProfilePanel chartData.significantBuildings → onPathBuildings.all
-              (최저탐지선 꺾음 기여(비차단) + 차단 건물) 중 차단(isBlocking)만 필터해 표시.
+          {/* LoS 차단 건물 — 출처: LoSProfilePanel chartData.pathBuildings → onPathBuildings.all
+              (경로 통과 건물 전수) 중 차단(isBlocking)만 필터해 표시.
               색 계약은 지도/차트와 동일: 대상=파랑(#3b82f6) · 차단=빨강(#ef4444). */}
           {(() => {
             const list = losPathBldgs?.all ?? [];
@@ -4023,6 +4349,145 @@ export default function TrackMap() {
               </div>
             );
           })()}
+        </div>
+      </>
+    );
+  };
+
+  // ── 좌측 도구 드로어 본문: BRA 분석 ──
+  const renderBraToolBody = () => {
+    const micro: React.CSSProperties = { fontSize: 8.5, fontWeight: 700, letterSpacing: ".06em", color: G[400], textTransform: "uppercase" };
+    const num: React.CSSProperties = { fontFamily: "ui-monospace, monospace", fontVariantNumeric: "tabular-nums", fontWeight: 700 };
+    const card: React.CSSProperties = { borderRadius: 9, border: `1px solid ${G[200]}`, background: "#fff", padding: "9px 10px" };
+    const antennaM = radarSite.altitude + radarSite.antenna_height;
+    const list = braResult?.buildings ?? [];
+    const MAX_ROWS = 300;
+    const shown = list.slice(0, MAX_ROWS);
+    return (
+      <>
+        {/* 헤더 */}
+        <div style={{ padding: "10px 12px", borderBottom: `1px solid ${G[200]}`, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: G[800], lineHeight: 1.15 }}>BRA 분석</span>
+              <span style={{ fontSize: 9.5, color: G[400], lineHeight: 1.2 }}>Building Restricted Area · 침범 검사</span>
+            </span>
+            <button onClick={() => handleToolClick("bra")} title="닫기"
+              style={{ width: 24, height: 24, borderRadius: 6, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, color: G[400] }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = G[100]; e.currentTarget.style.color = G[600]; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = G[400]; }}>
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
+          {/* 기준 */}
+          <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}` }}>
+            <div style={{ ...micro, marginBottom: 7 }}>Reference · 기준</div>
+            <div style={card}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: G[700], overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{radarSite.name}</span>
+                <span style={{ ...num, fontSize: 11, color: ACCENT, flexShrink: 0 }}>{antennaM.toFixed(1)}<span style={{ fontSize: 9, color: G[400], marginLeft: 1 }}>m AMSL</span></span>
+              </div>
+              <div style={{ fontSize: 9, color: G[400], marginTop: 3 }}>안테나 정점 (사이트 표고 + 안테나 높이)</div>
+            </div>
+          </div>
+
+          {/* 입력 */}
+          <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}`, display: "flex", flexDirection: "column", gap: 9 }}>
+            <div style={{ ...micro }}>Parameters · 입력</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>기준각(°)</span>
+              <input
+                type="number" value={braAngleDeg} step={0.05} min={0.05} max={10}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (Number.isFinite(v) && v >= 0.05 && v <= 10) setBraAngleDeg(v);
+                }}
+                style={{ ...num, width: 72, fontSize: 11, padding: "4px 7px", borderRadius: 6, border: `1px solid ${G[300]}`, color: G[800], textAlign: "right" }}
+              />
+            </div>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>원추 표시 반경</span>
+                <span style={{ ...num, fontSize: 10, color: "#22d3ee" }}>{braConeRadiusKm}km</span>
+              </div>
+              <DsSlider value={braConeRadiusKm} min={5} max={100} step={5} onChange={setBraConeRadiusKm} color="#22d3ee" />
+            </div>
+            <button
+              onClick={runBraAnalysis} disabled={braLoading}
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "7px 10px", borderRadius: 7, border: "none", width: "100%",
+                fontSize: 11.5, fontWeight: 700, cursor: braLoading ? "default" : "pointer",
+                background: braLoading ? G[300] : ACCENT, color: "#fff" }}>
+              {braLoading ? <Loader2 size={12} className="animate-spin" /> : <Cone size={12} />}
+              {braLoading ? "분석 중…" : "분석 실행"}
+            </button>
+            {braError && (
+              <div style={{ fontSize: 9.5, color: "#e94560", lineHeight: 1.35, wordBreak: "break-all" }}>{braError}</div>
+            )}
+          </div>
+
+          {/* 요약 */}
+          {braResult && (
+            <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}` }}>
+              <div style={card}>
+                <div style={{ fontSize: 10, color: G[600], lineHeight: 1.5 }}>
+                  검사 <span style={{ ...num, color: G[800] }}>{braResult.scanned.toLocaleString()}</span>동 ·
+                  침범 <span style={{ ...num, color: "#ef4444" }}>{braResult.total_penetrating.toLocaleString()}</span>동
+                  {list.length > 0 && (
+                    <> · 최대 초과 <span style={{ ...num, color: "#ef4444" }}>{list[0].exceed_m.toFixed(1)}m</span></>
+                  )}
+                </div>
+                {braResult.truncated && (
+                  <div style={{ fontSize: 9, color: G[400], marginTop: 3 }}>상위 2,000동 표시</div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 침범 건물 리스트 */}
+          <div style={{ padding: "9px 11px", flex: 1, minHeight: 150, display: "flex", flexDirection: "column" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <span style={{ ...micro, flex: 1, minWidth: 0 }}>Penetrating · 침범 건물</span>
+              <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>{list.length.toLocaleString()}</span>
+            </div>
+            {list.length === 0 ? (
+              <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", fontSize: 10, color: G[400] }}>
+                {braLoading ? "분석 중…" : braResult ? "침범 건물 없음" : "분석을 실행하세요"}
+              </div>
+            ) : (
+              <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+                {shown.map((b) => (
+                  <div key={`${b.source}-${b.id}`}
+                    onClick={() => {
+                      const map = mapRef.current?.getMap();
+                      if (map) map.easeTo({ center: [b.lon, b.lat], zoom: Math.max(map.getZoom(), 15), duration: 600 });
+                    }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = G[50])}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                    style={{ padding: "4px 5px", borderRadius: 4, cursor: "pointer" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ width: 6, height: 6, borderRadius: 3, background: "#ef4444", flexShrink: 0 }} />
+                      <span style={{ fontSize: 10.5, fontWeight: 600, color: G[700], flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {b.name ?? b.address ?? "이름 없음"}
+                      </span>
+                      <span style={{ ...num, fontSize: 9.5, color: "#ef4444", flexShrink: 0 }}>+{b.exceed_m.toFixed(1)}m</span>
+                    </div>
+                    <div style={{ fontSize: 9, color: G[400], paddingLeft: 12 }}>
+                      {(b.distance_km / 1.852).toFixed(1)}NM · {b.azimuth_deg.toFixed(0)}° · 꼭대기 {b.total_height_m.toFixed(0)}m AMSL
+                      {b.measured ? " · 실측" : ""}{b.source === "manual" ? " · 수동" : ""}
+                    </div>
+                  </div>
+                ))}
+                {list.length > MAX_ROWS && (
+                  <div style={{ padding: "6px 5px", fontSize: 9.5, color: G[400], textAlign: "center" }}>
+                    …외 {(list.length - MAX_ROWS).toLocaleString()}동
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </>
     );
@@ -4325,7 +4790,7 @@ export default function TrackMap() {
           <div className="flex items-center gap-2">
             <Building2 size={14} className={showBuildings ? "text-[#a60739]" : "text-gray-400"} />
             <span className="text-xs text-gray-600">건물</span>
-            <GearButton active={settingsDrawer === "building"} onClick={() => { setSettingsDrawer(settingsDrawer === "building" ? null : "building"); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
+            <GearButton active={settingsDrawer === "building"} onClick={() => { setSettingsDrawer(settingsDrawer === "building" ? null : "building"); setBldgDrawer(null); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
           </div>
           {buildingsLoading ? (
             <Loader2 size={16} className="animate-spin text-[#a60739]" />
@@ -4368,7 +4833,7 @@ export default function TrackMap() {
           <div className="flex items-center gap-2">
             <CloudRain size={14} className={weatherVisible ? "text-[#a60739]" : "text-gray-400"} />
             <span className="text-xs text-gray-600">기상</span>
-            <GearButton active={settingsDrawer === "weather"} onClick={() => { setSettingsDrawer(settingsDrawer === "weather" ? null : "weather"); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
+            <GearButton active={settingsDrawer === "weather"} onClick={() => { setSettingsDrawer(settingsDrawer === "weather" ? null : "weather"); setBldgDrawer(null); setAircraftDropOpen(false); setRadarDropOpen(false); }} />
           </div>
           <button
             onClick={() => setWeatherVisible(!weatherVisible)}
@@ -4377,6 +4842,23 @@ export default function TrackMap() {
             aria-checked={weatherVisible}
           >
             <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${weatherVisible ? "translate-x-4.5" : "translate-x-0.5"}`} />
+          </button>
+        </div>
+
+        {/* CoS (침묵원추 70° 최고탐지각) */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            {/* 꼭짓점이 아래인 역원추 표현 — rotate-180 */}
+            <Cone size={14} className={`rotate-180 ${showCos ? "text-[#a60739]" : "text-gray-400"}`} />
+            <span className="text-xs text-gray-600">CoS</span>
+          </div>
+          <button
+            onClick={() => setShowCos(!showCos)}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${showCos ? "bg-[#a60739]" : "bg-gray-300"}`}
+            role="switch"
+            aria-checked={showCos}
+          >
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${showCos ? "translate-x-4.5" : "translate-x-0.5"}`} />
           </button>
         </div>
 
@@ -4389,6 +4871,7 @@ export default function TrackMap() {
           <div className="space-y-1.5">
             <ToolButton icon={Mountain} label="LoS 분석" active={activeTool === "los"} onClick={() => handleToolClick("los")} />
             <ToolButton icon={Radar} label="커버리지 맵" active={activeTool === "coverage"} onClick={() => handleToolClick("coverage")} />
+            <ToolButton icon={Cone} label="BRA 분석" active={activeTool === "bra"} onClick={() => handleToolClick("bra")} />
           </div>
         </div>
         </div>,
@@ -4492,12 +4975,16 @@ export default function TrackMap() {
                 className="w-full rounded-md bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#85062e]">
                 LoS 단면도
               </button>
-              {/* 결과: 허용높이 / 초과·여유 */}
+              {/* 결과: LoS·BRA 허용높이 / 초과·여유 */}
               {losSimBuilding ? (
                 losSimStats ? (() => {
                   // 카드 전체 AMSL(지반고포함) 기준 통일 — 허용높이(지반고포함) = 허용 상한 AMSL 동일값이므로 별도 상한 행은 삭제(중복).
                   const ground = losSimBuilding.groundElevM;
                   const bTop = ground + (isNaN(losSimBuilding.heightM) ? 0 : losSimBuilding.heightM); // NaN 높이 0 처리 (LoSProfilePanel sim 계산과 동일)
+                  // BRA 허용높이 — 실제지구 원추면(4/3 미적용, bra.rs coneMsl·단면도 BRA 기준선과 동일 정의), 각도는 BRA 분석 설정(braAngleDeg) 공유
+                  const braDm = losSimStats.distKm * 1000;
+                  const braTopAmslM = radarSite.altitude + radarSite.antenna_height + braDm * Math.tan((braAngleDeg * Math.PI) / 180) + (braDm * braDm) / (2 * 6_371_000);
+                  const braExcessM = bTop - braTopAmslM; // 양수=초과, 음수=여유 (지면 클램프 없음)
                   return (
                   <div className="mt-2 space-y-0.5 border-t border-gray-100 pt-2">
                     <div>LoS 허용높이(지반고포함): <b className="text-gray-900">{losSimStats.allowableTopAmslM.toFixed(1)} m</b></div>
@@ -4505,6 +4992,12 @@ export default function TrackMap() {
                       {losSimStats.excessM > 0
                         ? <span style={{ color: "#e94560" }} className="font-semibold">현재 초과높이 +{losSimStats.excessM.toFixed(1)} m</span>
                         : <span className="font-semibold text-emerald-600">여유 {(-losSimStats.excessM).toFixed(1)} m</span>}
+                    </div>
+                    <div className="mt-1.5">BRA({braAngleDeg}°) 허용높이(지반고포함): <b className="text-gray-900">{braTopAmslM.toFixed(1)} m</b></div>
+                    <div>
+                      {braExcessM > 0
+                        ? <span style={{ color: "#e94560" }} className="font-semibold">현재 초과높이 +{braExcessM.toFixed(1)} m</span>
+                        : <span className="font-semibold text-emerald-600">여유 {(-braExcessM).toFixed(1)} m</span>}
                     </div>
                     <div className="text-[10px] text-gray-400">건물 상단 {bTop.toFixed(1)} m · 지반고 {ground.toFixed(1)} m · {(losSimStats.distKm / 1.852).toFixed(1)} NM</div>
                   </div>
@@ -4555,130 +5048,24 @@ export default function TrackMap() {
 
 
 
-        {/* 건축물정보 팝업 (건물 클릭 시) — VWorld 스타일 */}
-        {bldgPopup && (
+        {/* 건물 호버 간단 툴팁 (커서 옆) — 상세는 클릭 시 우측 드로어 */}
+        {bldgHoverTip && (
           <div
-            ref={bldgPopupRef}
-            className="absolute z-[1100] rounded-lg border border-gray-300 bg-white shadow-xl"
-            style={{ left: bldgPopupPos.left, top: bldgPopupPos.top, width: 360 }}
+            className="pointer-events-none absolute z-[9999] rounded-lg border border-gray-200 bg-white/95 px-3 py-2.5 text-xs shadow-xl backdrop-blur-sm"
+            style={{ left: bldgHoverTip.x + 14, top: bldgHoverTip.y - 14 }}
           >
-            {/* 헤더 */}
-            <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
-              <span className="text-[12px] font-bold text-gray-800">건축물정보</span>
-              <button
-                onClick={() => setBldgPopup(null)}
-                className="rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors"
-              >
-                <X size={13} />
-              </button>
+            <div className="flex items-center gap-1.5">
+              <span className="font-semibold text-gray-800">{bldgHoverTip.name || "건물"}</span>
+              {bldgHoverTip.measured && (
+                <span className="rounded-sm bg-[#a60739] px-1 text-[9px] font-semibold text-white">실측 3D</span>
+              )}
             </div>
-            {/* 본문 — 기하 정보(항상) + 대장 정보(로컬 FAC + 온라인 VWorld) */}
-            <div className="max-h-[440px] overflow-y-auto">
-              {(() => {
-                const bi = bldgPopup.info;
-                const fac = bldgPopup.facDetail;
-                const pick = (...vals: (string | null | undefined)[]): string => {
-                  for (const v of vals) if (v != null && v !== "") return v;
-                  return "-";
-                };
-                // 과거 DB/구 백업의 usability '실측(1m DSM)' 표기는 용도로 취급하지 않음 (DB 마이그레이션 보조 방어)
-                const realUsage = (v?: string | null) => (v === "실측(1m DSM)" ? null : v);
-                const displayName = pick(fac?.name, bi?.name, bldgPopup.localName);
-                // 레이더 기준 거리/방위
-                const cosLat = Math.cos(radarSite.latitude * Math.PI / 180);
-                const dLat = bldgPopup.lat - radarSite.latitude;
-                const dLon = bldgPopup.lon - radarSite.longitude;
-                const az = ((Math.atan2(dLon * cosLat, dLat) * 180 / Math.PI) + 360) % 360;
-                const distKm = Math.sqrt((dLat * 111.32) ** 2 + (dLon * 111.32 * cosLat) ** 2);
-                // 실측 지붕고(1m DSM)가 있으면 최우선 — 옥상표고 계산도 동일 값 사용
-                const heightMeasured = fac?.height_measured_m ?? null;
-                const height = heightMeasured ?? bldgPopup.localHeight ?? fac?.height_m;
-                const base = bldgPopup.localBase ?? fac?.ground_elev_m;
-                const src = bldgPopup.localSource ?? (fac ? "fac" : undefined);
-                const srcLabel = src === "fac" ? "건물통합정보" : src === "manual" ? "수동 등록" : "-";
-                const row = (k: string, v: React.ReactNode, k2?: string, v2?: React.ReactNode) => (
-                  <tr className="border-b border-gray-100">
-                    <td className="w-[64px] bg-gray-50 px-2 py-1.5 text-gray-500">{k}</td>
-                    <td className="px-2 py-1.5 text-gray-700" colSpan={k2 != null ? 1 : 3}>{v}</td>
-                    {k2 != null && <td className="w-[64px] bg-gray-50 px-2 py-1.5 text-gray-500">{k2}</td>}
-                    {k2 != null && <td className="px-2 py-1.5 text-gray-700">{v2}</td>}
-                  </tr>
-                );
-                const secLabel = "px-3 pt-2.5 pb-0.5 text-[9px] font-semibold uppercase tracking-wider text-gray-400";
-                return (
-                  <>
-                    {/* 건물명/주소 배너 */}
-                    {(displayName !== "-" || bi?.road_addr || bi?.jibun_addr) && (
-                      <div className="mx-3 mt-3 mb-2 rounded border border-gray-200 bg-gray-50 px-2.5 py-2 space-y-1">
-                        {displayName !== "-" && <div className="text-[12px] font-semibold text-gray-800">{displayName}</div>}
-                        {bi?.road_addr && (
-                          <div className="flex items-start gap-1.5 text-[10.5px]">
-                            <span className="shrink-0 rounded-sm bg-[#a60739] px-1.5 py-[1px] text-[9px] font-semibold text-white">도로명</span>
-                            <span className="text-gray-700 leading-[14px]">{bi.road_addr}</span>
-                          </div>
-                        )}
-                        {bi?.jibun_addr && (
-                          <div className="flex items-start gap-1.5 text-[10.5px]">
-                            <span className="shrink-0 rounded-sm bg-gray-500 px-1.5 py-[1px] text-[9px] font-semibold text-white">지번</span>
-                            <span className="text-gray-700 leading-[14px]">{bi.jibun_addr}</span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                    {/* 기하 정보 (레이더 기준 — 항상 표시) */}
-                    <div className={secLabel + " pt-1"}>기하 정보</div>
-                    <table className="w-full border-t border-gray-200 text-[10.5px]">
-                      <tbody>
-                        {row("출처", srcLabel, heightMeasured != null ? "건물높이(실측)" : "건물높이", height != null ? `${height.toFixed(1)} m` : "-")}
-                        {(heightMeasured != null || bldgPopup.localMeasured) && row("실측자료", "실측 3D (1m DSM)")}
-                        {row("지반표고", base != null ? `${base.toFixed(1)} m` : "-", "옥상표고", (base != null && height != null) ? `${(base + height).toFixed(1)} m` : "-")}
-                        {row("레이더거리", `${(distKm / 1.852).toFixed(1)} NM`, "레이더방위", `${az.toFixed(1)}°`)}
-                      </tbody>
-                    </table>
-                    {/* 대장 정보 (로컬 건물통합정보 + 온라인 VWorld) */}
-                    <div className={secLabel + " flex items-center gap-1.5"}>
-                      대장 정보
-                      {bldgPopup.loading && <Loader2 size={9} className="animate-spin text-gray-300" />}
-                    </div>
-                    <table className="w-full border-t border-gray-200 text-[10.5px]">
-                      <tbody>
-                        {row("건물명칭", pick(fac?.name, bi?.name))}
-                        {row("동명칭", pick(fac?.dong_name, bi?.dong_name), "용도", pick(realUsage(fac?.usage), bi?.usage, realUsage(bldgPopup.localUsage)))}
-                        {row("구조", pick(bi?.structure))}
-                        {row("지상층수", bi?.floors_above ? `${bi.floors_above} 층` : "-", "지하층수", bi?.floors_below ? `${bi.floors_below} 층` : "-")}
-                        {row("건물면적", bi?.area ? `${bi.area} ㎡` : "-", "연면적", bi?.total_area ? `${bi.total_area} ㎡` : "-")}
-                        {row("대지면적", bi?.site_area ? `${bi.site_area} ㎡` : "-", "용적률", bi?.floor_area_ratio ? `${bi.floor_area_ratio} %` : "-")}
-                        {row("건폐율", bi?.building_coverage ? `${bi.building_coverage} %` : "-", "승인일", pick(bi?.approval_date))}
-                        {row("PNU", pick(fac?.pnu))}
-                        {row("관리번호", pick(fac?.bd_mgt_sn))}
-                      </tbody>
-                    </table>
-                  </>
-                );
-              })()}
-            </div>
-            {/* LoS 단면도 진입 */}
-            <div className="border-t border-gray-200 px-3 py-2">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const lat = bldgPopup.lat, lon = bldgPopup.lon;
-                  const matched = buildings3dData.find(
-                    (b) => Math.abs(b.lat - lat) < 0.0001 && Math.abs(b.lon - lon) < 0.0001
-                  );
-                  setActiveTool("los");
-                  launchBuildingLoS(matched?.polygon ?? [], lat, lon);
-                  setBldgPopup(null);
-                }}
-                className="flex w-full items-center justify-center gap-1.5 rounded-md bg-[#a60739] px-3 py-2 text-[11px] font-semibold text-white transition-colors hover:bg-[#8a052f]"
-              >
-                <Mountain size={13} /> LoS 단면도 분석
-              </button>
-            </div>
-            {/* 좌표 푸터 */}
-            <div className="border-t border-gray-200 px-3 py-1.5 text-[9px] text-gray-400">
-              {bldgPopup.lat.toFixed(6)}°N, {bldgPopup.lon.toFixed(6)}°E
-            </div>
+            {bldgHoverTip.height != null && (
+              <div className="mt-1 flex items-center gap-2">
+                <span className="text-gray-500">높이</span>
+                <span className="text-gray-600">{bldgHoverTip.height.toFixed(1)} m</span>
+              </div>
+            )}
           </div>
         )}
 
@@ -4867,7 +5254,7 @@ export default function TrackMap() {
       {losTarget && (
         <div style={{
           marginLeft: activeTool ? 300 : 0,
-          marginRight: settingsDrawer ? 224 : 0,
+          marginRight: bldgDrawer ? 320 : settingsDrawer ? 224 : 0,
           transition: "margin .4s cubic-bezier(.4,0,.2,1)",
         }}>
         <LoSProfileTabs
@@ -4898,11 +5285,12 @@ export default function TrackMap() {
           onSimStats={setLosSimStats}
           onCurtainData={setLosCurtain}
           onPathBuildings={setLosPathBldgs}
+          onActiveViewChange={setLosActiveViewIdx}
         />
         </div>
       )}
 
-        {/* ── 좌측 도구 드로어 (LoS / 커버리지) — 지도+단면도 전체 높이 오버레이 ── */}
+        {/* ── 좌측 도구 드로어 (LoS / 커버리지 / BRA) — 지도+단면도 전체 높이 오버레이 ── */}
         <div
           className="absolute top-0 bottom-0 left-0 z-[700] flex flex-col bg-white"
           style={{
@@ -4926,6 +5314,7 @@ export default function TrackMap() {
               onClose={() => handleToolClick("coverage")}
             />
           )}
+          {activeTool === "bra" && renderBraToolBody()}
         </div>
 
         {/* ── 우측 표시 설정 드로어 (건물 / 기상) — 전체 높이 오버레이 ── */}
@@ -4940,6 +5329,145 @@ export default function TrackMap() {
           }}
         >
           {renderSettingsBody()}
+        </div>
+
+        {/* ── 우측 건축물정보 드로어 (건물 클릭) — 표시 설정 드로어와 택1 ── */}
+        <div
+          className="absolute top-0 bottom-0 right-0 z-[760] flex flex-col bg-white"
+          style={{
+            width: 320, borderLeft: "1px solid #e5e7eb",
+            boxShadow: bldgDrawer ? "-6px 0 28px rgba(0,0,0,.14)" : "none",
+            transform: bldgDrawer ? "translateX(0)" : "translateX(336px)",
+            transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
+            pointerEvents: bldgDrawer ? "auto" : "none",
+          }}
+        >
+          {(() => {
+            // 닫힘 애니메이션 중에도 마지막 내용 유지
+            const bd = bldgDrawer ?? lastBldgRef.current;
+            if (!bd) return null;
+            return (
+              <>
+                {/* 헤더 */}
+                <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
+                  <span className="text-[12px] font-bold text-gray-800">건축물정보</span>
+                  <button
+                    onClick={() => setBldgDrawer(null)}
+                    className="rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+                {/* 본문 — 기하 정보(항상) + 대장 정보(로컬 FAC + 온라인 VWorld) */}
+                <div className="flex-1 overflow-y-auto">
+                  {(() => {
+                    const bi = bd.info;
+                    const fac = bd.facDetail;
+                    const pick = (...vals: (string | null | undefined)[]): string => {
+                      for (const v of vals) if (v != null && v !== "") return v;
+                      return "-";
+                    };
+                    // 과거 DB/구 백업의 usability '실측(1m DSM)' 표기는 용도로 취급하지 않음 (DB 마이그레이션 보조 방어)
+                    const realUsage = (v?: string | null) => (v === "실측(1m DSM)" ? null : v);
+                    const displayName = pick(fac?.name, bi?.name, bd.localName);
+                    // 레이더 기준 거리/방위
+                    const cosLat = Math.cos(radarSite.latitude * Math.PI / 180);
+                    const dLat = bd.lat - radarSite.latitude;
+                    const dLon = bd.lon - radarSite.longitude;
+                    const az = ((Math.atan2(dLon * cosLat, dLat) * 180 / Math.PI) + 360) % 360;
+                    const distKm = Math.sqrt((dLat * 111.32) ** 2 + (dLon * 111.32 * cosLat) ** 2);
+                    // 실측 지붕고(1m DSM)가 있으면 최우선 — 옥상표고 계산도 동일 값 사용
+                    const heightMeasured = fac?.height_measured_m ?? null;
+                    const height = heightMeasured ?? bd.localHeight ?? fac?.height_m;
+                    const base = bd.localBase ?? fac?.ground_elev_m;
+                    const src = bd.localSource ?? (fac ? "fac" : undefined);
+                    const srcLabel = src === "fac" ? "건물통합정보" : src === "manual" ? "수동 등록" : "-";
+                    const row = (k: string, v: React.ReactNode, k2?: string, v2?: React.ReactNode) => (
+                      <tr className="border-b border-gray-100">
+                        <td className="w-[64px] bg-gray-50 px-2 py-1.5 text-gray-500">{k}</td>
+                        <td className="px-2 py-1.5 text-gray-700" colSpan={k2 != null ? 1 : 3}>{v}</td>
+                        {k2 != null && <td className="w-[64px] bg-gray-50 px-2 py-1.5 text-gray-500">{k2}</td>}
+                        {k2 != null && <td className="px-2 py-1.5 text-gray-700">{v2}</td>}
+                      </tr>
+                    );
+                    const secLabel = "px-3 pt-2.5 pb-0.5 text-[9px] font-semibold uppercase tracking-wider text-gray-400";
+                    return (
+                      <>
+                        {/* 건물명/주소 배너 */}
+                        {(displayName !== "-" || bi?.road_addr || bi?.jibun_addr) && (
+                          <div className="mx-3 mt-3 mb-2 rounded border border-gray-200 bg-gray-50 px-2.5 py-2 space-y-1">
+                            {displayName !== "-" && <div className="text-[12px] font-semibold text-gray-800">{displayName}</div>}
+                            {bi?.road_addr && (
+                              <div className="flex items-start gap-1.5 text-[10.5px]">
+                                <span className="shrink-0 rounded-sm bg-[#a60739] px-1.5 py-[1px] text-[9px] font-semibold text-white">도로명</span>
+                                <span className="text-gray-700 leading-[14px]">{bi.road_addr}</span>
+                              </div>
+                            )}
+                            {bi?.jibun_addr && (
+                              <div className="flex items-start gap-1.5 text-[10.5px]">
+                                <span className="shrink-0 rounded-sm bg-gray-500 px-1.5 py-[1px] text-[9px] font-semibold text-white">지번</span>
+                                <span className="text-gray-700 leading-[14px]">{bi.jibun_addr}</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {/* 기하 정보 (레이더 기준 — 항상 표시) */}
+                        <div className={secLabel + " pt-1"}>기하 정보</div>
+                        <table className="w-full border-t border-gray-200 text-[10.5px]">
+                          <tbody>
+                            {row("출처", srcLabel, heightMeasured != null ? "건물높이(실측)" : "건물높이", height != null ? `${height.toFixed(1)} m` : "-")}
+                            {(heightMeasured != null || bd.localMeasured) && row("실측자료", "실측 3D (1m DSM)")}
+                            {row("지반표고", base != null ? `${base.toFixed(1)} m` : "-", "옥상표고", (base != null && height != null) ? `${(base + height).toFixed(1)} m` : "-")}
+                            {row("레이더거리", `${(distKm / 1.852).toFixed(1)} NM`, "레이더방위", `${az.toFixed(1)}°`)}
+                          </tbody>
+                        </table>
+                        {/* 대장 정보 (로컬 건물통합정보 + 온라인 VWorld) */}
+                        <div className={secLabel + " flex items-center gap-1.5"}>
+                          대장 정보
+                          {bd.loading && <Loader2 size={9} className="animate-spin text-gray-300" />}
+                        </div>
+                        <table className="w-full border-t border-gray-200 text-[10.5px]">
+                          <tbody>
+                            {row("건물명칭", pick(fac?.name, bi?.name))}
+                            {row("동명칭", pick(fac?.dong_name, bi?.dong_name), "용도", pick(realUsage(fac?.usage), bi?.usage, realUsage(bd.localUsage)))}
+                            {row("구조", pick(bi?.structure))}
+                            {row("지상층수", bi?.floors_above ? `${bi.floors_above} 층` : "-", "지하층수", bi?.floors_below ? `${bi.floors_below} 층` : "-")}
+                            {row("건물면적", bi?.area ? `${bi.area} ㎡` : "-", "연면적", bi?.total_area ? `${bi.total_area} ㎡` : "-")}
+                            {row("대지면적", bi?.site_area ? `${bi.site_area} ㎡` : "-", "용적률", bi?.floor_area_ratio ? `${bi.floor_area_ratio} %` : "-")}
+                            {row("건폐율", bi?.building_coverage ? `${bi.building_coverage} %` : "-", "승인일", pick(bi?.approval_date))}
+                            {row("PNU", pick(fac?.pnu))}
+                            {row("관리번호", pick(fac?.bd_mgt_sn))}
+                          </tbody>
+                        </table>
+                      </>
+                    );
+                  })()}
+                </div>
+                {/* LoS 단면도 진입 (하단 고정) */}
+                <div className="border-t border-gray-200 px-3 py-2">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const lat = bd.lat, lon = bd.lon;
+                      const matched = buildings3dData.find(
+                        (b) => Math.abs(b.lat - lat) < 0.0001 && Math.abs(b.lon - lon) < 0.0001
+                      );
+                      setActiveTool("los");
+                      launchBuildingLoS(matched?.polygon ?? [], lat, lon);
+                      setBldgDrawer(null);
+                    }}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-md bg-[#a60739] px-3 py-2 text-[11px] font-semibold text-white transition-colors hover:bg-[#8a052f]"
+                  >
+                    <Mountain size={13} /> LoS 단면도 분석
+                  </button>
+                </div>
+                {/* 좌표 푸터 */}
+                <div className="border-t border-gray-200 px-3 py-1.5 text-[9px] text-gray-400">
+                  {bd.lat.toFixed(6)}°N, {bd.lon.toFixed(6)}°E
+                </div>
+              </>
+            );
+          })()}
         </div>
       </div>
 

@@ -1,3 +1,4 @@
+pub mod bra;
 pub mod coverage;
 pub mod heightmap;
 pub mod los;

@@ -771,7 +771,8 @@ fn azimuth_span(azimuths: &[f64]) -> (f64, f64) {
 
 /// 수동 건물 geometry_json을 파싱하여 샘플 포인트 (lat, lon) 목록으로 확장.
 /// 반환값이 비어 있으면 중심점만 사용.
-fn expand_manual_geometry(
+/// (BRA 침범 검사(analysis::bra)도 수동 건물 기하를 동일 규약으로 해석하기 위해 crate 내 공개)
+pub(crate) fn expand_manual_geometry(
     center_lat: f64,
     center_lon: f64,
     geo_type: Option<&str>,

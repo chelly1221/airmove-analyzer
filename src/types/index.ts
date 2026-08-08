@@ -19,6 +19,7 @@ export type {
   BuildingModalDraft,
 } from "./building";
 export type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult, PanoramaMergeDualResult } from "./panorama";
+export type { BraBuilding, BraResult } from "./bra";
 export type { Flight } from "./flight";
 export type { ReportMetadata } from "./report";
 export type {

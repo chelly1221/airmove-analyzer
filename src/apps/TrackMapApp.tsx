@@ -27,7 +27,7 @@ function useRestoreSettings() {
         if (dbAircraft.length > 0) useAppStore.setState({ aircraft: dbAircraft });
       } catch {}
       try {
-        for (const key of ["custom_radar_sites", "selected_radar_site", "dev_mode", "weather_nm_per_bin", "weather_colors"]) {
+        for (const key of ["custom_radar_sites", "selected_radar_site", "dev_mode", "weather_nm_per_bin", "weather_colors", "bra_angle_deg"]) {
           const value = await invoke<string | null>("load_setting", { key });
           if (!value) continue;
           if (key === "custom_radar_sites") {
@@ -50,6 +50,12 @@ function useRestoreSettings() {
                 c.every((n: unknown) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 255)
               );
             if (ok) useAppStore.setState({ weatherColors: v as [number, number, number][] });
+          } else if (key === "bra_angle_deg") {
+            // 0.05~10° 범위의 유한수일 때만 복원 (손상된 설정 무시)
+            const v = JSON.parse(value);
+            if (typeof v === "number" && Number.isFinite(v) && v >= 0.05 && v <= 10) {
+              useAppStore.setState({ braAngleDeg: v });
+            }
           }
         }
       } catch {}

@@ -81,6 +81,11 @@ interface AppState {
   setWeatherColor: (level: number, rgb: [number, number, number]) => void;
   resetWeatherColors: () => void;
 
+  // BRA(Building Restricted Area) 분석
+  /** BRA 원추면 기준각 (°, 기본 0.25 = LoS 단면도 BRA 기준선과 동일) */
+  braAngleDeg: number;
+  setBraAngleDeg: (v: number) => void;
+
   // 레이더 사이트
   radarSite: RadarSite;
   setRadarSite: (site: RadarSite) => void;
@@ -304,6 +309,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   resetWeatherColors: () => {
     set({ weatherColors: DEFAULT_WEATHER_COLORS });
     persistSetting("weather_colors", DEFAULT_WEATHER_COLORS);
+  },
+
+  // BRA 기준각 — 0.25°(장애물 제한표면 기본). 변경 시 영속화.
+  braAngleDeg: 0.25,
+  setBraAngleDeg: (v) => {
+    set({ braAngleDeg: v });
+    persistSetting("bra_angle_deg", v);
   },
 
   // 레이더 사이트 (기본: 김포 #1)

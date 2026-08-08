@@ -20,9 +20,11 @@ type PanelProps = ComponentProps<typeof LoSProfilePanel>;
 interface Props extends Omit<PanelProps, "targetLat" | "targetLon"> {
   /** 방위별 타겟. length>1이면 탭 표시 */
   views: AzView[];
+  /** 활성 탭 인덱스 보고 (지도 방위 마커 활성 강조 동기용) */
+  onActiveViewChange?: (idx: number) => void;
 }
 
-export default function LoSProfileTabs({ views, onLoaded, searchedAddress, ...rest }: Props) {
+export default function LoSProfileTabs({ views, onLoaded, searchedAddress, onActiveViewChange, ...rest }: Props) {
   const multi = views.length > 1;
   // views 시그니처 (새 건물 진입 감지)
   const viewsKey = views.map((v) => v.az.toFixed(4)).join(",");
@@ -40,6 +42,11 @@ export default function LoSProfileTabs({ views, onLoaded, searchedAddress, ...re
     setActiveTab(centerIdx);
     loadedOnceRef.current = false;
   }, [viewsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 활성 탭 인덱스 보고 — 지도 방위 마커(좌끝/중앙/우끝) 활성 강조 동기용
+  useEffect(() => {
+    onActiveViewChange?.(safeActive);
+  }, [safeActive, viewsKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 카메라 재이동(fitBounds)은 건물셋 첫 로드에만 — 탭 전환 시엔 억제
   const handleLoaded = () => {

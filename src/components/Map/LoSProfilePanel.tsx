@@ -70,7 +70,7 @@ interface Props {
    *  차트 렌더에는 전혀 영향 없음 — chartData 확정 후 별도 useEffect 에서 프레임 역변환만 수행. */
   onCurtainData?: (data: LosCurtainSample[] | null) => void;
   /** 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강). 로딩 중엔 직전 값 유지.
-   *  all = 드로어 리스트용 전체 목록(최저탐지선 꺾음 기여(비차단) + 차단 건물). */
+   *  all = 드로어 리스트용 전체 목록 — 경로 통과 건물 전수(isBlocking 플래그 포함). */
   onPathBuildings?: (d: { target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[] } | null) => void;
 }
 
@@ -458,20 +458,22 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     // 1.5) 통합 장애물 배열: 지형 프로파일 + 건물을 거리순 병합
     //    shadow-casting에서 건물을 정확한 위치의 독립 장애물로 처리
-    interface Obstacle { distance: number; elevation: number; }
+    //    bIdx: 소유 건물 인덱스 — 실꺾음 귀속용 (지형 항목은 undefined)
+    interface Obstacle { distance: number; elevation: number; bIdx?: number; }
     const obstacles: Obstacle[] = [];
     for (const p of profile) {
       obstacles.push({ distance: p.distance, elevation: p.elevation });
     }
     if (showBuildings && effBuildings.length > 0) {
-      for (const b of effBuildings) {
+      for (let i = 0; i < effBuildings.length; i++) {
+        const b = effBuildings[i];
         const bTop = b.ground_elev_m + b.height_m;
         const nearD = b.near_dist_km ?? b.distance_km;
         const farD = b.far_dist_km ?? b.distance_km;
         // 건물 양쪽 끝에 장애물 추가 (도형 건물의 경우 양쪽 경계)
-        obstacles.push({ distance: nearD, elevation: bTop });
+        obstacles.push({ distance: nearD, elevation: bTop, bIdx: i });
         if (farD - nearD > 0.001) {
-          obstacles.push({ distance: farD, elevation: bTop });
+          obstacles.push({ distance: farD, elevation: bTop, bIdx: i });
         }
       }
     }
@@ -691,9 +693,11 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       if (maxY < minMaxYFor40Pct) maxY = minMaxYFor40Pct;
     }
 
-    // 최저탐지선(los43)에 실제로 영향을 주는 건물만 필터링:
-    // 4/3 프레임에서 자기 앞 장애물(지형+타 건물) 그림자 위로 상단이 올라와 선을 꺾으면 = 유의미 건물
-    const significantBuildings: (BuildingOnPath & { isBlocking: boolean })[] = [];
+    // 경로 통과 건물 전수 표출 (차단/기여 플래그만 분류):
+    // 백엔드가 반환한 '레이더→타겟 직선이 실제로 관통하는 건물' 전부를 차트에 그리고,
+    // isBlocking(4/3 현 관통 AND 표시 최저탐지선 실꺾음 귀속) / bendsLine(실꺾음 귀속) 은
+    // 색·툴팁 분류용 플래그로만 부착
+    const pathBuildings: (BuildingOnPath & { isBlocking: boolean; bendsLine: boolean })[] = [];
     // 주소 검색으로 지정된 건물 찾기 (검색 좌표에 가장 가까운 건물, 150m 이내)
     let searchedBldg: BuildingOnPath | null = null;
     if (searchedAddress && effBuildings.length > 0) {
@@ -710,35 +714,24 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     }
     let searchedBldgIdx: number | null = null;
     if (showBuildings && effBuildings.length > 0) {
-      // ── 건물 앞쪽 장애물의 4/3 running max angle prefix (아래 '선 꺾음' 판정용) ──
-      //   obstacles 는 지형 프로파일 + 전 건물 near/far 상단이 distance 오름차순으로 정렬된 상태.
-      //   obsPrefixAng[i] = obstacles[0..i] 의 4/3 프레임 최대 앙각 (distance<=0 항목은 각도 갱신 제외).
-      const obsDist = new Float64Array(obstacles.length);
-      const obsPrefixAng = new Float64Array(obstacles.length);
-      let prefAng43 = -Infinity;
-      for (let i = 0; i < obstacles.length; i++) {
-        const ob = obstacles[i];
-        obsDist[i] = ob.distance;
-        if (ob.distance > 0) {
-          const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
-          if (ang > prefAng43) prefAng43 = ang;
+      // ── 실꺾음 귀속(exact attribution) ──
+      //   표시 최저탐지선(minDetStraight)과 동일한 장애물 집합·정렬 순서로 4/3 running max
+      //   앙각을 갱신하며, 자기 near/far 엣지 항목이 최대 앙각을 실제로 끌어올린 건물 인덱스만 수집.
+      //   (구 prefix 방식은 자기 near 엣지 '이전'과만 비교 — 레이더보다 낮은 상단은 far 엣지가 최대
+      //    앙각이라 near~far 사이 타 건물이 이미 올린 선을 무시해, 선을 못 꺾는 건물이 차단으로 오탐)
+      const bentBldg = new Set<number>();
+      let runMax43 = -Infinity;
+      for (const ob of obstacles) {
+        if (ob.distance <= 0) continue;
+        const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
+        if (ang > runMax43) {
+          runMax43 = ang;
+          if (ob.bIdx !== undefined) bentBldg.add(ob.bIdx);
         }
-        obsPrefixAng[i] = prefAng43;
       }
-      // 거리 d 보다 엄격히(strict) 앞에 있는 장애물들의 4/3 최대 앙각 (없으면 -Infinity).
-      //   strict 비교라 자기 자신의 near 경계 장애물 항목(정확히 bNearD 위치)은 자동 제외된다.
-      const maxAngleBefore = (d: number): number => {
-        const lim = d - 1e-6;
-        let lo = 0, hi = obstacles.length - 1, res = -1;
-        while (lo <= hi) {
-          const mid = (lo + hi) >> 1;
-          if (obsDist[mid] < lim) { res = mid; lo = mid + 1; }
-          else hi = mid - 1;
-        }
-        return res >= 0 ? obsPrefixAng[res] : -Infinity;
-      };
 
-      for (const b of effBuildings) {
+      for (let i = 0; i < effBuildings.length; i++) {
+        const b = effBuildings[i];
         const bDist = b.distance_km;
         // 단면도 전체 길이(profileMaxKm, 기본 200NM)까지 건물 표시 — 줌아웃 시 타겟 너머 건물도 함께.
         //   차단(isBlocking)은 레이더→타겟(0..D) 구간에서만 성립하므로 near≥D 인 타겟 너머 건물은
@@ -746,11 +739,10 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         if (bDist <= 0 || bDist >= profileMaxKm) continue;
         const bTop = b.ground_elev_m + b.height_m;
 
-        // 건물별 차단 판정 — 이중 조건(현 관통 AND 선 꺾음):
+        // 건물별 차단 판정 — 이중 조건(현 관통 AND 실꺾음 귀속):
         //   ① 4/3 현(chord43H) 관통 = 레이더↔타겟 직선 시야를 실제로 가로막음. 상단 AMSL 이 일정하고
         //      현이 선형이라 레이더→타겟 구간 교집합의 양끝 검사만으로 충분.
-        //   ② AND 자기 near 경계 이전 장애물(지형+타 건물)의 4/3 running max angle 그림자 위로 상단이
-        //      올라옴 = 최저탐지선(los43)을 실제로 꺾는 건물.
+        //   ② AND 표시 최저탐지선(los43)을 자기 엣지가 실제로 꺾어 올림(bentBldg 귀속).
         //   ② 가 없으면: 타겟 고도가 지면이라 현이 지면까지 내려가므로, 앞쪽 지형·건물 그림자에 완전히
         //   묻혀 선을 전혀 꺾지 못하는 건물까지 현 위로만 올라오면 전부 빨강으로 대량 오탐된다 (2026-08-03 수정).
         //   (구 maxBlockPoint 근접 귀속 방식은 최대 차단점 옆 무관 건물 오탐·비최대 관통 건물 누락으로 폐기)
@@ -761,29 +753,20 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         if (s0 <= s1) {
           const excessAt = (d: number) => (bTop - curvDrop43(d)) - chord43H(d);
           const penetratesChord = Math.max(excessAt(s0), excessAt(s1)) > 0;
-          if (penetratesChord) {
-            // 4/3 프레임 상단 앙각 — near/far 양끝 중 큰 값 (상단 AMSL 일정이라 극값은 경계에서 발생)
-            const angAt = (d: number) => (bTop - curvDrop43(d) - radarHeight) / (d * 1000);
-            isBlk = Math.max(angAt(s0), angAt(s1)) > maxAngleBefore(bNearD);
-          }
+          isBlk = penetratesChord && bentBldg.has(i);
         }
 
-        // 최저탐지선(los43) 꺾음 판정 — 4/3 프레임, 자기 near 엣지 이전 장애물(지형+타 건물)의
-        //   running max angle 을 상단 앙각(near/far 엣지, 상단 AMSL 일정이라 극값은 경계)이 초과하면
-        //   실제로 선을 꺾는 건물. 지형·타건물 그림자에 묻힌 건물은 선에 닿지 않으므로 제외
-        //   (구 기준은 지형만의 그림자(실제지구 프레임)라 타건물 그림자에 묻힌 건물이 대량 회색 오탐 — 2026-08-03 수정).
-        const e0 = Math.max(bNearD, 0.001);
-        const e1 = Math.max(bFarD, e0);
-        const angAtEdge = (d: number) => (bTop - curvDrop43(d) - radarHeight) / (d * 1000);
-        const bendsLine = Math.max(angAtEdge(e0), angAtEdge(e1)) > maxAngleBefore(bNearD);
+        // 최저탐지선(los43) 꺾음 판정 — 위 실꺾음 귀속 결과 그대로. 지형·타건물 그림자에 묻혀
+        //   running max 를 못 올린 건물은 선에 닿지 않으므로 제외된다.
+        //   표시 필터가 아니라 툴팁 분류용 플래그 — '비차단 · 최저탐지선 기여' ↔ '비차단 · 경로 통과' 구분.
+        //   (타겟 너머 건물도 선을 꺾으면 여기 포함 — 차단은 위 현 관통 교집합에서 별도로 걸러진다)
+        const bendsLine = bentBldg.has(i);
 
         const isSearched = searchedBldg !== null && b === searchedBldg;
-        // isBlk 는 이론상 bendsLine 에 포함되나(0..D 클램프 차이) 방어적으로 OR 유지.
-        //   isSearched 건물은 선에 닿지 않아도 항상 포함(주소검색 시뮬레이션 대상).
-        if (bendsLine || isBlk || isSearched) {
-          if (isSearched) searchedBldgIdx = significantBuildings.length;
-          significantBuildings.push({ ...b, isBlocking: isBlk });
-        }
+        // 경로 통과 건물은 조건 없이 전수 push (구 bendsLine||isBlk||isSearched 필터 폐지).
+        //   isSearched 건물의 인덱스만 대상 건물 표시(파랑·핀)용으로 기록.
+        if (isSearched) searchedBldgIdx = pathBuildings.length;
+        pathBuildings.push({ ...b, isBlocking: isBlk, bendsLine });
       }
     }
 
@@ -841,7 +824,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       blocked,
       maxBlockPoint,
       namedPeaks,
-      significantBuildings,
+      pathBuildings,
       searchedBldgIdx,
       minY,
       maxY,
@@ -856,8 +839,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   useEffect(() => {
     if (!onStats) return;
     if (!chartData) { onStats({ blocked: false, blocking: 0, nonBlocking: 0 }); return; }
-    const blocking = chartData.significantBuildings.filter((b) => b.isBlocking).length;
-    const nonBlocking = chartData.significantBuildings.length - blocking;
+    const blocking = chartData.pathBuildings.filter((b) => b.isBlocking).length;
+    const nonBlocking = chartData.pathBuildings.length - blocking;
     onStats({ blocked: chartData.blocked, blocking, nonBlocking });
   }, [chartData, onStats]);
 
@@ -961,7 +944,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
   // ── 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강) ──
   //   커튼과 동일 원칙: 재조회(loading) 중엔 방출하지 않고 직전 값 유지, 언마운트 시에만 해제.
-  //   all = 드로어 리스트용 전체 목록(significantBuildings 원본 — 최저탐지선 꺾음 기여(비차단) + 차단 건물).
+  //   all = 드로어 리스트용 전체 목록(pathBuildings 원본 — 경로 통과 건물 전수, isBlocking 플래그 포함).
   const onPathBuildingsRef = useRef(onPathBuildings);
   onPathBuildingsRef.current = onPathBuildings;
   useEffect(() => () => { onPathBuildingsRef.current?.(null); }, []);
@@ -970,7 +953,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (!emit) return;
     if (loading) return; // 재조회 중 — 직전 하이라이트 유지
     if (!chartData) { emit(null); return; }
-    const list = chartData.significantBuildings;
+    const list = chartData.pathBuildings;
     const idx = chartData.searchedBldgIdx;
     const target = idx != null ? (list[idx] ?? null) : null;
     const blocking = list.filter((b) => b.isBlocking && b !== target);
@@ -981,7 +964,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const visibleYRange = useMemo(() => {
     if (!chartData) return null;
     const { adjTerrain, minDetStraight, minDetFresnel, braLine,
-            significantBuildings, maxDistance, minY: fullMinY, maxY: fullMaxY } = chartData;
+            pathBuildings, maxDistance, minY: fullMinY, maxY: fullMaxY } = chartData;
     // Y 자동범위는 표시 중인 레이어만 반영 — 숨겨진 BRA(200NM에서 1,600m+) 등이 maxY를 부풀리면
     //   m/px가 커져 건물이 서브픽셀로 떨어져 사라지므로, 실제 그려지는 시리즈만 높이 수집에 포함.
     //   full-zoom(전체 거리)·줌인(윈도우) 모두 동일한 레이어-인지 로직을 태워 범위 출렁임 제거.
@@ -996,8 +979,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     if (layers.los43) for (const p of minDetStraight) if (inRange(p.distance)) heights.push(p.height);
     if (layers.fresnel) for (const p of minDetFresnel) if (inRange(p.distance)) heights.push(p.height);
     if (layers.bra) for (const p of braLine) if (inRange(p.distance)) heights.push(p.height);
-    // 건물 꼭대기 (significantBuildings는 이미 showBuildings에 종속)
-    for (const b of significantBuildings) {
+    // 건물 꼭대기 (pathBuildings는 이미 showBuildings에 종속)
+    for (const b of pathBuildings) {
       const nearD = b.near_dist_km ?? b.distance_km;
       const farD = b.far_dist_km ?? b.distance_km;
       if (inRange(nearD) || inRange(farD) || (nearD <= zoomStart && farD >= zoomEnd)) {
@@ -1512,12 +1495,12 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           </>
         )}
 
-        {/* 건물 실루엣 (최저탐지선 꺾음 기여 건물만) — 점 건물: 세로선, 도형 건물: 채워진 사각형 */}
-        {showBuildings && chartData.significantBuildings.map((b, bi) => {
+        {/* 건물 실루엣 (경로 통과 건물 전수) — 점 건물: 세로선, 도형 건물: 채워진 사각형 */}
+        {showBuildings && chartData.pathBuildings.map((b, bi) => {
           const nearD = b.near_dist_km ?? b.distance_km;
           const farD = b.far_dist_km ?? b.distance_km;
           // 보이는 줌 구간 밖 건물은 렌더 생략 (200NM 연장 시 화면 밖 수백 동이 DOM에 쌓이는 것 방지).
-          //   return null 이므로 bi(=significantBuildings 인덱스)는 그대로 → 호버/클릭/툴팁 인덱스 정합 유지.
+          //   return null 이므로 bi(=pathBuildings 인덱스)는 그대로 → 호버/클릭/툴팁 인덱스 정합 유지.
           if (farD < zoomStart || nearD > zoomEnd) return null;
           const hasExtent = (farD - nearD) > 0.001;
           // 도형 건물: 양 끝의 곡률 보정 적용
@@ -1637,6 +1620,27 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
             stroke="#a855f7" strokeWidth={1} strokeDasharray="4 3" />
         )}
 
+        {/* 건물모드/주소검색 대상 건물 핀 — 지도 마커(TrackMap los-bldg-az-markers)와 동일 파랑 계약,
+            3탭(중앙/좌끝/우끝) 모두 표시. 순수 인디케이터라 히트테스트·툴팁 없음(pointerEvents=none) */}
+        {showBuildings && (() => {
+          const si = chartData.searchedBldgIdx;
+          if (si === null) return null;
+          const b = chartData.pathBuildings[si];
+          if (!b) return null;
+          if (b.distance_km < zoomStart || b.distance_km > zoomEnd) return null;
+          const cx = xScale(Math.min(Math.max(b.distance_km, zoomStart), zoomEnd));
+          const topAdj = (b.ground_elev_m + b.height_m) - curvDrop(b.distance_km);
+          const cy = yScale(topAdj);
+          // 꼭짓점이 건물 상단(cx, cy-2)을 가리키는 높이 약 16px 맵핀
+          const pinD = `M ${cx} ${cy - 2} C ${cx - 5.5} ${cy - 9} ${cx - 5.5} ${cy - 17.5} ${cx} ${cy - 17.5} C ${cx + 5.5} ${cy - 17.5} ${cx + 5.5} ${cy - 9} ${cx} ${cy - 2} Z`;
+          return (
+            <g pointerEvents="none">
+              <path d={pinD} fill="#3b82f6" stroke="white" strokeWidth={1.2} />
+              <circle cx={cx} cy={cy - 13.5} r={2} fill="white" />
+            </g>
+          );
+        })()}
+
         {/* 레이더 위치 라벨 (Y축 상단) */}
         <text x={xScale(0) + 4} y={PAD.top + 12}
           fill="#6b7280" fontSize={8}>
@@ -1698,10 +1702,10 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         <g transform={`translate(${PAD.left + 8}, ${PAD.top + 5})`}>
           <rect x={-4} y={-6} width={270} height={(() => {
             let h = 66;
-            if (chartData.significantBuildings.length > 0) {
-              const hasBlocking = chartData.significantBuildings.some(b => b.isBlocking);
-              const hasNonBlocking = chartData.significantBuildings.some(b => !b.isBlocking);
-              const hasManual = chartData.significantBuildings.some(b => b.is_manual);
+            if (chartData.pathBuildings.length > 0) {
+              const hasBlocking = chartData.pathBuildings.some(b => b.isBlocking);
+              const hasNonBlocking = chartData.pathBuildings.some(b => !b.isBlocking);
+              const hasManual = chartData.pathBuildings.some(b => b.is_manual);
               if (hasBlocking) h += 14;
               if (hasNonBlocking) h += 14;
               if (hasManual) h += 14;
@@ -1733,10 +1737,10 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           <text x={24} y={59} fill="#374151" fontSize={8}>
             지형 (지구곡률 보정)
           </text>
-          {chartData.significantBuildings.length > 0 && (() => {
-            const blockingCount = chartData.significantBuildings.filter(b => b.isBlocking).length;
-            const manualCount = chartData.significantBuildings.filter(b => b.is_manual).length;
-            const nonBlockingCount = chartData.significantBuildings.length - blockingCount;
+          {chartData.pathBuildings.length > 0 && (() => {
+            const blockingCount = chartData.pathBuildings.filter(b => b.isBlocking).length;
+            const manualCount = chartData.pathBuildings.filter(b => b.is_manual).length;
+            const nonBlockingCount = chartData.pathBuildings.length - blockingCount;
             let legendY = 66;
             return (
               <>
@@ -1771,10 +1775,10 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           })()}
           {showCustomAngle && (() => {
             let caY = 66;
-            if (chartData.significantBuildings.length > 0) {
-              if (chartData.significantBuildings.some(b => b.isBlocking)) caY += 14;
-              if (chartData.significantBuildings.some(b => !b.isBlocking)) caY += 14;
-              if (chartData.significantBuildings.some(b => b.is_manual)) caY += 14;
+            if (chartData.pathBuildings.length > 0) {
+              if (chartData.pathBuildings.some(b => b.isBlocking)) caY += 14;
+              if (chartData.pathBuildings.some(b => !b.isBlocking)) caY += 14;
+              if (chartData.pathBuildings.some(b => b.is_manual)) caY += 14;
             }
             return (
               <>
@@ -1854,8 +1858,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         {/* 건물 호버/클릭 툴팁 */}
         {(() => {
           const activeBldgIdx = clickedBldgIdx ?? hoveredBldgIdx;
-          if (activeBldgIdx === null || !chartData.significantBuildings[activeBldgIdx]) return null;
-          const b = chartData.significantBuildings[activeBldgIdx];
+          if (activeBldgIdx === null || !chartData.pathBuildings[activeBldgIdx]) return null;
+          const b = chartData.pathBuildings[activeBldgIdx];
           const bTopAdj = (b.ground_elev_m + b.height_m) - curvDrop(b.distance_km);
           const bx = xScale(b.distance_km);
           const by = yScale(bTopAdj);
@@ -1902,7 +1906,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 <tspan fill="#374151" fontWeight="bold">{Math.round(b.ground_elev_m + b.height_m)}m AMSL</tspan>
               </text>
               <text x={tooltipX + 8} y={(lineY += 14, lineY)} fill={b.isBlocking ? "#ef4444" : "#6b7280"} fontSize={8} fontWeight={b.isBlocking ? "bold" : "normal"}>
-                {b.isBlocking ? "⚠ LoS 차단" : "비차단 · 최저탐지선 기여"}
+                {b.isBlocking ? "⚠ LoS 차단" : b.bendsLine ? "비차단 · 최저탐지선 기여" : "비차단 · 경로 통과"}
               </text>
               {isClicked && (
                 <text x={tooltipX + tooltipW - 8} y={lineY} textAnchor="end"
