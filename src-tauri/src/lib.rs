@@ -531,12 +531,200 @@ fn get_db_path(state: &AppState) -> Result<PathBuf, String> {
     Ok(app_data_dir.join("adsb.db"))
 }
 
-/// DB 내보내기 (현재 DB를 지정 경로로 복사)
+// ---------- DB 백업(ZIP) 내보내기/가져오기 ----------
+//
+// 백업 형식: 무압축(Stored) ZIP 한 개
+//   adsb.db          — DB 본체 (수 GB 가능 → zip64)
+//   tiles3d/<파일>   — 등록된 실측 3D 타일 폴더 (b3dm·tileset.json·buildings_3d.bin)
+// legacy 단일 .db 백업도 가져오기에서 계속 지원 (선두 매직으로 분기)
+
+/// 백업 복사 버퍼 8MB — 수 GB DB 를 io::copy 대신 수동 루프로 옮기며 진행률을 방출하기 위한 단위
+const BACKUP_BUF_SIZE: usize = 8 * 1024 * 1024;
+
+/// 백업 전송 진행 이벤트 (내보내기/가져오기 공용)
+/// unit: "bytes"(바이트 진행) | "files"(파일 수 진행) — 프론트 표기 분기용
+fn emit_transfer_progress(
+    handle: &tauri::AppHandle,
+    phase: &str,
+    unit: &str,
+    current: u64,
+    total: u64,
+) {
+    let _ = handle.emit(
+        "db-transfer-progress",
+        serde_json::json!({ "phase": phase, "unit": unit, "current": current, "total": total }),
+    );
+}
+
+/// 바이트 크기 → MB/GB 표기 (요약 메시지용)
+fn format_backup_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1}GB", b / GB)
+    } else {
+        format!("{:.1}MB", b / MB)
+    }
+}
+
+/// 버퍼 재사용 복사 (진행 이벤트 없음) — 타일처럼 작은 파일 다수용
+fn copy_buffered<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut [u8],
+) -> std::io::Result<u64> {
+    let mut done: u64 = 0;
+    loop {
+        let n = reader.read(buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        done += n as u64;
+    }
+    Ok(done)
+}
+
+/// 8MB 버퍼 복사 + 바이트 진행 이벤트 — DB 본체(수 GB)용
+fn copy_with_progress<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    total: u64,
+    handle: &tauri::AppHandle,
+    phase: &str,
+) -> std::io::Result<u64> {
+    let mut buf = vec![0u8; BACKUP_BUF_SIZE];
+    let mut done: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        done += n as u64;
+        emit_transfer_progress(handle, phase, "bytes", done, total.max(done));
+    }
+    emit_transfer_progress(handle, phase, "bytes", done, total.max(done));
+    Ok(done)
+}
+
+/// 폴더 내 파일을 재귀 수집 — (절대경로, root 기준 상대경로 '/' 구분) 목록
+fn collect_files_rel(
+    root: &std::path::Path,
+    cur: &std::path::Path,
+    out: &mut Vec<(PathBuf, String)>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(cur).map_err(|e| format!("폴더 읽기 실패 {:?}: {}", cur, e))?;
+    for ent in entries {
+        let ent = ent.map_err(|e| format!("폴더 항목 읽기 실패: {}", e))?;
+        let p = ent.path();
+        if p.is_dir() {
+            collect_files_rel(root, &p, out)?;
+        } else if p.is_file() {
+            let rel = p
+                .strip_prefix(root)
+                .map_err(|e| format!("상대경로 계산 실패: {}", e))?;
+            // ZIP 엔트리명은 플랫폼 무관하게 항상 '/' 구분자
+            let rel_str = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push((p, rel_str));
+        }
+    }
+    Ok(())
+}
+
+/// 백업 ZIP 작성 (adsb.db + 선택적 tiles3d/) — 요약 문자열 반환
+fn write_backup_zip(
+    handle: &tauri::AppHandle,
+    db_path: &std::path::Path,
+    tiles_dir: Option<&std::path::Path>,
+    dest_path: &str,
+) -> Result<String, String> {
+    use std::io::Write;
+
+    let dest = fs::File::create(dest_path).map_err(|e| format!("백업 파일 생성 실패: {}", e))?;
+    let mut zipw = zip::ZipWriter::new(std::io::BufWriter::new(dest));
+    // 무압축(Stored): 수 GB DB 를 deflate 하면 시간이 과도하고, b3dm 은 이미 압축된 바이너리 메시
+    // large_file: zip64 헤더 — DB 4GB 초과 대비
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(true);
+
+    // ① DB 본체
+    let db_size = fs::metadata(db_path)
+        .map_err(|e| format!("DB 파일 정보 조회 실패: {}", e))?
+        .len();
+    zipw.start_file("adsb.db", opts)
+        .map_err(|e| format!("ZIP 항목 생성 실패(adsb.db): {}", e))?;
+    {
+        let mut f = fs::File::open(db_path).map_err(|e| format!("DB 파일 열기 실패: {}", e))?;
+        copy_with_progress(&mut f, &mut zipw, db_size, handle, "DB 내보내는 중")
+            .map_err(|e| format!("DB 쓰기 실패: {}", e))?;
+    }
+
+    // ② 실측 3D 타일 폴더 — 현재 데이터는 평탄 구조지만 하위 폴더도 방어적으로 재귀
+    let mut tile_count = 0usize;
+    let mut tile_bytes = 0u64;
+    if let Some(dir) = tiles_dir {
+        let mut files: Vec<(PathBuf, String)> = Vec::new();
+        collect_files_rel(dir, dir, &mut files)?;
+        let total = files.len();
+        let mut buf = vec![0u8; BACKUP_BUF_SIZE];
+        for (i, (path, rel)) in files.iter().enumerate() {
+            zipw.start_file(format!("tiles3d/{}", rel), opts)
+                .map_err(|e| format!("ZIP 항목 생성 실패({}): {}", rel, e))?;
+            let mut f =
+                fs::File::open(path).map_err(|e| format!("타일 파일 열기 실패({}): {}", rel, e))?;
+            tile_bytes += copy_buffered(&mut f, &mut zipw, &mut buf)
+                .map_err(|e| format!("타일 쓰기 실패({}): {}", rel, e))?;
+            tile_count += 1;
+            if (i + 1) % 50 == 0 {
+                emit_transfer_progress(
+                    handle,
+                    "3D 타일 내보내는 중",
+                    "files",
+                    (i + 1) as u64,
+                    total as u64,
+                );
+            }
+        }
+        emit_transfer_progress(
+            handle,
+            "3D 타일 내보내는 중",
+            "files",
+            total as u64,
+            total as u64,
+        );
+    }
+
+    let mut inner = zipw.finish().map_err(|e| format!("ZIP 마무리 실패: {}", e))?;
+    inner.flush().map_err(|e| format!("백업 파일 기록 실패: {}", e))?;
+
+    Ok(if tile_count > 0 {
+        format!(
+            "DB {} + 3D 타일 {}개({}) 내보내기 완료",
+            format_backup_size(db_size),
+            tile_count,
+            format_backup_size(tile_bytes)
+        )
+    } else {
+        format!(
+            "DB {} 내보내기 완료 (3D 타일 미등록)",
+            format_backup_size(db_size)
+        )
+    })
+}
+
+/// DB 내보내기 — adsb.db + (등록 시) 실측 3D 타일 폴더를 무압축 ZIP 한 개로 저장
 #[tauri::command]
 async fn export_database(
     dest_path: String,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let db_path = get_db_path(&state)?;
@@ -546,56 +734,270 @@ async fn export_database(
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .map_err(|e| format!("WAL checkpoint error: {}", e))?;
         }
-        fs::copy(&db_path, &dest_path)
-            .map_err(|e| format!("파일 복사 실패: {}", e))?;
-        info!("Database exported to: {}", dest_path);
-        Ok(())
+        // 실측 3D 타일 폴더 (등록 + 실존 시에만 포함) — db lock 해제 후 순차 획득
+        let tiles_dir: Option<PathBuf> = {
+            let guard = state
+                .tiles3d_dir
+                .lock()
+                .map_err(|e| format!("tiles3d_dir lock: {}", e))?;
+            guard.as_ref().filter(|p| p.is_dir()).cloned()
+        };
+
+        match write_backup_zip(&app_handle, &db_path, tiles_dir.as_deref(), &dest_path) {
+            Ok(summary) => {
+                info!("Database exported to: {} ({})", dest_path, summary);
+                Ok(summary)
+            }
+            Err(e) => {
+                // 쓰다 만 백업 파일 정리
+                let _ = fs::remove_file(&dest_path);
+                Err(e)
+            }
+        }
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-/// DB 가져오기 (지정 경로의 DB로 교체, 풀 재생성)
-#[tauri::command]
-async fn import_database(
-    src_path: String,
-    app_handle: tauri::AppHandle,
+/// 교체된 DB 의 settings "tiles3d_dir" 로 AppState 를 갱신 (재시작 없이 반영, 시작 시 복원과 동일 규칙)
+fn sync_tiles3d_from_db(state: &AppState) -> Result<(), String> {
+    let stored: Option<String> = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|e| format!("DB lock: {}", e))?
+            .get()
+            .map_err(|e| format!("DB pool: {}", e))?;
+        db::get_setting(&conn, "tiles3d_dir").ok().flatten()
+    };
+    let resolved = stored
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    let mut guard = state
+        .tiles3d_dir
+        .lock()
+        .map_err(|e| format!("tiles3d_dir lock: {}", e))?;
+    *guard = resolved;
+    Ok(())
+}
+
+/// legacy 단일 .db 백업 가져오기 — 풀 임시교체 → 파일 복사 → wal/shm 제거 → 풀 재생성
+fn import_legacy_db(
+    state: &AppState,
+    src: &std::path::Path,
+    db_path: &std::path::Path,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle.state::<AppState>();
-        let db_path = get_db_path(&state)?;
-        let src = std::path::Path::new(&src_path);
-
-        // 유효한 SQLite 파일인지 확인 (매직 바이트)
-        let header = fs::read(src)
-            .map_err(|e| format!("파일 읽기 실패: {}", e))?;
-        if header.len() < 16 || &header[0..16] != b"SQLite format 3\0" {
-            return Err("유효한 SQLite 데이터베이스 파일이 아닙니다.".to_string());
-        }
-
+    {
         // 풀 교체 (Mutex 잠금 상태에서 수행 → 다른 커맨드 차단)
         let mut pool_guard = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
 
         // 기존 풀 drop → 모든 연결 해제
         // 인메모리 풀로 임시 교체하여 파일 핸들 확실히 해제
         let temp_manager = r2d2_sqlite::SqliteConnectionManager::memory();
-        let temp_pool = r2d2::Pool::builder().max_size(1).build(temp_manager)
+        let temp_pool = r2d2::Pool::builder()
+            .max_size(1)
+            .build(temp_manager)
             .map_err(|e| format!("임시 풀 오류: {}", e))?;
         *pool_guard = temp_pool;
 
         // DB 파일 교체
-        fs::copy(src, &db_path)
-            .map_err(|e| format!("파일 복사 실패: {}", e))?;
+        fs::copy(src, db_path).map_err(|e| format!("파일 복사 실패: {}", e))?;
         // WAL/SHM 잔여 파일 제거
         let _ = fs::remove_file(db_path.with_extension("db-wal"));
         let _ = fs::remove_file(db_path.with_extension("db-shm"));
 
         // 새 풀 생성 (마이그레이션 포함)
-        let new_pool = db::init_db_pool(&db_path)?;
+        let new_pool = db::init_db_pool(db_path)?;
         *pool_guard = new_pool;
+    }
+    // db lock 해제 후 tiles3d_dir lock (두 잠금 동시 보유 금지)
+    sync_tiles3d_from_db(state)
+}
 
-        info!("Database imported from: {}", src_path);
-        Ok(())
+/// 백업 ZIP 가져오기 — 타일 먼저 추출(DB 무손상 보장) 후 DB 교체. 요약 문자열 반환
+fn import_backup_zip(
+    handle: &tauri::AppHandle,
+    state: &AppState,
+    src: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Result<String, String> {
+    let file = fs::File::open(src).map_err(|e| format!("파일 열기 실패: {}", e))?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("ZIP 열기 실패: {}", e))?;
+
+    // adsb.db 존재 검증 — 없으면 기존 DB 를 건드리지 않고 종료
+    if archive.by_name("adsb.db").is_err() {
+        return Err("백업 ZIP 에 adsb.db 가 없습니다.".to_string());
+    }
+
+    // tiles3d/ 엔트리 수집 — enclosed_name 으로 '..'·절대경로(zip slip) 차단
+    let mut tile_entries: Vec<(usize, PathBuf)> = Vec::new();
+    for i in 0..archive.len() {
+        let entry = match archive.by_index(i) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.is_dir() || !entry.name().starts_with("tiles3d/") {
+            continue;
+        }
+        let safe = match entry.enclosed_name() {
+            Some(p) => p,
+            None => continue,
+        };
+        let rel = match safe.strip_prefix("tiles3d") {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => continue,
+        };
+        // enclosed_name 은 중간 '..'(예: tiles3d/../x)을 허용하므로 일반 성분만 남은 경로로 한정
+        if rel.as_os_str().is_empty()
+            || !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        tile_entries.push((i, rel));
+    }
+
+    // ① 타일 먼저 추출 (DB 교체 전 — 추출이 실패해도 기존 DB 는 무손상)
+    let mut tiles_root: Option<PathBuf> = None;
+    if !tile_entries.is_empty() {
+        let managed = {
+            let dir = state
+                .app_data_dir
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))?;
+            dir.join("tiles3d")
+        };
+        let _ = fs::remove_dir_all(&managed); // 이전 복원본 정리 (없으면 무시)
+        fs::create_dir_all(&managed).map_err(|e| format!("타일 폴더 생성 실패: {}", e))?;
+
+        let total = tile_entries.len();
+        let mut buf = vec![0u8; BACKUP_BUF_SIZE];
+        for (n, (idx, rel)) in tile_entries.iter().enumerate() {
+            let out_path = managed.join(rel);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("타일 폴더 생성 실패: {}", e))?;
+            }
+            let mut zf = archive
+                .by_index(*idx)
+                .map_err(|e| format!("ZIP 항목 읽기 실패: {}", e))?;
+            let mut of =
+                fs::File::create(&out_path).map_err(|e| format!("타일 파일 생성 실패: {}", e))?;
+            copy_buffered(&mut zf, &mut of, &mut buf)
+                .map_err(|e| format!("타일 복원 실패: {}", e))?;
+            if (n + 1) % 50 == 0 {
+                emit_transfer_progress(
+                    handle,
+                    "3D 타일 복원 중",
+                    "files",
+                    (n + 1) as u64,
+                    total as u64,
+                );
+            }
+        }
+        emit_transfer_progress(handle, "3D 타일 복원 중", "files", total as u64, total as u64);
+        tiles_root = Some(managed);
+    }
+
+    // ② DB 교체 (legacy 와 동일 패턴: 풀 임시교체 → 추출 → wal/shm 제거 → 풀 재생성)
+    {
+        let mut pool_guard = state.db.lock().map_err(|e| format!("DB lock: {}", e))?;
+
+        let temp_manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let temp_pool = r2d2::Pool::builder()
+            .max_size(1)
+            .build(temp_manager)
+            .map_err(|e| format!("임시 풀 오류: {}", e))?;
+        *pool_guard = temp_pool;
+
+        {
+            let mut zf = archive
+                .by_name("adsb.db")
+                .map_err(|e| format!("ZIP 항목 읽기 실패(adsb.db): {}", e))?;
+            let total = zf.size();
+            let mut of =
+                fs::File::create(db_path).map_err(|e| format!("DB 파일 생성 실패: {}", e))?;
+            copy_with_progress(&mut zf, &mut of, total, handle, "DB 복원 중")
+                .map_err(|e| format!("DB 복원 실패: {}", e))?;
+        }
+        let _ = fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = fs::remove_file(db_path.with_extension("db-shm"));
+
+        let new_pool = db::init_db_pool(db_path)?;
+        *pool_guard = new_pool;
+    }
+
+    // ③ 가져온 DB 의 tiles3d_dir 반영 → 타일을 복원했으면 관리 폴더 경로로 덮어쓴다
+    sync_tiles3d_from_db(state)?;
+    let tile_count = tile_entries.len();
+    if let Some(root) = tiles_root {
+        let dir_str = root.to_string_lossy().to_string();
+        {
+            let conn = state
+                .db
+                .lock()
+                .map_err(|e| format!("DB lock: {}", e))?
+                .get()
+                .map_err(|e| format!("DB pool: {}", e))?;
+            db::set_setting(&conn, "tiles3d_dir", &dir_str)
+                .map_err(|e| format!("3D 타일 폴더 저장 실패: {}", e))?;
+        }
+        let mut guard = state
+            .tiles3d_dir
+            .lock()
+            .map_err(|e| format!("tiles3d_dir lock: {}", e))?;
+        *guard = Some(root);
+    }
+
+    Ok(if tile_count > 0 {
+        format!("데이터베이스 + 3D 타일 {}개를 가져왔습니다.", tile_count)
+    } else {
+        "데이터베이스를 가져왔습니다. (3D 타일 없음)".to_string()
+    })
+}
+
+/// DB 가져오기 — 백업 ZIP(adsb.db + tiles3d/) 또는 legacy 단일 .db 겸용
+#[tauri::command]
+async fn import_database(
+    src_path: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+
+        let state = app_handle.state::<AppState>();
+        let db_path = get_db_path(&state)?;
+        let src = std::path::Path::new(&src_path);
+
+        // 형식 판별 — 선두 16바이트만 읽는다 (수백 MB~수 GB 파일이라 전체 읽기 금지)
+        let mut head = [0u8; 16];
+        let head_len = {
+            let mut f = fs::File::open(src).map_err(|e| format!("파일 읽기 실패: {}", e))?;
+            let mut n = 0usize;
+            while n < head.len() {
+                match f.read(&mut head[n..]) {
+                    Ok(0) => break,
+                    Ok(k) => n += k,
+                    Err(e) => return Err(format!("파일 읽기 실패: {}", e)),
+                }
+            }
+            n
+        };
+
+        let summary = if head_len == head.len() && &head[..] == b"SQLite format 3\0" {
+            import_legacy_db(&state, src, &db_path)?;
+            "데이터베이스를 가져왔습니다.".to_string()
+        } else if head_len >= 4 && &head[..4] == b"PK\x03\x04" {
+            import_backup_zip(&app_handle, &state, src, &db_path)?
+        } else {
+            return Err("유효한 백업 파일이 아닙니다 (.zip 또는 .db).".to_string());
+        };
+
+        info!("Database imported from: {} ({})", src_path, summary);
+        Ok(summary)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?

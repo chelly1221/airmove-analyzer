@@ -26,30 +26,49 @@ import type { PeakImportStatus } from "../types";
 
 // ─── DB 내보내기/가져오기 섹션 ────────────────────────────────────────
 
+/** 백업 전송 진행 이벤트 페이로드 — unit 으로 바이트/파일 수 표기를 분기 */
+type DbTransferProgress = { phase: string; unit: "bytes" | "files"; current: number; total: number };
+
+/** 바이트 → MB/GB 표기 (Rust format_backup_size 와 동일 규칙) */
+const formatBackupBytes = (bytes: number) => {
+  const MB = 1024 * 1024;
+  const GB = MB * 1024;
+  return bytes >= GB ? `${(bytes / GB).toFixed(1)}GB` : `${(bytes / MB).toFixed(1)}MB`;
+};
+
 export function DatabaseSection() {
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [status, setStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [confirmImport, setConfirmImport] = useState<string | null>(null);
+  const [transfer, setTransfer] = useState<DbTransferProgress | null>(null);
 
   const handleExport = async () => {
+    let unlisten: (() => void) | null = null;
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const dest = await save({
         title: "데이터베이스 내보내기",
-        defaultPath: `airmove-backup-${new Date().toISOString().slice(0, 10)}.db`,
-        filters: [{ name: "SQLite Database", extensions: ["db"] }],
+        defaultPath: `airmove-backup-${new Date().toISOString().slice(0, 10)}.zip`,
+        filters: [{ name: "AirMove 백업", extensions: ["zip"] }],
       });
       if (!dest) return;
 
       setExporting(true);
       setStatus(null);
-      await invoke("export_database", { destPath: dest });
-      setStatus({ type: "success", message: "데이터베이스를 내보냈습니다." });
+      setTransfer(null);
+      try {
+        unlisten = await listen<DbTransferProgress>("db-transfer-progress", (e) => setTransfer(e.payload));
+      } catch { /* 리스너 실패 시 진행률 없이 진행 */ }
+
+      const msg = await invoke<string>("export_database", { destPath: dest });
+      setStatus({ type: "success", message: msg });
     } catch (e) {
       setStatus({ type: "error", message: `내보내기 실패: ${e}` });
     } finally {
+      if (unlisten) unlisten();
       setExporting(false);
+      setTransfer(null);
     }
   };
 
@@ -58,7 +77,7 @@ export function DatabaseSection() {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const src = await open({
         title: "데이터베이스 가져오기",
-        filters: [{ name: "SQLite Database", extensions: ["db"] }],
+        filters: [{ name: "AirMove 백업", extensions: ["zip", "db"] }],
         multiple: false,
         directory: false,
       });
@@ -72,20 +91,32 @@ export function DatabaseSection() {
 
   const handleImportConfirm = async () => {
     if (!confirmImport) return;
+    let unlisten: (() => void) | null = null;
     try {
       setImporting(true);
       setStatus(null);
+      setTransfer(null);
       setConfirmImport(null);
-      await invoke("import_database", { srcPath: confirmImport });
-      setStatus({ type: "success", message: "데이터베이스를 가져왔습니다. 페이지를 새로고침합니다..." });
+      try {
+        unlisten = await listen<DbTransferProgress>("db-transfer-progress", (e) => setTransfer(e.payload));
+      } catch { /* 리스너 실패 시 진행률 없이 진행 */ }
+
+      const msg = await invoke<string>("import_database", { srcPath: confirmImport });
+      setStatus({ type: "success", message: `${msg} 페이지를 새로고침합니다...` });
       // 상태 반영을 위해 앱 새로고침
       setTimeout(() => window.location.reload(), 1500);
     } catch (e) {
       setStatus({ type: "error", message: `가져오기 실패: ${e}` });
     } finally {
+      if (unlisten) unlisten();
       setImporting(false);
+      setTransfer(null);
     }
   };
+
+  const transferPct = transfer && transfer.total > 0
+    ? Math.min(100, Math.round((transfer.current / transfer.total) * 100))
+    : 0;
 
   return (
     <div className="space-y-4">
@@ -95,6 +126,7 @@ export function DatabaseSection() {
       </div>
       <p className="text-xs text-gray-500">
         운항이력, ADS-B 항적, 파싱 데이터 등 모든 저장 데이터를 내보내거나 가져올 수 있습니다.
+        실측 3D 타일 폴더가 등록되어 있으면 백업(ZIP)에 타일 파일까지 함께 포함됩니다.
       </p>
 
       <div className="flex gap-3">
@@ -115,6 +147,24 @@ export function DatabaseSection() {
           {importing ? "가져오는 중..." : "DB 가져오기"}
         </button>
       </div>
+
+      {/* 내보내기/가져오기 진행률 */}
+      {(exporting || importing) && (
+        <div className="space-y-1">
+          {transfer && transfer.total > 0 && (
+            <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+              <div className="h-full rounded-full bg-[#a60739] transition-all duration-300" style={{ width: `${transferPct}%` }} />
+            </div>
+          )}
+          <p className="text-xs text-gray-500">
+            {transfer
+              ? transfer.unit === "bytes"
+                ? `${transfer.phase} ${formatBackupBytes(transfer.current)} / ${formatBackupBytes(transfer.total)}`
+                : `${transfer.phase} ${transfer.current.toLocaleString()} / ${transfer.total.toLocaleString()}`
+              : exporting ? "백업 파일 준비 중..." : "백업 파일 확인 중..."}
+          </p>
+        </div>
+      )}
 
       {status && (
         <div className={`rounded-lg px-4 py-3 text-sm ${
@@ -138,6 +188,7 @@ export function DatabaseSection() {
             <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-600" />
             <p className="text-sm text-amber-800">
               현재 저장된 모든 데이터(운항이력, ADS-B 항적, 파싱 데이터, 설정)가 선택한 파일의 데이터로 교체됩니다. 이 작업은 되돌릴 수 없습니다.
+              ZIP 백업에 실측 3D 타일이 포함되어 있으면 타일 폴더도 함께 복원되어 새 경로로 재등록됩니다.
             </p>
           </div>
           <div className="flex justify-end gap-3">
