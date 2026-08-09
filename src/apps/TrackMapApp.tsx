@@ -231,6 +231,26 @@ export default function TrackMapApp() {
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
+  // 비행검사기 목록 · 개발자 모드 · 수동 건물/그룹 변경 수신 (발신: 메인 창) — 위 레이더 사이트와 동일 계약.
+  // 수신측은 setter 를 쓰지 않는다: 발신 창이 이미 DB 에 영속했으므로 재영속·에코 루프 방지
+  // (loadManualBuildings/loadBuildingGroups 는 DB 재조회 후 set 만 하는 액션이라 예외적으로 안전).
+  useEffect(() => {
+    const unlistens = [
+      listen<{ list: Aircraft[] }>("aircraft-changed", (e) => {
+        useAppStore.setState({ aircraft: e.payload.list });
+      }),
+      listen<{ value: boolean }>("dev-mode-changed", (e) => {
+        useAppStore.setState({ devMode: e.payload.value });
+      }),
+      listen("manual-buildings-changed", () => {
+        const s = useAppStore.getState();
+        s.loadManualBuildings();
+        s.loadBuildingGroups();
+      }),
+    ];
+    return () => { for (const u of unlistens) u.then((fn) => fn()); };
+  }, []);
+
   return (
     <div className="flex h-full flex-col bg-white">
       {/* 상단바 — ASS 파일 열기 + 통계 */}

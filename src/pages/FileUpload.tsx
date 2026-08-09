@@ -11,6 +11,7 @@ import {
   Minus,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre";
 import Modal from "../components/common/Modal";
 import { SrtmDownloadSection, FacBuildingDataSection, MeasuredBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
@@ -21,6 +22,15 @@ import BuildingModal, { shapeTypeLabel, makeInitialDraft, type BuildingFormData 
 import { useAppStore } from "../store";
 
 // ─── 건물 목록 패널 ──────────────────────────────────────────────
+
+/** 수동 건물·그룹 변경을 다른 창(지도)에 알림 (fire-and-forget).
+ *  지도 창 store 의 manualBuildings/buildingGroups 는 LoS 도구를 켤 때만 재조회하므로
+ *  도구가 열려 있는 동안의 편집은 이 신호가 없으면 stale 로 남는다.
+ *  payload 없이 "변경됨"만 알리고 수신 창이 DB 재조회 — 목록 형상 중복 정의 회피.
+ *  (loadData 는 마운트 시에도 도는 공통 재조회라 발신 지점으로 부적합 — mutation 성공 지점에만 둔다) */
+const emitManualBuildingsChanged = () => {
+  emit("manual-buildings-changed", {}).catch(() => {});
+};
 
 function ManualBuildingPanel() {
   const [buildings, setBuildings] = useState<ManualBuilding[]>([]);
@@ -96,6 +106,7 @@ function ManualBuildingPanel() {
       }
       closeBuildingModal();
       loadData();
+      emitManualBuildingsChanged();
     } catch (e) {
       console.error("건물 저장 실패:", e);
     }
@@ -105,6 +116,7 @@ function ManualBuildingPanel() {
     try {
       await invoke("delete_manual_building", { id: b.id });
       loadData();
+      emitManualBuildingsChanged();
     } catch (e) {
       console.error("건물 삭제 실패:", e);
     }
@@ -164,12 +176,14 @@ function ManualBuildingPanel() {
       }
       setGroupModalOpen(false);
       loadData();
+      emitManualBuildingsChanged();
     } catch (e) { console.error("그룹 저장 실패:", e); }
   };
   const handleGroupDelete = async (g: BuildingGroup) => {
     try {
       await invoke("delete_building_group", { id: g.id });
       loadData();
+      emitManualBuildingsChanged();
     } catch (e) { console.error("그룹 삭제 실패:", e); }
   };
   const toggleGroupEnabled = async (g: BuildingGroup) => {
@@ -177,6 +191,7 @@ function ManualBuildingPanel() {
     setGroups((prev) => prev.map((x) => (x.id === g.id ? { ...x, enabled: next } : x)));
     try {
       await invoke("set_building_group_enabled", { id: g.id, enabled: next });
+      emitManualBuildingsChanged();
     } catch (e) {
       console.error("그룹 활성화 변경 실패:", e);
       setGroups((prev) => prev.map((x) => (x.id === g.id ? { ...x, enabled: g.enabled } : x)));

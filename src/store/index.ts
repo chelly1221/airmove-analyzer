@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { useToastStore } from "../components/common/Toast";
 import type {
   Aircraft,
@@ -25,6 +25,14 @@ function persistSetting(key: string, value: unknown) {
   invoke("save_setting", { key, value: JSON.stringify(value) }).catch((e) =>
     console.warn(`[Settings] ${key} 저장 실패:`, e)
   );
+}
+
+/** 비행검사기 목록 변경을 다른 창(지도·도면)에 전파 (fire-and-forget).
+ *  세터 3종(add/update/removeAircraft)이 DB 영속 choke-point 이므로 발신 지점도 여기로 모은다.
+ *  수신 창은 setter 가 아닌 setState 로만 반영 — 재영속·에코 루프 방지.
+ *  (앱 시작 복원 경로는 setState 직접이라 세터 미경유 = 발신 없음 — 의도) */
+function emitAircraftChanged(get: () => { aircraft: Aircraft[] }) {
+  emit("aircraft-changed", { list: get().aircraft }).catch(() => {});
 }
 
 /** CAT008 기상 강도(1~6) 기본 색상 (NWS 스타일 강수 램프). 인덱스 0 미사용. */
@@ -224,7 +232,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       active: true,
     },
   ],
-  addAircraft: (a) =>
+  addAircraft: (a) => {
     set((state) => {
       if (state.aircraft.length >= 10) return state;
       invoke("save_aircraft", { aircraft: a }).catch((e) => {
@@ -232,8 +240,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         useToastStore.getState().addToast("비행검사기 저장에 실패했습니다");
       });
       return { aircraft: [...state.aircraft, a] };
-    }),
-  updateAircraft: (id, updates) =>
+    });
+    emitAircraftChanged(get);
+  },
+  updateAircraft: (id, updates) => {
     set((state) => {
       const updated = state.aircraft.map((a) =>
         a.id === id ? { ...a, ...updates } : a
@@ -246,16 +256,20 @@ export const useAppStore = create<AppState>((set, get) => ({
         });
       }
       return { aircraft: updated };
-    }),
+    });
+    emitAircraftChanged(get);
+  },
   removeAircraft: (id) => {
     const prev = get().aircraft;
     set((state) => ({
       aircraft: state.aircraft.filter((a) => a.id !== id),
     }));
+    emitAircraftChanged(get);
     invoke("delete_aircraft", { id }).catch((e) => {
       console.warn("[Aircraft] DB 삭제 실패:", e);
       useToastStore.getState().addToast("비행검사기 삭제에 실패했습니다");
       set({ aircraft: prev }); // 롤백
+      emitAircraftChanged(get); // 롤백된 목록 재전파
     });
   },
 
@@ -522,6 +536,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDevMode: (v) => {
     set({ devMode: v });
     persistSetting("dev_mode", v);
+    // 다른 창(지도·도면) SourceOverlay 즉시 반영 — 수신측은 setState 만(재영속 금지)
+    emit("dev-mode-changed", { value: v }).catch(() => {});
   },
 
   // 건물통합정보 자동 다운로드

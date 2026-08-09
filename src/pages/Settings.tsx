@@ -19,7 +19,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import Modal from "../components/common/Modal";
 import { useAppStore } from "../store";
 import type { PeakImportStatus } from "../types";
@@ -898,6 +898,8 @@ export function MeasuredBuildingDataSection() {
         try {
           await invoke("set_tiles3d_dir", { dir });
           setTiles3dDir(dir);
+          // 열려 있는 지도 창에 즉시 반영 (없으면 재시작해야 메시가 보임)
+          emit("tiles3d-changed", { dir }).catch(() => {});
         } catch (e) {
           console.warn("3D 타일 폴더 등록 실패:", e);
         }
@@ -933,6 +935,7 @@ export function MeasuredBuildingDataSection() {
     try {
       await invoke("set_tiles3d_dir", { dir: null });
       setTiles3dDir(null);
+      emit("tiles3d-changed", { dir: null }).catch(() => {});
     } catch (e) {
       console.warn("타일 폴더 해제 실패:", e);
     }

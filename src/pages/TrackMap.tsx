@@ -22,6 +22,7 @@ import {
   Cone,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ToolButton, HeadingTape, Toggle as DsToggle, Check, Swatch, DsSlider, ACCENT, G } from "../components/Map/drawerPrimitives";
 
 /** 표시 행 설정 톱니 버튼 (우측 설정 드로어 토글) */
@@ -45,6 +46,16 @@ const TERRAIN_EXAGGERATION = 1.5;
  *  "건물은 사라졌는데 메시만 남는" 불일치가 없다. (buildingTileCache 의 줌 임계값은 타일 조회 격자
  *  단위라 의미가 다르므로 공유 대상 아님) */
 const BUILDINGS_3D_MIN_ZOOM = 14;
+
+/** 실측 3D 메시 레이어 id (main + 보충 cdm). data URL 은 convertFileSrc(파일명,"tiles3d") 라
+ *  폴더를 바꿔도 문자열이 동일 → id 까지 같으면 deck 이 id 매칭으로 구 tileset state 를 승계해
+ *  이전 폴더의 메시가 그대로 남는다. 그래서 id 에 dir 를 키로 넣어 폴더 교체 시에만 새 tileset 을
+ *  로드시킨다(같은 dir 내 재생성 = id 동일 → 기존 state 승계·재요청 없음 계약 유지).
+ *  레이어 생성과 클릭 픽(pickObject layerIds)이 이 단일 원천을 공유해야 픽 대상이 어긋나지 않는다. */
+const meshLayerIds = (dir: string | null) => [
+  `measured-3dtiles@${dir}`,
+  `measured-3dtiles-cdm@${dir}`,
+];
 
 /** CoS(침묵원추) 기준각 — LoSProfilePanel COS_DEG·CoveragePanel MAX_ELEV_DEG 와 동일 의미 (70° 최고탐지각) */
 const COS_DEG = 70;
@@ -1517,7 +1528,7 @@ export default function TrackMap() {
       if (meshActive) {
         let coord: number[] | undefined;
         try {
-          coord = deckOverlayRef.current?.pickObject({ x: e.point.x, y: e.point.y, layerIds: ["measured-3dtiles", "measured-3dtiles-cdm"] })?.coordinate;
+          coord = deckOverlayRef.current?.pickObject({ x: e.point.x, y: e.point.y, layerIds: meshLayerIds(tiles3dDir) })?.coordinate;
         } catch { /* deck 미초기화 등 — 박스 경로 폴백 */ }
         if (coord) {
           const b = resolveMeasuredBuildingAt(coord[1], coord[0], buildings3dDataRef.current);
@@ -1562,7 +1573,8 @@ export default function TrackMap() {
         setBldgHoverTip(null);
       }
     };
-  }, [losTarget, buildings3dMode, showBuildings, meshActive]); // eslint-disable-line react-hooks/exhaustive-deps
+    // tiles3dDir: 폴더 교체(dirA→dirB)로 메시 레이어 id 가 바뀌면 픽 대상도 갱신돼야 한다
+  }, [losTarget, buildings3dMode, showBuildings, meshActive, tiles3dDir]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 커버리지 활성 시 맵 hover → 최저 탐지고도 tooltip
   useEffect(() => {
@@ -3271,6 +3283,16 @@ export default function TrackMap() {
     invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 미등록 */ });
   }, []);
 
+  // 타일셋 등록/해제 수신 (발신: 메인 창 설정) — 위 조회는 마운트 1회뿐이라 이 경로가 없으면
+  // 등록·해제가 열려 있는 지도 창에 반영되지 않는다(재시작 필요). 로컬 state 만 갱신 —
+  // 영속(set_tiles3d_dir)은 발신 창이 이미 완료했으므로 수신측 재영속 금지.
+  useEffect(() => {
+    const unlisten = listen<{ dir: string | null }>("tiles3d-changed", (e) => {
+      setTiles3dDir(e.payload.dir);
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
   // 실측 커버리지 bbox 조회 — 메시 표출을 켤 때만 필요(끄면 필터가 커버리지를 안 쓰므로 값 유지해도 무해).
   // 실패 시 null 유지 → 필터가 기존 measured 플래그 방식으로 자연 폴백.
   useEffect(() => {
@@ -3345,10 +3367,12 @@ export default function TrackMap() {
       });
     // meshZoomOk 로 인스턴스를 재생성해도 id·data 가 동일하면 deck 이 id 매칭으로 기존 state(tileset3d)
     // 를 이어받고, Tile3DLayer.updateState 는 data 가 바뀔 때만 _loadTileset 하므로 재로드는 없다.
+    // (id 는 meshLayerIds 로 dir 를 키에 포함 — 폴더 교체 시에만 승계가 끊겨 새 타일셋을 로드)
+    const [mainId, cdmId] = meshLayerIds(tiles3dDir);
     return [
-      tileset("measured-3dtiles", "tileset.json"),
+      tileset(mainId, "tileset.json"),
       // 보충 타일셋 — 없으면 onTileError 로 조용히 무시
-      tileset("measured-3dtiles-cdm", "tileset_cdm.json"),
+      tileset(cdmId, "tileset_cdm.json"),
     ];
   }, [showTiles3d, tiles3dDir, meshZoomOk]);
 
@@ -3375,6 +3399,14 @@ export default function TrackMap() {
   useEffect(() => {
     if (!showTiles3d || !tiles3dDir) tilesetsRef.current = [];
   }, [showTiles3d, tiles3dDir]);
+
+  // 폴더 교체(dirA→dirB) 정리 — 레이어 id 가 바뀌어 구 tileset 은 폐기되므로 참조도 함께 비운다
+  // (안 비우면 죽은 객체가 게이트 setProps 대상으로 남는다). 새 타일셋은 onTilesetLoad 가 재push.
+  // deps 를 [tiles3dDir] 로 좁힌 것이 핵심 — 위 이펙트와 달리 조건 없이 비우므로, showTiles3d/줌
+  // 토글에도 반응하면 살아있는 참조까지 날아가고 onTilesetLoad 는 재발화하지 않아 영영 못 채운다.
+  useEffect(() => {
+    tilesetsRef.current = [];
+  }, [tiles3dDir]);
 
   // CAT008 기상 극좌표 벡터 → 부채꼴 폴리곤 레이어.
   // 시간은 NEC 프레임 분 단위로 양자화 → 재생 시점(visibleMaxTs) 이하의 최신 1분 스냅샷만 표시.
