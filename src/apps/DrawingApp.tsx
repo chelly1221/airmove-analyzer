@@ -35,7 +35,12 @@ function useRestoreSettings() {
             const sites: RadarSite[] = JSON.parse(value);
             if (sites.length > 0) useAppStore.getState().setCustomRadarSites(sites);
           } else if (key === "selected_radar_site") {
-            useAppStore.getState().setRadarSite(JSON.parse(value));
+            // 스냅샷 재해석 — selected_radar_site 는 저장 시점 스냅샷이라 이후 편집분이 빠져 있다.
+            // 위 키 순서상 목록(custom_radar_sites)이 먼저 로드돼 있으므로 이름으로 최신 항목을 찾아 쓴다
+            // (삭제된 사이트는 목록에 없으므로 스냅샷 폴백). setRadarSite 로 재영속 → 스냅샷 자가 치유
+            const parsed: RadarSite = JSON.parse(value);
+            const resolved = useAppStore.getState().customRadarSites.find((s) => s.name === parsed.name) ?? parsed;
+            useAppStore.getState().setRadarSite(resolved);
           } else if (key === "dev_mode") {
             if (JSON.parse(value) === true) useAppStore.setState({ devMode: true });
           }
@@ -215,6 +220,23 @@ export default function DrawingApp() {
 
   useRestoreSettings();
   const { pickFiles, parseWithFilter, closeFilterModal, filterModalOpen, parsing, fileCount } = useAssFilePicker();
+
+  // 레이더 사이트 변경 수신 (발신: 메인 창 레이더 관리) — 창마다 store 가 독립이고 시작 시 1회만
+  // DB 복원하므로 이 경로가 없으면 편집 결과가 이 창에 전파되지 않는다.
+  useEffect(() => {
+    const unlisten = listen<{ sites: RadarSite[]; editedName?: string; site?: RadarSite }>(
+      "radar-sites-changed",
+      (e) => {
+        // setter(setCustomRadarSites/setRadarSite) 대신 setState — 발신 창이 이미 DB에 영속했으므로 중복 쓰기 회피
+        useAppStore.setState({ customRadarSites: e.payload.sites });
+        const { editedName, site } = e.payload;
+        if (editedName && site && useAppStore.getState().radarSite.name === editedName) {
+          useAppStore.setState({ radarSite: site });
+        }
+      },
+    );
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
 
   return (
     <div className="flex h-full flex-col bg-white">

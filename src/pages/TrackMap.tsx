@@ -4501,7 +4501,8 @@ export default function TrackMap() {
           </div>
 
           {/* LoS 차단 장애물 — 출처: LoSProfilePanel chartData.pathBuildings → onPathBuildings.all
-              (경로 통과 건물 전수) 중 차단(isBlocking)인 건물 + 4/3 현을 관통하는 지형 봉우리(peaks)를
+              (경로 통과 건물 전수) 중 차단(isBlocking = 최저탐지선 실꺾음 귀속 — 선을 꺾어 올리면 그
+              너머 음영을 만드므로 차단, 2026-08-09 의미론)인 건물 + 4/3 현을 관통하는 지형 봉우리(peaks)를
               거리 오름차순으로 병합해 한 리스트로 표시.
               색 계약은 지도/차트와 동일: 대상=파랑(#3b82f6) · 차단=빨강(#ef4444). */}
           {(() => {

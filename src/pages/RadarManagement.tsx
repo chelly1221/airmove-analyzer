@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import maplibregl from "maplibre-gl";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
@@ -344,14 +345,27 @@ export default function RadarManagement() {
 
     if (editingSite) {
       updateCustomRadarSite(editingSite.name, site);
+      // 편집 대상이 현재 선택 레이더면 선택 상태(store + selected_radar_site 스냅샷)도 갱신 —
+      // 목록만 갱신하면 지도/LoS/BRA 가 구 좌표를 계속 사용한다. 판정은 구 이름 기준(이름 변경 커버)
+      if (useAppStore.getState().radarSite.name === editingSite.name) {
+        useAppStore.getState().setRadarSite(site);
+      }
     } else {
       addCustomRadarSite(site);
     }
+    // 타 창(지도·도면)은 시작 시 1회만 DB 복원 → 전파 경로가 없으므로 브로드캐스트.
+    // zustand set 은 동기라 setter 직후 최신 목록을 읽을 수 있다.
+    emit("radar-sites-changed", editingSite
+      ? { sites: useAppStore.getState().customRadarSites, editedName: editingSite.name, site }
+      : { sites: useAppStore.getState().customRadarSites },
+    ).catch(() => {});
     setModalOpen(false);
   };
 
   const handleDelete = (siteName: string) => {
     removeCustomRadarSite(siteName);
+    // 삭제도 타 창에 전파 (선택 레이더가 삭제 대상이어도 radarSite 는 현행 유지)
+    emit("radar-sites-changed", { sites: useAppStore.getState().customRadarSites }).catch(() => {});
     setDeleteConfirm(null);
   };
 

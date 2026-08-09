@@ -750,9 +750,9 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     // 경로 통과 건물 전수 표출 (차단/기여 플래그만 분류):
     // 백엔드가 반환한 '레이더→타겟 직선이 실제로 관통하는 건물' 전부를 차트에 그리고,
-    // isBlocking(4/3 현 관통 AND 표시 최저탐지선 실꺾음 귀속) / bendsLine(실꺾음 귀속) 은
-    // 색·툴팁 분류용 플래그로만 부착
-    const pathBuildings: (BuildingOnPath & { isBlocking: boolean; bendsLine: boolean })[] = [];
+    // isBlocking(표시 최저탐지선 실꺾음 귀속 = 차단) / chordBlocking(추가로 4/3 현까지 관통 =
+    // 타겟 시선 직접 차단) 은 색·툴팁 분류용 플래그로만 부착
+    const pathBuildings: (BuildingOnPath & { isBlocking: boolean; chordBlocking: boolean })[] = [];
     // 주소 검색으로 지정된 건물 찾기 (검색 좌표에 가장 가까운 건물, 150m 이내)
     let searchedBldg: BuildingOnPath | null = null;
     if (searchedAddress && effBuildings.length > 0) {
@@ -789,18 +789,24 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         const b = effBuildings[i];
         const bDist = b.distance_km;
         // 단면도 전체 길이(profileMaxKm, 기본 200NM)까지 건물 표시 — 줌아웃 시 타겟 너머 건물도 함께.
-        //   차단(isBlocking)은 레이더→타겟(0..D) 구간에서만 성립하므로 near≥D 인 타겟 너머 건물은
-        //   아래 교집합(s0>s1)에서 자동으로 비차단 처리된다.
+        //   차단(isBlocking)은 실꺾음 귀속 기준이므로 타겟 너머 건물도 최저탐지선을 꺾으면 차단으로
+        //   표시된다(그 너머 음영을 실제로 만들므로 — 의도). 레이더→타겟(0..D) 구간 한정인 것은
+        //   현 관통(chordBlocking) 뿐이며, near≥D 인 건물은 아래 교집합(s0>s1)에서 자동 false 가 된다.
         if (bDist <= 0 || bDist >= profileMaxKm) continue;
         const bTop = b.ground_elev_m + b.height_m;
 
-        // 건물별 차단 판정 — 이중 조건(현 관통 AND 실꺾음 귀속):
+        // 현 관통 판정(chordBlocking) — 이중 조건(현 관통 AND 실꺾음 귀속):
         //   ① 4/3 현(chord43H) 관통 = 레이더↔타겟 직선 시야를 실제로 가로막음. 상단 AMSL 이 일정하고
         //      현이 선형이라 레이더→타겟 구간 교집합의 양끝 검사만으로 충분.
         //   ② AND 표시 최저탐지선(los43)을 자기 엣지가 실제로 꺾어 올림(bentBldg 귀속).
         //   ② 가 없으면: 타겟 고도가 지면이라 현이 지면까지 내려가므로, 앞쪽 지형·건물 그림자에 완전히
         //   묻혀 선을 전혀 꺾지 못하는 건물까지 현 위로만 올라오면 전부 빨강으로 대량 오탐된다 (2026-08-03 수정).
         //   (구 maxBlockPoint 근접 귀속 방식은 최대 차단점 옆 무관 건물 오탐·비최대 관통 건물 누락으로 폐기)
+        //   ※ 2026-08-09 의미론 확정 — 차단 클래스(isBlocking)는 ②(실꺾음 귀속) 단독이다.
+        //     최저탐지선을 실제로 꺾어 올리는 건물은 그 너머 음영을 만들므로 곧 차단("최저탐지선 기여
+        //     = 차단")이며, '비차단 · 최저탐지선 기여' 라벨은 모순이라 폐지됐다. 여기 이중 조건 결과는
+        //     chordBlocking 으로만 남아 '타겟 시선 직접 차단' 라벨 구분에 쓰인다. ②를 포함하므로
+        //     2026-08-03 오탐 방지(그림자에 묻힌 건물 제외)는 실꺾음 귀속 조건이 그대로 담보한다.
         const bNearD = b.near_dist_km ?? b.distance_km;
         const bFarD = b.far_dist_km ?? b.distance_km;
         const s0 = Math.max(bNearD, 0.001), s1 = Math.min(bFarD, D - 0.001);
@@ -811,17 +817,16 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
           isBlk = penetratesChord && bentBldg.has(i);
         }
 
-        // 최저탐지선(los43) 꺾음 판정 — 위 실꺾음 귀속 결과 그대로. 지형·타건물 그림자에 묻혀
-        //   running max 를 못 올린 건물은 선에 닿지 않으므로 제외된다.
-        //   표시 필터가 아니라 툴팁 분류용 플래그 — '비차단 · 최저탐지선 기여' ↔ '비차단 · 경로 통과' 구분.
-        //   (타겟 너머 건물도 선을 꺾으면 여기 포함 — 차단은 위 현 관통 교집합에서 별도로 걸러진다)
+        // 차단 판정(isBlocking) = 최저탐지선(los43) 실꺾음 귀속 그대로. 지형·타건물 그림자에 묻혀
+        //   running max 를 못 올린 건물은 선에 닿지 않으므로 제외된다(오탐 방지).
+        //   색(빨강)·범례 카운트·onStats·지도 하이라이트·드로어 차단 리스트가 모두 이 플래그를 쓴다.
         const bendsLine = bentBldg.has(i);
 
         const isSearched = searchedBldg !== null && b === searchedBldg;
-        // 경로 통과 건물은 조건 없이 전수 push (구 bendsLine||isBlk||isSearched 필터 폐지).
+        // 경로 통과 건물은 조건 없이 전수 push (구 '꺾음 or 현관통 or 대상' 필터 폐지).
         //   isSearched 건물의 인덱스만 대상 건물 표시(파랑·핀)용으로 기록.
         if (isSearched) searchedBldgIdx = pathBuildings.length;
-        pathBuildings.push({ ...b, isBlocking: isBlk, bendsLine });
+        pathBuildings.push({ ...b, isBlocking: bendsLine, chordBlocking: isBlk });
       }
     }
 
@@ -1227,7 +1232,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       // 커서가 가리키는 절대 위치 (%)
       const pivot = s + cursorRatio * range;
       const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
-      const newRange = Math.min(100, Math.max(1, range * factor));
+      // 최소 스팬 0.1% — profileMaxKm(기본 200NM=370.4km) 기준 약 370m 창까지 줌인
+      const newRange = Math.min(100, Math.max(0.1, range * factor));
       let newStart = pivot - cursorRatio * newRange;
       let newEnd = pivot + (1 - cursorRatio) * newRange;
       if (newStart < 0) { newEnd -= newStart; newStart = 0; }
@@ -1522,7 +1528,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     // X축 눈금 (NM 기준, 줌 뷰포트 적용)
     const visibleDistNm = zoomRange * KM_TO_NM;
-    const xStepNm = visibleDistNm > 80 ? 20 : visibleDistNm > 40 ? 10 : visibleDistNm > 15 ? 5 : visibleDistNm > 5 ? 2 : 1;
+    const xStepNm = visibleDistNm > 80 ? 20 : visibleDistNm > 40 ? 10 : visibleDistNm > 15 ? 5 : visibleDistNm > 5 ? 2 : visibleDistNm > 2 ? 1 : visibleDistNm > 0.8 ? 0.5 : 0.2;
     const xTicks: number[] = []; // km 값으로 저장
     const zoomStartNm = zoomStart * KM_TO_NM;
     const zoomEndNm = zoomEnd * KM_TO_NM;
@@ -2039,7 +2045,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 <tspan fill="#374151" fontWeight="bold">{Math.round(b.ground_elev_m + b.height_m)}m AMSL</tspan>
               </text>
               <text x={tooltipX + 8} y={(lineY += 14, lineY)} fill={b.isBlocking ? "#ef4444" : "#6b7280"} fontSize={8} fontWeight={b.isBlocking ? "bold" : "normal"}>
-                {b.isBlocking ? "⚠ LoS 차단" : b.bendsLine ? "비차단 · 최저탐지선 기여" : "비차단 · 경로 통과"}
+                {b.chordBlocking ? "⚠ LoS 차단" : b.isBlocking ? "⚠ 차단 · 최저탐지선 기여" : "비차단 · 경로 통과"}
               </text>
               {isClicked && (
                 <text x={tooltipX + tooltipW - 8} y={lineY} textAnchor="end"

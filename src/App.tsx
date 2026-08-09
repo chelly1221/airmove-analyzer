@@ -67,8 +67,12 @@ function useRestoreSettings() {
             const sites: RadarSite[] = JSON.parse(value);
             if (sites.length > 0) useAppStore.getState().setCustomRadarSites(sites);
           } else if (key === "selected_radar_site") {
-            const site: RadarSite = JSON.parse(value);
-            useAppStore.getState().setRadarSite(site);
+            // 스냅샷 재해석 — selected_radar_site 는 저장 시점 스냅샷이라 이후 편집분이 빠져 있다.
+            // 위 키 순서상 목록(custom_radar_sites)이 먼저 로드돼 있으므로 이름으로 최신 항목을 찾아 쓴다
+            // (삭제된 사이트는 목록에 없으므로 스냅샷 폴백). setRadarSite 로 재영속 → 스냅샷 자가 치유
+            const parsed: RadarSite = JSON.parse(value);
+            const resolved = useAppStore.getState().customRadarSites.find((s) => s.name === parsed.name) ?? parsed;
+            useAppStore.getState().setRadarSite(resolved);
           } else if (key === "report_metadata") {
             const meta = JSON.parse(value);
             useAppStore.getState().setReportMetadata(meta);
