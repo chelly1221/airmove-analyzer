@@ -990,9 +990,11 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     const startKm = Math.max(0, Math.min((xZoom[0] / 100) * maxDistance, lastP.distance));
     const endKm = Math.max(startKm, Math.min((xZoom[1] / 100) * maxDistance, lastP.distance));
 
-    // 샘플 거리 목록 — 구간 경계 + 구간 내 profile 샘플 + 타겟(d=D). 오름차순 정렬 후 중복 제거.
+    // 샘플 거리 목록 — 구간 경계 + 구간 내 minDetStraight 샘플(uniqueDists: profile 전체 + 건물 경계 ±ε)
+    //   + 타겟(d=D). 건물 경계 ±ε 점을 포함해야 차트의 법면 수직 꺾임(최저탐지선·프레넬)이 지도 커튼에도
+    //   그대로 재현된다(profile 만 쓰면 보간이 수직 상승을 ~0.5km 대각 램프로 뭉갬). 오름차순 정렬 후 중복 제거.
     const dists: number[] = [startKm];
-    for (const p of profile) if (p.distance > startKm && p.distance < endKm) dists.push(p.distance);
+    for (const p of minDetStraight) if (p.distance > startKm && p.distance < endKm) dists.push(p.distance);
     if (D > startKm && D < endKm) dists.push(D);
     dists.push(endKm);
     dists.sort((a, b) => a - b);
