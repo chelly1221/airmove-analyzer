@@ -80,7 +80,7 @@ const TrackPointIcon = ({ size = 16 }: { size?: number }) => (
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult, BraBuilding } from "../types";
 import { readBulkJson, type BulkRef } from "../utils/bulkIpc";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
@@ -637,6 +637,27 @@ export default function TrackMap() {
         if (seq === addressReqSeq.current) setAddressBuilding(null);
       });
   }, []);
+  /** 건물 속성 → 우측 건축물정보 드로어 오픈 — BRA 프리즘/리스트·건물 점 클릭 공용.
+   *  maplibre 경로(openBldgDrawer)와 동일 로직. losPointClickedRef 마킹은 호출부 책임(BRA 모드는 losTarget 없음). */
+  const openBldgDrawerFor = useCallback((a: { lat: number; lon: number; name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean }) => {
+    setBldgHoverTip(null);
+    setSettingsDrawer(null); // 우측 표시 설정 드로어와 택1 상호 배타
+    setBldgDrawer((prev) => {
+      // 같은 건물 재클릭이면 기존 조회 데이터 유지 (재조회 방지)
+      if (prev && Math.abs(prev.lat - a.lat) < 1e-6 && Math.abs(prev.lon - a.lon) < 1e-6) return prev;
+      return {
+        lat: a.lat, lon: a.lon,
+        loading: true, info: null, facDetail: undefined,
+        localName: a.name, localHeight: a.height, localUsage: a.usage,
+        localBase: a.base, localSource: a.source, localMeasured: a.measured,
+      };
+    });
+    // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
+    const sel = addressSelRef.current;
+    if (sel && (Math.abs(sel.lat - a.lat) > 1e-6 || Math.abs(sel.lon - a.lon) > 1e-6)) {
+      selectBuildingAt(a.lat, a.lon, a.name || "선택 건물", false);
+    }
+  }, [selectBuildingAt]);
   const handleAddressSelect = useCallback((lat: number, lon: number, label: string) => {
     if (lat !== 0 && lon !== 0) {
       selectBuildingAt(lat, lon, label, true);
@@ -3237,33 +3258,13 @@ export default function TrackMap() {
           if (losTarget) losPointClickedRef.current = true;
           if (info.object) {
             const d = info.object;
-            setBldgHoverTip(null);
-            setSettingsDrawer(null); // 우측 표시 설정 드로어와 택1 상호 배타
-            setBldgDrawer((prev) => {
-              // 같은 건물 재클릭이면 기존 조회 데이터 유지 (재조회 방지)
-              if (prev && Math.abs(prev.lat - d.lat) < 1e-6 && Math.abs(prev.lon - d.lon) < 1e-6) return prev;
-              return {
-                lat: d.lat, lon: d.lon,
-                loading: true, info: null, facDetail: undefined,
-                localName: d.name || undefined,
-                localHeight: d.height_m,
-                localUsage: d.usage || undefined,
-                localBase: d.ground_elev_m,
-                localSource: d.source,
-                localMeasured: d.measured,
-              };
-            });
-            // 주소검색 선택 활성 중 다른 건물 클릭 → 선택건물 전환 (카메라 유지)
-            const sel = addressSelRef.current;
-            if (sel && (Math.abs(sel.lat - d.lat) > 1e-6 || Math.abs(sel.lon - d.lon) > 1e-6)) {
-              selectBuildingAt(d.lat, d.lon, d.name || "선택 건물", false);
-            }
+            openBldgDrawerFor({ lat: d.lat, lon: d.lon, name: d.name || undefined, height: d.height_m, usage: d.usage || undefined, base: d.ground_elev_m, source: d.source, measured: d.measured });
           }
         },
         onHover: buildingHover,
       }),
     ];
-  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgDrawer?.lat, bldgDrawer?.lon]);
+  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgDrawer?.lat, bldgDrawer?.lon, openBldgDrawerFor]);
 
   // 등록된 실측 3D 타일셋 폴더 조회 (미등록이면 null → 토글 비활성)
   useEffect(() => {
@@ -3509,6 +3510,8 @@ export default function TrackMap() {
   }, [showCos, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
   // BRA 3D 레이어 — ① 원추면(기준각 θ 로 전방위 상승) ② 침범 건물의 원추면 위 돌출부(붉은 프리즘).
+  //   ② 침범 프리즘은 pickable — 클릭 시 우측 건축물정보 드로어, 호버 시 간단 툴팁(BRA 초과·여유 행 포함).
+  //      (BRA 는 원추 전체를 보려 줌아웃한 상태라 fill-extrusion 건물 레이어가 비어 클릭 대상이 없다)
   //   z 규약은 CoS 원추(cosDeckLayers)와 동일: AMSL 미터 × EX (지형 메시가 1.5배 과장이라 정합).
   //   원추면 해발고는 Rust analysis/bra.rs cone_msl · LoSProfilePanel braAMSL 과 동일한
   //   실제지구 기하 직선: coneMsl(d) = h_ant + d·tanθ + d²/(2R) (4/3 굴절 미적용).
@@ -3588,7 +3591,8 @@ export default function TrackMap() {
       // 판정에 쓰인 값(결과 스냅샷)으로 원추면 재구성 — 입력 슬라이더를 이후 조정해도 오버레이는 결과와 정합
       const hRes = braResult.radar_height_m;
       const tanRes = Math.tan((braResult.angle_deg * Math.PI) / 180);
-      const faces: { polygon: [number, number, number][] }[] = [];
+      // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함
+      const faces: { polygon: [number, number, number][]; b: BraBuilding }[] = [];
       for (const b of braResult.buildings) {
         const poly = b.polygon;
         if (!poly || poly.length < 3) continue;
@@ -3611,7 +3615,7 @@ export default function TrackMap() {
         // 원추 기울기(0.25° ≈ 4.4m/km)에 비해 풋프린트 스팬이 작아 오차는 무시 가능.
         const cap: [number, number, number][] = new Array(n);
         for (let i = 0; i < n; i++) cap[i] = [lonlat[i][0], lonlat[i][1], topZ];
-        faces.push({ polygon: cap });
+        faces.push({ polygon: cap, b });
         // 측벽 — 양끝 초과량이 모두 0 에 가까운 변은 생략
         for (let i = 0; i < n; i++) {
           const j = (i + 1) % n;
@@ -3623,12 +3627,13 @@ export default function TrackMap() {
               [lonlat[j][0], lonlat[j][1], topZ],
               [lonlat[i][0], lonlat[i][1], topZ],
             ],
+            b,
           });
         }
       }
       if (faces.length > 0) {
         layers.push(
-          new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
+          new SolidPolygonLayer<{ polygon: [number, number, number][]; b: BraBuilding }>({
             id: "bra-penetration",
             data: faces,
             getPolygon: (d) => d.polygon,
@@ -3637,7 +3642,30 @@ export default function TrackMap() {
             extruded: false,
             _full3d: true,
             material: false,
-            pickable: false,
+            pickable: true,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            onClick: (info: any) => {
+              const b = info.object?.b as BraBuilding | undefined;
+              if (!b) return;
+              // MapboxOverlay(overlaid) 는 maplibre 의 click 을 deck 로 '전달'만 할 뿐 전파를 막지 않는다.
+              // 같은 클릭에서 maplibre 건물 핸들러도 돌고, BRA 줌아웃 상태엔 fill-extrusion 레이어가
+              // 아예 없어 setBldgDrawer(null) 로 끝난다 → 두 핸들러의 등록 순서에 따라 방금 연 드로어가
+              // 즉시 닫힐 수 있다. 다음 매크로태스크로 미뤄 항상 마지막 상태가 되게 한다(순서 무관 결정적).
+              setTimeout(() => {
+                openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.source, measured: b.measured });
+              }, 0);
+            },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            onHover: (info: any) => {
+              const b = info.object?.b as BraBuilding | undefined;
+              // maplibre fill-extrusion 호버가 활성인 픽셀에서는 양보 — 같은 건물을 두 경로가 다른 수치로 번갈아 쓰는 값 플리커 방지
+              if (buildingHoverActiveRef.current) return;
+              if (b) {
+                setBldgHoverTip({ x: info.x, y: info.y, name: b.name ?? undefined, height: b.height_m, measured: b.measured, lat: b.lat, lon: b.lon, base: b.ground_elev_m });
+              } else {
+                setBldgHoverTip(null); // 프리즘 이탈 시 잔류 툴팁 제거 (maplibre 경로는 자기 활성 플래그가 없으면 정리 안 함)
+              }
+            },
             parameters: { depthWriteEnabled: false },
           }),
         );
@@ -3645,7 +3673,7 @@ export default function TrackMap() {
     }
 
     return layers;
-  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
+  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled, openBldgDrawerFor]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
@@ -3950,10 +3978,9 @@ export default function TrackMap() {
             height: 620,
             anchorY: 620,
           }),
-          getSize: 50,
-          sizeMinPixels: 24,
-          sizeMaxPixels: 60,
-          sizeUnits: "meters",
+          // 줌 무관 절대(스크린 픽셀) 크기 고정 — 종전 meters(50m, 24~60px 클램프)는 줌에 따라 크기 변동
+          getSize: 40,
+          sizeUnits: "pixels" as const,
           billboard: true,
           pickable: true,
           onClick: () => { if (losTarget) losPointClickedRef.current = true; },
@@ -4683,6 +4710,8 @@ export default function TrackMap() {
                     onClick={() => {
                       const map = mapRef.current?.getMap();
                       if (map) map.easeTo({ center: [b.lon, b.lat], zoom: Math.max(map.getZoom(), 15), duration: 600 });
+                      // 리스트 행 클릭도 지도 프리즘 클릭과 동일하게 우측 건축물정보 드로어 오픈
+                      openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.source, measured: b.measured });
                     }}
                     onMouseEnter={(e) => (e.currentTarget.style.background = G[50])}
                     onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
