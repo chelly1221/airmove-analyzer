@@ -76,6 +76,7 @@ async function focusWindow(label: string) {
 
 const SCENARIO_REPORT_TRACK = "report-track";
 const SCENARIO_OBSTACLE_LOS = "obstacle-los-review";
+const SCENARIO_DB_BACKUP = "db-backup-restore";
 
 // ─── 시나리오 1: 비행검사결과보고서 첨부용 항적자료 ───────────────────
 // main(단일항적분석 창 열기) → drawing(항적도 캡처) → main(지도 창 열기) → trackmap(항적 점 캡처)
@@ -586,10 +587,144 @@ const OBSTACLE_LOS_PHASES: Record<string, TourStep[]> = {
   ],
 };
 
+// ─── 시나리오 3: 데이터베이스 백업·복원 ───────────────────────────────
+// main 단일 창(설정 → DB 내보내기 시뮬레이션 → DB 가져오기 시뮬레이션) — 창 릴레이 없음.
+// 네이티브 저장/열기 다이얼로그와 실제 가져오기(전체 데이터 교체)는 파괴적이라
+// interceptClick + 가상 오버레이로만 진행.
+
+const DB_BACKUP_PHASES: Record<string, TourStep[]> = {
+  main: [
+    {
+      id: "dbr-intro",
+      title: "데이터베이스 백업·복원",
+      body:
+        "운항이력, ADS-B 항적, 파싱 데이터, 설정 등 모든 저장 데이터를 ZIP 백업으로 내보내고 " +
+        "다시 가져와 복원하는 과정을 안내합니다. PC 교체·재설치나 다른 PC 로의 자료 이관에 사용합니다. " +
+        "가상 화면으로 시뮬레이션하므로 실제 데이터는 변경되지 않습니다.",
+      mode: "dim",
+      showNext: true,
+      nextLabel: "시작",
+    },
+    {
+      id: "dbr-open-settings",
+      target: '[data-tour="titlebar-settings"]',
+      title: "설정 열기",
+      body: "화면 우상단의 **톱니바퀴(설정)** 아이콘을 클릭하세요. 설정 페이지로 이동합니다.",
+      mode: "interactive",
+      placement: "bottom",
+      advanceOnTargetClick: true,
+    },
+    {
+      id: "dbr-db-section",
+      target: '[data-tour="settings-db-section"]',
+      title: "데이터베이스 관리",
+      body:
+        "이 섹션에서 모든 저장 데이터를 내보내거나 가져올 수 있습니다. " +
+        "실측 3D 타일 폴더가 등록되어 있으면 백업(ZIP)에 타일 파일까지 함께 포함됩니다.",
+      mode: "interactive",
+      placement: "bottom",
+      scrollIntoView: true,
+      showNext: true,
+    },
+    {
+      id: "dbr-export-btn",
+      target: '[data-tour="settings-db-export"]',
+      title: "DB 내보내기",
+      body: "'DB 내보내기'를 클릭하세요. 투어에서는 가상 저장 화면이 열립니다.",
+      mode: "interactive",
+      placement: "right",
+      scrollIntoView: true,
+      advanceOnTargetClick: true,
+      interceptClick: true,
+    },
+    {
+      id: "dbr-export-save",
+      target: '[data-tour="fake-file-save"]',
+      title: "저장 위치 지정",
+      body:
+        "파일명은 오늘 날짜의 백업명으로 자동 제안됩니다. " +
+        "실제 사용 시 저장 위치를 지정하고 **저장**을 클릭하세요.",
+      mode: "interactive",
+      placement: "right",
+      overlay: "backupSaveDialog",
+      overlayCancelGoTo: "dbr-export-btn",
+    },
+    {
+      id: "dbr-export-progress",
+      title: "백업 생성",
+      body:
+        "실제 사용 시 백업 ZIP 생성 진행률이 표시되고, 완료되면 파일 크기와 함께 완료 메시지가 나타납니다. " +
+        "생성된 백업 파일은 USB 등 외부 저장장치에 보관하세요.",
+      mode: "floating",
+      showNext: true,
+    },
+    {
+      id: "dbr-import-btn",
+      target: '[data-tour="settings-db-import"]',
+      title: "DB 가져오기",
+      body:
+        "이번에는 백업을 복원해 보겠습니다. 'DB 가져오기'를 클릭하세요. " +
+        "투어에서는 가상 파일 선택 화면이 열립니다.",
+      mode: "interactive",
+      placement: "right",
+      scrollIntoView: true,
+      advanceOnTargetClick: true,
+      interceptClick: true,
+    },
+    {
+      id: "dbr-import-pick",
+      target: '[data-tour="fake-file-list"]',
+      title: "백업 파일 선택",
+      body: "복원할 백업 파일(.zip)을 선택하세요.",
+      mode: "interactive",
+      placement: "right",
+      overlay: "backupOpenDialog",
+      overlayCancelGoTo: "dbr-import-btn",
+    },
+    {
+      id: "dbr-import-open",
+      target: '[data-tour="fake-file-open"]',
+      title: "파일 열기",
+      body: "'열기'를 클릭하세요.",
+      mode: "interactive",
+      placement: "right",
+      overlay: "backupOpenDialog",
+      overlayCancelGoTo: "dbr-import-btn",
+    },
+    {
+      id: "dbr-import-confirm",
+      target: '[data-tour="fake-import-confirm"]',
+      title: "교체 경고 확인",
+      body:
+        "가져오기는 현재 데이터를 백업 파일의 데이터로 **전부 교체**하며 되돌릴 수 없습니다. " +
+        "경고 내용을 확인한 뒤 '가져오기'를 클릭하세요.",
+      mode: "interactive",
+      placement: "right",
+      overlay: "backupConfirm",
+      overlayCancelGoTo: "dbr-import-btn",
+    },
+    {
+      id: "dbr-finish",
+      title: "백업·복원 완료",
+      body:
+        "실제 가져오기가 완료되면 앱이 자동으로 새로고침되며 백업 시점의 데이터로 복원됩니다. " +
+        "정기적으로 백업해 두면 PC 장애나 교체 시에도 분석 자료를 안전하게 지킬 수 있습니다.",
+      mode: "dim",
+      showNext: true,
+      nextLabel: "완료",
+      endsPhase: true,
+      onAdvance: async () => {
+        await clearTourState();
+      },
+    },
+  ],
+};
+
 /** 시나리오 id → phase 별 스텝 레지스트리 */
 const SCENARIO_PHASE_MAP: Record<string, Record<string, TourStep[]>> = {
   [SCENARIO_REPORT_TRACK]: REPORT_TRACK_PHASES,
   [SCENARIO_OBSTACLE_LOS]: OBSTACLE_LOS_PHASES,
+  [SCENARIO_DB_BACKUP]: DB_BACKUP_PHASES,
 };
 
 /** 사용방법 페이지 목록용 메타 */
@@ -620,6 +755,20 @@ export const TOUR_SCENARIOS: TourScenarioMeta[] = [
       "주소검색으로 대상 건물 선택 (예: 개화동로 561)",
       "건물 카드에서 지반고·건물높이 확인 후 LoS 단면도 열기",
       "허용높이·차단 여부와 중앙/좌끝/우끝 방위 확인, 차트 휠 줌",
+    ],
+  },
+  {
+    id: SCENARIO_DB_BACKUP,
+    title: "데이터베이스 백업·복원",
+    description:
+      "운항이력·ADS-B 항적·파싱 데이터·설정 등 모든 저장 데이터를 ZIP 백업으로 내보내고, " +
+      "백업 파일을 다시 가져와 복원하는 과정을 안내합니다. PC 교체·재설치나 다른 PC 로의 자료 이관에 사용합니다. " +
+      "가상 화면으로 시뮬레이션하므로 실제 데이터는 변경되지 않습니다.",
+    stepsSummary: [
+      "우상단 설정(톱니바퀴) 아이콘으로 설정 페이지 열기",
+      "데이터베이스 관리에서 'DB 내보내기' — 저장 위치 지정 후 ZIP 백업 생성",
+      "'DB 가져오기'로 백업 파일(.zip) 선택",
+      "교체 경고 확인 후 가져오기 — 완료 시 앱 자동 새로고침",
     ],
   },
 ];

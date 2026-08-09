@@ -53,6 +53,7 @@ export default function Titlebar({ title, controlsOnly, noBorder, children }: { 
 
       {/* Settings button */}
       <button
+        data-tour="titlebar-settings"
         onClick={() => { setActivePage("settings"); navigate("/settings"); }}
         className={`flex h-full w-10 items-center justify-center transition-colors ${
           location.pathname === "/settings"

@@ -24,8 +24,16 @@ export type TourPlacement = "right" | "bottom";
  * 스텝 동안 띄우는 시뮬레이션 오버레이
  * - fileDialog: 가상 ASS 파일 선택 화면 (TourFakeFileDialog)
  * - parseFilter: 실제 ParseFilterModal 을 데모 렌더 (파싱 미수행)
+ * - backupSaveDialog: 가상 백업 저장 다이얼로그 (TourFakeFileDialog save 모드)
+ * - backupOpenDialog: 가상 백업 열기 다이얼로그 (TourFakeFileDialog open 모드)
+ * - backupConfirm: 가상 가져오기 교체 경고 모달 (TourFakeImportConfirm)
  */
-export type TourOverlay = "fileDialog" | "parseFilter";
+export type TourOverlay =
+  | "fileDialog"
+  | "parseFilter"
+  | "backupSaveDialog"
+  | "backupOpenDialog"
+  | "backupConfirm";
 
 export interface TourStep {
   id: string;
@@ -46,6 +54,8 @@ export interface TourStep {
   interceptClick?: boolean;
   /** 대상이 DOM 에서 사라지면(드롭다운 닫힘) 지정 스텝 id 로 복귀 */
   retreatToOnTargetLost?: string;
+  /** 대상 발견 시 1회 뷰포트 중앙으로 스크롤 (스크롤 컨테이너 하단의 대상용) */
+  scrollIntoView?: boolean;
   /** 이 스텝 동안 띄울 시뮬레이션 오버레이 */
   overlay?: TourOverlay;
   /** 오버레이 취소(취소 버튼/ESC/배경 클릭) 시 점프할 스텝 id */

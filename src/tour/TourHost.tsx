@@ -7,6 +7,8 @@ import ParseFilterModal from "../components/common/ParseFilterModal";
 import { useAppStore } from "../store";
 import { useTourStore } from "./tourStore";
 import TourFakeFileDialog from "./TourFakeFileDialog";
+import type { FakeFile } from "./TourFakeFileDialog";
+import TourFakeImportConfirm from "./TourFakeImportConfirm";
 import { clearTourState, getPhaseSteps, phaseWindow, readTourState } from "./scenarios";
 import type { TourPlacement, TourWindow } from "./types";
 import type { Aircraft } from "../types";
@@ -35,6 +37,13 @@ const DEMO_AIRCRAFT: Aircraft[] = [
     active: true,
   },
 ];
+
+/** 가상 백업 파일 목록 (실제 자료 아님) */
+const FAKE_BACKUP_FILES: FakeFile[] = [
+  { name: "airmove-backup-2026-07-15.zip", modified: "2026-07-15 오후 6:12", size: "1.8 GB" },
+  { name: "airmove-backup-2026-06-30.zip", modified: "2026-06-30 오후 5:41", size: "1.6 GB" },
+];
+const BACKUP_PATH = ["내 PC", "문서", "백업"];
 
 interface Rect {
   top: number;
@@ -136,11 +145,18 @@ export default function TourHost({ window: win }: { window: TourWindow }) {
     }
     // 복귀 판정은 rect state 가 아니라 측정 루프 지역 변수로 — state 는 한 렌더 지연돼 오탐한다
     const retreatId = step.retreatToOnTargetLost;
+    const autoScroll = !!step.scrollIntoView;
     let seen = false;
     let lostAt = 0;
     let retreated = false;
+    // 설정 페이지처럼 스크롤 컨테이너 아래에 있는 대상을 자동 노출 (스텝당 1회)
+    let scrolled = false;
     const measure = () => {
       const el = document.querySelector(target);
+      if (autoScroll && el && !scrolled) {
+        scrolled = true;
+        el.scrollIntoView({ block: "center" });
+      }
       const r = el ? el.getBoundingClientRect() : null;
       const next: Rect | null = r ? { top: r.top, left: r.left, width: r.width, height: r.height } : null;
       setRect((prev) => (sameRect(prev, next) ? prev : next));
@@ -306,6 +322,37 @@ export default function TourHost({ window: win }: { window: TourWindow }) {
           onClose={cancelOverlay}
           onConfirm={confirmParseFilter}
           aircraft={demoAircraft}
+        />
+      )}
+      {overlay === "backupSaveDialog" && (
+        <TourFakeFileDialog
+          key="backupSaveDialog"
+          mode="save"
+          files={FAKE_BACKUP_FILES}
+          pathSegments={BACKUP_PATH}
+          filterLabel="AirMove 백업 (*.zip)"
+          defaultName={`airmove-backup-${new Date().toISOString().slice(0, 10)}.zip`}
+          onPick={() => {}}
+          onOpen={() => useTourStore.getState().advance()}
+          onCancel={cancelOverlay}
+        />
+      )}
+      {overlay === "backupOpenDialog" && (
+        <TourFakeFileDialog
+          key="backupOpenDialog"
+          files={FAKE_BACKUP_FILES}
+          pathSegments={BACKUP_PATH}
+          filterLabel="AirMove 백업 (*.zip, *.db)"
+          onPick={() => useTourStore.getState().advance()}
+          onOpen={() => useTourStore.getState().advance()}
+          onCancel={cancelOverlay}
+        />
+      )}
+      {overlay === "backupConfirm" && (
+        <TourFakeImportConfirm
+          key="backupConfirm"
+          onConfirm={() => useTourStore.getState().advance()}
+          onCancel={cancelOverlay}
         />
       )}
 

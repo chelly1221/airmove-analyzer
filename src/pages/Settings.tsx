@@ -119,7 +119,7 @@ export function DatabaseSection() {
     : 0;
 
   return (
-    <div className="space-y-4">
+    <div data-tour="settings-db-section" className="space-y-4">
       <div className="flex items-center gap-2">
         <Database size={16} className="text-[#a60739]" />
         <h2 className="text-lg font-semibold text-gray-800">데이터베이스 관리</h2>
@@ -131,6 +131,7 @@ export function DatabaseSection() {
 
       <div className="flex gap-3">
         <button
+          data-tour="settings-db-export"
           onClick={handleExport}
           disabled={exporting || importing}
           className="flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-gray-400 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -139,6 +140,7 @@ export function DatabaseSection() {
           {exporting ? "내보내는 중..." : "DB 내보내기"}
         </button>
         <button
+          data-tour="settings-db-import"
           onClick={handleImportClick}
           disabled={exporting || importing}
           className="flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-gray-400 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
