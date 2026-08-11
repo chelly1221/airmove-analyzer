@@ -73,7 +73,10 @@ const vec3 BRA_RED = vec3(239.0, 68.0, 68.0) / 255.0;
 const vec3 BRA_GRAY = vec3(229.0, 231.0, 235.0) / 255.0;
 `,
   // 픽셀 위치 → 레이더 수평거리 → 원추면 z → 상(빨강)/하(회색).
-  // fragColor.rgb 는 getFillColor 백색(255)에 VS 조명 계수가 곱해진 **조명 계수 캐리어**다.
+  // 주의: 훅 함수 시그니처가 `DECKGL_FILTER_COLOR(inout vec4 color, ...)` 라 반드시 파라미터명
+  // `color` 를 써야 한다 — 전역 `out vec4 fragColor` 는 조립된 소스에서 훅 함수 **뒤에** 선언되어
+  // 참조 시 미선언 식별자로 셰이더 컴파일이 실패한다(실측 크래시 로그로 확인).
+  // color.rgb 는 getFillColor 백색(255)에 VS 조명 계수가 곱해진 **조명 계수 캐리어**다.
   // (현재 extruded:false 경로는 VS 에서 조명을 타지 않아 정확히 흰색 = 1 곱이지만, 곱셈으로
   //  적용해 두면 조명이 걸리는 경로에서도 벽면 음영이 그대로 보존된다.)
   // 경도/위도가 f32 varying 이라 ~1.5e-5°(≈1.3m) 정밀도지만, 기울기 0.25°(tanθ≈0.0044) 기준
@@ -84,7 +87,7 @@ const vec3 BRA_GRAY = vec3(229.0, 231.0, 235.0) / 255.0;
   float brad = sqrt(bradx * bradx + brady * brady);
   float braConeZ = (braCone.apexM + brad * braCone.tanTheta + brad * brad * braCone.invTwoR) * braCone.ex;
   vec3 braBase = braWorldPos.z > braConeZ ? BRA_RED : BRA_GRAY;
-  fragColor = vec4(braBase * fragColor.rgb, fragColor.a);
+  color = vec4(braBase * color.rgb, color.a);
 `,
 };
 
