@@ -16,7 +16,7 @@ export interface BraBuilding {
   lat: number;
   /** centroid 경도 */
   lon: number;
-  /** 판정 지점(레이더 최근접 정점)까지 지표 거리 (km) */
+  /** 판정 지점(레이더 최근접 경계점)까지 지표 거리 (km) */
   distance_km: number;
   /** centroid 방위 (°, 정북=0, 시계방향) */
   azimuth_deg: number;
@@ -44,10 +44,10 @@ export interface BraResult {
   max_range_km: number;
   /** 검사한 건물 수 (fac + manual) */
   scanned: number;
-  /** 침범 총수 (truncate 전) */
+  /** 침범 총수 (= buildings.length) */
   total_penetrating: number;
-  /** 상한 초과로 잘렸는지 */
-  truncated: boolean;
-  /** 침범 건물 (exceed_m 내림차순, 최대 2,000동) */
+  /** 폴리곤 파싱 실패/3점 미만으로 판정 불가 처리된 fac 후보 동수 */
+  skipped_invalid_polygon: number;
+  /** 침범 건물 (exceed_m 내림차순, 전수) */
   buildings: BraBuilding[];
 }

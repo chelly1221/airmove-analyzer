@@ -377,6 +377,8 @@ export default function TrackMap() {
   const meshActive = showTiles3d && !!tiles3dDir;
   /** 실측(1m DSM) 커버리지 bbox [minLat, maxLat, minLon, maxLon] — null = 미조회/실측 데이터 없음 */
   const [meshCoverageBbox, setMeshCoverageBbox] = useState<[number, number, number, number] | null>(null);
+  /** fill-extrusion 동기화 재시도 틱 — 스타일 미로드로 skip 된 경우 styledata 후 1회 재실행용 */
+  const [styleRetryTick, setStyleRetryTick] = useState(0);
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
   const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
   /** 건축물정보 드로어 상태 — 클릭 건물의 로컬 기하 + 대장(로컬 FAC + 온라인 VWorld) 조회 결과 */
@@ -522,8 +524,8 @@ export default function TrackMap() {
   const [braConeOpacity, setBraConeOpacity] = useState(1); // 원추면 채움 불투명도 (기본 1 = 불투명, 슬라이더로 0.05까지 하향)
   /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
   const braReqSeq = useRef(0);
-  /** 마지막 분석에 사용한 원추 반경 (km) — 슬라이더 변경 시 자동 재분석 트리거 비교용 */
-  const braLastRunRadiusRef = useRef<number | null>(null);
+  /** 마지막 분석 요청의 반경|각도 서명 — 파라미터 변경 자동 재분석 비교용 */
+  const braLastRunKeyRef = useRef<string | null>(null);
 
   // 이펙트에서 최신 레이더 제원 참조용 (호버 조회 deps 에 radarSite 를 넣지 않기 위함)
   const radarSiteRef = useRef(radarSite);
@@ -1372,53 +1374,27 @@ export default function TrackMap() {
 
   const buildings3dGeoJSON = useMemo(() => {
     if (!showBuildings || !buildings3dMode || buildings3dData.length === 0) return null;
-    const fc = buildingsToGeoJSON(buildings3dData);
-    // BRA 모드: 피처별 원추면 교차 높이(braCut, 지형면 위 AGL) 주입 — "원추면 위 = 빨강" 분할 레이어용.
-    // 라이브 기준각·사이트(표시 중인 원추와 동일)·실척(EX=1) 프레임이라 cut = coneMsl(d) − 지반AMSL 이 곧
-    // 박스 분할 높이. centroid 단일 거리 근사(원추 기울기 0.25°≈4.4m/km 라 풋프린트 스팬 오차 ≤ 수십 cm).
-    // 원추 표시 반경(braConeRadiusKm) 밖 피처는 미주입 → red 레이어 필터에서 제외.
-    if (braToolActive) {
-      const R_EARTH_M = 6_371_000;
-      const M_PER_DEG_LAT = 111320;
-      const mPerDegLon = M_PER_DEG_LAT * Math.cos((radarSite.latitude * Math.PI) / 180);
-      const apexM = radarSite.altitude + radarSite.antenna_height;
-      const tanT = Math.tan((braAngleDeg * Math.PI) / 180);
-      const maxDm = braConeRadiusKm * 1000;
-      for (const f of fc.features) {
-        const p = f.properties;
-        if (!p) continue;
-        const dx = ((p.lon as number) - radarSite.longitude) * mPerDegLon;
-        const dy = ((p.lat as number) - radarSite.latitude) * M_PER_DEG_LAT;
-        const d = Math.sqrt(dx * dx + dy * dy);
-        if (d > maxDm) continue;
-        const coneMsl = apexM + d * tanT + (d * d) / (2 * R_EARTH_M);
-        p.braCut = Math.max(0, coneMsl - (p.base as number));
-      }
-    }
-    return fc;
-  }, [showBuildings, buildings3dMode, buildings3dData, braToolActive, braAngleDeg, braConeRadiusKm,
-      radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height]);
+    return buildingsToGeoJSON(buildings3dData);
+  }, [showBuildings, buildings3dMode, buildings3dData]);
 
   /** 마지막으로 적용된 fill-extrusion 필터 키 (JSON) — 변경 시에만 setFilter */
   const lastFiltersRef = useRef<string>("");
-  /** 마지막으로 적용된 fill-extrusion-height 표현식 키 (JSON) — 변경 시에만 setPaintProperty */
-  const lastBraHeightExprRef = useRef<string>("");
 
   // MapLibre fill-extrusion 레이어 동기화
   useEffect(() => {
     const map = mapRef.current?.getMap();
-    if (!map || !map.isStyleLoaded()) return;
+    if (!map) return;
+    // 스타일 미로드 순간의 setData/addLayer 유실 방지 — 점진 타일 로딩의 마지막 배치가 skip 되면
+    // 다음 moveend 까지 건물이 누락되므로 styledata 후 1회 재시도
+    if (!map.isStyleLoaded()) {
+      const onStyleData = () => setStyleRetryTick((t) => t + 1);
+      map.once("styledata", onStyleData);
+      return () => { map.off("styledata", onStyleData); };
+    }
 
     const sourceId = "buildings-3d-src";
     const layerId = "buildings-3d-fill";
     const measuredLayerId = "buildings-3d-fill-measured";
-    const redLayerId = "buildings-3d-bra-red";
-    // BRA 모드: 기존 박스는 원추면 높이에서 컷 (braCut 없는 피처는 원 높이 유지)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const heightExpr: any = braToolActive
-      ? ["min", ["get", "height"], ["coalesce", ["get", "braCut"], 999999]]
-      : ["get", "height"];
-    const heightExprKey = JSON.stringify(heightExpr);
     // 메시 대체 대상 건물은 메시 표출 중 레이어 opacity 0 (색 알파가 아닌 layer-level 스칼라)
     const measuredOpacity = meshActive ? 0 : buildingOpacity;
 
@@ -1453,7 +1429,7 @@ export default function TrackMap() {
           paint: {
             "fill-extrusion-color": FILL_COLOR_EXPR,
             // base/height 는 지도면(terrain 시 지형 표면) 위 상대 오프셋 — AMSL 지반고(base 프로퍼티)는 팝업 표시용으로만 유지
-            "fill-extrusion-height": heightExpr,
+            "fill-extrusion-height": ["get", "height"],
             "fill-extrusion-base": 0,
             "fill-extrusion-opacity": buildingOpacity,
           },
@@ -1470,14 +1446,13 @@ export default function TrackMap() {
           paint: {
             "fill-extrusion-color": FILL_COLOR_EXPR,
             // base/height 는 지도면(terrain 시 지형 표면) 위 상대 오프셋 — AMSL 지반고(base 프로퍼티)는 팝업 표시용으로만 유지
-            "fill-extrusion-height": heightExpr,
+            "fill-extrusion-height": ["get", "height"],
             "fill-extrusion-base": 0,
             "fill-extrusion-opacity": measuredOpacity,
           },
         });
-        // 생성 시점 필터/높이 표현식이 곧 최신 — 아래 변경 감지에서 중복 set 을 타지 않도록 기록
+        // 생성 시점 필터가 곧 최신 — 아래 변경 감지에서 중복 set 을 타지 않도록 기록
         lastFiltersRef.current = filterKey;
-        lastBraHeightExprRef.current = heightExprKey;
       }
       // 필터는 변경 시에만 반영 — setFilter 는 레이어 전 피처를 재평가하므로
       // 뷰포트 타일 로드마다(소스 setData) 무조건 호출하면 안 된다.
@@ -1495,37 +1470,6 @@ export default function TrackMap() {
         map.setLayoutProperty(measuredLayerId, "visibility", "visible");
         map.setPaintProperty(measuredLayerId, "fill-extrusion-opacity", measuredOpacity);
       }
-      // 높이 표현식(BRA 컷 ↔ 원 높이)도 변경 시에만 반영 — setPaintProperty 는 전 피처 재평가
-      if (lastBraHeightExprRef.current !== heightExprKey) {
-        lastBraHeightExprRef.current = heightExprKey;
-        if (map.getLayer(layerId)) map.setPaintProperty(layerId, "fill-extrusion-height", heightExpr);
-        if (map.getLayer(measuredLayerId)) map.setPaintProperty(measuredLayerId, "fill-extrusion-height", heightExpr);
-      }
-      // BRA 원추면 위로 솟은 박스 부분 = 빨강 분할 레이어 (목록/결과 상한과 무관한 기하 전수 마킹)
-      if (braToolActive) {
-        if (map.getLayer(redLayerId)) {
-          map.setLayoutProperty(redLayerId, "visibility", "visible");
-          map.setPaintProperty(redLayerId, "fill-extrusion-opacity", buildingOpacity);
-        } else {
-          map.addLayer({
-            id: redLayerId,
-            type: "fill-extrusion",
-            source: sourceId,
-            // braCut 보유(반경 내) + 원추면 위로 솟은 피처만 — hiddenFilter(메시 대체) 미적용:
-            // 메시 표출로 박스가 숨겨진 건물도 원추면 위 부분(red)은 메시 위에 마킹되어야 한다.
-            filter: ["all", ["has", "braCut"], [">", ["get", "height"], ["get", "braCut"]]],
-            paint: {
-              "fill-extrusion-color": "#ef4444",
-              "fill-extrusion-base": ["get", "braCut"],
-              "fill-extrusion-height": ["get", "height"],
-              "fill-extrusion-opacity": buildingOpacity,
-            },
-          });
-        }
-      } else if (map.getLayer(redLayerId)) {
-        // 제거가 아닌 숨김 — 도구 재진입 시 재사용
-        map.setLayoutProperty(redLayerId, "visibility", "none");
-      }
     } else {
       // 3D 모드 아닐 때 레이어 숨김
       if (map.getLayer(layerId)) {
@@ -1534,11 +1478,8 @@ export default function TrackMap() {
       if (map.getLayer(measuredLayerId)) {
         map.setLayoutProperty(measuredLayerId, "visibility", "none");
       }
-      if (map.getLayer(redLayerId)) {
-        map.setLayoutProperty(redLayerId, "visibility", "none");
-      }
     }
-  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive, meshCoverageBbox, braToolActive]);
+  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive, meshCoverageBbox, styleRetryTick]);
 
   // showBuildings=false 시 fill-extrusion 레이어 제거
   useEffect(() => {
@@ -1547,7 +1488,6 @@ export default function TrackMap() {
     if (!map) return;
     if (map.getLayer("buildings-3d-fill")) map.removeLayer("buildings-3d-fill");
     if (map.getLayer("buildings-3d-fill-measured")) map.removeLayer("buildings-3d-fill-measured");
-    if (map.getLayer("buildings-3d-bra-red")) map.removeLayer("buildings-3d-bra-red");
     if (map.getSource("buildings-3d-src")) map.removeSource("buildings-3d-src");
   }, [showBuildings]);
 
@@ -1557,9 +1497,7 @@ export default function TrackMap() {
     const map = mapRef.current?.getMap();
     if (!map) return;
     // 비실측/실측 두 fill-extrusion 레이어를 함께 쿼리 (실측 레이어는 메시 표출 중 opacity 0 이어도 히트테스트 유효)
-    // + BRA red 분할 레이어 — 원추면 위 빨간 부분은 컷된 박스 상단보다 위라 원 레이어 픽에 안 잡힌다.
-    //   피처 속성은 동일 소스라 툴팁/드로어 경로 무수정 호환 (레이어 부재 시 present 필터로 자동 제외)
-    const layerIds = ["buildings-3d-fill", "buildings-3d-fill-measured", "buildings-3d-bra-red"];
+    const layerIds = ["buildings-3d-fill", "buildings-3d-fill-measured"];
 
     const onMouseMove = (e: maplibregl.MapMouseEvent) => {
       const present = layerIds.filter((id) => map.getLayer(id));
@@ -2702,7 +2640,7 @@ export default function TrackMap() {
   // BRA 모드 해제 — 결과 폐기 + 진행 중 요청 무효화 (seq 증가 → 늦게 도착한 응답 무시)
   const teardownBra = useCallback(() => {
     braReqSeq.current += 1;
-    braLastRunRadiusRef.current = null;
+    braLastRunKeyRef.current = null;
     setBraResult(null);
     setBraError(null);
     setBraLoading(false);
@@ -2725,7 +2663,7 @@ export default function TrackMap() {
   //   결과는 폴리곤 포함 수 MB 가능 → bulk:// 파일 매개 수신
   const runBraAnalysis = useCallback(async () => {
     const seq = ++braReqSeq.current;
-    braLastRunRadiusRef.current = braConeRadiusKm;
+    braLastRunKeyRef.current = `${braConeRadiusKm}|${braAngleDeg}`;
     setBraLoading(true);
     setBraError(null);
     try {
@@ -2748,13 +2686,15 @@ export default function TrackMap() {
     }
   }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, braAngleDeg, braConeRadiusKm]);
 
-  // 원추 반경 슬라이더 변경 → 결과가 있으면 자동 재분석 (디바운스). 반경=분석 범위이므로 결과·표시 정합 유지.
+  // 원추 반경·기준각 변경 → 이미 한 번 실행한 뒤라면 자동 재분석 (디바운스).
+  //   반경=분석 범위, 각도=판정 기준면이므로 둘 다 결과·표시 정합에 직결된다.
+  //   실패해도 ref 에 실패한 키가 남아 동일 파라미터 재시도 루프는 발생하지 않고, 파라미터가 바뀌면 1회 재시도된다.
   useEffect(() => {
-    if (!braResult) return;
-    if (braLastRunRadiusRef.current === braConeRadiusKm) return;
+    if (!braResult && !braError) return; // 최초 실행 전에는 자동 실행 금지
+    if (braLastRunKeyRef.current === `${braConeRadiusKm}|${braAngleDeg}`) return;
     const t = setTimeout(() => { void runBraAnalysis(); }, 400);
     return () => clearTimeout(t);
-  }, [braConeRadiusKm, braResult, runBraAnalysis]);
+  }, [braConeRadiusKm, braAngleDeg, braResult, braError, runBraAnalysis]);
 
   // 3D 입체 허용 토글 ↔ 현재 줌에 맞춰 buildings3dMode 재조정
   useEffect(() => {
@@ -3678,6 +3618,9 @@ export default function TrackMap() {
   //      · 실측 3D 메시 타일은 부분 재색칠이 불가(셰이더 주입 필요)해 프리즘이 그 위에 덮이는 데 그친다.
   //      · 프리즘은 pickable — 클릭 시 우측 건축물정보 드로어, 호버 시 간단 툴팁(BRA 초과·여유 행 포함).
   //        (BRA 는 원추 전체를 보려 줌아웃한 상태라 fill-extrusion 건물 레이어가 비어 클릭 대상이 없다)
+  //      · Rust 결과(braResult.buildings)가 상한 없는 전수라 이 프리즘이 "원추면 위 = 빨강" 마킹의 단일 경로다.
+  //        (구 maplibre fill-extrusion red 분할 레이어는 줌 14 게이트·로더 높이필터·deck 원추 가림으로
+  //         누락이 커 제거 — 전수 마킹은 뷰포트 타일이 아닌 분석 결과가 책임진다)
   //   레이어 push 순서는 [프리즘 → 원추면 → 림]: 불투명 프리즘이 depth 를 먼저 기록해야 depth 미기록
   //   반투명 원추면이 프리즘 뒤에서는 가려지고 앞에서는 위에 블렌드된다.
   const braDeckLayers = useMemo(() => {
@@ -4875,8 +4818,8 @@ export default function TrackMap() {
                     <> · 최대 초과 <span style={{ ...num, color: "#ef4444" }}>{list[0].exceed_m.toFixed(1)}m</span></>
                   )}
                 </div>
-                {braResult.truncated && (
-                  <div style={{ fontSize: 9, color: G[400], marginTop: 3 }}>상위 2,000동 표시</div>
+                {braResult.skipped_invalid_polygon > 0 && (
+                  <div style={{ fontSize: 9, color: G[400], marginTop: 3 }}>폴리곤 불량 {braResult.skipped_invalid_polygon.toLocaleString()}동 판정 제외</div>
                 )}
               </div>
             </div>
@@ -4919,9 +4862,15 @@ export default function TrackMap() {
                   </div>
                 ))}
                 {list.length > MAX_ROWS && (
-                  <div style={{ padding: "6px 5px", fontSize: 9.5, color: G[400], textAlign: "center" }}>
-                    …외 {(list.length - MAX_ROWS).toLocaleString()}동
-                  </div>
+                  <>
+                    <div style={{ padding: "6px 5px", fontSize: 9.5, color: G[400], textAlign: "center" }}>
+                      …외 {(list.length - MAX_ROWS).toLocaleString()}동
+                    </div>
+                    {/* 목록만 상한 — 지도 프리즘 마킹은 전수(Rust 결과 전체) */}
+                    <div style={{ fontSize: 9, color: G[400], padding: "4px 5px" }}>
+                      상위 {MAX_ROWS}동 표시 — 지도 마킹은 전체 {list.length.toLocaleString()}동
+                    </div>
+                  </>
                 )}
               </div>
             )}

@@ -22,10 +22,8 @@ use crate::srtm::SrtmReader;
 const MAX_BUILDING_HEIGHT_M: f64 = 650.0;
 /// 국내 지붕고 해발 상한 (m) — 최대 지반(~1,950m) + 건물 상한 650m. 스캔 반경 해석적 상한 산출용.
 const MAX_ROOF_MSL_M: f64 = 2_600.0;
-/// 결과 상한 (동) — 초과 시 exceed_m 내림차순 상위만 반환
-const MAX_RESULTS: usize = 2000;
-/// centroid 기준 사전 컷 슬랙 (m) — 대형 풋프린트(정점이 centroid 보다 최대 수백 m 앞) 대비
-const FOOTPRINT_SLACK_M: f64 = 500.0;
+/// centroid 기준 사전 컷 슬랙 (m) — 대형 풋프린트(정점이 centroid 보다 최대 ~1km 앞) 대비
+const FOOTPRINT_SLACK_M: f64 = 1000.0;
 /// Pass 2 폴리곤 조회 배치 크기 (id IN (...))
 const POLY_BATCH: usize = 500;
 
@@ -40,11 +38,11 @@ pub struct BraResult {
     pub max_range_km: f64,
     /// 검사한 건물 수 (fac + manual)
     pub scanned: u64,
-    /// 침범 총수 (truncate 전)
+    /// 침범 총수 (= buildings.len())
     pub total_penetrating: u64,
-    /// 상한(MAX_RESULTS) 초과로 잘렸는지
-    pub truncated: bool,
-    /// 침범 건물 (exceed_m 내림차순, 최대 MAX_RESULTS)
+    /// 폴리곤 파싱 실패/3점 미만으로 판정 불가 처리된 fac 후보 동수
+    pub skipped_invalid_polygon: u64,
+    /// 침범 건물 (exceed_m 내림차순, 전수)
     pub buildings: Vec<BraBuilding>,
 }
 
@@ -65,7 +63,7 @@ pub struct BraBuilding {
     pub lat: f64,
     /// centroid 경도
     pub lon: f64,
-    /// 판정 지점(레이더 최근접 정점)까지 지표 거리 (km)
+    /// 판정 지점(레이더 최근접 경계점)까지 지표 거리 (km)
     pub distance_km: f64,
     /// centroid 방위 (°, 정북=0, 시계방향)
     pub azimuth_deg: f64,
@@ -123,7 +121,7 @@ struct FacCandidate {
 /// BRA 침범 검사 본체
 ///
 /// 2-pass 구성: Pass 1 은 centroid + 높이만 읽어 원추면 여유로 후보를 좁히고(폴리곤 JSON 미파싱),
-/// Pass 2 에서 후보 id 배치로 폴리곤/속성을 읽어 정점 최근접 거리로 확정 판정한다.
+/// Pass 2 에서 후보 id 배치로 폴리곤/속성을 읽어 경계 최근접 거리로 확정 판정한다.
 /// (단일 pass 로 폴리곤까지 읽으면 수십만 동 JSON 파싱이 지배적 — building.rs:539 주석과 동일한 함정)
 pub fn analyze_penetration(
     srtm: &mut SrtmReader,
@@ -136,6 +134,7 @@ pub fn analyze_penetration(
 ) -> Result<BraResult, String> {
     let tan_theta = angle_deg.to_radians().tan();
     let mut scanned: u64 = 0;
+    let mut skipped_invalid_polygon: u64 = 0;
     let mut hits: Vec<BraBuilding> = Vec::new();
 
     // 스캔 반경 = 제원 범위와 해석적 상한 중 작은 쪽
@@ -147,7 +146,7 @@ pub fn analyze_penetration(
             max_range_km: d_max / 1000.0,
             scanned: 0,
             total_penetrating: 0,
-            truncated: false,
+            skipped_invalid_polygon: 0,
             buildings: Vec::new(),
         });
     }
@@ -227,7 +226,7 @@ pub fn analyze_penetration(
         }
     }
 
-    // ── Pass 2: 후보 폴리곤/속성 배치 조회 → 최근접 정점으로 확정 판정 ──
+    // ── Pass 2: 후보 폴리곤/속성 배치 조회 → 최근접 경계점으로 확정 판정 ──
     for chunk in candidates.chunks(POLY_BATCH) {
         // id 는 DB 에서 읽은 i64 — 문자열 결합 안전 (panorama.rs 의 exclude_manual_ids 관례와 동일)
         let id_list: Vec<String> = chunk.iter().map(|c| c.id.to_string()).collect();
@@ -262,7 +261,10 @@ pub fn analyze_penetration(
                 .and_then(|s| serde_json::from_str::<Vec<[f64; 2]>>(s).ok())
             {
                 Some(p) if p.len() >= 3 => p,
-                _ => continue,
+                _ => {
+                    skipped_invalid_polygon += 1;
+                    continue;
+                }
             };
 
             if let Some(b) = judge(
@@ -347,18 +349,18 @@ pub fn analyze_penetration(
         }
     }
 
-    // 초과량 내림차순 — 상위 MAX_RESULTS 만 반환
+    // 초과량 내림차순 — 상한 없이 전수 반환 (지도 프리즘 마킹이 목록 상한에 잘리면 안 된다)
     hits.sort_by(|a, b| b.exceed_m.partial_cmp(&a.exceed_m).unwrap_or(std::cmp::Ordering::Equal));
     let total_penetrating = hits.len() as u64;
-    let truncated = hits.len() > MAX_RESULTS;
-    if truncated {
-        hits.truncate(MAX_RESULTS);
-    }
 
     log::info!(
         "[BRA] 기준각 {:.2}° · 안테나 {:.1}m AMSL · 반경 {:.1}km — 검사 {}동, 침범 {}동{}",
         angle_deg, radar_height_m, d_max / 1000.0, scanned, total_penetrating,
-        if truncated { format!(" (상위 {}동 반환)", MAX_RESULTS) } else { String::new() },
+        if skipped_invalid_polygon > 0 {
+            format!(" (폴리곤 불량 {}동 제외)", skipped_invalid_polygon)
+        } else {
+            String::new()
+        },
     );
 
     Ok(BraResult {
@@ -367,14 +369,14 @@ pub fn analyze_penetration(
         max_range_km: d_max / 1000.0,
         scanned,
         total_penetrating,
-        truncated,
+        skipped_invalid_polygon,
         buildings: hits,
     })
 }
 
-/// 확정 판정 — 폴리곤 정점 중 레이더 최근접 지점에서 원추면을 넘는지.
-/// 원추면은 d 에 대해 단조증가이므로 최근접 정점에서 초과량이 최대다.
-/// 최근접 정점이 스캔 반경(d_max) 밖이면 제외 — fac 은 centroid 사전컷 슬랙(FOOTPRINT_SLACK_M),
+/// 확정 판정 — 폴리곤 경계(변 위 최근접점 포함) 중 레이더 최근접 지점에서 원추면을 넘는지.
+/// 원추면은 d 에 대해 단조증가이므로 최근접 경계점에서 초과량이 최대다.
+/// 최근접 경계점이 스캔 반경(d_max) 밖이면 제외 — fac 은 centroid 사전컷 슬랙(FOOTPRINT_SLACK_M),
 /// 수동 건물은 bbox 코너까지 반경 밖으로 넘칠 수 있어 여기서 최종 컷한다.
 #[allow(clippy::too_many_arguments)]
 fn judge(
@@ -396,9 +398,30 @@ fn judge(
     height_m: f64,
     polygon: Vec<[f64; 2]>,
 ) -> Option<BraBuilding> {
-    let mut d_min = f64::INFINITY;
+    // 정점을 레이더 원점 ENU (east, north) 로 1회 변환 — enu_dist_m 과 동일 스케일
+    let n = polygon.len();
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(n);
     for p in &polygon {
-        let d = enu_dist_m(cos_lat, radar_lat, radar_lon, p[0], p[1]);
+        let east = (p[1] - radar_lon).to_radians() * EARTH_RADIUS_M * cos_lat;
+        let north = (p[0] - radar_lat).to_radians() * EARTH_RADIUS_M;
+        pts.push((east, north));
+    }
+    // 변(i, i+1) 마다 원점→선분 최근접점 거리를 구해 최소값 — 정점 전용 최소는 긴 변의 중간이
+    // 레이더 쪽으로 더 가까운 대형 풋프린트에서 거리를 과대평가(= 침범 누락)한다.
+    let mut d_min = f64::INFINITY;
+    for i in 0..n {
+        let (ax, ay) = pts[i];
+        let (bx, by) = pts[(i + 1) % n];
+        let (ex, ey) = (bx - ax, by - ay);
+        let len2 = ex * ex + ey * ey;
+        // 퇴화(선분 길이 0)면 t=0 → 정점 거리로 폴백
+        let t = if len2 > 0.0 {
+            (-(ax * ex + ay * ey) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (qx, qy) = (ax + ex * t, ay + ey * t);
+        let d = (qx * qx + qy * qy).sqrt();
         if d < d_min {
             d_min = d;
         }
@@ -407,7 +430,7 @@ fn judge(
         return None;
     }
     if d_min > d_max {
-        return None; // 최근접 정점이 스캔 반경 밖 — 원추 표시 반경과 결과 정합 유지
+        return None; // 최근접 경계점이 스캔 반경 밖 — 원추 표시 반경과 결과 정합 유지
     }
     let total_height_m = ground_elev_m + height_m;
     let cone = cone_msl(radar_height_m, tan_theta, d_min);
