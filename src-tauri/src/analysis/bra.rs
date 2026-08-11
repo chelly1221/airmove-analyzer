@@ -11,6 +11,11 @@
 //!
 //! 건물 지붕 해발고는 `centroid 라이브 SRTM + COALESCE(height_measured, height)`.
 //! `fac_buildings.ground_elev` 캐시 컬럼은 백필 안 된 행이 많아 사용 금지(building.rs:593 주석 참조).
+//!
+//! **실측 우선 중복 제거**: 실측(1m DSM) 행의 **실제 풋프린트 폴리곤**에 자기 풋프린트가
+//! MEASURED_COVER_RATIO 이상 덮이는 비실측 대장 행은 같은 건물의 중복으로 보고 판정에서
+//! 제외한다(`building::MeasuredOverlapIndex::covers_footprint` — bbox 는 프리필터로만 사용) —
+//! 실측3D 행과 대장 행이 같은 자리에 겹쳐 프리즘이 이중 렌더되는 것을 막는다. 수동 등록 건물은 대상 아님.
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -135,6 +140,8 @@ pub fn analyze_penetration(
     let tan_theta = angle_deg.to_radians().tan();
     let mut scanned: u64 = 0;
     let mut skipped_invalid_polygon: u64 = 0;
+    // 실측 행에 덮여 중복으로 제외한 대장 행 수 (로그 전용 — BraResult 미노출)
+    let mut excluded_ledger_overlap: u64 = 0;
     let mut hits: Vec<BraBuilding> = Vec::new();
 
     // 스캔 반경 = 제원 범위와 해석적 상한 중 작은 쪽
@@ -171,6 +178,12 @@ pub fn analyze_penetration(
     // 레이더 자체 건물(레이더가 올라앉은 구조물) — 안테나 발밑이라 원추면 시작점을 항상 뚫는다.
     // BRA 침범 목록에 자기 자신이 오르는 것을 막는다.
     let own_ids = crate::building::radar_own_building_ids(conn, radar_lat, radar_lon);
+
+    // 실측 우선 중복 제거용 겹침 인덱스 — 스캔 bbox 범위로 1회 적재.
+    // 제외 판정은 실제 풋프린트가 필요해 Pass 2(폴리곤 보유 시점)에서 수행 — 카운터는
+    // 원추면 사전컷 통과 후보 기준.
+    let mut overlap_idx =
+        crate::building::MeasuredOverlapIndex::load(conn, min_lat, max_lat, min_lon, max_lon);
 
     // ── Pass 1: 건물통합정보(fac) 후보 좁히기 — 폴리곤 JSON 미포함 ──
     let mut candidates: Vec<FacCandidate> = Vec::new();
@@ -267,6 +280,17 @@ pub fn analyze_penetration(
                 }
             };
 
+            // 실측 우선 — 실제 풋프린트가 실측 풋프린트에 상당 부분 덮이는 비실측 대장 행은
+            // 같은 건물 중복으로 보고 제외 (실측3D 행이 같은 자리를 대표. BRA 프리즘 이중 렌더 방지).
+            // 풋프린트가 필요한 판정이라 Pass 1 이 아닌 여기(폴리곤 보유 시점)에서 수행한다.
+            if !cand.measured
+                && !overlap_idx.is_empty()
+                && overlap_idx.covers_footprint(conn, &polygon)
+            {
+                excluded_ledger_overlap += 1;
+                continue;
+            }
+
             if let Some(b) = judge(
                 cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max,
                 id, "fac", cand.measured, name, address, usage,
@@ -354,10 +378,15 @@ pub fn analyze_penetration(
     let total_penetrating = hits.len() as u64;
 
     log::info!(
-        "[BRA] 기준각 {:.2}° · 안테나 {:.1}m AMSL · 반경 {:.1}km — 검사 {}동, 침범 {}동{}",
+        "[BRA] 기준각 {:.2}° · 안테나 {:.1}m AMSL · 반경 {:.1}km — 검사 {}동, 침범 {}동{}{}",
         angle_deg, radar_height_m, d_max / 1000.0, scanned, total_penetrating,
         if skipped_invalid_polygon > 0 {
             format!(" (폴리곤 불량 {}동 제외)", skipped_invalid_polygon)
+        } else {
+            String::new()
+        },
+        if excluded_ledger_overlap > 0 {
+            format!(" · 실측중복 제외 {}동", excluded_ledger_overlap)
         } else {
             String::new()
         },

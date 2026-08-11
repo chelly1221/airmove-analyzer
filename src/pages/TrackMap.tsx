@@ -103,6 +103,7 @@ import { GPU2D, type RectData } from "../utils/gpu2d";
 import { addPlanOverlay, removePlanOverlay, updatePlanOpacity, updatePlanBounds, rotateBounds } from "../utils/planOverlay";
 import { fetchBuildingsForViewport, invalidateBuildingCache, buildingsToGeoJSON } from "../utils/buildingTileCache";
 import { detectionTypeColor, radarTypeLabel, MAP_STYLE_URL } from "../utils/radarConstants";
+import BraPrismLayer from "../utils/braPrismLayer";
 import AddressSearch, { AddressMarker } from "../components/Map/AddressSearch";
 import PlaybackControls from "../components/Map/PlaybackControls";
 import CoveragePanel from "../components/Map/CoveragePanel";
@@ -3606,12 +3607,21 @@ export default function TrackMap() {
   //   z 규약은 원추면·CoS 원추·LoS 커튼과 동일하게 전부 AMSL 미터 × EX (지형 메시 과장 배율 공유, 현재 1=실척).
   //   원추면 해발고는 Rust analysis/bra.rs cone_msl · LoSProfilePanel braAMSL 과 동일한
   //   실제지구 기하 직선: coneMsl(d) = h_ant + d·tanθ + d²/(2R) (4/3 굴절 미적용).
-  //   ② 침범 건물은 바닥(지반 AMSL)~지붕(지붕 AMSL)을 한 덩어리 3D 프리즘으로 그리되 정점별 원추면
-  //      해발고에서 상·하로 갈라 아래는 일반 건물 회색 · 위(초과부)는 불투명 빨강 → 빨강 하단 경계가
-  //      렌더된 원추면과 기하적으로 정확히 일치한다. (구 설계는 붉은 반투명 밴드를 maplibre
+  //   ② 침범 건물은 바닥(지반 AMSL)~지붕(지붕 AMSL)을 한 덩어리 3D 프리즘으로 그리되, 아래는 일반
+  //      건물 회색 · 위(초과부)는 불투명 빨강으로 갈라 빨강 하단 경계가 렌더된 원추면과 기하적으로
+  //      정확히 일치한다. 분할은 BraPrismLayer 의 **픽셀(프래그먼트) 단위 셰이더 판정**이 수행한다
+  //      (구 설계는 붉은 반투명 밴드를 maplibre
   //      fill-extrusion 프레임 = 지형만 과장·건물 높이 비과장 인 '보이는 건물 상단'에 앵커해 두께를
   //      초과량으로 잡았는데, 원추면은 AMSL×EX 프레임이라 지형 과장 시 두 프레임이 어긋나 밴드가
   //      원추 아래에 떠 보였다 — 프레임 통일로 해소.)
+  //      · 분할이 픽셀 단위인 이유: 구 구현은 정점마다 원추면 z 를 구해 벽을 상·하 두 쿼드로
+  //        잘랐는데, 레이더에 접선 방향인 긴 벽은 **벽 중간이 양끝 정점보다 레이더에 가까워 원추면이
+  //        중간에서 더 낮게** 지나간다. 정점 보간으로는 이 처짐을 못 그려 실제로는 벽 중앙부가 원추를
+  //        뚫는데도 벽 전체가 회색이 됐다(실측3D 행은 폴리곤이 bbox 사각형 4정점뿐이라 증상 극대).
+  //        지붕 캡도 최근접 정점 기준 통째 빨강이라 과대 마킹이었다. 이제 벽/지붕을 통짜 면으로 넘기고
+  //        프래그먼트에서 그 픽셀의 실제 (lng,lat,z) 로 원추면 높이를 재계산 → "원추면 위 = 빨강"이
+  //        모든 픽셀에서 성립하고 지붕도 원추 위 부분만 빨강이 된다. 셰이더가 쓰는 수식·스냅샷이
+  //        ①의 원추면 메시와 동일해 "빨강 하단 경계 = 렌더된 원추면" 계약도 그대로 유지된다.
   //      · EX=1(실척)이면 maplibre fill-extrusion 건물(줌 14+)과도 프레임이 일치 — 같은 건물의 박스와
   //        프리즘이 정확히 겹치고, deck 오버레이(overlaid)가 항상 지도 위에 그려져 불투명 프리즘이 박스를
   //        시각적으로 대체한다. (EX>1 이면 프리즘이 박스보다 EX 배 커져 박스를 내포)
@@ -3675,10 +3685,9 @@ export default function TrackMap() {
       // 판정에 쓰인 값(결과 스냅샷)으로 원추면 재구성 — 입력 슬라이더를 이후 조정해도 오버레이는 결과와 정합
       const hRes = braResult.radar_height_m;
       const tanRes = Math.tan((braResult.angle_deg * Math.PI) / 180);
-      const GRAY: [number, number, number, number] = [229, 231, 235, 255]; // 일반 fac 건물 fill 과 동일 회색
-      const RED: [number, number, number, number] = [239, 68, 68, 255];    // 원추면 위 초과부
-      // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함
-      const faces: { polygon: [number, number, number][]; b: BraBuilding; color: [number, number, number, number] }[] = [];
+      // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함.
+      // 색은 면에 싣지 않는다 — 상/하 분할은 BraPrismLayer 가 프래그먼트 단위로 수행한다.
+      const faces: { polygon: [number, number, number][]; b: BraBuilding }[] = [];
       for (const b of braResult.buildings) {
         const poly = b.polygon;
         if (!poly || poly.length < 3) continue;
@@ -3688,63 +3697,51 @@ export default function TrackMap() {
         const zRoof = b.total_height_m * EX;
         const n = poly.length;
         const lonlat: [number, number][] = new Array(n);
-        const zCut: number[] = new Array(n); // 정점별 원추면 z (바닥~지붕으로 클램프)
         for (let i = 0; i < n; i++) {
           const [la, lo] = poly[i];
           lonlat[i] = [lo, la];
-          const dx = (lo - radarSite.longitude) * mPerDegLon;
-          const dy = (la - radarSite.latitude) * M_PER_DEG_LAT;
-          const dv = Math.sqrt(dx * dx + dy * dy);
-          const coneAmsl = coneMsl(dv, hRes, tanRes);
-          const cutAmsl = Math.max(b.ground_elev_m, Math.min(coneAmsl, b.total_height_m));
-          zCut[i] = cutAmsl * EX;
         }
-        // 측벽 — 하부(바닥→원추면, 회색) · 상부(원추면→지붕, 빨강). 양끝 두께가 모두 0 에 가까운 변은 생략
+        // 측벽 — 바닥→지붕 통짜 쿼드 (셰이더가 픽셀별로 회색/빨강 결정)
         for (let i = 0; i < n; i++) {
           const j = (i + 1) % n;
-          if (zCut[i] - zBase > 0.01 || zCut[j] - zBase > 0.01) {
-            faces.push({
-              polygon: [
-                [lonlat[i][0], lonlat[i][1], zBase],
-                [lonlat[j][0], lonlat[j][1], zBase],
-                [lonlat[j][0], lonlat[j][1], zCut[j]],
-                [lonlat[i][0], lonlat[i][1], zCut[i]],
-              ],
-              b,
-              color: GRAY,
-            });
-          }
-          if (zRoof - zCut[i] > 0.01 || zRoof - zCut[j] > 0.01) {
-            faces.push({
-              polygon: [
-                [lonlat[i][0], lonlat[i][1], zCut[i]],
-                [lonlat[j][0], lonlat[j][1], zCut[j]],
-                [lonlat[j][0], lonlat[j][1], zRoof],
-                [lonlat[i][0], lonlat[i][1], zRoof],
-              ],
-              b,
-              color: RED,
-            });
-          }
+          faces.push({
+            polygon: [
+              [lonlat[i][0], lonlat[i][1], zBase],
+              [lonlat[j][0], lonlat[j][1], zBase],
+              [lonlat[j][0], lonlat[j][1], zRoof],
+              [lonlat[i][0], lonlat[i][1], zRoof],
+            ],
+            b,
+          });
         }
-        // 지붕 캡 — 초과(exceed>0) 판정 건물이라 최근접 정점 기준 지붕은 항상 원추 위 → 빨강.
-        // 풋프린트 일부만 침범하는 경계 건물은 반대편 지붕까지 빨갛게 되어 다소 과대 표시되나,
-        // 원추 기울기(0.25° ≈ 4.4m/km)에 비해 풋프린트 스팬이 작아 오차는 무시 가능.
+        // 지붕 캡 — 원추면 위로 나온 부분만 셰이더가 빨강으로 칠한다(구 구현의 통째 빨강 과대 마킹 해소).
+        // 바닥 캡은 불필요 — 바닥은 항상 원추 아래(회색)이고 측벽이 하부를 감싸 아래에서 봐도 뚫려 보이지 않는다.
         const cap: [number, number, number][] = new Array(n);
         for (let i = 0; i < n; i++) cap[i] = [lonlat[i][0], lonlat[i][1], zRoof];
-        faces.push({ polygon: cap, b, color: RED });
+        faces.push({ polygon: cap, b });
       }
       if (faces.length > 0) {
         layers.push(
-          new SolidPolygonLayer<{ polygon: [number, number, number][]; b: BraBuilding; color: [number, number, number, number] }>({
+          new BraPrismLayer<{ polygon: [number, number, number][]; b: BraBuilding }>({
             id: "bra-penetration",
             data: faces,
             getPolygon: (d) => d.polygon,
-            getFillColor: (d) => d.color,
+            // 백색 = 셰이더의 조명 계수 캐리어 — FS 에서 실제 색(빨강/회색)을 여기에 곱한다
+            getFillColor: [255, 255, 255, 255],
+            // 원추면 재구성 파라미터 — ①의 원추면 메시와 **동일 값·동일 평면근사**라 렌더 원추와 픽셀 정합.
+            // 판정에 쓰인 결과 스냅샷(hRes/tanRes)만 사용 — 라이브 슬라이더 값 금지.
+            radarLng: radarSite.longitude,
+            radarLat: radarSite.latitude,
+            mPerDegLat: M_PER_DEG_LAT,
+            mPerDegLon,
+            apexM: hRes,
+            tanTheta: tanRes,
+            ex: EX,
             filled: true,
             extruded: false,
             _full3d: true,
-            // material 지정 없음 = deck 기본 조명 — 벽면 음영으로 입체감 (원추면은 플랫 유지)
+            // material 기본값(true) 유지 — 단 solid-polygon VS 는 extruded 분기에서만 조명을 계산하므로
+            // 현 설정(extruded:false)에선 vColor 가 흰색 그대로 FS 에 도달, 곱셈 결과 = 정확한 빨강/회색.
             pickable: true,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             onClick: (info: any) => {

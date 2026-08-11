@@ -3,6 +3,7 @@
 //! LoS 경로 상의 건물을 조회하여 높이 정보를 반환하고,
 //! 수동 등록 건물 및 건물 그룹 CRUD를 제공.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as IoRead, Seek};
 use std::path::Path;
 
@@ -605,6 +606,266 @@ pub fn radar_own_building_ids(conn: &Connection, radar_lat: f64, radar_lon: f64)
     ids
 }
 
+// ─── 실측 우선 중복 제거 (실측 bbox 겹침 인덱스) ─────────────────
+//
+// fac_buildings 에는 ① 대장(GIS) 행과 ② 실측 1m DSM 임포트 행이 공존한다.
+// 임포트(measured_building.rs::import_from_bin)는 실측 건물별 bbox 최대교차 후보 1건만 매칭하고
+// 미매칭 블롭은 region='실측3D' 신규 행으로 INSERT 하므로, 매칭 실패 구역에서는 실측3D 행과
+// 비실측 대장 행이 같은 자리에 겹친다. 이 겹침을 그대로 두면 BRA 프리즘·3D fill-extrusion 박스가
+// 이중 렌더되고 불투명 입체끼리 서로 가려 "빨강 일부 방위 누락" 증상이 된다.
+
+/// 실측 우선 중복 제거 임계 — 비실측(대장) 행의 **실제 폴리곤 풋프린트** 면적이 실측 행
+/// 풋프린트들에 이 비율 이상 덮이면 같은 건물의 중복으로 보고 표시/판정에서 제외.
+/// 면적비는 후보 풋프린트 내부 격자 샘플점의 피복 비율로 근사한다(`covers_footprint`).
+/// 3% = 매우 공격적(사용자 지시 "무조건 실측 우선") — 실측 풋프린트와 가장자리만 겹치는 인접
+/// 대장 건물도 제외될 수 있음을 감수하고, 실측 커버 구역의 대장 중복을 사실상 전부 걷어낸다.
+pub const MEASURED_COVER_RATIO: f64 = 0.03;
+
+/// 겹침 인덱스 셀 크기 (deg) — measured_building.rs 의 후보 버킷(CELL_DEG)과 동일 규약. 약 111m × 88m
+const OVERLAP_CELL_DEG: f64 = 0.001;
+
+/// bbox 가 걸치는 셀 축당 최대 개수 (비정상 bbox 방어) — measured_building.rs MAX_CELL_SPAN 과 동일
+const OVERLAP_MAX_CELL_SPAN: i32 = 256;
+
+/// 풋프린트 피복률 격자 샘플 축당 점 수 (24×24 = 576점)
+const OVERLAP_SAMPLE_N: i32 = 24;
+
+/// 실측 폴리곤 lazy 로드 배치 크기 (id IN (...)) — analysis/bra.rs POLY_BATCH 관례와 동일
+const OVERLAP_POLY_BATCH: usize = 500;
+
+/// 좌표 → 겹침 인덱스 셀 (measured_building.rs::cell_of 와 동일 식)
+#[inline]
+fn overlap_cell_of(lat: f64, lon: f64) -> (i32, i32) {
+    (
+        (lat / OVERLAP_CELL_DEG).floor() as i32,
+        (lon / OVERLAP_CELL_DEG).floor() as i32,
+    )
+}
+
+/// 조회 영역 내 실측 행 bbox 를 0.001° 셀 버킷에 적재한 겹침 판정 인덱스.
+/// measured_building.rs 의 후보 버킷(CELL_DEG=0.001, MAX_CELL_SPAN=256)과 동일 규약.
+/// bbox 는 **1차 프리필터 전용**이고, 확정 판정은 실제 폴리곤 풋프린트로 한다(`covers_footprint`).
+pub struct MeasuredOverlapIndex {
+    /// 셀 → 그 셀을 걸치는 실측 행 (id, bbox[min_lat, max_lat, min_lon, max_lon]) 목록
+    buckets: HashMap<(i32, i32), Vec<(i64, [f64; 4])>>,
+    /// 실측 행 id → 풋프린트 링 (lon, lat). 파싱 실패/3점 미만은 None 을 캐시해 재조회를 막는다.
+    /// 프리필터에 걸린 행만 lazy 로드하므로 뷰포트 전체 폴리곤을 읽지 않는다.
+    poly_cache: HashMap<i64, Option<Vec<(f64, f64)>>>,
+}
+
+impl MeasuredOverlapIndex {
+    /// 주어진 bbox 와 겹치는 실측 행을 읽어 셀 버킷을 구성.
+    /// 준비/실행 실패는 로그만 남기고 빈 인덱스 반환(제외 없음, fail-open — 치명 아님).
+    pub fn load(conn: &Connection, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> Self {
+        let mut buckets: HashMap<(i32, i32), Vec<(i64, [f64; 4])>> = HashMap::new();
+        let poly_cache: HashMap<i64, Option<Vec<(f64, f64)>>> = HashMap::new();
+
+        // WHERE 절의 실측 술어 텍스트는 db.rs 의 파셜 인덱스 idx_fac_buildings_measured_bbox
+        // predicate 와 동일해야 플래너가 그 인덱스를 선택한다(db.rs:268 주석의 기존 계약) — 문구 변경 금지.
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon
+             FROM fac_buildings
+             WHERE (height_measured IS NOT NULL OR region='실측3D')
+               AND bbox_max_lat >= ?1 AND bbox_min_lat <= ?2
+               AND bbox_max_lon >= ?3 AND bbox_min_lon <= ?4",
+        ) else {
+            log::warn!("[실측중복] 겹침 인덱스 쿼리 준비 실패 — 중복 제거 생략");
+            return Self { buckets, poly_cache };
+        };
+
+        let Ok(rows) = stmt.query_map(params![min_lat, max_lat, min_lon, max_lon], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<f64>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
+        }) else {
+            log::warn!("[실측중복] 겹침 인덱스 쿼리 실행 실패 — 중복 제거 생략");
+            return Self { buckets, poly_cache };
+        };
+
+        let mut loaded = 0usize;
+        for row in rows.flatten() {
+            // bbox 미기입(NULL) 행은 프리필터 근거가 없어 스킵
+            let (id, Some(b_min_lat), Some(b_max_lat), Some(b_min_lon), Some(b_max_lon)) = row
+            else {
+                continue;
+            };
+            if !(b_min_lat.is_finite()
+                && b_max_lat.is_finite()
+                && b_min_lon.is_finite()
+                && b_max_lon.is_finite())
+                || b_max_lat < b_min_lat
+                || b_max_lon < b_min_lon
+            {
+                continue;
+            }
+
+            let (r0, c0) = overlap_cell_of(b_min_lat, b_min_lon);
+            let (r1, c1) = overlap_cell_of(b_max_lat, b_max_lon);
+            // 축당 셀 수가 과대한 비정상 bbox 는 스킵 (임포트 모듈과 동일 방어)
+            if r1 - r0 > OVERLAP_MAX_CELL_SPAN || c1 - c0 > OVERLAP_MAX_CELL_SPAN {
+                continue;
+            }
+
+            let bbox = [b_min_lat, b_max_lat, b_min_lon, b_max_lon];
+            for r in r0..=r1 {
+                for cc in c0..=c1 {
+                    buckets.entry((r, cc)).or_default().push((id, bbox));
+                }
+            }
+            loaded += 1;
+        }
+
+        log::debug!("[실측중복] 실측 bbox {}동 / 버킷 {}셀", loaded, buckets.len());
+        Self { buckets, poly_cache }
+    }
+
+    /// 인덱스가 비었는지 (호출부 단락용 — 실측 임포트 전 DB 면 판정 호출 자체를 생략)
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// 후보의 실제 풋프린트가 실측 풋프린트들에 MEASURED_COVER_RATIO 이상 덮이는지.
+    /// polygon 은 DB 관례 [[lat, lon], ...]. 1차 bbox 프리필터 → 걸린 실측 행만 폴리곤 lazy
+    /// 로드(batch) → 후보 폴리곤 내부 격자 샘플점의 피복 비율로 판정.
+    ///
+    /// bbox 는 축 정렬 최소 직사각형이라 대각선/L자형 건물에서는 실제 풋프린트보다 훨씬 크다.
+    /// bbox 만으로 판정하면 실제로는 닿지도 않는 인접 건물이 '유령 겹침'으로 오제외되므로,
+    /// bbox 는 저비용 프리필터로만 쓰고 확정은 폴리곤 내부점으로 한다.
+    ///
+    /// 24×24=576 샘플이라 3% 임계 판정은 내부점 수 분의 수 샘플 수준의 몬테카를로 근사다
+    /// (경계 근처 비율은 흔들릴 수 있음). 핵심 개선은 유령 bbox 겹침(실제 풋프린트 비접촉)이
+    /// 0% 로 정확히 걸러진다는 점.
+    /// 실측3D 행은 원천(1m DSM 임포트)이 bbox 사각형 폴리곤이라 그 사각형이 곧 풋프린트다
+    /// — 데이터 한계이지 판정의 부정확이 아니다.
+    pub fn covers_footprint(&mut self, conn: &Connection, polygon: &[[f64; 2]]) -> bool {
+        if polygon.len() < 3 {
+            return false;
+        }
+
+        // ① 후보 bbox 산출 (폴리곤 직접 — 대장 bbox 컬럼 의존 없음)
+        let mut min_lat = f64::INFINITY;
+        let mut max_lat = f64::NEG_INFINITY;
+        let mut min_lon = f64::INFINITY;
+        let mut max_lon = f64::NEG_INFINITY;
+        for p in polygon {
+            if !p[0].is_finite() || !p[1].is_finite() {
+                return false; // 비정상 좌표 — 판정 불가(제외하지 않음)
+            }
+            min_lat = min_lat.min(p[0]);
+            max_lat = max_lat.max(p[0]);
+            min_lon = min_lon.min(p[1]);
+            max_lon = max_lon.max(p[1]);
+        }
+        let own_area = (max_lat - min_lat) * (max_lon - min_lon);
+        if own_area <= 0.0 || !own_area.is_finite() {
+            return false; // 퇴화(선/점) 풋프린트 — 판정 불가
+        }
+
+        // ② bbox 프리필터 — 대부분의 후보가 여기서 0건으로 끝난다(저비용)
+        let (r0, c0) = overlap_cell_of(min_lat, min_lon);
+        let (r1, c1) = overlap_cell_of(max_lat, max_lon);
+        if r1 - r0 > OVERLAP_MAX_CELL_SPAN || c1 - c0 > OVERLAP_MAX_CELL_SPAN {
+            return false; // 비정상 bbox — fail-open
+        }
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut near: Vec<(i64, [f64; 4])> = Vec::new();
+        for r in r0..=r1 {
+            for cc in c0..=c1 {
+                let Some(list) = self.buckets.get(&(r, cc)) else {
+                    continue;
+                };
+                for (id, b) in list {
+                    // 같은 실측 행이 여러 셀에 등록돼 있으므로 id dedup
+                    if !seen.insert(*id) {
+                        continue;
+                    }
+                    // bbox 교차 여부 (경계 접촉 포함)
+                    if max_lat < b[0] || min_lat > b[1] || max_lon < b[2] || min_lon > b[3] {
+                        continue;
+                    }
+                    near.push((*id, *b));
+                }
+            }
+        }
+        if near.is_empty() {
+            return false;
+        }
+
+        // ③ 캐시에 없는 실측 폴리곤만 배치 조회 (id 는 DB 에서 읽은 i64 — 문자열 결합 안전)
+        let missing: Vec<i64> = near
+            .iter()
+            .filter(|(id, _)| !self.poly_cache.contains_key(id))
+            .map(|(id, _)| *id)
+            .collect();
+        for chunk in missing.chunks(OVERLAP_POLY_BATCH) {
+            let id_list: Vec<String> = chunk.iter().map(|id| id.to_string()).collect();
+            let sql = format!(
+                "SELECT id, polygon_json FROM fac_buildings WHERE id IN ({})",
+                id_list.join(",")
+            );
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                }) {
+                    for (id, poly_json) in rows.flatten() {
+                        // 폴리곤은 [[lat, lon], ...] (기존 파싱 관례) → (lon, lat) 링으로 변환
+                        let ring = poly_json
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str::<Vec<[f64; 2]>>(s).ok())
+                            .filter(|p| p.len() >= 3)
+                            .map(|p| p.iter().map(|v| (v[1], v[0])).collect::<Vec<(f64, f64)>>());
+                        self.poly_cache.insert(id, ring);
+                    }
+                }
+            }
+            // 조회 실패/미반환 id 는 None 을 박아 재조회를 막는다(fail-open — 그 행은 피복 근거 없음)
+            for id in chunk {
+                self.poly_cache.entry(*id).or_insert(None);
+            }
+        }
+
+        // ④ 후보 bbox 위 24×24 격자 샘플 — 후보 폴리곤 내부점만 분모로 삼고,
+        //    그 점을 덮는 실측 폴리곤이 하나라도 있으면 피복으로 센다.
+        let cand_ring: Vec<(f64, f64)> = polygon.iter().map(|v| (v[1], v[0])).collect();
+        let step_lat = (max_lat - min_lat) / OVERLAP_SAMPLE_N as f64;
+        let step_lon = (max_lon - min_lon) / OVERLAP_SAMPLE_N as f64;
+        let mut inside = 0u32;
+        let mut covered = 0u32;
+        for i in 0..OVERLAP_SAMPLE_N {
+            let lat = min_lat + (i as f64 + 0.5) * step_lat;
+            for j in 0..OVERLAP_SAMPLE_N {
+                let lon = min_lon + (j as f64 + 0.5) * step_lon;
+                if !point_in_polygon_2d(lon, lat, &cand_ring) {
+                    continue;
+                }
+                inside += 1;
+                for (id, b) in &near {
+                    // bbox 퀵리젝트 후 실제 폴리곤 판정
+                    if lat < b[0] || lat > b[1] || lon < b[2] || lon > b[3] {
+                        continue;
+                    }
+                    let Some(Some(ring)) = self.poly_cache.get(id) else {
+                        continue;
+                    };
+                    if point_in_polygon_2d(lon, lat, ring) {
+                        covered += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if inside == 0 {
+            return false; // 격자에 안 잡히는 초미세/슬리버 풋프린트 — fail-open
+        }
+
+        covered as f64 / inside as f64 >= MEASURED_COVER_RATIO
+    }
+}
+
 /// LoS 경로(레이더→타겟) 상의 건물 조회
 pub fn query_buildings_along_path(
     conn: &Connection,
@@ -1115,6 +1376,9 @@ pub fn query_buildings_3d_binary(
 
     // FAC 건물 (fac_buildings 테이블 없을 수 있음 — 실패 시 무시)
     if !skip_fac {
+        // 실측 우선 중복 제거용 겹침 인덱스 — 뷰포트당 1회 적재
+        let mut overlap_idx = MeasuredOverlapIndex::load(conn, min_lat, max_lat, min_lon, max_lon);
+
         // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 3D 건물 렌더 높이/필터/정렬 모두 동일 기준.
         if let Ok(mut stmt) = conn.prepare(
             "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, usability, polygon_json, COALESCE(ground_elev, 0),
@@ -1144,16 +1408,27 @@ pub fn query_buildings_3d_binary(
                 },
             ) {
                 for row in rows {
-                    let (lat, lon, height, name, usage, poly_json, ground_elev, measured) = match row {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
+                    let (lat, lon, height, name, usage, poly_json, ground_elev, measured) =
+                        match row {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
 
                     let polygon: Vec<[f64; 2]> = match serde_json::from_str(&poly_json) {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
                     if polygon.len() < 3 { continue; }
+
+                    // 실측 우선 — 실제 풋프린트가 실측 풋프린트에 상당 부분 덮이는 비실측 대장 행은
+                    // 같은 건물 중복으로 보고 제외 (BRA 프리즘·박스 이중 렌더 방지).
+                    // LIMIT 는 제외 전 SQL 에서 걸리므로 제외분만큼 슬롯 낭비가 있지만 허용.
+                    if !measured
+                        && !overlap_idx.is_empty()
+                        && overlap_idx.covers_footprint(conn, &polygon)
+                    {
+                        continue;
+                    }
 
                     floats.push(lon);
                     floats.push(lat);
