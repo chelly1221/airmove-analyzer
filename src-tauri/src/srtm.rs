@@ -161,13 +161,33 @@ impl SrtmReader {
 
     /// Pre-load all SRTM tiles in the given coordinate range into memory cache
     pub fn preload_tiles(&mut self, min_lat: i32, max_lat: i32, min_lon: i32, max_lon: i32) {
+        self.preload_tiles_with_progress(min_lat, max_lat, min_lon, max_lon, |_, _, _| {});
+    }
+
+    /// preload_tiles 의 진행 콜백 변형 — 타일 1개 처리마다 `on_tile(done, total, name)` 호출.
+    /// 이미 캐시된 타일(로드 스킵)도 done 카운트에 포함해 진행률이 단조 증가하도록 한다.
+    /// (기존 `preload_tiles` 시그니처는 다른 호출자들이 있어 그대로 두고 이 함수에 위임)
+    pub fn preload_tiles_with_progress<F: FnMut(usize, usize, &str)>(
+        &mut self,
+        min_lat: i32,
+        max_lat: i32,
+        min_lon: i32,
+        max_lon: i32,
+        mut on_tile: F,
+    ) {
+        let lat_cnt = (max_lat - min_lat + 1).max(0) as usize;
+        let lon_cnt = (max_lon - min_lon + 1).max(0) as usize;
+        let total = lat_cnt * lon_cnt;
+        let mut done: usize = 0;
         for lat in min_lat..=max_lat {
             for lon in min_lon..=max_lon {
                 let name = Self::tile_name(lat, lon);
                 if !self.tiles.contains_key(&name) {
                     let tile = self.load_tile(&name);
-                    self.tiles.insert(name, tile);
+                    self.tiles.insert(name.clone(), tile);
                 }
+                done += 1;
+                on_tile(done, total, &name);
             }
         }
     }

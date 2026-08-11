@@ -36,6 +36,8 @@ pub struct BraResult {
     pub angle_deg: f64,
     /// 안테나 정점 해발고 (m AMSL)
     pub radar_height_m: f64,
+    /// 스캔 반경 (km) — 요청 반경과 해석적 상한 중 작은 쪽
+    pub max_range_km: f64,
     /// 검사한 건물 수 (fac + manual)
     pub scanned: u64,
     /// 침범 총수 (truncate 전)
@@ -142,6 +144,7 @@ pub fn analyze_penetration(
         return Ok(BraResult {
             angle_deg,
             radar_height_m,
+            max_range_km: d_max / 1000.0,
             scanned: 0,
             total_penetrating: 0,
             truncated: false,
@@ -263,7 +266,7 @@ pub fn analyze_penetration(
             };
 
             if let Some(b) = judge(
-                cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta,
+                cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max,
                 id, "fac", cand.measured, name, address, usage,
                 cand.clat, cand.clon, cand.ground_elev_m, cand.height_m, polygon,
             ) {
@@ -335,7 +338,7 @@ pub fn analyze_penetration(
             };
 
             if let Some(b) = judge(
-                cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta,
+                cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max,
                 id, "manual", false, name, memo, None,
                 mlat, mlon, ground_elev_m, height_m, polygon,
             ) {
@@ -361,6 +364,7 @@ pub fn analyze_penetration(
     Ok(BraResult {
         angle_deg,
         radar_height_m,
+        max_range_km: d_max / 1000.0,
         scanned,
         total_penetrating,
         truncated,
@@ -370,6 +374,8 @@ pub fn analyze_penetration(
 
 /// 확정 판정 — 폴리곤 정점 중 레이더 최근접 지점에서 원추면을 넘는지.
 /// 원추면은 d 에 대해 단조증가이므로 최근접 정점에서 초과량이 최대다.
+/// 최근접 정점이 스캔 반경(d_max) 밖이면 제외 — fac 은 centroid 사전컷 슬랙(FOOTPRINT_SLACK_M),
+/// 수동 건물은 bbox 코너까지 반경 밖으로 넘칠 수 있어 여기서 최종 컷한다.
 #[allow(clippy::too_many_arguments)]
 fn judge(
     cos_lat: f64,
@@ -377,6 +383,7 @@ fn judge(
     radar_lon: f64,
     radar_height_m: f64,
     tan_theta: f64,
+    d_max: f64,
     id: i64,
     source: &str,
     measured: bool,
@@ -398,6 +405,9 @@ fn judge(
     }
     if !d_min.is_finite() {
         return None;
+    }
+    if d_min > d_max {
+        return None; // 최근접 정점이 스캔 반경 밖 — 원추 표시 반경과 결과 정합 유지
     }
     let total_height_m = ground_elev_m + height_m;
     let cone = cone_msl(radar_height_m, tan_theta, d_min);

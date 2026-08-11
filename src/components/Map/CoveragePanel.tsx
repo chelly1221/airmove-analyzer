@@ -43,12 +43,14 @@ export default function CoveragePanel({
   const coverageError = useAppStore((s) => s.coverageError);
   const setCoverageError = useAppStore((s) => s.setCoverageError);
   const setCoverageData = useAppStore((s) => s.setCoverageData);
+  const setCoverageStage = useAppStore((s) => s.setCoverageStage);
+  const bumpCoverageAbortSeq = useAppStore((s) => s.bumpCoverageAbortSeq);
 
   const [coverageAltInput, setCoverageAltInput] = useState(coverageAlt);
   const [coverageAltMinInput, setCoverageAltMinInput] = useState(coverageAltMin);
   const coverageAltTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageAltMinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const coverageComputeAbortRef = useRef(0);
+  // 취소 시퀀스는 store(coverageAbortSeq) 단일 원천 — 진행 모달의 취소 버튼과 공유
 
   // 외부(슬라이더 리셋 등)에서 alt 값이 바뀌면 입력 동기화
   useEffect(() => { setCoverageAltInput(coverageAlt); }, [coverageAlt]);
@@ -74,23 +76,25 @@ export default function CoveragePanel({
   }, [setCoverageAltMin]);
 
   const startCoverageCompute = useCallback(async (force = false) => {
-    const computeSeq = ++coverageComputeAbortRef.current;
+    const computeSeq = bumpCoverageAbortSeq();
     setCoverageLoading(true);
     setCoverageError("");
     setCoverageProgressPct(0);
     setCoverageProgress("준비 중...");
+    setCoverageStage("srtm");
     try {
       if (force) invalidateGPUCache();
 
       const result = await computeMainCoverage(
         radarSite,
-        (pct, msg) => {
-          if (coverageComputeAbortRef.current !== computeSeq) return;
+        (pct, msg, stage) => {
+          if (useAppStore.getState().coverageAbortSeq !== computeSeq) return;
           setCoverageProgressPct(Math.round(pct));
           setCoverageProgress(msg);
+          if (stage) setCoverageStage(stage);
         },
       );
-      if (coverageComputeAbortRef.current !== computeSeq) return;
+      if (useAppStore.getState().coverageAbortSeq !== computeSeq) return;
       setGpuCacheReady(true);
       setCoverageVisible(true);
       setCoverageData(result);
@@ -107,29 +111,31 @@ export default function CoveragePanel({
         );
       }
     } catch (err) {
-      if (coverageComputeAbortRef.current !== computeSeq) return;
+      if (useAppStore.getState().coverageAbortSeq !== computeSeq) return;
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error("커버리지 계산 실패:", err);
       setCoverageError(`계산 실패: ${errMsg}`);
     } finally {
-      if (coverageComputeAbortRef.current === computeSeq) {
+      if (useAppStore.getState().coverageAbortSeq === computeSeq) {
         setCoverageLoading(false);
         setCoverageProgress("");
         setCoverageProgressPct(0);
+        setCoverageStage("");
       }
     }
-  }, [radarSite, mapRef, setGpuCacheReady, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData]);
+  }, [radarSite, mapRef, setGpuCacheReady, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageError, setCoverageVisible, setCoverageData, setCoverageStage, bumpCoverageAbortSeq]);
 
   // 토글 ON/OFF — 계산 중에도 OFF 가능
   const handleToggle = useCallback(() => {
     if (coverageVisible || coverageLoading) {
-      // OFF: 진행 중 계산 무효화 + 상태 초기화
-      ++coverageComputeAbortRef.current;
+      // OFF: 진행 중 계산 무효화 + 상태 초기화 (모달 취소와 동일한 store 시퀀스)
+      bumpCoverageAbortSeq();
       setCoverageVisible(false);
       if (coverageLoading) {
         setCoverageLoading(false);
         setCoverageProgress("");
         setCoverageProgressPct(0);
+        setCoverageStage("");
         invalidateGPUCache();
       }
     } else {
@@ -139,7 +145,7 @@ export default function CoveragePanel({
         setCoverageVisible(true);
       }
     }
-  }, [coverageLoading, coverageVisible, gpuCacheReady, radarSite, setCoverageVisible, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, startCoverageCompute]);
+  }, [coverageLoading, coverageVisible, gpuCacheReady, radarSite, setCoverageVisible, setCoverageLoading, setCoverageProgress, setCoverageProgressPct, setCoverageStage, bumpCoverageAbortSeq, startCoverageCompute]);
 
   const cacheValid = gpuCacheReady && isGPUCacheValidFor(radarSite);
   const isActive = coverageVisible && cacheValid;

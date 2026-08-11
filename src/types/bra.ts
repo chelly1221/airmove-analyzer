@@ -40,6 +40,8 @@ export interface BraResult {
   angle_deg: number;
   /** 안테나 정점 해발고 (m AMSL) */
   radar_height_m: number;
+  /** 스캔 반경 (km) — 요청 반경과 해석적 상한 중 작은 쪽 */
+  max_range_km: number;
   /** 검사한 건물 수 (fac + manual) */
   scanned: number;
   /** 침범 총수 (truncate 전) */

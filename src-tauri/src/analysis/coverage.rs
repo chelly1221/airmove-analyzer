@@ -763,6 +763,11 @@ fn alt_to_color(alt_ft: f64) -> [u8; 3] {
 }
 
 /// Per-pixel 캐시 초기화 (SRTM 프리로드 + 건물 building_map 구축)
+///
+/// `progress(pct, stage, msg, counts)` — 진행 콜백. 수치 계산에는 일절 관여하지 않는다.
+///   - pct: 0~100 (SRTM 0→60, 건물 조회 60→70, building_map 구축 70→98, 완료 100)
+///   - stage: "srtm" | "buildings" | "bmap" | "done"
+///   - counts: Some((done, total)) — 단계 내 진척(타일 수 / 건물 샘플점 수)
 pub fn init_pixel_coverage(
     srtm: &mut SrtmReader,
     conn: &rusqlite::Connection,
@@ -771,6 +776,7 @@ pub fn init_pixel_coverage(
     radar_altitude: f64,
     antenna_height: f64,
     range_nm: f64,
+    mut progress: impl FnMut(f32, &str, &str, Option<(usize, usize)>),
 ) {
     let radar_height = radar_altitude + antenna_height;
     let max_range_km = range_nm * 1.852;
@@ -780,20 +786,53 @@ pub fn init_pixel_coverage(
     let inv_deg_lat = 1.0 / 111_320.0;
     let inv_deg_lon = if cos_radar_lat > 0.0 { 1.0 / (111_320.0 * cos_radar_lat) } else { 0.0 };
 
-    // SRTM 타일 프리로드
+    // SRTM 타일 프리로드 (진행 0→60%)
     let range_deg = (max_range_km / 111.0).ceil() as i32 + 1;
-    srtm.preload_tiles(
+    progress(0.0, "srtm", "SRTM 지형 타일 로드 준비 중...", None);
+    srtm.preload_tiles_with_progress(
         radar_lat.floor() as i32 - range_deg,
         radar_lat.floor() as i32 + range_deg,
         radar_lon.floor() as i32 - range_deg,
         radar_lon.floor() as i32 + range_deg,
+        |done, total, name| {
+            let pct = if total > 0 { (done as f32 / total as f32) * 60.0 } else { 60.0 };
+            progress(
+                pct,
+                "srtm",
+                &format!("SRTM 지형 타일 로드 ({}/{}) — {}", done, total, name),
+                Some((done, total)),
+            );
+        },
     );
 
-    // 건물 쿼리 + sparse building map
+    // 건물 쿼리 + sparse building map (진행 60→70%)
     let range_deg_f = max_range_km / 111.0;
+    progress(60.0, "buildings", "건물 데이터 조회 중...", None);
     let buildings = query_buildings_for_coverage(conn, radar_lat, radar_lon, range_deg_f);
+    progress(
+        70.0,
+        "buildings",
+        &format!("건물 샘플 {}점 조회 완료", buildings.len()),
+        Some((buildings.len(), buildings.len())),
+    );
+
+    // building_map 구축 (진행 70→98%) — 청크(20,000점)마다 콜백
+    const BMAP_PROGRESS_CHUNK: usize = 20_000;
+    let bmap_total = buildings.len();
+    let mut bmap_done: usize = 0;
+    progress(70.0, "bmap", "차폐맵 구축 중...", Some((0, bmap_total)));
     let mut building_map: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_bearing_slots];
     for &(blat, blon, bheight) in &buildings {
+        bmap_done += 1;
+        if bmap_done % BMAP_PROGRESS_CHUNK == 0 {
+            let pct = 70.0 + (bmap_done as f32 / bmap_total.max(1) as f32) * 28.0;
+            progress(
+                pct,
+                "bmap",
+                &format!("차폐맵 구축 중 ({}/{}점)", bmap_done, bmap_total),
+                Some((bmap_done, bmap_total)),
+            );
+        }
         let d_lat = blat - radar_lat;
         let d_lon = (blon - radar_lon) * cos_radar_lat;
         let dist_deg = (d_lat * d_lat + d_lon * d_lon).sqrt();
@@ -806,12 +845,14 @@ pub fn init_pixel_coverage(
         if si < 0 || si >= SAMPLES_PER_RAY as i32 { continue; }
         building_map[slot].push((si as usize, bheight as f32));
     }
+    progress(98.0, "bmap", "차폐맵 구축 완료", Some((bmap_total, bmap_total)));
 
     *PIXEL_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PixelCoverageState {
         radar_lat, radar_lon, radar_height, max_range_km,
         cos_radar_lat, inv_deg_lat, inv_deg_lon,
         building_map, bearing_quant_deg, num_bearing_slots,
     });
+    progress(100.0, "done", "커버리지 캐시 준비 완료", None);
 }
 
 /// 특정 좌표의 최저 탐지고도(ft) 조회

@@ -37,9 +37,11 @@ const GearButton = ({ active, onClick }: { active: boolean; onClick: () => void 
   </button>
 );
 
-/** MapLibre terrain 과장 배율 — setTerrain(2곳)과 LoS 커튼 z 배율(EX)이 공유해야
- *  커튼 지형선이 1.5배 과장된 지형 메시 표면과 일치. 값 변경 시 커튼도 자동 정합. */
-const TERRAIN_EXAGGERATION = 1.5;
+/** MapLibre terrain 과장 배율 — setTerrain(2곳)과 분석 레이어 z 배율(EX: LoS 커튼·CoS·BRA)이 공유.
+ *  1 = 실척(전 프레임 통일). maplibre fill-extrusion 건물 높이·실측 3D 메시 z 는 이 배율의 영향을
+ *  받지 않으므로, 1 초과로 올리면 지형·분석 레이어만 과장되어 건물 박스/메시와 프레임이 어긋난다
+ *  (분석 레이어끼리는 EX 공유로 자동 정합 — BRA 침범 프리즘의 구 밴드 설계가 어긋났던 원인). */
+const TERRAIN_EXAGGERATION = 1;
 
 /** 3D 건물 표출 최소 줌 — 이 미만이면 fill-extrusion 3D 모드가 꺼지고(2D 점 전환) 실측 3D 메시도
  *  게이트 오프(visible:false + loadTiles:false). 두 표출 경로가 같은 임계를 공유해야 줌 인/아웃 시
@@ -104,6 +106,7 @@ import { detectionTypeColor, radarTypeLabel, MAP_STYLE_URL } from "../utils/rada
 import AddressSearch, { AddressMarker } from "../components/Map/AddressSearch";
 import PlaybackControls from "../components/Map/PlaybackControls";
 import CoveragePanel from "../components/Map/CoveragePanel";
+import CoverageProgressModal from "../components/Map/CoverageProgressModal";
 
 /** 전체 항적 표시 시 최대 선택 가능 윈도우 (초) = 24시간 */
 const MAX_WINDOW_SECS = 86400;
@@ -469,6 +472,12 @@ export default function TrackMap() {
   const [coverageTooltip, setCoverageTooltip] = useState<{ x: number; y: number; altFt: number | null; loading: boolean } | null>(null);
   const coverageTooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const coverageTooltipSeqRef = useRef(0);
+  /** 마지막으로 렌더 완료된 비트맵 키(고도목록+CoS+뷰포트) — 동일 키면 재렌더 스킵 (토글 = 순수 표시/숨김) */
+  const lastCoverageRenderKeyRef = useRef("");
+  /** 현재 보유 비트맵 유무 (콜백 dep churn 방지용 ref 미러) */
+  const coverageImageRef = useRef<ImageBitmap | null>(null);
+  /** init 완료 후 첫 비트맵 렌더 대기 — 진행 모달의 90~99% 구간 */
+  const [coverageFirstRenderPending, setCoverageFirstRenderPending] = useState(false);
 
 
   // 파노라마 장애물 맵 하이라이트 (전역 스토어)
@@ -508,11 +517,13 @@ export default function TrackMap() {
   const [braResult, setBraResult] = useState<BraResult | null>(null);
   const [braLoading, setBraLoading] = useState(false);
   const [braError, setBraError] = useState<string | null>(null);
-  /** 원추면 표시 반경 (km) — 표출 전용, 판정 반경(레이더 제원)과 무관. 미영속. */
+  /** 원추면 반경 (km) — 표시 반경 겸 분석 반경(maxRangeKm). 미영속. */
   const [braConeRadiusKm, setBraConeRadiusKm] = useState(10);
   const [braConeOpacity, setBraConeOpacity] = useState(1); // 원추면 채움 불투명도 (기본 1 = 불투명, 슬라이더로 0.05까지 하향)
   /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
   const braReqSeq = useRef(0);
+  /** 마지막 분석에 사용한 원추 반경 (km) — 슬라이더 변경 시 자동 재분석 트리거 비교용 */
+  const braLastRunRadiusRef = useRef<number | null>(null);
 
   // 이펙트에서 최신 레이더 제원 참조용 (호버 조회 deps 에 radarSite 를 넣지 않기 위함)
   const radarSiteRef = useRef(radarSite);
@@ -1124,8 +1135,10 @@ export default function TrackMap() {
     if (!isGPUCacheValidFor(radarSite)) {
       setGpuCacheReady(false);
       setCoverageImage(null);
+      coverageImageRef.current = null;
       setCoverageBounds(null);
       setCoverageUsedAlts([]);
+      lastCoverageRenderKeyRef.current = ""; // 렌더 키도 리셋 — 다음 표시 시 반드시 재렌더
     }
   }, [radarSite.name, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1172,10 +1185,19 @@ export default function TrackMap() {
     return [Math.round((r1 + m) * 255), Math.round((g1 + m) * 255), Math.round((b1 + m) * 255)];
   }, []);
 
-  // 커버리지 비표시 시 이미지 클리어
+  // 커버리지 토글 OFF 는 순수 "숨김" — 비트맵/바운즈/고도목록을 그대로 보존한다.
+  // (deck 레이어는 coverageVisible 게이트로 숨고, 다시 ON 하면 재계산·재렌더 없이 즉시 표시)
+
+  // 계산(신규/재계산) 시작 시: ① 렌더 키 리셋(같은 뷰포트라도 새 비트맵을 받아야 함)
+  // ② 첫 비트맵 렌더 대기 플래그 — 진행 모달이 init 90% 이후 구간을 이어받는다.
+  // stage 가 빈 값이면 DB 캐시 lazy load(store setCoverageVisible)이므로 대상 아님.
+  // (stage 는 진행 이벤트마다 바뀌므로 구독하지 않고 getState 로 읽는다 — 대형 컴포넌트 리렌더 방지)
   useEffect(() => {
-    if (!coverageVisible) { setCoverageImage(null); setCoverageBounds(null); setCoverageUsedAlts([]); }
-  }, [coverageVisible]);
+    if (!coverageLoading) return;
+    if (useAppStore.getState().coverageStage === "") return;
+    lastCoverageRenderKeyRef.current = "";
+    setCoverageFirstRenderPending(true);
+  }, [coverageLoading]);
 
 
   // ── 타일 기반 건물 캐시 로딩 ──────────────────────────────────
@@ -1949,15 +1971,30 @@ export default function TrackMap() {
       };
     }
 
+    // 렌더 키 — 고도목록 + CoS + 뷰포트(소수 6자리) + 캔버스 크기.
+    // 마지막 완료 렌더와 동일하고 이미 비트맵이 있으면 Rust 호출 없이 스킵 (토글 ON 즉시 표시)
+    const r6 = (v: number) => Math.round(v * 1e6) / 1e6;
+    const renderKey = JSON.stringify([
+      altFts, showConeOfSilence,
+      viewport ? [r6(viewport.west), r6(viewport.south), r6(viewport.east), r6(viewport.north), viewport.width, viewport.height] : null,
+    ]);
+    if (renderKey === lastCoverageRenderKeyRef.current && coverageImageRef.current) return;
+
     const seq = ++coverageRenderSeqRef.current;
     setCoverageRendering(true);
     renderCoverageImageAsync(altFts, showConeOfSilence, viewport)
       .then((result) => {
-        if (coverageRenderSeqRef.current !== seq || !result) return;
+        if (coverageRenderSeqRef.current !== seq) return;
+        if (!result) { setCoverageFirstRenderPending(false); return; } // 렌더 불가(맵/캐시 미준비) — 진행 모달 잔류 방지
         setCoverageImage(result.image);
+        coverageImageRef.current = result.image;
         setCoverageBounds(result.bounds);
         setCoverageUsedAlts(result.usedAltFts);
-      }).catch(() => {}).finally(() => {
+        lastCoverageRenderKeyRef.current = renderKey;
+        setCoverageFirstRenderPending(false);
+      }).catch(() => {
+        if (coverageRenderSeqRef.current === seq) setCoverageFirstRenderPending(false); // 렌더 실패 — 진행 모달 잔류 방지
+      }).finally(() => {
         if (coverageRenderSeqRef.current === seq) setCoverageRendering(false);
       });
   }, [gpuCacheReady, coverageVisible, coverageLoading, coverageAlt, coverageAltMin, showConeOfSilence]);
@@ -2594,6 +2631,7 @@ export default function TrackMap() {
   // BRA 모드 해제 — 결과 폐기 + 진행 중 요청 무효화 (seq 증가 → 늦게 도착한 응답 무시)
   const teardownBra = useCallback(() => {
     braReqSeq.current += 1;
+    braLastRunRadiusRef.current = null;
     setBraResult(null);
     setBraError(null);
     setBraLoading(false);
@@ -2612,9 +2650,11 @@ export default function TrackMap() {
     teardownBra();
   }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, teardownBra]);
 
-  // BRA 분석 실행 — 결과는 폴리곤 포함 수 MB 가능 → bulk:// 파일 매개 수신
+  // BRA 분석 실행 — 분석 반경 = 원추 반경(braConeRadiusKm) 이라 결과·표시가 항상 일치.
+  //   결과는 폴리곤 포함 수 MB 가능 → bulk:// 파일 매개 수신
   const runBraAnalysis = useCallback(async () => {
     const seq = ++braReqSeq.current;
+    braLastRunRadiusRef.current = braConeRadiusKm;
     setBraLoading(true);
     setBraError(null);
     try {
@@ -2623,7 +2663,7 @@ export default function TrackMap() {
         radarLon: radarSite.longitude,
         radarHeightM: radarSite.altitude + radarSite.antenna_height,
         angleDeg: braAngleDeg,
-        maxRangeKm: radarSite.range_nm * 1.852,
+        maxRangeKm: braConeRadiusKm,
       });
       const res = await readBulkJson<BraResult>(ref);
       if (seq !== braReqSeq.current) return; // 최신 요청만 반영
@@ -2635,7 +2675,15 @@ export default function TrackMap() {
     } finally {
       if (seq === braReqSeq.current) setBraLoading(false);
     }
-  }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, radarSite.range_nm, braAngleDeg]);
+  }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, braAngleDeg, braConeRadiusKm]);
+
+  // 원추 반경 슬라이더 변경 → 결과가 있으면 자동 재분석 (디바운스). 반경=분석 범위이므로 결과·표시 정합 유지.
+  useEffect(() => {
+    if (!braResult) return;
+    if (braLastRunRadiusRef.current === braConeRadiusKm) return;
+    const t = setTimeout(() => { void runBraAnalysis(); }, 400);
+    return () => clearTimeout(t);
+  }, [braConeRadiusKm, braResult, runBraAnalysis]);
 
   // 3D 입체 허용 토글 ↔ 현재 줌에 맞춰 buildings3dMode 재조정
   useEffect(() => {
@@ -2728,7 +2776,9 @@ export default function TrackMap() {
   }, [losTarget, radarSite, allPoints, signalLossPoints, visibleMinTs, visibleMaxTs, losFootprint]);
 
   // 커버리지 전용 deck.gl 레이어 — BitmapLayer (이미지 텍스처 1장, tessellation 없음)
+  // 표시 여부는 coverageVisible 로만 게이트 — OFF 여도 비트맵은 보존(재생성 없이 재표시)
   const coverageDeckLayers = useMemo(() => {
+    if (!coverageVisible || !gpuCacheReady) return [];
     if (!coverageImage || !coverageBounds) return [];
     return [
       new BitmapLayer({
@@ -2739,7 +2789,7 @@ export default function TrackMap() {
         parameters: { depthWriteEnabled: false },
       }),
     ];
-  }, [coverageImage, coverageBounds, coverageOpacity]);
+  }, [coverageImage, coverageBounds, coverageOpacity, coverageVisible, gpuCacheReady]);
 
 
   // LoS 전용 deck.gl 레이어 (LoS 모드 상태 변경 시에만 재생성)
@@ -2754,7 +2804,7 @@ export default function TrackMap() {
     // ── LoS 수직 단면 커튼 (차트 가시 구간) ── 단면도 프로파일 로드 후 상시 표출.
     //   단면도 차트의 각 선(지형·최저탐지 LoS·프레넬·BRA·CoS)을 3D 수직 리본면(커튼 월)+상단
     //   강조선으로 재현: 인접 샘플쌍마다 불투명 수직 quad(SolidPolygonLayer)를 먼저 깔고, 기존 PathLayer 선을
-    //   그 위에 상단 모서리로 얹음. 지형 메시가 1.5배 과장이라 커튼 전체 z 에 동일 배율(EX)을 곱해 지형 표면과 정합.
+    //   그 위에 상단 모서리로 얹음. 커튼 전체 z 에 지형 메시 과장 배율(EX, 현재 1=실척)을 곱해 지형 표면과 정합.
     //   수직 폴리곤은 2D 테셀레이터에서 선으로 퇴화하므로 SolidPolygonLayer 는 _full3d:true 필수(최대면적 평면 테셀레이션).
     //   pitch 0(탑다운)에선 면·선 모두 자연히 모서리시점(선)으로 퇴화 → 별도 토글 없음. 색·게이트는 LOS_LAYERS 칩과 동일.
     //   점선은 @deck.gl/extensions(PathStyleExtension) 미설치로 미지원 — 실선+가는 두께로 구분(의존성 추가 금지).
@@ -3485,7 +3535,7 @@ export default function TrackMap() {
   //   70° 를 넘는 앙각은 레이더가 탐지하지 못하므로 이 원추 내부가 곧 침묵 영역.
   //   천장은 커버리지 상한(COVERAGE_MAX_ALT_FT)과 동일 스코프 — 원추는 무한 발산하므로 같은 고도에서 잘라
   //   커버리지 맵/CoS 단면과 표시 범위를 맞춘다.
-  //   z 는 LoS 커튼과 동일 규약(AMSL 미터 × EX) — 지형 메시가 1.5배 과장이라 커튼/지형과 정합.
+  //   z 는 LoS 커튼과 동일 규약(AMSL 미터 × EX, 현재 1=실척) — 지형 메시 과장 배율 공유로 커튼/지형과 정합.
   const cosDeckLayers = useMemo(() => {
     if (!showCos) return [];
     const apexM = radarSite.altitude + radarSite.antenna_height; // 안테나 정점 (AMSL m)
@@ -3541,12 +3591,24 @@ export default function TrackMap() {
     return layers;
   }, [showCos, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
-  // BRA 3D 레이어 — ① 원추면(기준각 θ 로 전방위 상승) ② 침범 건물의 원추면 위 돌출부(붉은 프리즘).
-  //   ② 침범 프리즘은 pickable — 클릭 시 우측 건축물정보 드로어, 호버 시 간단 툴팁(BRA 초과·여유 행 포함).
-  //      (BRA 는 원추 전체를 보려 줌아웃한 상태라 fill-extrusion 건물 레이어가 비어 클릭 대상이 없다)
-  //   z 규약은 CoS 원추(cosDeckLayers)와 동일: AMSL 미터 × EX (지형 메시가 1.5배 과장이라 정합).
+  // BRA 3D 레이어 — ① 원추면(기준각 θ 로 전방위 상승) ② 침범 건물 통짜 프리즘.
+  //   z 규약은 원추면·CoS 원추·LoS 커튼과 동일하게 전부 AMSL 미터 × EX (지형 메시 과장 배율 공유, 현재 1=실척).
   //   원추면 해발고는 Rust analysis/bra.rs cone_msl · LoSProfilePanel braAMSL 과 동일한
   //   실제지구 기하 직선: coneMsl(d) = h_ant + d·tanθ + d²/(2R) (4/3 굴절 미적용).
+  //   ② 침범 건물은 바닥(지반 AMSL)~지붕(지붕 AMSL)을 한 덩어리 3D 프리즘으로 그리되 정점별 원추면
+  //      해발고에서 상·하로 갈라 아래는 일반 건물 회색 · 위(초과부)는 불투명 빨강 → 빨강 하단 경계가
+  //      렌더된 원추면과 기하적으로 정확히 일치한다. (구 설계는 붉은 반투명 밴드를 maplibre
+  //      fill-extrusion 프레임 = 지형만 과장·건물 높이 비과장 인 '보이는 건물 상단'에 앵커해 두께를
+  //      초과량으로 잡았는데, 원추면은 AMSL×EX 프레임이라 지형 과장 시 두 프레임이 어긋나 밴드가
+  //      원추 아래에 떠 보였다 — 프레임 통일로 해소.)
+  //      · EX=1(실척)이면 maplibre fill-extrusion 건물(줌 14+)과도 프레임이 일치 — 같은 건물의 박스와
+  //        프리즘이 정확히 겹치고, deck 오버레이(overlaid)가 항상 지도 위에 그려져 불투명 프리즘이 박스를
+  //        시각적으로 대체한다. (EX>1 이면 프리즘이 박스보다 EX 배 커져 박스를 내포)
+  //      · 실측 3D 메시 타일은 부분 재색칠이 불가(셰이더 주입 필요)해 프리즘이 그 위에 덮이는 데 그친다.
+  //      · 프리즘은 pickable — 클릭 시 우측 건축물정보 드로어, 호버 시 간단 툴팁(BRA 초과·여유 행 포함).
+  //        (BRA 는 원추 전체를 보려 줌아웃한 상태라 fill-extrusion 건물 레이어가 비어 클릭 대상이 없다)
+  //   레이어 push 순서는 [프리즘 → 원추면 → 림]: 불투명 프리즘이 depth 를 먼저 기록해야 depth 미기록
+  //   반투명 원추면이 프리즘 뒤에서는 가려지고 앞에서는 위에 블렌드된다.
   const braDeckLayers = useMemo(() => {
     if (activeTool !== "bra") return [];
     const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
@@ -3560,7 +3622,7 @@ export default function TrackMap() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const layers: any[] = [];
 
-    // ── ① 원추면 (분석 실행 전에도 즉시 표시) ──
+    // ── ① 원추면 기하 (분석 실행 전에도 즉시 표시) — 레이어 push 는 프리즘 뒤에서 ──
     const apexM = radarSite.altitude + radarSite.antenna_height; // 안테나 정점 (AMSL m)
     const tanTheta = Math.tan((braAngleDeg * Math.PI) / 180);
     const AZ_SEG = 72;  // 방위 분할
@@ -3593,87 +3655,82 @@ export default function TrackMap() {
         coneFaces.push({ polygon: [ring[i][j], ring[i + 1][j], ring[i + 1][j + 1], ring[i][j + 1]] });
       }
     }
-    layers.push(
-      new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
-        id: "bra-cone",
-        data: coneFaces,
-        getPolygon: (d) => d.polygon,
-        getFillColor: [34, 211, 238, Math.round(braConeOpacity * 255)], // LOS_LAYERS bra 색(#22d3ee) × 사용자 불투명도
-        filled: true,
-        extruded: false,
-        _full3d: true,   // 경사 폴리곤 필수 — 미지정 시 2D 테셀레이터가 퇴화
-        material: false, // 조명 음영 없이 플랫 색
-        pickable: false,
-        // depth 미기록 — 반투명 면이 depth 를 남기면 뒤에 그려지는 항적/건물/Loss 마커가 가려진다
-        parameters: { depthWriteEnabled: false },
-      }),
-      new PathLayer<{ path: [number, number, number][] }>({
-        id: "bra-cone-rim",
-        data: [{ path: ring[RINGS - 1] }],
-        getPath: (d) => d.path,
-        getColor: [34, 211, 238, 200],
-        getWidth: 1.5,
-        widthUnits: "pixels" as const,
-        pickable: false,
-      }),
-    );
 
-    // ── ② 침범 건물: 원추면 위로 솟은 부분만 붉은 프리즘 ──
+    // ── ② 침범 건물: AMSL×EX 프레임 통짜 프리즘 (원추면 아래 회색 · 위 빨강) ──
     if (braResult && braResult.buildings.length > 0) {
       // 판정에 쓰인 값(결과 스냅샷)으로 원추면 재구성 — 입력 슬라이더를 이후 조정해도 오버레이는 결과와 정합
       const hRes = braResult.radar_height_m;
       const tanRes = Math.tan((braResult.angle_deg * Math.PI) / 180);
+      const GRAY: [number, number, number, number] = [229, 231, 235, 255]; // 일반 fac 건물 fill 과 동일 회색
+      const RED: [number, number, number, number] = [239, 68, 68, 255];    // 원추면 위 초과부
       // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함
-      const faces: { polygon: [number, number, number][]; b: BraBuilding }[] = [];
+      const faces: { polygon: [number, number, number][]; b: BraBuilding; color: [number, number, number, number] }[] = [];
       for (const b of braResult.buildings) {
         const poly = b.polygon;
         if (!poly || poly.length < 3) continue;
-        // fill-extrusion 은 지도면(과장 지형) 기준 AGL 압출이라 원추면의 AMSL 프레임과 z 기준이 다르다.
-        // 붉은 띠를 '화면에 보이는 건물 상단'에 앵커하고 띠 두께 = 초과량이 되도록 하는 의도적 설계.
-        const topZ = (terrainEnabled ? b.ground_elev_m * EX : 0) + b.height_m;
+        // 바닥·지붕 모두 AMSL×EX — 원추면과 같은 프레임. terrainEnabled=false 면 EX=1 이라 AMSL 그대로라
+        // 평면 지도에선 건물이 지반고만큼 떠 보이지만, 원추면도 같은 AMSL 이라 정합을 우선한다.
+        const zBase = b.ground_elev_m * EX;
+        const zRoof = b.total_height_m * EX;
         const n = poly.length;
         const lonlat: [number, number][] = new Array(n);
-        const t: number[] = new Array(n);
+        const zCut: number[] = new Array(n); // 정점별 원추면 z (바닥~지붕으로 클램프)
         for (let i = 0; i < n; i++) {
           const [la, lo] = poly[i];
           lonlat[i] = [lo, la];
           const dx = (lo - radarSite.longitude) * mPerDegLon;
           const dy = (la - radarSite.latitude) * M_PER_DEG_LAT;
           const dv = Math.sqrt(dx * dx + dy * dy);
-          const over = b.total_height_m - coneMsl(dv, hRes, tanRes);
-          t[i] = Math.max(0, Math.min(over, b.height_m));
+          const coneAmsl = coneMsl(dv, hRes, tanRes);
+          const cutAmsl = Math.max(b.ground_elev_m, Math.min(coneAmsl, b.total_height_m));
+          zCut[i] = cutAmsl * EX;
         }
-        // 상단 캡 (지붕면). 풋프린트 일부만 침범하는 경계 건물은 캡이 다소 과대 표시되나,
-        // 원추 기울기(0.25° ≈ 4.4m/km)에 비해 풋프린트 스팬이 작아 오차는 무시 가능.
-        const cap: [number, number, number][] = new Array(n);
-        for (let i = 0; i < n; i++) cap[i] = [lonlat[i][0], lonlat[i][1], topZ];
-        faces.push({ polygon: cap, b });
-        // 측벽 — 양끝 초과량이 모두 0 에 가까운 변은 생략
+        // 측벽 — 하부(바닥→원추면, 회색) · 상부(원추면→지붕, 빨강). 양끝 두께가 모두 0 에 가까운 변은 생략
         for (let i = 0; i < n; i++) {
           const j = (i + 1) % n;
-          if (t[i] <= 0.01 && t[j] <= 0.01) continue;
-          faces.push({
-            polygon: [
-              [lonlat[i][0], lonlat[i][1], topZ - t[i]],
-              [lonlat[j][0], lonlat[j][1], topZ - t[j]],
-              [lonlat[j][0], lonlat[j][1], topZ],
-              [lonlat[i][0], lonlat[i][1], topZ],
-            ],
-            b,
-          });
+          if (zCut[i] - zBase > 0.01 || zCut[j] - zBase > 0.01) {
+            faces.push({
+              polygon: [
+                [lonlat[i][0], lonlat[i][1], zBase],
+                [lonlat[j][0], lonlat[j][1], zBase],
+                [lonlat[j][0], lonlat[j][1], zCut[j]],
+                [lonlat[i][0], lonlat[i][1], zCut[i]],
+              ],
+              b,
+              color: GRAY,
+            });
+          }
+          if (zRoof - zCut[i] > 0.01 || zRoof - zCut[j] > 0.01) {
+            faces.push({
+              polygon: [
+                [lonlat[i][0], lonlat[i][1], zCut[i]],
+                [lonlat[j][0], lonlat[j][1], zCut[j]],
+                [lonlat[j][0], lonlat[j][1], zRoof],
+                [lonlat[i][0], lonlat[i][1], zRoof],
+              ],
+              b,
+              color: RED,
+            });
+          }
         }
+        // 지붕 캡 — 초과(exceed>0) 판정 건물이라 최근접 정점 기준 지붕은 항상 원추 위 → 빨강.
+        // 풋프린트 일부만 침범하는 경계 건물은 반대편 지붕까지 빨갛게 되어 다소 과대 표시되나,
+        // 원추 기울기(0.25° ≈ 4.4m/km)에 비해 풋프린트 스팬이 작아 오차는 무시 가능.
+        const cap: [number, number, number][] = new Array(n);
+        for (let i = 0; i < n; i++) cap[i] = [lonlat[i][0], lonlat[i][1], zRoof];
+        faces.push({ polygon: cap, b, color: RED });
       }
       if (faces.length > 0) {
         layers.push(
-          new SolidPolygonLayer<{ polygon: [number, number, number][]; b: BraBuilding }>({
+          new SolidPolygonLayer<{ polygon: [number, number, number][]; b: BraBuilding; color: [number, number, number, number] }>({
             id: "bra-penetration",
             data: faces,
             getPolygon: (d) => d.polygon,
-            getFillColor: [239, 68, 68, 120],
+            getFillColor: (d) => d.color,
             filled: true,
             extruded: false,
             _full3d: true,
-            material: false,
+            // material 지정 없음 = deck 기본 조명 — 벽면 음영으로 입체감 (원추면은 플랫 유지)
             pickable: true,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             onClick: (info: any) => {
@@ -3698,11 +3755,38 @@ export default function TrackMap() {
                 setBldgHoverTip(null); // 프리즘 이탈 시 잔류 툴팁 제거 (maplibre 경로는 자기 활성 플래그가 없으면 정리 안 함)
               }
             },
-            parameters: { depthWriteEnabled: false },
+            // depth 기록 유지(기본값) — 불투명 입체라 자기 가림·상호 가림이 맞아야 하고,
+            // 뒤에 그려지는 원추면이 프리즘에 가려지려면 프리즘의 depth 가 남아 있어야 한다.
           }),
         );
       }
     }
+
+    // ── ③ 원추면·림 push — 프리즘(불투명, depth 기록) 뒤에 그려 앞면은 블렌드·뒷면은 가려지게 ──
+    layers.push(
+      new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
+        id: "bra-cone",
+        data: coneFaces,
+        getPolygon: (d) => d.polygon,
+        getFillColor: [34, 211, 238, Math.round(braConeOpacity * 255)], // LOS_LAYERS bra 색(#22d3ee) × 사용자 불투명도
+        filled: true,
+        extruded: false,
+        _full3d: true,   // 경사 폴리곤 필수 — 미지정 시 2D 테셀레이터가 퇴화
+        material: false, // 조명 음영 없이 플랫 색
+        pickable: false,
+        // depth 미기록 — 반투명 면이 depth 를 남기면 뒤에 그려지는 항적/건물/Loss 마커가 가려진다
+        parameters: { depthWriteEnabled: false },
+      }),
+      new PathLayer<{ path: [number, number, number][] }>({
+        id: "bra-cone-rim",
+        data: [{ path: ring[RINGS - 1] }],
+        getPath: (d) => d.path,
+        getColor: [34, 211, 238, 200],
+        getWidth: 1.5,
+        widthUnits: "pixels" as const,
+        pickable: false,
+      }),
+    );
 
     return layers;
   }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled, openBldgDrawerFor]);
@@ -4683,7 +4767,7 @@ export default function TrackMap() {
             </div>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
-                <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>원추 표시 반경</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>원추 반경</span>
                 <span style={{ ...num, fontSize: 10, color: "#22d3ee" }}>{braConeRadiusKm}km</span>
               </div>
               <DsSlider value={braConeRadiusKm} min={1} max={10} step={1} onChange={setBraConeRadiusKm} color="#22d3ee" />
@@ -4713,6 +4797,7 @@ export default function TrackMap() {
             <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}` }}>
               <div style={card}>
                 <div style={{ fontSize: 10, color: G[600], lineHeight: 1.5 }}>
+                  반경 <span style={{ ...num, color: "#22d3ee" }}>{Number(braResult.max_range_km.toFixed(1))}km</span> ·
                   검사 <span style={{ ...num, color: G[800] }}>{braResult.scanned.toLocaleString()}</span>동 ·
                   침범 <span style={{ ...num, color: "#ef4444" }}>{braResult.total_penetrating.toLocaleString()}</span>동
                   {list.length > 0 && (
@@ -5646,6 +5731,20 @@ export default function TrackMap() {
           )}
           {activeTool === "bra" && renderBraToolBody()}
         </div>
+
+        {/* ── 커버리지 생성 진행 모달 — 드로어와 독립(닫아도 유지) ── */}
+        <CoverageProgressModal
+          radarSite={radarSite}
+          bitmapPhase={coverageFirstRenderPending && coverageVisible && gpuCacheReady}
+          onCancel={() => {
+            // 진행 중 비트맵 렌더 폐기 + 로컬 캐시 플래그/렌더 키 리셋
+            ++coverageRenderSeqRef.current;
+            setCoverageRendering(false);
+            setCoverageFirstRenderPending(false);
+            setGpuCacheReady(false);
+            lastCoverageRenderKeyRef.current = "";
+          }}
+        />
 
         {/* ── 우측 표시 설정 드로어 (건물 / 기상) — 전체 높이 오버레이 ── */}
         <div

@@ -130,6 +130,12 @@ interface AppState {
   setCoverageProgress: (msg: string) => void;
   coverageProgressPct: number;
   setCoverageProgressPct: (pct: number) => void;
+  /** 현재 진행 단계 — "srtm" | "buildings" | "bmap" | "done" | "" (Rust coverage-init-progress stage) */
+  coverageStage: string;
+  setCoverageStage: (stage: string) => void;
+  /** 커버리지 계산 취소 시퀀스 — bump 시 진행 중 계산/콜백 무효화 (모달·패널 공용) */
+  coverageAbortSeq: number;
+  bumpCoverageAbortSeq: () => number;
   coverageError: string;
   setCoverageError: (msg: string) => void;
 
@@ -455,6 +461,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   setCoverageProgress: (msg) => set({ coverageProgress: msg }),
   coverageProgressPct: 0,
   setCoverageProgressPct: (pct) => set({ coverageProgressPct: pct }),
+  coverageStage: "",
+  setCoverageStage: (stage) => set({ coverageStage: stage }),
+  coverageAbortSeq: 0,
+  bumpCoverageAbortSeq: () => {
+    const next = get().coverageAbortSeq + 1;
+    set({ coverageAbortSeq: next });
+    return next;
+  },
   coverageError: "",
   setCoverageError: (msg) => set({ coverageError: msg }),
 

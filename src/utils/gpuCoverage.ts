@@ -11,6 +11,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { readBulkJson, readBulkBytes } from "./bulkIpc";
 import type { BulkRef } from "./bulkIpc";
 import type { CoverageLayer, MultiCoverageResult } from "./radarCoverage";
@@ -71,26 +72,51 @@ function radarKey(radar: RadarSite): string {
   return `${radar.name}_${radar.latitude}_${radar.longitude}_${radar.altitude + radar.antenna_height}`;
 }
 
+/** Rust init_pixel_coverage 진행 이벤트 페이로드 (coverage-init-progress) */
+export interface CoverageInitProgress {
+  /** "srtm" | "buildings" | "bmap" | "done" */
+  stage: string;
+  /** Rust 단계 진행률 0~100 */
+  pct: number;
+  msg: string;
+  done?: number | null;
+  total?: number | null;
+}
+
 /**
  * 메인 커버리지맵 초기화 — Rust per-pixel 캐시 준비
  * SRTM + 건물 데이터 프리로드만 수행, 비트맵은 renderCoverageImageAsync에서 on-demand
+ *
+ * onProgress 의 pct 는 0→90 스케일 (90~100 구간은 첫 비트맵 렌더 몫 — TrackMap/모달이 이어받음)
  */
 export async function computeMainCoverage(
   radar: RadarSite,
-  onProgress?: (pct: number, msg: string) => void,
+  onProgress?: (pct: number, msg: string, stage: string) => void,
 ): Promise<MultiCoverageResult> {
-  onProgress?.(10, "SRTM/건물 데이터 로드 중...");
-  await invoke("init_pixel_coverage", {
-    radarLat: radar.latitude,
-    radarLon: radar.longitude,
-    radarAltitude: radar.altitude,
-    antennaHeight: radar.antenna_height,
-    rangeNm: radar.range_nm,
-  });
+  onProgress?.(0, "SRTM/건물 데이터 로드 중...", "srtm");
+
+  // Rust 진행 이벤트 수신 — invoke 전에 등록, 완료/실패와 무관하게 해제
+  let unlisten: UnlistenFn | null = null;
+  try {
+    unlisten = await listen<CoverageInitProgress>("coverage-init-progress", (e) => {
+      const p = e.payload;
+      const pct = Math.max(0, Math.min(90, (p.pct ?? 0) * 0.9)); // init = 전체의 0~90%
+      onProgress?.(pct, p.msg ?? "", p.stage ?? "");
+    });
+    await invoke("init_pixel_coverage", {
+      radarLat: radar.latitude,
+      radarLon: radar.longitude,
+      radarAltitude: radar.altitude,
+      antennaHeight: radar.antenna_height,
+      rangeNm: radar.range_nm,
+    });
+  } finally {
+    if (unlisten) { try { unlisten(); } catch { /* noop */ } }
+  }
   _pixelCacheReady = true;
   _currentRadarKey = radarKey(radar);
 
-  onProgress?.(100, "완료");
+  onProgress?.(90, "지도 비트맵 렌더링 중...", "done");
   return {
     radarName: radar.name, radarLat: radar.latitude, radarLon: radar.longitude,
     radarAltitude: radar.altitude, antennaHeight: radar.antenna_height,

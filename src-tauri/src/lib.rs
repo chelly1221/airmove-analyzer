@@ -2733,9 +2733,20 @@ async fn init_pixel_coverage(
         let state = app_handle.state::<AppState>();
         let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
         let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+        // 진행 이벤트 — 프론트(gpuCoverage.ts)가 listen("coverage-init-progress") 로 수신
+        let h = app_handle.clone();
         analysis::coverage::init_pixel_coverage(
             &mut srtm, &conn,
             radar_lat, radar_lon, radar_altitude, antenna_height, range_nm,
+            |pct, stage, msg, counts| {
+                let _ = h.emit("coverage-init-progress", serde_json::json!({
+                    "stage": stage,
+                    "pct": pct,
+                    "msg": msg,
+                    "done": counts.map(|c| c.0),
+                    "total": counts.map(|c| c.1),
+                }));
+            },
         );
         Ok(())
     })
