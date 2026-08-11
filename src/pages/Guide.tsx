@@ -4,7 +4,7 @@ import { useTourStore } from "../tour/tourStore";
 
 /**
  * 사용방법 — 시나리오별 투어 목록.
- * 투어는 실제 UI 요소를 하이라이트하며 창(메인 → 단일항적분석 → 지도)을 릴레이한다.
+ * 투어는 실제 UI 요소를 하이라이트하며 창(메인 → 2D 항적현시 → 지도)을 릴레이한다.
  */
 export default function Guide() {
   const start = useTourStore((s) => s.start);

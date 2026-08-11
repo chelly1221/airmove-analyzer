@@ -3,7 +3,6 @@
 //! LoS 경로 상의 건물을 조회하여 높이 정보를 반환하고,
 //! 수동 등록 건물 및 건물 그룹 CRUD를 제공.
 
-use std::collections::{HashMap, HashSet};
 use std::io::{Read as IoRead, Seek};
 use std::path::Path;
 
@@ -43,7 +42,8 @@ fn line_seg_intersect_t(
 }
 
 /// 점이 폴리곤 내부인지 판정 (ray casting, (x,y) 좌표계)
-fn point_in_polygon_2d(px: f64, py: f64, polygon: &[(f64, f64)]) -> bool {
+/// (중복 억제 판정(suppression.rs)도 동일 규약으로 풋프린트 피복을 재기 위해 crate 내 공개)
+pub(crate) fn point_in_polygon_2d(px: f64, py: f64, polygon: &[(f64, f64)]) -> bool {
     let n = polygon.len();
     if n < 3 {
         return false;
@@ -168,11 +168,26 @@ pub struct FacBuildingDetail {
     pub lon: f64,
 }
 
+/// contained(폴리곤 내부 포함) 후보 경합 시 우선순위 키 — 값이 클수록 우선.
+/// ① 대장 속성(건물명·동명칭·PNU 중 하나) 보유 행 ② 억제되지 않은(suppressed_by IS NULL) 행.
+/// 실측3D 신규행은 대장 속성이 비어 있어, 같은 자리를 덮는 억제된 대장 행이 유일한 속성 원천이다.
+fn fac_detail_contained_rank(d: &FacBuildingDetail, suppressed: bool) -> u8 {
+    let has_ledger = d.name.is_some() || d.dong_name.is_some() || d.pnu.is_some();
+    (if has_ledger { 2 } else { 0 }) + (if suppressed { 0 } else { 1 })
+}
+
 /// 주어진 좌표를 포함(또는 최근접)하는 FAC 건물 1건 조회.
 /// 1) bbox 후보 중 폴리곤 내부 포함 건물 우선,
 /// 2) 없으면 centroid 최근접(반경 radius_m 이내).
+///
+/// 억제 행(suppressed_by)을 후보에서 빼지 않는 것은 의도다 — 실측3D 신규행이 대장 행 자리를 덮으면
+/// 대장 속성(건물명/동명칭/PNU/용도)은 억제된 그 행에만 남아, 필터하면 드로어 정보가 통째로 사라진다.
+/// 대신 contained 경합은 `fac_detail_contained_rank` 로 결정론적으로 고른다.
 pub fn query_fac_building_detail(
     conn: &Connection,
+    // 지반고 = centroid SRTM(live). fac_buildings.ground_elev 캐시 컬럼은 미백필 행이 많고
+    // 실측 지반고 융합 보정도 반영되지 않으므로 사용 금지(프로젝트 불변식 — query_building_near_point 와 동일).
+    srtm: &mut crate::srtm::SrtmReader,
     lat: f64,
     lon: f64,
     radius_m: f64,
@@ -181,7 +196,7 @@ pub fn query_fac_building_detail(
     let buf = eff_radius / 111_000.0;
     // 상세 카드는 대장 높이(height)와 실측(1m DSM) 지붕고(height_measured)를 모두 보여주므로 둘 다 조회
     let mut stmt = conn.prepare(
-        "SELECT building_name, dong_name, usability, pnu, bd_mgt_sn, height, COALESCE(ground_elev, 0), region, centroid_lat, centroid_lon, polygon_json, height_measured
+        "SELECT building_name, dong_name, usability, pnu, bd_mgt_sn, height, region, centroid_lat, centroid_lon, polygon_json, height_measured, suppressed_by
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4"
@@ -197,36 +212,40 @@ pub fn query_fac_building_detail(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, f64>(5)?,
-                row.get::<_, f64>(6)?,
-                row.get::<_, String>(7)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, f64>(7)?,
                 row.get::<_, f64>(8)?,
-                row.get::<_, f64>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<f64>>(11)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         },
     ).map_err(|e| format!("FAC 상세 쿼리 실행 실패: {}", e))?;
 
-    let mut contained: Option<FacBuildingDetail> = None;
+    // (우선순위 키, 상세) — 같은 좌표를 여러 행이 포함할 때 '첫 매치 선착순'은 임포트 순서에 좌우된다
+    let mut contained: Option<(u8, FacBuildingDetail)> = None;
     let mut best: Option<(f64, FacBuildingDetail)> = None; // (거리 km, 상세)
 
     for row in rows {
-        let (name, dong_name, usage, pnu, bd_mgt_sn, height, ground_elev, region, clat, clon, polygon_json, height_measured) =
+        let (name, dong_name, usage, pnu, bd_mgt_sn, height, region, clat, clon, polygon_json, height_measured, suppressed_by) =
             row.map_err(|e| format!("FAC 상세 행 읽기 실패: {}", e))?;
+        // ground_elev_m 은 반환 확정 후 1건만 live SRTM 으로 채운다(아래) — 여기서는 자리표시자 0.0
         let detail = FacBuildingDetail {
             name, dong_name, usage, pnu, bd_mgt_sn,
-            height_m: height, height_measured_m: height_measured, ground_elev_m: ground_elev,
+            height_m: height, height_measured_m: height_measured, ground_elev_m: 0.0,
             region, lat: clat, lon: clon,
         };
         // 1) 폴리곤 내부 포함 건물 우선 (정확)
-        if contained.is_none() {
-            if let Some(s) = polygon_json.as_deref() {
-                if let Ok(poly) = serde_json::from_str::<Vec<[f64; 2]>>(s) {
-                    let ring: Vec<(f64, f64)> = poly.iter().map(|p| (p[1], p[0])).collect();
-                    if point_in_polygon_2d(lon, lat, &ring) {
-                        contained = Some(detail);
-                        continue;
+        if let Some(s) = polygon_json.as_deref() {
+            if let Ok(poly) = serde_json::from_str::<Vec<[f64; 2]>>(s) {
+                let ring: Vec<(f64, f64)> = poly.iter().map(|p| (p[1], p[0])).collect();
+                if point_in_polygon_2d(lon, lat, &ring) {
+                    let rank = fac_detail_contained_rank(&detail, suppressed_by.is_some());
+                    // 동률은 기존대로 먼저 만난 행 유지
+                    if contained.as_ref().map_or(true, |(br, _)| rank > *br) {
+                        contained = Some((rank, detail));
                     }
+                    continue;
                 }
             }
         }
@@ -237,11 +256,14 @@ pub fn query_fac_building_detail(
         }
     }
 
-    if let Some(c) = contained {
+    // 지반고는 '반환할 1건'이 확정된 뒤에만 조회한다 — bbox 후보 전수 SRTM 조회 금지(클릭당 1점).
+    if let Some((_, mut c)) = contained {
+        c.ground_elev_m = srtm.get_elevation(c.lat, c.lon).unwrap_or(0.0);
         return Ok(Some(c));
     }
-    if let Some((d, detail)) = best {
+    if let Some((d, mut detail)) = best {
         if d * 1000.0 <= eff_radius {
+            detail.ground_elev_m = srtm.get_elevation(detail.lat, detail.lon).unwrap_or(0.0);
             return Ok(Some(detail));
         }
     }
@@ -360,11 +382,14 @@ pub fn query_building_near_point(
     // fac 지반 = centroid SRTM(live). ground_elev 캐시 컬럼은 미백필 행이 많아 사용 금지(프로젝트 불변식).
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 3D 표출·상세 카드가 실측 형상과 일치하게.
     //   height_measured 는 별도로도 읽어 '실측' 배지 표기에 사용.
+    // 억제된 행(suppressed_by) 제외 — 여기서는 fac 후보가 contained 판정에서 manual 을 이기므로,
+    //   수동/실측이 덮어 억제한 대장 행이 남아 있으면 우선순위(수동 > 실측 > 대장)가 뒤집힌다.
     let mut stmt = conn.prepare(
         "SELECT building_name, usability, COALESCE(height_measured, height), centroid_lat, centroid_lon, polygon_json, height_measured
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
-           AND centroid_lon BETWEEN ?3 AND ?4"
+           AND centroid_lon BETWEEN ?3 AND ?4
+           AND suppressed_by IS NULL"
     ).map_err(|e| format!("건물 근접 FAC 쿼리 준비 실패: {}", e))?;
     let rows = stmt.query_map(
         params![lat - buf, lat + buf, lon - buf, lon + buf],
@@ -606,266 +631,6 @@ pub fn radar_own_building_ids(conn: &Connection, radar_lat: f64, radar_lon: f64)
     ids
 }
 
-// ─── 실측 우선 중복 제거 (실측 bbox 겹침 인덱스) ─────────────────
-//
-// fac_buildings 에는 ① 대장(GIS) 행과 ② 실측 1m DSM 임포트 행이 공존한다.
-// 임포트(measured_building.rs::import_from_bin)는 실측 건물별 bbox 최대교차 후보 1건만 매칭하고
-// 미매칭 블롭은 region='실측3D' 신규 행으로 INSERT 하므로, 매칭 실패 구역에서는 실측3D 행과
-// 비실측 대장 행이 같은 자리에 겹친다. 이 겹침을 그대로 두면 BRA 프리즘·3D fill-extrusion 박스가
-// 이중 렌더되고 불투명 입체끼리 서로 가려 "빨강 일부 방위 누락" 증상이 된다.
-
-/// 실측 우선 중복 제거 임계 — 비실측(대장) 행의 **실제 폴리곤 풋프린트** 면적이 실측 행
-/// 풋프린트들에 이 비율 이상 덮이면 같은 건물의 중복으로 보고 표시/판정에서 제외.
-/// 면적비는 후보 풋프린트 내부 격자 샘플점의 피복 비율로 근사한다(`covers_footprint`).
-/// 3% = 매우 공격적(사용자 지시 "무조건 실측 우선") — 실측 풋프린트와 가장자리만 겹치는 인접
-/// 대장 건물도 제외될 수 있음을 감수하고, 실측 커버 구역의 대장 중복을 사실상 전부 걷어낸다.
-pub const MEASURED_COVER_RATIO: f64 = 0.03;
-
-/// 겹침 인덱스 셀 크기 (deg) — measured_building.rs 의 후보 버킷(CELL_DEG)과 동일 규약. 약 111m × 88m
-const OVERLAP_CELL_DEG: f64 = 0.001;
-
-/// bbox 가 걸치는 셀 축당 최대 개수 (비정상 bbox 방어) — measured_building.rs MAX_CELL_SPAN 과 동일
-const OVERLAP_MAX_CELL_SPAN: i32 = 256;
-
-/// 풋프린트 피복률 격자 샘플 축당 점 수 (24×24 = 576점)
-const OVERLAP_SAMPLE_N: i32 = 24;
-
-/// 실측 폴리곤 lazy 로드 배치 크기 (id IN (...)) — analysis/bra.rs POLY_BATCH 관례와 동일
-const OVERLAP_POLY_BATCH: usize = 500;
-
-/// 좌표 → 겹침 인덱스 셀 (measured_building.rs::cell_of 와 동일 식)
-#[inline]
-fn overlap_cell_of(lat: f64, lon: f64) -> (i32, i32) {
-    (
-        (lat / OVERLAP_CELL_DEG).floor() as i32,
-        (lon / OVERLAP_CELL_DEG).floor() as i32,
-    )
-}
-
-/// 조회 영역 내 실측 행 bbox 를 0.001° 셀 버킷에 적재한 겹침 판정 인덱스.
-/// measured_building.rs 의 후보 버킷(CELL_DEG=0.001, MAX_CELL_SPAN=256)과 동일 규약.
-/// bbox 는 **1차 프리필터 전용**이고, 확정 판정은 실제 폴리곤 풋프린트로 한다(`covers_footprint`).
-pub struct MeasuredOverlapIndex {
-    /// 셀 → 그 셀을 걸치는 실측 행 (id, bbox[min_lat, max_lat, min_lon, max_lon]) 목록
-    buckets: HashMap<(i32, i32), Vec<(i64, [f64; 4])>>,
-    /// 실측 행 id → 풋프린트 링 (lon, lat). 파싱 실패/3점 미만은 None 을 캐시해 재조회를 막는다.
-    /// 프리필터에 걸린 행만 lazy 로드하므로 뷰포트 전체 폴리곤을 읽지 않는다.
-    poly_cache: HashMap<i64, Option<Vec<(f64, f64)>>>,
-}
-
-impl MeasuredOverlapIndex {
-    /// 주어진 bbox 와 겹치는 실측 행을 읽어 셀 버킷을 구성.
-    /// 준비/실행 실패는 로그만 남기고 빈 인덱스 반환(제외 없음, fail-open — 치명 아님).
-    pub fn load(conn: &Connection, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> Self {
-        let mut buckets: HashMap<(i32, i32), Vec<(i64, [f64; 4])>> = HashMap::new();
-        let poly_cache: HashMap<i64, Option<Vec<(f64, f64)>>> = HashMap::new();
-
-        // WHERE 절의 실측 술어 텍스트는 db.rs 의 파셜 인덱스 idx_fac_buildings_measured_bbox
-        // predicate 와 동일해야 플래너가 그 인덱스를 선택한다(db.rs:268 주석의 기존 계약) — 문구 변경 금지.
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon
-             FROM fac_buildings
-             WHERE (height_measured IS NOT NULL OR region='실측3D')
-               AND bbox_max_lat >= ?1 AND bbox_min_lat <= ?2
-               AND bbox_max_lon >= ?3 AND bbox_min_lon <= ?4",
-        ) else {
-            log::warn!("[실측중복] 겹침 인덱스 쿼리 준비 실패 — 중복 제거 생략");
-            return Self { buckets, poly_cache };
-        };
-
-        let Ok(rows) = stmt.query_map(params![min_lat, max_lat, min_lon, max_lon], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<f64>>(1)?,
-                row.get::<_, Option<f64>>(2)?,
-                row.get::<_, Option<f64>>(3)?,
-                row.get::<_, Option<f64>>(4)?,
-            ))
-        }) else {
-            log::warn!("[실측중복] 겹침 인덱스 쿼리 실행 실패 — 중복 제거 생략");
-            return Self { buckets, poly_cache };
-        };
-
-        let mut loaded = 0usize;
-        for row in rows.flatten() {
-            // bbox 미기입(NULL) 행은 프리필터 근거가 없어 스킵
-            let (id, Some(b_min_lat), Some(b_max_lat), Some(b_min_lon), Some(b_max_lon)) = row
-            else {
-                continue;
-            };
-            if !(b_min_lat.is_finite()
-                && b_max_lat.is_finite()
-                && b_min_lon.is_finite()
-                && b_max_lon.is_finite())
-                || b_max_lat < b_min_lat
-                || b_max_lon < b_min_lon
-            {
-                continue;
-            }
-
-            let (r0, c0) = overlap_cell_of(b_min_lat, b_min_lon);
-            let (r1, c1) = overlap_cell_of(b_max_lat, b_max_lon);
-            // 축당 셀 수가 과대한 비정상 bbox 는 스킵 (임포트 모듈과 동일 방어)
-            if r1 - r0 > OVERLAP_MAX_CELL_SPAN || c1 - c0 > OVERLAP_MAX_CELL_SPAN {
-                continue;
-            }
-
-            let bbox = [b_min_lat, b_max_lat, b_min_lon, b_max_lon];
-            for r in r0..=r1 {
-                for cc in c0..=c1 {
-                    buckets.entry((r, cc)).or_default().push((id, bbox));
-                }
-            }
-            loaded += 1;
-        }
-
-        log::debug!("[실측중복] 실측 bbox {}동 / 버킷 {}셀", loaded, buckets.len());
-        Self { buckets, poly_cache }
-    }
-
-    /// 인덱스가 비었는지 (호출부 단락용 — 실측 임포트 전 DB 면 판정 호출 자체를 생략)
-    pub fn is_empty(&self) -> bool {
-        self.buckets.is_empty()
-    }
-
-    /// 후보의 실제 풋프린트가 실측 풋프린트들에 MEASURED_COVER_RATIO 이상 덮이는지.
-    /// polygon 은 DB 관례 [[lat, lon], ...]. 1차 bbox 프리필터 → 걸린 실측 행만 폴리곤 lazy
-    /// 로드(batch) → 후보 폴리곤 내부 격자 샘플점의 피복 비율로 판정.
-    ///
-    /// bbox 는 축 정렬 최소 직사각형이라 대각선/L자형 건물에서는 실제 풋프린트보다 훨씬 크다.
-    /// bbox 만으로 판정하면 실제로는 닿지도 않는 인접 건물이 '유령 겹침'으로 오제외되므로,
-    /// bbox 는 저비용 프리필터로만 쓰고 확정은 폴리곤 내부점으로 한다.
-    ///
-    /// 24×24=576 샘플이라 3% 임계 판정은 내부점 수 분의 수 샘플 수준의 몬테카를로 근사다
-    /// (경계 근처 비율은 흔들릴 수 있음). 핵심 개선은 유령 bbox 겹침(실제 풋프린트 비접촉)이
-    /// 0% 로 정확히 걸러진다는 점.
-    /// 실측3D 행은 원천(1m DSM 임포트)이 bbox 사각형 폴리곤이라 그 사각형이 곧 풋프린트다
-    /// — 데이터 한계이지 판정의 부정확이 아니다.
-    pub fn covers_footprint(&mut self, conn: &Connection, polygon: &[[f64; 2]]) -> bool {
-        if polygon.len() < 3 {
-            return false;
-        }
-
-        // ① 후보 bbox 산출 (폴리곤 직접 — 대장 bbox 컬럼 의존 없음)
-        let mut min_lat = f64::INFINITY;
-        let mut max_lat = f64::NEG_INFINITY;
-        let mut min_lon = f64::INFINITY;
-        let mut max_lon = f64::NEG_INFINITY;
-        for p in polygon {
-            if !p[0].is_finite() || !p[1].is_finite() {
-                return false; // 비정상 좌표 — 판정 불가(제외하지 않음)
-            }
-            min_lat = min_lat.min(p[0]);
-            max_lat = max_lat.max(p[0]);
-            min_lon = min_lon.min(p[1]);
-            max_lon = max_lon.max(p[1]);
-        }
-        let own_area = (max_lat - min_lat) * (max_lon - min_lon);
-        if own_area <= 0.0 || !own_area.is_finite() {
-            return false; // 퇴화(선/점) 풋프린트 — 판정 불가
-        }
-
-        // ② bbox 프리필터 — 대부분의 후보가 여기서 0건으로 끝난다(저비용)
-        let (r0, c0) = overlap_cell_of(min_lat, min_lon);
-        let (r1, c1) = overlap_cell_of(max_lat, max_lon);
-        if r1 - r0 > OVERLAP_MAX_CELL_SPAN || c1 - c0 > OVERLAP_MAX_CELL_SPAN {
-            return false; // 비정상 bbox — fail-open
-        }
-        let mut seen: HashSet<i64> = HashSet::new();
-        let mut near: Vec<(i64, [f64; 4])> = Vec::new();
-        for r in r0..=r1 {
-            for cc in c0..=c1 {
-                let Some(list) = self.buckets.get(&(r, cc)) else {
-                    continue;
-                };
-                for (id, b) in list {
-                    // 같은 실측 행이 여러 셀에 등록돼 있으므로 id dedup
-                    if !seen.insert(*id) {
-                        continue;
-                    }
-                    // bbox 교차 여부 (경계 접촉 포함)
-                    if max_lat < b[0] || min_lat > b[1] || max_lon < b[2] || min_lon > b[3] {
-                        continue;
-                    }
-                    near.push((*id, *b));
-                }
-            }
-        }
-        if near.is_empty() {
-            return false;
-        }
-
-        // ③ 캐시에 없는 실측 폴리곤만 배치 조회 (id 는 DB 에서 읽은 i64 — 문자열 결합 안전)
-        let missing: Vec<i64> = near
-            .iter()
-            .filter(|(id, _)| !self.poly_cache.contains_key(id))
-            .map(|(id, _)| *id)
-            .collect();
-        for chunk in missing.chunks(OVERLAP_POLY_BATCH) {
-            let id_list: Vec<String> = chunk.iter().map(|id| id.to_string()).collect();
-            let sql = format!(
-                "SELECT id, polygon_json FROM fac_buildings WHERE id IN ({})",
-                id_list.join(",")
-            );
-            if let Ok(mut stmt) = conn.prepare(&sql) {
-                if let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-                }) {
-                    for (id, poly_json) in rows.flatten() {
-                        // 폴리곤은 [[lat, lon], ...] (기존 파싱 관례) → (lon, lat) 링으로 변환
-                        let ring = poly_json
-                            .as_deref()
-                            .and_then(|s| serde_json::from_str::<Vec<[f64; 2]>>(s).ok())
-                            .filter(|p| p.len() >= 3)
-                            .map(|p| p.iter().map(|v| (v[1], v[0])).collect::<Vec<(f64, f64)>>());
-                        self.poly_cache.insert(id, ring);
-                    }
-                }
-            }
-            // 조회 실패/미반환 id 는 None 을 박아 재조회를 막는다(fail-open — 그 행은 피복 근거 없음)
-            for id in chunk {
-                self.poly_cache.entry(*id).or_insert(None);
-            }
-        }
-
-        // ④ 후보 bbox 위 24×24 격자 샘플 — 후보 폴리곤 내부점만 분모로 삼고,
-        //    그 점을 덮는 실측 폴리곤이 하나라도 있으면 피복으로 센다.
-        let cand_ring: Vec<(f64, f64)> = polygon.iter().map(|v| (v[1], v[0])).collect();
-        let step_lat = (max_lat - min_lat) / OVERLAP_SAMPLE_N as f64;
-        let step_lon = (max_lon - min_lon) / OVERLAP_SAMPLE_N as f64;
-        let mut inside = 0u32;
-        let mut covered = 0u32;
-        for i in 0..OVERLAP_SAMPLE_N {
-            let lat = min_lat + (i as f64 + 0.5) * step_lat;
-            for j in 0..OVERLAP_SAMPLE_N {
-                let lon = min_lon + (j as f64 + 0.5) * step_lon;
-                if !point_in_polygon_2d(lon, lat, &cand_ring) {
-                    continue;
-                }
-                inside += 1;
-                for (id, b) in &near {
-                    // bbox 퀵리젝트 후 실제 폴리곤 판정
-                    if lat < b[0] || lat > b[1] || lon < b[2] || lon > b[3] {
-                        continue;
-                    }
-                    let Some(Some(ring)) = self.poly_cache.get(id) else {
-                        continue;
-                    };
-                    if point_in_polygon_2d(lon, lat, ring) {
-                        covered += 1;
-                        break;
-                    }
-                }
-            }
-        }
-        if inside == 0 {
-            return false; // 격자에 안 잡히는 초미세/슬리버 풋프린트 — fail-open
-        }
-
-        covered as f64 / inside as f64 >= MEASURED_COVER_RATIO
-    }
-}
-
 /// LoS 경로(레이더→타겟) 상의 건물 조회
 pub fn query_buildings_along_path(
     conn: &Connection,
@@ -905,13 +670,16 @@ pub fn query_buildings_along_path(
     //   세그먼트 bbox 는 직선에 밀착해 후보를 수십분의 1 로 줄인다(실측: 200NM 대각 595k→23k). centroid 인덱스 활용,
     //   인접 세그먼트 buffer 중첩분은 id 로 1회만 처리.
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — LoS 단면도/차단 판정이 실측 지붕고를 쓰도록.
+    // 억제 행 제외는 bra.rs 와 동일 계약(저장 시점 확정 플래그 단순 필터) — 같은 실체의 중복 대장 행이
+    //   단면도·차단 판정에 이중 참여하는 것을 막는다.
     let mut stmt = conn.prepare(
         "SELECT id, centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, dong_name, usability, polygon_json
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND COALESCE(height_measured, height) > 0
-           AND COALESCE(height_measured, height) <= ?5"
+           AND COALESCE(height_measured, height) <= ?5
+           AND suppressed_by IS NULL"
     ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
 
     // 세그먼트 길이 ~3km — 각 bbox 는 (3km + buffer) 정사각 근방. 짧은 코리도는 1세그먼트(종전과 동일).
@@ -1298,6 +1066,9 @@ pub struct Buildings3DBinary {
 /// 폴리곤 좌표를 Float64로 패킹: [lon, lat, height, vertexCount, v0_lon, v0_lat, ...]
 pub fn query_buildings_3d_binary(
     conn: &Connection,
+    // FAC 건물 지반 = centroid SRTM(live). ground_elev 캐시 컬럼은 미백필 행이 많고 실측 지반고
+    // 융합 보정도 반영되지 않으므로 사용 금지(프로젝트 불변식 — GeoJSON/LoS 자매 경로와 동일 소스).
+    srtm: &mut crate::srtm::SrtmReader,
     min_lat: f64,
     max_lat: f64,
     min_lon: f64,
@@ -1310,6 +1081,16 @@ pub fn query_buildings_3d_binary(
 
     let skip_manual = exclude_sources.iter().any(|s| s == "manual");
     let skip_fac = exclude_sources.iter().any(|s| s == "fac");
+
+    // FAC 행 지반고 조회 전에 타일 프리로드 1회 — 이후 행별 조회는 캐시 히트 O(1)
+    if !skip_fac {
+        srtm.preload_tiles(
+            min_lat.floor() as i32,
+            max_lat.floor() as i32,
+            min_lon.floor() as i32,
+            max_lon.floor() as i32,
+        );
+    }
 
     // 좌표 데이터를 f64 벡터로 패킹
     let mut floats: Vec<f64> = Vec::new();
@@ -1376,18 +1157,17 @@ pub fn query_buildings_3d_binary(
 
     // FAC 건물 (fac_buildings 테이블 없을 수 있음 — 실패 시 무시)
     if !skip_fac {
-        // 실측 우선 중복 제거용 겹침 인덱스 — 뷰포트당 1회 적재
-        let mut overlap_idx = MeasuredOverlapIndex::load(conn, min_lat, max_lat, min_lon, max_lon);
-
         // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 3D 건물 렌더 높이/필터/정렬 모두 동일 기준.
+        // 중복 제거는 저장 시점에 확정된 suppressed_by 플래그로 처리(suppression.rs) — 조회 시점 겹침 계산 없음.
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, usability, polygon_json, COALESCE(ground_elev, 0),
+            "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, usability, polygon_json,
                     (height_measured IS NOT NULL OR region = '실측3D')
              FROM fac_buildings
              WHERE centroid_lat BETWEEN ?1 AND ?2
                AND centroid_lon BETWEEN ?3 AND ?4
                AND COALESCE(height_measured, height) >= ?5
                AND COALESCE(height_measured, height) <= ?6
+               AND suppressed_by IS NULL
              ORDER BY COALESCE(height_measured, height) DESC
              LIMIT ?7"
         ) {
@@ -1402,13 +1182,12 @@ pub fn query_buildings_3d_binary(
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, f64>(6)?,
-                        row.get::<_, bool>(7)?,
+                        row.get::<_, bool>(6)?,
                     ))
                 },
             ) {
                 for row in rows {
-                    let (lat, lon, height, name, usage, poly_json, ground_elev, measured) =
+                    let (lat, lon, height, name, usage, poly_json, measured) =
                         match row {
                             Ok(r) => r,
                             Err(_) => continue,
@@ -1420,15 +1199,8 @@ pub fn query_buildings_3d_binary(
                     };
                     if polygon.len() < 3 { continue; }
 
-                    // 실측 우선 — 실제 풋프린트가 실측 풋프린트에 상당 부분 덮이는 비실측 대장 행은
-                    // 같은 건물 중복으로 보고 제외 (BRA 프리즘·박스 이중 렌더 방지).
-                    // LIMIT 는 제외 전 SQL 에서 걸리므로 제외분만큼 슬롯 낭비가 있지만 허용.
-                    if !measured
-                        && !overlap_idx.is_empty()
-                        && overlap_idx.covers_footprint(conn, &polygon)
-                    {
-                        continue;
-                    }
+                    // 지반 = centroid SRTM(live) — 실측 지반고 융합 보정이 즉시 반영된다
+                    let ground_elev = srtm.get_elevation(lat, lon).unwrap_or(0.0);
 
                     floats.push(lon);
                     floats.push(lat);
@@ -1617,6 +1389,99 @@ pub fn list_manual_buildings(conn: &Connection) -> Result<Vec<ManualBuilding>, S
         .map_err(|e| format!("결과 수집 실패: {}", e))
 }
 
+/// 자동(SRTM) 모드 수동 건물의 지반고 재동기화 — 갱신 행 수 반환.
+///
+/// `elev_mode='auto'` 행의 ground_elev 는 등록/수정 시점 SRTM 스냅샷이라, 실측 3D 임포트로
+/// 지반고 융합 보정이 생기거나(임포트) 사라져도(초기화) 저장값이 낡은 채 남는다.
+/// 저장값은 LoS 단면·파노라마·BRA·3D 패킹이 그대로 쓰므로(수동 지반 = 저장값 계약) 여기서 다시 맞춘다.
+/// - `elev_mode='manual'` / `''`(레거시, 모드 미상) 행은 절대 갱신하지 않는다 — 사용자 확정값 존중.
+/// - 반올림 정수 저장은 프론트 등록 규약(`String(Math.round(...))`)과 레거시 모드 추론의
+///   정수 일치 비교(BuildingModal)와 정합을 유지하기 위함.
+/// - 호출자는 융합 세대가 확정된 뒤(보정 저장/삭제 + `srtm.clear_cache()` 이후)에 호출해야 한다.
+pub fn resync_auto_manual_ground(
+    conn: &Connection,
+    srtm: &mut crate::srtm::SrtmReader,
+) -> Result<usize, String> {
+    let rows: Vec<(i64, f64, f64)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, latitude, longitude FROM manual_buildings WHERE elev_mode = 'auto'")
+            .map_err(|e| format!("수동 건물 지반고 재동기화 SELECT 준비 실패: {}", e))?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| format!("수동 건물 지반고 재동기화 쿼리 실패: {}", e))?;
+        mapped.filter_map(|r| r.ok()).collect()
+    };
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut upd = conn
+        .prepare("UPDATE manual_buildings SET ground_elev = ?1 WHERE id = ?2")
+        .map_err(|e| format!("수동 건물 지반고 재동기화 UPDATE 준비 실패: {}", e))?;
+    let mut updated = 0usize;
+    for (id, lat, lon) in &rows {
+        let g = srtm.get_elevation(*lat, *lon).unwrap_or(0.0).round();
+        if upd.execute(params![g, id]).is_ok() {
+            updated += 1;
+        }
+    }
+    log::info!("[수동건물] 자동(SRTM) 지반고 재동기화 {}행", updated);
+    Ok(updated)
+}
+
+/// 수동 건물 1동의 저장된 기하 조회 → 중복 억제 재계산 영역 bbox
+/// [min_lat, max_lat, min_lon, max_lon]. 행이 없거나 조회 실패면 None.
+fn manual_area_bbox(conn: &Connection, id: i64) -> Option<[f64; 4]> {
+    conn.query_row(
+        "SELECT latitude, longitude, geometry_type, geometry_json FROM manual_buildings WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )
+    .ok()
+    .map(|(lat, lon, gt, gj)| {
+        crate::suppression::manual_bbox(lat, lon, gt.as_deref(), gj.as_deref())
+    })
+}
+
+/// 두 bbox 의 합집합 (둘 다 없으면 None)
+fn union_bbox(a: Option<[f64; 4]>, b: Option<[f64; 4]>) -> Option<[f64; 4]> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some([
+            x[0].min(y[0]),
+            x[1].max(y[1]),
+            x[2].min(y[2]),
+            x[3].max(y[3]),
+        ]),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+/// 수동 건물 변경 후 해당 영역의 중복 억제(suppressed_by) 재계산.
+/// 실패는 비치명 — log::warn 만 남기고 원 CRUD 는 성공으로 유지한다.
+fn resuppress_manual_area(conn: &Connection, bbox: Option<[f64; 4]>, what: &str) {
+    let Some(b) = bbox else {
+        log::warn!("[중복억제] {} — 재계산 영역 산출 실패, 건너뜀", what);
+        return;
+    };
+    let m = crate::suppression::AREA_MARGIN_DEG;
+    match crate::suppression::recompute_area(conn, b[0] - m, b[1] + m, b[2] - m, b[3] + m) {
+        Ok((s, c)) if s > 0 || c > 0 => {
+            log::info!("[중복억제] {} — 억제 {}행 · 해제 {}행", what, s, c)
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("[중복억제] {} — 재계산 실패: {}", what, e),
+    }
+}
+
 /// 수동 건물 추가 (생성된 id 반환)
 pub fn add_manual_building(
     conn: &Connection,
@@ -1635,7 +1500,15 @@ pub fn add_manual_building(
         "INSERT INTO manual_buildings (name, latitude, longitude, height, ground_elev, elev_mode, memo, geometry_type, geometry_json, group_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![name, latitude, longitude, height, ground_elev, elev_mode, memo, geometry_type, geometry_json, group_id],
     ).map_err(|e| format!("INSERT 실패: {}", e))?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+
+    // 새 수동 건물이 덮는 fac 행 억제 (수동등록 최우선)
+    let bbox = crate::suppression::manual_bbox(
+        latitude, longitude, Some(geometry_type), geometry_json,
+    );
+    resuppress_manual_area(conn, Some(bbox), "수동 건물 추가");
+
+    Ok(id)
 }
 
 /// 수동 건물 수정
@@ -1653,17 +1526,41 @@ pub fn update_manual_building(
     geometry_json: Option<&str>,
     group_id: Option<i64>,
 ) -> Result<(), String> {
+    // 이동/도형 변경 전 영역을 먼저 확보 — 변경 후에는 원래 자리를 알 수 없다
+    let old_bbox = manual_area_bbox(conn, id);
+
     conn.execute(
         "UPDATE manual_buildings SET name=?1, latitude=?2, longitude=?3, height=?4, ground_elev=?5, elev_mode=?6, memo=?7, geometry_type=?8, geometry_json=?9, group_id=?10 WHERE id=?11",
         params![name, latitude, longitude, height, ground_elev, elev_mode, memo, geometry_type, geometry_json, group_id, id],
     ).map_err(|e| format!("UPDATE 실패: {}", e))?;
+
+    // 이 건물이 원인인 억제를 먼저 전부 해제 — 재계산 영역 밖으로 이동한 잔재 방지
+    if let Err(e) = crate::suppression::clear_manual_suppression(conn, id) {
+        log::warn!("[중복억제] 수동 건물 수정 — 기존 억제 해제 실패: {}", e);
+    }
+
+    let new_bbox = crate::suppression::manual_bbox(
+        latitude, longitude, Some(geometry_type), geometry_json,
+    );
+    resuppress_manual_area(conn, union_bbox(old_bbox, Some(new_bbox)), "수동 건물 수정");
+
     Ok(())
 }
 
 /// 수동 건물 삭제
 pub fn delete_manual_building(conn: &Connection, id: i64) -> Result<(), String> {
+    // 삭제 전 영역 확보 + 이 건물이 원인인 억제 해제
+    let bbox = manual_area_bbox(conn, id);
+    if let Err(e) = crate::suppression::clear_manual_suppression(conn, id) {
+        log::warn!("[중복억제] 수동 건물 삭제 — 기존 억제 해제 실패: {}", e);
+    }
+
     conn.execute("DELETE FROM manual_buildings WHERE id = ?1", params![id])
         .map_err(|e| format!("DELETE 실패: {}", e))?;
+
+    // 남은 상위 자료(다른 수동 건물·실측)로 재평가 — 해제된 행이 실측 억제로 되돌아갈 수 있다
+    resuppress_manual_area(conn, bbox, "수동 건물 삭제");
+
     Ok(())
 }
 

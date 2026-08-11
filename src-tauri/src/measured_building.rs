@@ -2,7 +2,8 @@
 //!
 //! 항공 라이다 기반 1m DSM 에서 추출한 실측 건물 박스(`buildings_3d.bin`)를 읽어
 //! ① 기존 건물통합정보(fac_buildings) 행에 실측 지붕고를 `height_measured` 로 반영하고,
-//! ② GIS 대장에 없는 건물은 region='실측3D' 신규 행으로 추가한다.
+//! ② GIS 대장에 없는 건물은 region='실측3D' 신규 행으로 추가하며,
+//! ③ 박스의 기저부 최저 표면고(minH)로 SRTM 지반고 융합 보정을 생성한다(srtm.rs 가 로드 시 머지).
 //! 선정리(clear_measured) 후 전량 재적용하므로 재실행은 멱등(idempotent).
 //!
 //! ## buildings_3d.bin 레이아웃
@@ -46,6 +47,13 @@ const MAX_BUILDING_COUNT: usize = 5_000_000;
 /// bbox 가 걸치는 셀 축당 최대 개수 (비정상 bbox 방어)
 const MAX_CELL_SPAN: i32 = 256;
 
+/// SRTM 1-arcsec 타일의 노드 간격 수 (노드 인덱스 0..=3600)
+const SRTM_NODE_SPAN: f64 = 3600.0;
+
+/// 지반고 표본 유효 범위 (m, MSL) — 한반도 지형 + 해수면 여유. 벗어나면 그 표본만 폐기.
+const GROUND_SAMPLE_MIN_M: f64 = -10.0;
+const GROUND_SAMPLE_MAX_M: f64 = 2500.0;
+
 /// 임포트 진행률 이벤트
 #[derive(Clone, Serialize)]
 pub struct MeasuredImportProgress {
@@ -64,6 +72,8 @@ pub struct MeasuredImportSummary {
     pub matched: usize,
     pub inserted: usize,
     pub skipped: usize,
+    /// 지반고 융합 보정이 생성된 SRTM 노드 수 (건물 집계 total 과 무관한 별도 축)
+    pub corrected_cells: usize,
 }
 
 /// bin 파싱 결과 (grid 래스터는 v1 미사용이라 로드하지 않음)
@@ -270,10 +280,110 @@ fn bbox_polygon_json(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> 
     serde_json::to_string(&ring).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// SRTM 지반고 융합 보정 생성 — 실측 박스의 기저부 최저 표면고(minH)를 HGT 노드별로 모아
+/// 중앙값을 **절대 MSL** 로 `srtm_ground_corrections` 에 적재한다. 반환값 = 보정 노드 수.
+///
+/// 30m SRTM 은 도심에서 건물고가 섞인 DSM 편향을 갖는데, 1m DSM 의 건물 기저부는
+/// 실제 지반에 가까우므로 이를 노드별 중앙값(이상치에 강함)으로 대표시킨다.
+/// 델타가 아닌 절대 MSL 을 저장해야 SRTM 재다운로드 후에도 재계산 없이 자동 재적용된다.
+///
+/// **호출 시점 불변식**: SRTM 프리로드·건물 높이 계산(maxH − liveSRTM) **이전**에 완료하고
+/// 리더 캐시를 클리어해야, 같은 임포트 안에서 계산되는 실측 높이가 보정된 지반고를 쓴다.
+/// 다운샘플링 없이 전 박스를 순회한다.
+fn build_ground_corrections(
+    conn: &Connection,
+    bin: &MeasuredBin,
+    progress_fn: &dyn Fn(MeasuredImportProgress),
+) -> Result<usize, String> {
+    let count = bin.count;
+    progress_fn(MeasuredImportProgress {
+        total: count,
+        processed: 0,
+        status: "지반고 융합 보정 계산 중...".to_string(),
+    });
+
+    // 노드별 minH 표본 수집 (키 = 타일명 + HGT 노드 인덱스)
+    let mut samples: HashMap<(String, u32, u32), Vec<f32>> = HashMap::new();
+    let mut sampled = 0usize;
+
+    for i in 0..count {
+        if i > 0 && i % BATCH_SIZE == 0 {
+            progress_fn(MeasuredImportProgress {
+                total: count,
+                processed: i,
+                status: format!("지반고 융합 보정 계산 중... {}/{} (표본 {})", i, count, sampled),
+            });
+        }
+
+        let b = &bin.boxes[i * 6..i * 6 + 6];
+        let (m_min_lon, m_min_lat, m_max_lon, m_max_lat, min_h, max_h) = (
+            b[0] as f64,
+            b[1] as f64,
+            b[2] as f64,
+            b[3] as f64,
+            b[4] as f64,
+            b[5] as f64,
+        );
+        let clat = (m_min_lat + m_max_lat) / 2.0;
+        let clon = (m_min_lon + m_max_lon) / 2.0;
+
+        // 표본 위생 — 불통과 시 이 표본만 버리고 임포트는 계속 진행
+        if !min_h.is_finite()
+            || !(GROUND_SAMPLE_MIN_M..=GROUND_SAMPLE_MAX_M).contains(&min_h)
+            || !(min_h <= max_h)
+            || !in_domain(clat, clon)
+        {
+            continue;
+        }
+
+        // 최근접 HGT 노드 배정 (row 0 = 북단, col 0 = 서단, 0..=3600)
+        let tile_lat = clat.floor();
+        let tile_lon = clon.floor();
+        let row_f = ((tile_lat + 1.0 - clat) * SRTM_NODE_SPAN).round();
+        let col_f = ((clon - tile_lon) * SRTM_NODE_SPAN).round();
+        // 반올림이 타일 경계를 넘으면(음수/3601 이상) 이웃 타일 노드가 되므로 클램프 없이 스킵
+        if !(0.0..=SRTM_NODE_SPAN).contains(&row_f) || !(0.0..=SRTM_NODE_SPAN).contains(&col_f) {
+            continue;
+        }
+
+        let name = SrtmReader::tile_name(tile_lat as i32, tile_lon as i32);
+        samples
+            .entry((name, row_f as u32, col_f as u32))
+            .or_default()
+            .push(min_h as f32);
+        sampled += 1;
+    }
+
+    // 노드별 중앙값 → 영속화 행
+    let mut rows: Vec<(String, u32, u32, f64, u32)> = Vec::with_capacity(samples.len());
+    for ((name, row, col), mut vals) in samples.into_iter() {
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = vals.len();
+        let median = if n % 2 == 1 {
+            vals[n / 2] as f64
+        } else {
+            (vals[n / 2 - 1] as f64 + vals[n / 2] as f64) / 2.0
+        };
+        rows.push((name, row, col, median, n as u32));
+    }
+
+    crate::db::replace_srtm_ground_corrections(conn, &rows)
+        .map_err(|e| format!("지반고 보정 저장 실패: {}", e))?;
+
+    log::info!(
+        "[실측3D] 지반고 융합 보정 {}노드 (표본 {}동 / 전체 {}동)",
+        rows.len(),
+        sampled,
+        count
+    );
+    Ok(rows.len())
+}
+
 /// 실측 3D 건물(1m DSM) bin 임포트
 ///
-/// 1) 선정리(멱등) → 2) bin 파싱 → 3) SRTM 프리로드 → 4) 후보 그리드 버킷 →
-/// 5) 실측 건물별 bbox 최대교차 매칭(UPDATE) / 미매칭 신규 INSERT → 6) import_log 기록
+/// 1) bin 파싱 → 2) 선정리(멱등) → 3) SRTM 지반고 융합 보정 생성 + 리더 캐시 클리어 →
+/// 4) SRTM 프리로드(보정 반영본) → 5) 후보 그리드 버킷 →
+/// 6) 실측 건물별 bbox 최대교차 매칭(UPDATE) / 미매칭 신규 INSERT → 7) import_log 기록
 pub fn import_from_bin(
     conn: &Connection,
     srtm: &mut SrtmReader,
@@ -305,7 +415,13 @@ pub fn import_from_bin(
         bin.region
     );
 
-    // ③ SRTM 타일 프리로드 — 매칭/신규 모두 live SRTM 지반고를 쓰므로 미리 캐시
+    // ③ SRTM 지반고 융합 보정 생성 (건물 높이 계산 이전에 확정해야 상쇄 불변식 유지)
+    //    보정은 원본 srtm_tiles BLOB 을 건드리지 않고 사이드카 테이블에만 쌓이므로,
+    //    리더 캐시를 비워 이후 프리로드가 보정 머지된 타일을 다시 읽게 한다.
+    let corrected_cells = build_ground_corrections(conn, &bin, progress_fn)?;
+    srtm.clear_cache();
+
+    // ④ SRTM 타일 프리로드 — 매칭/신규 모두 live SRTM 지반고를 쓰므로 미리 캐시
     srtm.preload_tiles(
         bin.region[1].floor() as i32,
         bin.region[3].floor() as i32,
@@ -319,7 +435,7 @@ pub fn import_from_bin(
         status: "기존 건물 후보 로딩 중...".to_string(),
     });
 
-    // ④ 후보 인메모리 로드 + 0.001° 셀 버킷 (bbox 가 걸치는 셀 전부 등록)
+    // ⑤ 후보 인메모리 로드 + 0.001° 셀 버킷 (bbox 가 걸치는 셀 전부 등록)
     let cands = load_candidates(conn, &bin.region)?;
     let mut buckets: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
     for (idx, c) in cands.iter().enumerate() {
@@ -342,7 +458,7 @@ pub fn import_from_bin(
     }
     log::info!("[실측3D] 매칭 후보 {}동 / 버킷 {}셀", cands.len(), buckets.len());
 
-    // ⑤ 스캔 — 매칭(최대값 유지) / 미매칭 신규 INSERT
+    // ⑥ 스캔 — 매칭(최대값 유지) / 미매칭 신규 INSERT
     let mut height_map: HashMap<i64, f64> = HashMap::new();
     let mut matched = 0usize;
     let mut inserted = 0usize;
@@ -501,7 +617,7 @@ pub fn import_from_bin(
     }
     drop(ins);
 
-    // ⑥ 매칭분 일괄 UPDATE (같은 트랜잭션 흐름 안에서 배치 커밋)
+    // ⑦ 매칭분 일괄 UPDATE (같은 트랜잭션 흐름 안에서 배치 커밋)
     progress_fn(MeasuredImportProgress {
         total: count,
         processed: count,
@@ -539,7 +655,7 @@ pub fn import_from_bin(
     };
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
 
-    // ⑦ 임포트 로그
+    // ⑧ 임포트 로그
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -556,6 +672,29 @@ pub fn import_from_bin(
         count, matched, updated, inserted, skipped
     );
 
+    // ⑨ 우선순위 중복 억제 재계산 — region 전역(+여유). 새로 들어온 실측 행이 덮는 대장 행을
+    //    'measured:<fac_id>' 로, 수동 건물이 덮는 행을 'manual:<id>' 로 확정한다.
+    //    실패는 비치명 — 임포트 자체는 성공으로 유지(다음 등록/백필에서 재확정).
+    //    region = [min_lon, min_lat, max_lon, max_lat] (parse_bin 규약)
+    {
+        let m = crate::suppression::AREA_MARGIN_DEG;
+        progress_fn(MeasuredImportProgress {
+            total: count,
+            processed: count,
+            status: "중복 건물 정리 중...".to_string(),
+        });
+        match crate::suppression::recompute_area(
+            conn,
+            bin.region[1] - m,
+            bin.region[3] + m,
+            bin.region[0] - m,
+            bin.region[2] + m,
+        ) {
+            Ok((s, c)) => log::info!("[실측3D] 중복억제 재계산 — 억제 {}행 · 해제 {}행", s, c),
+            Err(e) => log::warn!("[실측3D] 중복억제 재계산 실패: {}", e),
+        }
+    }
+
     progress_fn(MeasuredImportProgress {
         total: count,
         processed: count,
@@ -570,6 +709,7 @@ pub fn import_from_bin(
         matched,
         inserted,
         skipped,
+        corrected_cells,
     })
 }
 
@@ -601,7 +741,8 @@ pub fn coverage_bbox(conn: &Connection) -> Result<Option<[f64; 4]>, String> {
     }
 }
 
-/// 실측 데이터 초기화 — 실측 지붕고 컬럼 해제 + 실측 신규행/로그 삭제
+/// 실측 데이터 초기화 — 실측 지붕고 컬럼 해제 + 실측 신규행/로그/지반고 보정 삭제
+/// (SRTM 리더 인메모리 캐시 무효화는 호출자 몫 — lib.rs 커맨드에서 `clear_cache()` 호출)
 pub fn clear_measured(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "UPDATE fac_buildings SET height_measured = NULL WHERE height_measured IS NOT NULL",
@@ -618,5 +759,18 @@ pub fn clear_measured(conn: &Connection) -> Result<(), String> {
         params![MEASURED_REGION],
     )
     .map_err(|e| format!("실측 임포트 로그 삭제 실패: {}", e))?;
+
+    // SRTM 지반고 융합 보정도 함께 제거 — 원본 srtm_tiles BLOB 은 애초에 불변이므로
+    // 사이드카만 비우면 다음 타일 로드부터 순수 SRTM 으로 복귀한다.
+    crate::db::clear_srtm_ground_corrections(conn)
+        .map_err(|e| format!("지반고 보정 초기화 실패: {}", e))?;
+
+    // 실측 원인 중복 억제 해제 — 원인이 사라졌으니 덮여 있던 대장 행을 되살린다(가역).
+    // 수동 원인('manual:%')은 원인이 남아 있으므로 유지. 실패는 비치명.
+    match crate::suppression::clear_measured_suppression(conn) {
+        Ok(n) if n > 0 => log::info!("[실측3D] 중복억제 해제 {}행", n),
+        Ok(_) => {}
+        Err(e) => log::warn!("[실측3D] 중복억제 해제 실패: {}", e),
+    }
     Ok(())
 }

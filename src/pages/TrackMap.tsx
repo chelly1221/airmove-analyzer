@@ -43,6 +43,18 @@ const GearButton = ({ active, onClick }: { active: boolean; onClick: () => void 
  *  (분석 레이어끼리는 EX 공유로 자동 정합 — BRA 침범 프리즘의 구 밴드 설계가 어긋났던 원인). */
 const TERRAIN_EXAGGERATION = 1;
 
+/** 융합 SRTM 지형 DEM 타일 URL (fused-dem 커스텀 프로토콜 — src-tauri/src/terrain_tiles.rs).
+ *  외부 terrarium DEM(s3) 대신 Rust 융합 SRTM 을 쓰는 이유: 실측 3D 임포트의 지반고 보정이
+ *  시각 지형면에도 반영돼야 BRA 프리즘·LoS 커튼(융합 SRTM 절대 AMSL z)과 지면이 어긋나지 않는다.
+ *  ?v= 는 캐시버스터 — 건물/실측 자료 변경 이벤트마다 증가시켜 웹뷰·MapLibre 타일 캐시를 비운다.
+ *  (프로토콜 URL 형식은 플랫폼마다 달라 convertFileSrc 로 베이스를 얻는다 — Windows: http://fused-dem.localhost/) */
+const fusedDemTiles = (v: number) => `${convertFileSrc("", "fused-dem")}{z}/{x}/{y}.png?v=${v}`;
+/** 융합 DEM 서빙 줌 범위 — Rust terrain_tiles.rs 의 MIN_ZOOM/MAX_ZOOM 과 반드시 일치.
+ *  최대 13 = HGT 1초각(≈30m) 한계(초과 줌은 MapLibre 오버줌), 최소 8 = 저줌 1타일이
+ *  HGT 타일(1장 25MB) 수십 개를 물어오는 것을 막는 하한. */
+const FUSED_DEM_MINZOOM = 8;
+const FUSED_DEM_MAXZOOM = 13;
+
 /** 3D 건물 표출 최소 줌 — 이 미만이면 fill-extrusion 3D 모드가 꺼지고(2D 점 전환) 실측 3D 메시도
  *  게이트 오프(visible:false + loadTiles:false). 두 표출 경로가 같은 임계를 공유해야 줌 인/아웃 시
  *  "건물은 사라졌는데 메시만 남는" 불일치가 없다. (buildingTileCache 의 줌 임계값은 타일 조회 격자
@@ -381,7 +393,6 @@ export default function TrackMap() {
   /** fill-extrusion 동기화 재시도 틱 — 스타일 미로드로 skip 된 경우 styledata 후 1회 재실행용 */
   const [styleRetryTick, setStyleRetryTick] = useState(0);
   const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
-  const [detailBuilding, setDetailBuilding] = useState<{ lat: number; lon: number; height_m: number; ground_elev_m: number; name: string | null; address: string | null; usage: string | null; distance_km: number; isBlocking?: boolean } | null>(null);
   /** 건축물정보 드로어 상태 — 클릭 건물의 로컬 기하 + 대장(로컬 FAC + 온라인 VWorld) 조회 결과 */
   type BldgDrawerState = {
     lat: number; lon: number;
@@ -525,8 +536,12 @@ export default function TrackMap() {
   const [braConeOpacity, setBraConeOpacity] = useState(1); // 원추면 채움 불투명도 (기본 1 = 불투명, 슬라이더로 0.05까지 하향)
   /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
   const braReqSeq = useRef(0);
-  /** 마지막 분석 요청의 반경|각도 서명 — 파라미터 변경 자동 재분석 비교용 */
+  /** 마지막 분석 요청의 반경|각도|건물세대 서명 — 파라미터·자료 변경 자동 재분석 비교용 */
   const braLastRunKeyRef = useRef<string | null>(null);
+  /** 건물 자료 세대 — 실측/대장/수동 건물 변경 이벤트마다 +1.
+   *  BRA 결과는 Rust 가 융합 SRTM + 현재 건물 세트로 계산한 스냅샷이라, 자료가 바뀌면
+   *  화면에 남은 침범 목록·프리즘이 낡는다. 세대를 재분석 키에 넣어 기존 디바운스/seq 가드를 재사용. */
+  const [braDataEpoch, setBraDataEpoch] = useState(0);
 
   // 이펙트에서 최신 레이더 제원 참조용 (호버 조회 deps 에 radarSite 를 넣지 않기 위함)
   const radarSiteRef = useRef(radarSite);
@@ -597,6 +612,8 @@ export default function TrackMap() {
 
   const mapRef = useRef<MapRef>(null);
   const terrainAdded = useRef(false);
+  /** 융합 DEM 타일 캐시버스터 세대 — 건물/실측 자료 변경 시 +1 (setupTerrain·소스 갱신 공용) */
+  const demVersionRef = useRef(0);
   const aircraftDropRef = useRef<HTMLDivElement>(null);
   const radarDropRef = useRef<HTMLDivElement>(null);
   const fittedRef = useRef(false);
@@ -1058,26 +1075,25 @@ export default function TrackMap() {
 
   // 지형 DEM 소스/레이어 추가 헬퍼
   const setupTerrain = useCallback((map: maplibregl.Map) => {
+    const demTiles = fusedDemTiles(demVersionRef.current);
     if (!map.getSource("terrain-dem")) {
       map.addSource("terrain-dem", {
         type: "raster-dem",
-        tiles: [
-          "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
-        ],
+        tiles: [demTiles],
         encoding: "terrarium",
         tileSize: 256,
-        maxzoom: 15,
+        minzoom: FUSED_DEM_MINZOOM,
+        maxzoom: FUSED_DEM_MAXZOOM,
       });
     }
     if (!map.getSource("hillshade-dem")) {
       map.addSource("hillshade-dem", {
         type: "raster-dem",
-        tiles: [
-          "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
-        ],
+        tiles: [demTiles],
         encoding: "terrarium",
         tileSize: 256,
-        maxzoom: 15,
+        minzoom: FUSED_DEM_MINZOOM,
+        maxzoom: FUSED_DEM_MAXZOOM,
       });
     }
     if (!map.getLayer("hillshade")) {
@@ -1368,6 +1384,48 @@ export default function TrackMap() {
       loadBuildingsForViewport(false);
     }
   }, [hiddenBuildingSources]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 건물 원본 변경 수신용 최신값 ref — 리스너를 마운트 1회만 등록(재구독 시 unlisten 경합 회피)
+  const showBuildingsRef = useRef(showBuildings);
+  showBuildingsRef.current = showBuildings;
+  const loadBuildingsForViewportRef = useRef(loadBuildingsForViewport);
+  loadBuildingsForViewportRef.current = loadBuildingsForViewport;
+
+  // 건물 원본 변경 수신 → 타일 캐시 무효화 + 재로드
+  //   fac-buildings-changed: 대장·실측 임포트/삭제, vworld 다운로드, 기동 백필 (발신: Rust)
+  //   manual-buildings-changed: 수동 건물·그룹 CRUD (발신: 메인 창 건물 목록)
+  // 어느 쪽이든 중복 억제(suppressed_by) 플래그가 바뀌므로, 이 경로가 없으면 이미 방문한 타일이
+  // 억제 전 대장 박스를 세션 내내 그대로 그려 수동 프리즘과 이중 렌더된다.
+  // 캐시 무효화는 건물 토글과 무관하게 항상 수행 — 꺼져 있는 동안 들어온 변경도 다음 켜기에 반영.
+  // 수신측은 캐시 조작·재조회만 한다(DB 재영속 금지 — 발신측이 이미 영속).
+  useEffect(() => {
+    const onBuildingSourceChanged = () => {
+      invalidateBuildingCache();
+      // 실측 3D 임포트/삭제는 SRTM 지반고 융합 보정도 함께 바꾼다 →
+      //   ① 융합 DEM 지형면·힐셰이드 타일 캐시버스트 (Rust 리더는 이미 clear_cache 됨)
+      //   ② BRA 결과 세대 증가 → 표시 중이면 기존 디바운스 경로로 자동 재분석
+      demVersionRef.current += 1;
+      const map = mapRef.current?.getMap();
+      if (map) {
+        const demTiles = fusedDemTiles(demVersionRef.current);
+        for (const id of ["terrain-dem", "hillshade-dem"]) {
+          const src = map.getSource(id) as maplibregl.RasterDEMTileSource | undefined;
+          // setTiles → 소스 content 변경 이벤트 → 인뷰 타일 전량 재요청(지형 RTT 포함)
+          if (src?.setTiles) src.setTiles([demTiles]);
+        }
+      }
+      setBraDataEpoch((e) => e + 1);
+      if (!showBuildingsRef.current) return;
+      // 즉시 기존 3D 건물 제거 (비동기 재로드 완료 전까지 이전 데이터가 남는 문제 방지)
+      setBuildings3dData([]);
+      loadBuildingsForViewportRef.current(false);
+    };
+    const unlistens = [
+      listen("fac-buildings-changed", onBuildingSourceChanged),
+      listen("manual-buildings-changed", onBuildingSourceChanged),
+    ];
+    return () => { for (const u of unlistens) u.then((fn) => fn()); };
+  }, []);
 
   // ── MapLibre fill-extrusion (3D 건물) ──────────────────────────
   // 건물 3D 모드: MapLibre 네이티브 fill-extrusion 레이어 사용
@@ -2362,7 +2420,6 @@ export default function TrackMap() {
         setLosHoverIdx(null);
         setLosHoverRatio(null);
         setLosBuildingHighlight(null);
-        setDetailBuilding(null);
       }
       setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
       setLosSearchedAddress(null);
@@ -2625,7 +2682,6 @@ export default function TrackMap() {
     setLosHighlightIdx(null);
     setLosCursorPicking(false);
     setLosBuildingHighlight(null);
-    setDetailBuilding(null);
     setLosSearchedAddress(null);
     setLosFootprint(null);
     setLosAzViews(null);
@@ -2664,7 +2720,7 @@ export default function TrackMap() {
   //   결과는 폴리곤 포함 수 MB 가능 → bulk:// 파일 매개 수신
   const runBraAnalysis = useCallback(async () => {
     const seq = ++braReqSeq.current;
-    braLastRunKeyRef.current = `${braConeRadiusKm}|${braAngleDeg}`;
+    braLastRunKeyRef.current = `${braConeRadiusKm}|${braAngleDeg}|${braDataEpoch}`;
     setBraLoading(true);
     setBraError(null);
     try {
@@ -2685,17 +2741,19 @@ export default function TrackMap() {
     } finally {
       if (seq === braReqSeq.current) setBraLoading(false);
     }
-  }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, braAngleDeg, braConeRadiusKm]);
+  }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, braAngleDeg, braConeRadiusKm, braDataEpoch]);
 
-  // 원추 반경·기준각 변경 → 이미 한 번 실행한 뒤라면 자동 재분석 (디바운스).
+  // 원추 반경·기준각·건물 자료 세대 변경 → 이미 한 번 실행한 뒤라면 자동 재분석 (디바운스).
   //   반경=분석 범위, 각도=판정 기준면이므로 둘 다 결과·표시 정합에 직결된다.
+  //   세대(braDataEpoch)=실측/대장/수동 건물 변경 — 지반고 융합 보정·건물 세트가 바뀌면 표시 중인
+  //   침범 목록·프리즘이 낡으므로 같은 경로로 재실행한다(Rust 는 호출마다 융합 SRTM 을 프리로드).
   //   실패해도 ref 에 실패한 키가 남아 동일 파라미터 재시도 루프는 발생하지 않고, 파라미터가 바뀌면 1회 재시도된다.
   useEffect(() => {
     if (!braResult && !braError) return; // 최초 실행 전에는 자동 실행 금지
-    if (braLastRunKeyRef.current === `${braConeRadiusKm}|${braAngleDeg}`) return;
+    if (braLastRunKeyRef.current === `${braConeRadiusKm}|${braAngleDeg}|${braDataEpoch}`) return;
     const t = setTimeout(() => { void runBraAnalysis(); }, 400);
     return () => clearTimeout(t);
-  }, [braConeRadiusKm, braAngleDeg, braResult, braError, runBraAnalysis]);
+  }, [braConeRadiusKm, braAngleDeg, braDataEpoch, braResult, braError, runBraAnalysis]);
 
   // 3D 입체 허용 토글 ↔ 현재 줌에 맞춰 buildings3dMode 재조정
   useEffect(() => {
@@ -4739,7 +4797,7 @@ export default function TrackMap() {
                       const dot = b === target ? "#3b82f6" : "#ef4444";
                       return (
                         <div key={`${b.lat},${b.lon},${b.distance_km}`}
-                          onClick={() => setDetailBuilding(b)}
+                          onClick={() => openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.is_manual ? "manual" : undefined })}
                           onMouseEnter={(e) => {
                             e.currentTarget.style.background = "#f9fafb";
                             setLosBuildingHighlight({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
@@ -5341,7 +5399,7 @@ export default function TrackMap() {
         </div>
       )}
 
-      {/* Map + Building Detail sidebar wrapper */}
+      {/* Map wrapper */}
       <div className="relative flex flex-1 min-h-0">
       {/* Map container — 드로어를 지도+단면도 전체 높이에 오버레이하기 위해 relative */}
       <div className="relative flex flex-col flex-1 min-w-0">
@@ -5742,7 +5800,7 @@ export default function TrackMap() {
         <LoSProfileTabs
           views={losAzViews ?? [{ lat: losTarget.lat, lon: losTarget.lon, label: "중앙", az: losAzimuth }]}
           radarSite={radarSite}
-          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setDetailBuilding(null); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosPathBldgs(null); setLosCursorPicking(true); }}
+          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosPathBldgs(null); setLosCursorPicking(true); }}
           searchedAddress={losSearchedAddress}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
@@ -5752,7 +5810,7 @@ export default function TrackMap() {
           onTrackPointHover={setLosHoverIdx}
           externalHoverIdx={losHoverIdx}
           onBuildingHover={setLosBuildingHighlight}
-          onBuildingDetail={setDetailBuilding}
+          onBuildingDetail={(b) => openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.is_manual ? "manual" : undefined })}
           layers={losLayers}
           fresnelClearance={fresnelPct / 100}
           showBuildings={losShowBuildings}
@@ -5938,6 +5996,40 @@ export default function TrackMap() {
                       </>
                     );
                   })()}
+                  {/* 지도 (Street View + Google Maps) — 본문 스크롤 맨 끝, 컴팩트 150px */}
+                  {(() => {
+                    // Street View 시선: 레이더 → 건물 방향에서 건물을 바라보도록 180° 반전
+                    const dLon2 = bd.lon - radarSite.longitude;
+                    const dLat2 = bd.lat - radarSite.latitude;
+                    const headingFromRadar = ((Math.atan2(dLon2 * Math.cos(bd.lat * Math.PI / 180), dLat2) * 180 / Math.PI) + 360) % 360;
+                    const headingToBuilding = (headingFromRadar + 180) % 360;
+                    return (
+                      <>
+                        <div className="px-2 py-1 text-[9px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Street View</div>
+                        <div className="overflow-hidden relative border-t border-gray-100" style={{ height: 150 }}>
+                          <iframe
+                            key={`sv-${bd.lat},${bd.lon}`}
+                            title="Street View"
+                            style={{ border: 0, position: "absolute", top: -72, left: -2, width: "calc(100% + 74px)", height: "calc(100% + 96px)" }}
+                            loading="lazy"
+                            referrerPolicy="no-referrer-when-downgrade"
+                            src={`https://maps.google.com/maps?layer=c&cbll=${bd.lat},${bd.lon}&cbp=12,${headingToBuilding.toFixed(0)},0,0,0&output=svembed`}
+                          />
+                        </div>
+                        <div className="px-2 py-1 text-[9px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Google Maps</div>
+                        <div className="overflow-hidden relative border-t border-gray-100" style={{ height: 150 }}>
+                          <iframe
+                            key={`gm-${bd.lat},${bd.lon}`}
+                            title="Google Maps"
+                            style={{ border: 0, position: "absolute", top: -2, left: -2, width: "calc(100% + 74px)", height: "calc(100% + 50px)" }}
+                            loading="lazy"
+                            referrerPolicy="no-referrer-when-downgrade"
+                            src={`https://maps.google.com/maps?q=${bd.lat},${bd.lon}&z=18&t=k&output=embed`}
+                          />
+                        </div>
+                      </>
+                    );
+                  })()}
                 </div>
                 {/* LoS 단면도 진입 (하단 고정) */}
                 <div className="border-t border-gray-200 px-3 py-2">
@@ -5965,68 +6057,6 @@ export default function TrackMap() {
             );
           })()}
         </div>
-      </div>
-
-      {/* 건물 상세보기 사이드바 (Google Street View + Maps) */}
-      <div
-        className="flex-shrink-0 flex flex-col border-l border-gray-200 bg-white overflow-hidden transition-[width] duration-300 ease-in-out"
-        style={{ width: detailBuilding ? 360 : 0, borderLeftWidth: detailBuilding ? 1 : 0 }}
-      >
-        {detailBuilding && (() => {
-          const lat = detailBuilding.lat;
-          const lon = detailBuilding.lon;
-          const label = detailBuilding.name || detailBuilding.address || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
-          const dLon = lon - radarSite.longitude;
-          const dLat = lat - radarSite.latitude;
-          const headingFromRadar = ((Math.atan2(dLon * Math.cos(lat * Math.PI / 180), dLat) * 180 / Math.PI) + 360) % 360;
-          const headingToBuilding = (headingFromRadar + 180) % 360;
-          return (
-            <>
-            <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2" style={{ minWidth: 360 }}>
-              <div className="min-w-0 flex-1">
-                <h3 className="text-xs font-semibold text-gray-800 truncate">{label}</h3>
-                <p className="text-[10px] text-gray-400 mt-0.5 truncate">
-                  {lat.toFixed(6)}°N, {lon.toFixed(6)}°E
-                  {detailBuilding.height_m > 0 && ` · ${detailBuilding.height_m.toFixed(1)}m`}
-                  {detailBuilding.usage && ` · ${detailBuilding.usage}`}
-                </p>
-              </div>
-              <button
-                onClick={() => setDetailBuilding(null)}
-                className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors ml-2"
-              >
-                <X size={14} />
-              </button>
-            </div>
-            <div className="flex-1 flex flex-col min-h-0 overflow-y-auto" style={{ minWidth: 360 }}>
-              <div className="flex-1 min-h-0 flex flex-col">
-                <div className="px-2 py-1 text-[9px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Street View</div>
-                <div className="flex-1 min-h-[200px] overflow-hidden relative">
-                  <iframe
-                    title="Street View"
-                    style={{ border: 0, position: "absolute", top: -72, left: -2, width: "calc(100% + 74px)", height: "calc(100% + 96px)" }}
-                    loading="lazy"
-                    referrerPolicy="no-referrer-when-downgrade"
-                    src={`https://maps.google.com/maps?layer=c&cbll=${lat},${lon}&cbp=12,${headingToBuilding.toFixed(0)},0,0,0&output=svembed`}
-                  />
-                </div>
-              </div>
-              <div className="flex-1 min-h-0 flex flex-col border-t border-gray-100">
-                <div className="px-2 py-1 text-[9px] font-medium text-gray-400 uppercase tracking-wider bg-gray-50">Google Maps</div>
-                <div className="flex-1 min-h-[200px] overflow-hidden relative">
-                  <iframe
-                    title="Google Maps"
-                    style={{ border: 0, position: "absolute", top: -2, left: -2, width: "calc(100% + 74px)", height: "calc(100% + 50px)" }}
-                    loading="lazy"
-                    referrerPolicy="no-referrer-when-downgrade"
-                    src={`https://maps.google.com/maps?q=${lat},${lon}&z=18&t=k&output=embed`}
-                  />
-                </div>
-              </div>
-            </div>
-            </>
-          );
-        })()}
       </div>
       </div>
 

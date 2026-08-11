@@ -914,13 +914,16 @@ export function MeasuredBuildingDataSection() {
         );
       } catch { /* 리스너 실패 시 진행률 없이 진행 */ }
 
-      const r = await invoke<{ total: number; matched: number; inserted: number; skipped: number }>(
-        "import_measured_buildings",
-        { binPath },
-      );
+      const r = await invoke<{
+        total: number;
+        matched: number;
+        inserted: number;
+        skipped: number;
+        corrected_cells: number;
+      }>("import_measured_buildings", { binPath });
       setMeasuredResult({
         type: "success",
-        message: `실측 건물 반영 완료 — 매칭 ${r.matched.toLocaleString()}건 · 신규 ${r.inserted.toLocaleString()}건 · 제외 ${r.skipped.toLocaleString()}건`,
+        message: `실측 건물 반영 완료 — 매칭 ${r.matched.toLocaleString()}건 · 신규 ${r.inserted.toLocaleString()}건 · 제외 ${r.skipped.toLocaleString()}건 · 지반보정 ${r.corrected_cells.toLocaleString()}셀`,
       });
       await loadStatus();
     } catch (e) {

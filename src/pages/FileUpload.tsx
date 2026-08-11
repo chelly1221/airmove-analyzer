@@ -11,7 +11,7 @@ import {
   Minus,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre";
 import Modal from "../components/common/Modal";
 import { SrtmDownloadSection, FacBuildingDataSection, MeasuredBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
@@ -73,6 +73,14 @@ function ManualBuildingPanel() {
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  // 수동 건물 변경 이벤트 수신 → 목록 재조회.
+  //   실측 3D 임포트/삭제는 자동(SRTM) 모드 행의 지반고를 융합 세대에 맞춰 재동기화하고
+  //   이 이벤트를 발신한다(Rust). 수신측은 DB 재조회만 한다 — 재영속 금지(발신측이 이미 영속).
+  useEffect(() => {
+    const un = listen("manual-buildings-changed", () => { loadData(); });
+    return () => { un.then((fn) => fn()); };
+  }, [loadData]);
 
   const handleSave = async (data: BuildingFormData) => {
     try {
@@ -677,7 +685,7 @@ function ManualBuildingPanel() {
 // ─── 메인 페이지 ─────────────────────────────────────────────────
 
 export default function FileUpload() {
-  // 자료관리는 건물/참조 데이터만 관리. ASS 업로드는 ACAS·지도·단일항적분석에서 수행.
+  // 자료관리는 건물/참조 데이터만 관리. ASS 업로드는 ACAS·지도·2D 항적현시에서 수행.
   return (
     <div className="space-y-4">
       {/* ── 수동 등록 건물 ── */}

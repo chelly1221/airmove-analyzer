@@ -23,6 +23,16 @@ static PROFILE_CACHE: Mutex<Option<CoverageProfile>> = Mutex::new(None);
 /// 건물 제외 커버리지 프로파일 캐시 (장애물 월간 보고서용)
 static PROFILE_CACHE_EXCLUDED: Mutex<Option<CoverageProfile>> = Mutex::new(None);
 
+/// 건물 자료 세대 변경(실측 임포트·대장 임포트/삭제·수동 CRUD·중복억제 재계산) 시 호출 —
+/// 건물 높이가 굳어 있는 프로파일/픽셀 캐시를 모두 비운다. 캐시 키에 건물 세대가 없어
+/// 비우지 않으면 앱 재시작 전까지 세션 내내 옛 건물로 계산된 커버리지가 반환된다.
+pub fn invalidate_building_caches() {
+    // 잠금 오염(다른 스레드 panic)이어도 캐시 값 자체는 버릴 것이므로 into_inner 로 이어서 비운다
+    *PROFILE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PROFILE_CACHE_EXCLUDED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PIXEL_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Cached terrain profile (stored in Rust, never sent to frontend)
 struct CoverageProfile {
     radar_lat: f64,
@@ -298,11 +308,13 @@ pub(crate) fn query_buildings_for_coverage(
 
     // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 커버리지 차폐가 실측 지붕고를 쓰도록.
+    // 억제 행(suppressed_by)은 같은 실체의 중복이라 제외 — 남겨두면 동일 건물이 두 번 차폐한다.
     if let Ok(mut stmt) = conn.prepare(
         "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json, id FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
-           AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0"
+           AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0
+           AND suppressed_by IS NULL"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],
@@ -390,11 +402,14 @@ pub(crate) fn query_buildings_for_coverage_excluding(
 
     // 건물통합정보 (fac_buildings) — 폴리곤 꼭짓점별 확장
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 커버리지 차폐가 실측 지붕고를 쓰도록.
+    // 억제 행(suppressed_by)은 분석대상 수동 건물과 '같은 실체의 중복'이므로 without 시나리오에서도
+    //   함께 빠지는 것이 맞다 — 여기서 되살리면 without 이 with 와 같아져 OM Δ 가 0 으로 붕괴한다.
     if let Ok(mut stmt) = conn.prepare(
         "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), polygon_json, id FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
-           AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0"
+           AND COALESCE(height_measured, height) >= 3.0 AND COALESCE(height_measured, height) <= 1000.0
+           AND suppressed_by IS NULL"
     ) {
         if let Ok(rows) = stmt.query_map(
             rusqlite::params![min_lat, max_lat, min_lon, max_lon],

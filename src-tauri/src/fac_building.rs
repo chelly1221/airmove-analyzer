@@ -41,6 +41,22 @@ pub struct FacBuildingImportStatus {
     pub record_count: i64,
 }
 
+/// 원인 행이 사라진 실측 억제('measured:<id>') 잔재 해제.
+///
+/// fac_buildings 행 삭제(재임포트 선정리·자료 삭제)로 height_measured 를 가진 행이 없어지면,
+/// 그 행이 원인이던 인접 region 행의 억제가 원인 없이 남는다(dangling) — 대장 행이 영영 안 보인다.
+/// 멱등이며 수동 원인('manual:%')은 원인이 별도 테이블에 남아 있으므로 건드리지 않는다.
+fn clear_dangling_measured_suppression(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE fac_buildings SET suppressed_by = NULL
+         WHERE suppressed_by LIKE 'measured:%'
+           AND NOT EXISTS (SELECT 1 FROM fac_buildings f2 WHERE 'measured:'||f2.id = fac_buildings.suppressed_by)",
+        [],
+    )
+    .map_err(|e| format!("dangling 실측 억제 정리 실패: {}", e))?;
+    Ok(())
+}
+
 /// F_FAC_BUILDING SHP ZIP 파일에서 건물 데이터를 임포트
 /// HEIGHT > 0 인 건물만 저장, 폴리곤 풋프린트를 WGS84 JSON으로 변환하여 저장
 pub fn import_from_zip(
@@ -100,6 +116,8 @@ pub fn import_from_zip(
     // 기존 region 데이터 삭제
     conn.execute("DELETE FROM fac_buildings WHERE region = ?1", params![region])
         .map_err(|e| format!("기존 데이터 삭제 실패: {}", e))?;
+    // 삭제된 region 에 실측(height_measured) 행이 섞여 있었다면 그 행이 원인이던 억제가 남는다 — 해제
+    clear_dangling_measured_suppression(conn)?;
     conn.execute("DELETE FROM fac_building_import_log WHERE region = ?1", params![region])
         .map_err(|e| format!("임포트 로그 삭제 실패: {}", e))?;
 
@@ -257,6 +275,52 @@ pub fn import_from_zip(
     // 임시 파일 정리
     let _ = std::fs::remove_dir_all(&temp_dir);
 
+    // 우선순위 중복 억제 재계산 — 방금 임포트한 region 행들의 bbox extent(+여유) 범위.
+    // 새로 들어온 대장 행이 기존 수동/실측 자료에 덮이면 여기서 suppressed_by 가 확정된다.
+    // 실패는 비치명 — 임포트 자체는 성공으로 유지(다음 등록/백필에서 재확정).
+    {
+        progress_fn(FacBuildingImportProgress {
+            region: region.to_string(),
+            total: count,
+            processed: count,
+            status: "중복 건물 정리 중...".to_string(),
+        });
+        let extent: Option<(f64, f64, f64, f64)> = conn
+            .query_row(
+                "SELECT MIN(bbox_min_lat), MAX(bbox_max_lat), MIN(bbox_min_lon), MAX(bbox_max_lon)
+                 FROM fac_buildings WHERE region = ?1",
+                params![region],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<f64>>(0)?,
+                        r.get::<_, Option<f64>>(1)?,
+                        r.get::<_, Option<f64>>(2)?,
+                        r.get::<_, Option<f64>>(3)?,
+                    ))
+                },
+            )
+            .ok()
+            .and_then(|(a, b, c, d)| match (a, b, c, d) {
+                (Some(a), Some(b), Some(c), Some(d)) => Some((a, b, c, d)),
+                _ => None, // 유효 행 0건 — 재계산할 것이 없다
+            });
+        if let Some((min_lat, max_lat, min_lon, max_lon)) = extent {
+            let m = crate::suppression::AREA_MARGIN_DEG;
+            match crate::suppression::recompute_area(
+                conn,
+                min_lat - m,
+                max_lat + m,
+                min_lon - m,
+                max_lon + m,
+            ) {
+                Ok((s, c)) => {
+                    log::info!("[fac_building] 중복억제 재계산 — 억제 {}행 · 해제 {}행", s, c)
+                }
+                Err(e) => log::warn!("[fac_building] 중복억제 재계산 실패: {}", e),
+            }
+        }
+    }
+
     progress_fn(FacBuildingImportProgress {
         region: region.to_string(),
         total: count,
@@ -331,17 +395,30 @@ pub fn get_import_status(conn: &Connection) -> Result<Vec<FacBuildingImportStatu
 }
 
 /// 건물통합정보 데이터 삭제
+///
+/// 삭제된 행 자신의 억제 플래그는 행과 함께 소멸하지만, 삭제 대상에 실측 지붕고(height_measured)
+/// 행이 섞여 있으면 그 행이 원인이던 다른 행의 억제('measured:<id>')가 원인 없이 남는다 —
+/// 두 분기 모두 dangling 정리를 돌린다.
+/// 실측3D region 은 여기로 들어오면 안 된다(measured_building::clear_measured 의 억제 해제 훅 우회).
 pub fn clear_data(conn: &Connection, region: Option<&str>) -> Result<(), String> {
+    if region == Some("실측3D") {
+        return Err(
+            "실측3D 자료는 여기서 삭제할 수 없습니다 — 실측 데이터 초기화(clear_measured)를 사용하세요"
+                .to_string(),
+        );
+    }
     match region {
         Some(r) => {
             conn.execute("DELETE FROM fac_buildings WHERE region = ?1", params![r])
                 .map_err(|e| format!("삭제 실패: {}", e))?;
+            clear_dangling_measured_suppression(conn)?;
             conn.execute("DELETE FROM fac_building_import_log WHERE region = ?1", params![r])
                 .map_err(|e| format!("로그 삭제 실패: {}", e))?;
         }
         None => {
             conn.execute("DELETE FROM fac_buildings", [])
                 .map_err(|e| format!("전체 삭제 실패: {}", e))?;
+            clear_dangling_measured_suppression(conn)?;
             conn.execute("DELETE FROM fac_building_import_log", [])
                 .map_err(|e| format!("전체 로그 삭제 실패: {}", e))?;
         }

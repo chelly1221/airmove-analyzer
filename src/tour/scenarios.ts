@@ -79,7 +79,7 @@ const SCENARIO_OBSTACLE_LOS = "obstacle-los-review";
 const SCENARIO_DB_BACKUP = "db-backup-restore";
 
 // ─── 시나리오 1: 비행검사결과보고서 첨부용 항적자료 ───────────────────
-// main(단일항적분석 창 열기) → drawing(항적도 캡처) → main(지도 창 열기) → trackmap(항적 점 캡처)
+// main(2D 항적현시 창 열기) → drawing(항적도 캡처) → main(지도 창 열기) → trackmap(항적 점 캡처)
 
 const REPORT_TRACK_PHASES: Record<string, TourStep[]> = {
   main: [
@@ -87,7 +87,7 @@ const REPORT_TRACK_PHASES: Record<string, TourStep[]> = {
       id: "intro",
       title: "비행검사결과보고서 첨부용 항적자료",
       body:
-        "단일항적분석 창에서 항적도를, 지도 창에서 항적 점 표시 화면을 캡처해 " +
+        "2D 항적현시 창에서 항적도를, 지도 창에서 항적 점 표시 화면을 캡처해 " +
         "비행검사결과보고서에 첨부하는 과정을 안내합니다. " +
         "안내에 따라 두 창을 차례로 열고 화면을 캡처하세요.",
       mode: "dim",
@@ -97,8 +97,8 @@ const REPORT_TRACK_PHASES: Record<string, TourStep[]> = {
     {
       id: "nav-drawing",
       target: '[data-tour="nav-drawing"]',
-      title: "단일항적분석 창 열기",
-      body: "'단일항적분석' 메뉴를 클릭하세요. 별도 창이 열립니다.",
+      title: "2D 항적현시 창 열기",
+      body: "'2D 항적현시' 메뉴를 클릭하세요. 별도 창이 열립니다.",
       mode: "interactive",
       placement: "right",
       advanceOnTargetClick: true,
@@ -304,7 +304,7 @@ const REPORT_TRACK_PHASES: Record<string, TourStep[]> = {
       id: "tm-aircraft-pick",
       target: '[data-tour="tm-aircraft-list"]',
       title: "비행검사기 선택",
-      body: "단일항적분석과 동일하게 검사에 사용한 기체를 선택하세요. 검색창으로 Mode-S 코드를 찾을 수도 있습니다.",
+      body: "2D 항적현시와 동일하게 검사에 사용한 기체를 선택하세요. 검색창으로 Mode-S 코드를 찾을 수도 있습니다.",
       mode: "interactive",
       placement: "right",
       advanceWhen: (s, b) => s.selectedModeS !== b.selectedModeS,
@@ -346,7 +346,7 @@ const REPORT_TRACK_PHASES: Record<string, TourStep[]> = {
       id: "tm-sim-file-pick",
       target: '[data-tour="fake-file-list"]',
       title: "저장자료 선택",
-      body: "단일항적분석과 동일하게 동일 검사일의 저장자료(.ass)를 선택하세요.",
+      body: "2D 항적현시와 동일하게 동일 검사일의 저장자료(.ass)를 선택하세요.",
       mode: "interactive",
       placement: "right",
       overlay: "fileDialog",
@@ -734,10 +734,10 @@ export const TOUR_SCENARIOS: TourScenarioMeta[] = [
     title: "비행검사결과보고서 첨부용 항적자료",
     description:
       "레이더 저장자료(ASS)를 불러와 비행검사기 항적을 표출하고, 보고서에 첨부할 항적도와 " +
-      "항적 점 표시 화면을 차례로 캡처합니다. 안내에 따라 단일항적분석 창과 지도 창이 순서대로 열립니다. " +
+      "항적 점 표시 화면을 차례로 캡처합니다. 안내에 따라 2D 항적현시 창과 지도 창이 순서대로 열립니다. " +
       "가상 자료로 전 과정을 시뮬레이션하므로 실제 ASS 파일이 없어도 진행할 수 있습니다.",
     stepsSummary: [
-      "단일항적분석 창에서 비행검사기·레이더 선택",
+      "2D 항적현시 창에서 비행검사기·레이더 선택",
       "ASS 파일 선택 후 파싱 필터(비행검사기·포함/제외 조건·전체 데이터) 설정",
       "항적도 화면 캡처 (Win + Shift + S)",
       "지도 창에서 동일 자료를 불러와 항적 표시를 '점'으로 전환",

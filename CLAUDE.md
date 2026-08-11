@@ -71,6 +71,11 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 - 실제지구(`R=6,371,000`)는 곡률 프레임이 아닌 거리/평면투영(haversine, panorama `wgs84_to_enu` 의 평면 스케일)에만 사용 — 앙각·차단 곡률엔 미사용
 - 고도: SRTM HGT (로컬), 산 이름: peak DB (N3P SHP, 오프라인)
 
+### SRTM-실측 지반고 융합
+- 실측 3D(1m DSM) 임포트가 건물 기저부 최저 표면고(minH)를 HGT 노드별 중앙값으로 모아 `srtm_ground_corrections` 사이드카 테이블에 **절대 MSL**(델타 아님)로 저장 → SRTM 재다운로드 후에도 재계산 없이 자동 재적용
+- 적용은 `srtm.rs::load_tile` 로드 시점 인메모리 머지 단 한 곳 — **원본 `srtm_tiles` BLOB 불변**, `get_elevation`/`elevation_from_tiles` 핫패스는 무변경
+- 델타 클램프 30m(초과=이상치 폐기)·페더 2셀(체비쇼프 `w=1−d/3`, void 노드/이웃 제외). 임포트는 보정 확정 → `clear_cache()` → SRTM 프리로드 순서 필수(상쇄 불변식: 실측 높이 = maxH − liveSRTM)
+
 ### 좌표 변환 (coord.rs)
 - **EPSG:5186** → WGS84: 중앙자오선 127°E (건물통합정보, 토지이용)
 - **EPSG:5179** → WGS84: 중앙자오선 127.5°E (N3P 산봉우리)

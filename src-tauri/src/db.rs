@@ -111,6 +111,19 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             downloaded_at INTEGER NOT NULL
         );
 
+        -- SRTM 지반고 융합 보정 (실측 1m DSM 건물 기저부 → HGT 노드별 절대 MSL)
+        -- row/col = HGT 노드 인덱스 0..=3600 (row 0 = 북단, col 0 = 서단).
+        -- srtm_tiles BLOB 은 원본 그대로 두고, 로드 시점(srtm.rs::load_tile)에만 머지한다.
+        -- 델타가 아닌 절대 MSL 을 저장하므로 SRTM 재다운로드 후에도 재계산 없이 자동 재적용된다.
+        CREATE TABLE IF NOT EXISTS srtm_ground_corrections (
+            tile_name TEXT NOT NULL,
+            row INTEGER NOT NULL,
+            col INTEGER NOT NULL,
+            ground_msl REAL NOT NULL,
+            n_samples INTEGER NOT NULL,
+            PRIMARY KEY (tile_name, row, col)
+        );
+
         -- 수동 건물 그룹
         CREATE TABLE IF NOT EXISTS building_groups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,6 +277,11 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
 
     // fac_buildings 실측 지붕고 컬럼 (1m DSM 임포트, NULL = 실측값 없음 → 기존 height 사용)
     let _ = conn.execute("ALTER TABLE fac_buildings ADD COLUMN height_measured REAL", []);
+
+    // fac_buildings 우선순위 중복 억제 컬럼 — NULL=활성, 'manual:<id>'=수동등록 건물에 덮임,
+    // 'measured:<fac_id>'=실측3D 행에 덮임. 상위 원인 삭제 시 재계산으로 복원(가역).
+    // 값 확정은 자료 등록/임포트 시점(suppression.rs::recompute_area) — 조회 시점 런타임 판정 아님.
+    let _ = conn.execute("ALTER TABLE fac_buildings ADD COLUMN suppressed_by TEXT", []);
 
     // 실측 커버리지 extent(MIN/MAX) 전용 파트셜 커버링 인덱스 — height_measured 컬럼 추가 뒤에 생성해야 한다
     // (CREATE TABLE 배치 시점엔 컬럼이 없어 실패). WHERE 절 텍스트가 measured_building::coverage_bbox 의
@@ -600,4 +618,56 @@ pub fn get_srtm_status(conn: &Connection) -> SqlResult<Option<(i64, i64)>> {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })?;
     if result.0 == 0 { Ok(None) } else { Ok(Some(result)) }
+}
+
+// ========== SRTM 지반고 융합 보정 ==========
+
+/// 지반고 보정 전량 교체 (기존 전건 삭제 + 배치 INSERT, 단일 트랜잭션)
+/// rows = `(tile_name, row, col, ground_msl, n_samples)` — ground_msl 은 델타가 아닌 **절대 MSL**.
+/// 실측 임포트가 멱등(선정리 후 전량 재적용)이므로 보정도 매번 통째로 갈아끼운다.
+pub fn replace_srtm_ground_corrections(
+    conn: &Connection,
+    rows: &[(String, u32, u32, f64, u32)],
+) -> SqlResult<()> {
+    // 실패 시 Transaction drop 으로 자동 롤백 (기존 보정 보존)
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM srtm_ground_corrections", [])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO srtm_ground_corrections (tile_name, row, col, ground_msl, n_samples)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (tile_name, row, col, ground_msl, n_samples) in rows {
+            stmt.execute(params![tile_name, *row as i64, *col as i64, ground_msl, *n_samples as i64])?;
+        }
+    }
+    tx.commit()
+}
+
+/// 타일 1개분 지반고 보정 로드 — `(row, col, ground_msl)`
+pub fn load_srtm_ground_corrections_for_tile(
+    conn: &Connection,
+    tile_name: &str,
+) -> SqlResult<Vec<(u32, u32, f64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT row, col, ground_msl FROM srtm_ground_corrections WHERE tile_name = ?1",
+    )?;
+    let rows = stmt.query_map(params![tile_name], |row| {
+        Ok((
+            row.get::<_, i64>(0)? as u32,
+            row.get::<_, i64>(1)? as u32,
+            row.get::<_, f64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// 지반고 보정 전건 삭제 (실측 데이터 초기화 시)
+pub fn clear_srtm_ground_corrections(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM srtm_ground_corrections", [])?;
+    Ok(())
 }

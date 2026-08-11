@@ -13,6 +13,8 @@ pub mod models;
 pub mod parser;
 pub mod peak;
 pub mod srtm;
+pub mod suppression;
+pub mod terrain_tiles;
 pub mod vworld;
 
 use std::fs;
@@ -996,6 +998,21 @@ async fn import_database(
             return Err("유효한 백업 파일이 아닙니다 (.zip 또는 .db).".to_string());
         };
 
+        // ── 복원 후 인메모리 캐시 무효화 (두 포맷 분기 공통 초크포인트) ──
+        // DB 가 통째로 교체돼 srtm_ground_corrections·건물 세대가 바뀌는데, 프로세스 수명인
+        // AppState.srtm 타일 캐시와 coverage 정적 캐시는 그대로 살아남아 복원 전 지형/프로파일을
+        // 계속 서비스한다(프론트 window.location.reload 는 웹뷰만 재기동).
+        {
+            let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+            srtm.clear_cache();
+        }
+        analysis::coverage::invalidate_building_caches();
+        // 설정 창은 reload 하지만 열려 있는 지도/도면 창은 재기동하지 않으므로 재조회를 유도
+        let _ = app_handle.emit("fac-buildings-changed", ());
+        let _ = app_handle.emit("manual-buildings-changed", ());
+        // panorama_cache 는 복원된 DB 안에 함께 실려 와 그 DB 의 보정 세대와 자기정합이므로
+        // 여기서 clear_panorama_cache_all 을 호출하면 백업의 유효 캐시만 버리게 된다 — 의도적으로 제외.
+
         info!("Database imported from: {} ({})", src_path, summary);
         Ok(summary)
     })
@@ -1391,7 +1408,9 @@ async fn get_fac_building_detail(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        building::query_fac_building_detail(&conn, lat, lon, 40.0)
+        // 지반고는 live SRTM(융합 보정 반영) — ground_elev 캐시 컬럼 미사용
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+        building::query_fac_building_detail(&conn, &mut srtm, lat, lon, 40.0)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1435,8 +1454,11 @@ async fn import_fac_building_data(
         let _ = handle.emit("fac-building-import-progress", progress);
     })?;
 
-    // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+    // 건물 높이 변경 → 파노라마·커버리지 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
     let _ = db::clear_panorama_cache_all(&conn);
+    analysis::coverage::invalidate_building_caches();
+    // 전 창(메인/TrackMap/도면)에 건물 자료 세대 변경 통보 — 각 창이 건물 레이어를 다시 조회한다
+    let _ = app_handle.emit("fac-buildings-changed", ());
 
     Ok(format!("{} 건물통합정보 {}건 임포트 완료", region_clone, count))
 }
@@ -1464,8 +1486,10 @@ async fn clear_fac_building_data(
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         fac_building::clear_data(&conn, region.as_deref())?;
-        // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+        // 건물 높이 변경 → 파노라마·커버리지 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
         let _ = db::clear_panorama_cache_all(&conn);
+        analysis::coverage::invalidate_building_caches();
+        let _ = app_handle.emit("fac-buildings-changed", ());
         Ok(())
     })
     .await
@@ -1490,8 +1514,21 @@ async fn import_measured_buildings(
         let summary = measured_building::import_from_bin(&conn, &mut srtm, &bin_path, &|progress| {
             let _ = handle.emit("measured-building-import-progress", progress);
         })?;
-        // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+        // 자동(SRTM) 모드 수동 건물 지반고 재동기화 — 저장 스냅샷이라 융합 보정을 스스로 따라가지 못한다.
+        //   import_from_bin 내부에서 보정 확정 → clear_cache 가 끝난 뒤라 여기 조회값은 융합값.
+        //   캐시 무효화보다 '먼저' 수행해야 뒤이은 재계산이 새 지반고를 읽는다.
+        let manual_resynced = match building::resync_auto_manual_ground(&conn, &mut srtm) {
+            Ok(n) => n,
+            Err(e) => { log::warn!("[수동건물] 지반고 재동기화 실패: {}", e); 0 }
+        };
+        // 건물 높이 변경 → 파노라마·커버리지 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
         let _ = db::clear_panorama_cache_all(&conn);
+        analysis::coverage::invalidate_building_caches();
+        let _ = app_handle.emit("fac-buildings-changed", ());
+        // 수동 건물 지반고가 실제로 바뀐 경우에만 수동건물 이벤트 추가 발신 (수신측은 DB 재조회만)
+        if manual_resynced > 0 {
+            let _ = app_handle.emit("manual-buildings-changed", ());
+        }
         Ok(summary)
     })
     .await
@@ -1505,8 +1542,24 @@ async fn clear_measured_buildings(app_handle: tauri::AppHandle) -> Result<(), St
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         measured_building::clear_measured(&conn)?;
-        // 건물 높이 변경 → 파노라마 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
+        // 지반고 융합 보정이 사라졌으므로 SRTM 인메모리 캐시도 무효화 — 다음 로드부터 순수 SRTM 복귀
+        let manual_resynced = {
+            let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
+            srtm.clear_cache();
+            // 자동(SRTM) 모드 수동 건물 지반고도 순수 SRTM 값으로 복귀 (캐시 클리어 이후 조회)
+            match building::resync_auto_manual_ground(&conn, &mut srtm) {
+                Ok(n) => n,
+                Err(e) => { log::warn!("[수동건물] 지반고 재동기화 실패: {}", e); 0 }
+            }
+        };
+        // 건물 높이 변경 → 파노라마·커버리지 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
         let _ = db::clear_panorama_cache_all(&conn);
+        analysis::coverage::invalidate_building_caches();
+        let _ = app_handle.emit("fac-buildings-changed", ());
+        // 수동 건물 지반고가 실제로 바뀐 경우에만 수동건물 이벤트 추가 발신 (수신측은 DB 재조회만)
+        if manual_resynced > 0 {
+            let _ = app_handle.emit("manual-buildings-changed", ());
+        }
         Ok(())
     })
     .await
@@ -1657,8 +1710,11 @@ async fn query_buildings_3d_binary(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        // FAC 건물 지반고는 live SRTM(융합 보정 반영) — ground_elev 캐시 컬럼 미사용
+        let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
         building::query_buildings_3d_binary(
             &conn,
+            &mut srtm,
             min_lat, max_lat, min_lon, max_lon,
             min_height_m.unwrap_or(3.0),
             max_count.unwrap_or(15_000),
@@ -1784,7 +1840,11 @@ async fn add_manual_building(
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         let gt = geometry_type.as_deref().unwrap_or("polygon");
         let gj = geometry_json.as_deref();
-        building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &elev_mode, &memo, gt, gj, group_id)
+        let id = building::add_manual_building(&conn, &name, latitude, longitude, height, ground_elev, &elev_mode, &memo, gt, gj, group_id)?;
+        // 건물 세대 변경(수동 등록 + 중복억제 재계산) → 파노라마·커버리지 캐시 무효화 (캐시 키에 건물 세대 없음)
+        let _ = db::clear_panorama_cache_all(&conn);
+        analysis::coverage::invalidate_building_caches();
+        Ok(id)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1810,7 +1870,11 @@ async fn update_manual_building(
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         let gt = geometry_type.as_deref().unwrap_or("polygon");
         let gj = geometry_json.as_deref();
-        building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &elev_mode, &memo, gt, gj, group_id)
+        building::update_manual_building(&conn, id, &name, latitude, longitude, height, ground_elev, &elev_mode, &memo, gt, gj, group_id)?;
+        // 건물 세대 변경(수동 수정 + 중복억제 재계산) → 파노라마·커버리지 캐시 무효화
+        let _ = db::clear_panorama_cache_all(&conn);
+        analysis::coverage::invalidate_building_caches();
+        Ok(())
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -1824,7 +1888,11 @@ async fn delete_manual_building(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
-        building::delete_manual_building(&conn, id)
+        building::delete_manual_building(&conn, id)?;
+        // 건물 세대 변경(수동 삭제 + 억제 해제/재계산) → 파노라마·커버리지 캐시 무효화
+        let _ = db::clear_panorama_cache_all(&conn);
+        analysis::coverage::invalidate_building_caches();
+        Ok(())
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -3060,6 +3128,15 @@ async fn vworld_download_fac_buildings(
         imported += 1;
     }
 
+    if imported > 0 {
+        // 건물 자료 세대 변경 → 파노라마·커버리지 캐시 무효화 + 전 창 통보 (임포트 루프 전체에 1회)
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {e}"))?;
+        let _ = db::clear_panorama_cache_all(&conn);
+        analysis::coverage::invalidate_building_caches();
+        let _ = app_handle.emit("fac-buildings-changed", ());
+    }
+
     emit(
         "done",
         &format!("{imported}개 건물통합정보 파일 완료"),
@@ -3216,6 +3293,58 @@ pub fn run() {
                 }
             });
         })
+        // 융합 SRTM 지형 DEM 타일 서빙 (terrarium PNG, terrain_tiles.rs 참조).
+        // MapLibre 3D 지형면·힐셰이드가 외부 terrarium DEM 을 쓰면 실측 지반고 융합 보정이
+        // 시각 지면에 영원히 반영되지 않아, 융합 SRTM 절대 AMSL 로 그리는 deck 기하
+        // (BRA 프리즘·LoS 커튼)와 지면이 보정량만큼 어긋난다. 타일 본문은 이 프로토콜로
+        // 직접 바이트 응답한다 — 타일 1장이 수십 KB 이고 팬/줌마다 다수 요청이라
+        // String 반환 invoke(항상 eval 경로) 로 실어 나르면 안 된다.
+        .register_asynchronous_uri_scheme_protocol("fused-dem", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let path = request.uri().path().to_string();
+
+            tauri::async_runtime::spawn_blocking(move || {
+                let err_response = |status: u16| {
+                    tauri::http::Response::builder()
+                        .status(status)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Vec::new())
+                };
+
+                let response = match terrain_tiles::parse_tile_path(&path) {
+                    None => err_response(404),
+                    Some((z, x, y)) => {
+                        // SRTM 리더는 AppState 공유 인스턴스 — 실측 임포트/삭제의 clear_cache 가
+                        // 곧 이 타일들의 무효화 계약이다(다음 요청부터 융합 세대 반영).
+                        let png = match app.try_state::<AppState>() {
+                            Some(state) => match state.srtm.lock() {
+                                Ok(mut srtm) => Some(terrain_tiles::render_tile(&mut srtm, z, x, y)),
+                                Err(_) => {
+                                    log::warn!("[FusedDEM] SRTM lock 실패");
+                                    None
+                                }
+                            },
+                            None => None,
+                        };
+                        match png {
+                            Some(data) => tauri::http::Response::builder()
+                                .status(200)
+                                .header("Content-Type", "image/png")
+                                .header("Access-Control-Allow-Origin", "*")
+                                // 캐시 무효화는 프론트 캐시버스터(?v=)가 담당 — 세션 내 재요청은 재사용
+                                .header("Cache-Control", "public, max-age=3600")
+                                .body(data),
+                            None => err_response(503),
+                        }
+                    }
+                };
+
+                match response {
+                    Ok(r) => responder.respond(r),
+                    Err(e) => log::warn!("[FusedDEM] 프로토콜 응답 빌드 실패: {}", e),
+                }
+            });
+        })
         // 실측 3D 건물 Cesium 3D Tiles 서빙 (tileset.json + *.b3dm).
         // set_tiles3d_dir 로 지정된 로컬 폴더를 루트로 하는 읽기 전용 정적 서버.
         // 경로는 화이트리스트 문자셋 + '..' 금지로 디렉터리 탈출을 차단한다.
@@ -3295,6 +3424,34 @@ pub fn run() {
                 ))
             })?;
             info!("Database path: {:?}", db_path);
+
+            // 백그라운드: fac_buildings.suppressed_by 1회 백필 (기존 DB 대응).
+            // 풀 커넥션을 장시간 점유하지 않도록 **별도 Connection** 을 열어 전용 스레드에서 수행한다
+            // (WAL 은 DB 속성이라 그대로 적용되고, busy_timeout 만 커넥션별로 다시 지정).
+            {
+                let bf_db_path = db_path.clone();
+                let bf_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let conn = match rusqlite::Connection::open(&bf_db_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::warn!("[중복억제] 백필 DB 열기 실패: {}", e);
+                            return;
+                        }
+                    };
+                    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+                    match suppression::backfill_if_needed(&conn) {
+                        // 백필이 실제로 행을 바꿨을 때만 — 기동 직후 이미 채워진 캐시/화면이 옛 상태다
+                        Ok(n) if n > 0 => {
+                            let _ = db::clear_panorama_cache_all(&conn);
+                            analysis::coverage::invalidate_building_caches();
+                            let _ = bf_handle.emit("fac-buildings-changed", ());
+                        }
+                        Ok(_) => {}
+                        Err(e) => log::warn!("[중복억제] 백필 실패: {}", e),
+                    }
+                });
+            }
 
             // 기존 aircraft.json → DB 마이그레이션
             let aircraft_json_path = app_data_dir.join("aircraft.json");

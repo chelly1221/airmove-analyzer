@@ -211,13 +211,15 @@ fn query_building_polygons(
 
     // 건물통합정보 (fac_buildings) — 폴리곤 단위로 반환
     // 높이는 실측(1m DSM) 지붕고 우선(COALESCE) — 파노라마 실루엣/차단각이 실측 지붕고를 쓰도록.
+    // 억제 행(suppressed_by)은 같은 실체의 중복이라 제외 — OM 장애물 후보가 한 건물로 두 번 잡힌다.
     if let Ok(mut stmt) = conn.prepare(
         "SELECT centroid_lat, centroid_lon, COALESCE(height_measured, height), building_name, dong_name, usability, polygon_json, id
          FROM fac_buildings
          WHERE centroid_lat BETWEEN ?1 AND ?2
            AND centroid_lon BETWEEN ?3 AND ?4
            AND COALESCE(height_measured, height) >= ?5
-           AND COALESCE(height_measured, height) <= ?6"
+           AND COALESCE(height_measured, height) <= ?6
+           AND suppressed_by IS NULL"
     ) {
         if let Ok(rows) = stmt.query_map(
             params![min_lat, max_lat, min_lon, max_lon, min_height_m, MAX_BUILDING_HEIGHT_M],

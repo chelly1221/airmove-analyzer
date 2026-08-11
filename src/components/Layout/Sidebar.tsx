@@ -50,7 +50,7 @@ const navSections: NavSection[] = [
     label: "항적 시각화",
     items: [
       { id: "map", label: "지도", icon: MapIcon, path: "/map" },
-      { id: "drawing", label: "단일항적분석", icon: PencilRuler, path: "/drawing" },
+      { id: "drawing", label: "2D 항적현시", icon: PencilRuler, path: "/drawing" },
     ],
   },
   {
