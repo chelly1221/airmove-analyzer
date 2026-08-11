@@ -3625,7 +3625,7 @@ export default function TrackMap() {
   //      · EX=1(실척)이면 maplibre fill-extrusion 건물(줌 14+)과도 프레임이 일치 — 같은 건물의 박스와
   //        프리즘이 정확히 겹치고, deck 오버레이(overlaid)가 항상 지도 위에 그려져 불투명 프리즘이 박스를
   //        시각적으로 대체한다. (EX>1 이면 프리즘이 박스보다 EX 배 커져 박스를 내포)
-  //      · 실측 3D 메시 타일은 부분 재색칠이 불가(셰이더 주입 필요)해 프리즘이 그 위에 덮이는 데 그친다.
+  //      · 메시 표출 중 실측 건물은 빨강 셸(원추 아래 discard)로 하부 메시 노출 — 아래 ② 셸 모드 참조.
   //      · 프리즘은 pickable — 클릭 시 우측 건축물정보 드로어, 호버 시 간단 툴팁(BRA 초과·여유 행 포함).
   //        (BRA 는 원추 전체를 보려 줌아웃한 상태라 fill-extrusion 건물 레이어가 비어 클릭 대상이 없다)
   //      · Rust 결과(braResult.buildings)가 상한 없는 전수라 이 프리즘이 "원추면 위 = 빨강" 마킹의 단일 경로다.
@@ -3636,6 +3636,8 @@ export default function TrackMap() {
   const braDeckLayers = useMemo(() => {
     if (activeTool !== "bra") return [];
     const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
+    // 실측 3D 메시가 실제로 화면에 그려지는 조건 (Tile3DLayer visible 게이트와 동일 식)
+    const meshShown = meshActive && meshZoomOk;
     const R_EARTH_M = 6_371_000;
     const M_PER_DEG_LAT = 111320; // 파일 내 기존 평면근사와 동일 계열
     const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
@@ -3681,26 +3683,55 @@ export default function TrackMap() {
     }
 
     // ── ② 침범 건물: AMSL×EX 프레임 통짜 프리즘 (원추면 아래 회색 · 위 빨강) ──
+    //   · 실측 건물 + 메시 표출 중(meshShown)이면 "빨강 셸 모드"로 분리한다. 같은 자리에 실측 메시와
+    //     불투명 프리즘이 겹치면 (a) 두 면이 사실상 동일 평면이라 z-fighting 패치워크가 생기고
+    //     (b) 프리즘이 메시를 덮어 "실측 우선 표시" 요구와 충돌한다. 셸 모드는 지오메트리를 통짜
+    //     프리즘 그대로 두되 셰이더가 원추 아래 픽셀을 discard 해(색·depth 모두 미기록) 하부는 실측
+    //     메시가 그대로 드러나고 원추 위 초과부만 빨강으로 남는다. 남는 셸도 메시와 동일면이 되지
+    //     않도록 수평 0.5m·수직 0.3m 팽창시킨다.
     if (braResult && braResult.buildings.length > 0) {
       // 판정에 쓰인 값(결과 스냅샷)으로 원추면 재구성 — 입력 슬라이더를 이후 조정해도 오버레이는 결과와 정합
       const hRes = braResult.radar_height_m;
       const tanRes = Math.tan((braResult.angle_deg * Math.PI) / 180);
       // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함.
       // 색은 면에 싣지 않는다 — 상/하 분할은 BraPrismLayer 가 프래그먼트 단위로 수행한다.
-      const faces: { polygon: [number, number, number][]; b: BraBuilding }[] = [];
+      type BraFace = { polygon: [number, number, number][]; b: BraBuilding };
+      const normalFaces: BraFace[] = [];   // 통짜 프리즘 (회색+빨강)
+      const measuredFaces: BraFace[] = []; // 빨강 셸 (원추 아래 discard)
+      const SHELL_H_M = 0.5; // 셸 수평 팽창 (m) — 메시 벽면과의 동일면 z-fighting 방지
+      const SHELL_V_M = 0.3; // 셸 수직 팽창 (m) — 메시 지붕(maxH)과의 동일면 z-fighting 방지
       for (const b of braResult.buildings) {
         const poly = b.polygon;
         if (!poly || poly.length < 3) continue;
+        const shell = b.measured && meshShown;
         // 바닥·지붕 모두 AMSL×EX — 원추면과 같은 프레임. terrainEnabled=false 면 EX=1 이라 AMSL 그대로라
         // 평면 지도에선 건물이 지반고만큼 떠 보이지만, 원추면도 같은 AMSL 이라 정합을 우선한다.
         const zBase = b.ground_elev_m * EX;
-        const zRoof = b.total_height_m * EX;
+        // 셸은 지붕을 +0.3m 띄운다 — 초과 건물의 지붕은 어차피 원추 위(빨강)라 시각적 차이가 없다.
+        const zRoof = (b.total_height_m + (shell ? SHELL_V_M : 0)) * EX;
         const n = poly.length;
         const lonlat: [number, number][] = new Array(n);
         for (let i = 0; i < n; i++) {
           const [la, lo] = poly[i];
-          lonlat[i] = [lo, la];
+          if (shell) {
+            // centroid(b.lat/b.lon) 기준 바깥 방향으로 0.5m 이동. 오목 폴리곤에선 방향이 실제 외법선과
+            // 다소 어긋날 수 있지만 0.5m 스케일이라 무시 가능(면 자체는 그대로 닫힌 프리즘).
+            const dxM = (lo - b.lon) * mPerDegLon;
+            const dyM = (la - b.lat) * M_PER_DEG_LAT;
+            const len = Math.hypot(dxM, dyM);
+            if (len > 0) {
+              lonlat[i] = [
+                lo + ((dxM / len) * SHELL_H_M) / mPerDegLon,
+                la + ((dyM / len) * SHELL_H_M) / M_PER_DEG_LAT,
+              ];
+            } else {
+              lonlat[i] = [lo, la]; // centroid 와 겹친 정점 — 이동 방향 없음
+            }
+          } else {
+            lonlat[i] = [lo, la];
+          }
         }
+        const faces = shell ? measuredFaces : normalFaces;
         // 측벽 — 바닥→지붕 통짜 쿼드 (셰이더가 픽셀별로 회색/빨강 결정)
         for (let i = 0; i < n; i++) {
           const j = (i + 1) % n;
@@ -3720,54 +3751,73 @@ export default function TrackMap() {
         for (let i = 0; i < n; i++) cap[i] = [lonlat[i][0], lonlat[i][1], zRoof];
         faces.push({ polygon: cap, b });
       }
-      if (faces.length > 0) {
+
+      // 두 레이어가 공유하는 픽 핸들러 (내용은 종전과 동일)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const onPrismClick = (info: any) => {
+        const b = info.object?.b as BraBuilding | undefined;
+        if (!b) return;
+        // MapboxOverlay(overlaid) 는 maplibre 의 click 을 deck 로 '전달'만 할 뿐 전파를 막지 않는다.
+        // 같은 클릭에서 maplibre 건물 핸들러도 돌고, BRA 줌아웃 상태엔 fill-extrusion 레이어가
+        // 아예 없어 setBldgDrawer(null) 로 끝난다 → 두 핸들러의 등록 순서에 따라 방금 연 드로어가
+        // 즉시 닫힐 수 있다. 다음 매크로태스크로 미뤄 항상 마지막 상태가 되게 한다(순서 무관 결정적).
+        setTimeout(() => {
+          openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.source, measured: b.measured });
+        }, 0);
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const onPrismHover = (info: any) => {
+        const b = info.object?.b as BraBuilding | undefined;
+        // maplibre fill-extrusion 호버가 활성인 픽셀에서는 양보 — 같은 건물을 두 경로가 다른 수치로 번갈아 쓰는 값 플리커 방지
+        if (buildingHoverActiveRef.current) return;
+        if (b) {
+          setBldgHoverTip({ x: info.x, y: info.y, name: b.name ?? undefined, height: b.height_m, measured: b.measured, lat: b.lat, lon: b.lon, base: b.ground_elev_m });
+        } else {
+          setBldgHoverTip(null); // 프리즘 이탈 시 잔류 툴팁 제거 (maplibre 경로는 자기 활성 플래그가 없으면 정리 안 함)
+        }
+      };
+
+      // 원추면 재구성 파라미터 — ①의 원추면 메시와 **동일 값·동일 평면근사**라 렌더 원추와 픽셀 정합.
+      // 판정에 쓰인 결과 스냅샷(hRes/tanRes)만 사용 — 라이브 슬라이더 값 금지.
+      const prismCommon = {
+        getPolygon: (d: BraFace) => d.polygon,
+        // 백색 = 셰이더의 조명 계수 캐리어 — FS 에서 실제 색(빨강/회색)을 여기에 곱한다
+        getFillColor: [255, 255, 255, 255] as [number, number, number, number],
+        radarLng: radarSite.longitude,
+        radarLat: radarSite.latitude,
+        mPerDegLat: M_PER_DEG_LAT,
+        mPerDegLon,
+        apexM: hRes,
+        tanTheta: tanRes,
+        ex: EX,
+        filled: true,
+        extruded: false,
+        _full3d: true,
+        // material 기본값(true) 유지 — 단 solid-polygon VS 는 extruded 분기에서만 조명을 계산하므로
+        // 현 설정(extruded:false)에선 vColor 가 흰색 그대로 FS 에 도달, 곱셈 결과 = 정확한 빨강/회색.
+        pickable: true,
+        onClick: onPrismClick,
+        onHover: onPrismHover,
+        // depth 기록 유지(기본값) — 불투명 입체라 자기 가림·상호 가림이 맞아야 하고,
+        // 뒤에 그려지는 원추면이 프리즘에 가려지려면 프리즘의 depth 가 남아 있어야 한다.
+      };
+      if (normalFaces.length > 0) {
         layers.push(
-          new BraPrismLayer<{ polygon: [number, number, number][]; b: BraBuilding }>({
+          new BraPrismLayer<BraFace>({
             id: "bra-penetration",
-            data: faces,
-            getPolygon: (d) => d.polygon,
-            // 백색 = 셰이더의 조명 계수 캐리어 — FS 에서 실제 색(빨강/회색)을 여기에 곱한다
-            getFillColor: [255, 255, 255, 255],
-            // 원추면 재구성 파라미터 — ①의 원추면 메시와 **동일 값·동일 평면근사**라 렌더 원추와 픽셀 정합.
-            // 판정에 쓰인 결과 스냅샷(hRes/tanRes)만 사용 — 라이브 슬라이더 값 금지.
-            radarLng: radarSite.longitude,
-            radarLat: radarSite.latitude,
-            mPerDegLat: M_PER_DEG_LAT,
-            mPerDegLon,
-            apexM: hRes,
-            tanTheta: tanRes,
-            ex: EX,
-            filled: true,
-            extruded: false,
-            _full3d: true,
-            // material 기본값(true) 유지 — 단 solid-polygon VS 는 extruded 분기에서만 조명을 계산하므로
-            // 현 설정(extruded:false)에선 vColor 가 흰색 그대로 FS 에 도달, 곱셈 결과 = 정확한 빨강/회색.
-            pickable: true,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            onClick: (info: any) => {
-              const b = info.object?.b as BraBuilding | undefined;
-              if (!b) return;
-              // MapboxOverlay(overlaid) 는 maplibre 의 click 을 deck 로 '전달'만 할 뿐 전파를 막지 않는다.
-              // 같은 클릭에서 maplibre 건물 핸들러도 돌고, BRA 줌아웃 상태엔 fill-extrusion 레이어가
-              // 아예 없어 setBldgDrawer(null) 로 끝난다 → 두 핸들러의 등록 순서에 따라 방금 연 드로어가
-              // 즉시 닫힐 수 있다. 다음 매크로태스크로 미뤄 항상 마지막 상태가 되게 한다(순서 무관 결정적).
-              setTimeout(() => {
-                openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.source, measured: b.measured });
-              }, 0);
-            },
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            onHover: (info: any) => {
-              const b = info.object?.b as BraBuilding | undefined;
-              // maplibre fill-extrusion 호버가 활성인 픽셀에서는 양보 — 같은 건물을 두 경로가 다른 수치로 번갈아 쓰는 값 플리커 방지
-              if (buildingHoverActiveRef.current) return;
-              if (b) {
-                setBldgHoverTip({ x: info.x, y: info.y, name: b.name ?? undefined, height: b.height_m, measured: b.measured, lat: b.lat, lon: b.lon, base: b.ground_elev_m });
-              } else {
-                setBldgHoverTip(null); // 프리즘 이탈 시 잔류 툴팁 제거 (maplibre 경로는 자기 활성 플래그가 없으면 정리 안 함)
-              }
-            },
-            // depth 기록 유지(기본값) — 불투명 입체라 자기 가림·상호 가림이 맞아야 하고,
-            // 뒤에 그려지는 원추면이 프리즘에 가려지려면 프리즘의 depth 가 남아 있어야 한다.
+            data: normalFaces,
+            ...prismCommon,
+          }),
+        );
+      }
+      if (measuredFaces.length > 0) {
+        layers.push(
+          new BraPrismLayer<BraFace>({
+            id: "bra-penetration-measured",
+            data: measuredFaces,
+            // 빨강 셸 — 원추 아래 프래그먼트는 discard 되어 하부의 실측 메시가 그대로 보인다
+            redOnly: true,
+            ...prismCommon,
           }),
         );
       }
@@ -3800,7 +3850,7 @@ export default function TrackMap() {
     );
 
     return layers;
-  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled, openBldgDrawerFor]);
+  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled, openBldgDrawerFor, meshActive, meshZoomOk]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {

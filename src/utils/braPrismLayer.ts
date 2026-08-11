@@ -31,6 +31,7 @@ uniform braConeUniforms {
   float tanTheta;
   float invTwoR;
   float ex;
+  float redOnly;
 } braCone;
 `;
 
@@ -43,6 +44,7 @@ uniform braConeUniforms {
  *   tanTheta    = 기준각 tan
  *   invTwoR     = 1/(2R) 지구곡률 항 계수
  *   ex          = 지형 과장 배율 (AMSL m → 렌더 z)
+ *   redOnly     = 빨강 셸 모드 (>0.5 면 원추 아래 프래그먼트 discard)
  */
 const braConeModule = {
   name: "braCone",
@@ -54,6 +56,7 @@ const braConeModule = {
     tanTheta: "f32",
     invTwoR: "f32",
     ex: "f32",
+    redOnly: "f32",
   },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 } as any;
@@ -86,6 +89,10 @@ const vec3 BRA_GRAY = vec3(229.0, 231.0, 235.0) / 255.0;
   float brady = (braWorldPos.y - braCone.radarLngLat.y) * braCone.mPerDeg.y;
   float brad = sqrt(bradx * bradx + brady * brady);
   float braConeZ = (braCone.apexM + brad * braCone.tanTheta + brad * brad * braCone.invTwoR) * braCone.ex;
+  // 빨강 셸 모드 — 원추 아래 픽셀을 버려 실측 메시가 그대로 보이게 한다.
+  // discard 는 depth 도 안 남겨 메시 가림 없음. 피킹 패스에서도 동일하게 버려져
+  // 하부 클릭/호버는 메시 경로로 간다.
+  if (braCone.redOnly > 0.5 && braWorldPos.z <= braConeZ) discard;
   vec3 braBase = braWorldPos.z > braConeZ ? BRA_RED : BRA_GRAY;
   color = vec4(braBase * color.rgb, color.a);
 `,
@@ -107,6 +114,8 @@ export type BraConeProps = {
   tanTheta?: number;
   /** 지형 과장 배율 */
   ex?: number;
+  /** 빨강 셸 모드 — 원추 아래 프래그먼트 discard(실측 메시 표출 중 실측 건물용) */
+  redOnly?: boolean;
 };
 
 export type BraPrismLayerProps<DataT = unknown> = SolidPolygonLayerProps<DataT> & BraConeProps;
@@ -124,6 +133,7 @@ export default class BraPrismLayer<DataT = any> extends SolidPolygonLayer<DataT,
     apexM: { type: "number", value: 0 },
     tanTheta: { type: "number", value: 0 },
     ex: { type: "number", value: 1 },
+    redOnly: false,
   };
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -137,7 +147,7 @@ export default class BraPrismLayer<DataT = any> extends SolidPolygonLayer<DataT,
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   draw(opts: { uniforms: any }): void {
-    const { radarLng, radarLat, mPerDegLat, mPerDegLon, apexM, tanTheta, ex } = this.props;
+    const { radarLng, radarLat, mPerDegLat, mPerDegLon, apexM, tanTheta, ex, redOnly } = this.props;
     const braCone = {
       radarLngLat: [radarLng, radarLat],
       mPerDeg: [mPerDegLon, mPerDegLat],
@@ -145,6 +155,7 @@ export default class BraPrismLayer<DataT = any> extends SolidPolygonLayer<DataT,
       tanTheta,
       invTwoR: 1 / (2 * R_EARTH_M),
       ex,
+      redOnly: redOnly ? 1 : 0,
     };
     // 존재하는 모든 모델에 세팅 (현 설정은 extruded:false 라 top 모델만 생성된다)
     for (const model of this.state.models ?? []) {
