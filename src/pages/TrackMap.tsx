@@ -537,6 +537,8 @@ export default function TrackMap() {
   /** 원추면 반경 (km) — 표시 반경 겸 분석 반경(maxRangeKm). 미영속. */
   const [braConeRadiusKm, setBraConeRadiusKm] = useState(10);
   const [braConeOpacity, setBraConeOpacity] = useState(1); // 원추면 채움 불투명도 (기본 1 = 불투명, 슬라이더로 0.05까지 하향)
+  /** 침범 목록 검색어 (이름·주소 부분일치) — 드로어 로컬, 미영속 */
+  const [braSearch, setBraSearch] = useState("");
   /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과 폐기) */
   const braReqSeq = useRef(0);
   /** 마지막 분석 요청의 반경|각도|건물세대 서명 — 파라미터·자료 변경 자동 재분석 비교용 */
@@ -4925,6 +4927,21 @@ export default function TrackMap() {
     );
   };
 
+  /** BRA 침범 목록 검색 필터 — 이름·주소 부분일치(대소문자 무시, trim).
+   *  침범이 1만 동을 넘으면 초과량 내림차순 300행 캡 밖으로 밀려 리스트에서 찾을 수 없는 건물이
+   *  생긴다(지도 프리즘은 전수 마킹). 여기서 먼저 걸러낸 뒤 캡을 적용해 탐색성을 보강한다.
+   *  검색어가 비면 원본 배열을 그대로 돌려주므로 기존 동작(전수 → 상위 300) 그대로. */
+  const braFilteredList = useMemo(() => {
+    const all = braResult?.buildings ?? [];
+    const q = braSearch.trim().toLowerCase(); // 정규화 1회
+    if (!q) return all;
+    const out: BraBuilding[] = [];
+    for (const b of all) {
+      if ((b.name && b.name.toLowerCase().includes(q)) || (b.address && b.address.toLowerCase().includes(q))) out.push(b);
+    }
+    return out;
+  }, [braResult, braSearch]);
+
   // ── 좌측 도구 드로어 본문: BRA 분석 ──
   const renderBraToolBody = () => {
     const micro: React.CSSProperties = { fontSize: 8.5, fontWeight: 700, letterSpacing: ".06em", color: G[400], textTransform: "uppercase" };
@@ -4933,7 +4950,19 @@ export default function TrackMap() {
     const antennaM = radarSite.altitude + radarSite.antenna_height;
     const list = braResult?.buildings ?? [];
     const MAX_ROWS = 300;
-    const shown = list.slice(0, MAX_ROWS);
+    const query = braSearch.trim();
+    const searching = query.length > 0;
+    // 검색 결과에 캡 적용 — 초과량 순위가 낮아도 검색으로는 도달할 수 있다
+    const filtered = braFilteredList;
+    const shown = filtered.slice(0, MAX_ROWS);
+    const folded = braResult?.folded_duplicates ?? 0;
+    /** 이름 없는 행(실측 3D 블롭 등)은 "(이름 없음)" 명시 — 주소가 있으면 병기 */
+    const rowLabel = (b: BraBuilding) => {
+      const nm = b.name?.trim();
+      if (nm) return nm;
+      const ad = b.address?.trim();
+      return ad ? `(이름 없음) · ${ad}` : "(이름 없음)";
+    };
     return (
       <>
         {/* 헤더 */}
@@ -5027,13 +5056,41 @@ export default function TrackMap() {
 
           {/* 침범 건물 리스트 */}
           <div style={{ padding: "9px 11px", flex: 1, minHeight: 150, display: "flex", flexDirection: "column" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
               <span style={{ ...micro, flex: 1, minWidth: 0 }}>Penetrating · 침범 건물</span>
-              <span style={{ ...num, fontSize: 9.5, color: "#ef4444" }}>{list.length.toLocaleString()}</span>
+              {searching ? (
+                // 검색 중 — 일치 수와 전체 수를 함께 표기
+                <span style={{ fontSize: 9.5, color: G[400], flexShrink: 0 }}>
+                  일치 <span style={{ ...num, color: "#ef4444" }}>{filtered.length.toLocaleString()}</span>동 / 전체 <span style={{ ...num, color: G[600] }}>{list.length.toLocaleString()}</span>동
+                </span>
+              ) : (
+                <span style={{ ...num, fontSize: 9.5, color: "#ef4444", flexShrink: 0 }}>{list.length.toLocaleString()}</span>
+              )}
+              {folded > 0 && (
+                // 대장 이중 임포트(광역본↔세분본 비트 동일 행) 접힘 수 — Rust 가 값을 줄 때만 노출
+                <span style={{ fontSize: 9, color: G[400], flexShrink: 0 }}>(중복 {folded.toLocaleString()}동 접힘)</span>
+              )}
             </div>
-            {list.length === 0 ? (
+            {/* 검색 — 300행 캡 밖 건물(예: 초과량 순위 2천위대)을 이름·주소로 직접 찾는다 */}
+            {list.length > 0 && (
+              <div style={{ position: "relative", marginBottom: 6 }}>
+                <Search size={11} color={G[400]} style={{ position: "absolute", left: 7, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }} />
+                <input
+                  type="text" value={braSearch} onChange={(e) => setBraSearch(e.target.value)}
+                  placeholder="건물명·주소 검색"
+                  style={{ width: "100%", fontSize: 10.5, padding: "4px 22px 4px 22px", borderRadius: 6, border: `1px solid ${G[300]}`, color: G[800], outline: "none" }}
+                />
+                {searching && (
+                  <button onClick={() => setBraSearch("")} title="검색 지우기"
+                    style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)", width: 16, height: 16, borderRadius: 4, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: G[400], padding: 0 }}>
+                    <X size={10} />
+                  </button>
+                )}
+              </div>
+            )}
+            {filtered.length === 0 ? (
               <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", fontSize: 10, color: G[400] }}>
-                {braLoading ? "분석 중…" : braResult ? "침범 건물 없음" : "분석을 실행하세요"}
+                {braLoading ? "분석 중…" : searching ? "검색과 일치하는 건물 없음" : braResult ? "침범 건물 없음" : "분석을 실행하세요"}
               </div>
             ) : (
               <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
@@ -5051,7 +5108,7 @@ export default function TrackMap() {
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <span style={{ width: 6, height: 6, borderRadius: 3, background: "#ef4444", flexShrink: 0 }} />
                       <span style={{ fontSize: 10.5, fontWeight: 600, color: G[700], flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {b.name ?? b.address ?? "이름 없음"}
+                        {rowLabel(b)}
                       </span>
                       <span style={{ ...num, fontSize: 9.5, color: "#ef4444", flexShrink: 0 }}>+{b.exceed_m.toFixed(1)}m</span>
                     </div>
@@ -5061,14 +5118,14 @@ export default function TrackMap() {
                     </div>
                   </div>
                 ))}
-                {list.length > MAX_ROWS && (
+                {filtered.length > MAX_ROWS && (
                   <>
                     <div style={{ padding: "6px 5px", fontSize: 9.5, color: G[400], textAlign: "center" }}>
-                      …외 {(list.length - MAX_ROWS).toLocaleString()}동
+                      …외 {(filtered.length - MAX_ROWS).toLocaleString()}동
                     </div>
                     {/* 목록만 상한 — 지도 프리즘 마킹은 전수(Rust 결과 전체) */}
                     <div style={{ fontSize: 9, color: G[400], padding: "4px 5px" }}>
-                      상위 {MAX_ROWS}동 표시 — 지도 마킹은 전체 {list.length.toLocaleString()}동
+                      {searching ? `일치 ${filtered.length.toLocaleString()}동 중 상위 ${MAX_ROWS}동 표시` : `상위 ${MAX_ROWS}동 표시`} — 지도 마킹은 전체 {list.length.toLocaleString()}동
                     </div>
                   </>
                 )}

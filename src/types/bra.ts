@@ -48,6 +48,8 @@ export interface BraResult {
   total_penetrating: number;
   /** 폴리곤 파싱 실패/3점 미만으로 판정 불가 처리된 fac 후보 동수 */
   skipped_invalid_polygon: number;
+  /** 대장 이중 임포트(광역본↔세분본 비트 동일 행)로 결과에서 접힌 행 수 — 구빌드 호환 옵셔널 */
+  folded_duplicates?: number;
   /** 침범 건물 (exceed_m 내림차순, 전수) */
   buildings: BraBuilding[];
 }
