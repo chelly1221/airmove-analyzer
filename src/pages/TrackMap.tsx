@@ -3833,6 +3833,9 @@ export default function TrackMap() {
     //     투명해지는 문제, ② 메시 커버리지 내 비실측 대장행 프리즘이 메시를 덮는 불일치를 동시에
     //     해소한다. 타일이 늦게 로드되면 그 건물만 통짜→셸로 전환된다(버전 코얼레싱 200ms).
     //     meshShown=false(줌<14 또는 메시 꺼짐)면 meshCoveredAt 을 보지 않고 전부 통짜 프리즘 — 불변.
+    // 빨강 관통 패스 — 결과 블록 안에서 만들고 원추면 push 뒤에 합류한다 (아래 계약 주석 참조)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let redTopLayer: any = null;
     if (braResult && braResult.buildings.length > 0) {
       // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함.
       // 색은 면에 싣지 않는다 — 상/하 분할은 BraPrismLayer 가 프래그먼트 단위로 수행한다.
@@ -3844,12 +3847,13 @@ export default function TrackMap() {
       for (const b of braResult.buildings) {
         const poly = b.polygon;
         if (!poly || poly.length < 3) continue;
-        // b.measured 는 셸 판정에서 제외 — 표출 여부의 진실은 로드된 타일 커버리지뿐이다
-        // (b.measured 는 픽 툴팁·드로어 등 다른 용도로는 그대로 사용).
-        // 단 수동 건물(source="manual")은 예외로 항상 통짜 프리즘 — 사용자가 그린 가상/시뮬 구조물이라
-        // 실측 메시(DSM)에 존재하지 않으므로, 메시 커버리지 안이라도 셸로 만들면 하부가 통째로
-        // 투명해진다(원추 아래 discard 인데 드러날 메시가 없음).
-        const shell = b.source !== "manual" && meshShown && meshCoveredAt(b.lat, b.lon);
+        // 셸 조건 = b.measured(실측 블롭이 이 건물을 표현) ∧ meshShown ∧ meshCoveredAt(타일 로드됨).
+        // · b.measured 필수: hm NULL 활성 대장행은 "DSM 에 대응 블롭이 없음"의 신호다(있었다면
+        //   매칭돼 hm 이 붙거나 억제됐음 — 예: 소사 에스케이뷰는 2023 DSM 이전 신축이라 블롭 부재).
+        //   그런 건물을 셸로 만들면 하부 discard 후 드러날 메시가 없어 몸통이 통째로 사라진다.
+        //   수동(가상) 건물도 measured=false 라 같은 이유로 자동 제외된다.
+        // · meshCoveredAt 필수: measured 라도 타일 미로드 구역이면 셸 하부가 투명해진다.
+        const shell = b.measured && meshShown && meshCoveredAt(b.lat, b.lon);
         // 바닥·지붕 모두 AMSL×EX — 원추면과 같은 프레임. terrainEnabled=false 면 EX=1 이라 AMSL 그대로라
         // 평면 지도에선 건물이 지반고만큼 떠 보이지만, 원추면도 같은 AMSL 이라 정합을 우선한다.
         const zBase = b.ground_elev_m * EX;
@@ -3970,9 +3974,29 @@ export default function TrackMap() {
           }),
         );
       }
+      // ── 빨강 관통 패스 (원추면 **뒤에** push — 아래 ③ 끝에서 합류) ──
+      // 계약: **원추 초과부(빨강)는 원추면에 절대 가려지지 않는다.**
+      // 원추면 고도는 8km 지점에서 이미 ~80m AMSL 라, 건물을 확대해 보는 카메라는 흔히 원추면보다
+      // 낮다. 그 순간 카메라→빨강 시선이 불투명(기본 opacity 1) 원추면을 관통해 빨강이 통째로
+      // 가려졌다("칠해지지 않았다" 증상의 실체). 원추면은 depth 를 안 남기므로, 원추면 뒤에 초과부
+      // 전용 패스(redOnly=원추 아래 discard)를 한 번 더 그리면 depth 는 프리즘/메시와만 경합하고
+      // 원추면은 경합 상대가 아니게 되어 빨강이 항상 관통 표시된다. 동일 지오메트리 재드로우라
+      // 자기 자신과는 depth 동일(LEQUAL 통과·동색 덮어쓰기)이라 아티팩트가 없다.
+      redTopLayer = new BraPrismLayer<BraFace>({
+        id: "bra-penetration-red-top",
+        data: normalFaces.concat(measuredFaces),
+        ...prismCommon,
+        redOnly: true,
+        // 픽은 본 패스(bra-penetration/-measured)가 담당 — 이중 픽 방지
+        pickable: false,
+        onClick: undefined,
+        onHover: undefined,
+      });
     }
 
     // ── ③ 원추면·림 push — 프리즘(불투명, depth 기록) 뒤에 그려 앞면은 블렌드·뒷면은 가려지게 ──
+    //    push 순서 계약: [프리즘 → 원추면 → 림 → 빨강 관통 패스]. 마지막 빨강 패스가 원추면을
+    //    "관통"하는 유일한 색이다 — 회색부는 원추면에 정상 가림(카메라가 원추 아래일 때 의도된 은닉).
     layers.push(
       new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
         id: "bra-cone",
@@ -4001,6 +4025,9 @@ export default function TrackMap() {
         pickable: false,
       }),
     );
+    // 빨강 관통 패스 — 원추면(무 depth 기록) 뒤라 원추면이 depth 경합 상대가 아니게 되어,
+    // 카메라가 원추면 아래로 내려가도 초과부 빨강은 항상 보인다 (위 결과 블록의 계약 주석 참조).
+    if (redTopLayer) layers.push(redTopLayer);
 
     return layers;
     // meshTilesVersion 은 값을 직접 쓰지 않고 loadedMeshTileBboxRef(ref) 변경을 알리는 세대 키로만
