@@ -28,7 +28,8 @@ pub const COVER_RATIO: f64 = 0.03;
 const CONTAIN_RATIO: f64 = 0.5;
 
 /// 억제 높이 슬랙 (m) — 상위(실측)가 하위(대장)보다 이만큼까지 낮아도 동일 건물로 인정
-const SUPPRESS_HEIGHT_SLACK_M: f64 = 10.0;
+/// (db.rs 기동 마이그레이션 `run_suppress_tag_sanity` 가 동일 식을 SQL 로 재사용 — 값 이중정의 금지)
+pub(crate) const SUPPRESS_HEIGHT_SLACK_M: f64 = 10.0;
 
 /// 면적비(주 판정) 격자 샘플 축당 점 수 (24×24 = 576점)
 const SAMPLE_N: i32 = 24;
@@ -671,6 +672,8 @@ pub fn clear_manual_suppression(conn: &Connection, manual_id: i64) -> Result<u64
 /// 대상 영역 = 실측 커버리지 bbox(있으면) ∪ 각 수동 건물 bbox(+AREA_MARGIN_DEG).
 /// 앱 기동 시 백그라운드 스레드에서 호출한다(lib.rs setup) — 메인 스레드 블로킹 금지.
 ///
+/// 완료 표식은 **전 영역이 성공했을 때만** 기록한다(부분 성공은 다음 기동 재시도).
+///
 /// 반환: 변경된 행 수(억제 + 해제). 0 이면 DB 상태가 그대로라 호출부의 캐시 무효화도 불필요하다.
 pub fn backfill_if_needed(conn: &Connection) -> Result<u64, String> {
     if crate::db::get_setting(conn, BACKFILL_KEY)
@@ -744,6 +747,21 @@ pub fn backfill_if_needed(conn: &Connection) -> Result<u64, String> {
     if ok_areas == 0 {
         // 전 영역 실패 — 표식을 남기지 않아 다음 기동에서 재시도한다
         return Err(format!("백필 전 영역({}개) 재계산 실패", area_count));
+    }
+    if ok_areas < area_count {
+        // 부분 성공 — 표식을 남기지 않아 다음 기동에서 **실패 영역**을 다시 처리한다.
+        // 표식을 여기서 박으면 최대 영역(실측 커버리지 전역)이 실패했는데 소형 수동 bbox 성공만으로
+        // 'done' 이 되어 실패 영역이 영구 미재계산으로 남는다.
+        // 성공 영역의 변경분은 이미 DB 에 커밋됐으므로 Err 가 아니라 Ok(변경 행 수)로 반환한다 —
+        // 호출부(lib.rs)가 n > 0 으로 캐시 무효화·emit 을 수행해야 화면이 옛 상태로 남지 않는다.
+        log::warn!(
+            "[중복억제] 백필 부분 성공 — 영역 {}/{} · 억제 {}행 · 해제 {}행 · 표식 미기록(다음 기동 재시도)",
+            ok_areas,
+            area_count,
+            total_suppressed,
+            total_cleared
+        );
+        return Ok(total_suppressed + total_cleared);
     }
 
     crate::db::set_setting(conn, BACKFILL_KEY, "done")

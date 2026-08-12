@@ -357,7 +357,83 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         }
     }
 
+    // 억제 태그 '청소 방향' 1회성 정정 (settings 'suppress_tag_sanity_v1' 멱등 가드).
+    // v2 백필의 '청소 방향' 부분집합을 기동 시점에 즉시 적용 — 사용자 체감이 수 분짜리 백그라운드
+    // 백필에 의존하지 않게 한다. 백필은 이후 태그 귀속·재억제를 정합화(신규 태그 추가 방향은 백필만 가능).
+    //
+    // 위 hm_sanity_v1 블록 **뒤에** 두어야 실측 지위(height_measured)를 잃은 원인행이 dangling 으로
+    // 함께 걸린다.
+    if get_setting(&conn, "suppress_tag_sanity_v1")
+        .unwrap_or(None)
+        .is_none()
+    {
+        match run_suppress_tag_sanity(&conn) {
+            Ok(n) => {
+                if n > 0 {
+                    // 억제 해제로 되살아난 건물은 옛 파노라마 캐시 스냅샷에 빠져 있다
+                    let _ = clear_panorama_cache_all(&conn);
+                    log::info!(
+                        "[중복억제] 억제 태그 정정 {}행 해제 — 파노라마 캐시 무효화",
+                        n
+                    );
+                }
+                let _ = set_setting(&conn, "suppress_tag_sanity_v1", "done");
+            }
+            // 실패 시 표식을 남기지 않아 다음 기동에서 재시도
+            Err(e) => log::warn!("[중복억제] 억제 태그 정정 실패: {}", e),
+        }
+    }
+
     Ok(conn)
+}
+
+/// 억제 태그 '청소 방향' 정정 — 원인이 사라졌거나 억제 규칙을 위반하는 `suppressed_by` 를 해제한다.
+///
+/// suppression.rs 의 v2 백필과 판정 규칙은 같지만, 여기서는 폴리곤 피복 재계산 없이
+/// **순수 SQL 로 결정 가능한 해제(청소)만** 수행한다 — 결정론적이라 기동 시점에 즉시 돌릴 수 있다.
+/// 반대로 신규 태그 추가(재억제)는 피복 판정이 필요하므로 백필만 가능하다.
+///
+/// 반환: 해제된 행 수(UPDATE 3건 합).
+pub(crate) fn run_suppress_tag_sanity(conn: &Connection) -> SqlResult<usize> {
+    let mut total = 0usize;
+
+    // ① dangling — 원인 실측행이 소멸했거나 hm 정정(hm_sanity_v1)으로 실측 지위를 잃음.
+    //    substr 오프셋 10 = 'measured:' 접두사 9자 + 1
+    total += conn.execute(
+        "UPDATE fac_buildings SET suppressed_by = NULL
+         WHERE suppressed_by LIKE 'measured:%'
+           AND NOT EXISTS (SELECT 1 FROM fac_buildings u
+               WHERE u.id = CAST(substr(fac_buildings.suppressed_by, 10) AS INTEGER)
+                 AND (u.height_measured IS NOT NULL OR u.region = '실측3D'))",
+        [],
+    )?;
+
+    // ② 높이 조건 위반 — 저층 실측 원인행이 고층 하위행을 붙들고 있음.
+    //    식은 suppression::height_allows_suppress 의 실측 분기와 동일(슬랙 상수 공유 — 이중정의 금지).
+    let sql_height = format!(
+        "UPDATE fac_buildings SET suppressed_by = NULL
+         WHERE suppressed_by LIKE 'measured:%'
+           AND EXISTS (SELECT 1 FROM fac_buildings u
+               WHERE u.id = CAST(substr(fac_buildings.suppressed_by, 10) AS INTEGER)
+                 AND (u.height_measured IS NOT NULL OR u.region = '실측3D')
+                 AND COALESCE(u.height_measured, u.height) + {slack} < COALESCE(fac_buildings.height_measured, fac_buildings.height))",
+        slack = crate::suppression::SUPPRESS_HEIGHT_SLACK_M,
+    );
+    total += conn.execute(&sql_height, [])?;
+
+    // ③ h ≤ 0 수동 원인행 — 자신이 BRA 렌더/판정에서 스킵되므로 억제까지 두면 블랙홀이 된다
+    //    (height_allows_suppress 의 수동 분기와 동일 규칙). 원인행 소멸도 같은 조건으로 함께 걸린다.
+    //    substr 오프셋 8 = 'manual:' 접두사 7자 + 1
+    total += conn.execute(
+        "UPDATE fac_buildings SET suppressed_by = NULL
+         WHERE suppressed_by LIKE 'manual:%'
+           AND NOT EXISTS (SELECT 1 FROM manual_buildings m
+               WHERE m.id = CAST(substr(fac_buildings.suppressed_by, 8) AS INTEGER)
+                 AND m.height > 0)",
+        [],
+    )?;
+
+    Ok(total)
 }
 
 /// r2d2 연결 풀 초기화
@@ -711,4 +787,80 @@ pub fn load_srtm_ground_corrections_for_tile(
 pub fn clear_srtm_ground_corrections(conn: &Connection) -> SqlResult<()> {
     conn.execute("DELETE FROM srtm_ground_corrections", [])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 억제 태그 정정에 필요한 최소 스키마 + 4행 시나리오 인메모리 DB
+    ///
+    /// 원인행: 실측3D 8m(id 100, 저층) · 실측3D 66m(id 101, 정상) · 수동 h=0(manual id 1)
+    /// 하위행: id 1 dangling / id 2 저층 원인 / id 3 정상 원인 / id 4 h=0 수동 원인
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("인메모리 DB");
+        conn.execute_batch(
+            "CREATE TABLE fac_buildings (
+                 id INTEGER PRIMARY KEY,
+                 region TEXT NOT NULL,
+                 height REAL NOT NULL,
+                 height_measured REAL,
+                 suppressed_by TEXT
+             );
+             CREATE TABLE manual_buildings (
+                 id INTEGER PRIMARY KEY,
+                 height REAL NOT NULL
+             );
+
+             -- 원인행 (상위 자료)
+             INSERT INTO fac_buildings (id, region, height, height_measured, suppressed_by)
+                 VALUES (100, '실측3D', 8.0, 8.0, NULL),
+                        (101, '실측3D', 66.0, 66.0, NULL);
+             INSERT INTO manual_buildings (id, height) VALUES (1, 0.0);
+
+             -- 하위행 (대장)
+             INSERT INTO fac_buildings (id, region, height, height_measured, suppressed_by)
+                 VALUES (1, '서울', 50.0, NULL, 'measured:999'),
+                        (2, '서울', 66.0, NULL, 'measured:100'),
+                        (3, '서울', 60.0, NULL, 'measured:101'),
+                        (4, '서울', 40.0, NULL, 'manual:1');",
+        )
+        .expect("테스트 스키마");
+        conn
+    }
+
+    /// 태그 조회 헬퍼
+    fn tag_of(conn: &Connection, id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT suppressed_by FROM fac_buildings WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("태그 조회")
+    }
+
+    /// 청소 3건(dangling · 저층 원인 · h=0 수동)만 해제되고 정상 태그는 유지된다
+    #[test]
+    fn test_suppress_tag_sanity_cleans_only_invalid() {
+        let conn = setup();
+        let n = run_suppress_tag_sanity(&conn).expect("정정 실행");
+        assert_eq!(n, 3, "해제 행 수");
+
+        assert_eq!(tag_of(&conn, 1), None, "dangling(원인행 소멸) 청소");
+        assert_eq!(tag_of(&conn, 2), None, "저층 실측 원인(8m vs 66m) 청소");
+        assert_eq!(
+            tag_of(&conn, 3),
+            Some("measured:101".to_string()),
+            "정상(66m vs 60m) 유지"
+        );
+        assert_eq!(tag_of(&conn, 4), None, "h=0 수동 원인 청소");
+    }
+
+    /// 멱등 — 두 번째 실행은 바꿀 행이 없다
+    #[test]
+    fn test_suppress_tag_sanity_idempotent() {
+        let conn = setup();
+        assert_eq!(run_suppress_tag_sanity(&conn).expect("1회차"), 3);
+        assert_eq!(run_suppress_tag_sanity(&conn).expect("2회차"), 0);
+    }
 }
