@@ -604,6 +604,7 @@ export default function TrackMap() {
   // LoS 단면도 레이어 표시 / 프레넬 클리어런스 / 사용자 각도선 (드로어에서 제어)
   const [losLayers, setLosLayers] = useState({ terrain: true, los43: true, fresnel: true, bra: true, cos: false });
   const [fresnelPct, setFresnelPct] = useState(80);
+  const [losCurtainOpacity, setLosCurtainOpacity] = useState(1); // LoS 커튼 월(면) 채움 불투명도 (기본 1 = 불투명, 슬라이더로 0.05까지 하향)
   const [losShowBuildings, setLosShowBuildings] = useState(true);
   const [showCustomAngle, setShowCustomAngle] = useState(false);
   const [customAngleDeg, setCustomAngleDeg] = useState(0.5);
@@ -2916,9 +2917,9 @@ export default function TrackMap() {
       //   quad 생성(밴드 분할·클램프·퇴화 skip)은 아래 동적 적층 루프가 담당하고 여기선 레이어 옵션만 책임진다.
       //   z 는 선과 동일 EX 배율. 수직 폴리곤은 2D 테셀레이션에서 퇴화하므로 _full3d 필수,
       //   material:false 로 조명 음영 없이 플랫 색.
-      //   전 월 불투명(α=255)이되 서로 겹치지 않는 비중첩 밴드로 쌓으므로 프래그먼트마다 속하는 월이
-      //   유일 → depth 경합 없음. depthCompare:"less-equal" 은 인접 밴드가 공유하는 모서리(경계 픽셀)
-      //   이음새용으로만 유지.
+      //   전 월이 서로 겹치지 않는 비중첩 밴드로 쌓이므로 프래그먼트마다 속하는 월이 유일 → depth 경합
+      //   없음(알파는 사용자 슬라이더 wallA, 반투명이어도 내부 이중 블렌딩 없음).
+      //   depthCompare:"less-equal" 은 인접 밴드가 공유하는 모서리(경계 픽셀) 이음새용으로만 유지.
       type CurtainQuad = { polygon: [number, number, number][] };
       const pushCurtainWallQuads = (
         id: string,
@@ -2961,11 +2962,14 @@ export default function TrackMap() {
       //   클램프 — 미클램프 시 천장 교차 세그먼트에서 top=max(top,bottom) 상향 클램프가 다음 샘플 cosM
       //   높이(샘플 간격만큼 천장 위 수 km)까지 스파이크 삼각형을 만든다. 클램프하면 교차 세그먼트가
       //   천장에서 평평하게 잘리고 그 너머는 bottom=top=ceilM 퇴화 skip → 레이더 근방 쐐기면만 남는다(의도).
+      //   월 채움 알파(사용자 슬라이더) — 비중첩 밴드(프래그먼트당 월 유일)라 반투명이어도 내부 이중 블렌딩 없음.
+      //   인접 밴드가 공유하는 모서리 1px 이음새만 미세 중첩 가능(허용).
+      const wallA = Math.round(losCurtainOpacity * 255);
       const wallDefs: { key: string; top: (s: LosCurtainSample) => number; color: [number, number, number, number]; on: boolean; bottomLine?: (s: LosCurtainSample) => number }[] = [
-        { key: "cos",     top: () => ceilM,       color: [168, 85, 247, 255], on: losLayers.cos, bottomLine: (s) => Math.min(s.cosM, ceilM) },
-        { key: "fresnel", top: (s) => s.fresnelM, color: [236, 72, 153, 255], on: losLayers.fresnel },
-        { key: "los43",   top: (s) => s.los43M,   color: [245, 158, 11, 255], on: losLayers.los43 },
-        { key: "bra",     top: (s) => s.braM,     color: [34, 211, 238, 255], on: losLayers.bra },
+        { key: "cos",     top: () => ceilM,       color: [168, 85, 247, wallA], on: losLayers.cos, bottomLine: (s) => Math.min(s.cosM, ceilM) },
+        { key: "fresnel", top: (s) => s.fresnelM, color: [236, 72, 153, wallA], on: losLayers.fresnel },
+        { key: "los43",   top: (s) => s.los43M,   color: [245, 158, 11, wallA], on: losLayers.los43 },
+        { key: "bra",     top: (s) => s.braM,     color: [34, 211, 238, wallA], on: losLayers.bra },
       ];
       const activeWalls = wallDefs.filter((w) => w.on);
       // ── 밴드 경계 교차점 세그먼트 분할 (refined) ──
@@ -3290,7 +3294,7 @@ export default function TrackMap() {
       }
     }
     return layers;
-  }, [losMode, losTarget, losCursor, radarInfo, radarSite.latitude, radarSite.longitude, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, losCurtain, losLayers, terrainEnabled, losBldgMarkers, losActiveViewIdx]);
+  }, [losMode, losTarget, losCursor, radarInfo, radarSite.latitude, radarSite.longitude, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, losCurtain, losLayers, losCurtainOpacity, terrainEnabled, losBldgMarkers, losActiveViewIdx]);
 
   // Loss 포인트 전용 deck.gl 레이어 (Loss 데이터 변경 시에만 재생성)
   const lossDeckLayers = useMemo(() => {
@@ -4844,6 +4848,14 @@ export default function TrackMap() {
                   <span style={{ ...num, fontSize: 10, color: "#f43f5e", width: 34, textAlign: "right" }}>{customAngleDeg.toFixed(2)}°</span>
                 </div>
               )}
+              {/* 지도 3D 커튼 월 채움 알파 — 상단 강조선은 영향 없음 (전 레이어 공통이라 중립 회색) */}
+              <div style={{ margin: "4px 0 0", paddingLeft: 5 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                  <span style={{ fontSize: 11, fontWeight: 500, color: "#4b5563", flex: 1 }}>커튼 불투명도</span>
+                  <span style={{ ...num, fontSize: 10, color: "#64748b" }}>{Math.round(losCurtainOpacity * 100)}%</span>
+                </div>
+                <DsSlider value={losCurtainOpacity} min={0.05} max={1} step={0.05} onChange={setLosCurtainOpacity} color="#64748b" />
+              </div>
             </div>
           </div>
 
