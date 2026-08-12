@@ -7,6 +7,9 @@ import type { MapboxOverlay } from "@deck.gl/mapbox";
 import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer, TextLayer } from "@deck.gl/layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
+// Tile3DLayer 의 onTileLoad/onTileUnload 콜백 인자 타입 (@deck.gl/geo-layers 가 참조하는 것과 동일 모듈).
+// 타입 전용 import 라 번들에는 포함되지 않는다.
+import type { Tile3D } from "@loaders.gl/tiles";
 import {
   Mountain,
   Crosshair,
@@ -3441,6 +3444,57 @@ export default function TrackMap() {
     return Math.round((8 + t * 16) / 2) * 2;
   }, [viewState.pitch]);
 
+  /** 로드된 실측 메시 콘텐츠 타일의 [minLat, maxLat, minLon, maxLon] — 셸 모드 판정용.
+   *  BRA 프리즘의 "빨강 셸(원추 아래 discard)" 은 그 자리에 실제로 그려지는 메시가 있을 때만 성립한다.
+   *  전역 플래그(meshActive&&meshZoomOk)만 보면 타일이 아직 안 온 구역에서 하부가 통째로 투명해지므로
+   *  실제 로드된 타일의 지리 bbox 를 모아 위치별로 판정한다. 키는 `타일셋레이어id|tile.id`. */
+  const loadedMeshTileBboxRef = useRef<Map<string, [number, number, number, number]>>(new Map());
+  /** bbox 집합 변경 세대 — braDeckLayers useMemo 의 재계산 트리거(ref 는 리렌더를 유발하지 않으므로 필요) */
+  const [meshTilesVersion, setMeshTilesVersion] = useState(0);
+  /** 세대 증가 코얼레싱 타이머 — 타일 스트리밍 중 프리즘 레이어 과재계산 방지 */
+  const meshTilesBumpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 200ms trailing 코얼레싱 — 첫 호출이 타이머를 예약하고 그 사이의 모든 로드/언로드는 같은 틱에 합류한다.
+  // (매 호출마다 타이머를 재설정하는 방식은 카메라가 계속 움직여 타일이 끊임없이 들어올 때 세대 증가가
+  //  무한 연기될 수 있어 채택하지 않았다 — 이 방식은 최대 200ms 안에 반드시 1회 반영된다.)
+  const bumpMeshTilesVersion = useCallback(() => {
+    if (meshTilesBumpTimerRef.current !== null) return;
+    meshTilesBumpTimerRef.current = setTimeout(() => {
+      meshTilesBumpTimerRef.current = null;
+      setMeshTilesVersion((v) => v + 1);
+    }, 200);
+  }, []);
+
+  // 언마운트 시 예약 타이머 정리
+  useEffect(() => () => {
+    if (meshTilesBumpTimerRef.current !== null) {
+      clearTimeout(meshTilesBumpTimerRef.current);
+      meshTilesBumpTimerRef.current = null;
+    }
+  }, []);
+
+  // 타일 콘텐츠 로드 — 지리 bbox 등록.
+  // tile.boundingBox(@loaders.gl/tiles Tile3D getter)는 3D Tiles 스펙의 boundingVolume 3종
+  // (region / box / sphere)을 타입 분기해 [[minLon,minLat,minAlt],[maxLon,maxLat,maxAlt]] 카토그래픽
+  // 경계로 환산한다(region 은 라디안→도, box/sphere 는 ECEF 코너·축단점을 Ellipsoid.WGS84 로 역투영).
+  // 라이브러리가 이미 스펙 분기를 제공하므로 동일 계산을 재구현하지 않는다 — 폴백이 아니라 타입 분기다.
+  // (김포 타일셋은 전 타일 region 사용 확인 — 값은 getter 내부에서 타일당 1회 캐시된다)
+  // 키는 `타일셋레이어id|tile.id` — tile.id 는 b3dm 콘텐츠 URL 이고 main/cdm 두 타일셋이 같은 폴더를
+  // 베이스로 삼으므로, 같은 파일을 양쪽이 참조하면 id 가 겹친다. 한쪽 언로드가 다른 쪽 항목까지 지우지
+  // 않도록 타일셋별로 분리한다.
+  const onMeshTileLoad = useCallback((tilesetKey: string, tile: Tile3D) => {
+    // 빈 타일·외부 타일셋 참조 노드는 아무것도 그리지 않으므로 커버리지에서 제외
+    if (!tile.hasRenderContent) return;
+    const [bbMin, bbMax] = tile.boundingBox; // [lon, lat, alt] 순
+    loadedMeshTileBboxRef.current.set(`${tilesetKey}|${tile.id}`, [bbMin[1], bbMax[1], bbMin[0], bbMax[0]]);
+    bumpMeshTilesVersion();
+  }, [bumpMeshTilesVersion]);
+
+  // 타일 언로드(캐시 축출) — 더 이상 그려지지 않으므로 커버리지에서 제거
+  const onMeshTileUnload = useCallback((tilesetKey: string, tile: Tile3D) => {
+    if (loadedMeshTileBboxRef.current.delete(`${tilesetKey}|${tile.id}`)) bumpMeshTilesVersion();
+  }, [bumpMeshTilesVersion]);
+
   // onTilesetLoad 로 수집한 Tileset3D 인스턴스(main + cdm 최대 2개) — setProps 라이브 갱신 대상.
   const tilesetsRef = useRef<any[]>([]);
   // 최신 게이트 목표값. 타일셋 로드는 비동기라 게이트가 먼저 바뀔 수 있고, 이때 늦게 도착한
@@ -3483,6 +3537,10 @@ export default function TrackMap() {
         // 버튼 드래그(카메라 조작) 중엔 스킵되므로 타일 튜닝(debounce/캐시)과 충돌 없음
         pickable: true,
         onTilesetLoad: tuneTileset,
+        // 로드/언로드 타일의 지리 bbox 추적 — BRA 프리즘 셸 모드가 "그 위치에 실제 메시가 있는가"를
+        // 판정하는 단일 원천. main·cdm 두 타일셋이 같은 핸들러를 쓰되 레이어 id 로 키를 분리한다.
+        onTileLoad: (tile: Tile3D) => onMeshTileLoad(id, tile),
+        onTileUnload: (tile: Tile3D) => onMeshTileUnload(id, tile),
         onTileError: (err: unknown) => console.warn("실측 3D 타일 로드 실패:", err),
       });
     // meshZoomOk 로 인스턴스를 재생성해도 id·data 가 동일하면 deck 이 id 매칭으로 기존 state(tileset3d)
@@ -3494,7 +3552,7 @@ export default function TrackMap() {
       // 보충 타일셋 — 없으면 onTileError 로 조용히 무시
       tileset(cdmId, "tileset_cdm.json"),
     ];
-  }, [showTiles3d, tiles3dDir, meshZoomOk]);
+  }, [showTiles3d, tiles3dDir, meshZoomOk, onMeshTileLoad, onMeshTileUnload]);
 
   // 게이트 적용 — 로드된 타일셋에 SSE/loadTiles 라이브 반영.
   // loadTiles:false 는 Tileset3D.doUpdate 를 조기 반환시켜 순회·신규 로드를 완전 동결하되
@@ -3516,17 +3574,30 @@ export default function TrackMap() {
   // 타일셋 표출 자체가 꺼지면(memo 가 [] 반환 → 레이어·tileset3d 폐기) 죽은 참조 정리.
   // 주의: 게이트 플립(meshZoomOk 변화)으로는 절대 비우면 안 된다 — onTilesetLoad 는 최초 로드 시
   // 1회만 발화하므로, 살아있는 타일셋 참조를 비우면 다시 채울 기회가 영영 없다.
+  // 타일 bbox 도 함께 비운다 — 타일셋이 폐기되면 onTileUnload 가 전 타일에 대해 발화한다는 보장이
+  // 없어, 남겨두면 "메시가 없는데 셸(투명)" 상태가 굳는다.
   useEffect(() => {
-    if (!showTiles3d || !tiles3dDir) tilesetsRef.current = [];
-  }, [showTiles3d, tiles3dDir]);
+    if (!showTiles3d || !tiles3dDir) {
+      tilesetsRef.current = [];
+      if (loadedMeshTileBboxRef.current.size > 0) {
+        loadedMeshTileBboxRef.current.clear();
+        bumpMeshTilesVersion();
+      }
+    }
+  }, [showTiles3d, tiles3dDir, bumpMeshTilesVersion]);
 
   // 폴더 교체(dirA→dirB) 정리 — 레이어 id 가 바뀌어 구 tileset 은 폐기되므로 참조도 함께 비운다
   // (안 비우면 죽은 객체가 게이트 setProps 대상으로 남는다). 새 타일셋은 onTilesetLoad 가 재push.
   // deps 를 [tiles3dDir] 로 좁힌 것이 핵심 — 위 이펙트와 달리 조건 없이 비우므로, showTiles3d/줌
   // 토글에도 반응하면 살아있는 참조까지 날아가고 onTilesetLoad 는 재발화하지 않아 영영 못 채운다.
+  // 구 폴더 타일의 bbox 도 같은 이유로 함께 비운다(새 타일은 onTileLoad 가 재등록).
   useEffect(() => {
     tilesetsRef.current = [];
-  }, [tiles3dDir]);
+    if (loadedMeshTileBboxRef.current.size > 0) {
+      loadedMeshTileBboxRef.current.clear();
+      bumpMeshTilesVersion();
+    }
+  }, [tiles3dDir, bumpMeshTilesVersion]);
 
   // CAT008 기상 극좌표 벡터 → 부채꼴 폴리곤 레이어.
   // 시간은 NEC 프레임 분 단위로 양자화 → 재생 시점(visibleMaxTs) 이하의 최신 1분 스냅샷만 표시.
@@ -3696,6 +3767,14 @@ export default function TrackMap() {
     const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
     // 실측 3D 메시가 실제로 화면에 그려지는 조건 (Tile3DLayer visible 게이트와 동일 식)
     const meshShown = meshActive && meshZoomOk;
+    // 그 좌표를 덮는 메시 콘텐츠 타일이 **실제로 로드돼 있는가** — 셸 모드 판정의 단일 원천.
+    // 타일 수는 뷰포트 선택분 수준(수십~수백)이라 건물당 선형 스캔으로 충분하다(early-return).
+    const meshCoveredAt = (lat: number, lon: number) => {
+      for (const [minLat, maxLat, minLon, maxLon] of loadedMeshTileBboxRef.current.values()) {
+        if (lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon) return true;
+      }
+      return false;
+    };
     const R_EARTH_M = 6_371_000;
     const M_PER_DEG_LAT = 111320; // 파일 내 기존 평면근사와 동일 계열
     const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
@@ -3741,16 +3820,18 @@ export default function TrackMap() {
     }
 
     // ── ② 침범 건물: AMSL×EX 프레임 통짜 프리즘 (원추면 아래 회색 · 위 빨강) ──
-    //   · 실측 건물 + 메시 표출 중(meshShown)이면 "빨강 셸 모드"로 분리한다. 같은 자리에 실측 메시와
+    //   · 메시가 그 자리에 실제로 그려지는 건물은 "빨강 셸 모드"로 분리한다. 같은 자리에 실측 메시와
     //     불투명 프리즘이 겹치면 (a) 두 면이 사실상 동일 평면이라 z-fighting 패치워크가 생기고
     //     (b) 프리즘이 메시를 덮어 "실측 우선 표시" 요구와 충돌한다. 셸 모드는 지오메트리를 통짜
     //     프리즘 그대로 두되 셰이더가 원추 아래 픽셀을 discard 해(색·depth 모두 미기록) 하부는 실측
     //     메시가 그대로 드러나고 원추 위 초과부만 빨강으로 남는다. 남는 셸도 메시와 동일면이 되지
     //     않도록 수평 0.5m·수직 0.3m 팽창시킨다.
+    //   · 셸 기준은 DB measured 플래그가 아니라 **그 위치에 실제 로드·표출 중인 메시 타일 존재 여부**
+    //     (meshShown && meshCoveredAt) — ① 타일 미로드/언로드 구역에서 하부 discard 로 건물이
+    //     투명해지는 문제, ② 메시 커버리지 내 비실측 대장행 프리즘이 메시를 덮는 불일치를 동시에
+    //     해소한다. 타일이 늦게 로드되면 그 건물만 통짜→셸로 전환된다(버전 코얼레싱 200ms).
+    //     meshShown=false(줌<14 또는 메시 꺼짐)면 meshCoveredAt 을 보지 않고 전부 통짜 프리즘 — 불변.
     if (braResult && braResult.buildings.length > 0) {
-      // 판정에 쓰인 값(결과 스냅샷)으로 원추면 재구성 — 입력 슬라이더를 이후 조정해도 오버레이는 결과와 정합
-      const hRes = braResult.radar_height_m;
-      const tanRes = Math.tan((braResult.angle_deg * Math.PI) / 180);
       // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함.
       // 색은 면에 싣지 않는다 — 상/하 분할은 BraPrismLayer 가 프래그먼트 단위로 수행한다.
       type BraFace = { polygon: [number, number, number][]; b: BraBuilding };
@@ -3761,7 +3842,12 @@ export default function TrackMap() {
       for (const b of braResult.buildings) {
         const poly = b.polygon;
         if (!poly || poly.length < 3) continue;
-        const shell = b.measured && meshShown;
+        // b.measured 는 셸 판정에서 제외 — 표출 여부의 진실은 로드된 타일 커버리지뿐이다
+        // (b.measured 는 픽 툴팁·드로어 등 다른 용도로는 그대로 사용).
+        // 단 수동 건물(source="manual")은 예외로 항상 통짜 프리즘 — 사용자가 그린 가상/시뮬 구조물이라
+        // 실측 메시(DSM)에 존재하지 않으므로, 메시 커버리지 안이라도 셸로 만들면 하부가 통째로
+        // 투명해진다(원추 아래 discard 인데 드러날 메시가 없음).
+        const shell = b.source !== "manual" && meshShown && meshCoveredAt(b.lat, b.lon);
         // 바닥·지붕 모두 AMSL×EX — 원추면과 같은 프레임. terrainEnabled=false 면 EX=1 이라 AMSL 그대로라
         // 평면 지도에선 건물이 지반고만큼 떠 보이지만, 원추면도 같은 AMSL 이라 정합을 우선한다.
         const zBase = b.ground_elev_m * EX;
@@ -3836,7 +3922,10 @@ export default function TrackMap() {
       };
 
       // 원추면 재구성 파라미터 — ①의 원추면 메시와 **동일 값·동일 평면근사**라 렌더 원추와 픽셀 정합.
-      // 판정에 쓰인 결과 스냅샷(hRes/tanRes)만 사용 — 라이브 슬라이더 값 금지.
+      // 색 분할(회색/빨강)은 **렌더된 원추면과 동일한 라이브 파라미터**(apexM/tanTheta) — 경계가 항상
+      // 화면의 원추면과 픽셀 일치한다. 프리즘 **집합**(어떤 건물이 있는가)은 결과 스냅샷이며 파라미터
+      // 변경 시 400ms 디바운스 자동 재분석이 수렴시킨다. 종전 스냅샷 색분할(braResult.radar_height_m/
+      // angle_deg)은 각도 변경 직후 "원추면 위인데 회색" 어긋남 창을 만들었다(2026-08-12 수정).
       const prismCommon = {
         getPolygon: (d: BraFace) => d.polygon,
         // 백색 = 셰이더의 조명 계수 캐리어 — FS 에서 실제 색(빨강/회색)을 여기에 곱한다
@@ -3845,8 +3934,8 @@ export default function TrackMap() {
         radarLat: radarSite.latitude,
         mPerDegLat: M_PER_DEG_LAT,
         mPerDegLon,
-        apexM: hRes,
-        tanTheta: tanRes,
+        apexM,
+        tanTheta,
         ex: EX,
         filled: true,
         extruded: false,
@@ -3895,6 +3984,10 @@ export default function TrackMap() {
         pickable: false,
         // depth 미기록 — 반투명 면이 depth 를 남기면 뒤에 그려지는 항적/건물/Loss 마커가 가려진다
         parameters: { depthWriteEnabled: false },
+        // deck 기본 오프셋([0,-layerIndex*100])은 뒤에 그리는 이 원추면을 depth 동일평면 경합에서
+        // 항상 이기게 해 프리즘 빨강 하단 경계를 청록으로 침식했다. +100 으로 원추면을 한 레이어 스텝
+        // 뒤로 밀어 프리즘(기본 오프셋)이 항상 이긴다 — 시각 위치는 불변, 경계 픽셀 소유만 프리즘으로.
+        getPolygonOffset: () => [0, 100] as [number, number],
       }),
       new PathLayer<{ path: [number, number, number][] }>({
         id: "bra-cone-rim",
@@ -3908,7 +4001,9 @@ export default function TrackMap() {
     );
 
     return layers;
-  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled, openBldgDrawerFor, meshActive, meshZoomOk]);
+    // meshTilesVersion 은 값을 직접 쓰지 않고 loadedMeshTileBboxRef(ref) 변경을 알리는 세대 키로만
+    // 존재한다 — 이게 없으면 타일이 늦게 로드돼도 셸 판정이 재평가되지 않는다.
+  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled, openBldgDrawerFor, meshActive, meshZoomOk, meshTilesVersion]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {

@@ -27,6 +27,9 @@ pub const COVER_RATIO: f64 = 0.03;
 /// 작은 수동 마커/블롭 조각이 큰 건물 안에 통째로 들어있는 경우(면적비로는 COVER_RATIO 미달)를 잡는다.
 const CONTAIN_RATIO: f64 = 0.5;
 
+/// 억제 높이 슬랙 (m) — 상위(실측)가 하위(대장)보다 이만큼까지 낮아도 동일 건물로 인정
+const SUPPRESS_HEIGHT_SLACK_M: f64 = 10.0;
+
 /// 면적비(주 판정) 격자 샘플 축당 점 수 (24×24 = 576점)
 const SAMPLE_N: i32 = 24;
 
@@ -51,7 +54,10 @@ const FALLBACK_HALF_DEG: f64 = 0.000045;
 const LOG_EVERY: u64 = 50_000;
 
 /// 백필 완료 표식 settings 키
-const BACKFILL_KEY: &str = "suppression_backfill_v1";
+/// v2 = 높이 조건 억제(height_allows_suppress) 도입 — 구 규칙으로 확정된 억제 태그를 전 영역
+/// 재계산해 바로잡기 위해 키를 올렸다. 구 키 'suppression_backfill_v1' 행은 조회되지 않으므로
+/// settings 에 남아 있어도 무해하다(삭제 불필요).
+const BACKFILL_KEY: &str = "suppression_backfill_v2";
 
 /// 좌표 → 겹침 인덱스 셀 (measured_building.rs::cell_of 와 동일 식)
 #[inline]
@@ -63,10 +69,29 @@ fn cell_of(lat: f64, lon: f64) -> (i32, i32) {
 struct Footprint {
     /// `suppressed_by` 에 기록할 태그 — "manual:<id>" 또는 "measured:<fac_id>"
     tag: String,
+    /// 상위 자료의 높이 (m) — 수동은 `manual_buildings.height`,
+    /// 실측은 `COALESCE(height_measured, height)`. 높이 조건 억제(height_allows_suppress) 기준.
+    height_m: f64,
     /// 풋프린트 링 (lon, lat) — point_in_polygon_2d 의 (x, y) 규약
     ring: Vec<(f64, f64)>,
     /// [min_lat, max_lat, min_lon, max_lon]
     bbox: [f64; 4],
+}
+
+/// 상위 풋프린트가 하위 행을 **높이 기준으로** 억제할 자격이 있는가.
+///
+/// 피복(면적) 판정만으로는 5~16m 저층 실측 블롭이 66m 아파트 대장 행을 통째로 억제해
+/// 건물이 BRA/LoS 에서 사라진다(은행마을 아주아파트 사례). 상위가 하위를 대체하려면
+/// 최소한 비슷한 높이를 갖고 있어야 한다.
+///
+/// · 실측(measured:) — `상위고 + SUPPRESS_HEIGHT_SLACK_M ≥ 하위고` 여야 억제 가능.
+/// · 수동(manual:) — 사용자가 직접 넣은 최우선 자료라 높이 비교 없이 우선한다. 단 h ≤ 0 마커는
+///   자신이 BRA 렌더/판정에서 스킵되므로 억제까지 허용하면 건물이 통째로 사라지는 블랙홀이 된다.
+fn height_allows_suppress(upper: &Footprint, lower_height_m: f64) -> bool {
+    if upper.tag.starts_with("manual:") {
+        return upper.height_m > 0.0;
+    }
+    upper.height_m + SUPPRESS_HEIGHT_SLACK_M >= lower_height_m
 }
 
 /// 상위 풋프린트들을 0.001° 셀 버킷에 적재한 겹침 프리필터 인덱스.
@@ -87,7 +112,7 @@ impl FootprintIndex {
     }
 
     /// 링 + bbox 를 인덱스에 등록. 3점 미만/비정상 bbox 는 무시(등록 안 함).
-    fn push(&mut self, tag: String, ring: Vec<(f64, f64)>, bbox: [f64; 4]) {
+    fn push(&mut self, tag: String, height_m: f64, ring: Vec<(f64, f64)>, bbox: [f64; 4]) {
         if ring.len() < 3 {
             return;
         }
@@ -101,7 +126,9 @@ impl FootprintIndex {
             return;
         }
         let idx = self.items.len();
-        self.items.push(Footprint { tag, ring, bbox });
+        // 높이 미상(NULL/비정상)은 0.0 으로 들어와 실측 상위는 낮은 하위만 억제하게 된다(보수적)
+        let height_m = if height_m.is_finite() { height_m } else { 0.0 };
+        self.items.push(Footprint { tag, height_m, ring, bbox });
         for r in r0..=r1 {
             for cc in c0..=c1 {
                 self.buckets.entry((r, cc)).or_default().push(idx);
@@ -221,18 +248,32 @@ pub fn manual_bbox(
 ///    샘플 중 하위 풋프린트 안에 드는 비율 ≥ CONTAIN_RATIO 인 상위가 있으면 그 **최초 매치**.
 ///    (작은 수동 마커/블롭 조각이 큰 건물 안에 들어있는 경우)
 ///
+/// 두 판정 모두 **높이 조건**(height_allows_suppress)을 통과한 상위만 대상으로 한다 — 자격 없는
+/// 상위는 후보 목록에서 먼저 걸러내므로 피복 기여(주판정 union)에도 포함되지 않는다.
+///
 /// bbox 는 축 정렬 최소 직사각형이라 대각선/L자형 건물에서는 실제 풋프린트보다 훨씬 크다.
 /// bbox 만으로 판정하면 실제로는 닿지도 않는 인접 건물이 '유령 겹침'으로 오억제되므로,
 /// bbox 는 저비용 프리필터로만 쓰고 확정은 폴리곤 내부점으로 한다.
 fn covering_tag(
     lower_ring: &[(f64, f64)],
     lower_bbox: &[f64; 4],
+    lower_height_m: f64,
     index: &FootprintIndex,
     cands: &[usize],
 ) -> Option<String> {
     if lower_ring.len() < 3 || cands.is_empty() {
         return None;
     }
+    // 높이 조건 미달 상위는 애초에 후보에서 제외 (주판정·보조판정 공통 게이트)
+    let cands: Vec<usize> = cands
+        .iter()
+        .copied()
+        .filter(|&ci| height_allows_suppress(&index.items[ci], lower_height_m))
+        .collect();
+    if cands.is_empty() {
+        return None;
+    }
+    let cands = &cands[..];
     let (min_lat, max_lat, min_lon, max_lon) =
         (lower_bbox[0], lower_bbox[1], lower_bbox[2], lower_bbox[3]);
     let own_area = (max_lat - min_lat) * (max_lon - min_lon);
@@ -331,7 +372,7 @@ fn load_manual_index(
     // 그룹 비활성(enabled=0) 여부와 무관하게 전부 적재 — 억제는 자료 우선순위의 문제이고,
     // 그룹 토글은 표시/판정 범위의 문제라 서로 독립이다(토글로 대장 중복이 되살아나면 안 됨).
     let Ok(mut stmt) = conn.prepare(
-        "SELECT id, latitude, longitude, geometry_type, geometry_json
+        "SELECT id, latitude, longitude, geometry_type, geometry_json, height
          FROM manual_buildings
          WHERE latitude BETWEEN ?1 AND ?2 AND longitude BETWEEN ?3 AND ?4",
     ) else {
@@ -352,6 +393,7 @@ fn load_manual_index(
                 row.get::<_, f64>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, f64>(5)?,
             ))
         },
     ) else {
@@ -359,13 +401,13 @@ fn load_manual_index(
         return idx;
     };
 
-    for (id, lat, lon, geo_type, geo_json) in rows.flatten() {
+    for (id, lat, lon, geo_type, geo_json, height) in rows.flatten() {
         if !lat.is_finite() || !lon.is_finite() {
             continue;
         }
         let ring = manual_ring(lat, lon, geo_type.as_deref(), geo_json.as_deref());
         let Some(bbox) = ring_bbox(&ring) else { continue };
-        idx.push(format!("manual:{}", id), ring, bbox);
+        idx.push(format!("manual:{}", id), height, ring, bbox);
     }
     idx
 }
@@ -382,7 +424,8 @@ fn load_measured_index(
     // WHERE 절의 실측 술어 텍스트는 db.rs 의 파셜 인덱스 idx_fac_buildings_measured_bbox
     // predicate 와 동일해야 플래너가 그 인덱스를 선택한다(db.rs 주석의 기존 계약) — 문구 변경 금지.
     let Ok(mut stmt) = conn.prepare(
-        "SELECT id, polygon_json, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon
+        "SELECT id, polygon_json, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon,
+                COALESCE(height_measured, height)
          FROM fac_buildings
          WHERE (height_measured IS NOT NULL OR region='실측3D')
            AND bbox_max_lat >= ?1 AND bbox_min_lat <= ?2
@@ -399,13 +442,14 @@ fn load_measured_index(
             row.get::<_, Option<f64>>(3)?,
             row.get::<_, Option<f64>>(4)?,
             row.get::<_, Option<f64>>(5)?,
+            row.get::<_, Option<f64>>(6)?,
         ))
     }) else {
         log::warn!("[중복억제] 실측 행 쿼리 실행 실패 — 실측 우선순위 생략");
         return idx;
     };
 
-    for (id, poly_json, b0, b1, b2, b3) in rows.flatten() {
+    for (id, poly_json, b0, b1, b2, b3, height) in rows.flatten() {
         // 폴리곤 파싱 실패 행은 피복 근거가 없어 스킵(억제 원인이 되지 못함)
         let Some(ring) = parse_polygon_ring(poly_json.as_deref()) else { continue };
         // bbox 는 저장 컬럼 우선, 미기입(NULL)이면 링에서 산출
@@ -416,7 +460,7 @@ fn load_measured_index(
                 None => continue,
             },
         };
-        idx.push(format!("measured:{}", id), ring, bbox);
+        idx.push(format!("measured:{}", id), height.unwrap_or(0.0), ring, bbox);
     }
     idx
 }
@@ -463,7 +507,8 @@ pub fn recompute_area(
         let mut stmt = conn
             .prepare(
                 "SELECT id, polygon_json, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon,
-                        (height_measured IS NOT NULL OR region = '실측3D'), suppressed_by
+                        (height_measured IS NOT NULL OR region = '실측3D'), suppressed_by,
+                        COALESCE(height_measured, height)
                  FROM fac_buildings
                  WHERE centroid_lat BETWEEN ?1 AND ?2
                    AND centroid_lon BETWEEN ?3 AND ?4",
@@ -480,13 +525,16 @@ pub fn recompute_area(
                     row.get::<_, Option<f64>>(5)?,
                     row.get::<_, bool>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
                 ))
             })
             .map_err(|e| format!("중복억제 대상 쿼리 실행 실패: {}", e))?;
 
         for row in rows {
-            let (id, poly_json, b0, b1, b2, b3, measured, current) =
+            let (id, poly_json, b0, b1, b2, b3, measured, current, lower_height) =
                 row.map_err(|e| format!("중복억제 대상 행 읽기 실패: {}", e))?;
+            // 높이 미상은 0 — 상위(실측)가 어떤 높이든 억제할 수 있다(기존 동작 유지)
+            let lower_height_m = lower_height.filter(|v| v.is_finite()).unwrap_or(0.0);
             scanned += 1;
             if scanned % LOG_EVERY == 0 {
                 log::info!("[중복억제] 스캔 {}행 · 변경 예정 {}건", scanned, changes.len());
@@ -524,11 +572,13 @@ pub fn recompute_area(
                         };
                         // ① 수동 최우선
                         if !manual_idx.is_empty() {
-                            new_val = covering_tag(&ring, &bb, &manual_idx, &m_cands);
+                            new_val =
+                                covering_tag(&ring, &bb, lower_height_m, &manual_idx, &m_cands);
                         }
                         // ② 수동에 안 덮인 대장 행만 실측 우선순위 적용
                         if new_val.is_none() && !measured && !measured_idx.is_empty() {
-                            new_val = covering_tag(&ring, &bb, &measured_idx, &s_cands);
+                            new_val =
+                                covering_tag(&ring, &bb, lower_height_m, &measured_idx, &s_cands);
                         }
                     }
                 }
@@ -706,4 +756,82 @@ pub fn backfill_if_needed(conn: &Connection) -> Result<u64, String> {
         started.elapsed().as_secs_f64()
     );
     Ok(total_suppressed + total_cleared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 중심 (lat, lon) · 반변 half(deg) 정사각 링 — (lon, lat) 규약
+    fn square(lat: f64, lon: f64, half: f64) -> Vec<(f64, f64)> {
+        vec![
+            (lon - half, lat - half),
+            (lon + half, lat - half),
+            (lon + half, lat + half),
+            (lon - half, lat + half),
+        ]
+    }
+
+    /// 상위 풋프린트 1건짜리 인덱스 (하위와 완전히 겹치는 위치)
+    fn one_upper(tag: &str, height_m: f64, half: f64) -> FootprintIndex {
+        let mut idx = FootprintIndex::new();
+        let ring = square(37.5, 127.0, half);
+        let bbox = ring_bbox(&ring).expect("상위 bbox");
+        idx.push(tag.to_string(), height_m, ring, bbox);
+        idx
+    }
+
+    /// 하위(대장) 행 판정 실행 — 상위와 같은 자리, 반변 0.0002°(≈22m)
+    fn judge(idx: &FootprintIndex, lower_height_m: f64) -> Option<String> {
+        let ring = square(37.5, 127.0, 0.0002);
+        let bbox = ring_bbox(&ring).expect("하위 bbox");
+        let cands = idx.candidates(&bbox);
+        assert!(!cands.is_empty(), "프리필터 후보가 비었다 — 테스트 배치 오류");
+        covering_tag(&ring, &bbox, lower_height_m, idx, &cands)
+    }
+
+    /// 저층 실측 블롭(8m)은 고층 대장(66m 아파트)을 억제하지 못한다
+    #[test]
+    fn test_low_measured_cannot_suppress_tall_register() {
+        let idx = one_upper("measured:1", 8.0, 0.0002);
+        assert_eq!(judge(&idx, 66.0), None);
+    }
+
+    /// 같은 높이대(실측 66m vs 대장 60m)는 정상 억제
+    #[test]
+    fn test_same_height_measured_suppresses() {
+        let idx = one_upper("measured:1", 66.0, 0.0002);
+        assert_eq!(judge(&idx, 60.0), Some("measured:1".to_string()));
+    }
+
+    /// 슬랙 범위 안(실측 55m vs 대장 60m — 5m 낮음)도 동일 건물로 인정
+    #[test]
+    fn test_measured_within_slack_suppresses() {
+        let idx = one_upper("measured:1", 55.0, 0.0002);
+        assert_eq!(judge(&idx, 60.0), Some("measured:1".to_string()));
+    }
+
+    /// h=0 수동 마커는 억제 불가 — 자신은 BRA 에서 스킵되므로 블랙홀이 된다
+    #[test]
+    fn test_zero_height_manual_cannot_suppress() {
+        let idx = one_upper("manual:9", 0.0, 0.0002);
+        assert_eq!(judge(&idx, 66.0), None);
+    }
+
+    /// h=5 수동은 높이와 무관하게 억제 (사용자 의도 최우선)
+    #[test]
+    fn test_low_manual_suppresses_regardless_of_height() {
+        let idx = one_upper("manual:9", 5.0, 0.0002);
+        assert_eq!(judge(&idx, 66.0), Some("manual:9".to_string()));
+    }
+
+    /// 보조 판정(포함비) 경로도 높이 조건을 탄다 — 큰 대장 안에 든 작은 저층 실측 블롭
+    #[test]
+    fn test_contain_branch_respects_height() {
+        // 상위 반변 0.00002°(≈2m) → 하위(≈22m) 안에 완전히 포함 = 포함비 100%
+        let low = one_upper("measured:1", 8.0, 0.00002);
+        assert_eq!(judge(&low, 66.0), None);
+        let tall = one_upper("measured:1", 66.0, 0.00002);
+        assert_eq!(judge(&tall, 66.0), Some("measured:1".to_string()));
+    }
 }

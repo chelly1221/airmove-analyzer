@@ -35,6 +35,19 @@ const MIN_HEIGHT_M: f64 = 0.5;
 /// bbox 매칭 판정 임계 — 교차면적 / min(실측, 후보) 면적
 const MATCH_AREA_RATIO: f64 = 0.3;
 
+/// 매칭 정합 게이트: hm 이 대장고 대비 이보다 크게 낮으면 오매칭(부분 블롭)으로 보고 매칭 기각
+pub(crate) const HM_SANITY_ABS_GAP_M: f64 = 20.0;
+pub(crate) const HM_SANITY_RATIO: f64 = 0.5;
+
+/// 실측 높이 상한 — building.rs/bra.rs 의 MAX_BUILDING_HEIGHT_M(650) 과 동일값 유지
+pub(crate) const MEASURED_MAX_HEIGHT_M: f64 = 650.0;
+
+/// 실측 신규행 최소 bbox 면적 (m²) — 1m DSM 노이즈(수목/컨테이너 조각) 행 생성 방지
+pub(crate) const MIN_BLOB_AREA_M2: f64 = 4.0;
+
+/// 위도 1° 당 미터 (bbox 면적 평면 근사) — analysis/coverage.rs 와 동일 상수
+const DEG_LAT_M: f64 = 111_320.0;
+
 /// 후보 버킷 셀 크기 (deg) — 약 111m(위도) × 88m(경도)
 const CELL_DEG: f64 = 0.001;
 
@@ -96,12 +109,35 @@ struct Candidate {
     max_lon: f64,
     centroid_lat: f64,
     centroid_lon: f64,
+    /// 대장고 (fac_buildings.height) — 매칭 정합 게이트(hm_match_sane) 비교 기준
+    height: f64,
 }
 
 /// 좌표를 버킷 셀 인덱스로 변환
 #[inline]
 fn cell_of(lat: f64, lon: f64) -> (i32, i32) {
     ((lat / CELL_DEG).floor() as i32, (lon / CELL_DEG).floor() as i32)
+}
+
+/// 매칭된 실측고가 대장고 대비 정합한가 — 오매칭(부분 블롭) 판별.
+///
+/// bbox 30% 교차 매칭은 대형 건물의 일부만 덮는 오분할 블롭도 같은 건물로 인정해 버린다.
+/// 그 블롭의 낮은 지붕고가 `height_measured` 로 들어가면 조회부의 COALESCE 가 대장고를
+/// 무검증 하향시켜(예: 117m → 32.7m) 건물이 BRA/LoS 에서 통째로 사라진다.
+/// `register_h ≤ 0`(대장고 없음)이면 비교 불가로 통과.
+pub(crate) fn hm_match_sane(register_h: f64, hm: f64) -> bool {
+    !(register_h > 0.0
+        && (register_h - hm) > HM_SANITY_ABS_GAP_M
+        && hm < register_h * HM_SANITY_RATIO)
+}
+
+/// bbox 의 평면 근사 면적 (m²) — 위도 코사인 반영
+#[inline]
+fn bbox_area_m2(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> f64 {
+    let cos_lat = ((min_lat + max_lat) / 2.0).to_radians().cos().abs();
+    let h_m = (max_lat - min_lat) * DEG_LAT_M;
+    let w_m = (max_lon - min_lon) * DEG_LAT_M * cos_lat;
+    h_m * w_m
 }
 
 /// 한반도 주변 좌표 도메인 검증 (lat 25~50, lon 115~145)
@@ -230,7 +266,7 @@ fn load_candidates(conn: &Connection, region: &[f64; 4]) -> Result<Vec<Candidate
     const MARGIN_DEG: f64 = 0.01;
     let mut stmt = conn
         .prepare(
-            "SELECT id, bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon, centroid_lat, centroid_lon
+            "SELECT id, bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon, centroid_lat, centroid_lon, height
              FROM fac_buildings
              WHERE centroid_lat BETWEEN ?1 AND ?2
                AND centroid_lon BETWEEN ?3 AND ?4
@@ -256,6 +292,7 @@ fn load_candidates(conn: &Connection, region: &[f64; 4]) -> Result<Vec<Candidate
                     max_lon: row.get(4)?,
                     centroid_lat: row.get(5)?,
                     centroid_lon: row.get(6)?,
+                    height: row.get(7)?,
                 })
             },
         )
@@ -463,6 +500,8 @@ pub fn import_from_bin(
     let mut matched = 0usize;
     let mut inserted = 0usize;
     let mut skipped = 0usize;
+    // 매칭 후보는 있었으나 정합 게이트에서 기각된 블롭 수 (요약 로그 전용 — ImportSummary 불변)
+    let mut rejected = 0usize;
 
     conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
 
@@ -545,33 +584,53 @@ pub fn import_from_bin(
                 }
             }
 
-            match best {
+            // ── 매칭 정합 게이트 — 통과분만 대장 행 반영 대상(accepted) 으로 승격 ──
+            // 기각된 블롭은 아래 미매칭 경로로 흘려보낸다. 낮은 부분 블롭도 실물이므로
+            // 자체 '실측3D' 행으로 존재하는 것이 정답이고, 높이 조건 억제(suppression.rs)가
+            // 그 행이 고층 대장 행을 죽이지 못하게 막는다.
+            let mut accepted: Option<(i64, f64)> = None; // (fac 행 id, 실측 지붕고)
+            if let Some((_, ci)) = best {
+                let cand = &cands[ci];
+                // 지반고 = centroid SRTM(live). ground_elev 캐시 컬럼은 미백필 행이 많아 사용 금지(프로젝트 불변식).
+                let ground = srtm
+                    .get_elevation(cand.centroid_lat, cand.centroid_lon)
+                    .unwrap_or(0.0);
+                let hm = max_h - ground;
+                if hm.is_finite()
+                    && hm >= MIN_HEIGHT_M
+                    && hm <= MEASURED_MAX_HEIGHT_M
+                    && hm_match_sane(cand.height, hm)
+                {
+                    accepted = Some((cand.id, hm));
+                } else {
+                    rejected += 1;
+                }
+            }
+
+            match accepted {
                 // ── 매칭: 기존 GIS 건물에 실측 지붕고 반영 ──
-                Some((_, ci)) => {
-                    let cand = &cands[ci];
-                    // 지반고 = centroid SRTM(live). ground_elev 캐시 컬럼은 미백필 행이 많아 사용 금지(프로젝트 불변식).
-                    let ground = srtm
-                        .get_elevation(cand.centroid_lat, cand.centroid_lon)
-                        .unwrap_or(0.0);
-                    let hm = max_h - ground;
-                    if hm < MIN_HEIGHT_M {
-                        skipped += 1;
-                        continue;
-                    }
+                Some((cand_id, hm)) => {
                     // 한 GIS 건물에 여러 실측 박스가 겹칠 수 있으므로 최대값 유지
-                    let e = height_map.entry(cand.id).or_insert(hm);
+                    // (게이트 통과분만 여기 도달하므로 최대값도 정합 검증을 거친 값이다)
+                    let e = height_map.entry(cand_id).or_insert(hm);
                     if hm > *e {
                         *e = hm;
                     }
                     matched += 1;
                 }
-                // ── 미매칭: GIS 대장에 없는 건물 → 신규 행 ──
+                // ── 미매칭(또는 매칭 기각): GIS 대장에 없는 건물 → 신규 행 ──
                 None => {
                     let clat = (m_min_lat + m_max_lat) / 2.0;
                     let clon = (m_min_lon + m_max_lon) / 2.0;
                     let ground = srtm.get_elevation(clat, clon).unwrap_or(0.0);
                     let h = max_h - ground;
-                    if h < MIN_HEIGHT_M {
+                    // 높이 하한·상한 컷 — 상한 초과는 DSM 잡음(전파탑 스파이크 등)으로 본다
+                    if h < MIN_HEIGHT_M || h > MEASURED_MAX_HEIGHT_M {
+                        skipped += 1;
+                        continue;
+                    }
+                    // 면적 컷 — 1m DSM 의 수목/컨테이너 조각이 건물 행으로 승격되는 것 방지
+                    if bbox_area_m2(m_min_lat, m_min_lon, m_max_lat, m_max_lon) < MIN_BLOB_AREA_M2 {
                         skipped += 1;
                         continue;
                     }
@@ -668,8 +727,8 @@ pub fn import_from_bin(
     .map_err(|e| format!("임포트 로그 저장 실패: {}", e))?;
 
     log::info!(
-        "[실측3D] 완료 — 총 {} · 매칭 {}(UPDATE {}행) · 신규 {} · 스킵 {}",
-        count, matched, updated, inserted, skipped
+        "[실측3D] 완료 — 총 {} · 매칭 {}(UPDATE {}행) · 신규 {} · 스킵 {} · 매칭기각 {}(정합 게이트 → 신규행 경로)",
+        count, matched, updated, inserted, skipped, rejected
     );
 
     // ⑨ 우선순위 중복 억제 재계산 — region 전역(+여유). 새로 들어온 실측 행이 덮는 대장 행을
@@ -773,4 +832,54 @@ pub fn clear_measured(conn: &Connection) -> Result<(), String> {
         Err(e) => log::warn!("[실측3D] 중복억제 해제 실패: {}", e),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 부분 블롭 오매칭 — 대장 117m 에 32.7m 지붕고가 붙으면 기각
+    /// (절대 격차 20m 초과 AND 대장고의 50% 미만 두 조건 동시 충족)
+    #[test]
+    fn test_hm_match_sane_rejects_partial_blob() {
+        assert!(!hm_match_sane(117.0, 32.7));
+        assert!(!hm_match_sane(66.0, 8.0));
+    }
+
+    /// 정상 매칭 — 실측이 대장보다 높거나, 낮아도 격차/비율 중 하나만 걸리면 통과
+    #[test]
+    fn test_hm_match_sane_accepts_normal() {
+        assert!(hm_match_sane(117.0, 121.5)); // 실측이 더 높음 (일반적: 옥탑/설비)
+        assert!(hm_match_sane(66.0, 60.0)); // 격차 6m — 절대 격차 미달
+        assert!(hm_match_sane(30.0, 18.0)); // 격차 12m — 절대 격차 미달
+        assert!(hm_match_sane(100.0, 60.0)); // 비율 60% — 비율 조건 미달
+    }
+
+    /// 경계값 — 두 조건 모두 '초과/미만' 이므로 경계에서는 통과
+    #[test]
+    fn test_hm_match_sane_boundary() {
+        assert!(hm_match_sane(100.0, 80.0)); // 격차 정확히 20m (초과 아님)
+        assert!(hm_match_sane(100.0, 50.0)); // 정확히 50% (미만 아님)
+        assert!(!hm_match_sane(100.0, 49.9)); // 격차 50.1m + 49.9% → 기각
+    }
+
+    /// 대장고가 없는 행(0 이하)은 비교 불가 — 항상 통과
+    #[test]
+    fn test_hm_match_sane_no_register_height() {
+        assert!(hm_match_sane(0.0, 3.0));
+        assert!(hm_match_sane(-1.0, 3.0));
+    }
+
+    /// bbox 면적 — 1m² 블롭은 노이즈 컷(4m²) 미달, 3m×3m 은 통과
+    #[test]
+    fn test_bbox_area_m2_noise_cut() {
+        // 위도 37.5° 부근 1m ≈ 8.98e-6°(lat) / 1.13e-5°(lon)
+        let lat: f64 = 37.5;
+        let d_lat_1m = 1.0 / DEG_LAT_M;
+        let d_lon_1m = 1.0 / (DEG_LAT_M * lat.to_radians().cos());
+        let a1 = bbox_area_m2(lat, 127.0, lat + d_lat_1m, 127.0 + d_lon_1m);
+        assert!(a1 < MIN_BLOB_AREA_M2, "1m² 블롭 = {}", a1);
+        let a9 = bbox_area_m2(lat, 127.0, lat + 3.0 * d_lat_1m, 127.0 + 3.0 * d_lon_1m);
+        assert!(a9 > MIN_BLOB_AREA_M2, "9m² 블롭 = {}", a9);
+    }
 }

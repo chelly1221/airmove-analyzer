@@ -316,6 +316,47 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         let _ = set_setting(&conn, "panorama_cache_ver", "2");
     }
 
+    // 실측 오매칭 실측고 1회성 정정 (settings 'hm_sanity_v1' 멱등 가드).
+    // 구 임포트의 bbox 30% 교차 매칭이 부분/오분할 블롭의 낮은 지붕고를 대장 행 height_measured 에
+    // 기록해, 조회부의 COALESCE(height_measured, height) 가 대장고를 무검증 하향시켰다
+    // (예: 삼보테크노타워 대장 117m → 32.7m → BRA/LoS 에서 완전 소실). 그런 행만 NULL 로 되돌려
+    // 대장고를 복원한다. 신규 게이트(measured_building::hm_match_sane)는 향후 임포트에만 적용되므로
+    // 기존 DB 는 이 정정이 유일한 복구 경로다.
+    //
+    // 실행 시점 근거: init_db 는 init_db_pool 의 첫 단계이고(같은 함수 안 첫 호출), lib.rs setup 은
+    // init_db_pool 이 성공 반환한 **뒤에야** 중복억제 백필 스레드를 spawn 하므로, 이 정정은 항상
+    // suppression::backfill_if_needed(v2) 보다 먼저 끝난다 — 백필이 정정된 높이로 판정하게 된다.
+    //
+    // region='실측3D' 자체 행은 비교할 대장고가 없어 대상에서 제외하고, DELETE 도 하지 않는다
+    // (데이터 파괴 최소화). 억제 태그 정정은 v2 백필 담당이라 여기서 건드리지 않는다.
+    if get_setting(&conn, "hm_sanity_v1").unwrap_or(None).is_none() {
+        // 임계값은 measured_building.rs 공유 상수를 참조 — 값 이중정의 금지
+        let sql = format!(
+            "UPDATE fac_buildings SET height_measured = NULL
+             WHERE height_measured IS NOT NULL AND region <> '실측3D'
+               AND ( (height > 0 AND (height - height_measured) > {gap} AND height_measured < height * {ratio})
+                     OR height_measured > {max_h} )",
+            gap = crate::measured_building::HM_SANITY_ABS_GAP_M,
+            ratio = crate::measured_building::HM_SANITY_RATIO,
+            max_h = crate::measured_building::MEASURED_MAX_HEIGHT_M,
+        );
+        match conn.execute(&sql, []) {
+            Ok(n) => {
+                if n > 0 {
+                    // 퍼시스턴트 파노라마 캐시는 옛(하향된) 높이 스냅샷이라 통째로 무효
+                    let _ = clear_panorama_cache_all(&conn);
+                    log::info!(
+                        "[실측3D] 오매칭 실측고 정정 {}행 — 대장고 복원 · 파노라마 캐시 무효화",
+                        n
+                    );
+                }
+                let _ = set_setting(&conn, "hm_sanity_v1", "done");
+            }
+            // 실패 시 표식을 남기지 않아 다음 기동에서 재시도
+            Err(e) => log::warn!("[실측3D] 오매칭 실측고 정정 실패: {}", e),
+        }
+    }
+
     Ok(conn)
 }
 
