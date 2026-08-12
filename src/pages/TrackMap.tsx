@@ -71,12 +71,6 @@ const meshLayerIds = (dir: string | null) => [
   `measured-3dtiles-cdm@${dir}`,
 ];
 
-/** V-World 3D 건물 타일 레이어 id. data URL(convertFileSrc(...,"vworld3d"))이 항상 동일하므로
- *  id 까지 같으면 deck 이 id 매칭으로 기존 tileset state 를 승계해 새로 받은 타일셋이 반영되지 않는다.
- *  그래서 갱신 세대(epoch)를 id 에 넣어 vworld3d-changed 수신 시에만 재로드시킨다
- *  (실측 meshLayerIds 가 폴더 경로를 키로 쓰는 것과 동일 계약). */
-const vworld3dLayerId = (epoch: number) => `vworld-3dtiles@${epoch}`;
-
 /** CoS(침묵원추) 기준각 — LoSProfilePanel COS_DEG·CoveragePanel MAX_ELEV_DEG 와 동일 의미 (70° 최고탐지각) */
 const COS_DEG = 70;
 /** CoS 원추 측면 분할 세그먼트 수 */
@@ -395,14 +389,6 @@ export default function TrackMap() {
   const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
   /** 실측 메시 실제 표출 중 — 이때 커버리지 영역 내 extrusion 박스는 숨김 처리("메시 우선") */
   const meshActive = showTiles3d && !!tiles3dDir;
-  /** V-World 3D 건물 타일 표출 토글 — 실측 3D 토글과 동일 계약(영속화 없음).
-   *  기본 OFF: 실측 메시 커버리지와 겹치면 같은 건물이 이중으로 그려지므로 사용자가 명시적으로 켠다.
-   *  타일셋 미보유(vworld3dReady=false)면 레이어가 빈 배열이라 무해. */
-  const [showVworld3d, setShowVworld3d] = useState(false);
-  /** V-World 3D 타일셋 보유 여부 (자료관리 > V-World 3D 건물 다운로드 시 생성) — false 면 토글 비활성 */
-  const [vworld3dReady, setVworld3dReady] = useState(false);
-  /** V-World 타일셋 갱신 세대 — vworld3d-changed 수신 시 증가시켜 레이어 id 를 바꿔 재로드 */
-  const [vworld3dEpoch, setVworld3dEpoch] = useState(0);
   /** 실측(1m DSM) 커버리지 bbox [minLat, maxLat, minLon, maxLon] — null = 미조회/실측 데이터 없음 */
   const [meshCoverageBbox, setMeshCoverageBbox] = useState<[number, number, number, number] | null>(null);
   /** fill-extrusion 동기화 재시도 틱 — 스타일 미로드로 skip 된 경우 styledata 후 1회 재실행용 */
@@ -3610,90 +3596,6 @@ export default function TrackMap() {
     tilesetsRef.current = [];
   }, [tiles3dDir]);
 
-  // ─── V-World 3D 건물 타일 (실측 tiles3d 경로와 분리된 병렬 구조 — 렌더 전용) ───
-
-  /** 타일셋 보유 여부 조회 — manifest 요약(소용량 JSON). 타일 0개거나 디렉터리 미생성이면 토글 비활성.
-   *  실측 경로가 get_tiles3d_dir 로 등록 여부를 묻는 것과 같은 자리의 계약. */
-  const refreshVworld3dReady = useCallback(async () => {
-    try {
-      const s = await invoke<{ tileCount?: number; tile_count?: number } | null>("vworld3d_status");
-      setVworld3dReady(!!s && (s.tileCount ?? s.tile_count ?? 0) > 0);
-    } catch {
-      setVworld3dReady(false); // 미다운로드(디렉터리 없음)는 정상 상태
-    }
-  }, []);
-  useEffect(() => { refreshVworld3dReady(); }, [refreshVworld3dReady]);
-
-  // 다운로드 완료/전체 삭제 수신 (발신: 자료관리 화면) — 위 조회는 마운트 1회뿐이라 이 경로가
-  // 없으면 열려 있는 지도 창에 반영되지 않는다. 로컬 state 만 갱신(재영속 금지).
-  useEffect(() => {
-    const unlisten = listen("vworld3d-changed", () => {
-      refreshVworld3dReady();
-      setVworld3dEpoch((e) => e + 1); // 레이어 id 교체 → 새 tileset.json 재로드
-    });
-    return () => { unlisten.then((fn) => fn()); };
-  }, [refreshVworld3dReady]);
-
-  // onTilesetLoad 로 수집한 Tileset3D 인스턴스 — 실측 tilesetsRef 와 절대 공유하지 않는다.
-  const vworldTilesetsRef = useRef<any[]>([]);
-  const vworldTuneRef = useRef({ sse: 8, load: true });
-
-  // V-World 3D 타일 레이어 — vworld3d 커스텀 프로토콜로 로컬 타일셋(tileset.json/b3dm) 서빙.
-  // 성능 계약(debounce 150ms · _cacheBytes 512MB · memoryAdjustedScreenSpaceError · 줌 게이트 ·
-  // 피치 SSE 램프)은 실측 메시와 동일 — 같은 GPU/메모리 예산을 쓰는 같은 종류의 부하이기 때문.
-  const vworld3dDeckLayers = useMemo(() => {
-    if (!showVworld3d || !vworld3dReady) return [];
-    const tuneTileset = (ts: any) => {
-      ts.setProps({
-        debounceTime: 150,
-        memoryAdjustedScreenSpaceError: true,
-        maximumScreenSpaceError: vworldTuneRef.current.sse,
-        loadTiles: vworldTuneRef.current.load,
-      });
-      ts._cacheBytes = 512 * 1024 * 1024;
-      ts._cacheOverflowBytes = 64 * 1024 * 1024;
-      vworldTilesetsRef.current.push(ts); // 이후 게이트 변화 시 setProps 로 라이브 갱신
-    };
-    return [
-      new Tile3DLayer({
-        id: vworld3dLayerId(vworld3dEpoch),
-        data: convertFileSrc("tileset.json", "vworld3d"),
-        loader: Tiles3DLoader,
-        // 줌 게이트 — visible:false 는 드로우만 막고, 실제 로드 차단은 아래 loadTiles:false 와 페어
-        visible: meshZoomOk,
-        // 픽 제외 필수 — 클릭 픽(pickObject)은 실측 메시 → 건물 해석 계약 전용이라
-        // V-World 메시가 픽되면 3단 폴백이 엉뚱한 표면을 집는다.
-        pickable: false,
-        onTileError: () => { /* 타일셋/타일 404 는 미다운로드 영역에서 정상 — 조용히 무시 */ },
-        onTilesetLoad: tuneTileset,
-      }),
-    ];
-  }, [showVworld3d, vworld3dReady, vworld3dEpoch, meshZoomOk]);
-
-  // 게이트 적용 — 실측 경로와 동일하게 SSE/loadTiles 를 라이브 반영 (대상 ref 만 다름)
-  useEffect(() => {
-    vworldTuneRef.current = { sse: meshTargetSse, load: meshZoomOk };
-    for (const ts of vworldTilesetsRef.current) {
-      ts.setProps({ maximumScreenSpaceError: meshTargetSse, loadTiles: meshZoomOk });
-      if (ts.memoryAdjustedScreenSpaceError < meshTargetSse) ts.memoryAdjustedScreenSpaceError = meshTargetSse;
-      if (meshZoomOk) ts.update(); // 게이트 재진입 시 즉시 재순회
-    }
-  }, [meshTargetSse, meshZoomOk]);
-
-  // 표출이 꺼지면(memo 가 [] 반환 → tileset3d 폐기) 죽은 참조 정리.
-  // 게이트 플립으로는 절대 비우지 않는다 — onTilesetLoad 는 최초 1회만 발화한다.
-  useEffect(() => {
-    if (!showVworld3d || !vworld3dReady) {
-      vworldTilesetsRef.current = [];
-    }
-  }, [showVworld3d, vworld3dReady]);
-
-  // 세대 교체(재다운로드/삭제) 정리 — 레이어 id 가 바뀌어 구 tileset 은 폐기되므로 참조도 비운다.
-  // deps 를 [vworld3dEpoch] 로 좁힌 것이 핵심(조건 없이 비우므로 토글/줌에 반응하면 안 된다).
-  useEffect(() => {
-    vworldTilesetsRef.current = [];
-  }, [vworld3dEpoch]);
-
   // 실측 메시 커버리지 내 선택/하이라이트 건물 → 지붕 위 마커 (박스 하이라이트 대체)
   // 메시는 MSL 절대고도 z 로 그려지므로 마커 z = 지반고 + 건물높이 (= 실측 지붕 MSL, 상쇄 불변식)
   const selMarkerDeckLayers = useMemo(() => {
@@ -4310,9 +4212,6 @@ export default function TrackMap() {
     // 실측 3D 타일 합성 (별도 useMemo)
     layers.push(...tiles3dDeckLayers);
 
-    // V-World 3D 건물 타일 합성 (별도 useMemo · 렌더 전용, pickable:false)
-    layers.push(...vworld3dDeckLayers);
-
     // 실측 메시 선택 마커 — 메시(불투명) 다음에 그려 depth 로 지붕 위에 안착
     layers.push(...selMarkerDeckLayers);
 
@@ -4394,7 +4293,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, vworld3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -5174,22 +5073,6 @@ export default function TrackMap() {
                   </div>
                   <span style={{ fontSize: 9, color: "#9ca3af", lineHeight: 1.35 }}>
                     설정 &gt; GIS 건물에서 buildings_3d.bin 임포트 시 활성화
-                  </span>
-                </div>
-              )}
-              {vworld3dReady ? (
-                srcRow("V-World 3D 건물", "다운로드 영역", showVworld3d, () => setShowVworld3d((v) => !v))
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", opacity: 0.55 }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: "#4b5563" }}>V-World 3D 건물</span>
-                      <span style={{ fontSize: 9, color: "#d1d5db" }}>다운로드 영역</span>
-                    </span>
-                    <DsToggle on={false} onClick={() => { /* 타일셋 미보유 */ }} size={0.9} disabled />
-                  </div>
-                  <span style={{ fontSize: 9, color: "#9ca3af", lineHeight: 1.35 }}>
-                    자료관리 &gt; V-World 3D 건물에서 다운로드 시 활성화
                   </span>
                 </div>
               )}

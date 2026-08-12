@@ -14,7 +14,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre";
 import Modal from "../components/common/Modal";
-import { SrtmDownloadSection, FacBuildingDataSection, MeasuredBuildingDataSection, Vworld3dBuildingSection, LandUseDataSection, PeakDataSection } from "./Settings";
+import { SrtmDownloadSection, FacBuildingDataSection, MeasuredBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
 import type { BuildingGroup, ManualBuilding } from "../types";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
 import { ensureLanduseProtocol } from "../utils/landuseProtocol";
@@ -697,9 +697,6 @@ export default function FileUpload() {
       </div>
       <div className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
         <MeasuredBuildingDataSection />
-      </div>
-      <div className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
-        <Vworld3dBuildingSection />
       </div>
       <div className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
         <LandUseDataSection />
