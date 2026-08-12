@@ -2,7 +2,7 @@
 //!
 //! MapLibre 3D 지형면·힐셰이드가 쓰던 외부 terrarium DEM(s3 elevation-tiles-prod)은 Rust 를
 //! 거치지 않아 실측 3D 임포트의 지반고 융합 보정이 영원히 반영되지 않는다. 그 결과 융합
-//! SRTM 절대 AMSL 로 그려지는 deck 기하(BRA 프리즘·LoS 커튼)와 시각 지면이 보정량만큼 어긋난다.
+//! SRTM 절대 AMSL 로 그려지는 deck 기하(LoS 커튼·BRA 원추면)와 시각 지면이 보정량만큼 어긋난다.
 //!
 //! 여기서 같은 terrarium 규격의 타일을 `SrtmReader`(융합 경유 유일 경로)로 직접 합성해
 //! 지형면·힐셰이드가 분석 수치와 같은 지형을 쓰게 한다. 보정 갱신은 리더 캐시 클리어로

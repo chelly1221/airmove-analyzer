@@ -16,6 +16,7 @@ pub mod srtm;
 pub mod suppression;
 pub mod terrain_tiles;
 pub mod vworld;
+pub mod vworld3d;
 
 use std::fs;
 use std::path::PathBuf;
@@ -3296,7 +3297,7 @@ pub fn run() {
         // 융합 SRTM 지형 DEM 타일 서빙 (terrarium PNG, terrain_tiles.rs 참조).
         // MapLibre 3D 지형면·힐셰이드가 외부 terrarium DEM 을 쓰면 실측 지반고 융합 보정이
         // 시각 지면에 영원히 반영되지 않아, 융합 SRTM 절대 AMSL 로 그리는 deck 기하
-        // (BRA 프리즘·LoS 커튼)와 지면이 보정량만큼 어긋난다. 타일 본문은 이 프로토콜로
+        // (LoS 커튼·BRA 원추면)와 지면이 보정량만큼 어긋난다. 타일 본문은 이 프로토콜로
         // 직접 바이트 응답한다 — 타일 1장이 수십 KB 이고 팬/줌마다 다수 요청이라
         // String 반환 invoke(항상 eval 경로) 로 실어 나르면 안 된다.
         .register_asynchronous_uri_scheme_protocol("fused-dem", |ctx, request, responder| {
@@ -3407,6 +3408,59 @@ pub fn run() {
                 match response {
                     Ok(r) => responder.respond(r),
                     Err(e) => log::warn!("[Tiles3D] 프로토콜 응답 빌드 실패: {}", e),
+                }
+            });
+        })
+        // V-World 3D 건물 임포트 결과 서빙 (tileset.json + tiles/*.b3dm).
+        // 위 tiles3d 핸들러와 동일 규칙이되 루트는 앱 데이터 dir 하위 vworld3d/ 로 **고정**
+        // (등록 절차 없음 — 임포터가 직접 만든 폴더 하나뿐). 디렉터리/타일셋 없으면 404.
+        .register_asynchronous_uri_scheme_protocol("vworld3d", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let rel = request.uri().path().trim_start_matches('/').to_string();
+
+            tauri::async_runtime::spawn_blocking(move || {
+                let err_response = |status: u16| {
+                    tauri::http::Response::builder()
+                        .status(status)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Vec::new())
+                };
+
+                // ── 경로 검증 ── ('%' 등 화이트리스트 밖 문자는 즉시 거부)
+                let path_ok = !rel.is_empty()
+                    && rel.len() < 256
+                    && rel.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-')
+                    })
+                    && rel.split('/').all(|seg| !seg.is_empty() && seg != "..");
+
+                let response = if !path_ok {
+                    err_response(403)
+                } else {
+                    match vworld3d::root_dir(&app) {
+                        Err(_) => err_response(404),
+                        Ok(dir) => match std::fs::read(dir.join(&rel)) {
+                            Ok(data) => {
+                                let ctype = if rel.to_ascii_lowercase().ends_with(".json") {
+                                    "application/json"
+                                } else {
+                                    "application/octet-stream"
+                                };
+                                tauri::http::Response::builder()
+                                    .status(200)
+                                    .header("Content-Type", ctype)
+                                    .header("Access-Control-Allow-Origin", "*")
+                                    .header("Cache-Control", "public, max-age=3600")
+                                    .body(data)
+                            }
+                            Err(_) => err_response(404),
+                        },
+                    }
+                };
+
+                match response {
+                    Ok(r) => responder.respond(r),
+                    Err(e) => log::warn!("[VW3D] 프로토콜 응답 빌드 실패: {}", e),
                 }
             });
         })
@@ -3606,6 +3660,12 @@ pub fn run() {
             // vworld 자동 다운로드
             vworld_download_fac_buildings,
             vworld_download_n3p,
+            // V-World 3D 건물(XDO) 임포터 — 시각화 전용
+            vworld3d::vworld3d_test_key,
+            vworld3d::vworld3d_download,
+            vworld3d::vworld3d_cancel,
+            vworld3d::vworld3d_status,
+            vworld3d::vworld3d_clear,
             // WebView2 네이티브 PDF
             webview_print_to_pdf,
             // 대용량 IPC 파일 매개 전송

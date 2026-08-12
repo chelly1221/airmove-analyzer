@@ -1091,6 +1091,555 @@ export function MeasuredBuildingDataSection() {
   );
 }
 
+// ─── V-World 3D 건물 (XDO 타일 다운로드 → 3D Tiles 변환) ───────────────
+
+/** vworld3d_status 원본 응답 — Rust serde 직렬화 케이스(camel/snake)가 갈릴 수 있어 양쪽 모두 수용 */
+type Vworld3dRegionRaw = { lon: number; lat: number; radiusKm?: number; radius_km?: number; ts?: number };
+type Vworld3dStatusRaw = {
+  tileCount?: number; tile_count?: number;
+  objectCount?: number; object_count?: number;
+  totalBytes?: number; total_bytes?: number;
+  regions?: Vworld3dRegionRaw[];
+};
+type Vworld3dRegion = { lon: number; lat: number; radiusKm: number; ts: number };
+type Vworld3dStatus = { tileCount: number; objectCount: number; totalBytes: number; regions: Vworld3dRegion[] };
+
+/** vworld3d-progress 이벤트 페이로드 (Rust emit_all 계약) */
+type Vworld3dProgress = { phase: string; done: number; total: number; message?: string };
+
+/** 진행 단계 한글 라벨 — 미지 phase 는 원문 그대로 표시 */
+const VWORLD3D_PHASE_LABEL: Record<string, string> = {
+  enumerate: "타일 열거",
+  download: "다운로드",
+  convert: "변환",
+  tileset: "타일셋 생성",
+};
+
+/** 바이트 → KB/MB/GB 표기 (타일 용량은 KB~GB 폭이 넓어 formatBackupBytes 와 별도) */
+const formatVworldBytes = (bytes: number) => {
+  const KB = 1024, MB = KB * 1024, GB = MB * 1024;
+  if (bytes >= GB) return `${(bytes / GB).toFixed(1)}GB`;
+  if (bytes >= MB) return `${(bytes / MB).toFixed(1)}MB`;
+  return `${(bytes / KB).toFixed(0)}KB`;
+};
+
+const normalizeVworld3dStatus = (raw: Vworld3dStatusRaw | null): Vworld3dStatus | null => {
+  if (!raw) return null;
+  return {
+    tileCount: raw.tileCount ?? raw.tile_count ?? 0,
+    objectCount: raw.objectCount ?? raw.object_count ?? 0,
+    totalBytes: raw.totalBytes ?? raw.total_bytes ?? 0,
+    regions: (raw.regions ?? []).map((r) => ({
+      lon: r.lon,
+      lat: r.lat,
+      radiusKm: r.radiusKm ?? r.radius_km ?? 0,
+      ts: r.ts ?? 0,
+    })),
+  };
+};
+
+export function Vworld3dBuildingSection() {
+  const [collapsed, setCollapsed] = useState(true);
+
+  // API 키 / 리퍼러 (설정 저장 — vworld_id/vworld_pw 와 동일하게 save_setting/load_setting)
+  const [apiKey, setApiKey] = useState("");
+  const [referer, setReferer] = useState("http://localhost");
+  const [showKey, setShowKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [keyResult, setKeyResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+
+  // 현황 (manifest 요약 — 소용량 JSON)
+  const [status, setStatus] = useState<Vworld3dStatus | null>(null);
+  const [statusLoading, setStatusLoading] = useState(true);
+
+  // 다운로드 대상
+  const [targetMode, setTargetMode] = useState<"site" | "manual">("site");
+  const [siteName, setSiteName] = useState("");
+  const [lonText, setLonText] = useState("");
+  const [latText, setLatText] = useState("");
+  const [radiusKm, setRadiusKm] = useState(5);
+
+  const [downloading, setDownloading] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [progress, setProgress] = useState<Vworld3dProgress | null>(null);
+  const [result, setResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [clearConfirm, setClearConfirm] = useState(false);
+
+  /** 이 마운트에서 다운로드를 시작해 이미 끝냈는지 — 늦게 도착한 progress 이벤트가
+   *  완료된 다운로드를 되살리는 것을 막는 가드 (자가 복구는 최초 1회만 필요) */
+  const doneRef = useRef(false);
+
+  const radarSites = useAppStore((s) => s.customRadarSites);
+
+  const loadStatus = async () => {
+    try {
+      const raw = await invoke<Vworld3dStatusRaw | null>("vworld3d_status");
+      setStatus(normalizeVworld3dStatus(raw));
+    } catch {
+      // 백엔드 미탑재/디렉터리 없음 — 현황 없음으로 표시
+      setStatus(null);
+    } finally {
+      setStatusLoading(false);
+    }
+  };
+
+  // 저장된 키/리퍼러 + 현황 로드
+  useEffect(() => {
+    (async () => {
+      try {
+        const savedKey = await invoke<string | null>("load_setting", { key: "vworld_apikey" });
+        const savedRef = await invoke<string | null>("load_setting", { key: "vworld_referer" });
+        if (savedKey) setApiKey(savedKey);
+        if (savedRef) setReferer(savedRef);
+      } catch { /* 무시 */ }
+    })();
+    loadStatus();
+  }, []);
+
+  // 레이더 사이트 기본 선택 (활성 사이트 우선)
+  useEffect(() => {
+    if (siteName || radarSites.length === 0) return;
+    const first = radarSites.find((s) => s.active !== false) ?? radarSites[0];
+    setSiteName(first.name);
+  }, [radarSites, siteName]);
+
+  // 진행률/완료 이벤트 구독 — 마운트 동안 상시. 다른 창에서 시작했거나 페이지를 다시 열어
+  // 로컬 downloading 플래그가 없는 경우에도 진행 상태를 자가 복구한다.
+  useEffect(() => {
+    const unProgress = listen<Vworld3dProgress>("vworld3d-progress", (e) => {
+      setProgress(e.payload);
+      setDownloading((prev) => prev || !doneRef.current);
+    });
+    // 완료/삭제 알림 — 로컬 state 만 갱신(재영속 금지)
+    const unChanged = listen("vworld3d-changed", () => {
+      setDownloading(false);
+      setProgress(null);
+      loadStatus();
+    });
+    return () => { unProgress.then((f) => f()); unChanged.then((f) => f()); };
+  }, []);
+
+  const handleSaveKey = async () => {
+    if (!apiKey.trim()) {
+      setKeyResult({ type: "error", message: "API 키를 입력해 주세요." });
+      return;
+    }
+    setSaving(true);
+    setKeyResult(null);
+    try {
+      await invoke("save_setting", { key: "vworld_apikey", value: apiKey.trim() });
+      await invoke("save_setting", { key: "vworld_referer", value: referer.trim() || "http://localhost" });
+      setKeyResult({ type: "success", message: "V-World 3D API 키가 저장되었습니다." });
+    } catch (e) {
+      setKeyResult({ type: "error", message: `저장 실패: ${e}` });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTestKey = async () => {
+    if (!apiKey.trim()) {
+      setKeyResult({ type: "error", message: "API 키를 입력해 주세요." });
+      return;
+    }
+    setTesting(true);
+    setKeyResult(null);
+    try {
+      const msg = await invoke<string>("vworld3d_test_key", {
+        apiKey: apiKey.trim(),
+        referer: referer.trim() || "http://localhost",
+      });
+      setKeyResult({ type: "success", message: `연결 성공 — ${msg}` });
+    } catch (e) {
+      setKeyResult({ type: "error", message: `연결 실패: ${e}` });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const selectedSite = radarSites.find((s) => s.name === siteName) ?? null;
+  /** 다운로드 중심 좌표 — 사이트 선택 또는 직접 입력. 유효 범위 밖이면 null(시작 버튼 비활성) */
+  const center = (() => {
+    const lon = targetMode === "site" ? selectedSite?.longitude : parseFloat(lonText);
+    const lat = targetMode === "site" ? selectedSite?.latitude : parseFloat(latText);
+    if (lon === undefined || lat === undefined || !Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+    // 동아시아 유효 범위 (파서 규약과 동일)
+    if (lat < 25 || lat > 50 || lon < 115 || lon > 145) return null;
+    return { lon, lat };
+  })();
+
+  const handleStart = async () => {
+    if (!center) {
+      setResult({ type: "error", message: "다운로드 중심 좌표가 올바르지 않습니다 (위도 25~50°, 경도 115~145°)." });
+      return;
+    }
+    doneRef.current = false;
+    setDownloading(true);
+    setCancelling(false);
+    setProgress(null);
+    setResult(null);
+    try {
+      await invoke("vworld3d_download", { centerLon: center.lon, centerLat: center.lat, radiusKm });
+      setResult({
+        type: "success",
+        message: `V-World 3D 건물 다운로드 완료 — 중심 ${center.lat.toFixed(4)}, ${center.lon.toFixed(4)} · 반경 ${radiusKm}km`,
+      });
+    } catch (e) {
+      setResult({ type: "error", message: `다운로드 실패: ${e}` });
+    } finally {
+      doneRef.current = true;
+      setDownloading(false);
+      setCancelling(false);
+      setProgress(null);
+      loadStatus();
+    }
+  };
+
+  const handleCancel = async () => {
+    setCancelling(true);
+    try {
+      await invoke("vworld3d_cancel");
+    } catch (e) {
+      console.warn("V-World 3D 다운로드 취소 실패:", e);
+      setCancelling(false);
+    }
+  };
+
+  const handleClear = async () => {
+    try {
+      await invoke("vworld3d_clear");
+      setClearConfirm(false);
+      setResult({ type: "success", message: "V-World 3D 건물 타일을 모두 삭제했습니다." });
+      await loadStatus();
+    } catch (e) {
+      setClearConfirm(false);
+      setResult({ type: "error", message: `삭제 실패: ${e}` });
+    }
+  };
+
+  const hasData = !!status && status.tileCount > 0;
+  const pct = progress && progress.total > 0
+    ? Math.min(100, Math.round((progress.done / progress.total) * 100))
+    : 0;
+  const phaseLabel = progress ? (VWORLD3D_PHASE_LABEL[progress.phase] ?? progress.phase) : "";
+
+  const isCollapsible = !statusLoading && !downloading;
+  const isExpanded = !isCollapsible || !collapsed;
+
+  return (
+    <div className={`px-5 py-[13px] ${isCollapsible ? "cursor-pointer select-none" : ""}`} onClick={(e) => { if (isCollapsible && !(e.target as HTMLElement).closest("button, a, input, select, label")) setCollapsed((c) => !c); }}>
+      <div className="grid items-center gap-3" style={{ gridTemplateColumns: "220px 1fr auto" }}>
+        <div className="flex items-center gap-2">
+          {isCollapsible && (
+            <ChevronDown
+              size={14}
+              className={`text-gray-400 shrink-0 transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`}
+            />
+          )}
+          <Globe size={16} className="text-[#a60739] shrink-0" />
+          <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">V-World 3D 건물</h2>
+        </div>
+        <div className="flex items-center gap-2 min-w-0">
+          {hasData && status ? (
+            <>
+              <span className="w-24 shrink-0 text-xs text-gray-600"><Check size={11} className="inline text-emerald-500" /> {status.tileCount.toLocaleString()}타일</span>
+              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{status.objectCount.toLocaleString()}동</span>
+              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-0.5 text-xs text-gray-500">{formatVworldBytes(status.totalBytes)}</span>
+            </>
+          ) : (
+            <span className="text-xs text-gray-400">V-World XDO 건물 → 3D Tiles 변환 · 지도 표출 전용</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {downloading ? (
+            <button
+              onClick={handleCancel}
+              disabled={cancelling}
+              className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-500 transition-colors hover:border-red-300 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Loader2 size={13} className="animate-spin" />
+              {cancelling ? "취소 중..." : "취소"}
+            </button>
+          ) : (
+            <button
+              onClick={() => { setCollapsed(false); handleStart(); }}
+              disabled={!center}
+              className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Download size={13} />
+              다운로드
+            </button>
+          )}
+          {hasData && (
+            <button
+              onClick={() => setClearConfirm(true)}
+              disabled={downloading}
+              className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-500 transition-colors hover:border-red-300 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Trash2 size={13} />
+              전체 삭제
+            </button>
+          )}
+        </div>
+      </div>
+
+      {isExpanded && (
+        <div className="mt-3 space-y-3" onClick={(e) => e.stopPropagation()}>
+          {/* API 키 / 리퍼러 */}
+          <div className="rounded-xl border border-gray-200 bg-white p-3 space-y-2">
+            <div className="flex items-center gap-1.5">
+              <KeyRound size={13} className="text-[#a60739]" />
+              <span className="text-xs font-semibold text-gray-700">V-World 3D API 키</span>
+            </div>
+            <div className="flex items-end gap-2">
+              <div className="flex-1 min-w-0">
+                <label className="block text-[11px] font-medium text-gray-500 mb-1">API 키</label>
+                <div className="relative">
+                  <input
+                    type={showKey ? "text" : "password"}
+                    value={apiKey}
+                    onChange={(e) => { setApiKey(e.target.value); setKeyResult(null); }}
+                    placeholder="V-World 3D 인증키"
+                    className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 pr-8 text-sm text-gray-800 placeholder-gray-400 focus:border-[#a60739]/50 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowKey(!showKey)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                    tabIndex={-1}
+                  >
+                    {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
+              </div>
+              <div className="w-56 shrink-0">
+                <label className="block text-[11px] font-medium text-gray-500 mb-1">Referer (키 발급 시 등록 URL)</label>
+                <input
+                  type="text"
+                  value={referer}
+                  onChange={(e) => { setReferer(e.target.value); setKeyResult(null); }}
+                  placeholder="http://localhost"
+                  className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-800 placeholder-gray-400 focus:border-[#a60739]/50 focus:outline-none"
+                />
+              </div>
+              <button
+                onClick={handleTestKey}
+                disabled={testing || saving}
+                className="flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:border-[#a60739]/40 hover:text-[#a60739] disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {testing ? <Loader2 size={14} className="animate-spin" /> : <Globe size={14} />}
+                {testing ? "확인 중..." : "연결 테스트"}
+              </button>
+              <button
+                onClick={handleSaveKey}
+                disabled={saving || testing}
+                className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#a60739] px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-[#8a0630] disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Save size={14} />
+                {saving ? "저장 중..." : "저장"}
+              </button>
+            </div>
+            {keyResult && (
+              <div className={`rounded-lg px-3 py-2 text-xs ${
+                keyResult.type === "success"
+                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                  : "bg-red-50 text-red-600 border border-red-200"
+              }`}>
+                {keyResult.message}
+              </div>
+            )}
+          </div>
+
+          {/* 다운로드 대상 */}
+          <div className="rounded-xl border border-gray-200 bg-white p-3 space-y-2.5">
+            <div className="flex items-center gap-1.5">
+              <Boxes size={13} className="text-[#a60739]" />
+              <span className="text-xs font-semibold text-gray-700">다운로드 영역</span>
+            </div>
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-1.5 text-xs text-gray-600">
+                <input
+                  type="radio"
+                  checked={targetMode === "site"}
+                  onChange={() => setTargetMode("site")}
+                  className="accent-[#a60739]"
+                />
+                레이더 사이트
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-gray-600">
+                <input
+                  type="radio"
+                  checked={targetMode === "manual"}
+                  onChange={() => setTargetMode("manual")}
+                  className="accent-[#a60739]"
+                />
+                좌표 직접 입력
+              </label>
+            </div>
+
+            {targetMode === "site" ? (
+              <div className="flex items-end gap-3">
+                <div className="w-64">
+                  <label className="block text-[11px] font-medium text-gray-500 mb-1">사이트</label>
+                  <select
+                    value={siteName}
+                    onChange={(e) => setSiteName(e.target.value)}
+                    className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-800 focus:border-[#a60739]/50 focus:outline-none"
+                  >
+                    {radarSites.length === 0 && <option value="">등록된 사이트 없음</option>}
+                    {radarSites.map((s) => (
+                      <option key={s.name} value={s.name}>{s.name}</option>
+                    ))}
+                  </select>
+                </div>
+                {selectedSite && (
+                  <span className="pb-1.5 text-[11px] tabular-nums text-gray-500">
+                    {selectedSite.latitude.toFixed(5)}, {selectedSite.longitude.toFixed(5)}
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-end gap-3">
+                <div className="w-40">
+                  <label className="block text-[11px] font-medium text-gray-500 mb-1">위도 (°)</label>
+                  <input
+                    type="text"
+                    value={latText}
+                    onChange={(e) => setLatText(e.target.value)}
+                    placeholder="37.5490"
+                    className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm tabular-nums text-gray-800 placeholder-gray-400 focus:border-[#a60739]/50 focus:outline-none"
+                  />
+                </div>
+                <div className="w-40">
+                  <label className="block text-[11px] font-medium text-gray-500 mb-1">경도 (°)</label>
+                  <input
+                    type="text"
+                    value={lonText}
+                    onChange={(e) => setLonText(e.target.value)}
+                    placeholder="126.7937"
+                    className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm tabular-nums text-gray-800 placeholder-gray-400 focus:border-[#a60739]/50 focus:outline-none"
+                  />
+                </div>
+                {!center && (latText || lonText) && (
+                  <span className="pb-1.5 text-[11px] text-red-500">위도 25~50°, 경도 115~145° 범위로 입력</span>
+                )}
+              </div>
+            )}
+
+            <div>
+              <div className="mb-1 flex items-baseline justify-between">
+                <label className="text-[11px] font-medium text-gray-500">반경</label>
+                <span className="text-xs font-semibold tabular-nums text-[#a60739]">{radiusKm}km</span>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={15}
+                step={1}
+                value={radiusKm}
+                onChange={(e) => setRadiusKm(Number(e.target.value))}
+                disabled={downloading}
+                className="w-full accent-[#a60739] disabled:opacity-40"
+              />
+            </div>
+
+            <div className="flex items-start gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
+              <AlertTriangle size={13} className="mt-[1px] shrink-0" />
+              <span>
+                대용량 주의 — 도심 반경 5km 는 수만 건의 서버 요청과 수 GB 저장 용량이 필요할 수 있습니다.
+                반경을 넓힐수록 소요 시간·용량이 제곱으로 증가하며, 이미 받은 타일은 자동으로 건너뜁니다(재개 가능).
+                이 데이터는 지도 표출 전용으로, LoS·커버리지·BRA 등 분석에는 사용되지 않습니다.
+              </span>
+            </div>
+          </div>
+
+          {/* 진행률 */}
+          {downloading && (
+            <div className="space-y-1">
+              {progress && progress.total > 0 && (
+                <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                  <div className="h-full rounded-full bg-[#a60739] transition-all duration-300" style={{ width: `${pct}%` }} />
+                </div>
+              )}
+              <p className="text-xs text-gray-500">
+                {progress
+                  ? <>
+                      <span className="font-medium text-gray-600">{phaseLabel}</span>{" "}
+                      {progress.total > 0 && <>{progress.done.toLocaleString()} / {progress.total.toLocaleString()} ({pct}%)</>}
+                      {progress.message && <span> · {progress.message}</span>}
+                    </>
+                  : "V-World 3D 건물 다운로드 준비 중..."}
+              </p>
+            </div>
+          )}
+
+          {result && !downloading && (
+            <div className={`rounded-lg px-3 py-2 text-xs ${
+              result.type === "success"
+                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                : "bg-red-50 text-red-600 border border-red-200"
+            }`}>
+              {result.message}
+            </div>
+          )}
+
+          {/* 다운로드된 영역 목록 */}
+          {status && status.regions.length > 0 && (
+            <div className="rounded-xl border border-gray-200 overflow-hidden">
+              <div className="grid grid-cols-[minmax(160px,1fr)_80px_100px] gap-2 bg-gray-100 px-4 py-1 text-[11px] font-normal text-gray-500 uppercase tracking-wider">
+                <span>중심 좌표</span>
+                <span className="text-right">반경</span>
+                <span className="text-right">다운로드 일자</span>
+              </div>
+              {status.regions.map((r, idx) => (
+                <div
+                  key={`${r.lon}_${r.lat}_${r.ts}_${idx}`}
+                  className={`grid grid-cols-[minmax(160px,1fr)_80px_100px] items-center gap-2 px-4 py-1 ${idx % 2 === 0 ? "bg-white" : "bg-gray-50"}`}
+                >
+                  <span className="text-xs tabular-nums text-gray-800">{r.lat.toFixed(5)}, {r.lon.toFixed(5)}</span>
+                  <span className="text-right text-xs tabular-nums text-gray-700">{r.radiusKm}km</span>
+                  <span className="text-right text-xs text-gray-500">
+                    {r.ts > 0 ? new Date(r.ts * 1000).toLocaleDateString("ko-KR") : "-"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 전체 삭제 확인 모달 */}
+      <Modal
+        open={clearConfirm}
+        onClose={() => setClearConfirm(false)}
+        title="V-World 3D 건물 삭제"
+        width="max-w-sm"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            다운로드한 V-World 3D 건물 타일을 모두 삭제하시겠습니까? 다시 보려면 재다운로드가 필요합니다.
+          </p>
+          <div className="flex justify-end gap-3">
+            <button
+              onClick={() => setClearConfirm(false)}
+              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              취소
+            </button>
+            <button
+              onClick={handleClear}
+              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+            >
+              삭제
+            </button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
 // ─── 산 이름 데이터 (연속수치지형도) ──────────────────────────────────
 
 export function PeakDataSection() {

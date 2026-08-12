@@ -39,8 +39,9 @@ interface Props {
   onTrackPointHover?: (idx: number | null) => void;
   /** 맵에서 호버한 항적 포인트 인덱스 (외부→차트 호버) */
   externalHoverIdx?: number | null;
-  /** 차트에서 건물 호버/클릭 시 건물 정보 콜백 (null이면 해제) */
-  onBuildingHover?: (building: { lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null) => void;
+  /** 차트에서 건물 호버/클릭 시 건물 정보 콜백 (null이면 해제).
+   *  ground_elev_m: 실측 메시 지붕 마커 z(지반고+높이) 계산용 */
+  onBuildingHover?: (building: { lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; ground_elev_m?: number } | null) => void;
   /** 건물 상세보기 요청 콜백 */
   onBuildingDetail?: (building: BuildingOnPath & { isBlocking?: boolean }) => void;
   /** 주소 검색으로 LoS 분석 시작한 경우의 대상 좌표 — 해당 건물을 목록에 강제 포함하고 파란색으로 구분(자동 선택은 안 함) */
@@ -1708,13 +1709,13 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 {/* 투명 히트영역 */}
                 <path d={pathD} fill="transparent" stroke="transparent" strokeWidth={4}
                   style={{ cursor: "pointer" }}
-                  onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage }); }}
+                  onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage, ground_elev_m: b.ground_elev_m }); }}
                   onMouseLeave={() => { setHoveredBldgIdx(null); if (clickedBldgIdx === null) onBuildingHover?.(null); }}
                   onClick={(e) => {
                     e.stopPropagation();
                     const toggling = clickedBldgIdx === bi;
                     setClickedBldgIdx(toggling ? null : bi);
-                    onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
+                    onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage, ground_elev_m: b.ground_elev_m });
                   }}
                 />
                 {/* 채워진 사각형 + 윤곽선 */}
@@ -1734,13 +1735,13 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
                 stroke="transparent"
                 strokeWidth={14}
                 style={{ cursor: "pointer" }}
-                onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage }); }}
+                onMouseEnter={() => { setHoveredBldgIdx(bi); onBuildingHover?.({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage, ground_elev_m: b.ground_elev_m }); }}
                 onMouseLeave={() => { setHoveredBldgIdx(null); if (clickedBldgIdx === null) onBuildingHover?.(null); }}
                 onClick={(e) => {
                   e.stopPropagation();
                   const toggling = clickedBldgIdx === bi;
                   setClickedBldgIdx(toggling ? null : bi);
-                  onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
+                  onBuildingHover?.(toggling ? null : { lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage, ground_elev_m: b.ground_elev_m });
                 }}
               />
               <line

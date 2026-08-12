@@ -5,8 +5,8 @@
 //!   ② 실측3D(`fac_buildings` 중 `height_measured IS NOT NULL OR region='실측3D'`) — 1m DSM 임포트
 //!   ③ 건물통합정보 대장(그 외 `fac_buildings` 행) — 후순위
 //!
-//! 중복을 그대로 두면 BRA 프리즘·3D fill-extrusion 박스가 이중 렌더되고 불투명 입체끼리
-//! 서로 가려 "빨강 일부 방위 누락" 증상이 된다.
+//! 중복을 그대로 두면 3D fill-extrusion 박스가 이중 렌더되고(불투명 입체끼리 서로 가림)
+//! BRA 침범 목록·동수도 같은 건물을 여러 번 세게 된다.
 //!
 //! 예전에는 조회 시점(BRA·뷰포트 쿼리)에 겹침을 계산해 제외했으나, 적용 쿼리에만 효과가 있고
 //! 수동등록 겹침은 아예 처리되지 않았다. 지금은 **자료 등록/임포트 시점에 겹침을 비교해
@@ -48,7 +48,7 @@ const MAX_CELL_SPAN: i32 = 256;
 pub const AREA_MARGIN_DEG: f64 = 0.011;
 
 /// 폴리곤 미형성(3점 미만) 수동 건물의 폴백 사각 반변 (deg ≈ 5m)
-/// — bra.rs / building.rs 의 프리즘 폴백(±0.000045°)과 동일 규약
+/// — bra.rs / building.rs 의 폴리곤 폴백(±0.000045°)과 동일 규약
 const FALLBACK_HALF_DEG: f64 = 0.000045;
 
 /// 진행 로그 간격 (스캔 행 수)

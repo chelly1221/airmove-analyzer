@@ -7,9 +7,6 @@ import type { MapboxOverlay } from "@deck.gl/mapbox";
 import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer, TextLayer } from "@deck.gl/layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
-// Tile3DLayer 의 onTileLoad/onTileUnload 콜백 인자 타입 (@deck.gl/geo-layers 가 참조하는 것과 동일 모듈).
-// 타입 전용 import 라 번들에는 포함되지 않는다.
-import type { Tile3D } from "@loaders.gl/tiles";
 import {
   Mountain,
   Crosshair,
@@ -43,12 +40,12 @@ const GearButton = ({ active, onClick }: { active: boolean; onClick: () => void 
 /** MapLibre terrain 과장 배율 — setTerrain(2곳)과 분석 레이어 z 배율(EX: LoS 커튼·CoS·BRA)이 공유.
  *  1 = 실척(전 프레임 통일). maplibre fill-extrusion 건물 높이·실측 3D 메시 z 는 이 배율의 영향을
  *  받지 않으므로, 1 초과로 올리면 지형·분석 레이어만 과장되어 건물 박스/메시와 프레임이 어긋난다
- *  (분석 레이어끼리는 EX 공유로 자동 정합 — BRA 침범 프리즘의 구 밴드 설계가 어긋났던 원인). */
+ *  (분석 레이어끼리는 EX 공유로 자동 정합). */
 const TERRAIN_EXAGGERATION = 1;
 
 /** 융합 SRTM 지형 DEM 타일 URL (fused-dem 커스텀 프로토콜 — src-tauri/src/terrain_tiles.rs).
  *  외부 terrarium DEM(s3) 대신 Rust 융합 SRTM 을 쓰는 이유: 실측 3D 임포트의 지반고 보정이
- *  시각 지형면에도 반영돼야 BRA 프리즘·LoS 커튼(융합 SRTM 절대 AMSL z)과 지면이 어긋나지 않는다.
+ *  시각 지형면에도 반영돼야 LoS 커튼·BRA 원추면(절대 AMSL z)과 지면이 어긋나지 않는다.
  *  ?v= 는 캐시버스터 — 건물/실측 자료 변경 이벤트마다 증가시켜 웹뷰·MapLibre 타일 캐시를 비운다.
  *  (프로토콜 URL 형식은 플랫폼마다 달라 convertFileSrc 로 베이스를 얻는다 — Windows: http://fused-dem.localhost/) */
 const fusedDemTiles = (v: number) => `${convertFileSrc("", "fused-dem")}{z}/{x}/{y}.png?v=${v}`;
@@ -73,6 +70,12 @@ const meshLayerIds = (dir: string | null) => [
   `measured-3dtiles@${dir}`,
   `measured-3dtiles-cdm@${dir}`,
 ];
+
+/** V-World 3D 건물 타일 레이어 id. data URL(convertFileSrc(...,"vworld3d"))이 항상 동일하므로
+ *  id 까지 같으면 deck 이 id 매칭으로 기존 tileset state 를 승계해 새로 받은 타일셋이 반영되지 않는다.
+ *  그래서 갱신 세대(epoch)를 id 에 넣어 vworld3d-changed 수신 시에만 재로드시킨다
+ *  (실측 meshLayerIds 가 폴더 경로를 키로 쓰는 것과 동일 계약). */
+const vworld3dLayerId = (epoch: number) => `vworld-3dtiles@${epoch}`;
 
 /** CoS(침묵원추) 기준각 — LoSProfilePanel COS_DEG·CoveragePanel MAX_ELEV_DEG 와 동일 의미 (70° 최고탐지각) */
 const COS_DEG = 70;
@@ -118,7 +121,6 @@ import { GPU2D, type RectData } from "../utils/gpu2d";
 import { addPlanOverlay, removePlanOverlay, updatePlanOpacity, updatePlanBounds, rotateBounds } from "../utils/planOverlay";
 import { fetchBuildingsForViewport, invalidateBuildingCache, buildingsToGeoJSON } from "../utils/buildingTileCache";
 import { detectionTypeColor, radarTypeLabel, MAP_STYLE_URL } from "../utils/radarConstants";
-import BraPrismLayer from "../utils/braPrismLayer";
 import AddressSearch, { AddressMarker } from "../components/Map/AddressSearch";
 import PlaybackControls from "../components/Map/PlaybackControls";
 import CoveragePanel from "../components/Map/CoveragePanel";
@@ -176,8 +178,10 @@ const FILL_COLOR_EXPR: any = [
 ];
 
 /** 실측 메시 픽 좌표 → 로드된 실측 건물 매칭.
- *  폴리곤([lat,lon] 순서, bbox 프리필터 + ray casting) 포함 우선, 실패 시 최근접 centroid ≤ 30m. */
-function resolveMeasuredBuildingAt(lat: number, lon: number, buildings: Building3D[]): Building3D | null {
+ *  contained = 폴리곤([lat,lon] 순서, bbox 프리필터 + ray casting) 포함 히트,
+ *  nearest = 최근접 centroid ≤ 30m 후보. 두 단계를 분리 반환해 호출부가 순서를 정한다
+ *  (포함 미스 시 곧장 이웃 건물을 여는 오동작 방지 — 백엔드 점 조회 폴백을 먼저 태우기 위함). */
+function resolveMeasuredBuildingAt(lat: number, lon: number, buildings: Building3D[]): { contained: Building3D | null; nearest: Building3D | null } {
   let nearest: Building3D | null = null;
   let nearestM = Infinity;
   const mPerLat = 111_320;
@@ -199,13 +203,13 @@ function resolveMeasuredBuildingAt(lat: number, lon: number, buildings: Building
           const [la1, lo1] = poly[i], [la2, lo2] = poly[j];
           if ((lo1 > lon) !== (lo2 > lon) && lat < ((la2 - la1) * (lon - lo1)) / (lo2 - lo1) + la1) inside = !inside;
         }
-        if (inside) return b;
+        if (inside) return { contained: b, nearest: null };
       }
     }
     const d = Math.hypot((b.lat - lat) * mPerLat, (b.lon - lon) * mPerLon);
     if (d < nearestM) { nearestM = d; nearest = b; }
   }
-  return nearestM <= 30 ? nearest : null;
+  return { contained: null, nearest: nearestM <= 30 ? nearest : null };
 }
 
 /** LoS 분석용 등록 장애물(수동 건물) 선택 — 그룹별 + 이름 검색 */
@@ -391,11 +395,20 @@ export default function TrackMap() {
   const [tiles3dDir, setTiles3dDir] = useState<string | null>(null);
   /** 실측 메시 실제 표출 중 — 이때 커버리지 영역 내 extrusion 박스는 숨김 처리("메시 우선") */
   const meshActive = showTiles3d && !!tiles3dDir;
+  /** V-World 3D 건물 타일 표출 토글 — 실측 3D 토글과 동일 계약(영속화 없음).
+   *  기본 OFF: 실측 메시 커버리지와 겹치면 같은 건물이 이중으로 그려지므로 사용자가 명시적으로 켠다.
+   *  타일셋 미보유(vworld3dReady=false)면 레이어가 빈 배열이라 무해. */
+  const [showVworld3d, setShowVworld3d] = useState(false);
+  /** V-World 3D 타일셋 보유 여부 (자료관리 > V-World 3D 건물 다운로드 시 생성) — false 면 토글 비활성 */
+  const [vworld3dReady, setVworld3dReady] = useState(false);
+  /** V-World 타일셋 갱신 세대 — vworld3d-changed 수신 시 증가시켜 레이어 id 를 바꿔 재로드 */
+  const [vworld3dEpoch, setVworld3dEpoch] = useState(0);
   /** 실측(1m DSM) 커버리지 bbox [minLat, maxLat, minLon, maxLon] — null = 미조회/실측 데이터 없음 */
   const [meshCoverageBbox, setMeshCoverageBbox] = useState<[number, number, number, number] | null>(null);
   /** fill-extrusion 동기화 재시도 틱 — 스타일 미로드로 skip 된 경우 styledata 후 1회 재실행용 */
   const [styleRetryTick, setStyleRetryTick] = useState(0);
-  const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null } | null>(null);
+  // ground_elev_m: 실측 메시 지붕 마커 z(지반고+높이) 계산용 — 미전달 시 마커 생략
+  const [losBuildingHighlight, setLosBuildingHighlight] = useState<{ lat: number; lon: number; height_m: number; name: string | null; address: string | null; usage: string | null; ground_elev_m?: number } | null>(null);
   /** 건축물정보 드로어 상태 — 클릭 건물의 로컬 기하 + 대장(로컬 FAC + 온라인 VWorld) 조회 결과 */
   type BldgDrawerState = {
     lat: number; lon: number;
@@ -545,7 +558,7 @@ export default function TrackMap() {
   const braLastRunKeyRef = useRef<string | null>(null);
   /** 건물 자료 세대 — 실측/대장/수동 건물 변경 이벤트마다 +1.
    *  BRA 결과는 Rust 가 융합 SRTM + 현재 건물 세트로 계산한 스냅샷이라, 자료가 바뀌면
-   *  화면에 남은 침범 목록·프리즘이 낡는다. 세대를 재분석 키에 넣어 기존 디바운스/seq 가드를 재사용. */
+   *  화면에 남은 침범 목록이 낡는다. 세대를 재분석 키에 넣어 기존 디바운스/seq 가드를 재사용. */
   const [braDataEpoch, setBraDataEpoch] = useState(0);
 
   // 이펙트에서 최신 레이더 제원 참조용 (호버 조회 deps 에 radarSite 를 넣지 않기 위함)
@@ -685,7 +698,7 @@ export default function TrackMap() {
         if (seq === addressReqSeq.current) setAddressBuilding(null);
       });
   }, []);
-  /** 건물 속성 → 우측 건축물정보 드로어 오픈 — BRA 프리즘/리스트·건물 점 클릭 공용.
+  /** 건물 속성 → 우측 건축물정보 드로어 오픈 — BRA 침범 리스트·건물 점 클릭 공용.
    *  maplibre 경로(openBldgDrawer)와 동일 로직. losPointClickedRef 마킹은 호출부 책임(BRA 모드는 losTarget 없음). */
   const openBldgDrawerFor = useCallback((a: { lat: number; lon: number; name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean }) => {
     setBldgHoverTip(null);
@@ -1558,6 +1571,8 @@ export default function TrackMap() {
 
   // MapLibre fill-extrusion 호버/클릭 이벤트 (3D 모드)
   const buildingHoverActiveRef = useRef(false);
+  // 건물 클릭 시퀀스 — 백엔드 점 조회(비동기 폴백) 응답이 도착했을 때 그 사이 다른 클릭이 있었으면 폐기
+  const bldgClickSeqRef = useRef(0);
   useEffect(() => {
     const map = mapRef.current?.getMap();
     if (!map) return;
@@ -1597,9 +1612,11 @@ export default function TrackMap() {
       }
     };
 
-    /** 건물 속성 → 우측 건축물정보 드로어 오픈 (박스 쿼리·메시 픽 공용) */
-    const openBldgDrawer = (a: { lat: number; lon: number; name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean }) => {
-      if (losTarget) losPointClickedRef.current = true;
+    /** 건물 속성 → 우측 건축물정보 드로어 오픈 (박스 쿼리·메시 픽 공용).
+     *  markLosClick=false 는 비동기 폴백 전용 — 클릭 이벤트 처리(handleMapClick 플래그 소비)가
+     *  이미 끝난 뒤에 losPointClickedRef 를 세우면 스테일 true 가 남아 다음 빈 영역 클릭을 한 번 삼킨다. */
+    const openBldgDrawer = (a: { lat: number; lon: number; name?: string; height?: number; usage?: string; base?: number; source?: string; measured?: boolean }, markLosClick = true) => {
+      if (markLosClick && losTarget) losPointClickedRef.current = true;
       setBldgHoverTip(null);
       setSettingsDrawer(null); // 우측 표시 설정 드로어와 택1 상호 배타
       setBldgDrawer((prev) => {
@@ -1619,26 +1636,11 @@ export default function TrackMap() {
       }
     };
 
-    const onClick = (e: maplibregl.MapMouseEvent) => {
-      // ① 실측 메시 표출 중이면 메시 GPU 픽 우선 — 화면에 보이는(항상 박스 위에 그려지는) 실측 지붕면을 그대로 클릭 대상으로
-      if (meshActive) {
-        let coord: number[] | undefined;
-        try {
-          coord = deckOverlayRef.current?.pickObject({ x: e.point.x, y: e.point.y, layerIds: meshLayerIds(tiles3dDir) })?.coordinate;
-        } catch { /* deck 미초기화 등 — 박스 경로 폴백 */ }
-        if (coord) {
-          const b = resolveMeasuredBuildingAt(coord[1], coord[0], buildings3dDataRef.current);
-          if (b) {
-            openBldgDrawer({ lat: b.lat, lon: b.lon, name: b.name || undefined, height: b.height_m, usage: b.usage || undefined, base: b.ground_elev_m, source: b.source, measured: true });
-            return;
-          }
-          // 메시는 맞았지만 매칭 건물 없음(미매칭 메시) → 박스 경로 폴백
-        }
-      }
-      // ② 기존 fill-extrusion 박스 쿼리 경로
+    /** ② fill-extrusion 박스 쿼리 경로 — 메시 비활성·메시 픽 미스·백엔드 점 조회 미스 공용 */
+    const tryBoxPath = (point: maplibregl.MapMouseEvent["point"], markLosClick = true) => {
       const present = layerIds.filter((id) => map.getLayer(id));
       if (present.length === 0) { setBldgDrawer(null); return; }
-      const features = map.queryRenderedFeatures(e.point, { layers: present });
+      const features = map.queryRenderedFeatures(point, { layers: present });
       if (features.length > 0) {
         const p = features[0].properties;
         if (p) {
@@ -1650,11 +1652,60 @@ export default function TrackMap() {
             base: p.base != null ? Number(p.base) : undefined,
             source: p.source || undefined,
             measured: p.measured === true || p.measured === "true",
-          });
+          }, markLosClick);
         }
       } else {
         setBldgDrawer(null);
       }
+    };
+
+    const onClick = (e: maplibregl.MapMouseEvent) => {
+      const seq = ++bldgClickSeqRef.current; // 비동기 폴백 응답의 스테일 판정 기준
+      // ① 실측 메시 표출 중이면 메시 GPU 픽 우선 — 화면에 보이는(항상 박스 위에 그려지는) 실측 지붕면을 그대로 클릭 대상으로
+      if (meshActive) {
+        let coord: number[] | undefined;
+        try {
+          coord = deckOverlayRef.current?.pickObject({ x: e.point.x, y: e.point.y, layerIds: meshLayerIds(tiles3dDir) })?.coordinate;
+        } catch { /* deck 미초기화 등 — 박스 경로 폴백 */ }
+        if (coord) {
+          const lat = coord[1], lon = coord[0];
+          const hit = resolveMeasuredBuildingAt(lat, lon, buildings3dDataRef.current);
+          // ①-a 로드된 목록에 폴리곤 포함 히트 → 즉시 오픈 (동기 빠른 경로)
+          if (hit.contained) {
+            const b = hit.contained;
+            openBldgDrawer({ lat: b.lat, lon: b.lon, name: b.name || undefined, height: b.height_m, usage: b.usage || undefined, base: b.ground_elev_m, source: b.source, measured: true });
+            return;
+          }
+          // ①-b 포함 미스 → 백엔드 점 조회 폴백. 뷰포트 박스 데이터셋(buildings3dData)은 줌별 최소높이·
+          // 카메라 거리 링·타일당 상한 필터를 거쳐 낮은 실측 건물이 통째로 미로드라, 로컬 매칭만으로는
+          // 메시에 보이는 건물을 클릭해도 무반응이 된다. 백엔드는 높이 필터 없이 점 포함으로 찾는다.
+          const point = e.point;
+          invoke<AddressBuildingHit | null>("find_building_near_point", { lat, lon })
+            .then((res) => {
+              if (seq !== bldgClickSeqRef.current) return; // 그 사이 다른 클릭 발생 → 폐기
+              if (res) {
+                openBldgDrawer({
+                  lat: res.lat, lon: res.lon,
+                  name: res.name ?? undefined, height: res.height_m, usage: res.usage ?? undefined,
+                  base: res.ground_elev_m, source: res.source, measured: res.height_measured != null,
+                }, false);
+              } else if (hit.nearest) {
+                // 백엔드 미스 → 로컬 최근접(≤30m) 후보
+                const n = hit.nearest;
+                openBldgDrawer({ lat: n.lat, lon: n.lon, name: n.name || undefined, height: n.height_m, usage: n.usage || undefined, base: n.ground_elev_m, source: n.source, measured: true }, false);
+              } else {
+                tryBoxPath(point, false);
+              }
+            })
+            .catch(() => {
+              // 조회 실패는 조용히 무시 — 최신 클릭이면 박스 폴백만 시도
+              if (seq !== bldgClickSeqRef.current) return;
+              tryBoxPath(point, false);
+            });
+          return;
+        }
+      }
+      tryBoxPath(e.point);
     };
 
     map.on("mousemove", onMouseMove);
@@ -1722,6 +1773,19 @@ export default function TrackMap() {
     };
   }, [coverageVisible, gpuCacheReady]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 실측 메시 줌 게이트 — fill-extrusion 3D 건물과 동일 임계(BUILDINGS_3D_MIN_ZOOM).
+  // 광역 줌에서 김포 타일셋 전역이 순회·로드 대상이 되는 것을 막아 표출 스코프를 건물과 일치시킨다.
+  // (타일셋 튜닝 + 아래 하이라이트 게이트가 함께 쓰므로 두 사용처보다 위에서 선언)
+  const meshZoomOk = viewState.zoom >= BUILDINGS_3D_MIN_ZOOM;
+
+  /** 실측 메시가 실제 그려지는 지점인지 — 커버리지 내에서는 박스 하이라이트 대신 지붕 마커를 쓴다
+   *  (박스가 메시와 겹쳐 이중으로 보이는 문제). meshZoomOk: 줌14 미만 동결 중엔 메시가 안 보이므로 박스 유지 */
+  const inMeshCoverage = useCallback((lat: number, lon: number) =>
+    meshActive && meshZoomOk && !!meshCoverageBbox &&
+    lat >= meshCoverageBbox[0] && lat <= meshCoverageBbox[1] &&
+    lon >= meshCoverageBbox[2] && lon <= meshCoverageBbox[3],
+  [meshActive, meshZoomOk, meshCoverageBbox]);
+
   // LoS 단면도 건물 클릭/호버 → 3D 건물 주황색 하이라이트
   useEffect(() => {
     const map = mapRef.current?.getMap();
@@ -1735,6 +1799,8 @@ export default function TrackMap() {
     if (map.getSource(hlSourceId)) map.removeSource(hlSourceId);
 
     if (!losBuildingHighlight || !buildings3dMode || buildings3dData.length === 0) return;
+    // 실측 메시 커버리지 내에서는 박스 대신 지붕 마커(selMarkerDeckLayers)로 표시 — 메시와 이중 표출 방지
+    if (inMeshCoverage(losBuildingHighlight.lat, losBuildingHighlight.lon)) return;
 
     // lat/lon 근접 매칭으로 Building3D 찾기
     const tgt = losBuildingHighlight;
@@ -1762,7 +1828,7 @@ export default function TrackMap() {
       if (map.getLayer(hlLayerId)) map.removeLayer(hlLayerId);
       if (map.getSource(hlSourceId)) map.removeSource(hlSourceId);
     };
-  }, [losBuildingHighlight, buildings3dMode, buildings3dData]);
+  }, [losBuildingHighlight, buildings3dMode, buildings3dData, inMeshCoverage]);
 
   // 클릭(고정) 건물 → 3D 골드 glow (채움 + 외곽선)
   useEffect(() => {
@@ -1780,6 +1846,8 @@ export default function TrackMap() {
     cleanup();
 
     if (!bldgDrawer || !buildings3dMode || buildings3dData.length === 0) return;
+    // 실측 메시 커버리지 내에서는 박스 대신 지붕 마커(selMarkerDeckLayers)로 표시 — 메시와 이중 표출 방지
+    if (inMeshCoverage(bldgDrawer.lat, bldgDrawer.lon)) return;
 
     const matched = buildings3dData.find(
       (b) => Math.abs(b.lat - bldgDrawer.lat) < 0.0001 && Math.abs(b.lon - bldgDrawer.lon) < 0.0001
@@ -1808,7 +1876,7 @@ export default function TrackMap() {
 
     return cleanup;
     // 조회 결과(loading/info/facDetail) 갱신으로 레이어가 재생성되지 않게 열림 여부·좌표만 deps 로
-  }, [bldgDrawer != null, bldgDrawer?.lat, bldgDrawer?.lon, buildings3dMode, buildings3dData]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bldgDrawer != null, bldgDrawer?.lat, bldgDrawer?.lon, buildings3dMode, buildings3dData, inMeshCoverage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 주소검색 건물 → 3D 골드 표출(히트) / 지반 2D 폴백(미히트).
   //   buildings3dMode·showBuildings·줌 게이트와 무관하게 addressMarker 존재 동안 항상 표시.
@@ -1833,6 +1901,10 @@ export default function TrackMap() {
     cleanup();
 
     if (!addressMarker) return;
+    // 실측 메시 커버리지 내에서는 박스 대신 지붕 마커(selMarkerDeckLayers)로 표시 — 메시와 이중 표출 방지.
+    // 미히트 2D 지반 원도 불투명 메시 아래에 깔려 안 보이므로 함께 skip
+    const addrSel = addressBuilding ?? addressMarker;
+    if (inMeshCoverage(addrSel.lat, addrSel.lon)) return;
 
     const hasFootprint = !!addressBuilding && addressBuilding.polygons.length > 0;
 
@@ -1898,7 +1970,7 @@ export default function TrackMap() {
     }
 
     return cleanup;
-  }, [addressMarker, addressBuilding]);
+  }, [addressMarker, addressBuilding, inMeshCoverage]);
 
   // ── LoS 단면도 경로상 건물 → 지도 3D 하이라이트 (대상=파랑 #3b82f6, 차단=빨강 #ef4444) ──
   //   단면도 차트의 대상/차단 건물 색과 1:1 대응. 주소검색 골드 건물과 동일하게
@@ -2752,7 +2824,7 @@ export default function TrackMap() {
   // 원추 반경·기준각·건물 자료 세대 변경 → 이미 한 번 실행한 뒤라면 자동 재분석 (디바운스).
   //   반경=분석 범위, 각도=판정 기준면이므로 둘 다 결과·표시 정합에 직결된다.
   //   세대(braDataEpoch)=실측/대장/수동 건물 변경 — 지반고 융합 보정·건물 세트가 바뀌면 표시 중인
-  //   침범 목록·프리즘이 낡으므로 같은 경로로 재실행한다(Rust 는 호출마다 융합 SRTM 을 프리로드).
+  //   침범 목록이 낡으므로 같은 경로로 재실행한다(Rust 는 호출마다 융합 SRTM 을 프리로드).
   //   실패해도 ref 에 실패한 키가 남아 동일 파라미터 재시도 루프는 발생하지 않고, 파라미터가 바뀌면 1회 재시도된다.
   useEffect(() => {
     if (!braResult && !braError) return; // 최초 실행 전에는 자동 실행 금지
@@ -3433,9 +3505,8 @@ export default function TrackMap() {
     return () => { cancelled = true; };
   }, [meshActive]);
 
-  // 실측 메시 줌 게이트 — fill-extrusion 3D 건물과 동일 임계(BUILDINGS_3D_MIN_ZOOM).
-  // 광역 줌에서 김포 타일셋 전역이 순회·로드 대상이 되는 것을 막아 표출 스코프를 건물과 일치시킨다.
-  const meshZoomOk = viewState.zoom >= BUILDINGS_3D_MIN_ZOOM;
+  // 실측 메시 줌 게이트(meshZoomOk)는 하이라이트 박스 억제 게이트(inMeshCoverage)와 공유하므로
+  // 두 사용처보다 위(하이라이트 이펙트 직전)에서 1회만 선언한다.
 
   // 피치 적응 SSE 목표값 — fill-extrusion 쪽 앵커 반경 클램프(고피치에서 지평선까지 bounds 가
   // 폭주해 건물 조회량이 터지는 것을 막는 방어)의 메시 대응물. 메시는 뷰포트 반경을 직접 자를
@@ -3449,57 +3520,6 @@ export default function TrackMap() {
     const t = Math.min(1, (pitch - 40) / 45); // 40→85°
     return Math.round((8 + t * 16) / 2) * 2;
   }, [viewState.pitch]);
-
-  /** 로드된 실측 메시 콘텐츠 타일의 [minLat, maxLat, minLon, maxLon] — 셸 모드 판정용.
-   *  BRA 프리즘의 "빨강 셸(원추 아래 discard)" 은 그 자리에 실제로 그려지는 메시가 있을 때만 성립한다.
-   *  전역 플래그(meshActive&&meshZoomOk)만 보면 타일이 아직 안 온 구역에서 하부가 통째로 투명해지므로
-   *  실제 로드된 타일의 지리 bbox 를 모아 위치별로 판정한다. 키는 `타일셋레이어id|tile.id`. */
-  const loadedMeshTileBboxRef = useRef<Map<string, [number, number, number, number]>>(new Map());
-  /** bbox 집합 변경 세대 — braDeckLayers useMemo 의 재계산 트리거(ref 는 리렌더를 유발하지 않으므로 필요) */
-  const [meshTilesVersion, setMeshTilesVersion] = useState(0);
-  /** 세대 증가 코얼레싱 타이머 — 타일 스트리밍 중 프리즘 레이어 과재계산 방지 */
-  const meshTilesBumpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // 200ms trailing 코얼레싱 — 첫 호출이 타이머를 예약하고 그 사이의 모든 로드/언로드는 같은 틱에 합류한다.
-  // (매 호출마다 타이머를 재설정하는 방식은 카메라가 계속 움직여 타일이 끊임없이 들어올 때 세대 증가가
-  //  무한 연기될 수 있어 채택하지 않았다 — 이 방식은 최대 200ms 안에 반드시 1회 반영된다.)
-  const bumpMeshTilesVersion = useCallback(() => {
-    if (meshTilesBumpTimerRef.current !== null) return;
-    meshTilesBumpTimerRef.current = setTimeout(() => {
-      meshTilesBumpTimerRef.current = null;
-      setMeshTilesVersion((v) => v + 1);
-    }, 200);
-  }, []);
-
-  // 언마운트 시 예약 타이머 정리
-  useEffect(() => () => {
-    if (meshTilesBumpTimerRef.current !== null) {
-      clearTimeout(meshTilesBumpTimerRef.current);
-      meshTilesBumpTimerRef.current = null;
-    }
-  }, []);
-
-  // 타일 콘텐츠 로드 — 지리 bbox 등록.
-  // tile.boundingBox(@loaders.gl/tiles Tile3D getter)는 3D Tiles 스펙의 boundingVolume 3종
-  // (region / box / sphere)을 타입 분기해 [[minLon,minLat,minAlt],[maxLon,maxLat,maxAlt]] 카토그래픽
-  // 경계로 환산한다(region 은 라디안→도, box/sphere 는 ECEF 코너·축단점을 Ellipsoid.WGS84 로 역투영).
-  // 라이브러리가 이미 스펙 분기를 제공하므로 동일 계산을 재구현하지 않는다 — 폴백이 아니라 타입 분기다.
-  // (김포 타일셋은 전 타일 region 사용 확인 — 값은 getter 내부에서 타일당 1회 캐시된다)
-  // 키는 `타일셋레이어id|tile.id` — tile.id 는 b3dm 콘텐츠 URL 이고 main/cdm 두 타일셋이 같은 폴더를
-  // 베이스로 삼으므로, 같은 파일을 양쪽이 참조하면 id 가 겹친다. 한쪽 언로드가 다른 쪽 항목까지 지우지
-  // 않도록 타일셋별로 분리한다.
-  const onMeshTileLoad = useCallback((tilesetKey: string, tile: Tile3D) => {
-    // 빈 타일·외부 타일셋 참조 노드는 아무것도 그리지 않으므로 커버리지에서 제외
-    if (!tile.hasRenderContent) return;
-    const [bbMin, bbMax] = tile.boundingBox; // [lon, lat, alt] 순
-    loadedMeshTileBboxRef.current.set(`${tilesetKey}|${tile.id}`, [bbMin[1], bbMax[1], bbMin[0], bbMax[0]]);
-    bumpMeshTilesVersion();
-  }, [bumpMeshTilesVersion]);
-
-  // 타일 언로드(캐시 축출) — 더 이상 그려지지 않으므로 커버리지에서 제거
-  const onMeshTileUnload = useCallback((tilesetKey: string, tile: Tile3D) => {
-    if (loadedMeshTileBboxRef.current.delete(`${tilesetKey}|${tile.id}`)) bumpMeshTilesVersion();
-  }, [bumpMeshTilesVersion]);
 
   // onTilesetLoad 로 수집한 Tileset3D 인스턴스(main + cdm 최대 2개) — setProps 라이브 갱신 대상.
   const tilesetsRef = useRef<any[]>([]);
@@ -3543,10 +3563,6 @@ export default function TrackMap() {
         // 버튼 드래그(카메라 조작) 중엔 스킵되므로 타일 튜닝(debounce/캐시)과 충돌 없음
         pickable: true,
         onTilesetLoad: tuneTileset,
-        // 로드/언로드 타일의 지리 bbox 추적 — BRA 프리즘 셸 모드가 "그 위치에 실제 메시가 있는가"를
-        // 판정하는 단일 원천. main·cdm 두 타일셋이 같은 핸들러를 쓰되 레이어 id 로 키를 분리한다.
-        onTileLoad: (tile: Tile3D) => onMeshTileLoad(id, tile),
-        onTileUnload: (tile: Tile3D) => onMeshTileUnload(id, tile),
         onTileError: (err: unknown) => console.warn("실측 3D 타일 로드 실패:", err),
       });
     // meshZoomOk 로 인스턴스를 재생성해도 id·data 가 동일하면 deck 이 id 매칭으로 기존 state(tileset3d)
@@ -3558,7 +3574,7 @@ export default function TrackMap() {
       // 보충 타일셋 — 없으면 onTileError 로 조용히 무시
       tileset(cdmId, "tileset_cdm.json"),
     ];
-  }, [showTiles3d, tiles3dDir, meshZoomOk, onMeshTileLoad, onMeshTileUnload]);
+  }, [showTiles3d, tiles3dDir, meshZoomOk]);
 
   // 게이트 적용 — 로드된 타일셋에 SSE/loadTiles 라이브 반영.
   // loadTiles:false 는 Tileset3D.doUpdate 를 조기 반환시켜 순회·신규 로드를 완전 동결하되
@@ -3580,30 +3596,169 @@ export default function TrackMap() {
   // 타일셋 표출 자체가 꺼지면(memo 가 [] 반환 → 레이어·tileset3d 폐기) 죽은 참조 정리.
   // 주의: 게이트 플립(meshZoomOk 변화)으로는 절대 비우면 안 된다 — onTilesetLoad 는 최초 로드 시
   // 1회만 발화하므로, 살아있는 타일셋 참조를 비우면 다시 채울 기회가 영영 없다.
-  // 타일 bbox 도 함께 비운다 — 타일셋이 폐기되면 onTileUnload 가 전 타일에 대해 발화한다는 보장이
-  // 없어, 남겨두면 "메시가 없는데 셸(투명)" 상태가 굳는다.
   useEffect(() => {
     if (!showTiles3d || !tiles3dDir) {
       tilesetsRef.current = [];
-      if (loadedMeshTileBboxRef.current.size > 0) {
-        loadedMeshTileBboxRef.current.clear();
-        bumpMeshTilesVersion();
-      }
     }
-  }, [showTiles3d, tiles3dDir, bumpMeshTilesVersion]);
+  }, [showTiles3d, tiles3dDir]);
 
   // 폴더 교체(dirA→dirB) 정리 — 레이어 id 가 바뀌어 구 tileset 은 폐기되므로 참조도 함께 비운다
   // (안 비우면 죽은 객체가 게이트 setProps 대상으로 남는다). 새 타일셋은 onTilesetLoad 가 재push.
   // deps 를 [tiles3dDir] 로 좁힌 것이 핵심 — 위 이펙트와 달리 조건 없이 비우므로, showTiles3d/줌
   // 토글에도 반응하면 살아있는 참조까지 날아가고 onTilesetLoad 는 재발화하지 않아 영영 못 채운다.
-  // 구 폴더 타일의 bbox 도 같은 이유로 함께 비운다(새 타일은 onTileLoad 가 재등록).
   useEffect(() => {
     tilesetsRef.current = [];
-    if (loadedMeshTileBboxRef.current.size > 0) {
-      loadedMeshTileBboxRef.current.clear();
-      bumpMeshTilesVersion();
+  }, [tiles3dDir]);
+
+  // ─── V-World 3D 건물 타일 (실측 tiles3d 경로와 분리된 병렬 구조 — 렌더 전용) ───
+
+  /** 타일셋 보유 여부 조회 — manifest 요약(소용량 JSON). 타일 0개거나 디렉터리 미생성이면 토글 비활성.
+   *  실측 경로가 get_tiles3d_dir 로 등록 여부를 묻는 것과 같은 자리의 계약. */
+  const refreshVworld3dReady = useCallback(async () => {
+    try {
+      const s = await invoke<{ tileCount?: number; tile_count?: number } | null>("vworld3d_status");
+      setVworld3dReady(!!s && (s.tileCount ?? s.tile_count ?? 0) > 0);
+    } catch {
+      setVworld3dReady(false); // 미다운로드(디렉터리 없음)는 정상 상태
     }
-  }, [tiles3dDir, bumpMeshTilesVersion]);
+  }, []);
+  useEffect(() => { refreshVworld3dReady(); }, [refreshVworld3dReady]);
+
+  // 다운로드 완료/전체 삭제 수신 (발신: 자료관리 화면) — 위 조회는 마운트 1회뿐이라 이 경로가
+  // 없으면 열려 있는 지도 창에 반영되지 않는다. 로컬 state 만 갱신(재영속 금지).
+  useEffect(() => {
+    const unlisten = listen("vworld3d-changed", () => {
+      refreshVworld3dReady();
+      setVworld3dEpoch((e) => e + 1); // 레이어 id 교체 → 새 tileset.json 재로드
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [refreshVworld3dReady]);
+
+  // onTilesetLoad 로 수집한 Tileset3D 인스턴스 — 실측 tilesetsRef 와 절대 공유하지 않는다.
+  const vworldTilesetsRef = useRef<any[]>([]);
+  const vworldTuneRef = useRef({ sse: 8, load: true });
+
+  // V-World 3D 타일 레이어 — vworld3d 커스텀 프로토콜로 로컬 타일셋(tileset.json/b3dm) 서빙.
+  // 성능 계약(debounce 150ms · _cacheBytes 512MB · memoryAdjustedScreenSpaceError · 줌 게이트 ·
+  // 피치 SSE 램프)은 실측 메시와 동일 — 같은 GPU/메모리 예산을 쓰는 같은 종류의 부하이기 때문.
+  const vworld3dDeckLayers = useMemo(() => {
+    if (!showVworld3d || !vworld3dReady) return [];
+    const tuneTileset = (ts: any) => {
+      ts.setProps({
+        debounceTime: 150,
+        memoryAdjustedScreenSpaceError: true,
+        maximumScreenSpaceError: vworldTuneRef.current.sse,
+        loadTiles: vworldTuneRef.current.load,
+      });
+      ts._cacheBytes = 512 * 1024 * 1024;
+      ts._cacheOverflowBytes = 64 * 1024 * 1024;
+      vworldTilesetsRef.current.push(ts); // 이후 게이트 변화 시 setProps 로 라이브 갱신
+    };
+    return [
+      new Tile3DLayer({
+        id: vworld3dLayerId(vworld3dEpoch),
+        data: convertFileSrc("tileset.json", "vworld3d"),
+        loader: Tiles3DLoader,
+        // 줌 게이트 — visible:false 는 드로우만 막고, 실제 로드 차단은 아래 loadTiles:false 와 페어
+        visible: meshZoomOk,
+        // 픽 제외 필수 — 클릭 픽(pickObject)은 실측 메시 → 건물 해석 계약 전용이라
+        // V-World 메시가 픽되면 3단 폴백이 엉뚱한 표면을 집는다.
+        pickable: false,
+        onTileError: () => { /* 타일셋/타일 404 는 미다운로드 영역에서 정상 — 조용히 무시 */ },
+        onTilesetLoad: tuneTileset,
+      }),
+    ];
+  }, [showVworld3d, vworld3dReady, vworld3dEpoch, meshZoomOk]);
+
+  // 게이트 적용 — 실측 경로와 동일하게 SSE/loadTiles 를 라이브 반영 (대상 ref 만 다름)
+  useEffect(() => {
+    vworldTuneRef.current = { sse: meshTargetSse, load: meshZoomOk };
+    for (const ts of vworldTilesetsRef.current) {
+      ts.setProps({ maximumScreenSpaceError: meshTargetSse, loadTiles: meshZoomOk });
+      if (ts.memoryAdjustedScreenSpaceError < meshTargetSse) ts.memoryAdjustedScreenSpaceError = meshTargetSse;
+      if (meshZoomOk) ts.update(); // 게이트 재진입 시 즉시 재순회
+    }
+  }, [meshTargetSse, meshZoomOk]);
+
+  // 표출이 꺼지면(memo 가 [] 반환 → tileset3d 폐기) 죽은 참조 정리.
+  // 게이트 플립으로는 절대 비우지 않는다 — onTilesetLoad 는 최초 1회만 발화한다.
+  useEffect(() => {
+    if (!showVworld3d || !vworld3dReady) {
+      vworldTilesetsRef.current = [];
+    }
+  }, [showVworld3d, vworld3dReady]);
+
+  // 세대 교체(재다운로드/삭제) 정리 — 레이어 id 가 바뀌어 구 tileset 은 폐기되므로 참조도 비운다.
+  // deps 를 [vworld3dEpoch] 로 좁힌 것이 핵심(조건 없이 비우므로 토글/줌에 반응하면 안 된다).
+  useEffect(() => {
+    vworldTilesetsRef.current = [];
+  }, [vworld3dEpoch]);
+
+  // 실측 메시 커버리지 내 선택/하이라이트 건물 → 지붕 위 마커 (박스 하이라이트 대체)
+  // 메시는 MSL 절대고도 z 로 그려지므로 마커 z = 지반고 + 건물높이 (= 실측 지붕 MSL, 상쇄 불변식)
+  const selMarkerDeckLayers = useMemo(() => {
+    const entries: { lon: number; lat: number; topM: number; color: [number, number, number] }[] = [];
+
+    // 클릭(고정) 드로어 건물 — 골드. 높이/지반고 우선순위는 드로어 표시 규칙과 동일
+    if (bldgDrawer && inMeshCoverage(bldgDrawer.lat, bldgDrawer.lon)) {
+      const base = bldgDrawer.localBase ?? bldgDrawer.facDetail?.ground_elev_m;
+      const height = bldgDrawer.facDetail?.height_measured_m ?? bldgDrawer.localHeight ?? bldgDrawer.facDetail?.height_m;
+      if (typeof base === "number" && typeof height === "number") {
+        entries.push({ lon: bldgDrawer.lon, lat: bldgDrawer.lat, topM: base + height, color: [251, 191, 36] });
+      }
+    }
+
+    // 주소검색 건물 — 골드. 드로어와 같은 건물이면 중복 마커 생략
+    if (addressMarker && addressBuilding && inMeshCoverage(addressBuilding.lat, addressBuilding.lon)) {
+      const dup = entries.some((e) => Math.abs(e.lat - addressBuilding.lat) < 1e-6 && Math.abs(e.lon - addressBuilding.lon) < 1e-6);
+      if (!dup) {
+        entries.push({
+          lon: addressBuilding.lon, lat: addressBuilding.lat,
+          topM: addressBuilding.ground_elev_m + addressBuilding.height_m,
+          color: [251, 191, 36],
+        });
+      }
+    }
+
+    // LoS 단면도 호버 건물 — 주황 (지반고 미전달 시 마커 z 산출 불가 → 생략)
+    if (losBuildingHighlight && losBuildingHighlight.ground_elev_m != null &&
+        inMeshCoverage(losBuildingHighlight.lat, losBuildingHighlight.lon)) {
+      entries.push({
+        lon: losBuildingHighlight.lon, lat: losBuildingHighlight.lat,
+        topM: losBuildingHighlight.ground_elev_m + losBuildingHighlight.height_m,
+        color: [249, 115, 22],
+      });
+    }
+
+    if (entries.length === 0) return [];
+    return [
+      // 지붕에서 위로 뻗는 빔 + 그 끝의 점 — 메시 지붕면에 파묻히지 않게 +1m 부터 시작
+      new LineLayer({
+        id: "sel-mesh-marker-beam",
+        data: entries,
+        getSourcePosition: (d) => [d.lon, d.lat, d.topM + 1],
+        getTargetPosition: (d) => [d.lon, d.lat, d.topM + 30],
+        getColor: (d) => d.color,
+        getWidth: 3,
+        widthUnits: "pixels",
+        pickable: false,
+      }),
+      new ScatterplotLayer({
+        id: "sel-mesh-marker-dot",
+        data: entries,
+        getPosition: (d) => [d.lon, d.lat, d.topM + 32],
+        getFillColor: (d) => d.color,
+        getRadius: 7,
+        radiusUnits: "pixels",
+        stroked: true,
+        getLineColor: [255, 255, 255, 230],
+        lineWidthMinPixels: 2,
+        billboard: true,
+        pickable: false,
+      }),
+    ];
+    // bldgDrawer 통째 dep — facDetail 도착 시 마커 갱신 목적(useMemo 라 렌더 비용 무시 가능)
+  }, [bldgDrawer, addressMarker, addressBuilding, losBuildingHighlight, inMeshCoverage]);
 
   // CAT008 기상 극좌표 벡터 → 부채꼴 폴리곤 레이어.
   // 시간은 NEC 프레임 분 단위로 양자화 → 재생 시점(visibleMaxTs) 이하의 최신 1분 스냅샷만 표시.
@@ -3738,49 +3893,14 @@ export default function TrackMap() {
     return layers;
   }, [showCos, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
-  // BRA 3D 레이어 — ① 원추면(기준각 θ 로 전방위 상승) ② 침범 건물 통짜 프리즘.
-  //   z 규약은 원추면·CoS 원추·LoS 커튼과 동일하게 전부 AMSL 미터 × EX (지형 메시 과장 배율 공유, 현재 1=실척).
+  // BRA 3D 레이어 — 원추면(기준각 θ 로 전방위 상승) + 최외곽 림.
+  //   z 규약은 CoS 원추·LoS 커튼과 동일하게 전부 AMSL 미터 × EX (지형 메시 과장 배율 공유, 현재 1=실척).
   //   원추면 해발고는 Rust analysis/bra.rs cone_msl · LoSProfilePanel braAMSL 과 동일한
   //   실제지구 기하 직선: coneMsl(d) = h_ant + d·tanθ + d²/(2R) (4/3 굴절 미적용).
-  //   ② 침범 건물은 바닥(지반 AMSL)~지붕(지붕 AMSL)을 한 덩어리 3D 프리즘으로 그리되, 아래는 일반
-  //      건물 회색 · 위(초과부)는 불투명 빨강으로 갈라 빨강 하단 경계가 렌더된 원추면과 기하적으로
-  //      정확히 일치한다. 분할은 BraPrismLayer 의 **픽셀(프래그먼트) 단위 셰이더 판정**이 수행한다
-  //      (구 설계는 붉은 반투명 밴드를 maplibre
-  //      fill-extrusion 프레임 = 지형만 과장·건물 높이 비과장 인 '보이는 건물 상단'에 앵커해 두께를
-  //      초과량으로 잡았는데, 원추면은 AMSL×EX 프레임이라 지형 과장 시 두 프레임이 어긋나 밴드가
-  //      원추 아래에 떠 보였다 — 프레임 통일로 해소.)
-  //      · 분할이 픽셀 단위인 이유: 구 구현은 정점마다 원추면 z 를 구해 벽을 상·하 두 쿼드로
-  //        잘랐는데, 레이더에 접선 방향인 긴 벽은 **벽 중간이 양끝 정점보다 레이더에 가까워 원추면이
-  //        중간에서 더 낮게** 지나간다. 정점 보간으로는 이 처짐을 못 그려 실제로는 벽 중앙부가 원추를
-  //        뚫는데도 벽 전체가 회색이 됐다(실측3D 행은 폴리곤이 bbox 사각형 4정점뿐이라 증상 극대).
-  //        지붕 캡도 최근접 정점 기준 통째 빨강이라 과대 마킹이었다. 이제 벽/지붕을 통짜 면으로 넘기고
-  //        프래그먼트에서 그 픽셀의 실제 (lng,lat,z) 로 원추면 높이를 재계산 → "원추면 위 = 빨강"이
-  //        모든 픽셀에서 성립하고 지붕도 원추 위 부분만 빨강이 된다. 셰이더가 쓰는 수식·스냅샷이
-  //        ①의 원추면 메시와 동일해 "빨강 하단 경계 = 렌더된 원추면" 계약도 그대로 유지된다.
-  //      · EX=1(실척)이면 maplibre fill-extrusion 건물(줌 14+)과도 프레임이 일치 — 같은 건물의 박스와
-  //        프리즘이 정확히 겹치고, deck 오버레이(overlaid)가 항상 지도 위에 그려져 불투명 프리즘이 박스를
-  //        시각적으로 대체한다. (EX>1 이면 프리즘이 박스보다 EX 배 커져 박스를 내포)
-  //      · 메시 표출 중 실측 건물은 빨강 셸(원추 아래 discard)로 하부 메시 노출 — 아래 ② 셸 모드 참조.
-  //      · 프리즘은 pickable — 클릭 시 우측 건축물정보 드로어, 호버 시 간단 툴팁(BRA 초과·여유 행 포함).
-  //        (BRA 는 원추 전체를 보려 줌아웃한 상태라 fill-extrusion 건물 레이어가 비어 클릭 대상이 없다)
-  //      · Rust 결과(braResult.buildings)가 상한 없는 전수라 이 프리즘이 "원추면 위 = 빨강" 마킹의 단일 경로다.
-  //        (구 maplibre fill-extrusion red 분할 레이어는 줌 14 게이트·로더 높이필터·deck 원추 가림으로
-  //         누락이 커 제거 — 전수 마킹은 뷰포트 타일이 아닌 분석 결과가 책임진다)
-  //   레이어 push 순서는 [프리즘 → 원추면 → 림]: 불투명 프리즘이 depth 를 먼저 기록해야 depth 미기록
-  //   반투명 원추면이 프리즘 뒤에서는 가려지고 앞에서는 위에 블렌드된다.
+  //   침범 건물의 지도 마킹은 없음 — 침범 현황은 좌측 드로어 리스트가 담당(2026-08-12 빨강 채색 기능 제거).
   const braDeckLayers = useMemo(() => {
     if (activeTool !== "bra") return [];
     const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
-    // 실측 3D 메시가 실제로 화면에 그려지는 조건 (Tile3DLayer visible 게이트와 동일 식)
-    const meshShown = meshActive && meshZoomOk;
-    // 그 좌표를 덮는 메시 콘텐츠 타일이 **실제로 로드돼 있는가** — 셸 모드 판정의 단일 원천.
-    // 타일 수는 뷰포트 선택분 수준(수십~수백)이라 건물당 선형 스캔으로 충분하다(early-return).
-    const meshCoveredAt = (lat: number, lon: number) => {
-      for (const [minLat, maxLat, minLon, maxLon] of loadedMeshTileBboxRef.current.values()) {
-        if (lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon) return true;
-      }
-      return false;
-    };
     const R_EARTH_M = 6_371_000;
     const M_PER_DEG_LAT = 111320; // 파일 내 기존 평면근사와 동일 계열
     const cosLat = Math.cos((radarSite.latitude * Math.PI) / 180);
@@ -3788,10 +3908,7 @@ export default function TrackMap() {
     const coneMsl = (dM: number, hAnt: number, tanT: number) =>
       hAnt + dM * tanT + (dM * dM) / (2 * R_EARTH_M);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const layers: any[] = [];
-
-    // ── ① 원추면 기하 (분석 실행 전에도 즉시 표시) — 레이어 push 는 프리즘 뒤에서 ──
+    // ── ① 원추면 기하 (분석 실행 전에도 즉시 표시) ──
     const apexM = radarSite.altitude + radarSite.antenna_height; // 안테나 정점 (AMSL m)
     const tanTheta = Math.tan((braAngleDeg * Math.PI) / 180);
     const AZ_SEG = 72;  // 방위 분할
@@ -3825,183 +3942,8 @@ export default function TrackMap() {
       }
     }
 
-    // ── ② 침범 건물: AMSL×EX 프레임 통짜 프리즘 (원추면 아래 회색 · 위 빨강) ──
-    //   · 메시가 그 자리에 실제로 그려지는 건물은 "빨강 셸 모드"로 분리한다. 같은 자리에 실측 메시와
-    //     불투명 프리즘이 겹치면 (a) 두 면이 사실상 동일 평면이라 z-fighting 패치워크가 생기고
-    //     (b) 프리즘이 메시를 덮어 "실측 우선 표시" 요구와 충돌한다. 셸 모드는 지오메트리를 통짜
-    //     프리즘 그대로 두되 셰이더가 원추 아래 픽셀을 discard 해(색·depth 모두 미기록) 하부는 실측
-    //     메시가 그대로 드러나고 원추 위 초과부만 빨강으로 남는다. 남는 셸도 메시와 동일면이 되지
-    //     않도록 수평 0.5m·수직 0.3m 팽창시킨다.
-    //   · 셸 기준은 DB measured 플래그가 아니라 **그 위치에 실제 로드·표출 중인 메시 타일 존재 여부**
-    //     (meshShown && meshCoveredAt) — ① 타일 미로드/언로드 구역에서 하부 discard 로 건물이
-    //     투명해지는 문제, ② 메시 커버리지 내 비실측 대장행 프리즘이 메시를 덮는 불일치를 동시에
-    //     해소한다. 타일이 늦게 로드되면 그 건물만 통짜→셸로 전환된다(버전 코얼레싱 200ms).
-    //     meshShown=false(줌<14 또는 메시 꺼짐)면 meshCoveredAt 을 보지 않고 전부 통짜 프리즘 — 불변.
-    // 빨강 관통 패스 — 결과 블록 안에서 만들고 원추면 push 뒤에 합류한다 (아래 계약 주석 참조)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let redTopLayer: any = null;
-    if (braResult && braResult.buildings.length > 0) {
-      // 면마다 원본 건물 참조(b)를 동반 — 픽 결과에서 곧바로 건물 속성을 꺼내 쓰기 위함.
-      // 색은 면에 싣지 않는다 — 상/하 분할은 BraPrismLayer 가 프래그먼트 단위로 수행한다.
-      type BraFace = { polygon: [number, number, number][]; b: BraBuilding };
-      const normalFaces: BraFace[] = [];   // 통짜 프리즘 (회색+빨강)
-      const measuredFaces: BraFace[] = []; // 빨강 셸 (원추 아래 discard)
-      const SHELL_H_M = 0.5; // 셸 수평 팽창 (m) — 메시 벽면과의 동일면 z-fighting 방지
-      const SHELL_V_M = 0.3; // 셸 수직 팽창 (m) — 메시 지붕(maxH)과의 동일면 z-fighting 방지
-      for (const b of braResult.buildings) {
-        const poly = b.polygon;
-        if (!poly || poly.length < 3) continue;
-        // 셸 조건 = b.measured(실측 블롭이 이 건물을 표현) ∧ meshShown ∧ meshCoveredAt(타일 로드됨).
-        // · b.measured 필수: hm NULL 활성 대장행은 "DSM 에 대응 블롭이 없음"의 신호다(있었다면
-        //   매칭돼 hm 이 붙거나 억제됐음 — 예: 소사 에스케이뷰는 2023 DSM 이전 신축이라 블롭 부재).
-        //   그런 건물을 셸로 만들면 하부 discard 후 드러날 메시가 없어 몸통이 통째로 사라진다.
-        //   수동(가상) 건물도 measured=false 라 같은 이유로 자동 제외된다.
-        // · meshCoveredAt 필수: measured 라도 타일 미로드 구역이면 셸 하부가 투명해진다.
-        const shell = b.measured && meshShown && meshCoveredAt(b.lat, b.lon);
-        // 바닥·지붕 모두 AMSL×EX — 원추면과 같은 프레임. terrainEnabled=false 면 EX=1 이라 AMSL 그대로라
-        // 평면 지도에선 건물이 지반고만큼 떠 보이지만, 원추면도 같은 AMSL 이라 정합을 우선한다.
-        const zBase = b.ground_elev_m * EX;
-        // 셸은 지붕을 +0.3m 띄운다 — 초과 건물의 지붕은 어차피 원추 위(빨강)라 시각적 차이가 없다.
-        const zRoof = (b.total_height_m + (shell ? SHELL_V_M : 0)) * EX;
-        const n = poly.length;
-        const lonlat: [number, number][] = new Array(n);
-        for (let i = 0; i < n; i++) {
-          const [la, lo] = poly[i];
-          if (shell) {
-            // centroid(b.lat/b.lon) 기준 바깥 방향으로 0.5m 이동. 오목 폴리곤에선 방향이 실제 외법선과
-            // 다소 어긋날 수 있지만 0.5m 스케일이라 무시 가능(면 자체는 그대로 닫힌 프리즘).
-            const dxM = (lo - b.lon) * mPerDegLon;
-            const dyM = (la - b.lat) * M_PER_DEG_LAT;
-            const len = Math.hypot(dxM, dyM);
-            if (len > 0) {
-              lonlat[i] = [
-                lo + ((dxM / len) * SHELL_H_M) / mPerDegLon,
-                la + ((dyM / len) * SHELL_H_M) / M_PER_DEG_LAT,
-              ];
-            } else {
-              lonlat[i] = [lo, la]; // centroid 와 겹친 정점 — 이동 방향 없음
-            }
-          } else {
-            lonlat[i] = [lo, la];
-          }
-        }
-        const faces = shell ? measuredFaces : normalFaces;
-        // 측벽 — 바닥→지붕 통짜 쿼드 (셰이더가 픽셀별로 회색/빨강 결정)
-        for (let i = 0; i < n; i++) {
-          const j = (i + 1) % n;
-          faces.push({
-            polygon: [
-              [lonlat[i][0], lonlat[i][1], zBase],
-              [lonlat[j][0], lonlat[j][1], zBase],
-              [lonlat[j][0], lonlat[j][1], zRoof],
-              [lonlat[i][0], lonlat[i][1], zRoof],
-            ],
-            b,
-          });
-        }
-        // 지붕 캡 — 원추면 위로 나온 부분만 셰이더가 빨강으로 칠한다(구 구현의 통째 빨강 과대 마킹 해소).
-        // 바닥 캡은 불필요 — 바닥은 항상 원추 아래(회색)이고 측벽이 하부를 감싸 아래에서 봐도 뚫려 보이지 않는다.
-        const cap: [number, number, number][] = new Array(n);
-        for (let i = 0; i < n; i++) cap[i] = [lonlat[i][0], lonlat[i][1], zRoof];
-        faces.push({ polygon: cap, b });
-      }
-
-      // 두 레이어가 공유하는 픽 핸들러 (내용은 종전과 동일)
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const onPrismClick = (info: any) => {
-        const b = info.object?.b as BraBuilding | undefined;
-        if (!b) return;
-        // MapboxOverlay(overlaid) 는 maplibre 의 click 을 deck 로 '전달'만 할 뿐 전파를 막지 않는다.
-        // 같은 클릭에서 maplibre 건물 핸들러도 돌고, BRA 줌아웃 상태엔 fill-extrusion 레이어가
-        // 아예 없어 setBldgDrawer(null) 로 끝난다 → 두 핸들러의 등록 순서에 따라 방금 연 드로어가
-        // 즉시 닫힐 수 있다. 다음 매크로태스크로 미뤄 항상 마지막 상태가 되게 한다(순서 무관 결정적).
-        setTimeout(() => {
-          openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.source, measured: b.measured });
-        }, 0);
-      };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const onPrismHover = (info: any) => {
-        const b = info.object?.b as BraBuilding | undefined;
-        // maplibre fill-extrusion 호버가 활성인 픽셀에서는 양보 — 같은 건물을 두 경로가 다른 수치로 번갈아 쓰는 값 플리커 방지
-        if (buildingHoverActiveRef.current) return;
-        if (b) {
-          setBldgHoverTip({ x: info.x, y: info.y, name: b.name ?? undefined, height: b.height_m, measured: b.measured, lat: b.lat, lon: b.lon, base: b.ground_elev_m });
-        } else {
-          setBldgHoverTip(null); // 프리즘 이탈 시 잔류 툴팁 제거 (maplibre 경로는 자기 활성 플래그가 없으면 정리 안 함)
-        }
-      };
-
-      // 원추면 재구성 파라미터 — ①의 원추면 메시와 **동일 값·동일 평면근사**라 렌더 원추와 픽셀 정합.
-      // 색 분할(회색/빨강)은 **렌더된 원추면과 동일한 라이브 파라미터**(apexM/tanTheta) — 경계가 항상
-      // 화면의 원추면과 픽셀 일치한다. 프리즘 **집합**(어떤 건물이 있는가)은 결과 스냅샷이며 파라미터
-      // 변경 시 400ms 디바운스 자동 재분석이 수렴시킨다. 종전 스냅샷 색분할(braResult.radar_height_m/
-      // angle_deg)은 각도 변경 직후 "원추면 위인데 회색" 어긋남 창을 만들었다(2026-08-12 수정).
-      const prismCommon = {
-        getPolygon: (d: BraFace) => d.polygon,
-        // 백색 = 셰이더의 조명 계수 캐리어 — FS 에서 실제 색(빨강/회색)을 여기에 곱한다
-        getFillColor: [255, 255, 255, 255] as [number, number, number, number],
-        radarLng: radarSite.longitude,
-        radarLat: radarSite.latitude,
-        mPerDegLat: M_PER_DEG_LAT,
-        mPerDegLon,
-        apexM,
-        tanTheta,
-        ex: EX,
-        filled: true,
-        extruded: false,
-        _full3d: true,
-        // material 기본값(true) 유지 — 단 solid-polygon VS 는 extruded 분기에서만 조명을 계산하므로
-        // 현 설정(extruded:false)에선 vColor 가 흰색 그대로 FS 에 도달, 곱셈 결과 = 정확한 빨강/회색.
-        pickable: true,
-        onClick: onPrismClick,
-        onHover: onPrismHover,
-        // depth 기록 유지(기본값) — 불투명 입체라 자기 가림·상호 가림이 맞아야 하고,
-        // 뒤에 그려지는 원추면이 프리즘에 가려지려면 프리즘의 depth 가 남아 있어야 한다.
-      };
-      if (normalFaces.length > 0) {
-        layers.push(
-          new BraPrismLayer<BraFace>({
-            id: "bra-penetration",
-            data: normalFaces,
-            ...prismCommon,
-          }),
-        );
-      }
-      if (measuredFaces.length > 0) {
-        layers.push(
-          new BraPrismLayer<BraFace>({
-            id: "bra-penetration-measured",
-            data: measuredFaces,
-            // 빨강 셸 — 원추 아래 프래그먼트는 discard 되어 하부의 실측 메시가 그대로 보인다
-            redOnly: true,
-            ...prismCommon,
-          }),
-        );
-      }
-      // ── 빨강 관통 패스 (원추면 **뒤에** push — 아래 ③ 끝에서 합류) ──
-      // 계약: **원추 초과부(빨강)는 원추면에 절대 가려지지 않는다.**
-      // 원추면 고도는 8km 지점에서 이미 ~80m AMSL 라, 건물을 확대해 보는 카메라는 흔히 원추면보다
-      // 낮다. 그 순간 카메라→빨강 시선이 불투명(기본 opacity 1) 원추면을 관통해 빨강이 통째로
-      // 가려졌다("칠해지지 않았다" 증상의 실체). 원추면은 depth 를 안 남기므로, 원추면 뒤에 초과부
-      // 전용 패스(redOnly=원추 아래 discard)를 한 번 더 그리면 depth 는 프리즘/메시와만 경합하고
-      // 원추면은 경합 상대가 아니게 되어 빨강이 항상 관통 표시된다. 동일 지오메트리 재드로우라
-      // 자기 자신과는 depth 동일(LEQUAL 통과·동색 덮어쓰기)이라 아티팩트가 없다.
-      redTopLayer = new BraPrismLayer<BraFace>({
-        id: "bra-penetration-red-top",
-        data: normalFaces.concat(measuredFaces),
-        ...prismCommon,
-        redOnly: true,
-        // 픽은 본 패스(bra-penetration/-measured)가 담당 — 이중 픽 방지
-        pickable: false,
-        onClick: undefined,
-        onHover: undefined,
-      });
-    }
-
-    // ── ③ 원추면·림 push — 프리즘(불투명, depth 기록) 뒤에 그려 앞면은 블렌드·뒷면은 가려지게 ──
-    //    push 순서 계약: [프리즘 → 원추면 → 림 → 빨강 관통 패스]. 마지막 빨강 패스가 원추면을
-    //    "관통"하는 유일한 색이다 — 회색부는 원추면에 정상 가림(카메라가 원추 아래일 때 의도된 은닉).
-    layers.push(
+    // ── ② 레이어 (그리기 순서: 원추면 → 림) ──
+    return [
       new SolidPolygonLayer<{ polygon: [number, number, number][] }>({
         id: "bra-cone",
         data: coneFaces,
@@ -4014,10 +3956,6 @@ export default function TrackMap() {
         pickable: false,
         // depth 미기록 — 반투명 면이 depth 를 남기면 뒤에 그려지는 항적/건물/Loss 마커가 가려진다
         parameters: { depthWriteEnabled: false },
-        // deck 기본 오프셋([0,-layerIndex*100])은 뒤에 그리는 이 원추면을 depth 동일평면 경합에서
-        // 항상 이기게 해 프리즘 빨강 하단 경계를 청록으로 침식했다. +100 으로 원추면을 한 레이어 스텝
-        // 뒤로 밀어 프리즘(기본 오프셋)이 항상 이긴다 — 시각 위치는 불변, 경계 픽셀 소유만 프리즘으로.
-        getPolygonOffset: () => [0, 100] as [number, number],
       }),
       new PathLayer<{ path: [number, number, number][] }>({
         id: "bra-cone-rim",
@@ -4028,15 +3966,8 @@ export default function TrackMap() {
         widthUnits: "pixels" as const,
         pickable: false,
       }),
-    );
-    // 빨강 관통 패스 — 원추면(무 depth 기록) 뒤라 원추면이 depth 경합 상대가 아니게 되어,
-    // 카메라가 원추면 아래로 내려가도 초과부 빨강은 항상 보인다 (위 결과 블록의 계약 주석 참조).
-    if (redTopLayer) layers.push(redTopLayer);
-
-    return layers;
-    // meshTilesVersion 은 값을 직접 쓰지 않고 loadedMeshTileBboxRef(ref) 변경을 알리는 세대 키로만
-    // 존재한다 — 이게 없으면 타일이 늦게 로드돼도 셸 판정이 재평가되지 않는다.
-  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled, openBldgDrawerFor, meshActive, meshZoomOk, meshTilesVersion]);
+    ];
+  }, [activeTool, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
@@ -4379,6 +4310,12 @@ export default function TrackMap() {
     // 실측 3D 타일 합성 (별도 useMemo)
     layers.push(...tiles3dDeckLayers);
 
+    // V-World 3D 건물 타일 합성 (별도 useMemo · 렌더 전용, pickable:false)
+    layers.push(...vworld3dDeckLayers);
+
+    // 실측 메시 선택 마커 — 메시(불투명) 다음에 그려 depth 로 지붕 위에 안착
+    layers.push(...selMarkerDeckLayers);
+
     // CoS 침묵원추 합성 (별도 useMemo) — depth 미기록 반투명이라 뒤에 그려지는 Loss/아이콘과 자연 블렌드
     layers.push(...cosDeckLayers);
 
@@ -4457,7 +4394,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, vworld3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -4936,7 +4873,7 @@ export default function TrackMap() {
                           onClick={() => openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.is_manual ? "manual" : undefined })}
                           onMouseEnter={(e) => {
                             e.currentTarget.style.background = "#f9fafb";
-                            setLosBuildingHighlight({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage });
+                            setLosBuildingHighlight({ lat: b.lat, lon: b.lon, height_m: b.height_m, name: b.name, address: b.address, usage: b.usage, ground_elev_m: b.ground_elev_m });
                           }}
                           onMouseLeave={(e) => {
                             e.currentTarget.style.background = "transparent";
@@ -4968,7 +4905,7 @@ export default function TrackMap() {
 
   /** BRA 침범 목록 검색 필터 — 이름·주소 부분일치(대소문자 무시, trim).
    *  침범이 1만 동을 넘으면 초과량 내림차순 300행 캡 밖으로 밀려 리스트에서 찾을 수 없는 건물이
-   *  생긴다(지도 프리즘은 전수 마킹). 여기서 먼저 걸러낸 뒤 캡을 적용해 탐색성을 보강한다.
+   *  생긴다. 여기서 먼저 걸러낸 뒤 캡을 적용해 탐색성을 보강한다.
    *  검색어가 비면 원본 배열을 그대로 돌려주므로 기존 동작(전수 → 상위 300) 그대로. */
   const braFilteredList = useMemo(() => {
     const all = braResult?.buildings ?? [];
@@ -5138,7 +5075,7 @@ export default function TrackMap() {
                     onClick={() => {
                       const map = mapRef.current?.getMap();
                       if (map) map.easeTo({ center: [b.lon, b.lat], zoom: Math.max(map.getZoom(), 15), duration: 600 });
-                      // 리스트 행 클릭도 지도 프리즘 클릭과 동일하게 우측 건축물정보 드로어 오픈
+                      // 리스트 행 클릭 시 우측 건축물정보 드로어 오픈
                       openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.source, measured: b.measured });
                     }}
                     onMouseEnter={(e) => (e.currentTarget.style.background = G[50])}
@@ -5162,9 +5099,9 @@ export default function TrackMap() {
                     <div style={{ padding: "6px 5px", fontSize: 9.5, color: G[400], textAlign: "center" }}>
                       …외 {(filtered.length - MAX_ROWS).toLocaleString()}동
                     </div>
-                    {/* 목록만 상한 — 지도 프리즘 마킹은 전수(Rust 결과 전체) */}
+                    {/* 목록만 상한 — Rust 결과(침범 전수)는 그대로 유지된다 */}
                     <div style={{ fontSize: 9, color: G[400], padding: "4px 5px" }}>
-                      {searching ? `일치 ${filtered.length.toLocaleString()}동 중 상위 ${MAX_ROWS}동 표시` : `상위 ${MAX_ROWS}동 표시`} — 지도 마킹은 전체 {list.length.toLocaleString()}동
+                      {searching ? `일치 ${filtered.length.toLocaleString()}동 중 상위 ${MAX_ROWS}동 표시` : `상위 ${MAX_ROWS}동 표시`}
                     </div>
                   </>
                 )}
@@ -5237,6 +5174,22 @@ export default function TrackMap() {
                   </div>
                   <span style={{ fontSize: 9, color: "#9ca3af", lineHeight: 1.35 }}>
                     설정 &gt; GIS 건물에서 buildings_3d.bin 임포트 시 활성화
+                  </span>
+                </div>
+              )}
+              {vworld3dReady ? (
+                srcRow("V-World 3D 건물", "다운로드 영역", showVworld3d, () => setShowVworld3d((v) => !v))
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", opacity: 0.55 }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 12, color: "#4b5563" }}>V-World 3D 건물</span>
+                      <span style={{ fontSize: 9, color: "#d1d5db" }}>다운로드 영역</span>
+                    </span>
+                    <DsToggle on={false} onClick={() => { /* 타일셋 미보유 */ }} size={0.9} disabled />
+                  </div>
+                  <span style={{ fontSize: 9, color: "#9ca3af", lineHeight: 1.35 }}>
+                    자료관리 &gt; V-World 3D 건물에서 다운로드 시 활성화
                   </span>
                 </div>
               )}

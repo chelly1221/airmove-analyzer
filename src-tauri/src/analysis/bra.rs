@@ -15,7 +15,7 @@
 //! **우선순위 중복 제거**: 상위 자료(수동등록 > 실측3D)에 덮인 후순위 fac 행은 저장 시점
 //! `suppressed_by` 플래그(등록/임포트 시 확정, suppression.rs)로 이미 걸러져 있으므로
 //! 후보 쿼리에서 `suppressed_by IS NULL` 로 단순 필터한다 — 조회 시점 겹침 계산 없음.
-//! 같은 자리의 중복 행이 프리즘으로 이중 렌더되는 것을 막는다. 수동 등록 건물은 억제 대상 아님.
+//! 같은 자리의 중복 행이 침범 목록에 이중 계상되는 것을 막는다. 수동 등록 건물은 억제 대상 아님.
 //!
 //! **대장↔대장 이중 임포트**는 위 억제 체계(수동/실측 우선순위 전용)로 걸러지지 않는다 —
 //! 광역본(F_FAC_BUILDING_경기)과 세분본(F_FAC_BUILDING_경기_부천시_소사구) SHP 가 같은 건물을
@@ -90,7 +90,10 @@ pub struct BraBuilding {
     pub cone_msl_m: f64,
     /// 초과량 (m) = total_height_m − cone_msl_m (> 0 이면 침범)
     pub exceed_m: f64,
-    /// 폴리곤 꼭짓점 [[lat, lon], ...] — 프론트 3D 오버레이 프리즘용
+    /// 폴리곤 꼭짓점 [[lat, lon], ...] — 내부 판정 전용(경계 최근접 judge·중복 접기 키).
+    /// 프리즘 오버레이 제거(2026-08-12)로 프론트 소비처가 사라져 응답에서 제외한다
+    /// (침범 건물 수천~수만 동 × 폴리곤 정점 = 응답 대부분을 차지하던 페이로드).
+    #[serde(skip_serializing)]
     pub polygon: Vec<[f64; 2]>,
 }
 
@@ -384,7 +387,7 @@ pub fn analyze_penetration(
                 mlat, mlon, geo_type.as_deref(), geo_json.as_deref(),
             );
             // 폴리곤 미형성(point/line 등)은 중심 주변 소형 정사각으로 대체 —
-            //   building.rs 의 binary 패킹 폴백(±0.000045° ≈ 5m)과 동일 규약이라 프론트 프리즘 렌더가 통일된다.
+            //   building.rs 의 binary 패킹 폴백(±0.000045° ≈ 5m)·suppression.rs FALLBACK_HALF_DEG 와 동일 규약.
             let polygon: Vec<[f64; 2]> = if pts.len() >= 3 {
                 pts.iter().map(|&(la, lo)| [la, lo]).collect()
             } else {
@@ -410,7 +413,8 @@ pub fn analyze_penetration(
     // 대장 이중 임포트(광역본↔세분본) 접기 — 정렬 전에 수행해야 total_penetrating 이 실체 수와 맞는다
     let folded_duplicates = fold_fac_duplicates(&mut hits);
 
-    // 초과량 내림차순 — 상한 없이 전수 반환 (지도 프리즘 마킹이 목록 상한에 잘리면 안 된다)
+    // 초과량 내림차순 — 상한 없이 전수 반환 (드로어 침범 리스트의 이름·주소 검색이 전수를 훑는다.
+    // 표시 행 수만 프론트가 캡하므로 여기서 자르면 캡 밖 건물을 영영 못 찾는다 — 상한 도입 금지)
     hits.sort_by(|a, b| b.exceed_m.partial_cmp(&a.exceed_m).unwrap_or(std::cmp::Ordering::Equal));
     let total_penetrating = hits.len() as u64;
 
@@ -556,7 +560,7 @@ fn fold_prefers(cand: &BraBuilding, kept: &BraBuilding) -> bool {
 /// 결과 수준 대장 중복 접기 — fac 소스끼리 완전 동일 실체를 1행으로 접는다. 반환: 접어낸 행 수.
 ///
 /// 저장 시점 `suppressed_by` 억제는 수동/실측3D 우선순위 전용이라 대장↔대장 이중 임포트는
-/// 통과한다(예: '소사 에스케이뷰' 14동 → 침범 28행). 목록 부풀림과 프리즘 이중 렌더를 막는다.
+/// 통과한다(예: '소사 에스케이뷰' 14동 → 침범 28행). 목록 부풀림·침범 동수 이중 계상을 막는다.
 /// 수동 등록(manual) 건물은 사용자가 같은 자리에 의도적으로 세울 수 있으므로 접지 않는다.
 fn fold_fac_duplicates(hits: &mut Vec<BraBuilding>) -> u64 {
     let mut kept: HashMap<FoldKey, usize> = HashMap::new();

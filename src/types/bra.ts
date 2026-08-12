@@ -30,8 +30,6 @@ export interface BraBuilding {
   cone_msl_m: number;
   /** 초과량 (m) = total_height_m − cone_msl_m */
   exceed_m: number;
-  /** 폴리곤 꼭짓점 [[lat, lon], ...] */
-  polygon: [number, number][];
 }
 
 /** BRA 침범 검사 결과 */
