@@ -830,6 +830,60 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       }
     }
 
+    // ── 표시 지형 = 프로파일 샘플 + 건물 기저 앵커(융합 지반 정합용) — 분석·emit 은 원본 profile ──
+    //   증상: SRTM-실측 지반고 융합(srtm_ground_corrections, 30m 노드 단위 절대 MSL 머지) 이후
+    //   건물 위치의 지형이 국소적으로 수 m 내려갔는데, 지형 곡선은 ~0.5km 간격 프로파일 샘플이라
+    //   그 고주파 디테일을 에일리어싱으로 건너뛴다. 반면 건물 기저는 백엔드가 centroid 정밀 융합값
+    //   (ground_elev_m)으로 주므로 곡선과 기저가 ±수 m 어긋나 건물이 떠 보이거나 파묻힌다.
+    //   → 건물 near/far 거리에 ground_elev_m 앵커점을 끼워 넣어 '표시 폴리라인'만 정합시킨다.
+    //   계약: displayTerrain 은 지형 라인·지형 음영(area fill) 렌더 전용. 최저탐지선·차단 판정·
+    //        피크 라벨·Y축 범위·커튼 emit·호버 수치 등 계산 경로는 전부 원본 profile(adjTerrain) 유지.
+    //   앵커 대상 = pathBuildings(실제로 실루엣이 그려지는 건물 전수 — effBuildings 파생이라 sim
+    //        덮어쓰기/가상 건물·수동 건물 사용자 입력 지반고가 그대로 포함된다). 화면에 없는 건물
+    //        때문에 지형선을 꺾지 않도록 '그려지는 집합'과 1:1 로 맞춘다.
+    const displayTerrain = (() => {
+      if (pathBuildings.length === 0) return adjTerrain;
+      const lastD = profile[profile.length - 1].distance;
+      const anchors: { distance: number; elevation: number }[] = [];
+      for (const b of pathBuildings) {
+        const g = b.ground_elev_m;
+        if (!Number.isFinite(g)) continue;
+        const nearD = b.near_dist_km ?? b.distance_km;
+        const farD = b.far_dist_km ?? b.distance_km;
+        // 도형 건물은 near/far 양 끝 2점, 점 건물(near==far 이거나 둘 중 하나가 null)은 centroid 1점
+        const hasExtent = b.near_dist_km != null && b.far_dist_km != null && farD - nearD > 1e-6;
+        const ds = hasExtent ? [nearD, farD] : [b.distance_km];
+        for (const d of ds) {
+          if (!Number.isFinite(d) || d < 0 || d > lastD) continue; // 차트 x 도메인 밖 제외
+          anchors.push({ distance: d, elevation: g });
+        }
+      }
+      if (anchors.length === 0) return adjTerrain;
+      anchors.sort((a, b) => a.distance - b.distance);
+      // 프로파일 샘플 + 앵커를 raw AMSL 상태로 병합한 뒤 adjTerrain 과 동일한 곡률 변환을 한 번만
+      //   적용한다(앵커 전용 변환 금지 — 표시 프레임이 바뀌어도 자동으로 같은 변환을 탄다).
+      const EPS = 1e-6; // km(≈1mm) — 같은 거리 중복점 데듀프 허용오차
+      const merged: { distance: number; elevation: number }[] = [];
+      const pushPt = (d: number, elev: number, isAnchor: boolean) => {
+        const last = merged[merged.length - 1];
+        if (last && d - last.distance < EPS) {
+          if (isAnchor) last.elevation = elev; // 같은 거리면 정밀 융합 지반(앵커) 우선
+          return;
+        }
+        merged.push({ distance: d, elevation: elev });
+      };
+      let ai = 0;
+      for (const p of profile) {
+        while (ai < anchors.length && anchors[ai].distance <= p.distance + EPS) {
+          pushPt(anchors[ai].distance, anchors[ai].elevation, true);
+          ai++;
+        }
+        pushPt(p.distance, p.elevation, false);
+      }
+      for (; ai < anchors.length; ai++) pushPt(anchors[ai].distance, anchors[ai].elevation, true);
+      return merged.map((p) => ({ distance: p.distance, height: p.elevation - curvDrop(p.distance) }));
+    })();
+
     // ── 주소검색 건물 LoS 허용높이 시뮬레이션 ──
     //   차트 장애물은 위 effBuildings(사용자 지정값 반영)를 사용. 허용 상한 산출만 '자기 자신(15m 이내) 제외'한
     //   별도 장애물 경로(simObstacles)로 계산해 "그 건물이 없을 때의 최저탐지선(4/3)"을 구한다(자기참조 오염 방지).
@@ -877,6 +931,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     return {
       adjTerrain,
+      displayTerrain, // 표시 전용(지형 라인·음영) — 계산 경로는 adjTerrain 사용
       minDetStraight,
       minDetFresnel,
       braLine,
@@ -1468,7 +1523,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
   const renderChart = () => {
     if (!chartData || !visibleYRange) return null;
     const {
-      adjTerrain, minDetStraight, minDetFresnel, braLine, cosLine,
+      displayTerrain, minDetStraight, minDetFresnel, braLine, cosLine,
       maxBlockPoint, maxDistance, blockingPeaks,
     } = chartData;
     // 차단 봉우리는 아래에서 빨강으로 그리므로, 같은 idx 의 namedPeaks(주황) 렌더는 생략 — 이중 라벨 방지
@@ -1483,14 +1538,14 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     chartScaleRef.current = { zoomStart, zoomEnd, zoomRange, minY, maxY };
     if (!showCustomAngle) angleHandlePosRef.current = null;
 
-    // 지형 채우기
+    // 지형 채우기 (displayTerrain = 프로파일 샘플 + 건물 기저 앵커 — 표시 전용)
     const terrainFill =
       `M ${xScale(0)} ${yScale(minY)} ` +
-      adjTerrain.map((p) => `L ${xScale(p.distance)} ${yScale(p.height)}`).join(" ") +
+      displayTerrain.map((p) => `L ${xScale(p.distance)} ${yScale(p.height)}`).join(" ") +
       ` L ${xScale(maxDistance)} ${yScale(minY)} Z`;
 
-    // 지형 윤곽선
-    const terrainLine = adjTerrain
+    // 지형 윤곽선 (동일 displayTerrain — 채우기와 윤곽이 어긋나지 않도록)
+    const terrainLine = displayTerrain
       .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
       .join(" ");
 

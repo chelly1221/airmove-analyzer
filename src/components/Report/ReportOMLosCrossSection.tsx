@@ -350,6 +350,57 @@ export function LosCrossSection({
     // 분석 대상 건물을 마지막에 그려 다른 건물·지형 위로(높은 z-index) 올린다. (Array.sort 는 안정 정렬)
     significantBuildings.sort((a, b) => Number(a.isTarget) - Number(b.isTarget));
 
+    // ── 표시 지형 = 프로파일 샘플 + 건물 기저 앵커(융합 지반 정합용) — 분석·판정은 원본 baseTerrain ──
+    //   TrackMap LoSProfilePanel 과 동일 패턴(동일 증상 예방). SRTM-실측 지반고 융합 이후 건물 위치
+    //   지형이 국소적으로 수 m 내려가는데, 지형 곡선은 코리도 ~60m 격자 샘플이라 30m 노드 단위
+    //   디테일과 어긋날 수 있다. 건물 기저(ground_elev_m)는 centroid 정밀 융합값이라 그 차이만큼
+    //   실루엣이 지형선에서 떠 보이거나 파묻힌다 → 건물 near/far 거리에 기저 앵커점을 끼워 넣는다.
+    //   계약: displayTerrain 은 지형 fill·윤곽선 렌더 전용. 최저탐지선(computeMinDet)·차단 배지
+    //        (computeLosBlockage/losBlocked)·chord43H·shadowObs·Y축 범위는 전부 baseTerrain/adjTerrain
+    //        원본 유지 — 차트·배지 판정식 불변.
+    //   앵커 대상 = significantBuildings(실제로 실루엣이 그려지는 집합, 수동건물 사용자 입력 지반고 포함).
+    const displayTerrain = (() => {
+      if (significantBuildings.length === 0 || baseTerrain.length === 0) return adjTerrain;
+      const lastD = baseTerrain[baseTerrain.length - 1].distance;
+      const anchors: { distance: number; elevation: number }[] = [];
+      for (const b of significantBuildings) {
+        const g = b.ground_elev_m;
+        if (!Number.isFinite(g)) continue;
+        const nearD = b.near_dist_km ?? b.distance_km;
+        const farD = b.far_dist_km ?? b.distance_km;
+        // 도형 건물은 near/far 양 끝 2점, 점 건물은 centroid 1점 (실루엣 렌더의 hasExtent 규약과 동일)
+        const hasExtent = b.near_dist_km != null && b.far_dist_km != null && farD - nearD > 1e-6;
+        const ds = hasExtent ? [nearD, farD] : [b.distance_km];
+        for (const d of ds) {
+          if (!Number.isFinite(d) || d < 0 || d > lastD) continue; // 차트 x 도메인 밖 제외
+          anchors.push({ distance: d, elevation: g });
+        }
+      }
+      if (anchors.length === 0) return adjTerrain;
+      anchors.sort((a, b) => a.distance - b.distance);
+      // raw AMSL 로 병합 후 adjTerrain 과 동일한 4/3 곡률 처짐(curvDrop43)을 한 번만 적용 — 앵커 전용 변환 금지
+      const EPS = 1e-6; // km(≈1mm) — 같은 거리 중복점 데듀프 허용오차
+      const merged: { distance: number; elevation: number }[] = [];
+      const pushPt = (d: number, elev: number, isAnchor: boolean) => {
+        const last = merged[merged.length - 1];
+        if (last && d - last.distance < EPS) {
+          if (isAnchor) last.elevation = elev; // 같은 거리면 정밀 융합 지반(앵커) 우선
+          return;
+        }
+        merged.push({ distance: d, elevation: elev });
+      };
+      let ai = 0;
+      for (const p of baseTerrain) {
+        while (ai < anchors.length && anchors[ai].distance <= p.distance + EPS) {
+          pushPt(anchors[ai].distance, anchors[ai].elevation, true);
+          ai++;
+        }
+        pushPt(p.distance, p.elevation, false);
+      }
+      for (; ai < anchors.length; ai++) pushPt(anchors[ai].distance, anchors[ai].elevation, true);
+      return merged.map((p) => ({ distance: p.distance, height: p.elevation - curvDrop43(p.distance) }));
+    })();
+
     // Y축 범위 — 뷰는 0~FULL_X_KM(60NM 고정)만 보이므로 그 구간 데이터로만 산출.
     //   (60NM 밖 곡률 처짐/상승 LoS 가 Y축을 망가뜨리지 않도록 FULL_X_KM 이내로 제한.)
     const allHeights = [radarHeight];
@@ -367,7 +418,9 @@ export function LosCrossSection({
     }
 
     return {
-      adjTerrain, minDetStraight, minDetWithout,
+      adjTerrain,
+      displayTerrain, // 표시 전용(지형 fill·윤곽선) — 계산·판정 경로는 adjTerrain/baseTerrain 사용
+      minDetStraight, minDetWithout,
       maxBlockPoint, significantBuildings,
       minY, maxY, maxDistance: FULL_X_KM,
       targetElev, radarHeight,
@@ -689,7 +742,7 @@ export function LosCrossSection({
   if (!chartData) return null;
 
   const {
-    adjTerrain, minDetStraight, minDetWithout,
+    displayTerrain, minDetStraight, minDetWithout,
     significantBuildings, maxDistance, radarHeight,
   } = chartData;
   // X 줌 윈도우에 맞춰 자동조정된 세로 범위 (전체 줌이면 chartData 전체범위와 동일)
@@ -702,13 +755,13 @@ export function LosCrossSection({
   const xScale = (d: number) => PAD.left + ((d - zoomStartKm) / zoomRangeKm) * cw;
   const yScale = (h: number) => PAD.top + ch - ((h - minY) / (maxY - minY)) * ch;
 
-  // 지형 채우기 (마지막 profile 포인트까지)
-  const lastTerrainD = adjTerrain[adjTerrain.length - 1]?.distance ?? maxDistance;
+  // 지형 채우기 (마지막 profile 포인트까지) — displayTerrain = 프로파일 샘플 + 건물 기저 앵커(표시 전용)
+  const lastTerrainD = displayTerrain[displayTerrain.length - 1]?.distance ?? maxDistance;
   const terrainFill =
     `M ${xScale(0)} ${yScale(minY)} ` +
-    adjTerrain.map((p) => `L ${xScale(p.distance)} ${yScale(p.height)}`).join(" ") +
+    displayTerrain.map((p) => `L ${xScale(p.distance)} ${yScale(p.height)}`).join(" ") +
     ` L ${xScale(lastTerrainD)} ${yScale(minY)} Z`;
-  const terrainLine = adjTerrain
+  const terrainLine = displayTerrain
     .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.distance)} ${yScale(p.height)}`)
     .join(" ");
 
