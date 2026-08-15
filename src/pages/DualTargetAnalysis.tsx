@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
-import { ScatterplotLayer, LineLayer, PathLayer, TextLayer } from "@deck.gl/layers";
+import { ScatterplotLayer, LineLayer, PathLayer, PolygonLayer, TextLayer } from "@deck.gl/layers";
 import { TripsLayer } from "@deck.gl/geo-layers";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
+import { fetchBuildingsForViewport } from "../utils/buildingTileCache";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -21,8 +22,11 @@ import {
 import type {
   Aircraft,
   AddressBuildingHit,
+  Building3D,
   DualTargetEvent,
+  FacBuildingDetail,
   Flight,
+  RadarSite,
   ReflectorCluster,
   TrackPoint,
 } from "../types";
@@ -41,6 +45,11 @@ import type {
  *
  * 결과 스냅샷은 store(dualTargetResult)에 두어 페이지 이탈 후 복귀 시에도 유지한다.
  * 파싱/분석 진행·선택 상태는 페이지 로컬.
+ *
+ * **분석 레이더(analysisRadarName)** — 파싱은 레이더 좌표를 원점으로 I040 극좌표(거리·방위)를
+ * WGS84 로 변환하므로 레이더 선택 = 파싱 앵커 선택이다. 레이더가 달라지면 모든 포인트 좌표가
+ * 달라지므로 변경 시 재파싱이 필수(확인 모달 → runParse 재실행). 전역 radarSite 는 초기값일 뿐,
+ * 이 페이지의 파싱·태깅·통합은 전부 선택된 analysisSite 를 쓴다.
  */
 
 const ACCENT = "#a60739";
@@ -50,6 +59,67 @@ const ERROR = "#e94560";
 const GROUP_ROW_CAP = 200;
 /** 건물명 라벨링 대상 클러스터 수 (count 상위) */
 const LABEL_MAX = 20;
+
+// ── 2D 건물 표출 ────────────────────────────────────────────────────
+/** 건물 표출 최소 줌 — 미만이면 뷰포트 조회 자체를 생략(광역에서 수만 동 로드 방지) */
+const BUILDING_MIN_ZOOM = 13;
+/** 지도 이동 후 건물 재조회 디바운스 (ms) */
+const BUILDING_FETCH_DEBOUNCE_MS = 250;
+
+// ── 반사체 줌 적응 클러스터링 ────────────────────────────────────────
+/** 화면 픽셀 기준 병합 셀 크기 — 이 격자 안의 반사 위치는 한 마커로 합쳐 표시 */
+const CLUSTER_CELL_PX = 56;
+
+/** "#rrggbb" → [r,g,b] (파싱 불가 시 null) */
+function hexToRgb(hex?: string): [number, number, number] | null {
+  if (!hex) return null;
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+/** 건물 폴리곤 표출 단위 — 커밋마다 1회 변환(원본 polygon 은 [lat,lon] 순서) */
+interface DualBuildingPoly {
+  b: Building3D;
+  /** deck.gl 용 [lon,lat] 링 */
+  path: [number, number][];
+  fill: [number, number, number, number];
+}
+
+/** 줌 적응 병합 반사체 마커 — members 1개면 개별 클러스터와 동일 */
+interface ZoomCluster {
+  key: string;
+  latitude: number;
+  longitude: number;
+  /** 병합된 이벤트 건수 합 */
+  count: number;
+  members: ReflectorCluster[];
+}
+
+/** 건축물정보 드로어 상태 — 클릭 건물의 로컬 기하 + 대장(로컬 FAC + 온라인 VWorld) 조회 결과 */
+interface BldgDrawerState {
+  lat: number;
+  lon: number;
+  /** 온라인 VWorld 조회 진행 중 */
+  loading: boolean;
+  info: {
+    name: string; dong_name: string; road_addr: string; jibun_addr: string;
+    usage: string; structure: string; floors_above: string; floors_below: string;
+    height: string; area: string; total_area: string; site_area: string;
+    floor_area_ratio: string; building_coverage: string; approval_date: string;
+  } | null;
+  /** 로컬 FAC 대장 상세 (undefined=조회 전, null=없음) */
+  facDetail?: FacBuildingDetail | null;
+  localName?: string;
+  localHeight?: number;
+  localUsage?: string;
+  /** 지반 표고(AMSL, m) + 출처(fac/manual) — 클릭 시점 로컬 값 */
+  localBase?: number;
+  localSource?: string;
+  /** 실측(1m DSM) 자료 보유 건물 */
+  localMeasured?: boolean;
+}
 
 // ── 전파 반사 애니메이션 타임라인 (초) ──────────────────────────────
 //   0–2 실표적(항공기) → 반사체 · 2–4 반사체 → 레이더 · 4–6 유령표적 위치 펄스
@@ -189,6 +259,12 @@ export default function DualTargetAnalysis() {
   const seqRef = useRef(0);
   /** 지도 로드 전에 확정된 fitBounds 예약 (파싱 직후 분석 완료 대비) */
   const pendingFitRef = useRef<[[number, number], [number, number]] | null>(null);
+  /** 직전 파싱 입력 — 분석 레이더 변경 시 같은 파일·필터로 재파싱하기 위해 보관 */
+  const lastPathsRef = useRef<string[]>([]);
+  const lastFilterRef = useRef<ParseFilterResult | null>(null);
+  /** 건물 뷰포트 조회 시퀀스 — 늦게 도착한 progressive 커밋 폐기 */
+  const buildingSeqRef = useRef(0);
+  const buildingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [fileCount, setFileCount] = useState(0);
@@ -206,9 +282,31 @@ export default function DualTargetAnalysis() {
   const [selectedClusterId, setSelectedClusterId] = useState<number | null>(null);
   /** 지도 표출을 특정 기체(Mode-S)로 한정 — 좌측 그룹 목록은 계속 전 기체를 보여준다 */
   const [selectedModeS, setSelectedModeS] = useState<string | null>(null);
-  /** 지도 표출을 특정 레이더로 한정 (지도 레이더 마커 클릭 토글) */
-  const [selectedRadarName, setSelectedRadarName] = useState<string | null>(null);
   const [expandedModeS, setExpandedModeS] = useState<Set<string>>(new Set());
+
+  // ── 지도 부수 상태 (건물 표출 / 줌 적응 클러스터링) ────────────────
+  /** MapGL onLoad 완료 — 지도 이벤트 구독 게이트 */
+  const [mapReady, setMapReady] = useState(false);
+  /** 0.25 단위로 반올림한 줌 — 반사체 병합 격자 계산 입력(과도 리렌더 방지) */
+  const [mapZoom, setMapZoom] = useState(9);
+  /** 뷰포트 건물 (줌 ≥ BUILDING_MIN_ZOOM 에서만 채워짐) */
+  const [viewBuildings, setViewBuildings] = useState<Building3D[]>([]);
+  /** 건축물정보 드로어 — 건물 폴리곤 클릭으로만 열린다 */
+  const [bldgDrawer, setBldgDrawer] = useState<BldgDrawerState | null>(null);
+  /** 닫힘 애니메이션 중 내용 유지용 마지막 드로어 값 */
+  const lastBldgRef = useRef<BldgDrawerState | null>(null);
+  if (bldgDrawer) lastBldgRef.current = bldgDrawer;
+
+  /**
+   * 분석 기준 레이더 이름 — 파싱(극좌표→WGS84)의 원점.
+   * 페이지 재진입으로 결과만 복원된 경우 셀렉터가 결과와 어긋나지 않도록
+   * 기존 결과의 레이더를 초기값으로 채운다(없으면 전역 선택 레이더).
+   */
+  const [analysisRadarName, setAnalysisRadarName] = useState<string>(
+    () => dualResult?.events[0]?.radar_name ?? dualResult?.clusters[0]?.radar_name ?? radarSite.name,
+  );
+  /** 레이더 변경 확인 모달 대상 이름 — null 이면 닫힘 */
+  const [radarConfirm, setRadarConfirm] = useState<string | null>(null);
 
   // 파일 선택 → 필터 모달
   const [filterModalOpen, setFilterModalOpen] = useState(false);
@@ -232,6 +330,18 @@ export default function DualTargetAnalysis() {
     return out;
   }, [radarSite, customRadarSites]);
 
+  /**
+   * 분석 기준 레이더의 **원본** 사이트 객체 — 파싱 원점·비행 통합 인자로 그대로 쓴다.
+   * startConsolidate 는 RadarSite 전체(고도·안테나고·range_nm)를 요구하므로 좌표만 담은
+   * dualSites 항목이 아니라 store 원본을 찾아야 한다. 미등록 이름이면 전역 선택 레이더로 폴백.
+   */
+  const analysisSite = useMemo<RadarSite>(() => {
+    for (const s of [radarSite, ...customRadarSites]) {
+      if (s?.name === analysisRadarName) return s;
+    }
+    return radarSite;
+  }, [radarSite, customRadarSites, analysisRadarName]);
+
   /** 지도 범위 맞춤 — 지도가 아직 로드 전이면 예약 후 onLoad 에서 적용 */
   const fitBounds = useCallback((bounds: [[number, number], [number, number]]) => {
     const map = mapRef.current?.getMap();
@@ -245,6 +355,134 @@ export default function DualTargetAnalysis() {
       pendingFitRef.current = bounds;
     }
   }, []);
+
+  // ── 2D 건물 표출 ──────────────────────────────────────────────────
+  /**
+   * 뷰포트 건물 조회 — TrackMap 과 동일한 모듈 글로벌 타일 캐시를 공유한다(포맷 동일).
+   * 이 페이지는 캐시를 **무효화하지 않는다**(메인 창 오프스크린 TrackMap 의 로드를 헛돌게 함).
+   * 늦게 도착한 progressive 커밋은 seq 로 폐기.
+   */
+  const loadBuildings = useCallback(async () => {
+    const map = mapRef.current?.getMap();
+    if (!map) return;
+    const zoom = map.getZoom();
+    const seq = ++buildingSeqRef.current;
+
+    // 광역 줌에서는 표출하지 않는다 — 조회 생략 + 기존 표출 해제
+    if (zoom < BUILDING_MIN_ZOOM) {
+      setViewBuildings((prev) => (prev.length === 0 ? prev : []));
+      return;
+    }
+
+    const bounds = map.getBounds();
+    const center = map.getCenter();
+    try {
+      const res = await fetchBuildingsForViewport(
+        {
+          south: bounds.getSouth(),
+          north: bounds.getNorth(),
+          west: bounds.getWest(),
+          east: bounds.getEast(),
+          zoom,
+        },
+        [], // 출처 제외 없음 — 출처 토글은 TrackMap 창 로컬 기능
+        (list) => {
+          if (seq !== buildingSeqRef.current) return; // 늦은 커밋 폐기
+          setViewBuildings(list);
+        },
+        { lat: center.lat, lon: center.lng },
+      );
+      // 전 타일 캐시 히트면 onProgress 가 호출되지 않으므로 최종 결과로 한 번 더 커밋
+      if (seq === buildingSeqRef.current) setViewBuildings(res.buildings);
+    } catch (err) {
+      console.warn("[DualTarget] 건물 타일 로드 실패:", err);
+    }
+  }, []);
+
+  // 지도 이벤트 구독 — 건물 재조회(디바운스) + 줌 추적(0.25 단위 변화만 반영)
+  useEffect(() => {
+    if (!mapReady) return;
+    const map = mapRef.current?.getMap();
+    if (!map) return;
+
+    const scheduleBuildings = () => {
+      if (buildingTimerRef.current) clearTimeout(buildingTimerRef.current);
+      buildingTimerRef.current = setTimeout(() => {
+        buildingTimerRef.current = null;
+        void loadBuildings();
+      }, BUILDING_FETCH_DEBOUNCE_MS);
+    };
+    const trackZoom = () => {
+      const z = Math.round(map.getZoom() * 4) / 4;
+      setMapZoom((prev) => (prev === z ? prev : z));
+    };
+
+    map.on("moveend", scheduleBuildings);
+    map.on("zoom", trackZoom);
+    trackZoom();
+    void loadBuildings(); // 최초 1회
+
+    return () => {
+      map.off("moveend", scheduleBuildings);
+      map.off("zoom", trackZoom);
+      if (buildingTimerRef.current) {
+        clearTimeout(buildingTimerRef.current);
+        buildingTimerRef.current = null;
+      }
+    };
+  }, [mapReady, loadBuildings]);
+
+  /** 건물 폴리곤 표출 데이터 — 커밋마다 1회만 [lat,lon]→[lon,lat] 변환 + 색상 확정 */
+  const buildingPolys = useMemo<DualBuildingPoly[]>(() => {
+    const out: DualBuildingPoly[] = [];
+    for (const b of viewBuildings) {
+      const poly = b.polygon;
+      if (!poly || poly.length < 3) continue;
+      const path: [number, number][] = new Array(poly.length);
+      for (let i = 0; i < poly.length; i++) path[i] = [poly[i][1], poly[i][0]];
+      const rgb = hexToRgb(b.group_color);
+      out.push({
+        b,
+        path,
+        fill: rgb ? [rgb[0], rgb[1], rgb[2], 90] : [148, 163, 184, 70],
+      });
+    }
+    return out;
+  }, [viewBuildings]);
+
+  /** 건물 클릭 → 우측 건축물정보 드로어 (로컬 값 시드 후 대장 조회 effect 가 채운다) */
+  const openBuildingDrawer = useCallback((b: Building3D) => {
+    setBldgDrawer({
+      lat: b.lat,
+      lon: b.lon,
+      loading: true,
+      info: null,
+      localName: b.name ?? undefined,
+      localHeight: b.height_m,
+      localUsage: b.usage ?? undefined,
+      localBase: b.ground_elev_m,
+      localSource: b.source,
+      localMeasured: !!b.measured,
+    });
+  }, []);
+
+  // 드로어 좌표 설정 시 건물정보 조회 — 로컬 FAC 대장(오프라인) + 온라인 VWorld 병렬
+  useEffect(() => {
+    if (!bldgDrawer) return;
+    const lat = bldgDrawer.lat, lon = bldgDrawer.lon;
+    let cancelled = false;
+    if (bldgDrawer.facDetail === undefined) {
+      invoke<FacBuildingDetail | null>("get_fac_building_detail", { lat, lon })
+        .then((res) => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, facDetail: res ?? null } : null); })
+        .catch(() => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, facDetail: null } : null); });
+    }
+    if (bldgDrawer.loading) {
+      invoke<BldgDrawerState["info"]>("get_vworld_building_info", { lat, lon })
+        .then((res) => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, loading: false, info: res ?? null } : null); })
+        .catch(() => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, loading: false, info: null } : null); });
+    }
+    return () => { cancelled = true; };
+  }, [bldgDrawer?.lat, bldgDrawer?.lon]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 분석 실행 ─────────────────────────────────────────────────────
   //   Worker 소유 포인트로 계산(메인 스레드 축적 없음). 결과 수신 후 상위 클러스터에 한해
@@ -260,7 +498,6 @@ export default function DualTargetAnalysis() {
       setSelectedEventId(null);
       setSelectedClusterId(null);
       setSelectedModeS(null);
-      setSelectedRadarName(null);
 
       // 기본 접힘 + 최다 이벤트 그룹 1개만 펼침 (그룹 정렬 기준과 동일: 건수 desc → Mode-S asc)
       const counts = new Map<string, number>();
@@ -334,9 +571,12 @@ export default function DualTargetAnalysis() {
   }, [busy]);
 
   // ── 파싱 → Worker 적재 → 비행 통합 → 자동 분석 ────────────────────
-  const parseWithFilter = useCallback(async (filter: ParseFilterResult) => {
-    setFilterModalOpen(false);
-    const paths = pendingPaths;
+  /**
+   * 단일 파싱 경로 — 파일 목록·필터·**기준 레이더**를 모두 인자로 받는다.
+   * site 는 극좌표 변환 원점(radarLat/radarLon)이자 포인트 radar_name 태그이자
+   * 비행 통합 사이트다. 전역 radarSite 를 직접 참조하지 않는다(레이더 변경 재파싱 지원).
+   */
+  const runParse = useCallback(async (paths: string[], filter: ParseFilterResult, site: RadarSite) => {
     if (paths.length === 0) return;
 
     const seq = ++seqRef.current;
@@ -345,18 +585,20 @@ export default function DualTargetAnalysis() {
     setSelectedEventId(null);
     setSelectedClusterId(null);
     setSelectedModeS(null);
-    setSelectedRadarName(null);
     setExpandedModeS(new Set());
     setSearch("");
+    setBldgDrawer(null); // 새 파싱 시작 = 건축물정보 드로어 닫기
     flightsRef.current = [];
     setFlightCount(0);
     setFileCount(paths.length);
     setPhase("parsing");
 
+    // 레이더 변경 재파싱용 입력 보관 (동일 파일·필터 재실행)
+    lastPathsRef.current = paths;
+    lastFilterRef.current = filter;
+
     // 재업로드 = 대체 시맨틱 — Worker 축적분(포인트·비행 인덱스·유령 보존분) 전량 폐기
     clearWorkerPoints();
-
-    const site = useAppStore.getState().radarSite;
 
     // 항적 포인트 / 파서 보존 유령표적 — 둘 다 radar_name 태깅 후 Worker 로 즉시 전송
     const unlistenPoints = await listen<{ points: TrackPoint[] }>("parse-points-chunk", (event) => {
@@ -416,32 +658,85 @@ export default function DualTargetAnalysis() {
     setFlightCount(flightsRef.current.length);
 
     await runAnalysis();
-  }, [pendingPaths, setDualResult, runAnalysis]);
+  }, [setDualResult, runAnalysis]);
+
+  /** 필터 모달 확인 → 현재 선택된 분석 레이더 기준으로 파싱 */
+  const parseWithFilter = useCallback((filter: ParseFilterResult) => {
+    setFilterModalOpen(false);
+    void runParse(pendingPaths, filter, analysisSite);
+  }, [pendingPaths, analysisSite, runParse]);
 
   const closeFilterModal = useCallback(() => {
     setFilterModalOpen(false);
     setPendingPaths([]);
   }, []);
 
+  // ── 분석 레이더 변경 ──────────────────────────────────────────────
+  /** 지도를 해당 레이더 위치로 이동 (줌은 유지하되 최소 9) */
+  const easeToSite = useCallback((name: string) => {
+    const s = dualSites.find((x) => x.name === name);
+    const map = mapRef.current?.getMap();
+    if (!s || !map) return;
+    map.easeTo({ center: [s.longitude, s.latitude], zoom: Math.max(map.getZoom(), 9), duration: 600 });
+  }, [dualSites]);
+
+  /**
+   * 분석 레이더 선택 — 드롭다운·지도 마커 클릭 공용 경로.
+   * 이미 파싱된 자료가 있으면 좌표 재변환(재파싱)이 필요하므로 확인 모달을 띄우고,
+   * 확정 전까지 셀렉터 값(analysisRadarName)은 바꾸지 않는다(controlled select → 자동 복귀).
+   */
+  const handleRadarChange = useCallback((name: string) => {
+    if (busy) return;
+    if (name === analysisRadarName) {
+      easeToSite(name); // 같은 레이더 재선택 = 위치 확인만
+      return;
+    }
+    // 파싱된 자료가 없으면 다시 만들 것도 없다 — 즉시 전환
+    if (!dualResult && flightsRef.current.length === 0) {
+      setAnalysisRadarName(name);
+      easeToSite(name);
+      return;
+    }
+    setRadarConfirm(name);
+  }, [busy, analysisRadarName, dualResult, easeToSite]);
+
+  /** 확인 모달 확정 — 직전 파일 정보가 있으면 새 레이더 기준으로 재파싱, 없으면 레이더만 전환 */
+  const confirmRadarChange = useCallback(() => {
+    const name = radarConfirm;
+    if (!name) return;
+    setRadarConfirm(null);
+    setAnalysisRadarName(name);
+
+    let site: RadarSite = radarSite;
+    for (const s of [radarSite, ...customRadarSites]) {
+      if (s?.name === name) { site = s; break; }
+    }
+
+    const paths = lastPathsRef.current;
+    const filter = lastFilterRef.current;
+    if (paths.length > 0 && filter) {
+      void runParse(paths, filter, site);
+      return;
+    }
+    // 재파싱할 파일 정보가 없는 경우(결과만 복원된 재진입) — 다음 파싱부터 적용
+    easeToSite(name);
+  }, [radarConfirm, radarSite, customRadarSites, runParse, easeToSite]);
+
   // ── 파생 데이터 ───────────────────────────────────────────────────
 
-  // 필터 3종은 순차 교집합. 목록(groups)은 Mode-S 필터 **이전** 단계(listEvents)를 쓰므로
+  // 필터 2종은 순차 교집합. 목록(groups)은 Mode-S 필터 **이전** 단계(listEvents)를 쓰므로
   // 한 기체를 선택해도 다른 기체 그룹이 목록에 남아 곧바로 바꿔 선택할 수 있다.
+  // (한 파싱 세션의 포인트는 전부 단일 레이더로 태깅되므로 레이더 표출 필터는 두지 않는다 —
+  //  레이더 선택은 "표출 한정"이 아니라 파싱 앵커 선택이다.)
 
-  /** 레이더 선택 필터 (지도 레이더 마커 클릭) */
-  const radarEvents = useMemo(() => {
-    const all = dualResult?.events ?? [];
-    if (selectedRadarName == null) return all;
-    return all.filter((e) => e.radar_name === selectedRadarName);
-  }, [dualResult, selectedRadarName]);
-
-  /** 좌측 그룹 목록 모집단 — 레이더 + 반사 위치 필터 적용 */
+  /** 좌측 그룹 목록 모집단 — 반사 위치 필터 적용 */
   const listEvents = useMemo(() => {
-    if (selectedClusterId == null) return radarEvents;
-    return radarEvents.filter((e) => e.cluster_id === selectedClusterId);
-  }, [radarEvents, selectedClusterId]);
+    const all = dualResult?.events ?? [];
+    if (selectedClusterId == null) return all;
+    return all.filter((e) => e.cluster_id === selectedClusterId);
+  }, [dualResult, selectedClusterId]);
 
-  /** 지도 표출 이벤트 — 반사 위치 ∩ Mode-S ∩ 레이더 */
+  /** 지도 표출 이벤트 — 반사 위치 ∩ Mode-S */
   const baseEvents = useMemo(() => {
     if (selectedModeS == null) return listEvents;
     return listEvents.filter((e) => e.mode_s === selectedModeS);
@@ -455,23 +750,126 @@ export default function DualTargetAnalysis() {
    */
   const displayClusters = useMemo<ReflectorCluster[]>(() => {
     const all = dualResult?.clusters ?? [];
-    const byRadar = selectedRadarName == null ? all : all.filter((c) => c.radar_name === selectedRadarName);
-    if (selectedModeS == null) return [...byRadar].sort((a, b) => b.count - a.count);
+    if (selectedModeS == null) return [...all].sort((a, b) => b.count - a.count);
 
     const counts = new Map<number, number>();
-    for (const e of radarEvents) {
+    for (const e of dualResult?.events ?? []) {
       if (e.mode_s !== selectedModeS || e.cluster_id == null) continue;
       counts.set(e.cluster_id, (counts.get(e.cluster_id) ?? 0) + 1);
     }
     const out: ReflectorCluster[] = [];
-    for (const c of byRadar) {
+    for (const c of all) {
       const n = counts.get(c.id);
       if (n == null) continue;
       out.push({ ...c, count: n });
     }
     out.sort((a, b) => b.count - a.count);
     return out;
-  }, [dualResult, radarEvents, selectedModeS, selectedRadarName]);
+  }, [dualResult, selectedModeS]);
+
+  /**
+   * 지도 표출용 줌 적응 병합 반사체 — Web Mercator 픽셀 좌표를 CLUSTER_CELL_PX 격자로 비닝.
+   * 줌아웃에서 겹쳐 뭉개지던 마커가 하나로 합쳐지고, 줌인하면 자연히 풀린다.
+   * 좌측 "예상 반사 위치" 리스트는 병합 없이 displayClusters 를 그대로 쓴다.
+   */
+  const zoomClusters = useMemo<ZoomCluster[]>(() => {
+    const scale = 512 * Math.pow(2, mapZoom);
+    // 비닝 중 latitude/longitude 필드는 **가중합 누산기**로 쓰고 마지막에 wSum 으로 나눠 centroid 확정
+    const bins = new Map<string, ZoomCluster & { wSum: number }>();
+    for (const c of displayClusters) {
+      // 위도는 메르카토르 발산 방지를 위해 ±85° 로 클램프 (국내 자료라 실질 무영향)
+      const lat = Math.min(85, Math.max(-85, c.latitude));
+      const x = ((c.longitude + 180) / 360) * scale;
+      const phi = (lat * Math.PI) / 180;
+      const y = ((1 - Math.log(Math.tan(Math.PI / 4 + phi / 2)) / Math.PI) / 2) * scale;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      const key = `${Math.floor(x / CLUSTER_CELL_PX)}_${Math.floor(y / CLUSTER_CELL_PX)}`;
+      const w = c.count > 0 ? c.count : 1; // centroid 가중치(건수)
+      const bin = bins.get(key);
+      if (bin) {
+        bin.latitude += c.latitude * w;
+        bin.longitude += c.longitude * w;
+        bin.count += c.count;
+        bin.wSum += w;
+        bin.members.push(c);
+      } else {
+        bins.set(key, {
+          key,
+          latitude: c.latitude * w,
+          longitude: c.longitude * w,
+          count: c.count,
+          members: [c],
+          wSum: w,
+        });
+      }
+    }
+    const out: ZoomCluster[] = [];
+    for (const b of bins.values()) {
+      out.push({
+        key: b.key,
+        latitude: b.latitude / b.wSum,
+        longitude: b.longitude / b.wSum,
+        count: b.count,
+        members: b.members,
+      });
+    }
+    out.sort((a, b) => b.count - a.count);
+    return out;
+  }, [displayClusters, mapZoom]);
+
+  /**
+   * 반사 위치 선택 — 지도 마커·좌측 리스트 공용.
+   * Mode-S 한정을 함께 해제한다: 반사체를 고르면 그 반사체에 속한 **모든 기체**의 이벤트가
+   * 나와야 하므로, Mode-S 필터와 교집합이 되어 목록이 비는 것을 막는다.
+   */
+  const selectCluster = useCallback((id: number) => {
+    setSelectedEventId(null);
+    setSelectedModeS(null);
+    setSelectedClusterId((prev) => (prev === id ? null : id));
+  }, []);
+
+  /** 병합 마커(2개 이상) 클릭 — 소속 반사 위치 bbox 로 줌인해 자연히 풀리게 한다 */
+  const zoomIntoCluster = useCallback((zc: ZoomCluster) => {
+    const map = mapRef.current?.getMap();
+    if (!map) return;
+    let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+    for (const m of zc.members) {
+      if (m.latitude < minLat) minLat = m.latitude;
+      if (m.latitude > maxLat) maxLat = m.latitude;
+      if (m.longitude < minLon) minLon = m.longitude;
+      if (m.longitude > maxLon) maxLon = m.longitude;
+    }
+    // 완전 동일 좌표(퇴화 bbox) 대비 최소 폭 부여
+    const eps = 1e-4;
+    if (maxLat - minLat < eps) { minLat -= eps; maxLat += eps; }
+    if (maxLon - minLon < eps) { minLon -= eps; maxLon += eps; }
+    try {
+      map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 80, duration: 600, maxZoom: 16 });
+    } catch {
+      // 지도 미준비 등 — 무시(다음 클릭에서 재시도)
+    }
+  }, []);
+
+  /**
+   * 실표적·유령표적 클릭 공용 — 그 항공기(Mode-S) 전체로 지도·목록을 한정한다.
+   * 같은 이벤트 재클릭은 이벤트 선택만 해제(Mode-S 한정은 유지).
+   * 사용자가 보고 있는 화면을 유지해야 하므로 지도 이동(fitBounds/easeTo)은 하지 않는다.
+   */
+  const selectEventFromMap = useCallback((ev: DualTargetEvent) => {
+    if (selectedEventId === ev.id) {
+      setSelectedEventId(null);
+      return;
+    }
+    setSelectedClusterId(null);
+    setSelectedModeS(ev.mode_s);
+    setSelectedEventId(ev.id);
+    setExpandedModeS((prev) => (prev.has(ev.mode_s) ? prev : new Set(prev).add(ev.mode_s)));
+    // 좌측 목록에서 해당 그룹이 보이도록 스크롤 (렌더 반영 후 1프레임 뒤)
+    const modeS = ev.mode_s;
+    requestAnimationFrame(() => {
+      document.getElementById(`dual-group-${modeS}`)?.scrollIntoView({ block: "nearest" });
+    });
+  }, [selectedEventId]);
 
   /** Mode-S 단위 이벤트 그룹 — 건수 내림차순(동수 시 Mode-S 오름차순) */
   const groups = useMemo<ModeSGroup[]>(() => {
@@ -517,15 +915,6 @@ export default function DualTargetAnalysis() {
     return groups.filter((g) => g.modeS.toLowerCase().includes(q) || g.label.toLowerCase().includes(q));
   }, [groups, search]);
 
-  /** 결과에 등장하는 레이더 사이트만 지도에 표기 */
-  const siteMarkers = useMemo(() => {
-    if (!dualResult) return [];
-    const names = new Set<string>();
-    for (const e of dualResult.events) names.add(e.radar_name);
-    for (const c of dualResult.clusters) names.add(c.radar_name);
-    return dualSites.filter((s) => names.has(s.name));
-  }, [dualResult, dualSites]);
-
   const toggleGroup = useCallback((modeS: string) => {
     setExpandedModeS((prev) => {
       const next = new Set(prev);
@@ -563,12 +952,6 @@ export default function DualTargetAnalysis() {
     if (minLat <= maxLat && minLon <= maxLon) fitBounds([[minLon, minLat], [maxLon, maxLat]]);
   }, [selectedModeS, dualSites, fitBounds]);
 
-  /** 레이더 마커 클릭 토글 — 선택 레이더로 지도 표출을 한정 */
-  const toggleRadar = useCallback((name: string) => {
-    setSelectedEventId(null);
-    setSelectedRadarName((prev) => (prev === name ? null : name));
-  }, []);
-
   /**
    * 전파 반사 애니메이션 입력 — 선택 이벤트에 반사점·레이더 좌표가 모두 있을 때만 생성.
    * 데이터 배열을 여기서 만들어 참조를 고정한다(프레임마다 새 배열이면 deck.gl 이 매번 재업로드).
@@ -599,15 +982,42 @@ export default function DualTargetAnalysis() {
   // ── deck.gl 레이어 ────────────────────────────────────────────────
   //   전부 2D 지면 표현(고도 z 미사용). 반사 기하는 수평면 문제라 3D 고도 축을 쓰면
   //   실표적/유령표적 짝이 서로 다른 높이로 떠서 짝 관계가 읽히지 않는다.
-  //   그리기 순서(뒤 → 앞): 사이트 → 짝선 → 실표적 → 유령표적 → 반사 위치 → 개수 → 선택 강조.
+  //   그리기 순서(뒤 → 앞): 건물 → 사이트 → 짝선 → 실표적 → 유령표적 → 반사 위치 → 개수 → 선택 강조.
+  //   (deck.gl 픽은 나중에 그린 레이어가 이기므로 건물이 표적·반사체 클릭을 가리지 않는다)
   const deckLayers = useMemo<DeckLayerList>(() => {
-    if (!dualResult) return [];
     /** 클러스터 원 반경(px) — count 로 완만히 증가, 26px 상한 */
     const clusterRadius = (count: number) => Math.min(26, 7 + Math.sqrt(count) * 3);
-    const layers: DeckLayerList = [
+
+    const layers: DeckLayerList = [];
+
+    // ── 2D 건물 (최하단) ──
+    //   레이어 배열 맨 앞에 두어 표적·반사체 픽이 항상 건물보다 우선되게 한다.
+    if (buildingPolys.length > 0) {
+      layers.push(
+        new PolygonLayer<DualBuildingPoly>({
+          id: "dual-buildings",
+          data: buildingPolys,
+          getPolygon: (d) => d.path,
+          extruded: false,
+          filled: true,
+          stroked: true,
+          getFillColor: (d) => d.fill,
+          getLineColor: [100, 116, 139, 130],
+          lineWidthMinPixels: 0.5,
+          pickable: true,
+          onClick: (info: { object?: DualBuildingPoly }) => {
+            if (info.object) openBuildingDrawer(info.object.b);
+          },
+        })
+      );
+    }
+
+    // 사이트 마커·라벨은 결과 유무와 무관하게 상시 표시 — 파싱 전에도 지도에서
+    // 분석 기준 레이더를 고를 수 있어야 한다(마커 클릭 = 드롭다운과 동일 경로).
+    layers.push(
       new ScatterplotLayer<{ name: string; latitude: number; longitude: number }>({
         id: "dual-sites",
-        data: siteMarkers,
+        data: dualSites,
         getPosition: (d) => [d.longitude, d.latitude],
         getFillColor: [55, 65, 81, 235],
         getLineColor: [255, 255, 255, 255],
@@ -619,12 +1029,12 @@ export default function DualTargetAnalysis() {
         onClick: (info: { object?: { name: string } }) => {
           const d = info.object;
           if (!d) return;
-          toggleRadar(d.name);
+          handleRadarChange(d.name);
         },
       }),
       new TextLayer<{ name: string; latitude: number; longitude: number }>({
         id: "dual-site-labels",
-        data: siteMarkers,
+        data: dualSites,
         getPosition: (d) => [d.longitude, d.latitude],
         getText: (d) => d.name,
         getColor: [55, 65, 81, 255],
@@ -639,6 +1049,9 @@ export default function DualTargetAnalysis() {
         billboard: true,
         pickable: false,
       }),
+    );
+
+    if (dualResult) layers.push(
       new LineLayer<DualTargetEvent>({
         id: "dual-pair-lines",
         data: baseEvents,
@@ -658,7 +1071,10 @@ export default function DualTargetAnalysis() {
         getRadius: 60,
         radiusMinPixels: 3,
         radiusMaxPixels: 6,
-        pickable: false,
+        pickable: true,
+        onClick: (info: { object?: DualTargetEvent }) => {
+          if (info.object) selectEventFromMap(info.object);
+        },
       }),
       new ScatterplotLayer<DualTargetEvent>({
         id: "dual-ghost-pts",
@@ -670,36 +1086,37 @@ export default function DualTargetAnalysis() {
         radiusMaxPixels: 8,
         pickable: true,
         onClick: (info: { object?: DualTargetEvent }) => {
-          const d = info.object;
-          if (!d) return;
-          setSelectedClusterId(null);
-          setSelectedEventId((prev) => (prev === d.id ? null : d.id));
-          // 선택된 이벤트 행이 목록에서 보이도록 소속 Mode-S 그룹을 펼친다
-          setExpandedModeS((prev) => new Set(prev).add(d.mode_s));
+          if (info.object) selectEventFromMap(info.object);
         },
       }),
-      new ScatterplotLayer<ReflectorCluster>({
+      new ScatterplotLayer<ZoomCluster>({
         id: "dual-reflectors",
-        data: displayClusters,
+        data: zoomClusters,
         getPosition: (d) => [d.longitude, d.latitude],
         getFillColor: [166, 7, 57, 235],
         getLineColor: [255, 255, 255, 255],
         stroked: true,
         filled: true,
+        // 병합 마커(2개 이상)는 흰 테두리를 두껍게 — 개별 반사 위치와 시각 구분
+        lineWidthUnits: "pixels" as const,
+        getLineWidth: (d) => (d.members.length > 1 ? 2 : 1.5),
         lineWidthMinPixels: 1.5,
         radiusUnits: "pixels" as const,
         getRadius: (d) => clusterRadius(d.count),
         pickable: true,
-        onClick: (info: { object?: ReflectorCluster }) => {
+        onClick: (info: { object?: ZoomCluster }) => {
           const d = info.object;
           if (!d) return;
-          setSelectedEventId(null);
-          setSelectedClusterId((prev) => (prev === d.id ? null : d.id));
+          if (d.members.length > 1) {
+            zoomIntoCluster(d); // 줌인 → 병합 해제
+            return;
+          }
+          selectCluster(d.members[0].id);
         },
       }),
-      new TextLayer<ReflectorCluster>({
+      new TextLayer<ZoomCluster>({
         id: "dual-reflector-count",
-        data: displayClusters,
+        data: zoomClusters,
         getPosition: (d) => [d.longitude, d.latitude],
         getText: (d) => String(d.count),
         getColor: [255, 255, 255, 255],
@@ -711,28 +1128,26 @@ export default function DualTargetAnalysis() {
         billboard: true,
         pickable: false,
       }),
-    ];
+    );
 
-    // ── 선택 레이더 강조 링 ──
-    if (selectedRadarName != null) {
-      const s = siteMarkers.find((m) => m.name === selectedRadarName);
-      if (s) {
-        layers.push(
-          new ScatterplotLayer<{ name: string; latitude: number; longitude: number }>({
-            id: "dual-selected-site-ring",
-            data: [s],
-            getPosition: (d) => [d.longitude, d.latitude],
-            stroked: true,
-            filled: false,
-            radiusUnits: "pixels" as const,
-            getRadius: 12,
-            radiusMinPixels: 12,
-            getLineColor: [166, 7, 57, 255],
-            lineWidthMinPixels: 2,
-            pickable: false,
-          })
-        );
-      }
+    // ── 분석 기준 레이더 강조 링 (결과 없어도 상시) ──
+    const anchorSite = dualSites.find((m) => m.name === analysisRadarName);
+    if (anchorSite) {
+      layers.push(
+        new ScatterplotLayer<{ name: string; latitude: number; longitude: number }>({
+          id: "dual-selected-site-ring",
+          data: [anchorSite],
+          getPosition: (d) => [d.longitude, d.latitude],
+          stroked: true,
+          filled: false,
+          radiusUnits: "pixels" as const,
+          getRadius: 12,
+          radiusMinPixels: 12,
+          getLineColor: [166, 7, 57, 255],
+          lineWidthMinPixels: 2,
+          pickable: false,
+        })
+      );
     }
 
     // ── Mode-S 선택(이벤트 미선택) 시 반사 기하 분포: 실표적 → 반사점 정적 기하선 ──
@@ -758,7 +1173,7 @@ export default function DualTargetAnalysis() {
 
     // ── 선택 이벤트 강조: 반사 경로(레이더→반사면→실표적) + 유령 방위선 + 실/유령 링 ──
     if (selectedEventId != null) {
-      const ev = dualResult.events.find((e) => e.id === selectedEventId);
+      const ev = dualResult?.events.find((e) => e.id === selectedEventId);
       const site = ev ? dualSites.find((s) => s.name === ev.radar_name) : undefined;
       if (ev && site) {
         if (ev.reflector) {
@@ -816,14 +1231,15 @@ export default function DualTargetAnalysis() {
       }
     }
 
-    // ── 선택 클러스터 강조: 반사 위치 링 (소속 이벤트 필터는 baseEvents 에서 적용) ──
+    // ── 선택 클러스터 강조: 반사 위치 링 ──
+    //   병합 마커에 묻힌 경우에도 보이도록, 선택 클러스터를 품은 **병합 마커** 위치·반경 기준.
     if (selectedClusterId != null) {
-      const cl = displayClusters.find((c) => c.id === selectedClusterId);
-      if (cl) {
+      const zc = zoomClusters.find((z) => z.members.some((m) => m.id === selectedClusterId));
+      if (zc) {
         layers.push(
-          new ScatterplotLayer<ReflectorCluster>({
+          new ScatterplotLayer<ZoomCluster>({
             id: "dual-selected-cluster-ring",
-            data: [cl],
+            data: [zc],
             getPosition: (d) => [d.longitude, d.latitude],
             stroked: true,
             filled: false,
@@ -840,8 +1256,9 @@ export default function DualTargetAnalysis() {
     return layers;
     // animTime 은 의도적으로 의존성에서 제외 — 애니메이션은 DualDeckLayers 가 따로 합성한다
   }, [
-    dualResult, baseEvents, displayClusters, siteMarkers, dualSites,
-    selectedEventId, selectedClusterId, selectedModeS, selectedRadarName, toggleRadar,
+    dualResult, baseEvents, zoomClusters, dualSites, buildingPolys,
+    selectedEventId, selectedClusterId, selectedModeS, analysisRadarName,
+    handleRadarChange, openBuildingDrawer, selectEventFromMap, selectCluster, zoomIntoCluster,
   ]);
 
   // ── 렌더 ──────────────────────────────────────────────────────────
@@ -883,6 +1300,24 @@ export default function DualTargetAnalysis() {
 
       {/* ── 파라미터 ── */}
       <div className="flex shrink-0 flex-wrap items-center gap-4 rounded-lg border border-gray-200 bg-[#f8f9fa] px-3 py-2">
+        <label className="flex items-center gap-2">
+          <span className="text-[11px] font-medium text-gray-600">분석 레이더</span>
+          <select
+            value={analysisRadarName}
+            onChange={(e) => handleRadarChange(e.target.value)}
+            disabled={busy}
+            title="극좌표(거리·방위)를 WGS84 로 변환할 기준 레이더 — 변경하면 재파싱이 필요합니다"
+            className="h-6 max-w-[160px] rounded-md border border-gray-200 bg-white px-1.5 text-[11px] font-medium text-gray-700 focus:border-[#a60739] focus:outline-none disabled:opacity-50"
+          >
+            {/* 등록 목록에서 사라진 레이더로 분석된 결과가 복원된 경우에도 값이 비지 않도록 */}
+            {!dualSites.some((s) => s.name === analysisRadarName) && (
+              <option value={analysisRadarName}>{analysisRadarName}</option>
+            )}
+            {dualSites.map((s) => (
+              <option key={s.name} value={s.name}>{s.name}</option>
+            ))}
+          </select>
+        </label>
         <label className="flex items-center gap-2">
           <span className="text-[11px] font-medium text-gray-600">동일스캔 윈도우</span>
           <input
@@ -970,7 +1405,7 @@ export default function DualTargetAnalysis() {
                 </div>
               </div>
 
-              {/* 예상 반사 위치 — Mode-S·레이더 선택 시 그 선택이 참조하는 클러스터만 (건수도 재계산) */}
+              {/* 예상 반사 위치 — Mode-S 선택 시 그 기체가 참조하는 클러스터만 (건수도 재계산) */}
               {dualResult.clusters.length > 0 && (
                 <div className="shrink-0 border-b border-gray-200 p-3">
                   <div className="mb-1.5 flex items-center gap-2">
@@ -998,8 +1433,8 @@ export default function DualTargetAnalysis() {
                           onClick={() => {
                             const map = mapRef.current?.getMap();
                             if (map) map.easeTo({ center: [c.longitude, c.latitude], zoom: 14, duration: 600 });
-                            setSelectedEventId(null);
-                            setSelectedClusterId(sel ? null : c.id);
+                            // Mode-S 한정도 함께 해제 — 이 반사체에 속한 모든 기체의 항목을 보여준다
+                            selectCluster(c.id);
                           }}
                           className={`cursor-pointer rounded px-1.5 py-1 transition-colors ${sel ? "bg-[#a60739]/8" : "hover:bg-gray-50"}`}
                         >
@@ -1027,15 +1462,6 @@ export default function DualTargetAnalysis() {
                     Events · Mode-S별 이벤트
                   </span>
                   <div className="ml-auto flex min-w-0 items-center gap-2">
-                    {selectedRadarName != null && (
-                      <button
-                        onClick={() => toggleRadar(selectedRadarName)}
-                        title="레이더 선택을 해제합니다"
-                        className="min-w-0 shrink truncate text-[10px] text-[#a60739] hover:underline"
-                      >
-                        레이더 필터 해제 ({selectedRadarName})
-                      </button>
-                    )}
                     {selectedModeS != null && (
                       <button
                         onClick={() => setSelectedModeS(null)}
@@ -1093,6 +1519,7 @@ export default function DualTargetAnalysis() {
                       return (
                         <div
                           key={g.modeS}
+                          id={`dual-group-${g.modeS}`}
                           className={`mb-1 rounded-md border ${picked ? "border-l-[3px] border-[#a60739] bg-[#a60739]/[0.03]" : "border-gray-200"}`}
                         >
                           {/* 그룹 헤더 — 클릭 = 지도 표출 한정(선택), 셰브런 = 접기/펼치기 */}
@@ -1209,18 +1636,19 @@ export default function DualTargetAnalysis() {
           )}
         </div>
 
-        {/* 우측 지도 */}
-        <div className="min-w-0 flex-1 overflow-hidden rounded-lg border border-gray-200">
+        {/* 우측 지도 — 건축물정보 드로어를 내부에 도킹하므로 relative */}
+        <div className="relative min-w-0 flex-1 overflow-hidden rounded-lg border border-gray-200">
           <MapGL
             ref={mapRef}
             initialViewState={{
-              latitude: radarSite.latitude,
-              longitude: radarSite.longitude,
+              latitude: analysisSite.latitude,
+              longitude: analysisSite.longitude,
               zoom: 9,
             }}
             style={{ width: "100%", height: "100%" }}
             mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
             onLoad={() => {
+              setMapReady(true); // 지도 이벤트(건물 재조회·줌 추적) 구독 게이트
               // 지도 로드 전에 확정된 범위 예약분 적용
               const b = pendingFitRef.current;
               if (!b) return;
@@ -1231,11 +1659,159 @@ export default function DualTargetAnalysis() {
             <NavigationControl position="top-right" />
             <DualDeckLayers staticLayers={deckLayers} anim={reflectionAnim} />
           </MapGL>
+
+          {/* ── 우측 건축물정보 드로어 (건물 폴리곤 클릭) ── */}
+          <div
+            className="absolute bottom-0 right-0 top-0 z-[760] flex flex-col bg-white"
+            style={{
+              width: 300,
+              borderLeft: "1px solid #e5e7eb",
+              boxShadow: bldgDrawer ? "-6px 0 28px rgba(0,0,0,.14)" : "none",
+              transform: bldgDrawer ? "translateX(0)" : "translateX(316px)",
+              transition: "transform .4s cubic-bezier(.4,0,.2,1), box-shadow .3s",
+              pointerEvents: bldgDrawer ? "auto" : "none",
+            }}
+          >
+            {(() => {
+              // 닫힘 애니메이션 중에도 마지막 내용 유지
+              const bd = bldgDrawer ?? lastBldgRef.current;
+              if (!bd) return null;
+              const bi = bd.info;
+              const fac = bd.facDetail;
+              const pick = (...vals: (string | null | undefined)[]): string => {
+                for (const v of vals) if (v != null && v !== "") return v;
+                return "-";
+              };
+              // 과거 DB 의 '실측(1m DSM)' 표기는 용도로 취급하지 않음
+              const realUsage = (v?: string | null) => (v === "실측(1m DSM)" ? null : v);
+              const displayName = pick(fac?.name, bi?.name, bd.localName);
+              // 거리·방위는 **분석 기준 레이더(analysisSite)** 기준 — 전역 선택 레이더가 아니다
+              const cosLat = Math.cos((analysisSite.latitude * Math.PI) / 180);
+              const dLat = bd.lat - analysisSite.latitude;
+              const dLon = bd.lon - analysisSite.longitude;
+              const az = ((Math.atan2(dLon * cosLat, dLat) * 180) / Math.PI + 360) % 360;
+              const distKm = Math.sqrt((dLat * 111.32) ** 2 + (dLon * 111.32 * cosLat) ** 2);
+              // 실측 지붕고(1m DSM)가 있으면 최우선 — 옥상표고도 동일 값 사용
+              const heightMeasured = fac?.height_measured_m ?? null;
+              const height = heightMeasured ?? bd.localHeight ?? fac?.height_m;
+              const base = bd.localBase ?? fac?.ground_elev_m;
+              const src = bd.localSource ?? (fac ? "fac" : undefined);
+              const srcLabel = src === "fac" ? "건물통합정보" : src === "manual" ? "수동 등록" : "-";
+              const row = (k: string, v: ReactNode, k2?: string, v2?: ReactNode) => (
+                <tr className="border-b border-gray-100">
+                  <td className="w-[62px] bg-gray-50 px-2 py-1.5 text-gray-500">{k}</td>
+                  <td className="px-2 py-1.5 text-gray-700" colSpan={k2 != null ? 1 : 3}>{v}</td>
+                  {k2 != null && <td className="w-[62px] bg-gray-50 px-2 py-1.5 text-gray-500">{k2}</td>}
+                  {k2 != null && <td className="px-2 py-1.5 text-gray-700">{v2}</td>}
+                </tr>
+              );
+              const secLabel = "px-3 pt-2.5 pb-0.5 text-[9px] font-semibold uppercase tracking-wider text-gray-400";
+              return (
+                <>
+                  {/* 헤더 */}
+                  <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
+                    <span className="text-[12px] font-bold text-gray-800">건축물정보</span>
+                    <button
+                      onClick={() => setBldgDrawer(null)}
+                      title="닫기"
+                      className="rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                  {/* 본문 — 기하 정보(항상) + 대장 정보(로컬 FAC + 온라인 VWorld) */}
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    {/* 건물명/주소 배너 */}
+                    {(displayName !== "-" || bi?.road_addr || bi?.jibun_addr) && (
+                      <div className="mx-3 mb-2 mt-3 space-y-1 rounded border border-gray-200 bg-gray-50 px-2.5 py-2">
+                        {displayName !== "-" && <div className="text-[12px] font-semibold text-gray-800">{displayName}</div>}
+                        {bi?.road_addr && (
+                          <div className="flex items-start gap-1.5 text-[10.5px]">
+                            <span className="shrink-0 rounded-sm bg-[#a60739] px-1.5 py-[1px] text-[9px] font-semibold text-white">도로명</span>
+                            <span className="leading-[14px] text-gray-700">{bi.road_addr}</span>
+                          </div>
+                        )}
+                        {bi?.jibun_addr && (
+                          <div className="flex items-start gap-1.5 text-[10.5px]">
+                            <span className="shrink-0 rounded-sm bg-gray-500 px-1.5 py-[1px] text-[9px] font-semibold text-white">지번</span>
+                            <span className="leading-[14px] text-gray-700">{bi.jibun_addr}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {/* 기하 정보 (분석 레이더 기준 — 항상 표시) */}
+                    <div className={secLabel + " pt-1"}>기하 정보</div>
+                    <table className="w-full border-t border-gray-200 text-[10.5px]">
+                      <tbody>
+                        {row("출처", srcLabel, heightMeasured != null ? "건물높이(실측)" : "건물높이", height != null ? `${height.toFixed(1)} m` : "-")}
+                        {(heightMeasured != null || bd.localMeasured) && row("실측자료", "실측 3D (1m DSM)")}
+                        {row("지반표고", base != null ? `${base.toFixed(1)} m` : "-", "옥상표고", (base != null && height != null) ? `${(base + height).toFixed(1)} m` : "-")}
+                        {row("레이더거리", `${(distKm / 1.852).toFixed(1)} NM`, "레이더방위", `${az.toFixed(1)}°`)}
+                      </tbody>
+                    </table>
+                    <div className="px-3 pb-1 pt-0.5 text-[9px] text-gray-400">기준 레이더 · {analysisSite.name}</div>
+                    {/* 대장 정보 (로컬 건물통합정보 + 온라인 VWorld) */}
+                    <div className={secLabel + " flex items-center gap-1.5"}>
+                      대장 정보
+                      {bd.loading && <Loader2 size={9} className="animate-spin text-gray-300" />}
+                    </div>
+                    <table className="w-full border-t border-gray-200 text-[10.5px]">
+                      <tbody>
+                        {row("건물명칭", pick(fac?.name, bi?.name))}
+                        {row("동명칭", pick(fac?.dong_name, bi?.dong_name), "용도", pick(realUsage(fac?.usage), bi?.usage, realUsage(bd.localUsage)))}
+                        {row("구조", pick(bi?.structure))}
+                        {row("지상층수", bi?.floors_above ? `${bi.floors_above} 층` : "-", "지하층수", bi?.floors_below ? `${bi.floors_below} 층` : "-")}
+                        {row("건물면적", bi?.area ? `${bi.area} ㎡` : "-", "연면적", bi?.total_area ? `${bi.total_area} ㎡` : "-")}
+                        {row("PNU", pick(fac?.pnu))}
+                        {row("관리번호", pick(fac?.bd_mgt_sn))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
         </div>
       </div>
 
       {/* 파싱 필터 모달 */}
       <ParseFilterModal open={filterModalOpen} onClose={closeFilterModal} onConfirm={parseWithFilter} aircraft={aircraft} />
+
+      {/* 분석 레이더 변경 확인 — 좌표 재변환이 필요하므로 재파싱 여부를 확인받는다 */}
+      {radarConfirm && (
+        <Modal open={true} onClose={() => setRadarConfirm(null)} title="분석 레이더 변경" width="max-w-md">
+          <div className="space-y-4 text-sm text-gray-700">
+            <p className="leading-relaxed">
+              ASS 자료는 레이더 기준 극좌표(거리·방위)로 기록되어 있어, 기준 레이더가 바뀌면
+              모든 표적 좌표를 <span className="font-semibold text-[#a60739]">다시 변환(재파싱)</span>해야 합니다.
+            </p>
+            {lastPathsRef.current.length > 0 && lastFilterRef.current ? (
+              <p className="rounded-lg border border-gray-200 bg-[#f8f9fa] px-3 py-2 text-[12.5px] leading-relaxed">
+                현재 불러온 ASS 파일 <span className="font-mono font-bold tabular-nums">{lastPathsRef.current.length.toLocaleString()}</span>개를{" "}
+                <span className="font-semibold text-[#a60739]">{radarConfirm}</span> 기준으로 다시 파싱합니다.
+              </p>
+            ) : (
+              <p className="rounded-lg border border-gray-200 bg-[#f8f9fa] px-3 py-2 text-[12.5px] leading-relaxed">
+                다시 파싱할 파일 정보가 없습니다 — 레이더만 변경하고 새 ASS 파일을 선택하세요.
+              </p>
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setRadarConfirm(null)}
+                className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-50"
+              >
+                취소
+              </button>
+              <button
+                onClick={confirmRadarChange}
+                className="rounded-lg bg-[#a60739] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#8a062f]"
+              >
+                {lastPathsRef.current.length > 0 && lastFilterRef.current ? "재파싱 실행" : "레이더만 변경"}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       {/* 파싱 결과 안내 */}
       {notice && (
