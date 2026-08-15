@@ -124,8 +124,9 @@ const TrackHeatIcon = ({ size = 16 }: { size?: number }) => (
 // 대신 OM 보고서 §1 전체표적 히트맵(ReportOMTargetHeatmapMap)과 동일 레시피 —
 // 고정 메르카토르 그리드 비닝 → box blur(r=2 ×2패스) → ln(1+v) 정규화 → LUT → 오프스크린 캔버스 —
 // 로 비트맵을 굽고 BitmapLayer 로 지도 좌표에 고정한다. 보고서 모듈을 번들에 끌어들이지 않도록 이식(복사).
-// 단, 트랙맵은 화면에서 확대해 보는 용도라 선명도를 위해 그리드 해상도(장축 2048)와 감마(HEAT_GAMMA=1.3)
-// 두 가지만 보고서 §1 과 의도적으로 분기한다. 색상 스톱·blur(r=2 ×2패스)·ln(1+v) 정규화는 여전히 동일.
+// 단, 트랙맵은 화면에서 확대해 보는 용도라 그리드 해상도(장축 2048)·감마(HEAT_GAMMA=1.3)·
+// 색상 스톱 위치/알파 세 가지를 보고서 §1 과 의도적으로 분기한다(선명도 + 화면 가독성).
+// RGB 램프(ColorBrewer)·blur(r=2 ×2패스)·ln(1+v) 정규화는 여전히 동일.
 
 const HEAT_DEG2RAD = Math.PI / 180;
 /** 웹 메르카토르 0..1 정규화 (ReportOMRadarBuildingMap 의 mercX/mercY 와 동일 수식) */
@@ -137,27 +138,29 @@ const mercY = (latDeg: number) => {
 /** mercY 역변환 (0..1 → 위도 deg) */
 const mercYinv = (y: number) => Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) / HEAT_DEG2RAD;
 
-/** 정상 항적 스톱 — ColorBrewer Blues (보고서 §1 HEAT_STOPS 와 동일 구조·alpha, 분기는 해상도·감마뿐) */
+/** 정상 항적 스톱 — ColorBrewer Blues.
+ *  보고서 §1 대비 스톱 위치 압축·알파 상향으로 화면 표시용 진하게(RGB 램프는 동일, 트랙맵 전용 분기) */
 const HEAT_BLUE_STOPS: [number, number, number, number, number][] = [
   [0.0, 198, 219, 239, 0.0],
-  [0.15, 198, 219, 239, 0.35],
-  [0.3, 158, 202, 225, 0.5],
-  [0.45, 107, 174, 214, 0.62],
-  [0.6, 66, 146, 198, 0.72],
-  [0.75, 33, 113, 181, 0.8],
-  [0.9, 8, 81, 156, 0.87],
-  [1.0, 8, 48, 107, 0.92],
+  [0.08, 198, 219, 239, 0.5],
+  [0.18, 158, 202, 225, 0.65],
+  [0.3, 107, 174, 214, 0.78],
+  [0.45, 66, 146, 198, 0.86],
+  [0.6, 33, 113, 181, 0.92],
+  [0.78, 8, 81, 156, 0.97],
+  [1.0, 8, 48, 107, 1.0],
 ];
-/** 소실표적 스톱 — 보고서 §1 HEAT_STOPS(ColorBrewer Reds) 와 동일 (분기는 해상도·감마뿐) */
+/** 소실표적 스톱 — ColorBrewer Reds.
+ *  마찬가지로 보고서 §1 대비 스톱 위치 압축·알파 상향(RGB 램프는 동일, 트랙맵 전용 분기) */
 const HEAT_RED_STOPS: [number, number, number, number, number][] = [
   [0.0, 254, 224, 210, 0.0],
-  [0.15, 254, 224, 210, 0.35],
-  [0.3, 252, 187, 161, 0.5],
-  [0.45, 252, 146, 114, 0.62],
-  [0.6, 251, 106, 74, 0.72],
-  [0.75, 239, 59, 44, 0.8],
-  [0.9, 203, 24, 29, 0.87],
-  [1.0, 153, 0, 13, 0.92],
+  [0.08, 254, 224, 210, 0.5],
+  [0.18, 252, 187, 161, 0.65],
+  [0.3, 252, 146, 114, 0.78],
+  [0.45, 251, 106, 74, 0.86],
+  [0.6, 239, 59, 44, 0.92],
+  [0.78, 203, 24, 29, 0.97],
+  [1.0, 153, 0, 13, 1.0],
 ];
 
 /** 스톱 배열 → 256×RGBA LUT (Uint8ClampedArray, alpha 도 0..255). */
@@ -571,7 +574,7 @@ export default function TrackMap() {
   const [playing, setPlaying] = useState(false);
   const altScale = 1;
   /** 항적 표시 모드: 항적선 / 항적점 / 히트맵 / 끄기 */
-  const [trackDisplay, setTrackDisplay] = useState<"line" | "points" | "heatmap" | "off">("line");
+  const [trackDisplay, setTrackDisplay] = useState<"line" | "points" | "heatmap" | "off">("points");
   const [hiddenLegendItems, setHiddenLegendItems] = useState<Set<string>>(new Set());
   const [showBuildings, setShowBuildings] = useState(true);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
