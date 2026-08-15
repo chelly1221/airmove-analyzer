@@ -72,7 +72,8 @@ interface Props {
   onCurtainData?: (data: LosCurtainSample[] | null) => void;
   /** 경로상 대상/차단 건물 방출 (지도 하이라이트용 — 대상=파랑, 차단=빨강). 로딩 중엔 직전 값 유지.
    *  all = 드로어 리스트용 전체 목록 — 경로 통과 건물 전수(isBlocking 플래그 포함).
-   *  peaks = 4/3 현을 관통하는 지형 봉우리(산) — 드로어 차단 장애물 리스트 전용(지도 하이라이트 없음). */
+   *  peaks = 차단 지형 봉우리(산) — 4/3 현 관통 AND 최저탐지선 실꺾음 귀속(건물 실꺾음 의미론과 동일).
+   *          드로어 차단 장애물 리스트 전용(지도 하이라이트 없음). */
   onPathBuildings?: (d: {
     target: BuildingOnPath | null;
     blocking: BuildingOnPath[];
@@ -469,10 +470,12 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     // 1.5) 통합 장애물 배열: 지형 프로파일 + 건물을 거리순 병합
     //    shadow-casting에서 건물을 정확한 위치의 독립 장애물로 처리
     //    bIdx: 소유 건물 인덱스 — 실꺾음 귀속용 (지형 항목은 undefined)
-    interface Obstacle { distance: number; elevation: number; bIdx?: number; }
+    //    tIdx: 소유 지형 프로파일 인덱스 — 실꺾음 귀속용 (건물 항목은 undefined)
+    interface Obstacle { distance: number; elevation: number; bIdx?: number; tIdx?: number; }
     const obstacles: Obstacle[] = [];
-    for (const p of profile) {
-      obstacles.push({ distance: p.distance, elevation: p.elevation });
+    for (let i = 0; i < profile.length; i++) {
+      const p = profile[i];
+      obstacles.push({ distance: p.distance, elevation: p.elevation, tIdx: i });
     }
     if (showBuildings && effBuildings.length > 0) {
       for (let i = 0; i < effBuildings.length; i++) {
@@ -488,6 +491,28 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       }
     }
     obstacles.sort((a, b) => a.distance - b.distance);
+
+    // ── 실꺾음 귀속(exact attribution) — 건물·지형 공통 ──
+    //   표시 최저탐지선(minDetStraight)과 동일한 장애물 집합·정렬 순서로 4/3 running max 앙각을
+    //   갱신하며, 자기 항목이 최대 앙각을 실제로 끌어올린 소유자(건물 인덱스 / 지형 프로파일 인덱스)만
+    //   수집한다. 앞 능선·타 건물 그림자에 완전히 묻혀 선을 전혀 꺾지 못하는 장애물은 여기 안 들어온다.
+    //   (구 prefix 방식은 자기 near 엣지 '이전'과만 비교 — 레이더보다 낮은 상단은 far 엣지가 최대
+    //    앙각이라 near~far 사이 타 건물이 이미 올린 선을 무시해, 선을 못 꺾는 건물이 차단으로 오탐)
+    //   showBuildings=false 면 obstacles 에 건물 항목이 없어 bentBldg 는 자연히 빈 Set 이 된다.
+    const bentBldg = new Set<number>();
+    const bentTerrain = new Set<number>();
+    {
+      let runMax43 = -Infinity;
+      for (const ob of obstacles) {
+        if (ob.distance <= 0) continue;
+        const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
+        if (ang > runMax43) {
+          runMax43 = ang;
+          if (ob.bIdx !== undefined) bentBldg.add(ob.bIdx);
+          else if (ob.tIdx !== undefined) bentTerrain.add(ob.tIdx);
+        }
+      }
+    }
 
     // 건물 경계 거리 목록 (쉐도잉 라인에 건물 경계점 삽입용)
     interface BuildingEdge { nearD: number; farD: number; topElev: number; groundElev: number; }
@@ -667,10 +692,15 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
 
     // ── 차단 봉우리(산) 전수 산출 — 차트 빨강 마커·드로어 차단 장애물 리스트용 ──
     //   maxBlockPoint 는 최대 초과 1점뿐이라 여러 능선이 현을 관통해도 하나만 보였다.
-    //   판정 프레임은 위 건물 차단과 동일한 4/3 현(chord43H) — 신규 식 없음.
+    //   판정 = 이중 조건 — ① 4/3 현(chord43H) 관통 AND ② 표시 최저탐지선(los43) 실꺾음
+    //   귀속(bentTerrain). 건물의 2026-08-09 실꺾음 의미론과 정합시킨 것으로, ② 가 없으면
+    //   타겟 고도가 지면일 때 현이 지면까지 내려가므로 앞 능선·건물 그림자에 완전히 묻혀 선을
+    //   전혀 꺾지 못하는 산까지 현 위로만 올라오면 차단(빨강)으로 오탐된다 (2026-08-15 수정).
+    //   판정 프레임은 위 건물 차단과 동일한 4/3 현·4/3 running max 앙각 — 신규 식 없음.
     //   장애물 집합은 '순수 지형'만(profile.elevation): 건물 유효고를 섞으면 건물 차단이
     //   산으로 중복 계상되므로, 건물은 기존 pathBuildings 경로가 단독으로 담당한다.
-    //   excess>0 연속 런마다 초과 최대점 1개를 그 능선의 대표 봉우리로 채택.
+    //   excess>0 연속 런마다 초과 최대점 1개를 그 능선의 대표 봉우리로 채택하되,
+    //   런 안에 실꺾음 귀속 샘플이 하나라도 있는 런만 채택한다.
     const blockingPeaks: {
       idx: number; distance: number; lat: number; lon: number;
       realElevation: number; excessM: number; adjHeight: number;
@@ -678,8 +708,9 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     {
       let runIdx = -1;   // 현재 런의 최대 초과점 프로파일 인덱스
       let runExcess = 0; // 그 지점의 초과량(m)
+      let runBends = false; // 런 안에 최저탐지선을 실제로 꺾은 샘플이 있었는가
       const flushRun = () => {
-        if (runIdx < 0) return;
+        if (runIdx < 0 || !runBends) { runIdx = -1; runExcess = 0; runBends = false; return; }
         const p = profile[runIdx];
         blockingPeaks.push({
           idx: runIdx,
@@ -693,6 +724,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         });
         runIdx = -1;
         runExcess = 0;
+        runBends = false;
       };
       for (let i = 0; i < profile.length; i++) {
         const p = profile[i];
@@ -700,6 +732,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         const excess = (p.elevation - curvDrop43(p.distance)) - chord43H(p.distance);
         if (excess > 0) {
           if (runIdx < 0 || excess > runExcess) { runIdx = i; runExcess = excess; }
+          if (bentTerrain.has(i)) runBends = true;
         } else flushRun();
       }
       flushRun();
@@ -770,22 +803,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
     }
     let searchedBldgIdx: number | null = null;
     if (showBuildings && effBuildings.length > 0) {
-      // ── 실꺾음 귀속(exact attribution) ──
-      //   표시 최저탐지선(minDetStraight)과 동일한 장애물 집합·정렬 순서로 4/3 running max
-      //   앙각을 갱신하며, 자기 near/far 엣지 항목이 최대 앙각을 실제로 끌어올린 건물 인덱스만 수집.
-      //   (구 prefix 방식은 자기 near 엣지 '이전'과만 비교 — 레이더보다 낮은 상단은 far 엣지가 최대
-      //    앙각이라 near~far 사이 타 건물이 이미 올린 선을 무시해, 선을 못 꺾는 건물이 차단으로 오탐)
-      const bentBldg = new Set<number>();
-      let runMax43 = -Infinity;
-      for (const ob of obstacles) {
-        if (ob.distance <= 0) continue;
-        const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
-        if (ang > runMax43) {
-          runMax43 = ang;
-          if (ob.bIdx !== undefined) bentBldg.add(ob.bIdx);
-        }
-      }
-
+      // 실꺾음 귀속 집합(bentBldg)은 obstacles 정렬 직후 공통 루프에서 이미 산출됨 — 여기선 조회만.
       for (let i = 0; i < effBuildings.length; i++) {
         const b = effBuildings[i];
         const bDist = b.distance_km;
@@ -1787,7 +1805,7 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         )}
 
         {/* 건물모드/주소검색 대상 건물 핀 — 지도 마커(TrackMap los-bldg-az-markers)와 동일 파랑 계약,
-            3탭(중앙/좌끝/우끝) 모두 표시. 순수 인디케이터라 히트테스트·툴팁 없음(pointerEvents=none) */}
+            방위 슬라이더 스윕 전 구간에서 표시. 순수 인디케이터라 히트테스트·툴팁 없음(pointerEvents=none) */}
         {showBuildings && (() => {
           const si = chartData.searchedBldgIdx;
           if (si === null) return null;

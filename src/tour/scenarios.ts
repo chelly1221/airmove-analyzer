@@ -527,35 +527,15 @@ const OBSTACLE_LOS_PHASES: Record<string, TourStep[]> = {
       showNext: true,
     },
     {
-      id: "ob-tab-center",
-      target: '[data-tour="tm-los-tab-center"]',
-      title: "중앙 방위 단면",
-      body: "기본으로 건물 **중앙** 방위 단면이 표시됩니다. 헤더의 차단/양호 배지와 단면도를 확인하세요.",
-      mode: "interactive",
-      placement: "bottom",
-      showNext: true,
-    },
-    {
-      id: "ob-tab-left",
-      target: '[data-tour="tm-los-tab-left"]',
-      title: "좌끝 방위 단면",
+      id: "ob-az-slider",
+      target: '[data-tour="tm-los-az-slider"]',
+      title: "방위 슬라이더",
       body:
-        "'좌끝' 탭을 클릭하세요 — 건물 좌측 끝 방위의 단면입니다. " +
-        "넓은 건물은 방위별로 차단 여부가 다를 수 있습니다.",
+        "기본으로 건물 **중앙** 방위 단면이 표시됩니다. 슬라이더를 드래그하면 건물 **좌끝↔우끝** 한계 안에서 " +
+        "단면을 연속으로 훑을 수 있습니다. 넓은 건물은 방위별로 차단 여부가 다를 수 있습니다.",
       mode: "interactive",
       placement: "bottom",
-      advanceOnTargetClick: true,
-      // 폴리곤 미검출 건물은 단일 뷰라 탭바 자체가 없다 — [다음] 폴백 필수
-      showNext: true,
-    },
-    {
-      id: "ob-tab-right",
-      target: '[data-tour="tm-los-tab-right"]',
-      title: "우끝 방위 단면",
-      body: "'우끝' 탭도 확인하세요.",
-      mode: "interactive",
-      placement: "bottom",
-      advanceOnTargetClick: true,
+      // 폴리곤 미검출 건물은 단일 뷰라 슬라이더 자체가 없다 — [다음] 폴백 필수
       showNext: true,
     },
     {
@@ -749,12 +729,12 @@ export const TOUR_SCENARIOS: TourScenarioMeta[] = [
     title: "장애물 전파영향성 사전검토",
     description:
       "신축 계획 건물이나 기존 장애물이 레이더 전파에 미치는 영향(LoS 차단 여부·허용높이)을 지도에서 " +
-      "사전검토합니다. 주소검색으로 대상 건물을 찾아 LoS 단면도로 중앙·좌끝·우끝 방위의 차단 여부를 확인합니다.",
+      "사전검토합니다. 주소검색으로 대상 건물을 찾아 LoS 단면도의 방위 슬라이더로 건물 좌끝↔우끝 방위의 차단 여부를 확인합니다.",
     stepsSummary: [
       "지도 창에서 LoS 분석 도구 열기",
       "주소검색으로 대상 건물 선택 (예: 개화동로 561)",
       "건물 카드에서 지반고·건물높이 확인 후 LoS 단면도 열기",
-      "허용높이·차단 여부와 중앙/좌끝/우끝 방위 확인, 차트 휠 줌",
+      "허용높이·차단 여부 확인, 방위 슬라이더로 좌끝↔우끝 스윕, 차트 휠 줌",
     ],
   },
   {

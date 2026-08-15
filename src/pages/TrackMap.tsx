@@ -4,7 +4,7 @@ import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import type { MapboxOverlay } from "@deck.gl/mapbox";
-import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer, TextLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
 import {
@@ -109,11 +109,11 @@ import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, Bu
 import { readBulkJson, type BulkRef } from "../utils/bulkIpc";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
-import LoSProfileTabs from "../components/Map/LoSProfileTabs";
+import LoSProfilePanel from "../components/Map/LoSProfilePanel";
 import { isGPUCacheValidFor, renderCoverageImageAsync, queryMinDetectionAlt, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
 import { addPlanOverlay, removePlanOverlay, updatePlanOpacity, updatePlanBounds, rotateBounds } from "../utils/planOverlay";
-import { fetchBuildingsForViewport, invalidateBuildingCache, buildingsToGeoJSON } from "../utils/buildingTileCache";
+import { fetchBuildingsForViewport, fetchBuildingsInRadius, invalidateBuildingCache, buildingsToGeoJSON } from "../utils/buildingTileCache";
 import { detectionTypeColor, radarTypeLabel, MAP_STYLE_URL } from "../utils/radarConstants";
 import AddressSearch, { AddressMarker } from "../components/Map/AddressSearch";
 import PlaybackControls from "../components/Map/PlaybackControls";
@@ -519,8 +519,6 @@ export default function TrackMap() {
   // 특정 건물 LoS 분석 시 해당 건물 footprint([lat,lon][]) 보관 → 단면도 항적을 건물 실측 방위폭으로 한정 + 양끝 방위 계산.
   // (등록 장애물·툴팁·주소검색 모든 진입점 단일화)
   const [losFootprint, setLosFootprint] = useState<[number, number][] | null>(null);
-  // 건물 LoS 단면도 탭: 중앙/좌끝/우끝 방위별 타겟. null이면 단일 단면도.
-  const [losAzViews, setLosAzViews] = useState<{ lat: number; lon: number; label: string; az: number }[] | null>(null);
   const savedPitchRef = useRef(45);
   const savedBearingRef = useRef(0);
   const losPointClickedRef = useRef(false); // deck.gl LoS 포인트 클릭 여부 (빈 영역 클릭 구분용)
@@ -546,6 +544,15 @@ export default function TrackMap() {
    *  BRA 결과는 Rust 가 융합 SRTM + 현재 건물 세트로 계산한 스냅샷이라, 자료가 바뀌면
    *  화면에 남은 침범 목록이 낡는다. 세대를 재분석 키에 넣어 기존 디바운스/seq 가드를 재사용. */
   const [braDataEpoch, setBraDataEpoch] = useState(0);
+  /** 분석 원(반경 = 결과 스냅샷 max_range_km) 내부 건물 전량 — 줌·건물 토글과 무관하게 상시 3D 표출용.
+   *  중심/반경을 함께 들고 있어야 일반 건물 레이어의 "원 밖" 제외 필터와 좌표계가 어긋나지 않는다. */
+  const [braArea, setBraArea] = useState<{ lat: number; lon: number; radiusKm: number; buildings: Building3D[] } | null>(null);
+  /** 범위 건물 로드 시퀀스 — 결과 해제/재분석 시 증가시켜 늦게 도착한 응답을 폐기 */
+  const braAreaSeqRef = useRef(0);
+  /** 마지막으로 로드한 범위 서명(좌표|반경|자료세대|출처) — 각도만 바뀐 재분석에서 재페치 억제 */
+  const braAreaKeyRef = useRef<string | null>(null);
+  /** 분석 범위 상시 3D 활성 여부 (결과 + 범위 건물이 모두 준비된 상태) */
+  const braAlways3d = braResult != null && braArea != null;
 
   // 이펙트에서 최신 레이더 제원 참조용 (호버 조회 deps 에 radarSite 를 넣지 않기 위함)
   const radarSiteRef = useRef(radarSite);
@@ -646,8 +653,6 @@ export default function TrackMap() {
   const [losPathBldgs, setLosPathBldgs] = useState<{ target: BuildingOnPath | null; blocking: BuildingOnPath[]; all: (BuildingOnPath & { isBlocking: boolean })[]; peaks: LosBlockingPeak[] } | null>(null);
   // 건물모드 방위 한계 — 건물 양끝 방위(offset 도메인, 0/360 랩 안전). launchBuildingLoS valid 시 설정
   const [losBldgAzBounds, setLosBldgAzBounds] = useState<{ center: number; minOff: number; maxOff: number } | null>(null);
-  // 건물모드 3탭(좌끝/중앙/우끝) 활성 인덱스 — 지도 방위 마커 강조 동기 (LoSProfileTabs onActiveViewChange 수신)
-  const [losActiveViewIdx, setLosActiveViewIdx] = useState(0);
   // 건물 스윕 최초 1회 줌인 플래그 (launchBuildingLoS 시 리셋)
   const bldgSweepZoomedRef = useRef(false);
   // 카드 입력값 (문자열) — 지반고 / 건물높이
@@ -1474,8 +1479,26 @@ export default function TrackMap() {
     const hiddenFilter: any = coveredExpr
       ? ["any", ["==", ["get", "measured"], true], coveredExpr]
       : ["==", ["get", "measured"], true];
-    const normalFilter: any = ["!", hiddenFilter];
-    const filterKey = JSON.stringify(hiddenFilter);
+
+    // BRA 분석 범위 안의 건물은 전용 레이어(bra-area-3d-*)가 줌 무관 상시 3D 로 그리므로
+    // 여기서는 제외한다 (동일 건물 이중 렌더 = z-fighting 방지).
+    // 판정식은 fetchBuildingsInRadius 의 centroid 필터와 동일한 equirect 근사 (단위만 deg²).
+    // MapLibre 표현식에는 거듭제곱이 없어 ["*", x, x] 로 전개하고 상수는 JS 에서 미리 계산한다.
+    let outCircle: any = null;
+    const ba = braArea;
+    if (braAlways3d && ba) {
+      const cosLatBra = Math.cos((ba.lat * Math.PI) / 180);
+      const rDeg2 = (ba.radiusKm / 111.32) ** 2;
+      const dLatExpr: any = ["-", ["get", "lat"], ba.lat];
+      const dLonExpr: any = ["*", ["-", ["get", "lon"], ba.lon], cosLatBra];
+      const inCircle: any = ["<=", ["+", ["*", dLatExpr, dLatExpr], ["*", dLonExpr, dLonExpr]], rDeg2];
+      outCircle = ["!", inCircle];
+    }
+    const measuredFilter: any = outCircle ? ["all", hiddenFilter, outCircle] : hiddenFilter;
+    const normalFilter: any = outCircle ? ["all", ["!", hiddenFilter], outCircle] : ["!", hiddenFilter];
+    // 필터 키에 원 표현식을 포함 — 원 유무·중심·반경이 바뀔 때만 setFilter 가 돈다.
+    // (braArea 아이덴티티는 점진 커밋마다 바뀌지만 좌표/반경이 같으면 키가 동일해 스킵된다)
+    const filterKey = JSON.stringify([hiddenFilter, outCircle]);
 
     if (buildings3dGeoJSON && buildings3dMode) {
       // GeoJSON 소스 업데이트 또는 생성
@@ -1505,7 +1528,7 @@ export default function TrackMap() {
         map.addLayer({
           id: measuredLayerId,
           type: "fill-extrusion",
-          filter: hiddenFilter,
+          filter: measuredFilter,
           source: sourceId,
           paint: {
             "fill-extrusion-color": FILL_COLOR_EXPR,
@@ -1523,7 +1546,7 @@ export default function TrackMap() {
       if (lastFiltersRef.current !== filterKey) {
         lastFiltersRef.current = filterKey;
         if (map.getLayer(layerId)) map.setFilter(layerId, normalFilter);
-        if (map.getLayer(measuredLayerId)) map.setFilter(measuredLayerId, hiddenFilter);
+        if (map.getLayer(measuredLayerId)) map.setFilter(measuredLayerId, measuredFilter);
       }
       // 레이어 표시 + 채움 투명도 반영 (색 표현식은 상수라 갱신 불필요)
       if (map.getLayer(layerId)) {
@@ -1543,7 +1566,9 @@ export default function TrackMap() {
         map.setLayoutProperty(measuredLayerId, "visibility", "none");
       }
     }
-  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive, meshCoverageBbox, styleRetryTick]);
+    // braArea 는 스칼라(lat/lon/radiusKm)만 사용 — 아이덴티티를 deps 에 넣으면 점진 커밋(600ms)마다
+    // 뷰포트 소스 setData 재인덱싱이 돌므로 스칼라 deps 로 제한 (2D 점 memo 와 동일 패턴)
+  }, [buildings3dGeoJSON, buildings3dMode, buildingOpacity, meshActive, meshCoverageBbox, styleRetryTick, braAlways3d, braArea?.lat, braArea?.lon, braArea?.radiusKm]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // showBuildings=false 시 fill-extrusion 레이어 제거
   useEffect(() => {
@@ -1563,7 +1588,10 @@ export default function TrackMap() {
     const map = mapRef.current?.getMap();
     if (!map) return;
     // 비실측/실측 두 fill-extrusion 레이어를 함께 쿼리 (실측 레이어는 메시 표출 중 opacity 0 이어도 히트테스트 유효)
-    const layerIds = ["buildings-3d-fill", "buildings-3d-fill-measured"];
+    // BRA 분석 범위 전용 레이어도 합산 — 원 내부 건물은 일반 레이어에서 빠지므로 이게 없으면
+    // 줌 무관 표출 중인 박스가 호버 툴팁(BRA 초과·여유 행)·클릭 드로어에 잡히지 않는다.
+    // (미존재 레이어는 아래 present 필터가 걸러주므로 조건 분기 불필요)
+    const layerIds = ["buildings-3d-fill", "buildings-3d-fill-measured", "bra-area-3d-fill", "bra-area-3d-fill-measured"];
 
     const onMouseMove = (e: maplibregl.MapMouseEvent) => {
       const present = layerIds.filter((id) => map.getLayer(id));
@@ -1771,6 +1799,109 @@ export default function TrackMap() {
     lat >= meshCoverageBbox[0] && lat <= meshCoverageBbox[1] &&
     lon >= meshCoverageBbox[2] && lon <= meshCoverageBbox[3],
   [meshActive, meshZoomOk, meshCoverageBbox]);
+
+  // ── BRA 분석 범위 전용 fill-extrusion (줌·건물 토글 무관 상시 3D) ──────────
+  // 위 일반 건물 레이어 동기화의 미러. 다른 점은 ① 전용 소스/레이어 id, ② 표시 조건이
+  // buildings3dMode·showBuildings·줌과 무관(분석 결과가 떠 있는 동안 항상 표출 — LoS 분석 중
+  // 상시 표출과 같은 정신), ③ 실측 레이어 opacity 만 줌 게이트를 탄다는 것뿐이다.
+  // 침범 여부 색칠은 하지 않는다 — 색은 일반 건물과 동일한 FILL_COLOR_EXPR (침범 현황은 드로어 리스트 담당).
+  // (meshZoomOk 선언 이후여야 해서 일반 레이어 effect 옆이 아닌 이 위치에 둔다)
+  const braAreaGeoJSON = useMemo(() => {
+    const ba = braArea;
+    if (!braAlways3d || !ba) return null;
+    return buildingsToGeoJSON(ba.buildings);
+  }, [braAlways3d, braArea]);
+
+  /** BRA 전용 레이어의 마지막 필터 키 — 일반 레이어(lastFiltersRef)와 독립적으로 setFilter 최소화 */
+  const braAreaLastFiltersRef = useRef<string>("");
+
+  useEffect(() => {
+    const map = mapRef.current?.getMap();
+    if (!map) return;
+    // 스타일 미로드 순간의 addSource/addLayer 유실 방지 — 일반 레이어와 동일하게 styledata 후 1회 재시도
+    if (!map.isStyleLoaded()) {
+      const onStyleData = () => setStyleRetryTick((t) => t + 1);
+      map.once("styledata", onStyleData);
+      return () => { map.off("styledata", onStyleData); };
+    }
+
+    const sourceId = "bra-area-3d-src";
+    const layerId = "bra-area-3d-fill";
+    const measuredLayerId = "bra-area-3d-fill-measured";
+
+    if (!braAreaGeoJSON) {
+      // 결과 해제 시 레이어·소스까지 제거 (수십만 피처를 스타일에 남기지 않는다).
+      // showBuildings=false 제거 effect 와 별개 — BRA 레이어는 의도적으로 건물 토글과 독립이다.
+      if (map.getLayer(layerId)) map.removeLayer(layerId);
+      if (map.getLayer(measuredLayerId)) map.removeLayer(measuredLayerId);
+      if (map.getSource(sourceId)) map.removeSource(sourceId);
+      braAreaLastFiltersRef.current = "";
+      return;
+    }
+
+    // 실측 박스 숨김은 메시가 실제로 그려질 때만 — 줌 14 미만에서는 메시가 동결·비표시(visible:false)라
+    // 박스가 대신 보여야 한다. 줌 14 이상에서는 기존대로 메시가 유일한 진실이라 opacity 0.
+    // (opacity 0 이어도 queryRenderedFeatures 히트테스트는 유효 — 기존 계약)
+    const measuredOpacity = meshActive && meshZoomOk ? 0 : buildingOpacity;
+
+    // 필터는 일반 레이어와 동일한 hidden/normal 여집합 구조. 줌 게이트는 넣지 않는다 —
+    // setFilter 는 레이어 전 피처를 재평가하므로 줌마다 필터가 흔들리면 안 된다.
+    const coveredExpr: any = meshActive && meshCoverageBbox ? ["all",
+      [">=", ["get", "lat"], meshCoverageBbox[0]], ["<=", ["get", "lat"], meshCoverageBbox[1]],
+      [">=", ["get", "lon"], meshCoverageBbox[2]], ["<=", ["get", "lon"], meshCoverageBbox[3]],
+    ] : null;
+    const hiddenFilter: any = coveredExpr
+      ? ["any", ["==", ["get", "measured"], true], coveredExpr]
+      : ["==", ["get", "measured"], true];
+    const normalFilter: any = ["!", hiddenFilter];
+    const filterKey = JSON.stringify(hiddenFilter);
+
+    const source = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
+    if (source) {
+      source.setData(braAreaGeoJSON);
+    } else {
+      map.addSource(sourceId, { type: "geojson", data: braAreaGeoJSON });
+      map.addLayer({
+        id: layerId,
+        type: "fill-extrusion",
+        filter: normalFilter,
+        source: sourceId,
+        paint: {
+          "fill-extrusion-color": FILL_COLOR_EXPR,
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": buildingOpacity,
+        },
+      });
+      map.addLayer({
+        id: measuredLayerId,
+        type: "fill-extrusion",
+        filter: hiddenFilter,
+        source: sourceId,
+        paint: {
+          "fill-extrusion-color": FILL_COLOR_EXPR,
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": measuredOpacity,
+        },
+      });
+      braAreaLastFiltersRef.current = filterKey;
+    }
+    // 점진 로딩의 setData 마다 setFilter 가 돌지 않도록 변경 시에만 반영
+    if (braAreaLastFiltersRef.current !== filterKey) {
+      braAreaLastFiltersRef.current = filterKey;
+      if (map.getLayer(layerId)) map.setFilter(layerId, normalFilter);
+      if (map.getLayer(measuredLayerId)) map.setFilter(measuredLayerId, hiddenFilter);
+    }
+    if (map.getLayer(layerId)) {
+      map.setLayoutProperty(layerId, "visibility", "visible");
+      map.setPaintProperty(layerId, "fill-extrusion-opacity", buildingOpacity);
+    }
+    if (map.getLayer(measuredLayerId)) {
+      map.setLayoutProperty(measuredLayerId, "visibility", "visible");
+      map.setPaintProperty(measuredLayerId, "fill-extrusion-opacity", measuredOpacity);
+    }
+  }, [braAreaGeoJSON, buildingOpacity, meshActive, meshZoomOk, meshCoverageBbox, styleRetryTick]);
 
   // LoS 단면도 건물 클릭/호버 → 3D 건물 주황색 하이라이트
   useEffect(() => {
@@ -2488,7 +2619,6 @@ export default function TrackMap() {
       setLosTarget({ lat: lngLat.lat, lon: lngLat.lng });
       setLosSearchedAddress(null);
       setLosFootprint(null);
-      setLosAzViews(null);
       setLosSimBuilding(null);
       setLosSimStats(null);
       setLosBldgAzBounds(null);
@@ -2508,8 +2638,8 @@ export default function TrackMap() {
     const map = mapRef.current?.getMap();
     const target = losTargetRef.current;
     if (!map || !target) return;
-    // 건물 스윕 중(이미 건물 줌인 후)에는 카메라 재정렬 억제 — 슬라이더 스윕이 건물 줌을 유지.
-    //   (losAzViews=null 로 단일뷰 전환 시 viewsKey 변화가 onLoaded 게이트를 재무장해 매 스윕 재정렬되는 것 차단)
+    // 패널 onLoaded 는 타겟(radarSite/targetLat/targetLon) 변경당 1회 발화 = 방위 스윕마다 재발화.
+    //   건물 스윕 중(이미 건물 줌인 후, bldgSweepZoomedRef)에는 카메라 재정렬 억제 — 스윕이 건물 줌을 유지.
     if (losFootprintRef.current && losBldgAzBoundsRef.current && bldgSweepZoomedRef.current) return;
     const rLat = radarSite.latitude;
     const rLon = radarSite.longitude;
@@ -2578,8 +2708,33 @@ export default function TrackMap() {
     setLosTarget({ lat, lon });
   }, [radarSite.latitude, radarSite.longitude, losMode, viewState.pitch, viewState.bearing]);
 
+  // 건물모드 방위 스윕 — 단면도 방위 슬라이더 / 드로어 HeadingTape 공용.
+  //   건물 양끝 방위(losBldgAzBounds) 안으로 랩 안전 클램프 후 단일 단면도를 연속 스윕한다.
+  //   losFootprint/losSearchedAddress/losSimBuilding/losSimStats/losBldgAzBounds 는 유지(건물 컨텍스트 보존).
+  const sweepBuildingAz = useCallback((v: number) => {
+    if (!losFootprint || !losBldgAzBounds) return;
+    const { center, minOff, maxOff } = losBldgAzBounds;
+    const dLt = ((v - center) % 360 + 540) % 360 - 180; // wrapDelta ∈ (−180,180]
+    const delta = Math.max(minOff, Math.min(maxOff, dLt));
+    const az = (((center + delta) % 360) + 360) % 360;
+    setLosFromAzDist(+az.toFixed(2), losDistanceKm);
+    setLosAzFineCenter(az);
+    // 최초 1회만 해당 건물로 줌인 (현재 방위·피치 유지)
+    if (!bldgSweepZoomedRef.current) {
+      bldgSweepZoomedRef.current = true;
+      const map = mapRef.current?.getMap();
+      if (map) {
+        let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+        for (const [la, lo] of losFootprint) { if (la < minLat) minLat = la; if (la > maxLat) maxLat = la; if (lo < minLon) minLon = lo; if (lo > maxLon) maxLon = lo; }
+        if (minLat !== Infinity) {
+          map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 80, maxZoom: 17.5, duration: 600, bearing: map.getBearing(), pitch: map.getPitch() });
+        }
+      }
+    }
+  }, [losFootprint, losBldgAzBounds, losDistanceKm, setLosFromAzDist]);
+
   // 특정 건물에 대한 LoS 분석 진입 (등록 장애물 / 툴팁 / 주소검색 공용).
-  // footprint([lat,lon][])로 ① 항적 코리도(건물 실측 방위폭) ② 중앙/좌끝/우끝 3탭 단면도 방위를 계산.
+  // footprint([lat,lon][])로 ① 항적 코리도(건물 실측 방위폭) ② 방위 슬라이더 스윕 한계(양끝 방위)를 계산.
   const launchBuildingLoS = useCallback((footprint: [number, number][], centerLat: number, centerLon: number) => {
     const rLat = radarSite.latitude, rLon = radarSite.longitude;
     const DEG2RAD = Math.PI / 180, R = 6_371_000;
@@ -2589,13 +2744,6 @@ export default function TrackMap() {
     const distKm = Math.sqrt((dLat * 111.32) ** 2 + (dLon * 111.32 * cosLat) ** 2);
     const rangeKm = radarSite.range_nm > 0 ? radarSite.range_nm * 1.852 : Infinity;
     const targetKm = Math.min(distKm * 1.08 + 1, rangeKm);
-
-    // 방위(°)→타겟 좌표 투영 (setLosFromAzDist와 동일 공식)
-    const proj = (azDeg: number) => {
-      const azRad = azDeg * DEG2RAD;
-      return { lat: rLat + (targetKm / 111.32) * Math.cos(azRad), lon: rLon + (targetKm / (111.32 * cosLat)) * Math.sin(azRad) };
-    };
-    const wrap = (a: number) => ((a % 360) + 360) % 360;
 
     // footprint 각 꼭짓점의 radar→center축 기준 좌우 각도(rad) min/max → 양끝 방위
     const mPerDegLat = DEG2RAD * R, mPerDegLon = DEG2RAD * R * cosLat;
@@ -2611,37 +2759,24 @@ export default function TrackMap() {
       if (ang > angMax) angMax = ang;
     }
     const valid = Number.isFinite(angMin) && angMin < angMax && (angMax - angMin) > 2e-4; // ≳0.01°
-    // 좌/우끝 방위는 footprint 꼭짓점 '접선' — 그대로 쓰면 Rust line_polygon_intersections 의 정확 교차가
-    //   수치오차로 빗나가 대상 건물이 코리도 조회에서 통째로 탈락한다(단면도에 대상 건물 미표시).
-    //   방위를 도형 안쪽으로 미세 인셋해 접선 스침 대신 확실히 관통시킨다(폭의 1%, 최소 2e-5 rad ≈ 0.001°).
-    const span = angMax - angMin;
-    const inset = Math.min(span * 0.25, Math.max(2e-5, span * 0.01));
-    const azLeft = wrap(centerAz + (angMin + inset) * 180 / Math.PI);
-    const azRight = wrap(centerAz + (angMax - inset) * 180 / Math.PI);
-    const views = valid ? [
-      { ...proj(azLeft), label: "좌끝", az: azLeft },
-      { ...proj(centerAz), label: "중앙", az: centerAz },
-      { ...proj(azRight), label: "우끝", az: azRight },
-    ] : null;
 
     setLosFromAzDist(centerAz, targetKm); // losMode 진입 + losTarget=중앙
     setLosFootprint(footprint.length >= 3 ? footprint : null);
-    setLosAzViews(views);
     setLosSearchedAddress({ lat: centerLat, lon: centerLon });
     setLosAzFineCenter(centerAz);
     // 건물 양끝 방위(offset)로 방위 슬라이더 한계 설정 — valid(폴리곤 좌우폭 유효) 일 때만.
-    //   스윕 한계는 실제 건물 경계여야 하므로 위 인셋을 적용하지 않은 원래 접선값 사용
+    //   스윕 한계는 실제 건물 경계여야 하므로 footprint 꼭짓점 '접선'값 그대로 사용
     setLosBldgAzBounds(valid ? { center: centerAz, minOff: angMin * 180 / Math.PI, maxOff: angMax * 180 / Math.PI } : null);
     bldgSweepZoomedRef.current = false; // 새 건물 → 최초 스윕 줌인 재무장
     setLosCursorPicking(false);
   }, [radarSite.latitude, radarSite.longitude, radarSite.range_nm, setLosFromAzDist]);
 
-  // 건물모드 방위 마커 — 좌끝/중앙/우끝(탭) 또는 현재 스윕 방위 레이가 대상 건물 footprint를
-  //   관통하는 구간의 중점. 지도에 대상 건물 위 아이콘으로 표출(단면도 대상 건물 핀과 동일 파랑 계약).
+  // 건물모드 방위 마커 — 현재 스윕 방위 레이가 대상 건물 footprint를 관통하는 구간의 중점.
+  //   지도에 대상 건물 위 아이콘으로 표출(단면도 대상 건물 핀과 동일 파랑 계약).
   const losBldgMarkers = useMemo(() => {
-    const out: { lon: number; lat: number; label: string; viewIdx: number }[] = [];
+    const out: { lon: number; lat: number }[] = [];
     const fp = losFootprint;
-    // 건물모드(footprint + 양끝 방위 유효)에서만 표출 — 스윕/탭 공용
+    // 건물모드(footprint + 양끝 방위 유효)에서만 표출
     if (!fp || fp.length < 3 || !losBldgAzBounds) return out;
 
     const rLat = radarSite.latitude, rLon = radarSite.longitude;
@@ -2698,18 +2833,10 @@ export default function TrackMap() {
       return { lat: rLat + (t * ux) / mPerDegLat, lon: rLon + (t * uy) / mPerDegLon };
     };
 
-    if (losAzViews) {
-      // 탭 모드 — 좌끝/중앙/우끝 각 방위마다 1개
-      for (let i = 0; i < losAzViews.length; i++) {
-        const v = losAzViews[i];
-        out.push({ ...toLonLat(v.az), label: v.label, viewIdx: i });
-      }
-    } else {
-      // 스윕 모드 — 현재 방위 1개 (라벨 없음)
-      out.push({ ...toLonLat(losAzimuth), label: "", viewIdx: -1 });
-    }
+    // 현재 방위(슬라이더 스윕 추종) 1개
+    out.push(toLonLat(losAzimuth));
     return out;
-  }, [losFootprint, losBldgAzBounds, losAzViews, losAzimuth, radarSite.latitude, radarSite.longitude]);
+  }, [losFootprint, losBldgAzBounds, losAzimuth, radarSite.latitude, radarSite.longitude]);
 
   // 등록 장애물 선택 → 해당 건물 footprint로 LoS 분석
   const setLosToObstacle = useCallback((b: ManualBuilding) => {
@@ -2748,7 +2875,6 @@ export default function TrackMap() {
     setLosBuildingHighlight(null);
     setLosSearchedAddress(null);
     setLosFootprint(null);
-    setLosAzViews(null);
     setLosSimBuilding(null);
     setLosSimStats(null);
     setLosBldgAzBounds(null);
@@ -2818,6 +2944,39 @@ export default function TrackMap() {
     const t = setTimeout(() => { void runBraAnalysis(); }, 400);
     return () => clearTimeout(t);
   }, [braConeRadiusKm, braAngleDeg, braDataEpoch, braResult, braError, runBraAnalysis]);
+
+  // 분석 범위(원) 내 건물 전량 로드 — 결과가 떠 있는 동안 줌 무관 상시 3D 표출용 데이터.
+  //   반경은 결과 스냅샷(max_range_km) 기준. 라이브 슬라이더(braConeRadiusKm)를 쓰면 디바운스
+  //   재분석이 끝나기 전 표시 원·전용 레이어·일반 레이어 제외 필터가 서로 어긋난다.
+  //   결과 해제(도구 닫기/레이더 변경/실패)는 전부 braResult=null 로 수렴하므로 여기서 일괄 정리된다.
+  useEffect(() => {
+    if (!braResult) {
+      braAreaSeqRef.current += 1; // 진행 중 로드 폐기
+      braAreaKeyRef.current = null;
+      setBraArea((prev) => (prev ? null : prev));
+      return;
+    }
+    // 각도만 바뀐 재분석은 건물 집합이 그대로이므로 재페치하지 않는다
+    const key = `${radarSite.latitude}|${radarSite.longitude}|${braResult.max_range_km}|${braDataEpoch}|${[...hiddenBuildingSources].sort().join(",")}`;
+    if (braAreaKeyRef.current === key) return;
+    braAreaKeyRef.current = key;
+    const seq = ++braAreaSeqRef.current;
+    const lat = radarSite.latitude;
+    const lon = radarSite.longitude;
+    const radiusKm = braResult.max_range_km;
+    // 점진 커밋 + 최종 커밋 공용 — 최종 콜백은 진행 콜백의 마지막 배열과 동일 참조라 중복 렌더가 없다
+    const commit = (buildings: Building3D[]) => {
+      if (seq !== braAreaSeqRef.current) return;
+      setBraArea((prev) => (prev && prev.buildings === buildings ? prev : { lat, lon, radiusKm, buildings }));
+    };
+    fetchBuildingsInRadius({ lat, lon }, radiusKm, [...hiddenBuildingSources], commit)
+      .then(commit)
+      .catch((err) => {
+        console.warn("BRA 범위 건물 로드 실패:", err);
+        // 키를 비워 다음 결과/자료 변경 때 1회 재시도 (deps 가 그대로면 재실행되지 않아 루프는 없다)
+        if (seq === braAreaSeqRef.current) braAreaKeyRef.current = null;
+      });
+  }, [braResult, braDataEpoch, hiddenBuildingSources, radarSite.latitude, radarSite.longitude]);
 
   // 3D 입체 허용 토글 ↔ 현재 줌에 맞춰 buildings3dMode 재조정
   useEffect(() => {
@@ -3308,51 +3467,28 @@ export default function TrackMap() {
       }
     }
 
-    // 건물모드 방위 마커 (좌끝/중앙/우끝 or 스윕 단면 지점) — overlaid deck 캔버스라 건물 위에 항상 보임.
-    //   정리 경로는 별도 코드 불필요 — teardownLoS/onClose 가 losFootprint·losAzViews·losBldgAzBounds 를
+    // 건물모드 방위 마커 (현재 스윕 단면 지점) — overlaid deck 캔버스라 건물 위에 항상 보임.
+    //   정리 경로는 별도 코드 불필요 — teardownLoS/onClose 가 losFootprint·losBldgAzBounds 를
     //   비우면 losBldgMarkers 가 빈 배열이 되어 레이어가 자동 소멸한다.
     if (losBldgMarkers.length > 0) {
-      type AzMarker = { lon: number; lat: number; label: string; viewIdx: number };
-      const isActive = (d: AzMarker) => d.viewIdx === losActiveViewIdx || d.viewIdx === -1;
+      type AzMarker = { lon: number; lat: number };
       layers.push(
         new ScatterplotLayer<AzMarker>({
           id: "los-bldg-az-markers",
           data: losBldgMarkers,
           getPosition: (d) => [d.lon, d.lat, 0],
           radiusUnits: "pixels",
-          getRadius: (d) => (isActive(d) ? 6.5 : 4.5),
-          getFillColor: (d) => (isActive(d) ? [59, 130, 246, 255] : [59, 130, 246, 150]),
+          getRadius: 6.5,
+          getFillColor: [59, 130, 246, 255],
           stroked: true,
           getLineColor: [255, 255, 255, 230],
           lineWidthMinPixels: 1.5,
           pickable: false,
-          updateTriggers: { getRadius: losActiveViewIdx, getFillColor: losActiveViewIdx },
         })
       );
-      const labeled = losBldgMarkers.filter((d) => d.label);
-      if (labeled.length > 0) {
-        layers.push(
-          new TextLayer<AzMarker>({
-            id: "los-bldg-az-labels",
-            data: labeled,
-            getText: (d) => d.label,
-            getPosition: (d) => [d.lon, d.lat, 0],
-            getPixelOffset: [0, -16],
-            getSize: (d) => (isActive(d) ? 12 : 11),
-            getColor: (d) => (isActive(d) ? [29, 78, 216, 255] : [59, 130, 246, 205]),
-            background: true,
-            getBackgroundColor: [255, 255, 255, 220],
-            backgroundPadding: [4, 2, 4, 2],
-            fontFamily: "'Pretendard Variable', Pretendard, sans-serif",
-            characterSet: ["좌", "끝", "중", "앙", "우"],
-            pickable: false,
-            updateTriggers: { getSize: losActiveViewIdx, getColor: losActiveViewIdx },
-          })
-        );
-      }
     }
     return layers;
-  }, [losMode, losTarget, losCursor, radarInfo, radarSite.latitude, radarSite.longitude, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, losCurtain, losLayers, losCurtainOpacity, terrainEnabled, losBldgMarkers, losActiveViewIdx]);
+  }, [losMode, losTarget, losCursor, radarInfo, radarSite.latitude, radarSite.longitude, losHoverRatio, losHighlightIdx, losHoverIdx, losTrackPoints, losCurtain, losLayers, losCurtainOpacity, terrainEnabled, losBldgMarkers]);
 
   // Loss 포인트 전용 deck.gl 레이어 (Loss 데이터 변경 시에만 재생성)
   const lossDeckLayers = useMemo(() => {
@@ -3424,6 +3560,19 @@ export default function TrackMap() {
         : [209, 213, 219, a(220)];
     };
     const selObj = sel ? buildings3dData.find((d) => isSelected(d)) : null;
+    // BRA 분석 범위 안은 전용 fill-extrusion 레이어가 3D 로 그리므로 점 표시에서 제외 (지붕 위 점 이중 표출 방지).
+    //   판정식은 fetchBuildingsInRadius centroid 필터와 동일. 선택/하이라이트 검색은 필터 전 원본을 그대로 쓴다.
+    const ba = braArea;
+    let dotData = buildings3dData;
+    if (braAlways3d && ba) {
+      const cosLatBra = Math.cos((ba.lat * Math.PI) / 180);
+      const r2 = ba.radiusKm * ba.radiusKm;
+      dotData = buildings3dData.filter((d) => {
+        const dy = (d.lat - ba.lat) * 111.32;
+        const dx = (d.lon - ba.lon) * 111.32 * cosLatBra;
+        return dx * dx + dy * dy > r2;
+      });
+    }
     // 호버는 간단 툴팁만 (건물명·높이·실측 배지) — 상세 조회는 클릭(드로어) 전용
     const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
       if (info.object) {
@@ -3446,7 +3595,7 @@ export default function TrackMap() {
       })] : []),
       new ScatterplotLayer({
         id: "buildings-dots",
-        data: buildings3dData,
+        data: dotData,
         getPosition: (d: Building3D) => [d.lon, d.lat],
         getRadius: (d: Building3D) => isHighlighted(d) || isSelected(d) ? 6 : 3,
         radiusUnits: "pixels" as const,
@@ -3463,7 +3612,7 @@ export default function TrackMap() {
         onHover: buildingHover,
       }),
     ];
-  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgDrawer?.lat, bldgDrawer?.lon, openBldgDrawerFor]);
+  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgDrawer?.lat, bldgDrawer?.lon, openBldgDrawerFor, braAlways3d, braArea?.lat, braArea?.lon, braArea?.radiusKm]);
 
   // 등록된 실측 3D 타일셋 폴더 조회 (미등록이면 null → 토글 비활성)
   useEffect(() => {
@@ -3800,6 +3949,7 @@ export default function TrackMap() {
   //   원추면 해발고는 Rust analysis/bra.rs cone_msl · LoSProfilePanel braAMSL 과 동일한
   //   실제지구 기하 직선: coneMsl(d) = h_ant + d·tanθ + d²/(2R) (4/3 굴절 미적용).
   //   침범 건물의 지도 마킹은 없음 — 침범 현황은 좌측 드로어 리스트가 담당(2026-08-12 빨강 채색 기능 제거).
+  //   분석 실행 전(braResult 없음)에는 원추면 대신 분석 대상 원의 굵은 점선 테두리만 표시한다.
   const braDeckLayers = useMemo(() => {
     if (activeTool !== "bra") return [];
     const EX = terrainEnabled ? TERRAIN_EXAGGERATION : 1;
@@ -3810,12 +3960,50 @@ export default function TrackMap() {
     const coneMsl = (dM: number, hAnt: number, tanT: number) =>
       hAnt + dM * tanT + (dM * dM) / (2 * R_EARTH_M);
 
-    // ── ① 원추면 기하 (분석 실행 전에도 즉시 표시) ──
+    // ── ① 공통 기하 파라미터 (점선 원·원추면 공용) ──
     const apexM = radarSite.altitude + radarSite.antenna_height; // 안테나 정점 (AMSL m)
     const tanTheta = Math.tan((braAngleDeg * Math.PI) / 180);
     const AZ_SEG = 72;  // 방위 분할
     const RINGS = 24;   // 반경 링 (중심 조밀 — r_i ∝ (i/RINGS)²)
     const R_render = braConeRadiusKm * 1000;
+
+    // ── 분석 실행 전(braResult 없음): 원추면 대신 "분석 대상 원" 점선 테두리만 ──
+    //   반경은 라이브 슬라이더(braConeRadiusKm)라 조작 즉시 리사이즈되고, z 는 실행 후 림과
+    //   같은 원추면 높이라 분석을 돌리면 그 자리에서 원추면이 이어진다.
+    //   점선은 PathStyleExtension(@deck.gl/extensions 미설치 — 의존성 추가 금지) 대신
+    //   원주를 잘게 나눠 짧은 arc path 를 나열하는 수동 분할로 만든다.
+    //   실행 중(braLoading)·실패(braError) 상태도 braResult 가 null 이라 이 표시로 남는다 — 의도된 동작.
+    if (!braResult) {
+      const rimZ = coneMsl(R_render, apexM, tanTheta) * EX;
+      const DASH_SEG = 240;                 // 원주 분할 수
+      const DASH_ON = 6, DASH_OFF = 4;      // 주기 10 → 240 을 정확히 24 주기로 분할 (이음매 겹침 없음)
+      const dashPt = (j: number): [number, number, number] => {
+        const a = ((j % DASH_SEG) / DASH_SEG) * Math.PI * 2;
+        return [
+          radarSite.longitude + (R_render * Math.sin(a)) / mPerDegLon,
+          radarSite.latitude + (R_render * Math.cos(a)) / M_PER_DEG_LAT,
+          rimZ,
+        ];
+      };
+      const dashes: { path: [number, number, number][] }[] = [];
+      for (let j = 0; j < DASH_SEG; j += DASH_ON + DASH_OFF) {
+        const path: [number, number, number][] = [];
+        for (let k = 0; k <= DASH_ON; k++) path.push(dashPt(j + k));
+        dashes.push({ path });
+      }
+      return [
+        new PathLayer<{ path: [number, number, number][] }>({
+          id: "bra-scope-dash",
+          data: dashes,
+          getPath: (d) => d.path,
+          getColor: [34, 211, 238, 230],
+          getWidth: 4,
+          widthUnits: "pixels" as const,
+          pickable: false,
+        }),
+      ];
+    }
+
     // ring[i][j] = 링 i · 방위 j 의 [lon, lat, z]
     const ring: [number, number, number][][] = [];
     for (let i = 1; i <= RINGS; i++) {
@@ -3869,7 +4057,7 @@ export default function TrackMap() {
         pickable: false,
       }),
     ];
-  }, [activeTool, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
+  }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
@@ -4200,9 +4388,6 @@ export default function TrackMap() {
       );
     }
 
-    // LoS 레이어 합성 (별도 useMemo)
-    layers.push(...losDeckLayers);
-
     // 커버리지 맵 합성 (2D/3D 모드에 따라 선택)
     layers.push(...coverageDeckLayers);
 
@@ -4214,6 +4399,13 @@ export default function TrackMap() {
 
     // 실측 메시 선택 마커 — 메시(불투명) 다음에 그려 depth 로 지붕 위에 안착
     layers.push(...selMarkerDeckLayers);
+
+    // LoS 레이어 합성 (별도 useMemo) — 반드시 불투명 지오메트리(건물 2D·실측 메시·선택 마커) 뒤에.
+    //   커튼 월은 depth 기록 반투명이라, 메시보다 먼저 그리면 커튼 뒤 메시 프래그먼트가 depth 탈락해
+    //   반투명 커튼 너머로 건물이 안 비치는 오클루전 버그가 된다(2026-08-15 이동). 불투명 커튼일 때는
+    //   depth 테스트가 순서 무관 동일 결과를 보장. CoS/BRA(depth 미기록 반투명)보다는 앞을 유지 —
+    //   커튼이 depth 를 기록하므로 원추가 커튼 뒤 구간에서 가려지는 기존 합성 계약 불변.
+    layers.push(...losDeckLayers);
 
     // CoS 침묵원추 합성 (별도 useMemo) — depth 미기록 반투명이라 뒤에 그려지는 Loss/아이콘과 자연 블렌드
     layers.push(...cosDeckLayers);
@@ -4607,32 +4799,13 @@ export default function TrackMap() {
                 </div>
                 <HeadingTape azimuth={losAzimuth} precise={losPrecise} bounds={bldgMode ? losBldgAzBounds : null}
                   onChange={(v) => {
-                    if (bldgMode && losFootprint && losBldgAzBounds) {
-                      // 건물모드: 컨텍스트 유지, 랩 안전 클램프 후 단일 단면도 연속 스윕
-                      const { center, minOff, maxOff } = losBldgAzBounds;
-                      const dLt = ((v - center) % 360 + 540) % 360 - 180; // wrapDelta ∈ (−180,180]
-                      const delta = Math.max(minOff, Math.min(maxOff, dLt));
-                      const az = (((center + delta) % 360) + 360) % 360;
-                      setLosFromAzDist(+az.toFixed(2), losDistanceKm);
-                      setLosAzViews(null);       // 탭 → 단일뷰(슬라이더 추종) 전환
-                      setLosAzFineCenter(az);
-                      // 최초 1회만 해당 건물로 줌인 (현재 방위·피치 유지)
-                      if (!bldgSweepZoomedRef.current) {
-                        bldgSweepZoomedRef.current = true;
-                        const map = mapRef.current?.getMap();
-                        if (map) {
-                          let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-                          for (const [la, lo] of losFootprint) { if (la < minLat) minLat = la; if (la > maxLat) maxLat = la; if (lo < minLon) minLon = lo; if (lo > maxLon) maxLon = lo; }
-                          if (minLat !== Infinity) {
-                            map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 80, maxZoom: 17.5, duration: 600, bearing: map.getBearing(), pitch: map.getPitch() });
-                          }
-                        }
-                      }
-                      // losFootprint/losSearchedAddress/losSimBuilding/losSimStats/losBldgAzBounds 유지
+                    if (bldgMode) {
+                      // 건물모드: 컨텍스트 유지, 단면도 방위 슬라이더와 동일한 공용 스윕
+                      sweepBuildingAz(v);
                     } else {
                       // 비건물모드: 기존 그대로 전부 클리어
                       setLosFromAzDist(+v.toFixed(losPrecise ? 2 : 1), losDistanceKm);
-                      setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null);
+                      setLosSearchedAddress(null); setLosFootprint(null);
                       setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosAzFineCenter(v);
                     }
                   }} />
@@ -4687,7 +4860,7 @@ export default function TrackMap() {
               {/* 지도 3D 커튼 월 채움 알파 — 상단 강조선은 영향 없음 (전 레이어 공통이라 중립 회색) */}
               <div style={{ margin: "4px 0 0", paddingLeft: 5 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
-                  <span style={{ fontSize: 11, fontWeight: 500, color: "#4b5563", flex: 1 }}>커튼 불투명도</span>
+                  <span style={{ fontSize: 11, fontWeight: 500, color: "#4b5563", flex: 1 }}>단면도 불투명도</span>
                   <span style={{ ...num, fontSize: 10, color: "#64748b" }}>{Math.round(losCurtainOpacity * 100)}%</span>
                 </div>
                 <DsSlider value={losCurtainOpacity} min={0.05} max={1} step={0.05} onChange={setLosCurtainOpacity} color="#64748b" />
@@ -4709,8 +4882,8 @@ export default function TrackMap() {
 
           {/* LoS 차단 장애물 — 출처: LoSProfilePanel chartData.pathBuildings → onPathBuildings.all
               (경로 통과 건물 전수) 중 차단(isBlocking = 최저탐지선 실꺾음 귀속 — 선을 꺾어 올리면 그
-              너머 음영을 만드므로 차단, 2026-08-09 의미론)인 건물 + 4/3 현을 관통하는 지형 봉우리(peaks)를
-              거리 오름차순으로 병합해 한 리스트로 표시.
+              너머 음영을 만드므로 차단, 2026-08-09 의미론)인 건물 + 4/3 현 관통 AND 실꺾음 귀속인
+              지형 봉우리(peaks, 건물과 동일 의미론 — 2026-08-15)를 거리 오름차순으로 병합해 한 리스트로 표시.
               색 계약은 지도/차트와 동일: 대상=파랑(#3b82f6) · 차단=빨강(#ef4444). */}
           {(() => {
             const list = losPathBldgs?.all ?? [];
@@ -5817,17 +5990,43 @@ export default function TrackMap() {
 
         </div>
 
-      {/* LoS Profile Panel (건물 분석 시 중앙/좌끝/우끝 3탭) — 드로어가 열리면 좌/우로 밀려남(드로어 우선) */}
+      {/* LoS Profile Panel (건물 분석 시 상단에 방위 슬라이더) — 드로어가 열리면 좌/우로 밀려남(드로어 우선) */}
       {losTarget && (
         <div style={{
           marginLeft: activeTool ? 300 : 0,
           marginRight: bldgDrawer ? 320 : settingsDrawer ? 224 : 0,
           transition: "margin .4s cubic-bezier(.4,0,.2,1)",
         }}>
-        <LoSProfileTabs
-          views={losAzViews ?? [{ lat: losTarget.lat, lon: losTarget.lon, label: "중앙", az: losAzimuth }]}
+        <div className="flex flex-col">
+        {/* 건물모드 방위 슬라이더 — 한계=건물 양끝 방위. 좌↔우끝을 연속 스윕 (구 3탭 대체) */}
+        {losFootprint && losBldgAzBounds && (() => {
+          const { center, minOff, maxOff } = losBldgAzBounds;
+          const wrap = (a: number) => ((a % 360) + 360) % 360;
+          const curOff = Math.max(minOff, Math.min(maxOff, ((losAzimuth - center) % 360 + 540) % 360 - 180));
+          return (
+            <div data-tour="tm-los-az-slider"
+              className="flex items-center gap-2.5 border-t border-gray-200 bg-gray-50 px-3 py-1.5">
+              <span className="flex items-baseline gap-1 text-[11px] font-semibold text-gray-500 whitespace-nowrap">
+                좌끝<span className="font-mono text-[9px] font-medium opacity-70">{wrap(center + minOff).toFixed(1)}°</span>
+              </span>
+              <div className="flex-1">
+                <DsSlider value={curOff} min={minOff} max={maxOff} step={0.01}
+                  onChange={(off) => sweepBuildingAz(center + off)} />
+              </div>
+              <span className="flex items-baseline gap-1 text-[11px] font-semibold text-gray-500 whitespace-nowrap">
+                우끝<span className="font-mono text-[9px] font-medium opacity-70">{wrap(center + maxOff).toFixed(1)}°</span>
+              </span>
+              <span className="flex items-baseline gap-1 text-[11px] font-semibold whitespace-nowrap" style={{ color: ACCENT }}>
+                방위<span className="font-mono text-[9px] font-medium">{losAzimuth.toFixed(2)}°</span>
+              </span>
+            </div>
+          );
+        })()}
+        <LoSProfilePanel
+          targetLat={losTarget.lat}
+          targetLon={losTarget.lon}
           radarSite={radarSite}
-          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setLosSearchedAddress(null); setLosFootprint(null); setLosAzViews(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosPathBldgs(null); setLosCursorPicking(true); }}
+          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setLosSearchedAddress(null); setLosFootprint(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosPathBldgs(null); setLosCursorPicking(true); }}
           searchedAddress={losSearchedAddress}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
@@ -5852,8 +6051,8 @@ export default function TrackMap() {
           onSimStats={setLosSimStats}
           onCurtainData={setLosCurtain}
           onPathBuildings={setLosPathBldgs}
-          onActiveViewChange={setLosActiveViewIdx}
         />
+        </div>
         </div>
       )}
 

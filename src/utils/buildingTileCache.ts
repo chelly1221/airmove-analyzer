@@ -11,6 +11,8 @@
  * - 앵커 거리 오름차순으로 근경부터 채운 뒤 타일 상한(MAX_TILES_PER_FETCH)으로 하드캡 (줌 무관).
  *   (뷰포트 클램프 자체도 줌 14+ 에서만 호출부 TrackMap 이 수행 — 피치 시 bounds 가 지평선까지
  *    확장되어 수백 km² 타일이 fetch 되는 것을 앵커±반경 박스로 제한)
+ * - 별도 경로: fetchBuildingsInRadius (BRA 분석 원 내부 전량, 높이 필터 없음) — 줌 연동 타일 크기와
+ *   섞이지 않도록 글로벌 캐시를 쓰지 않는 완전 독립 구현
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -331,6 +333,122 @@ export async function fetchBuildingsForViewport(
     cacheHits: cachedTiles.length,
     fetched,
   };
+}
+
+// ── 반경 원 내부 전량 조회 (BRA 분석 범위 전용) ────────────────
+
+/** 반경 조회의 고정 타일 크기 (도, ~1.1km) — 줌 비연동.
+ *  뷰포트 캐시(tileSize)는 줌마다 타일 크기가 달라 캐시가 통째로 무효화되므로 공유하지 않는다. */
+const RADIUS_TILE_SIZE = 0.01;
+/** 타일당 상한 (뷰포트 경로와 동일) */
+const RADIUS_TILE_MAX_COUNT = 15000;
+/** 동시 invoke 수 — 대용량 단일 응답 금지(CLAUDE.md) 준수를 위해 타일 분할 유지 */
+const RADIUS_BATCH_SIZE = 6;
+/** 진행 콜백 최소 간격 (ms) — 커밋마다 MapLibre setData→geojson-vt 재인덱싱이 돈다 */
+const RADIUS_PROGRESS_MS = 600;
+
+/**
+ * 중심점 기준 반경 원 내부의 건물을 **높이 필터 없이 전량** 조회 (BRA 분석 범위 상시 3D 표출용).
+ *
+ * 뷰포트 경로와 달리 **글로벌 타일 캐시(_cache)를 사용하지 않는다** — 타일 크기가 줌 연동이라
+ * 섞이면 줌 변경 시 이 데이터까지 함께 무효화되고, 반대로 minHeight 0 타일이 캐시에 남아
+ * 뷰포트 경로의 히트 판정을 왜곡한다.
+ *
+ * 타일은 원과 교차하는 것만(사각형↔중심 최근접점 거리 ≤ 반경) 채택해 중심 근접 순으로
+ * 소량 배치 invoke → 원 밖 centroid 를 걸러 누적한다. suppressed_by/출처 제외는 Rust 쿼리가
+ * 이미 처리하므로 프론트에서 추가 필터를 걸지 않는다.
+ *
+ * @param center 원 중심 (레이더 좌표)
+ * @param radiusKm 반경 (km) — BRA 결과 스냅샷 max_range_km
+ * @param excludeSources 제외할 출처
+ * @param onProgress 점진 콜백 (RADIUS_PROGRESS_MS 스로틀, 마지막 1회는 반환 배열과 동일 참조)
+ */
+export async function fetchBuildingsInRadius(
+  center: { lat: number; lon: number },
+  radiusKm: number,
+  excludeSources: string[],
+  onProgress?: (buildings: Building3D[]) => void,
+): Promise<Building3D[]> {
+  const cosLat = Math.max(Math.cos((center.lat * Math.PI) / 180), 1e-6);
+  const dLat = radiusKm / KM_PER_DEG;
+  const dLon = radiusKm / (KM_PER_DEG * cosLat);
+  const r2 = radiusKm * radiusKm;
+
+  // bbox → 고정 그리드 타일 인덱스
+  const latStart = Math.floor((center.lat - dLat) / RADIUS_TILE_SIZE);
+  const latEnd = Math.floor((center.lat + dLat) / RADIUS_TILE_SIZE);
+  const lonStart = Math.floor((center.lon - dLon) / RADIUS_TILE_SIZE);
+  const lonEnd = Math.floor((center.lon + dLon) / RADIUS_TILE_SIZE);
+
+  const tiles: { latIdx: number; lonIdx: number; dist: number }[] = [];
+  for (let li = latStart; li <= latEnd; li++) {
+    for (let lj = lonStart; lj <= lonEnd; lj++) {
+      const south = li * RADIUS_TILE_SIZE;
+      const north = (li + 1) * RADIUS_TILE_SIZE;
+      const west = lj * RADIUS_TILE_SIZE;
+      const east = (lj + 1) * RADIUS_TILE_SIZE;
+      // 타일 사각형에서 중심까지의 최근접점 거리 ≤ 반경 → 원과 교차하는 타일만 채택
+      const nearLat = Math.min(Math.max(center.lat, south), north);
+      const nearLon = Math.min(Math.max(center.lon, west), east);
+      const ny = (nearLat - center.lat) * KM_PER_DEG;
+      const nx = (nearLon - center.lon) * KM_PER_DEG * cosLat;
+      if (nx * nx + ny * ny > r2) continue;
+      // 정렬 기준은 타일 중심 거리 — 중심(레이더) 근경부터 채워진다
+      const cy = ((li + 0.5) * RADIUS_TILE_SIZE - center.lat) * KM_PER_DEG;
+      const cx = ((lj + 0.5) * RADIUS_TILE_SIZE - center.lon) * KM_PER_DEG * cosLat;
+      tiles.push({ latIdx: li, lonIdx: lj, dist: Math.sqrt(cx * cx + cy * cy) });
+    }
+  }
+  tiles.sort((a, b) => a.dist - b.dist);
+
+  const acc: Building3D[] = [];
+  let lastProgress = Date.now();
+
+  for (let bi = 0; bi < tiles.length; bi += RADIUS_BATCH_SIZE) {
+    const batch = tiles.slice(bi, bi + RADIUS_BATCH_SIZE);
+    const loaded = await Promise.all(batch.map(async ({ latIdx, lonIdx }) => {
+      try {
+        const result = await invoke<Buildings3DBinaryResult>("query_buildings_3d_binary", {
+          minLat: latIdx * RADIUS_TILE_SIZE,
+          maxLat: (latIdx + 1) * RADIUS_TILE_SIZE,
+          minLon: lonIdx * RADIUS_TILE_SIZE,
+          maxLon: (lonIdx + 1) * RADIUS_TILE_SIZE,
+          minHeightM: 0, // 높이 필터 없음 — 분석 범위 내 전체 건물
+          maxCount: RADIUS_TILE_MAX_COUNT,
+          excludeSources,
+        });
+        // 상한 도달 = 절단 가능 (침묵 절단 금지)
+        if (result.count >= RADIUS_TILE_MAX_COUNT) {
+          console.warn(`BRA 범위 타일 (${latIdx},${lonIdx}) 상한 ${RADIUS_TILE_MAX_COUNT}동 도달 — 일부 건물 누락 가능`);
+        }
+        return await unpackBuildingsOffThread(result.coords, result.meta, result.count);
+      } catch (err) {
+        console.warn(`BRA 범위 타일 (${latIdx},${lonIdx}) 로드 실패:`, err);
+        return [] as Building3D[];
+      }
+    }));
+
+    // centroid 가 원 내부인 건물만 누적 (spread 금지 — 대량 배열 push(...) 는 스택 오버플로우)
+    for (const list of loaded) {
+      for (const b of list) {
+        const dy = (b.lat - center.lat) * KM_PER_DEG;
+        const dx = (b.lon - center.lon) * KM_PER_DEG * cosLat;
+        if (dx * dx + dy * dy <= r2) acc.push(b);
+      }
+    }
+
+    if (onProgress) {
+      const now = Date.now();
+      if (now - lastProgress >= RADIUS_PROGRESS_MS) {
+        lastProgress = now;
+        onProgress(acc.slice()); // 중간 커밋은 사본 (이후 push 로 인한 참조 공유 방지)
+      }
+    }
+  }
+
+  // 마지막 1회는 반환 배열과 동일 참조 — 호출부가 아이덴티티 비교로 중복 커밋을 스킵할 수 있게 한다
+  if (onProgress) onProgress(acc);
+  return acc;
 }
 
 // ── MapLibre GeoJSON 변환 ──────────────────────────────────────
