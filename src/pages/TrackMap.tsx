@@ -20,6 +20,7 @@ import {
   CloudRain,
   Settings,
   Cone,
+  Radius,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -5091,21 +5092,21 @@ export default function TrackMap() {
                 <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>원추 반경</span>
                 <span style={{ ...num, fontSize: 10, color: "#22d3ee" }}>{braConeRadiusKm}km</span>
               </div>
-              <DsSlider value={braConeRadiusKm} min={1} max={10} step={1} onChange={setBraConeRadiusKm} color="#22d3ee" />
+              <DsSlider value={braConeRadiusKm} min={1} max={10} step={0.1} onChange={setBraConeRadiusKm} color="#22d3ee" />
             </div>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
                 <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>원추 불투명도</span>
                 <span style={{ ...num, fontSize: 10, color: "#22d3ee" }}>{Math.round(braConeOpacity * 100)}%</span>
               </div>
-              <DsSlider value={braConeOpacity} min={0.05} max={1} step={0.05} onChange={setBraConeOpacity} color="#22d3ee" />
+              <DsSlider value={braConeOpacity} min={0.05} max={1} step={0.01} onChange={setBraConeOpacity} color="#22d3ee" />
             </div>
             <button
               onClick={runBraAnalysis} disabled={braLoading}
               style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "7px 10px", borderRadius: 7, border: "none", width: "100%",
                 fontSize: 11.5, fontWeight: 700, cursor: braLoading ? "default" : "pointer",
                 background: braLoading ? G[300] : ACCENT, color: "#fff" }}>
-              {braLoading ? <Loader2 size={12} className="animate-spin" /> : <Cone size={12} />}
+              {braLoading ? <Loader2 size={12} className="animate-spin" /> : <Radius size={12} />}
               {braLoading ? "분석 중…" : "분석 실행"}
             </button>
             {braError && (
@@ -5596,7 +5597,7 @@ export default function TrackMap() {
           <div className="space-y-1.5">
             <ToolButton icon={Mountain} label="LoS 분석" active={activeTool === "los"} onClick={() => handleToolClick("los")} dataTour="tm-tool-los" />
             <ToolButton icon={Radar} label="커버리지 맵" active={activeTool === "coverage"} onClick={() => handleToolClick("coverage")} />
-            <ToolButton icon={Cone} label="BRA 분석" active={activeTool === "bra"} onClick={() => handleToolClick("bra")} />
+            <ToolButton icon={Radius} label="BRA 분석" active={activeTool === "bra"} onClick={() => handleToolClick("bra")} />
           </div>
         </div>
         </div>,
