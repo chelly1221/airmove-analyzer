@@ -119,11 +119,19 @@ const TrackHeatIcon = ({ size = 16 }: { size?: number }) => (
   </svg>
 );
 
-/** 항적 히트맵 색상 램프 — OM 보고서 항적 히트맵(chartDensityHeatmap.ts 의 HEATMAP_TRACK_RGB
- *  = blue-600 [37,99,235])과 동일 계열 단일 파랑. 밀도↑ = 알파↑·명도↓ 6스톱. */
-const HEAT_COLOR_RANGE: [number, number, number, number][] = [
-  [37, 99, 235, 40], [37, 99, 235, 100], [37, 99, 235, 160],
-  [29, 78, 216, 200], [30, 64, 175, 230], [23, 37, 84, 255],
+/** 히트맵 램프 — OM 보고서 §1 전체표적 히트맵(ReportOMTargetHeatmapMap 의 HEAT_STOPS:
+ *  ColorBrewer 램프 + ln(1+v) 정규화 + alpha 상승)의 룩을 deck.gl 선형 매핑에서 근사.
+ *  로그 정규화 효과는 스톱 색을 진한 후반부 위주로 전진 배치하고 intensity 바이어스(>1)로 재현 —
+ *  저밀도부터 또렷하고 고밀도는 진하게 타오르는 전형적 히트맵 룩. 정상 항적=파랑(Blues). */
+const HEAT_BLUE_RANGE: [number, number, number, number][] = [
+  [158, 202, 225, 120], [107, 174, 214, 160], [66, 146, 198, 190],
+  [33, 113, 181, 215], [8, 81, 156, 235], [8, 48, 107, 250],
+];
+
+/** 소실표적 히트맵 램프 — 보고서 HEAT_STOPS 와 동일 색상열(ColorBrewer Reds) 진한 구간 6스톱 */
+const HEAT_RED_RANGE: [number, number, number, number][] = [
+  [252, 146, 114, 120], [251, 106, 74, 160], [239, 59, 44, 190],
+  [203, 24, 29, 215], [153, 0, 13, 235], [103, 0, 13, 250],
 ];
 
 
@@ -2554,6 +2562,12 @@ export default function TrackMap() {
     );
   }, [trackDisplay, allPoints, visibleMinTs, visibleMaxTs]);
 
+  // 히트맵 모드 소실표적 (범례 '표적소실' 토글 준수) — 정상 항적과 분리된 빨강 램프로 집계
+  const heatLossPoints = useMemo(() => {
+    if (trackDisplay !== "heatmap" || hiddenLegendItems.has("loss")) return [];
+    return signalLossPoints;
+  }, [trackDisplay, hiddenLegendItems, signalLossPoints]);
+
   // 레이더 동심원 + 귀치도 (MapLibre 네이티브 레이어 - 지형에 밀착)
   useEffect(() => {
     const map = mapRef.current?.getMap();
@@ -3546,8 +3560,8 @@ export default function TrackMap() {
 
   // Loss 포인트 전용 deck.gl 레이어 (Loss 데이터 변경 시에만 재생성)
   const lossDeckLayers = useMemo(() => {
-    // 항적 표시 '끄기' 시 Loss 마커도 함께 숨김
-    if (signalLossPoints.length === 0 || hiddenLegendItems.has("loss") || trackDisplay === "off") return [];
+    // 항적 표시 '끄기' 시 Loss 마커도 함께 숨김. 히트맵 모드에서는 소실표적이 빨강 히트맵으로 집계되므로 점 마커 중복 표출 억제
+    if (signalLossPoints.length === 0 || hiddenLegendItems.has("loss") || trackDisplay === "off" || trackDisplay === "heatmap") return [];
     const acName = (ms: string) => {
       const a = aircraft.find((ac) => ac.mode_s_code.toLowerCase() === ms.toLowerCase());
       return a ? a.name : ms;
@@ -4299,7 +4313,8 @@ export default function TrackMap() {
         })
       );
     } else if (trackDisplay === "heatmap") {
-      // 탐지점 밀도 히트맵 — 지면 집계라 고도/altScale/losMode 와 무관
+      // 탐지점 밀도 히트맵 — 지면 집계라 고도/altScale/losMode 와 무관.
+      // 정상 항적(파랑) 위에 소실표적(빨강)을 얹어 소실 밀집 구역이 위로 드러나게 합성
       layers.push(
         new HeatmapLayer<TrackPoint>({
           id: "track-heatmap",
@@ -4307,13 +4322,29 @@ export default function TrackMap() {
           getPosition: (d) => [d.longitude, d.latitude],
           getWeight: 1,
           radiusPixels: 30,
-          intensity: 1,
-          threshold: 0.05,
+          intensity: 3,
+          threshold: 0.03,
           aggregation: "SUM",
-          colorRange: HEAT_COLOR_RANGE,
+          colorRange: HEAT_BLUE_RANGE,
           pickable: false,
         })
       );
+      if (heatLossPoints.length > 0) {
+        layers.push(
+          new HeatmapLayer<LossPoint>({
+            id: "loss-heatmap",
+            data: heatLossPoints,
+            getPosition: (d) => [d.longitude, d.latitude],
+            getWeight: 1,
+            radiusPixels: 30,
+            intensity: 3,
+            threshold: 0.03,
+            aggregation: "SUM",
+            colorRange: HEAT_RED_RANGE,
+            pickable: false,
+          })
+        );
+      }
     } else if (trackDisplay === "line") {
       layers.push(
         new PathLayer<TrackPath>({
@@ -4556,7 +4587,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, heatLossPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
