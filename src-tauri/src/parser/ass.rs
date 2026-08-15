@@ -89,6 +89,10 @@ struct Cat048Record {
     mode_s_address: Option<u32>,
     mode3a: Option<u16>,
     mode3a_garbled: bool,
+    /// I048/090 V 플래그 (1 = 고도 미검증) — 통계 전용, 고도 채택 정책에는 미개입
+    fl_v_flag: bool,
+    /// I048/090 G 플래그 (1 = 고도 garbled) — 통계 전용, 고도 채택 정책에는 미개입
+    fl_g_flag: bool,
     radar_typ: u8,
     sim_flag: bool,
     track_number: Option<u16>,
@@ -1845,8 +1849,11 @@ fn parse_cat048_record(
             UAP_I090 => {
                 if pos + 2 > block.len() { truncated = true; break; }
                 let raw = u16::from_be_bytes([block[pos], block[pos + 1]]);
-                let _v_flag = (raw >> 15) & 1; // 0=validated, 1=not validated
-                let _g_flag = (raw >> 14) & 1; // 0=ok, 1=garbled
+                let v_flag = (raw >> 15) & 1; // 0=validated, 1=not validated
+                let g_flag = (raw >> 14) & 1; // 0=ok, 1=garbled
+                // 통계 집계용으로만 보존 — 아래 고도 채택 로직은 기존 정책 그대로 유지
+                record.fl_v_flag = v_flag == 1;
+                record.fl_g_flag = g_flag == 1;
                 // I090: bits 15=V, 14=G, bits 13-0 = Flight Level (14-bit signed, LSB=1/4 FL)
                 // V=1(미검증)이어도 고도 정보 활용 (데이터 손실 방지)
                 // G=1(garbled)이어도 대략 유효한 경우가 많으므로 수용
@@ -2185,6 +2192,22 @@ pub struct AsterixFileStat {
     pub bytes: u64,
     pub frames: u64,
     pub records: u64,
+    /// 파일 내 레코드 절대시각(Unix 초) 최소/최대 — abs_time 없는 파일이면 None
+    pub time_min: Option<f64>,
+    pub time_max: Option<f64>,
+    /// I140 TOD→UTC 자동보정량(시간). 0.0 = 보정 없음. KST 인코딩 파일이면 -9.0
+    pub tod_shift_hours: f64,
+}
+
+/// 시간대별 레코드 밀도 (수집 공백 시각화용). 출력 버킷 ≤ 1,440개.
+#[derive(Serialize, Clone)]
+pub struct TimeDensity {
+    /// 첫 버킷 시작 Unix 초 (분 정렬)
+    pub start_ts: f64,
+    /// 버킷 폭(초), 60의 배수
+    pub bucket_secs: u32,
+    /// 버킷별 레코드 수 (빈 구간은 0)
+    pub counts: Vec<u64>,
 }
 
 /// 대시보드 집계 통계 (전수 1패스).
@@ -2213,6 +2236,18 @@ pub struct AsterixStats {
     pub nec_dates: Vec<String>,
     pub acas_ra_records: u64,
     pub mode3a_garbled: u64,
+    /// 시간대별 레코드 밀도 — abs_time 보유 레코드가 없으면 None
+    pub time_density: Option<TimeDensity>,
+    /// I048/040 ρ 10NM 구간 히스토그램 (0번 구간부터 마지막 관측 구간까지 연속)
+    pub range_hist: Vec<LabeledCount>,
+    /// I048/040 θ 10° 섹터 히스토그램 (관측 있으면 길이 36 고정, 없으면 빈 Vec)
+    pub azimuth_hist: Vec<u64>,
+    /// I048/090 고도 1,000ft 구간 히스토그램 (고도 오름차순)
+    pub fl_hist: Vec<LabeledCount>,
+    /// I048/090 V=1(미검증) 레코드 수
+    pub fl_v_invalid: u64,
+    /// I048/090 G=1(garbled) 레코드 수
+    pub fl_g_garbled: u64,
     pub files: Vec<AsterixFileStat>,
 }
 
@@ -2255,6 +2290,15 @@ pub struct AsterixQueryResult {
     pub frames: Vec<AsterixFrameSummary>,
 }
 
+/// 10° 섹터 36개 카운터 — `[u64; 36]` 은 Default 파생 대상(길이 ≤32)이 아니라 얇게 감싼다.
+struct AzimuthBins([u64; 36]);
+
+impl Default for AzimuthBins {
+    fn default() -> Self {
+        Self([0u64; 36])
+    }
+}
+
 /// 스캔 1패스에서 채우는 내부 누산기 (여러 파일에 걸쳐 공유).
 #[derive(Default)]
 struct StatAccum {
@@ -2280,6 +2324,18 @@ struct StatAccum {
     skipped_bytes: u64,
     parse_errors: u64,
     block_count: u64,
+    /// 분 단위 버킷 → 레코드 수 (key = (abs_time / 60.0).floor())
+    time_buckets: HashMap<i64, u64>,
+    /// I040 ρ 10NM 구간 (idx = (rho/10), ρ<256 보장이나 안전상 25로 클램프)
+    range_bins: [u64; 26],
+    /// I040 θ 10° 섹터
+    azimuth_bins: AzimuthBins,
+    /// I090 고도 구간 (key = (fl/10).floor() → 1,000ft 단위, 음수 허용)
+    fl_bins: HashMap<i32, u64>,
+    /// I090 V=1 레코드 수
+    fl_v_invalid: u64,
+    /// I090 G=1 레코드 수
+    fl_g_garbled: u64,
 }
 
 /// 스캔 진행 상태 (커맨드가 파일별로 누적 후 finalize).
@@ -2303,6 +2359,13 @@ struct ScanRecord {
     frns: Vec<usize>,
     truncated: bool,
     mode3a_garbled: bool,
+    /// I048/040 극좌표 (거리/방위 분포 집계용)
+    rho_nm: Option<f64>,
+    theta_deg: Option<f64>,
+    /// I048/090 고도(FL) 및 V/G 플래그
+    flight_level: Option<f64>,
+    fl_v: bool,
+    fl_g: bool,
 }
 
 /// 한 프레임(NEC 헤더~다음 헤더 직전, 또는 비프레이밍 시 단일 블록).
@@ -2446,6 +2509,11 @@ fn parse_block_records(
                         frns,
                         truncated,
                         mode3a_garbled: record.mode3a_garbled,
+                        rho_nm: record.rho_nm,
+                        theta_deg: record.theta_deg,
+                        flight_level: record.flight_level,
+                        fl_v: record.fl_v_flag,
+                        fl_g: record.fl_g_flag,
                     });
                     if next <= rec_offset {
                         break;
@@ -2486,6 +2554,11 @@ fn parse_block_records(
             frns: Vec::new(),
             truncated: false,
             mode3a_garbled: false,
+            rho_nm: None,
+            theta_deg: None,
+            flight_level: None,
+            fl_v: false,
+            fl_g: false,
         });
     }
     recs
@@ -2603,6 +2676,9 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
 
     let mut file_frames = 0u64;
     let mut file_records = 0u64;
+    // 파일별 시각 범위 (파일별 요약 컬럼용)
+    let mut file_time_min: Option<f64> = None;
+    let mut file_time_max: Option<f64> = None;
 
     walk_asterix(
         &data,
@@ -2634,6 +2710,10 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
                 if let Some(a) = r.abs_time {
                     acc.time_min = Some(acc.time_min.map_or(a, |m| m.min(a)));
                     acc.time_max = Some(acc.time_max.map_or(a, |m| m.max(a)));
+                    file_time_min = Some(file_time_min.map_or(a, |m: f64| m.min(a)));
+                    file_time_max = Some(file_time_max.map_or(a, |m: f64| m.max(a)));
+                    // 분 단위 버킷 누산 (CAT 무관 — abs_time 보유 레코드 전부)
+                    *acc.time_buckets.entry((a / 60.0).floor() as i64).or_insert(0) += 1;
                 }
                 match r.cat {
                     CAT048 => {
@@ -2650,6 +2730,25 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
                         *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
                         if let Some(ms) = r.mode_s {
                             *acc.modes.entry(ms).or_insert(0) += 1;
+                        }
+                        // 거리(10NM)·방위(10°) 분포 — I040 보유 레코드만
+                        if let Some(rho) = r.rho_nm {
+                            acc.range_bins[((rho / 10.0) as usize).min(25)] += 1;
+                            if let Some(th) = r.theta_deg {
+                                let sector = ((th / 10.0) as usize) % 36;
+                                acc.azimuth_bins.0[sector] += 1;
+                            }
+                        }
+                        // 고도(1,000ft) 분포 — I090 보유 레코드만
+                        if let Some(fl) = r.flight_level {
+                            *acc.fl_bins.entry((fl / 10.0).floor() as i32).or_insert(0) += 1;
+                        }
+                        // V/G 플래그는 고도 채택 여부와 무관하게 카운트
+                        if r.fl_v {
+                            acc.fl_v_invalid += 1;
+                        }
+                        if r.fl_g {
+                            acc.fl_g_garbled += 1;
                         }
                     }
                     CAT034 => {
@@ -2685,6 +2784,9 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
         bytes: data.len() as u64,
         frames: file_frames,
         records: file_records,
+        time_min: file_time_min,
+        time_max: file_time_max,
+        tod_shift_hours: tod_utc_shift / 3600.0,
     });
 
     Ok(())
@@ -2778,6 +2880,94 @@ pub fn asterix_finalize(state: AsterixScanState) -> AsterixStats {
         .map(|&(m, d)| format!("{:02}-{:02}", m, d))
         .collect();
 
+    // 시간대별 밀도 — 분 버킷을 최대 1,440개로 리샘플 (빈 구간은 0 유지)
+    let time_density = if acc.time_buckets.is_empty() {
+        None
+    } else {
+        let min_k = *acc.time_buckets.keys().min().unwrap();
+        let max_k = *acc.time_buckets.keys().max().unwrap();
+        let span = (max_k - min_k + 1) as u64;
+        let factor = span.div_ceil(1440).max(1);
+        let n = span.div_ceil(factor) as usize;
+        let mut counts = vec![0u64; n];
+        for (&k, &c) in &acc.time_buckets {
+            let idx = ((k - min_k) as u64 / factor) as usize;
+            if idx < n {
+                counts[idx] += c;
+            }
+        }
+        Some(TimeDensity {
+            start_ts: min_k as f64 * 60.0,
+            bucket_secs: (60 * factor) as u32,
+            counts,
+        })
+    };
+
+    // 거리 분포 — 0번 구간부터 마지막 관측 구간까지 0 포함 연속 (히스토그램 모양 보존)
+    let range_hist: Vec<LabeledCount> = match acc.range_bins.iter().rposition(|&c| c > 0) {
+        None => Vec::new(),
+        Some(last) => (0..=last)
+            .map(|i| LabeledCount {
+                key: (i * 10).to_string(),
+                label: format!("{}\u{2013}{} NM", i * 10, (i + 1) * 10),
+                count: acc.range_bins[i],
+            })
+            .collect(),
+    };
+
+    // 방위 분포 — 관측 없으면 빈 Vec, 있으면 36섹터 고정
+    let azimuth_hist: Vec<u64> = if acc.azimuth_bins.0.iter().all(|&c| c == 0) {
+        Vec::new()
+    } else {
+        acc.azimuth_bins.0.to_vec()
+    };
+
+    // 고도 분포 — 정상 범위(≤60구간)면 사이 0 포함 연속, 오염 데이터면 관측 구간만
+    let fl_hist: Vec<LabeledCount> = if acc.fl_bins.is_empty() {
+        Vec::new()
+    } else {
+        let lo = *acc.fl_bins.keys().min().unwrap();
+        let hi = *acc.fl_bins.keys().max().unwrap();
+        let fl_label = |b: i32| -> String {
+            let fmt = |ft: i32| -> String {
+                let s = ft.unsigned_abs().to_string();
+                // 천단위 콤마
+                let mut out = String::new();
+                for (i, ch) in s.chars().enumerate() {
+                    if i > 0 && (s.len() - i) % 3 == 0 {
+                        out.push(',');
+                    }
+                    out.push(ch);
+                }
+                if ft < 0 {
+                    format!("\u{2212}{}", out)
+                } else {
+                    out
+                }
+            };
+            format!("{}\u{2013}{} ft", fmt(b * 1000), fmt((b + 1) * 1000))
+        };
+        if (hi - lo) < 60 {
+            (lo..=hi)
+                .map(|b| LabeledCount {
+                    key: b.to_string(),
+                    label: fl_label(b),
+                    count: *acc.fl_bins.get(&b).unwrap_or(&0),
+                })
+                .collect()
+        } else {
+            let mut keys: Vec<i32> = acc.fl_bins.keys().copied().collect();
+            keys.sort_unstable();
+            keys.into_iter()
+                .map(|b| LabeledCount {
+                    key: b.to_string(),
+                    label: fl_label(b),
+                    count: acc.fl_bins[&b],
+                })
+                .collect()
+        }
+    };
+
     AsterixStats {
         file_count: state.files.len(),
         total_bytes: acc.total_bytes,
@@ -2802,6 +2992,12 @@ pub fn asterix_finalize(state: AsterixScanState) -> AsterixStats {
         nec_dates,
         acas_ra_records: acc.acas_ra,
         mode3a_garbled: acc.mode3a_garbled,
+        time_density,
+        range_hist,
+        azimuth_hist,
+        fl_hist,
+        fl_v_invalid: acc.fl_v_invalid,
+        fl_g_garbled: acc.fl_g_garbled,
         files: state.files,
     }
 }

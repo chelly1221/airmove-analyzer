@@ -28,6 +28,7 @@ import type {
   AsterixQueryResult,
   AsterixFilter,
   LabeledCount,
+  TimeDensity,
 } from "../types/asterix";
 import type { Aircraft } from "../types";
 
@@ -61,6 +62,12 @@ function formatTime(ts: number, tz: TzMode): string {
   const d = new Date((ts + (tz === "KST" ? KST_OFFSET_SECS : 0)) * 1000);
   const yy = String(d.getUTCFullYear()).slice(2);
   return `${yy}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+/** I140 TOD→UTC 보정량(시간) 표기 — 부호 명시(U+2212), 소수부는 필요할 때만 */
+function fmtShiftH(h: number): string {
+  const a = Math.abs(h);
+  return `${h < 0 ? "−" : "+"}${Number.isInteger(a) ? String(a) : a.toFixed(1)}h`;
 }
 
 function dtLocalToTs(s: string, tz: TzMode): number | null {
@@ -129,12 +136,43 @@ function useAsterixScan() {
 
 // ─── 대시보드 보조 컴포넌트 ──────────────────────────
 
-function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
-  return (
-    <div className="rounded-lg border border-gray-200 bg-[#f8f9fa] px-3 py-2">
+function StatCard({
+  label,
+  value,
+  sub,
+  onClick,
+  title,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  onClick?: () => void;
+  title?: string;
+}) {
+  const body = (
+    <>
       <div className="text-[10px] uppercase tracking-wider text-gray-400">{label}</div>
       <div className="mt-0.5 text-lg font-semibold tabular-nums text-gray-800">{value}</div>
       {sub && <div className="text-[10px] text-gray-400">{sub}</div>}
+    </>
+  );
+  const base = "rounded-lg border border-gray-200 bg-[#f8f9fa] px-3 py-2";
+  // onClick 있으면 버튼화 (외형은 동일, 호버 강조만 추가)
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        title={title}
+        className={`${base} w-full cursor-pointer text-left transition-colors hover:border-[#a60739]/40`}
+      >
+        {body}
+      </button>
+    );
+  }
+  return (
+    <div className={base} title={title}>
+      {body}
     </div>
   );
 }
@@ -180,9 +218,215 @@ function LabeledBars({ items, total, color }: { items: LabeledCount[]; total: nu
   );
 }
 
+// ─── 차트 (순수 SVG, 단일 시리즈 · 단일 색상) ────────
+
+const CHART_INK = "#a60739";
+
+/** 툴팁이 차트 밖으로 크게 튀지 않도록 x 위치를 컨테이너 안쪽으로 당김 */
+function clampTipX(x: number, width: number): number {
+  if (width <= 120) return x;
+  return Math.min(Math.max(x, 55), width - 55);
+}
+
+/** 차트 공용 호버 툴팁 — 컨테이너(relative) 기준 절대 배치 */
+function ChartTip({ x, text }: { x: number; text: string }) {
+  return (
+    <div
+      className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded bg-gray-900/90 px-1.5 py-0.5 text-[10px] text-white shadow-sm"
+      style={{ left: x }}
+    >
+      {text}
+    </div>
+  );
+}
+
+/**
+ * 시간대별 레코드 밀도 — 버킷 스텝 실루엣.
+ * 0 카운트 구간은 기준선까지 떨어져 수집 공백이 그대로 보인다.
+ */
+function TimeDensityChart({ density, tz }: { density: TimeDensity; tz: TzMode }) {
+  const { start_ts, bucket_secs, counts } = density;
+  const n = counts.length;
+  const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
+
+  const H = 56; // 그래프 본체 높이 (viewBox 단위 = px)
+  const maxCount = useMemo(() => counts.reduce((a, b) => (b > a ? b : a), 0), [counts]);
+
+  // 스텝 경로 (상단선) + 기준선까지 닫은 면적 경로
+  const { line, area } = useMemo(() => {
+    const scale = maxCount > 0 ? (H - 2) / maxCount : 0;
+    let d = "";
+    for (let i = 0; i < n; i++) {
+      const y = (H - counts[i] * scale).toFixed(2);
+      d += `${i === 0 ? "M" : " L"}${i} ${y} L${i + 1} ${y}`;
+    }
+    return { line: d, area: n > 0 ? `${d} L${n} ${H} L0 ${H} Z` : "" };
+  }, [counts, n, maxCount]);
+
+  // x축 눈금 3~5개 (스팬 하루 미만이면 HH:MM, 이상이면 MM-DD HH:MM)
+  const spanSecs = n * bucket_secs;
+  const withDate = spanSecs >= 86400;
+  const ticks = useMemo(() => {
+    const k = Math.min(5, Math.max(2, n));
+    return Array.from({ length: k }, (_, i) => {
+      const frac = k === 1 ? 0 : i / (k - 1);
+      const ts = start_ts + frac * spanSecs;
+      const full = formatTime(ts, tz);
+      return { frac, label: withDate ? full.slice(3, 14) : full.slice(9, 14) };
+    });
+  }, [n, start_ts, spanSecs, withDate, tz]);
+
+  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const frac = (e.clientX - rect.left) / rect.width;
+    const idx = Math.min(n - 1, Math.max(0, Math.floor(frac * n)));
+    setHover({ idx, x: clampTipX(((idx + 0.5) / n) * rect.width, rect.width) });
+  };
+
+  const tipText = (() => {
+    if (!hover) return "";
+    const s = start_ts + hover.idx * bucket_secs;
+    const e = s + bucket_secs;
+    const head = withDate ? formatTime(s, tz).slice(3, 14) : formatTime(s, tz).slice(9, 14);
+    const tail = formatTime(e, tz).slice(9, 14);
+    return `${head}~${tail} · ${counts[hover.idx].toLocaleString()}건`;
+  })();
+
+  if (n === 0) return null;
+
+  return (
+    <div className="mt-2">
+      <div className="mb-0.5 flex items-baseline justify-between">
+        <span className="text-[10px] uppercase tracking-wider text-gray-400">시간대별 레코드 밀도</span>
+        <span className="text-[10px] text-gray-400">
+          분해능 {(bucket_secs / 60).toLocaleString()}분 · 최대 {maxCount.toLocaleString()}건/버킷
+        </span>
+      </div>
+      <div className="relative">
+        {hover && <ChartTip x={hover.x} text={tipText} />}
+        <svg
+          viewBox={`0 0 ${n} ${H}`}
+          preserveAspectRatio="none"
+          className="block w-full"
+          style={{ height: H }}
+          onPointerMove={onMove}
+          onPointerLeave={() => setHover(null)}
+        >
+          <path d={area} fill={CHART_INK} opacity={0.15} />
+          <path
+            d={line}
+            fill="none"
+            stroke={CHART_INK}
+            strokeWidth={1.5}
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
+          {hover && (
+            <line
+              x1={hover.idx + 0.5}
+              x2={hover.idx + 0.5}
+              y1={0}
+              y2={H}
+              stroke={CHART_INK}
+              strokeWidth={1}
+              opacity={0.45}
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+        <div className="h-px w-full bg-gray-200" />
+        <div className="relative mt-0.5 h-3">
+          {ticks.map((t, i) => (
+            <span
+              key={i}
+              className="absolute top-0 whitespace-nowrap text-[9px] tabular-nums text-gray-400"
+              style={{
+                left: `${t.frac * 100}%`,
+                transform: i === 0 ? "none" : i === ticks.length - 1 ? "translateX(-100%)" : "translateX(-50%)",
+              }}
+            >
+              {t.label}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 방위 분포 — 10° 섹터 36개 세로 막대 (0° = 북) */
+function AzimuthHistogram({ bins }: { bins: number[] }) {
+  const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
+  const total = useMemo(() => bins.reduce((a, b) => a + b, 0), [bins]);
+  const maxV = useMemo(() => bins.reduce((a, b) => (b > a ? b : a), 0), [bins]);
+
+  const H = 88; // 막대 영역 높이
+  const SLOT = 10; // viewBox 슬롯 폭 (막대 8 + 간격 2)
+
+  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const frac = (e.clientX - rect.left) / rect.width;
+    const idx = Math.min(35, Math.max(0, Math.floor(frac * 36)));
+    setHover({ idx, x: clampTipX(((idx + 0.5) / 36) * rect.width, rect.width) });
+  };
+
+  const tipText = (() => {
+    if (!hover) return "";
+    const c = bins[hover.idx];
+    const pct = total > 0 ? (c / total) * 100 : 0;
+    return `${hover.idx * 10}°–${hover.idx * 10 + 10}° · ${c.toLocaleString()}건 (${pct.toFixed(1)}%)`;
+  })();
+
+  return (
+    <div className="relative">
+      {hover && <ChartTip x={hover.x} text={tipText} />}
+      <svg
+        viewBox={`0 0 ${SLOT * 36} ${H}`}
+        preserveAspectRatio="none"
+        className="block w-full"
+        style={{ height: H }}
+        onPointerMove={onMove}
+        onPointerLeave={() => setHover(null)}
+      >
+        {bins.map((c, i) => {
+          const h = maxV > 0 ? (c / maxV) * H : 0;
+          return (
+            <rect
+              key={i}
+              x={i * SLOT + 1}
+              y={H - h}
+              width={SLOT - 2}
+              height={h}
+              fill={CHART_INK}
+              opacity={hover?.idx === i ? 1 : 0.85}
+            />
+          );
+        })}
+      </svg>
+      <div className="h-px w-full bg-gray-200" />
+      <div className="relative mt-0.5 h-3">
+        {[0, 90, 180, 270, 360].map((deg, i, arr) => (
+          <span
+            key={deg}
+            className="absolute top-0 text-[9px] tabular-nums text-gray-400"
+            style={{
+              left: `${(deg / 360) * 100}%`,
+              transform: i === 0 ? "none" : i === arr.length - 1 ? "translateX(-100%)" : "translateX(-50%)",
+            }}
+          >
+            {deg}°
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── 대시보드 ────────────────────────────────────────
 
-function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
+function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode; onAcasClick?: () => void }) {
   const recTotal = stats.record_count || 1;
   const timeRange =
     stats.time_min != null && stats.time_max != null
@@ -190,6 +434,21 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
       : stats.tod_min != null && stats.tod_max != null
         ? `${fmtTod(stats.tod_min)} ~ ${fmtTod(stats.tod_max)} UTC`
         : "—";
+
+  // I140 TOD→UTC 자동보정이 적용된 파일 (보정량별 묶음)
+  const todShiftGroups = useMemo(() => {
+    const g = new Map<number, string[]>();
+    for (const f of stats.files) {
+      if (f.tod_shift_hours !== 0) {
+        const list = g.get(f.tod_shift_hours);
+        if (list) list.push(f.filename);
+        else g.set(f.tod_shift_hours, [f.filename]);
+      }
+    }
+    return [...g.entries()].sort((a, b) => a[0] - b[0]);
+  }, [stats.files]);
+  const rangeTotal = useMemo(() => stats.range_hist.reduce((a, b) => a + b.count, 0), [stats.range_hist]);
+  const flTotal = useMemo(() => stats.fl_hist.reduce((a, b) => a + b.count, 0), [stats.fl_hist]);
 
   // EXCEL 내보내기 — 대시보드 통계를 항목별 시트로 분리해 저장
   const [exporting, setExporting] = useState(false);
@@ -215,6 +474,9 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
         [L.sum.parseErrors, stats.parse_errors],
         [L.sum.truncated, stats.truncated_records],
         [L.sum.mode3aGarbled, stats.mode3a_garbled],
+        [L.sum.flVInvalid, stats.fl_v_invalid],
+        [L.sum.flGGarbled, stats.fl_g_garbled],
+        [L.sum.todShiftFiles, stats.files.filter((f) => f.tod_shift_hours !== 0).length],
       ];
       const cats: Cell[][] = [L.catsHeader];
       for (const c of stats.cat_counts) cats.push([L.catLabel(c.cat), c.blocks, c.records]);
@@ -235,30 +497,65 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
       for (const m of stats.msg_type_034) msg.push(["CAT034", L.msg034(m.key, m.label), m.count]);
       for (const m of stats.msg_type_008) msg.push(["CAT008", L.msg008(m.key, m.label), m.count]);
 
-      const files: Cell[][] = [L.filesHeader];
-      for (const f of stats.files) files.push([f.filename, f.bytes, f.frames, f.records]);
+      const files: Cell[][] = [L.filesHeader(tz)];
+      for (const f of stats.files) {
+        files.push([
+          f.filename,
+          f.bytes,
+          f.frames,
+          f.records,
+          f.time_min != null ? formatTime(f.time_min, tz) : "",
+          f.time_max != null ? formatTime(f.time_max, tz) : "",
+          f.tod_shift_hours || 0,
+        ]);
+      }
+
+      const sheets: { name: string; rows: Cell[][] }[] = [
+        { name: L.sheet.summary, rows: summary },
+        { name: L.sheet.categories, rows: cats },
+        { name: L.sheet.radarTyp, rows: radarTyp },
+        { name: L.sheet.frn, rows: frn },
+        { name: L.sheet.modesTop, rows: modes },
+        { name: L.sheet.sacSic, rows: sacSic },
+        { name: L.sheet.msgType, rows: msg },
+      ];
+
+      // 신규 분포 시트 — 데이터 있을 때만 (빈 시트 생성 금지)
+      const td = stats.time_density;
+      if (td && td.counts.length > 0) {
+        const rows: Cell[][] = [L.timeDensityHeader(tz)];
+        for (let i = 0; i < td.counts.length; i++) {
+          rows.push([formatTime(td.start_ts + i * td.bucket_secs, tz), td.counts[i]]);
+        }
+        sheets.push({ name: L.sheet.timeDensity, rows });
+      }
+      if (stats.range_hist.length > 0) {
+        const rows: Cell[][] = [L.rangeHeader];
+        for (const r of stats.range_hist) rows.push([r.label, r.count]);
+        sheets.push({ name: L.sheet.rangeHist, rows });
+      }
+      if (stats.azimuth_hist.length > 0) {
+        const rows: Cell[][] = [L.azimuthHeader];
+        stats.azimuth_hist.forEach((c, s) => rows.push([`${s * 10}–${s * 10 + 10}°`, c]));
+        sheets.push({ name: L.sheet.azimuthHist, rows });
+      }
+      if (stats.fl_hist.length > 0) {
+        const rows: Cell[][] = [L.flHeader];
+        for (const f of stats.fl_hist) rows.push([f.label, f.count]);
+        sheets.push({ name: L.sheet.flHist, rows });
+      }
+
+      sheets.push({ name: L.sheet.files, rows: files });
 
       const stamp = new Date().toISOString().slice(0, 10);
-      await saveXlsx(
-        [
-          { name: L.sheet.summary, rows: summary },
-          { name: L.sheet.categories, rows: cats },
-          { name: L.sheet.radarTyp, rows: radarTyp },
-          { name: L.sheet.frn, rows: frn },
-          { name: L.sheet.modesTop, rows: modes },
-          { name: L.sheet.sacSic, rows: sacSic },
-          { name: L.sheet.msgType, rows: msg },
-          { name: L.sheet.files, rows: files },
-        ],
-        `ASTERIX_통계_${stamp}.xlsx`,
-      );
+      await saveXlsx(sheets, `ASTERIX_통계_${stamp}.xlsx`);
     } catch (e) {
       console.error("[ASTERIX] 대시보드 EXCEL 내보내기 실패:", e);
       setExportError(String(e));
     } finally {
       setExporting(false);
     }
-  }, [exporting, stats, timeRange]);
+  }, [exporting, stats, timeRange, tz]);
 
   return (
     <div className="space-y-3">
@@ -266,7 +563,7 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
         <ExcelExportButton
           onExport={exportExcel}
           busy={exporting}
-          title="대시보드 통계를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+          title="통계를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
         />
       </div>
 
@@ -277,7 +574,12 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
         <StatCard label="블록" value={stats.block_count.toLocaleString()} />
         <StatCard label="레코드" value={stats.record_count.toLocaleString()} />
         <StatCard label="Mode-S(고유)" value={stats.modes_distinct.toLocaleString()} />
-        <StatCard label="ACAS RA" value={stats.acas_ra_records.toLocaleString()} />
+        <StatCard
+          label="ACAS RA"
+          value={stats.acas_ra_records.toLocaleString()}
+          onClick={stats.acas_ra_records > 0 ? onAcasClick : undefined}
+          title={stats.acas_ra_records > 0 && onAcasClick ? "프레임 탐색에서 ACAS RA 프레임만 조회" : undefined}
+        />
       </div>
 
       {/* 시간/날짜 */}
@@ -292,6 +594,20 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
             <span className="font-mono">{stats.nec_dates.length ? stats.nec_dates.join(", ") : "—"}</span>
           </div>
         </div>
+        {todShiftGroups.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {todShiftGroups.map(([h, files]) => (
+              <span
+                key={h}
+                title={`${files.slice(0, 10).join(", ")}${files.length > 10 ? ` 외 ${files.length - 10}개` : ""}`}
+                className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] text-amber-700"
+              >
+                I140 TOD {fmtShiftH(h)} → UTC 보정 · {files.length}개 파일
+              </span>
+            ))}
+          </div>
+        )}
+        {stats.time_density && <TimeDensityChart density={stats.time_density} tz={tz} />}
       </Section>
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -320,6 +636,27 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
         {/* 레이더 탐지 유형 (I020) */}
         <Section title="레이더 탐지 유형 (I048/020 TYP)">
           <LabeledBars items={stats.radar_typ_counts} total={recTotal} />
+        </Section>
+
+        {/* 거리 분포 (I040 ρ) — 분모는 I040 보유 레코드 */}
+        <Section title="거리 분포 (I048/040 ρ)">
+          <LabeledBars items={stats.range_hist} total={rangeTotal} />
+        </Section>
+
+        {/* 방위 분포 (I040 θ) */}
+        <Section title="방위 분포 (I048/040 θ)">
+          {stats.azimuth_hist.length === 0 ? (
+            <div className="text-[11px] text-gray-400">없음</div>
+          ) : (
+            <AzimuthHistogram bins={stats.azimuth_hist} />
+          )}
+        </Section>
+
+        {/* 고도 분포 (I090) — 분모는 I090 보유 레코드 */}
+        <Section title="고도 분포 (I048/090)">
+          <div className="max-h-72 overflow-auto">
+            <LabeledBars items={stats.fl_hist} total={flTotal} />
+          </div>
         </Section>
 
         {/* CAT048 데이터 항목 출현 빈도 */}
@@ -372,11 +709,13 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
 
       {/* 품질/파싱 지표 */}
       <Section title="파싱 품질 지표">
-        <div className="grid grid-cols-2 gap-2 text-[11px] md:grid-cols-4">
+        <div className="grid grid-cols-2 gap-2 text-[11px] md:grid-cols-3">
           <div><span className="text-gray-400">스킵 바이트 </span><span className="tabular-nums text-gray-700">{stats.skipped_bytes.toLocaleString()}</span></div>
           <div><span className="text-gray-400">파싱 오류 </span><span className="tabular-nums text-gray-700">{stats.parse_errors.toLocaleString()}</span></div>
           <div><span className="text-gray-400">절단 레코드 </span><span className="tabular-nums text-gray-700">{stats.truncated_records.toLocaleString()}</span></div>
           <div><span className="text-gray-400">Mode-3/A 무효 </span><span className="tabular-nums text-gray-700">{stats.mode3a_garbled.toLocaleString()}</span></div>
+          <div title="I048/090 V=1 — 고도값이 검증되지 않음(고도는 그대로 수용)"><span className="text-gray-400">고도 미검증(V) </span><span className="tabular-nums text-gray-700">{stats.fl_v_invalid.toLocaleString()}</span></div>
+          <div title="I048/090 G=1 — 고도값 garbled(고도는 그대로 수용)"><span className="text-gray-400">고도 Garbled(G) </span><span className="tabular-nums text-gray-700">{stats.fl_g_garbled.toLocaleString()}</span></div>
         </div>
       </Section>
 
@@ -387,6 +726,7 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
             <thead>
               <tr className="sticky top-0 bg-gray-50 text-gray-500">
                 <th className="px-2 py-1 text-left font-medium">파일</th>
+                <th className="px-2 py-1 text-left font-medium">시각 범위 ({tz})</th>
                 <th className="px-2 py-1 text-right font-medium">용량</th>
                 <th className="px-2 py-1 text-right font-medium">프레임</th>
                 <th className="px-2 py-1 text-right font-medium">레코드</th>
@@ -395,7 +735,22 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
             <tbody>
               {stats.files.map((f, i) => (
                 <tr key={i} className="border-t border-gray-100">
-                  <td className="px-2 py-1 text-gray-700">{f.filename}</td>
+                  <td className="px-2 py-1 text-gray-700">
+                    {f.filename}
+                    {f.tod_shift_hours !== 0 && (
+                      <span
+                        title="I140 TOD→UTC 보정 적용"
+                        className="ml-1 rounded border border-amber-200 bg-amber-50 px-1 text-[9px] tabular-nums text-amber-700"
+                      >
+                        {fmtShiftH(f.tod_shift_hours)}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-2 py-1 text-left font-mono text-gray-600">
+                    {f.time_min != null && f.time_max != null
+                      ? `${formatTime(f.time_min, tz)} ~ ${formatTime(f.time_max, tz)}`
+                      : "—"}
+                  </td>
                   <td className="px-2 py-1 text-right tabular-nums text-gray-600">{fmtBytes(f.bytes)}</td>
                   <td className="px-2 py-1 text-right tabular-nums text-gray-600">{f.frames.toLocaleString()}</td>
                   <td className="px-2 py-1 text-right tabular-nums text-gray-600">{f.records.toLocaleString()}</td>
@@ -425,7 +780,18 @@ function Dashboard({ stats, tz }: { stats: AsterixStats; tz: TzMode }) {
 
 // ─── 프레임 탐색 ─────────────────────────────────────
 
-function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void }) {
+function FrameBrowser({
+  tz,
+  setTz,
+  acasSignal,
+  onAcasHandled,
+}: {
+  tz: TzMode;
+  setTz: (t: TzMode) => void;
+  /** 대시보드 ACAS RA 카드에서 넘어온 점프 신호 (0 = 없음) */
+  acasSignal: number;
+  onAcasHandled: () => void;
+}) {
   const filePaths = useAppStore((s) => s.asterixFilePaths);
   const aircraft = useAppStore((s) => s.aircraft);
 
@@ -434,6 +800,7 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
   const [startDt, setStartDt] = useState("");
   const [endDt, setEndDt] = useState("");
   const [dateOpen, setDateOpen] = useState(false);
+  const [acasOnly, setAcasOnly] = useState(false);
 
   const [querying, setQuerying] = useState(false);
   const [result, setResult] = useState<AsterixQueryResult | null>(null);
@@ -449,6 +816,7 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
     const tMax = dtLocalToTs(endDt, tz);
     if (tMin != null) filter.timeMin = tMin;
     if (tMax != null) filter.timeMax = tMax;
+    if (acasOnly) filter.hasAcas = true;
 
     setQuerying(true);
     try {
@@ -462,7 +830,7 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
     } finally {
       setQuerying(false);
     }
-  }, [querying, search, catFilter, startDt, endDt, tz, filePaths]);
+  }, [querying, search, catFilter, startDt, endDt, acasOnly, tz, filePaths]);
 
   // 파일 업로드 시 필터 없는 전체 검색을 1회 자동 실행 (동일 파일셋 중복 방지)
   const autoSearchedPaths = useRef<string[] | null>(null);
@@ -472,6 +840,11 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
       return;
     }
     if (autoSearchedPaths.current === filePaths) return;
+    // ACAS 점프로 진입한 마운트면 아래 점프 effect가 대신 조회 (경합 방지)
+    if (acasSignal > 0) {
+      autoSearchedPaths.current = filePaths;
+      return;
+    }
     autoSearchedPaths.current = filePaths;
 
     // 필터 초기화 후 무필터 조회
@@ -479,6 +852,7 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
     setCatFilter(null);
     setStartDt("");
     setEndDt("");
+    setAcasOnly(false);
     setQuerying(true);
     invoke<AsterixQueryResult>("query_asterix_frames", { filePaths, filter: {} })
       .then((res) => {
@@ -493,13 +867,40 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
       .finally(() => setQuerying(false));
   }, [filePaths]);
 
+  // 대시보드 ACAS RA 카드 → 이 탭으로 점프: 필터를 ACAS 전용으로 바꾸고 즉시 조회
+  useEffect(() => {
+    if (acasSignal <= 0) return;
+    setSearch("");
+    setCatFilter(null);
+    setStartDt("");
+    setEndDt("");
+    setAcasOnly(true);
+    onAcasHandled();
+
+    // 상태 반영을 기다리지 않고 명시 필터로 즉시 조회
+    setQuerying(true);
+    invoke<AsterixQueryResult>("query_asterix_frames", { filePaths, filter: { hasAcas: true } })
+      .then((res) => {
+        setResult(res);
+        setSearched(true);
+      })
+      .catch((e) => {
+        console.error("[ASTERIX] ACAS 조회 실패:", e);
+        setResult({ total_matched: 0, truncated: false, frames: [] });
+        setSearched(true);
+      })
+      .finally(() => setQuerying(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [acasSignal]);
+
   const clearFilters = () => {
     setSearch("");
     setCatFilter(null);
     setStartDt("");
     setEndDt("");
+    setAcasOnly(false);
   };
-  const anyFilter = !!(search || catFilter != null || startDt || endDt);
+  const anyFilter = !!(search || catFilter != null || startDt || endDt || acasOnly);
 
   // 상세 프레임 디코드
   const frameBytes = useMemo<number[]>(() => {
@@ -613,6 +1014,18 @@ function FrameBrowser({ tz, setTz }: { tz: TzMode; setTz: (t: TzMode) => void })
             </>
           )}
         </div>
+
+        {/* ACAS RA 전용 토글 */}
+        <button
+          onClick={() => setAcasOnly((v) => !v)}
+          title="ACAS RA(I048/260 · BDS 3,0) 포함 프레임만 조회"
+          className={`inline-flex h-7 items-center gap-1.5 rounded-md border bg-white px-2.5 text-[10.5px] font-medium transition-colors ${
+            acasOnly ? "border-[#a60739]/30 bg-[#a60739]/8 text-[#a60739]" : "border-gray-200 text-gray-500 hover:text-gray-700"
+          }`}
+        >
+          <ShieldAlert size={12} />
+          ACAS RA
+        </button>
 
         <button
           onClick={runQuery}
@@ -759,6 +1172,8 @@ export default function AsterixAnalysis() {
 
   const [tab, setTab] = useState<InnerTab>("dashboard");
   const [tz, setTz] = useState<TzMode>("KST");
+  // 대시보드 ACAS RA 카드 → 프레임 탐색 점프 신호
+  const [acasSignal, setAcasSignal] = useState(0);
 
   return (
     <div className="flex h-full flex-col bg-white">
@@ -802,7 +1217,7 @@ export default function AsterixAnalysis() {
               onClick={() => setTab("dashboard")}
               className={`px-4 py-2 text-[12px] font-medium border-b-2 -mb-px ${tab === "dashboard" ? "border-[#a60739] text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"}`}
             >
-              통계 대시보드
+              통계
             </button>
             <button
               onClick={() => setTab("frames")}
@@ -813,7 +1228,18 @@ export default function AsterixAnalysis() {
           </div>
 
           <div className="mt-3 min-h-0 flex-1 overflow-auto">
-            {tab === "dashboard" ? <Dashboard stats={stats} tz={tz} /> : <FrameBrowser tz={tz} setTz={setTz} />}
+            {tab === "dashboard" ? (
+              <Dashboard
+                stats={stats}
+                tz={tz}
+                onAcasClick={() => {
+                  setTab("frames");
+                  setAcasSignal((s) => s + 1);
+                }}
+              />
+            ) : (
+              <FrameBrowser tz={tz} setTz={setTz} acasSignal={acasSignal} onAcasHandled={() => setAcasSignal(0)} />
+            )}
           </div>
         </>
       )}

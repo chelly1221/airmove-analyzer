@@ -5,6 +5,7 @@ import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import type { MapboxOverlay } from "@deck.gl/mapbox";
 import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
+import { HeatmapLayer } from "@deck.gl/aggregation-layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
 import {
@@ -102,6 +103,28 @@ const TrackPointIcon = ({ size = 16 }: { size?: number }) => (
     <circle cx="14" cy="3" r="1.6" />
   </svg>
 );
+
+/** 히트맵 아이콘 (3×3 밀도 격자 — 불투명도로 밀집도 표현) */
+const TrackHeatIcon = ({ size = 16 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor" stroke="none">
+    <rect x="2" y="2" width="3.6" height="3.6" rx="0.6" opacity="0.25" />
+    <rect x="6.2" y="2" width="3.6" height="3.6" rx="0.6" opacity="0.5" />
+    <rect x="10.4" y="2" width="3.6" height="3.6" rx="0.6" opacity="0.3" />
+    <rect x="2" y="6.2" width="3.6" height="3.6" rx="0.6" opacity="0.55" />
+    <rect x="6.2" y="6.2" width="3.6" height="3.6" rx="0.6" opacity="1" />
+    <rect x="10.4" y="6.2" width="3.6" height="3.6" rx="0.6" opacity="0.7" />
+    <rect x="2" y="10.4" width="3.6" height="3.6" rx="0.6" opacity="0.3" />
+    <rect x="6.2" y="10.4" width="3.6" height="3.6" rx="0.6" opacity="0.65" />
+    <rect x="10.4" y="10.4" width="3.6" height="3.6" rx="0.6" opacity="0.4" />
+  </svg>
+);
+
+/** 항적 히트맵 색상 램프 — OM 보고서 항적 히트맵(chartDensityHeatmap.ts 의 HEATMAP_TRACK_RGB
+ *  = blue-600 [37,99,235])과 동일 계열 단일 파랑. 밀도↑ = 알파↑·명도↓ 6스톱. */
+const HEAT_COLOR_RANGE: [number, number, number, number][] = [
+  [37, 99, 235, 40], [37, 99, 235, 100], [37, 99, 235, 160],
+  [29, 78, 216, 200], [30, 64, 175, 230], [23, 37, 84, 255],
+];
 
 
 import { format } from "date-fns";
@@ -372,8 +395,8 @@ export default function TrackMap() {
   const [sliderValue, setSliderValue] = useState(100);
   const [playing, setPlaying] = useState(false);
   const altScale = 1;
-  /** 항적 표시 모드: 항적선 / 항적점 / 끄기 */
-  const [trackDisplay, setTrackDisplay] = useState<"line" | "points" | "off">("line");
+  /** 항적 표시 모드: 항적선 / 항적점 / 히트맵 / 끄기 */
+  const [trackDisplay, setTrackDisplay] = useState<"line" | "points" | "heatmap" | "off">("line");
   const [hiddenLegendItems, setHiddenLegendItems] = useState<Set<string>>(new Set());
   const [showBuildings, setShowBuildings] = useState(true);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
@@ -2523,9 +2546,9 @@ export default function TrackMap() {
     return result;
   }, [allPointsByModeS, visibleMinTs, visibleMaxTs, sliderValue]);
 
-  // 원시 탐지점 (항적점 모드에서만 표시)
+  // 원시 탐지점 (항적점·히트맵 모드에서 표시) — 두 모드가 동일한 시간창 전수 필터를 공유
   const dotPoints = useMemo(() => {
-    if (trackDisplay !== "points") return [];
+    if (trackDisplay !== "points" && trackDisplay !== "heatmap") return [];
     return allPoints.filter(
       (p) => p.timestamp >= visibleMinTs && p.timestamp <= visibleMaxTs
     );
@@ -4213,7 +4236,7 @@ export default function TrackMap() {
     // 기상 레이어 (항적 아래에 깔리도록 가장 먼저 합성)
     layers.push(...weatherDeckLayers);
 
-    // 항적 표시 모드: 항적점(원시 탐지점) / 항적선 / 끄기
+    // 항적 표시 모드: 항적점(원시 탐지점) / 항적선 / 히트맵 / 끄기
     if (trackDisplay === "points") {
       // 수직선 (지면 → 고도)
       layers.push(
@@ -4273,6 +4296,22 @@ export default function TrackMap() {
               setHoverInfo(null);
             }
           },
+        })
+      );
+    } else if (trackDisplay === "heatmap") {
+      // 탐지점 밀도 히트맵 — 지면 집계라 고도/altScale/losMode 와 무관
+      layers.push(
+        new HeatmapLayer<TrackPoint>({
+          id: "track-heatmap",
+          data: filteredDotPoints,
+          getPosition: (d) => [d.longitude, d.latitude],
+          getWeight: 1,
+          radiusPixels: 30,
+          intensity: 1,
+          threshold: 0.05,
+          aggregation: "SUM",
+          colorRange: HEAT_COLOR_RANGE,
+          pickable: false,
         })
       );
     } else if (trackDisplay === "line") {
@@ -4336,8 +4375,9 @@ export default function TrackMap() {
       );
     }
 
-    // 1포인트 항적 (ScatterplotLayer) — 끄기 모드에서는 숨김
-    if (trackDisplay !== "off" && filteredSinglePoints.length > 0) {
+    // 1포인트 항적 (ScatterplotLayer) — 끄기 모드에서는 숨김.
+    // 히트맵 모드에서도 제외: 해당 포인트가 이미 히트맵 집계(filteredDotPoints)에 포함돼 중복 표출됨
+    if (trackDisplay !== "off" && trackDisplay !== "heatmap" && filteredSinglePoints.length > 0) {
       layers.push(
         new ScatterplotLayer({
           id: "track-single-points",
@@ -5487,14 +5527,14 @@ export default function TrackMap() {
           <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">표시</div>
           <div className="space-y-2.5">
 
-        {/* 항적 표시: 항적선 / 항적점 / 끄기 */}
+        {/* 항적 표시: 항적선 / 항적점 / 히트맵 / 끄기 */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <span className={trackDisplay !== "off" ? "text-[#a60739]" : "text-gray-400"}>{trackDisplay === "points" ? <TrackPointIcon size={14} /> : <TrackLineIcon size={14} />}</span>
+            <span className={trackDisplay !== "off" ? "text-[#a60739]" : "text-gray-400"}>{trackDisplay === "points" ? <TrackPointIcon size={14} /> : trackDisplay === "heatmap" ? <TrackHeatIcon size={14} /> : <TrackLineIcon size={14} />}</span>
             <span className="text-xs text-gray-600">항적</span>
           </div>
           <div className="inline-flex items-center gap-0.5 rounded-md bg-gray-100 p-0.5" role="radiogroup" aria-label="항적 표시 모드">
-            {([["line", "선"], ["points", "점"], ["off", "끄기"]] as const).map(([mode, label]) => (
+            {([["line", "선"], ["points", "점"], ["heatmap", "히트맵"], ["off", "끄기"]] as const).map(([mode, label]) => (
               <button
                 key={mode}
                 data-tour={mode === "points" ? "tm-track-points" : undefined}

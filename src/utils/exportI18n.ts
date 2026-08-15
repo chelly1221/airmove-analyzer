@@ -200,6 +200,10 @@ export function exportStrings(lang: ExportLang) {
       sacSic: "SAC SIC",
       msgType: pick("메시지 유형", "Message Types", "メッセージ種別"),
       files: pick("파일별", "Files", "ファイル別"),
+      timeDensity: pick("시간대별 밀도", "Time Density", "時間帯別密度"),
+      rangeHist: pick("거리 분포", "Range Distribution", "距離分布"),
+      azimuthHist: pick("방위 분포", "Azimuth Distribution", "方位分布"),
+      flHist: pick("고도 분포", "Altitude Distribution", "高度分布"),
     },
     // 요약 시트: 항목/값 헤더 + 항목명
     sumHeader: pick(["항목", "값"], ["Item", "Value"], ["項目", "値"]),
@@ -217,6 +221,9 @@ export function exportStrings(lang: ExportLang) {
       parseErrors: pick("파싱 오류", "Parse Errors", "解析エラー"),
       truncated: pick("절단 레코드", "Truncated Records", "切断レコード"),
       mode3aGarbled: pick("Mode-3/A 무효", "Mode-3/A Garbled", "Mode-3/A 無効"),
+      flVInvalid: pick("고도 미검증(V)", "Altitude Not Validated (V)", "高度未検証 (V)"),
+      flGGarbled: pick("고도 Garbled(G)", "Altitude Garbled (G)", "高度 Garbled (G)"),
+      todShiftFiles: pick("TOD 보정 파일 수", "TOD-Corrected Files", "TOD 補正ファイル数"),
     },
     // 각 시트 헤더 행
     catsHeader: pick(["카테고리", "블록", "레코드"], ["Category", "Blocks", "Records"], ["カテゴリ", "ブロック", "レコード"]),
@@ -225,11 +232,21 @@ export function exportStrings(lang: ExportLang) {
     modesHeader: pick(["Mode-S", "건수"], ["Mode-S", "Count"], ["Mode-S", "件数"]),
     sacSicHeader: pick(["SAC", "SIC", "건수"], ["SAC", "SIC", "Count"], ["SAC", "SIC", "件数"]),
     msgHeader: pick(["분류", "유형", "건수"], ["Class", "Type", "Count"], ["分類", "種別", "件数"]),
-    filesHeader: pick(
-      ["파일", "용량(bytes)", "프레임", "레코드"],
-      ["File", "Size (bytes)", "Frames", "Records"],
-      ["ファイル", "容量 (bytes)", "フレーム", "レコード"],
-    ),
+    filesHeader: (tz: string) =>
+      pick(
+        ["파일", "용량(bytes)", "프레임", "레코드", `시각 시작(${tz})`, `시각 종료(${tz})`, "TOD 보정(h)"],
+        ["File", "Size (bytes)", "Frames", "Records", `Start (${tz})`, `End (${tz})`, "TOD Shift (h)"],
+        ["ファイル", "容量 (bytes)", "フレーム", "レコード", `開始 (${tz})`, `終了 (${tz})`, "TOD 補正 (h)"],
+      ),
+    timeDensityHeader: (tz: string) =>
+      pick(
+        [`시각(${tz})`, "레코드"],
+        [`Time (${tz})`, "Records"],
+        [`時刻 (${tz})`, "レコード"],
+      ),
+    rangeHeader: pick(["거리(NM)", "건수"], ["Range (NM)", "Count"], ["距離 (NM)", "件数"]),
+    azimuthHeader: pick(["방위(°)", "건수"], ["Azimuth (°)", "Count"], ["方位 (°)", "件数"]),
+    flHeader: pick(["고도", "건수"], ["Altitude", "Count"], ["高度", "件数"]),
 
     // 값 번역기 (매핑 없으면 한글 원문 유지)
     catLabel: (cat: number) => (lang === "ja" ? CAT_JA : lang === "en" ? CAT_EN : CAT_KO)[cat] ?? catFallback(cat),
