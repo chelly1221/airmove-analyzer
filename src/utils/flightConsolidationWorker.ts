@@ -155,6 +155,14 @@ export function postGhostPointsToWorker(points: TrackPoint[]): void {
 }
 
 /**
+ * Worker 축적 데이터(포인트 배치·비행 인덱스·유령 보존분) 전체 폐기.
+ * 재업로드가 "대체" 시맨틱을 갖는 페이지(이중표적 분석)에서 파싱 직전에 호출.
+ */
+export function clearWorkerPoints(): void {
+  getWorker().postMessage({ type: "CLEAR_POINTS" });
+}
+
+/**
  * Worker에 축적된 포인트로 비행 통합 시작 — 완전 스트리밍.
  *
  * sendPointsToWorker()로 포인트를 미리 전송한 후 호출.

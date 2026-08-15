@@ -4,7 +4,7 @@ import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import type { MapboxOverlay } from "@deck.gl/mapbox";
-import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer, TextLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
 import {
@@ -21,7 +21,6 @@ import {
   Settings,
   Cone,
   Radius,
-  Ghost,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -308,9 +307,9 @@ function buildHeatBitmap(
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult, BraBuilding, DualTargetResult, DualTargetEvent, ReflectorCluster } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult, BraBuilding } from "../types";
 import { readBulkJson, type BulkRef } from "../utils/bulkIpc";
-import { queryViewportPoints, ViewportQuerySuperseded, analyzeDualTargets } from "../utils/flightConsolidationWorker";
+import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
 import LoSProfilePanel from "../components/Map/LoSProfilePanel";
 import { isGPUCacheValidFor, renderCoverageImageAsync, queryMinDetectionAlt, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
@@ -726,9 +725,9 @@ export default function TrackMap() {
   const savedBearingRef = useRef(0);
   const losPointClickedRef = useRef(false); // deck.gl LoS 포인트 클릭 여부 (빈 영역 클릭 구분용)
   const [losCursorPicking, setLosCursorPicking] = useState(false);
-  // ── 도구 드로어 (좌측 도킹) — LoS 분석 / 커버리지 맵 / BRA 분석 / 이중표적 분석 택1 ──
-  const [activeTool, setActiveTool] = useState<"los" | "coverage" | "bra" | "dual" | null>(null);
-  const lastToolRef = useRef<"los" | "coverage" | "bra" | "dual">("los");
+  // ── 도구 드로어 (좌측 도킹) — LoS 분석 / 커버리지 맵 / BRA 분석 택1 ──
+  const [activeTool, setActiveTool] = useState<"los" | "coverage" | "bra" | null>(null);
+  const lastToolRef = useRef<"los" | "coverage" | "bra">("los");
   if (activeTool) lastToolRef.current = activeTool;
   // ── BRA 분석 상태 (드로어 로컬) ──
   const [braResult, setBraResult] = useState<BraResult | null>(null);
@@ -756,23 +755,6 @@ export default function TrackMap() {
   const braAreaKeyRef = useRef<string | null>(null);
   /** 분석 범위 상시 3D 활성 여부 (결과 + 범위 건물이 모두 준비된 상태) */
   const braAlways3d = braResult != null && braArea != null;
-
-  // ── 이중표적(반사 유령표적) 분석 상태 (드로어 로컬, 미영속) ──
-  //   결과는 Worker 가 축적한 항적 + 파서 보존 유령점으로 계산한 스냅샷 — 도구를 닫으면 폐기한다.
-  const [dualResult, setDualResult] = useState<DualTargetResult | null>(null);
-  const [dualLoading, setDualLoading] = useState(false);
-  const [dualError, setDualError] = useState<string | null>(null);
-  /** 동일 스캔 판정 윈도우 (초) */
-  const [dualScanWindowS, setDualScanWindowS] = useState(0.5);
-  /** 이중표적 최소 이격 거리 (km) */
-  const [dualMinSepKm, setDualMinSepKm] = useState(1.0);
-  /** 이벤트 목록 검색어 (Mode-S·반사 건물명 부분일치) */
-  const [dualSearch, setDualSearch] = useState("");
-  /** 선택 이벤트/클러스터 (지도 강조 + 목록 필터) — 상호 배타 */
-  const [selectedDualEventId, setSelectedDualEventId] = useState<number | null>(null);
-  const [selectedDualClusterId, setSelectedDualClusterId] = useState<number | null>(null);
-  /** 최신 요청만 반영 (드로어 이탈/재실행 시 늦게 도착한 결과·라벨링 폐기) */
-  const dualReqSeqRef = useRef(0);
 
   // 이펙트에서 최신 레이더 제원 참조용 (호버 조회 deps 에 radarSite 를 넣지 않기 위함)
   const radarSiteRef = useRef(radarSite);
@@ -3148,25 +3130,13 @@ export default function TrackMap() {
     setBraLoading(false);
   }, []);
 
-  // 이중표적 모드 해제 — 결과·선택 폐기 + 진행 중 요청/라벨링 무효화 (seq 증가)
-  const teardownDual = useCallback(() => {
-    dualReqSeqRef.current += 1;
-    setDualResult(null);
-    setDualError(null);
-    setDualLoading(false);
-    setSelectedDualEventId(null);
-    setSelectedDualClusterId(null);
-    setDualSearch("");
-  }, []);
-
-  // 도구 버튼 클릭 — 같은 도구 재클릭 시 닫힘, LoS/BRA/이중표적 떠날 때 정리
-  const handleToolClick = useCallback((tool: "los" | "coverage" | "bra" | "dual") => {
+  // 도구 버튼 클릭 — 같은 도구 재클릭 시 닫힘, LoS/BRA 떠날 때 정리
+  const handleToolClick = useCallback((tool: "los" | "coverage" | "bra") => {
     const next = activeTool === tool ? null : tool;
     if (activeTool === "los" && next !== "los") teardownLoS();
     if (activeTool === "bra" && next !== "bra") teardownBra();
-    if (activeTool === "dual" && next !== "dual") teardownDual();
     setActiveTool(next);
-  }, [activeTool, teardownLoS, teardownBra, teardownDual]);
+  }, [activeTool, teardownLoS, teardownBra]);
 
   // 레이더 사이트가 바뀌면 이전 사이트 기준 BRA 결과는 무효
   useEffect(() => {
@@ -3199,68 +3169,6 @@ export default function TrackMap() {
       if (seq === braReqSeq.current) setBraLoading(false);
     }
   }, [radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, braAngleDeg, braConeRadiusKm, braDataEpoch]);
-
-  // ── 이중표적 분석 ──────────────────────────────────────────────
-  // Worker 는 비행의 radar_name 으로 사이트 좌표를 찾아 극좌표(거리·방위)를 재계산한다.
-  //   현재 선택 사이트 + 등록 사이트 전부를 이름 기준 dedupe 해 넘겨야, 여러 레이더가 섞인
-  //   자료에서도 사이트 미매칭(skipped_no_site)으로 통째 누락되는 비행이 생기지 않는다.
-  //   지도 강조 레이어(dualDeckLayers)도 같은 목록으로 레이더 좌표를 찾으므로 단일 원천이다.
-  const dualSites = useMemo(() => {
-    const out: { name: string; latitude: number; longitude: number }[] = [];
-    const seen = new Set<string>();
-    for (const s of [radarSite, ...customRadarSites]) {
-      if (!s || !s.name || seen.has(s.name)) continue;
-      seen.add(s.name);
-      out.push({ name: s.name, latitude: s.latitude, longitude: s.longitude });
-    }
-    return out;
-  }, [radarSite, customRadarSites]);
-
-  // 이중표적 분석 실행 — Worker 소유 포인트로 계산(메인 스레드 축적 없음).
-  //   결과 수신 후 상위 클러스터에 한해 건물명을 순차 라벨링한다(전 클러스터 라벨링은
-  //   find_building_near_point 호출이 과다 — 목록 상단 가독성만 보강하는 후처리).
-  const runDualTargetAnalysis = useCallback(async () => {
-    const seq = ++dualReqSeqRef.current;
-    setDualLoading(true);
-    setDualError(null);
-    try {
-      const result = await analyzeDualTargets({
-        sites: dualSites,
-        scanWindowS: dualScanWindowS,
-        minSepKm: dualMinSepKm,
-      });
-      if (seq !== dualReqSeqRef.current) return; // 최신 요청만 반영
-      setDualResult(result);
-      setSelectedDualEventId(null);
-      setSelectedDualClusterId(null);
-      setDualLoading(false); // 라벨링은 결과 표시 후 진행 (버튼 잠금 해제)
-
-      // ── 클러스터 건물명 라벨링 (count 상위 20개소, 순차 호출) ──
-      const LABEL_MAX = 20;
-      const targets = [...result.clusters].sort((a, b) => b.count - a.count).slice(0, LABEL_MAX);
-      const names = new Map<number, string>();
-      for (const c of targets) {
-        try {
-          const hit = await invoke<AddressBuildingHit | null>("find_building_near_point", { lat: c.latitude, lon: c.longitude });
-          if (seq !== dualReqSeqRef.current) return; // 드로어 이탈/재실행 → 라벨링 중단
-          if (hit?.name) names.set(c.id, hit.name);
-        } catch {
-          // 라벨 조회 실패는 조용히 무시 — 좌표 표기로 폴백
-        }
-      }
-      if (seq !== dualReqSeqRef.current || names.size === 0) return;
-      setDualResult((prev) => {
-        if (!prev) return prev;
-        return { ...prev, clusters: prev.clusters.map((c) => (names.has(c.id) ? { ...c, building_name: names.get(c.id)! } : c)) };
-      });
-    } catch (e) {
-      if (seq !== dualReqSeqRef.current) return;
-      setDualError(String(e));
-      setDualResult(null);
-    } finally {
-      if (seq === dualReqSeqRef.current) setDualLoading(false);
-    }
-  }, [dualSites, dualScanWindowS, dualMinSepKm]);
 
   // 원추 반경·기준각·건물 자료 세대 변경 → 이미 한 번 실행한 뒤라면 자동 재분석 (디바운스).
   //   반경=분석 범위, 각도=판정 기준면이므로 둘 다 결과·표시 정합에 직결된다.
@@ -4312,175 +4220,6 @@ export default function TrackMap() {
     ];
   }, [activeTool, braResult, braAngleDeg, braConeRadiusKm, braConeOpacity, radarSite.latitude, radarSite.longitude, radarSite.altitude, radarSite.antenna_height, terrainEnabled]);
 
-  // 이중표적 오버레이 레이어 — 전부 2D 지면 표현(고도 z 미사용). 반사 기하는 수평면 문제라
-  //   3D 고도 축을 쓰면 실표적/유령표적 짝이 서로 다른 높이로 떠서 짝 관계가 읽히지 않는다.
-  //   그리기 순서(뒤 → 앞): 짝선 → 실표적 → 유령표적 → 반사 위치 → 개수 라벨 → 선택 강조.
-  const dualDeckLayers = useMemo(() => {
-    if (activeTool !== "dual" || !dualResult) return [];
-    // 클러스터 선택 시 소속 이벤트만 표시 (선택 반사면이 만든 유령표적 분포를 격리해 본다)
-    const events = selectedDualClusterId != null
-      ? dualResult.events.filter((e) => e.cluster_id === selectedDualClusterId)
-      : dualResult.events;
-    /** 클러스터 원 반경(px) — count 로 완만히 증가, 26px 상한 */
-    const clusterRadius = (count: number) => Math.min(26, 7 + Math.sqrt(count) * 3);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const layers: any[] = [
-      new LineLayer<DualTargetEvent>({
-        id: "dual-pair-lines",
-        data: events,
-        getSourcePosition: (d) => [d.real.longitude, d.real.latitude],
-        getTargetPosition: (d) => [d.ghost.longitude, d.ghost.latitude],
-        getColor: [107, 114, 128, 110],
-        getWidth: 1,
-        widthUnits: "pixels" as const,
-        widthMinPixels: 1,
-        pickable: false,
-      }),
-      new ScatterplotLayer<DualTargetEvent>({
-        id: "dual-real-pts",
-        data: events,
-        getPosition: (d) => [d.real.longitude, d.real.latitude],
-        getFillColor: [59, 130, 246, 200],
-        getRadius: 60,
-        radiusMinPixels: 3,
-        radiusMaxPixels: 6,
-        pickable: false,
-      }),
-      new ScatterplotLayer<DualTargetEvent>({
-        id: "dual-ghost-pts",
-        data: events,
-        getPosition: (d) => [d.ghost.longitude, d.ghost.latitude],
-        getFillColor: [233, 69, 96, 220],
-        getRadius: 90,
-        radiusMinPixels: 4,
-        radiusMaxPixels: 8,
-        pickable: true,
-        onClick: (info) => {
-          const d = info.object as DualTargetEvent | undefined;
-          if (!d) return;
-          setSelectedDualClusterId(null);
-          setSelectedDualEventId((prev) => (prev === d.id ? null : d.id));
-        },
-      }),
-      new ScatterplotLayer<ReflectorCluster>({
-        id: "dual-reflectors",
-        data: dualResult.clusters,
-        getPosition: (d) => [d.longitude, d.latitude],
-        getFillColor: [166, 7, 57, 235],
-        getLineColor: [255, 255, 255, 255],
-        stroked: true,
-        filled: true,
-        lineWidthMinPixels: 1.5,
-        radiusUnits: "pixels" as const,
-        getRadius: (d) => clusterRadius(d.count),
-        pickable: true,
-        onClick: (info) => {
-          const d = info.object as ReflectorCluster | undefined;
-          if (!d) return;
-          setSelectedDualEventId(null);
-          setSelectedDualClusterId((prev) => (prev === d.id ? null : d.id));
-        },
-      }),
-      new TextLayer<ReflectorCluster>({
-        id: "dual-reflector-count",
-        data: dualResult.clusters,
-        getPosition: (d) => [d.longitude, d.latitude],
-        getText: (d) => String(d.count),
-        getColor: [255, 255, 255, 255],
-        getSize: 11,
-        sizeUnits: "pixels" as const,
-        getTextAnchor: "middle" as const,
-        getAlignmentBaseline: "center" as const,
-        fontWeight: 700,
-        billboard: true,
-        pickable: false,
-      }),
-    ];
-
-    // ── 선택 이벤트 강조: 반사 경로(레이더→반사면→실표적) + 유령 방위선 + 실/유령 링 ──
-    if (selectedDualEventId != null) {
-      const ev = dualResult.events.find((e) => e.id === selectedDualEventId);
-      const site = ev ? dualSites.find((s) => s.name === ev.radar_name) : undefined;
-      if (ev && site) {
-        if (ev.reflector) {
-          layers.push(
-            new PathLayer<{ path: [number, number][] }>({
-              id: "dual-selected-path",
-              data: [{
-                path: [
-                  [site.longitude, site.latitude],
-                  [ev.reflector.longitude, ev.reflector.latitude],
-                  [ev.real.longitude, ev.real.latitude],
-                ] as [number, number][],
-              }],
-              getPath: (d) => d.path,
-              getColor: [166, 7, 57, 255],
-              getWidth: 2.5,
-              widthUnits: "pixels" as const,
-              widthMinPixels: 2.5,
-              pickable: false,
-            })
-          );
-        }
-        // 유령이 찍힌 방위선 — 레이더는 반사 경로 전체 거리를 이 방위에 그대로 투영한다
-        layers.push(
-          new LineLayer<DualTargetEvent>({
-            id: "dual-selected-ghostline",
-            data: [ev],
-            getSourcePosition: () => [site.longitude, site.latitude],
-            getTargetPosition: (d) => [d.ghost.longitude, d.ghost.latitude],
-            getColor: [233, 69, 96, 200],
-            getWidth: 1.5,
-            widthUnits: "pixels" as const,
-            widthMinPixels: 1.5,
-            pickable: false,
-          })
-        );
-        layers.push(
-          new ScatterplotLayer<{ lon: number; lat: number; color: [number, number, number, number] }>({
-            id: "dual-selected-rings",
-            data: [
-              { lon: ev.real.longitude, lat: ev.real.latitude, color: [59, 130, 246, 255] as [number, number, number, number] },
-              { lon: ev.ghost.longitude, lat: ev.ghost.latitude, color: [233, 69, 96, 255] as [number, number, number, number] },
-            ],
-            getPosition: (d) => [d.lon, d.lat],
-            stroked: true,
-            filled: false,
-            radiusUnits: "pixels" as const,
-            getRadius: 9,
-            radiusMinPixels: 9,
-            getLineColor: (d) => d.color,
-            lineWidthMinPixels: 2,
-            pickable: false,
-          })
-        );
-      }
-    }
-
-    // ── 선택 클러스터 강조: 반사 위치에 액센트 링 (소속 이벤트 필터는 위 events 에서 적용) ──
-    if (selectedDualClusterId != null) {
-      const cl = dualResult.clusters.find((c) => c.id === selectedDualClusterId);
-      if (cl) {
-        layers.push(
-          new ScatterplotLayer<ReflectorCluster>({
-            id: "dual-selected-cluster-ring",
-            data: [cl],
-            getPosition: (d) => [d.longitude, d.latitude],
-            stroked: true,
-            filled: false,
-            radiusUnits: "pixels" as const,
-            getRadius: (d) => clusterRadius(d.count) + 6,
-            getLineColor: [166, 7, 57, 255],
-            lineWidthMinPixels: 2,
-            pickable: false,
-          })
-        );
-      }
-    }
-
-    return layers;
-  }, [activeTool, dualResult, selectedDualEventId, selectedDualClusterId, dualSites]);
-
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
     if (!panoramaViewActive || !panoramaActivePoint) return [];
@@ -4866,9 +4605,6 @@ export default function TrackMap() {
     // BRA 원추면 + 침범 건물 오버레이 합성 (별도 useMemo) — CoS 와 동일한 depth 미기록 반투명
     layers.push(...braDeckLayers);
 
-    // 이중표적 오버레이 합성 (별도 useMemo) — 전부 2D 지면 표현이라 원추/커튼 뒤에 놓아도 가려지지 않는다
-    layers.push(...dualDeckLayers);
-
     // LoS 단면도 건물 호버/클릭 하이라이트 (건물 오버레이 비활성 상태에서도 표시)
     if (losBuildingHighlight) {
       layers.push(
@@ -4941,7 +4677,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, trackHeatBitmap, lossHeatBitmap, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, dualDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, trackHeatBitmap, lossHeatBitmap, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -5641,248 +5377,6 @@ export default function TrackMap() {
     );
   };
 
-  /** Mode-S → 기체명 (비행 목록 기준) — 이중표적 이벤트 행 라벨용 */
-  const dualAcNames = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const f of flights) {
-      const key = f.mode_s.toLowerCase();
-      if (f.aircraft_name && !m.has(key)) m.set(key, f.aircraft_name);
-    }
-    return m;
-  }, [flights]);
-
-  /** 반사 위치 클러스터 — count 내림차순 (Rust/Worker 가 이미 정렬해 주지만 표시 순서를 여기서 확정) */
-  const dualSortedClusters = useMemo(() => {
-    const all = dualResult?.clusters ?? [];
-    return [...all].sort((a, b) => b.count - a.count);
-  }, [dualResult]);
-
-  /** 이벤트 목록 필터 — 선택 클러스터 소속 + 검색어(Mode-S·반사 건물명) 부분일치 */
-  const dualFilteredEvents = useMemo(() => {
-    const all = dualResult?.events ?? [];
-    const q = dualSearch.trim().toLowerCase();
-    const cl = selectedDualClusterId;
-    if (!q && cl == null) return all;
-    // 검색어 대상에 반사 건물명을 포함시키기 위한 클러스터 라벨 인덱스
-    const nameById = new Map<number, string>();
-    if (q) for (const c of dualResult?.clusters ?? []) if (c.building_name) nameById.set(c.id, c.building_name.toLowerCase());
-    const out: DualTargetEvent[] = [];
-    for (const e of all) {
-      if (cl != null && e.cluster_id !== cl) continue;
-      if (q) {
-        const bn = e.cluster_id != null ? nameById.get(e.cluster_id) ?? "" : "";
-        if (!e.mode_s.toLowerCase().includes(q) && !bn.includes(q)) continue;
-      }
-      out.push(e);
-    }
-    return out;
-  }, [dualResult, dualSearch, selectedDualClusterId]);
-
-  // ── 좌측 도구 드로어 본문: 이중표적 분석 ──
-  const renderDualToolBody = () => {
-    const micro: React.CSSProperties = { fontSize: 8.5, fontWeight: 700, letterSpacing: ".06em", color: G[400], textTransform: "uppercase" };
-    const num: React.CSSProperties = { fontFamily: "ui-monospace, monospace", fontVariantNumeric: "tabular-nums", fontWeight: 700 };
-    const card: React.CSSProperties = { borderRadius: 9, border: `1px solid ${G[200]}`, background: "#fff", padding: "9px 10px" };
-    const MAX_ROWS = 300;
-    const stats = dualResult?.stats;
-    const query = dualSearch.trim();
-    const searching = query.length > 0;
-    const shown = dualFilteredEvents.slice(0, MAX_ROWS);
-    /** 클러스터 행 라벨 — 라벨링된 건물명이 없으면 좌표 표기로 폴백 */
-    const clusterLabel = (c: ReflectorCluster) =>
-      c.building_name?.trim() || `${c.latitude.toFixed(4)}, ${c.longitude.toFixed(4)}`;
-    return (
-      <>
-        {/* 헤더 */}
-        <div style={{ padding: "10px 12px", borderBottom: `1px solid ${G[200]}`, flexShrink: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
-              <span style={{ fontSize: 13, fontWeight: 700, color: G[800], lineHeight: 1.15 }}>이중표적 분석</span>
-              <span style={{ fontSize: 9.5, color: G[400], lineHeight: 1.2 }}>Dual Target · 반사 유령표적</span>
-            </span>
-            <button onClick={() => handleToolClick("dual")} title="닫기"
-              style={{ width: 24, height: 24, borderRadius: 6, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, color: G[400] }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = G[100]; e.currentTarget.style.color = G[600]; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = G[400]; }}>
-              <X size={14} />
-            </button>
-          </div>
-        </div>
-
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
-          {/* 입력 */}
-          <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}`, display: "flex", flexDirection: "column", gap: 9 }}>
-            <div style={{ ...micro }}>Parameters · 입력</div>
-            <div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
-                <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>동일스캔 윈도우</span>
-                <span style={{ ...num, fontSize: 10, color: ACCENT }}>{dualScanWindowS.toFixed(1)}s</span>
-              </div>
-              <DsSlider value={dualScanWindowS} min={0.2} max={2.0} step={0.1} onChange={setDualScanWindowS} />
-            </div>
-            <div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
-                <span style={{ fontSize: 11, fontWeight: 600, color: G[600], flex: 1 }}>최소 이격 거리</span>
-                <span style={{ ...num, fontSize: 10, color: ACCENT }}>{dualMinSepKm.toFixed(1)}km</span>
-              </div>
-              <DsSlider value={dualMinSepKm} min={0.5} max={5.0} step={0.5} onChange={setDualMinSepKm} />
-            </div>
-            <div style={{ fontSize: 9, color: G[400], lineHeight: 1.45 }}>
-              동일 Mode-S 가 같은 스캔 주기 내 두 위치로 탐지되면 이중표적(반사)으로 판정합니다.
-            </div>
-            <button
-              onClick={runDualTargetAnalysis} disabled={dualLoading}
-              style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "7px 10px", borderRadius: 7, border: "none", width: "100%",
-                fontSize: 11.5, fontWeight: 700, cursor: dualLoading ? "default" : "pointer",
-                background: dualLoading ? G[300] : ACCENT, color: "#fff" }}>
-              {dualLoading ? <Loader2 size={12} className="animate-spin" /> : <Ghost size={12} />}
-              {dualLoading ? "분석 중…" : "분석 실행"}
-            </button>
-            {dualError && (
-              <div style={{ fontSize: 9.5, color: "#e94560", lineHeight: 1.35, wordBreak: "break-all" }}>{dualError}</div>
-            )}
-          </div>
-
-          {/* 요약 */}
-          {dualResult && stats && (
-            <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}` }}>
-              <div style={card}>
-                <div style={{ fontSize: 10, color: G[600], lineHeight: 1.5 }}>
-                  이벤트 <span style={{ ...num, color: "#e94560" }}>{dualResult.events.length.toLocaleString()}</span>건
-                  <span style={{ color: G[400] }}> (잔존 {stats.events_scan.toLocaleString()}·파서 보존 {stats.events_parser.toLocaleString()})</span> ·
-                  관련 항공기 <span style={{ ...num, color: G[800] }}>{stats.aircraft_count.toLocaleString()}</span>대 ·
-                  예상 반사 위치 <span style={{ ...num, color: ACCENT }}>{dualResult.clusters.length.toLocaleString()}</span>개소
-                </div>
-                {stats.dropped_unmatched > 0 && (
-                  <div style={{ fontSize: 9, color: G[400], marginTop: 3 }}>실표적 짝 매칭 불가 {stats.dropped_unmatched.toLocaleString()}점 제외</div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* 예상 반사 위치 (클러스터) */}
-          {dualSortedClusters.length > 0 && (
-            <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}` }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
-                <span style={{ ...micro, flex: 1, minWidth: 0 }}>Reflectors · 예상 반사 위치</span>
-                <span style={{ ...num, fontSize: 9.5, color: ACCENT, flexShrink: 0 }}>{dualSortedClusters.length.toLocaleString()}</span>
-              </div>
-              <div style={{ maxHeight: 168, overflowY: "auto" }}>
-                {dualSortedClusters.map((c) => {
-                  const sel = selectedDualClusterId === c.id;
-                  return (
-                    <div key={c.id}
-                      onClick={() => {
-                        const map = mapRef.current?.getMap();
-                        if (map) map.easeTo({ center: [c.longitude, c.latitude], zoom: 14, duration: 600 });
-                        setSelectedDualEventId(null);
-                        setSelectedDualClusterId(sel ? null : c.id);
-                      }}
-                      onMouseEnter={(e) => { if (!sel) e.currentTarget.style.background = G[50]; }}
-                      onMouseLeave={(e) => { if (!sel) e.currentTarget.style.background = "transparent"; }}
-                      style={{ padding: "4px 5px", borderRadius: 4, cursor: "pointer", background: sel ? `${ACCENT}14` : "transparent" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span style={{ width: 6, height: 6, borderRadius: 3, background: ACCENT, flexShrink: 0 }} />
-                        <span style={{ fontSize: 10.5, fontWeight: 600, color: G[700], flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {clusterLabel(c)}
-                        </span>
-                        <span style={{ ...num, fontSize: 9.5, color: ACCENT, flexShrink: 0 }}>{c.count.toLocaleString()}건</span>
-                      </div>
-                      <div style={{ fontSize: 9, color: G[400], paddingLeft: 12 }}>{c.radar_name}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* 이중표적 이벤트 리스트 */}
-          <div style={{ padding: "9px 11px", flex: 1, minHeight: 150, display: "flex", flexDirection: "column" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-              <span style={{ ...micro, flex: 1, minWidth: 0 }}>Events · 이중표적 이벤트</span>
-              {selectedDualClusterId != null ? (
-                // 클러스터 선택 중 — 해당 반사 위치 소속만 표시 중임을 명시 + 해제 버튼
-                <button onClick={() => setSelectedDualClusterId(null)}
-                  style={{ fontSize: 9, color: ACCENT, background: "transparent", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}>
-                  반사 위치 필터 해제 ({dualFilteredEvents.length.toLocaleString()}건)
-                </button>
-              ) : (
-                <span style={{ ...num, fontSize: 9.5, color: "#e94560", flexShrink: 0 }}>{(dualResult?.events.length ?? 0).toLocaleString()}</span>
-              )}
-            </div>
-            {/* 검색 — 300행 캡 밖 이벤트를 Mode-S·건물명으로 직접 찾는다 */}
-            {(dualResult?.events.length ?? 0) > 0 && (
-              <div style={{ position: "relative", marginBottom: 6 }}>
-                <Search size={11} color={G[400]} style={{ position: "absolute", left: 7, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }} />
-                <input
-                  type="text" value={dualSearch} onChange={(e) => setDualSearch(e.target.value)}
-                  placeholder="Mode-S·건물명 검색"
-                  style={{ width: "100%", fontSize: 10.5, padding: "4px 22px 4px 22px", borderRadius: 6, border: `1px solid ${G[300]}`, color: G[800], outline: "none" }}
-                />
-                {searching && (
-                  <button onClick={() => setDualSearch("")} title="검색 지우기"
-                    style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)", width: 16, height: 16, borderRadius: 4, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: G[400], padding: 0 }}>
-                    <X size={10} />
-                  </button>
-                )}
-              </div>
-            )}
-            {dualFilteredEvents.length === 0 ? (
-              <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", fontSize: 10, color: G[400], padding: "0 8px", lineHeight: 1.5 }}>
-                {dualLoading ? "분석 중…"
-                  : searching ? "검색과 일치하는 이벤트 없음"
-                  : dualResult ? "이중표적이 탐지되지 않았습니다"
-                  : "ASS 파일 파싱 후 분석 실행을 누르세요"}
-              </div>
-            ) : (
-              <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
-                {shown.map((e) => {
-                  const sel = selectedDualEventId === e.id;
-                  const acName = dualAcNames.get(e.mode_s.toLowerCase());
-                  const high = e.confidence === "high";
-                  return (
-                    <div key={e.id}
-                      onClick={() => {
-                        const map = mapRef.current?.getMap();
-                        if (map) map.easeTo({ center: [e.ghost.longitude, e.ghost.latitude], zoom: Math.max(map.getZoom(), 12), duration: 600 });
-                        setSelectedDualEventId(sel ? null : e.id);
-                      }}
-                      onMouseEnter={(ev) => { if (!sel) ev.currentTarget.style.background = G[50]; }}
-                      onMouseLeave={(ev) => { if (!sel) ev.currentTarget.style.background = "transparent"; }}
-                      style={{ padding: "4px 5px", borderRadius: 4, cursor: "pointer", background: sel ? `${ACCENT}14` : "transparent" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span style={{ width: 6, height: 6, borderRadius: 3, background: high ? "#e94560" : G[300], flexShrink: 0 }} title={high ? "반사 기하 부합" : "기하 불부합·모호"} />
-                        <span style={{ ...num, fontSize: 10, color: G[600], flexShrink: 0 }}>{format(new Date(e.ghost.timestamp * 1000), "HH:mm:ss")}</span>
-                        <span style={{ fontSize: 10.5, fontWeight: 600, color: G[700], flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {acName ? `${acName} (${e.mode_s})` : e.mode_s}
-                        </span>
-                        <span style={{ ...num, fontSize: 9.5, color: "#e94560", flexShrink: 0 }}>{e.separation_km.toFixed(2)}km</span>
-                      </div>
-                      <div style={{ fontSize: 9, color: G[400], paddingLeft: 12, display: "flex", alignItems: "center", gap: 5 }}>
-                        <span style={{ padding: "0 4px", borderRadius: 3, background: G[100], color: G[500], fontWeight: 700, flexShrink: 0 }}>
-                          {e.source === "scan" ? "잔존" : "파서"}
-                        </span>
-                        <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {e.radar_name} · 초과경로 {e.extra_path_km >= 0 ? "+" : ""}{e.extra_path_km.toFixed(2)}km
-                          {e.reflector ? ` · 반사 ${e.reflector.range_km.toFixed(1)}km/${e.reflector.azimuth_deg.toFixed(0)}°` : " · 반사점 미산출"}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
-                {dualFilteredEvents.length > MAX_ROWS && (
-                  <div style={{ padding: "6px 5px", fontSize: 9.5, color: G[400], textAlign: "center" }}>
-                    …외 {(dualFilteredEvents.length - MAX_ROWS).toLocaleString()}건
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-      </>
-    );
-  };
-
   // ── 우측 표시 설정 드로어 본문: 건물 / 기상 ──
   const renderSettingsBody = () => {
     const kind = settingsDrawer ?? lastSettingsRef.current;
@@ -6265,7 +5759,6 @@ export default function TrackMap() {
             <ToolButton icon={Mountain} label="LoS 분석" active={activeTool === "los"} onClick={() => handleToolClick("los")} dataTour="tm-tool-los" />
             <ToolButton icon={Radar} label="커버리지 맵" active={activeTool === "coverage"} onClick={() => handleToolClick("coverage")} />
             <ToolButton icon={Radius} label="BRA 분석" active={activeTool === "bra"} onClick={() => handleToolClick("bra")} />
-            <ToolButton icon={Ghost} label="이중표적 분석" active={activeTool === "dual"} onClick={() => handleToolClick("dual")} />
           </div>
         </div>
         </div>,
@@ -6755,7 +6248,7 @@ export default function TrackMap() {
         </div>
       )}
 
-        {/* ── 좌측 도구 드로어 (LoS / 커버리지 / BRA / 이중표적) — 지도+단면도 전체 높이 오버레이 ── */}
+        {/* ── 좌측 도구 드로어 (LoS / 커버리지 / BRA) — 지도+단면도 전체 높이 오버레이 ── */}
         <div
           className="absolute top-0 bottom-0 left-0 z-[700] flex flex-col bg-white"
           style={{
@@ -6780,7 +6273,6 @@ export default function TrackMap() {
             />
           )}
           {activeTool === "bra" && renderBraToolBody()}
-          {activeTool === "dual" && renderDualToolBody()}
         </div>
 
         {/* ── 커버리지 생성 진행 모달 — 드로어와 독립(닫아도 유지) ── */}

@@ -13,6 +13,7 @@ import TrackMap from "./pages/TrackMap";
 import LoSObstacle from "./pages/LoSObstacle";
 import AcasAnalysis from "./pages/AcasAnalysis";
 import AsterixAnalysis from "./pages/AsterixAnalysis";
+import DualTargetAnalysis from "./pages/DualTargetAnalysis";
 import ReportGeneration from "./pages/ReportGeneration";
 import AircraftManagement from "./pages/AircraftManagement";
 import RadarManagement from "./pages/RadarManagement";
@@ -238,6 +239,7 @@ export default function App() {
                 <Route path="/obstacle" element={<PageWrapper><LoSObstacle /></PageWrapper>} />
                 <Route path="/acas" element={<PageWrapper><AcasAnalysis /></PageWrapper>} />
                 <Route path="/asterix" element={<PageWrapper><AsterixAnalysis /></PageWrapper>} />
+                <Route path="/dualtarget" element={<PageWrapper><DualTargetAnalysis /></PageWrapper>} />
                 <Route path="/report" element={<PageWrapper><ReportGeneration /></PageWrapper>} />
                 <Route path="/settings" element={<PageWrapper><Settings /></PageWrapper>} />
                 <Route path="/aircraft" element={<PageWrapper><AircraftManagement /></PageWrapper>} />

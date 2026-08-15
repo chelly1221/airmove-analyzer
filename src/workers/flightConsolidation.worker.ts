@@ -1278,6 +1278,15 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
 
+      case "CLEAR_POINTS": {
+        // fire-and-forget — 축적 포인트·비행 인덱스·유령 보존분 전체 폐기.
+        // 페이지 단위 재업로드가 "대체" 시맨틱을 가질 때(이중표적 분석 페이지) 사용.
+        _pointBatches = [];
+        _flightIndex.clear();
+        _ghostPoints = [];
+        break;
+      }
+
       case "ANALYZE_DUAL_TARGETS": {
         const { sites, scanWindowS, minSepKm } = e.data;
         const t0 = performance.now();

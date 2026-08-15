@@ -16,6 +16,7 @@ import {
   ShieldAlert,
   Binary,
   BookOpen,
+  Ghost,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import Modal from "../common/Modal";
@@ -60,6 +61,7 @@ const navSections: NavSection[] = [
       { id: "obstacle", label: "장애물 스카이라인", icon: Eye, path: "/obstacle" },
       { id: "acas", label: "ACAS", icon: ShieldAlert, path: "/acas" },
       { id: "asterix", label: "ASTERIX", icon: Binary, path: "/asterix" },
+      { id: "dualtarget", label: "이중표적", icon: Ghost, path: "/dualtarget" },
       { id: "report", label: "보고서", icon: FileText, path: "/report" },
     ],
   },

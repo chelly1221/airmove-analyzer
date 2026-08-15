@@ -19,6 +19,7 @@ import { readBulkJson, cleanupBulk } from "../utils/bulkIpc";
 import type { BulkRef } from "../utils/bulkIpc";
 import type { TcasReport, WeatherVector } from "../types/track";
 import type { AsterixStats } from "../types/asterix";
+import type { DualTargetResult } from "../types/dualTarget";
 
 /** 설정을 DB에 비동기 저장 (fire-and-forget) */
 function persistSetting(key: string, value: unknown) {
@@ -148,6 +149,11 @@ interface AppState {
   asterixStats: AsterixStats | null;
   asterixFilePaths: string[];
   setAsterixResult: (stats: AsterixStats, paths: string[]) => void;
+
+  // 이중표적(반사 유령표적) 분석 결과 스냅샷 — 세션 한정(DB 미영속).
+  //   페이지 이탈 후 복귀 시 결과 유지용. 포인트는 Worker 소유이므로 여기엔 요약 결과만 둔다.
+  dualTargetResult: DualTargetResult | null;
+  setDualTargetResult: (r: DualTargetResult | null) => void;
 
 
   // 보고서 메타데이터
@@ -480,6 +486,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   asterixStats: null,
   asterixFilePaths: [],
   setAsterixResult: (stats, paths) => set({ asterixStats: stats, asterixFilePaths: paths }),
+
+  // 이중표적 분석 결과 (세션 한정)
+  dualTargetResult: null,
+  setDualTargetResult: (r) => set({ dualTargetResult: r }),
 
 
   // 보고서 메타데이터
