@@ -1,6 +1,7 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import { ScatterplotLayer, LineLayer, PathLayer, TextLayer } from "@deck.gl/layers";
+import { TripsLayer } from "@deck.gl/geo-layers";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -50,6 +51,19 @@ const GROUP_ROW_CAP = 200;
 /** 건물명 라벨링 대상 클러스터 수 (count 상위) */
 const LABEL_MAX = 20;
 
+// ── 전파 반사 애니메이션 타임라인 (초) ──────────────────────────────
+//   0–2 실표적(항공기) → 반사체 · 2–4 반사체 → 레이더 · 4–6 유령표적 위치 펄스
+const ANIM_PERIOD_S = 6;
+/** 전파가 레이더에 도달하는 시각 (= 유령표적 펄스 시작) */
+const ANIM_ARRIVE_S = 4;
+/** TripsLayer waypoint 타임스탬프 — [실표적, 반사체, 레이더] */
+const ANIM_TIMESTAMPS = [0, 2, ANIM_ARRIVE_S];
+/** 펄스 꼬리 길이 (타임스탬프 단위) */
+const ANIM_TRAIL = 1.2;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type DeckLayerList = any[];
+
 type Phase = "idle" | "parsing" | "consolidating" | "analyzing";
 
 /** Mode-S 단위 이벤트 그룹 */
@@ -67,6 +81,98 @@ function labelFor(modeS: string, aircraft: Aircraft[]): string {
   const a = aircraft.find((ac) => ac.mode_s_code?.toUpperCase() === modeS.toUpperCase());
   const name = a?.name || a?.registration;
   return name ? `${name} (${modeS})` : modeS;
+}
+
+/** 전파 반사 경로 애니메이션 입력 — null 이면 애니메이션 비활성 */
+interface ReflectionAnim {
+  /** [실표적 → 반사체 → 레이더] 경로 (TripsLayer 데이터, 참조 고정) */
+  tripData: { path: [number, number][] }[];
+  /** 유령표적 도달 펄스 + 유령 방위선 (참조 고정) */
+  pulseData: { lon: number; lat: number; siteLon: number; siteLat: number }[];
+}
+
+/**
+ * 지도 레이어 합성 + 전파 반사 애니메이션 프레임 소유.
+ *
+ * animTime 을 **이 컴포넌트가** 들고 있어야 매 프레임 리렌더가 좌측 대용량 이벤트 목록까지
+ * 번지지 않는다(정적 staticLayers 는 부모 useMemo 산출물 그대로 통과 — 프레임마다 재생성 없음).
+ */
+function DualDeckLayers({ staticLayers, anim }: { staticLayers: DeckLayerList; anim: ReflectionAnim | null }) {
+  const [animTime, setAnimTime] = useState(0);
+
+  // rAF 루프 — 선택 이벤트에 반사점이 있을 때만 구동, 해제/언마운트 시 취소
+  useEffect(() => {
+    if (!anim) {
+      setAnimTime((t) => (t === 0 ? t : 0)); // 불필요한 리렌더 방지
+      return;
+    }
+    let raf = 0;
+    const t0 = performance.now();
+    const tick = (now: number) => {
+      setAnimTime(((now - t0) / 1000) % ANIM_PERIOD_S);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [anim]);
+
+  const animLayers = useMemo<DeckLayerList>(() => {
+    if (!anim) return [];
+    // 0–4초: 전파 펄스가 항공기 → 반사체 → 레이더 이동
+    if (animTime < ANIM_ARRIVE_S) {
+      return [
+        new TripsLayer<{ path: [number, number][] }>({
+          id: "dual-anim-trip",
+          data: anim.tripData,
+          getPath: (d) => d.path,
+          getTimestamps: () => ANIM_TIMESTAMPS,
+          getColor: [233, 69, 96],
+          currentTime: animTime,
+          trailLength: ANIM_TRAIL,
+          fadeTrail: true,
+          getWidth: 4,
+          widthUnits: "pixels" as const,
+          widthMinPixels: 4,
+          capRounded: true,
+          jointRounded: true,
+          pickable: false,
+        }),
+      ];
+    }
+    // 4–6초: 유령표적 위치 확장 펄스 링 + 유령 방위선 강조
+    const p = (animTime - ANIM_ARRIVE_S) / (ANIM_PERIOD_S - ANIM_ARRIVE_S); // 0 → 1
+    const alpha = Math.round(255 * (1 - p));
+    return [
+      new LineLayer<ReflectionAnim["pulseData"][number]>({
+        id: "dual-anim-ghostline",
+        data: anim.pulseData,
+        getSourcePosition: (d) => [d.siteLon, d.siteLat],
+        getTargetPosition: (d) => [d.lon, d.lat],
+        getColor: [233, 69, 96, Math.max(120, alpha)],
+        getWidth: 3,
+        widthUnits: "pixels" as const,
+        widthMinPixels: 3,
+        updateTriggers: { getColor: alpha },
+        pickable: false,
+      }),
+      new ScatterplotLayer<ReflectionAnim["pulseData"][number]>({
+        id: "dual-anim-pulse",
+        data: anim.pulseData,
+        getPosition: (d) => [d.lon, d.lat],
+        stroked: true,
+        filled: false,
+        radiusUnits: "pixels" as const,
+        getRadius: 6 + 20 * p,
+        radiusMinPixels: 0,
+        getLineColor: [233, 69, 96, alpha],
+        lineWidthMinPixels: 2,
+        updateTriggers: { getRadius: p, getLineColor: alpha },
+        pickable: false,
+      }),
+    ];
+  }, [anim, animTime]);
+
+  return <DeckGLOverlay layers={[...staticLayers, ...animLayers]} />;
 }
 
 export default function DualTargetAnalysis() {
@@ -98,6 +204,10 @@ export default function DualTargetAnalysis() {
   const [search, setSearch] = useState("");
   const [selectedEventId, setSelectedEventId] = useState<number | null>(null);
   const [selectedClusterId, setSelectedClusterId] = useState<number | null>(null);
+  /** 지도 표출을 특정 기체(Mode-S)로 한정 — 좌측 그룹 목록은 계속 전 기체를 보여준다 */
+  const [selectedModeS, setSelectedModeS] = useState<string | null>(null);
+  /** 지도 표출을 특정 레이더로 한정 (지도 레이더 마커 클릭 토글) */
+  const [selectedRadarName, setSelectedRadarName] = useState<string | null>(null);
   const [expandedModeS, setExpandedModeS] = useState<Set<string>>(new Set());
 
   // 파일 선택 → 필터 모달
@@ -149,6 +259,8 @@ export default function DualTargetAnalysis() {
       setDualResult(result);
       setSelectedEventId(null);
       setSelectedClusterId(null);
+      setSelectedModeS(null);
+      setSelectedRadarName(null);
 
       // 기본 접힘 + 최다 이벤트 그룹 1개만 펼침 (그룹 정렬 기준과 동일: 건수 desc → Mode-S asc)
       const counts = new Map<string, number>();
@@ -232,6 +344,8 @@ export default function DualTargetAnalysis() {
     setDualResult(null);
     setSelectedEventId(null);
     setSelectedClusterId(null);
+    setSelectedModeS(null);
+    setSelectedRadarName(null);
     setExpandedModeS(new Set());
     setSearch("");
     flightsRef.current = [];
@@ -311,23 +425,58 @@ export default function DualTargetAnalysis() {
 
   // ── 파생 데이터 ───────────────────────────────────────────────────
 
-  /** 클러스터 선택 시 소속 이벤트만 (선택 반사면이 만든 유령표적 분포를 격리해 본다) */
-  const baseEvents = useMemo(() => {
-    const all = dualResult?.events ?? [];
-    if (selectedClusterId == null) return all;
-    return all.filter((e) => e.cluster_id === selectedClusterId);
-  }, [dualResult, selectedClusterId]);
+  // 필터 3종은 순차 교집합. 목록(groups)은 Mode-S 필터 **이전** 단계(listEvents)를 쓰므로
+  // 한 기체를 선택해도 다른 기체 그룹이 목록에 남아 곧바로 바꿔 선택할 수 있다.
 
-  /** 반사 위치 클러스터 — count 내림차순 */
-  const sortedClusters = useMemo(() => {
+  /** 레이더 선택 필터 (지도 레이더 마커 클릭) */
+  const radarEvents = useMemo(() => {
+    const all = dualResult?.events ?? [];
+    if (selectedRadarName == null) return all;
+    return all.filter((e) => e.radar_name === selectedRadarName);
+  }, [dualResult, selectedRadarName]);
+
+  /** 좌측 그룹 목록 모집단 — 레이더 + 반사 위치 필터 적용 */
+  const listEvents = useMemo(() => {
+    if (selectedClusterId == null) return radarEvents;
+    return radarEvents.filter((e) => e.cluster_id === selectedClusterId);
+  }, [radarEvents, selectedClusterId]);
+
+  /** 지도 표출 이벤트 — 반사 위치 ∩ Mode-S ∩ 레이더 */
+  const baseEvents = useMemo(() => {
+    if (selectedModeS == null) return listEvents;
+    return listEvents.filter((e) => e.mode_s === selectedModeS);
+  }, [listEvents, selectedModeS]);
+
+  /**
+   * 표출용 반사 위치 클러스터 — count 내림차순.
+   * Mode-S 선택 시엔 그 기체 이벤트가 참조하는 클러스터만 남기고 count 도 그 기체 기준으로
+   * 재계산한다(원본 클러스터 객체는 mutate 금지 — 복제본 생성). 반사 위치 선택 필터는
+   * 여기에 적용하지 않는다(다른 클러스터로 갈아탈 수 있어야 하므로).
+   */
+  const displayClusters = useMemo<ReflectorCluster[]>(() => {
     const all = dualResult?.clusters ?? [];
-    return [...all].sort((a, b) => b.count - a.count);
-  }, [dualResult]);
+    const byRadar = selectedRadarName == null ? all : all.filter((c) => c.radar_name === selectedRadarName);
+    if (selectedModeS == null) return [...byRadar].sort((a, b) => b.count - a.count);
+
+    const counts = new Map<number, number>();
+    for (const e of radarEvents) {
+      if (e.mode_s !== selectedModeS || e.cluster_id == null) continue;
+      counts.set(e.cluster_id, (counts.get(e.cluster_id) ?? 0) + 1);
+    }
+    const out: ReflectorCluster[] = [];
+    for (const c of byRadar) {
+      const n = counts.get(c.id);
+      if (n == null) continue;
+      out.push({ ...c, count: n });
+    }
+    out.sort((a, b) => b.count - a.count);
+    return out;
+  }, [dualResult, radarEvents, selectedModeS, selectedRadarName]);
 
   /** Mode-S 단위 이벤트 그룹 — 건수 내림차순(동수 시 Mode-S 오름차순) */
   const groups = useMemo<ModeSGroup[]>(() => {
     const byModeS = new Map<string, DualTargetEvent[]>();
-    for (const ev of baseEvents) {
+    for (const ev of listEvents) {
       const arr = byModeS.get(ev.mode_s);
       if (arr) arr.push(ev);
       else byModeS.set(ev.mode_s, [ev]);
@@ -359,7 +508,7 @@ export default function DualTargetAnalysis() {
     }
     out.sort((a, b) => (b.events.length - a.events.length) || a.modeS.localeCompare(b.modeS));
     return out;
-  }, [baseEvents, aircraft]);
+  }, [listEvents, aircraft]);
 
   /** 검색 필터 (Mode-S·기체명 부분일치) — 목록 표시만 좁힌다(지도는 baseEvents 전수) */
   const filteredGroups = useMemo(() => {
@@ -386,16 +535,76 @@ export default function DualTargetAnalysis() {
     });
   }, []);
 
+  /**
+   * 그룹 헤더 클릭 = 지도 표출을 이 기체로 한정 + 펼침 보장.
+   * 이미 선택된 그룹 재클릭이면 선택만 해제하고 펼침 상태는 유지한다.
+   * 선택 시 지도는 이벤트 bbox ∪ 해당 이벤트들의 레이더 좌표로 맞춘다
+   * (레이더 ↔ 반사체 ↔ 항적 기하가 한 화면에 들어와야 반사 경로가 읽힌다).
+   */
+  const selectGroup = useCallback((g: ModeSGroup) => {
+    if (selectedModeS === g.modeS) {
+      setSelectedModeS(null);
+      return;
+    }
+    setSelectedModeS(g.modeS);
+    setSelectedEventId(null);
+    setExpandedModeS((prev) => (prev.has(g.modeS) ? prev : new Set(prev).add(g.modeS)));
+
+    let { minLat, maxLat, minLon, maxLon } = g.bbox;
+    const names = new Set<string>();
+    for (const ev of g.events) names.add(ev.radar_name);
+    for (const s of dualSites) {
+      if (!names.has(s.name)) continue;
+      if (s.latitude < minLat) minLat = s.latitude;
+      if (s.latitude > maxLat) maxLat = s.latitude;
+      if (s.longitude < minLon) minLon = s.longitude;
+      if (s.longitude > maxLon) maxLon = s.longitude;
+    }
+    if (minLat <= maxLat && minLon <= maxLon) fitBounds([[minLon, minLat], [maxLon, maxLat]]);
+  }, [selectedModeS, dualSites, fitBounds]);
+
+  /** 레이더 마커 클릭 토글 — 선택 레이더로 지도 표출을 한정 */
+  const toggleRadar = useCallback((name: string) => {
+    setSelectedEventId(null);
+    setSelectedRadarName((prev) => (prev === name ? null : name));
+  }, []);
+
+  /**
+   * 전파 반사 애니메이션 입력 — 선택 이벤트에 반사점·레이더 좌표가 모두 있을 때만 생성.
+   * 데이터 배열을 여기서 만들어 참조를 고정한다(프레임마다 새 배열이면 deck.gl 이 매번 재업로드).
+   */
+  const reflectionAnim = useMemo<ReflectionAnim | null>(() => {
+    if (selectedEventId == null || !dualResult) return null;
+    const ev = dualResult.events.find((e) => e.id === selectedEventId);
+    if (!ev?.reflector) return null;
+    const site = dualSites.find((s) => s.name === ev.radar_name);
+    if (!site) return null;
+    return {
+      tripData: [{
+        path: [
+          [ev.real.longitude, ev.real.latitude],
+          [ev.reflector.longitude, ev.reflector.latitude],
+          [site.longitude, site.latitude],
+        ] as [number, number][],
+      }],
+      pulseData: [{
+        lon: ev.ghost.longitude,
+        lat: ev.ghost.latitude,
+        siteLon: site.longitude,
+        siteLat: site.latitude,
+      }],
+    };
+  }, [selectedEventId, dualResult, dualSites]);
+
   // ── deck.gl 레이어 ────────────────────────────────────────────────
   //   전부 2D 지면 표현(고도 z 미사용). 반사 기하는 수평면 문제라 3D 고도 축을 쓰면
   //   실표적/유령표적 짝이 서로 다른 높이로 떠서 짝 관계가 읽히지 않는다.
   //   그리기 순서(뒤 → 앞): 사이트 → 짝선 → 실표적 → 유령표적 → 반사 위치 → 개수 → 선택 강조.
-  const deckLayers = useMemo(() => {
+  const deckLayers = useMemo<DeckLayerList>(() => {
     if (!dualResult) return [];
     /** 클러스터 원 반경(px) — count 로 완만히 증가, 26px 상한 */
     const clusterRadius = (count: number) => Math.min(26, 7 + Math.sqrt(count) * 3);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const layers: any[] = [
+    const layers: DeckLayerList = [
       new ScatterplotLayer<{ name: string; latitude: number; longitude: number }>({
         id: "dual-sites",
         data: siteMarkers,
@@ -405,8 +614,13 @@ export default function DualTargetAnalysis() {
         stroked: true,
         lineWidthMinPixels: 1.5,
         radiusUnits: "pixels" as const,
-        getRadius: 6,
-        pickable: false,
+        getRadius: 8,
+        pickable: true,
+        onClick: (info: { object?: { name: string } }) => {
+          const d = info.object;
+          if (!d) return;
+          toggleRadar(d.name);
+        },
       }),
       new TextLayer<{ name: string; latitude: number; longitude: number }>({
         id: "dual-site-labels",
@@ -466,7 +680,7 @@ export default function DualTargetAnalysis() {
       }),
       new ScatterplotLayer<ReflectorCluster>({
         id: "dual-reflectors",
-        data: dualResult.clusters,
+        data: displayClusters,
         getPosition: (d) => [d.longitude, d.latitude],
         getFillColor: [166, 7, 57, 235],
         getLineColor: [255, 255, 255, 255],
@@ -485,7 +699,7 @@ export default function DualTargetAnalysis() {
       }),
       new TextLayer<ReflectorCluster>({
         id: "dual-reflector-count",
-        data: dualResult.clusters,
+        data: displayClusters,
         getPosition: (d) => [d.longitude, d.latitude],
         getText: (d) => String(d.count),
         getColor: [255, 255, 255, 255],
@@ -498,6 +712,49 @@ export default function DualTargetAnalysis() {
         pickable: false,
       }),
     ];
+
+    // ── 선택 레이더 강조 링 ──
+    if (selectedRadarName != null) {
+      const s = siteMarkers.find((m) => m.name === selectedRadarName);
+      if (s) {
+        layers.push(
+          new ScatterplotLayer<{ name: string; latitude: number; longitude: number }>({
+            id: "dual-selected-site-ring",
+            data: [s],
+            getPosition: (d) => [d.longitude, d.latitude],
+            stroked: true,
+            filled: false,
+            radiusUnits: "pixels" as const,
+            getRadius: 12,
+            radiusMinPixels: 12,
+            getLineColor: [166, 7, 57, 255],
+            lineWidthMinPixels: 2,
+            pickable: false,
+          })
+        );
+      }
+    }
+
+    // ── Mode-S 선택(이벤트 미선택) 시 반사 기하 분포: 실표적 → 반사점 정적 기하선 ──
+    //   개별 이벤트를 고르지 않아도 이 기체의 반사가 어디로 모이는지 한눈에 드러난다.
+    if (selectedModeS != null && selectedEventId == null) {
+      const withReflector = baseEvents.filter((e) => e.reflector != null);
+      if (withReflector.length > 0) {
+        layers.push(
+          new LineLayer<DualTargetEvent>({
+            id: "dual-reflect-geometry",
+            data: withReflector,
+            getSourcePosition: (d) => [d.real.longitude, d.real.latitude],
+            getTargetPosition: (d) => [d.reflector!.longitude, d.reflector!.latitude],
+            getColor: [166, 7, 57, 60],
+            getWidth: 1,
+            widthUnits: "pixels" as const,
+            widthMinPixels: 1,
+            pickable: false,
+          })
+        );
+      }
+    }
 
     // ── 선택 이벤트 강조: 반사 경로(레이더→반사면→실표적) + 유령 방위선 + 실/유령 링 ──
     if (selectedEventId != null) {
@@ -561,7 +818,7 @@ export default function DualTargetAnalysis() {
 
     // ── 선택 클러스터 강조: 반사 위치 링 (소속 이벤트 필터는 baseEvents 에서 적용) ──
     if (selectedClusterId != null) {
-      const cl = dualResult.clusters.find((c) => c.id === selectedClusterId);
+      const cl = displayClusters.find((c) => c.id === selectedClusterId);
       if (cl) {
         layers.push(
           new ScatterplotLayer<ReflectorCluster>({
@@ -581,7 +838,11 @@ export default function DualTargetAnalysis() {
     }
 
     return layers;
-  }, [dualResult, baseEvents, siteMarkers, selectedEventId, selectedClusterId, dualSites]);
+    // animTime 은 의도적으로 의존성에서 제외 — 애니메이션은 DualDeckLayers 가 따로 합성한다
+  }, [
+    dualResult, baseEvents, displayClusters, siteMarkers, dualSites,
+    selectedEventId, selectedClusterId, selectedModeS, selectedRadarName, toggleRadar,
+  ]);
 
   // ── 렌더 ──────────────────────────────────────────────────────────
 
@@ -709,19 +970,27 @@ export default function DualTargetAnalysis() {
                 </div>
               </div>
 
-              {/* 예상 반사 위치 */}
-              {sortedClusters.length > 0 && (
+              {/* 예상 반사 위치 — Mode-S·레이더 선택 시 그 선택이 참조하는 클러스터만 (건수도 재계산) */}
+              {dualResult.clusters.length > 0 && (
                 <div className="shrink-0 border-b border-gray-200 p-3">
                   <div className="mb-1.5 flex items-center gap-2">
                     <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">
                       Reflectors · 예상 반사 위치
                     </span>
                     <span className="ml-auto font-mono text-[10px] font-bold tabular-nums text-[#a60739]">
-                      {sortedClusters.length.toLocaleString()}
+                      {displayClusters.length.toLocaleString()}
+                      {displayClusters.length !== dualResult.clusters.length && (
+                        <span className="text-gray-400"> / {dualResult.clusters.length.toLocaleString()}</span>
+                      )}
                     </span>
                   </div>
+                  {displayClusters.length === 0 && (
+                    <div className="px-1.5 py-2 text-[10.5px] text-gray-400">
+                      선택한 필터에 해당하는 반사 위치가 없습니다
+                    </div>
+                  )}
                   <div className="max-h-[168px] overflow-y-auto">
-                    {sortedClusters.map((c) => {
+                    {displayClusters.map((c) => {
                       const sel = selectedClusterId === c.id;
                       return (
                         <div
@@ -754,21 +1023,41 @@ export default function DualTargetAnalysis() {
               {/* Mode-S별 이벤트 그룹 */}
               <div className="flex min-h-0 flex-1 flex-col p-3">
                 <div className="mb-1.5 flex items-center gap-2">
-                  <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+                  <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
                     Events · Mode-S별 이벤트
                   </span>
-                  {selectedClusterId != null ? (
-                    <button
-                      onClick={() => setSelectedClusterId(null)}
-                      className="ml-auto shrink-0 text-[10px] text-[#a60739] hover:underline"
-                    >
-                      반사 위치 필터 해제 ({baseEvents.length.toLocaleString()}건)
-                    </button>
-                  ) : (
-                    <span className="ml-auto shrink-0 font-mono text-[10px] font-bold tabular-nums" style={{ color: ERROR }}>
-                      {groups.length.toLocaleString()}대 / {baseEvents.length.toLocaleString()}건
-                    </span>
-                  )}
+                  <div className="ml-auto flex min-w-0 items-center gap-2">
+                    {selectedRadarName != null && (
+                      <button
+                        onClick={() => toggleRadar(selectedRadarName)}
+                        title="레이더 선택을 해제합니다"
+                        className="min-w-0 shrink truncate text-[10px] text-[#a60739] hover:underline"
+                      >
+                        레이더 필터 해제 ({selectedRadarName})
+                      </button>
+                    )}
+                    {selectedModeS != null && (
+                      <button
+                        onClick={() => setSelectedModeS(null)}
+                        title="지도 표출 기체 한정을 해제합니다"
+                        className="min-w-0 shrink truncate text-[10px] text-[#a60739] hover:underline"
+                      >
+                        Mode-S 필터 해제 ({labelFor(selectedModeS, aircraft)})
+                      </button>
+                    )}
+                    {selectedClusterId != null ? (
+                      <button
+                        onClick={() => setSelectedClusterId(null)}
+                        className="shrink-0 text-[10px] text-[#a60739] hover:underline"
+                      >
+                        반사 위치 필터 해제 ({listEvents.length.toLocaleString()}건)
+                      </button>
+                    ) : (
+                      <span className="shrink-0 font-mono text-[10px] font-bold tabular-nums" style={{ color: ERROR }}>
+                        {groups.length.toLocaleString()}대 / {listEvents.length.toLocaleString()}건
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {/* 검색 */}
@@ -799,16 +1088,35 @@ export default function DualTargetAnalysis() {
                   <div className="min-h-0 flex-1 overflow-y-auto">
                     {filteredGroups.map((g) => {
                       const open = expandedModeS.has(g.modeS);
+                      const picked = selectedModeS === g.modeS;
                       const shown = g.events.slice(0, GROUP_ROW_CAP);
                       return (
-                        <div key={g.modeS} className="mb-1 rounded-md border border-gray-200">
-                          {/* 그룹 헤더 */}
+                        <div
+                          key={g.modeS}
+                          className={`mb-1 rounded-md border ${picked ? "border-l-[3px] border-[#a60739] bg-[#a60739]/[0.03]" : "border-gray-200"}`}
+                        >
+                          {/* 그룹 헤더 — 클릭 = 지도 표출 한정(선택), 셰브런 = 접기/펼치기 */}
                           <div
-                            onClick={() => toggleGroup(g.modeS)}
-                            className={`flex cursor-pointer items-center gap-1.5 rounded-t-md px-2 py-1.5 transition-colors ${open ? "bg-[#a60739]/5" : "hover:bg-gray-50"}`}
+                            onClick={() => selectGroup(g)}
+                            title={picked ? "클릭하면 지도 표출 한정을 해제합니다" : "클릭하면 이 기체만 지도에 표출합니다"}
+                            className={`flex cursor-pointer items-center gap-1.5 rounded-t-md px-2 py-1.5 transition-colors ${
+                              picked ? "bg-[#a60739]/10" : open ? "bg-[#a60739]/5" : "hover:bg-gray-50"
+                            }`}
                           >
-                            {open ? <ChevronUp size={12} className="shrink-0 text-gray-400" /> : <ChevronDown size={12} className="shrink-0 text-gray-400" />}
-                            <span className="min-w-0 flex-1 truncate text-[11.5px] font-semibold text-gray-800" title={g.label}>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleGroup(g.modeS);
+                              }}
+                              title={open ? "접기" : "펼치기"}
+                              className="shrink-0 rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-[#a60739]"
+                            >
+                              {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                            </button>
+                            <span
+                              className={`min-w-0 flex-1 truncate text-[11.5px] font-semibold ${picked ? "text-[#a60739]" : "text-gray-800"}`}
+                              title={g.label}
+                            >
                               {g.label}
                             </span>
                             <span className="shrink-0 font-mono text-[10px] font-bold tabular-nums" style={{ color: ERROR }}>
@@ -825,7 +1133,7 @@ export default function DualTargetAnalysis() {
                               <Crosshair size={12} />
                             </button>
                           </div>
-                          <div className="flex items-center gap-2 px-2 pb-1 pl-[26px] text-[9.5px] text-gray-400">
+                          <div className="flex items-center gap-2 px-2 pb-1 pl-[30px] text-[9.5px] text-gray-400">
                             <span>high {g.highCount.toLocaleString()}건</span>
                             <span>·</span>
                             <span>최대 이격 {g.maxSepKm.toFixed(2)}km</span>
@@ -851,6 +1159,11 @@ export default function DualTargetAnalysis() {
                                       }
                                       setSelectedClusterId(null);
                                       setSelectedEventId(sel ? null : e.id);
+                                      // Mode-S 한정 중에 다른 기체 행을 고르면 한정 대상도 그 기체로 옮긴다
+                                      // (선택 강조만 필터 밖에 떠 있는 어긋난 상태 방지)
+                                      if (!sel && selectedModeS != null && selectedModeS !== e.mode_s) {
+                                        setSelectedModeS(e.mode_s);
+                                      }
                                     }}
                                     className={`cursor-pointer rounded px-1.5 py-1 transition-colors ${sel ? "bg-[#a60739]/8" : "hover:bg-gray-50"}`}
                                   >
@@ -916,7 +1229,7 @@ export default function DualTargetAnalysis() {
             }}
           >
             <NavigationControl position="top-right" />
-            <DeckGLOverlay layers={deckLayers} />
+            <DualDeckLayers staticLayers={deckLayers} anim={reflectionAnim} />
           </MapGL>
         </div>
       </div>
