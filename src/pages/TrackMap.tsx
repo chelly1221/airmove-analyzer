@@ -5,7 +5,6 @@ import type maplibregl from "maplibre-gl";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import type { MapboxOverlay } from "@deck.gl/mapbox";
 import { PathLayer, ScatterplotLayer, LineLayer, IconLayer, BitmapLayer, PolygonLayer, SolidPolygonLayer } from "@deck.gl/layers";
-import { HeatmapLayer } from "@deck.gl/aggregation-layers";
 import { Tile3DLayer } from "@deck.gl/geo-layers";
 import { Tiles3DLoader } from "@loaders.gl/3d-tiles";
 import {
@@ -57,10 +56,11 @@ const fusedDemTiles = (v: number) => `${convertFileSrc("", "fused-dem")}{z}/{x}/
 const FUSED_DEM_MINZOOM = 8;
 const FUSED_DEM_MAXZOOM = 13;
 
-/** 3D 건물 표출 최소 줌 — 이 미만이면 fill-extrusion 3D 모드가 꺼지고(2D 점 전환) 실측 3D 메시도
- *  게이트 오프(visible:false + loadTiles:false). 두 표출 경로가 같은 임계를 공유해야 줌 인/아웃 시
- *  "건물은 사라졌는데 메시만 남는" 불일치가 없다. (buildingTileCache 의 줌 임계값은 타일 조회 격자
- *  단위라 의미가 다르므로 공유 대상 아님) */
+/** 3D 건물 표출 최소 줌 — 이 미만이면 건물 오버레이를 아예 표시하지 않는다(2D 점 표현 없음,
+ *  뷰포트 건물 fetch 도 생략). 실측 3D 메시도 동일 임계에서 게이트 오프(visible:false +
+ *  loadTiles:false). 두 표출 경로가 같은 임계를 공유해야 줌 인/아웃 시 "건물은 사라졌는데 메시만
+ *  남는" 불일치가 없다. (buildingTileCache 의 줌 임계값은 타일 조회 격자 단위라 의미가 다르므로
+ *  공유 대상 아님) */
 const BUILDINGS_3D_MIN_ZOOM = 14;
 
 /** 실측 3D 메시 레이어 id (main + 보충 cdm). data URL 은 convertFileSrc(파일명,"tiles3d") 라
@@ -119,20 +119,187 @@ const TrackHeatIcon = ({ size = 16 }: { size?: number }) => (
   </svg>
 );
 
-/** 히트맵 램프 — OM 보고서 §1 전체표적 히트맵(ReportOMTargetHeatmapMap 의 HEAT_STOPS:
- *  ColorBrewer 램프 + ln(1+v) 정규화 + alpha 상승)의 룩을 deck.gl 선형 매핑에서 근사.
- *  로그 정규화 효과는 스톱 색을 진한 후반부 위주로 전진 배치하고 intensity 바이어스(>1)로 재현 —
- *  저밀도부터 또렷하고 고밀도는 진하게 타오르는 전형적 히트맵 룩. 정상 항적=파랑(Blues). */
-const HEAT_BLUE_RANGE: [number, number, number, number][] = [
-  [158, 202, 225, 120], [107, 174, 214, 160], [66, 146, 198, 190],
-  [33, 113, 181, 215], [8, 81, 156, 235], [8, 48, 107, 250],
+// ── 줌 불변 히트맵 빌더 ──────────────────────────────────────────────
+// deck.gl HeatmapLayer 는 화면 픽셀 반경 집계 + 가시 최대밀도 재정규화라 줌에 따라 그림이 변한다.
+// 대신 OM 보고서 §1 전체표적 히트맵(ReportOMTargetHeatmapMap)과 동일 레시피 —
+// 고정 메르카토르 그리드 비닝 → box blur(r=2 ×2패스) → ln(1+v) 정규화 → LUT → 오프스크린 캔버스 —
+// 로 비트맵을 굽고 BitmapLayer 로 지도 좌표에 고정한다. 보고서 모듈을 번들에 끌어들이지 않도록 이식(복사).
+// 단, 트랙맵은 화면에서 확대해 보는 용도라 선명도를 위해 그리드 해상도(장축 2048)와 감마(HEAT_GAMMA=1.3)
+// 두 가지만 보고서 §1 과 의도적으로 분기한다. 색상 스톱·blur(r=2 ×2패스)·ln(1+v) 정규화는 여전히 동일.
+
+const HEAT_DEG2RAD = Math.PI / 180;
+/** 웹 메르카토르 0..1 정규화 (ReportOMRadarBuildingMap 의 mercX/mercY 와 동일 수식) */
+const mercX = (lonDeg: number) => (lonDeg + 180) / 360;
+const mercY = (latDeg: number) => {
+  const lat = Math.max(-85.05, Math.min(85.05, latDeg)) * HEAT_DEG2RAD;
+  return (1 - Math.log(Math.tan(lat) + 1 / Math.cos(lat)) / Math.PI) / 2;
+};
+/** mercY 역변환 (0..1 → 위도 deg) */
+const mercYinv = (y: number) => Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) / HEAT_DEG2RAD;
+
+/** 정상 항적 스톱 — ColorBrewer Blues (보고서 §1 HEAT_STOPS 와 동일 구조·alpha, 분기는 해상도·감마뿐) */
+const HEAT_BLUE_STOPS: [number, number, number, number, number][] = [
+  [0.0, 198, 219, 239, 0.0],
+  [0.15, 198, 219, 239, 0.35],
+  [0.3, 158, 202, 225, 0.5],
+  [0.45, 107, 174, 214, 0.62],
+  [0.6, 66, 146, 198, 0.72],
+  [0.75, 33, 113, 181, 0.8],
+  [0.9, 8, 81, 156, 0.87],
+  [1.0, 8, 48, 107, 0.92],
+];
+/** 소실표적 스톱 — 보고서 §1 HEAT_STOPS(ColorBrewer Reds) 와 동일 (분기는 해상도·감마뿐) */
+const HEAT_RED_STOPS: [number, number, number, number, number][] = [
+  [0.0, 254, 224, 210, 0.0],
+  [0.15, 254, 224, 210, 0.35],
+  [0.3, 252, 187, 161, 0.5],
+  [0.45, 252, 146, 114, 0.62],
+  [0.6, 251, 106, 74, 0.72],
+  [0.75, 239, 59, 44, 0.8],
+  [0.9, 203, 24, 29, 0.87],
+  [1.0, 153, 0, 13, 0.92],
 ];
 
-/** 소실표적 히트맵 램프 — 보고서 HEAT_STOPS 와 동일 색상열(ColorBrewer Reds) 진한 구간 6스톱 */
-const HEAT_RED_RANGE: [number, number, number, number][] = [
-  [252, 146, 114, 120], [251, 106, 74, 160], [239, 59, 44, 190],
-  [203, 24, 29, 215], [153, 0, 13, 235], [103, 0, 13, 250],
-];
+/** 스톱 배열 → 256×RGBA LUT (Uint8ClampedArray, alpha 도 0..255). */
+function buildHeatLut(stops: [number, number, number, number, number][]): Uint8ClampedArray {
+  const lut = new Uint8ClampedArray(256 * 4);
+  let si = 0;
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    while (si < stops.length - 2 && t > stops[si + 1][0]) si++;
+    const a = stops[si], b = stops[si + 1];
+    const span = b[0] - a[0] || 1;
+    const f = Math.min(1, Math.max(0, (t - a[0]) / span));
+    const o = i * 4;
+    lut[o] = a[1] + (b[1] - a[1]) * f;
+    lut[o + 1] = a[2] + (b[2] - a[2]) * f;
+    lut[o + 2] = a[3] + (b[3] - a[3]) * f;
+    lut[o + 3] = (a[4] + (b[4] - a[4]) * f) * 255;
+  }
+  return lut;
+}
+
+const HEAT_BLUE_LUT = buildHeatLut(HEAT_BLUE_STOPS);
+const HEAT_RED_LUT = buildHeatLut(HEAT_RED_STOPS);
+
+/** 분리형 box blur(반경 r) 1패스 — 슬라이딩 윈도우 O(W·H). 경계는 가장자리 값 확장. in-place(src 갱신). */
+function boxBlur(src: Float32Array, w: number, h: number, r: number) {
+  const win = 2 * r + 1;
+  const tmp = new Float32Array(w * h);
+  // 수평
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let acc = 0;
+    for (let k = -r; k <= r; k++) acc += src[row + Math.min(w - 1, Math.max(0, k))];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = acc / win;
+      const xout = Math.min(w - 1, Math.max(0, x - r));
+      const xin = Math.min(w - 1, Math.max(0, x + r + 1));
+      acc += src[row + xin] - src[row + xout];
+    }
+  }
+  // 수직
+  for (let x = 0; x < w; x++) {
+    let acc = 0;
+    for (let k = -r; k <= r; k++) acc += tmp[Math.min(h - 1, Math.max(0, k)) * w + x];
+    for (let y = 0; y < h; y++) {
+      src[y * w + x] = acc / win;
+      const yout = Math.min(h - 1, Math.max(0, y - r));
+      const yin = Math.min(h - 1, Math.max(0, y + r + 1));
+      acc += tmp[yin * w + x] - tmp[yout * w + x];
+    }
+  }
+}
+
+/** 그리드 장축 셀 수 — 데이터 bbox 기준 고정 해상도(줌 불변의 원천).
+ *  보고서 §1(1024) 대비 2배 — 셀이 절반이라 디테일 2배 + box blur(r=2)의 지리적 번짐 반경도 절반 → 선명화 */
+const HEAT_GRID_LONG = 2048;
+/** bbox 패딩(셀) — 블러 글로우가 가장자리에서 잘리지 않게 */
+const HEAT_GRID_PAD = 8;
+/** 그리드 변당 상한 가드 — 정상 데이터에선 도달 불가(장축 2048 + 패딩) */
+const HEAT_GRID_MAX = 4400;
+/** 정규화 감마 — 저밀도 헤이즈를 눌러 고밀도 코어 대비를 키우는 트랙맵 전용 선명화(보고서 §1 은 감마 없음) */
+const HEAT_GAMMA = 1.3;
+
+/** 점 집합 → 줌 불변 히트맵 비트맵. 보고서 §1 레시피(비닝→blur→ln 정규화→LUT).
+ *  bounds 는 BitmapLayer [west, south, east, north]. 점 없거나 정규화 불가 시 null. */
+function buildHeatBitmap(
+  points: { longitude: number; latitude: number }[],
+  lut: Uint8ClampedArray,
+): { canvas: HTMLCanvasElement; bounds: [number, number, number, number] } | null {
+  if (points.length === 0) return null;
+
+  // bbox — spread 금지(10M+ 규모, CLAUDE.md 규칙 6)
+  let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
+  for (let i = 0; i < points.length; i++) {
+    const { longitude: lon, latitude: lat } = points[i];
+    if (lon < minLon) minLon = lon;
+    if (lon > maxLon) maxLon = lon;
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+  }
+  if (!Number.isFinite(minLon) || !Number.isFinite(minLat)) return null;
+
+  // 메르카토르 bbox — my 는 북쪽이 작음
+  let mx0 = mercX(minLon), mx1 = mercX(maxLon);
+  let my0 = mercY(maxLat), my1 = mercY(minLat);
+  // 정방형 셀: 장축 스팬을 HEAT_GRID_LONG 등분
+  const spanLong = Math.max(mx1 - mx0, my1 - my0);
+  const cell = Math.max(spanLong, 1e-9) / HEAT_GRID_LONG;
+
+  // 사방 패딩 — 블러 글로우 여유
+  const pad = cell * HEAT_GRID_PAD;
+  mx0 -= pad; mx1 += pad; my0 -= pad; my1 += pad;
+
+  const w = Math.min(HEAT_GRID_MAX, Math.max(1, Math.ceil((mx1 - mx0) / cell)));
+  const h = Math.min(HEAT_GRID_MAX, Math.max(1, Math.ceil((my1 - my0) / cell)));
+
+  // 전수 비닝 — 다운샘플링 없이 점당 +1 (집계이지 표본화가 아님)
+  const buf = new Float32Array(w * h);
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const gx = ((mercX(p.longitude) - mx0) / cell) | 0;
+    const gy = ((mercY(p.latitude) - my0) / cell) | 0;   // 행 0 = 북쪽
+    if (gx < 0 || gy < 0 || gx >= w || gy >= h) continue;
+    buf[gy * w + gx] += 1;
+  }
+
+  // 스무딩(box blur 반경 2 × 2패스 ≈ gaussian)
+  boxBlur(buf, w, h, 2);
+  boxBlur(buf, w, h, 2);
+
+  let vmax = 0;
+  for (let i = 0; i < buf.length; i++) if (buf[i] > vmax) vmax = buf[i];
+  if (vmax <= 0) return null;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  const img = ctx.createImageData(w, h);   // zero-fill(투명) — v≤0 픽셀은 그대로 둠
+  const data = img.data;
+  const lnMax = Math.log(1 + vmax);
+  for (let i = 0; i < buf.length; i++) {
+    const v = buf[i];
+    if (v <= 0) continue;
+    let t = Math.log(1 + v) / lnMax;
+    if (t > 1) t = 1; else if (t < 0) t = 0;
+    t = Math.pow(t, HEAT_GAMMA);   // 감마 대비 강조(저밀도 헤이즈 억제)
+    const lo = ((t * 255) | 0) * 4;
+    const o = i * 4;
+    data[o] = lut[lo]; data[o + 1] = lut[lo + 1]; data[o + 2] = lut[lo + 2]; data[o + 3] = lut[lo + 3];
+  }
+  ctx.putImageData(img, 0, 0);
+
+  // 패딩 확장 후 bbox 를 지리좌표로 역변환 → BitmapLayer bounds
+  const bounds: [number, number, number, number] = [
+    mx0 * 360 - 180,        // west
+    mercYinv(my1),          // south (큰 my)
+    mx1 * 360 - 180,        // east
+    mercYinv(my0),          // north (작은 my)
+  ];
+  return { canvas, bounds };
+}
 
 
 import { format } from "date-fns";
@@ -409,7 +576,7 @@ export default function TrackMap() {
   const [showBuildings, setShowBuildings] = useState(true);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
   const [buildings3dData, setBuildings3dData] = useState<Building3D[]>([]);
-  /** 건물 3D↔점 전환 경계 (줌 15+: 3D, 14 이하: 점) */
+  /** 건물 3D 표출 게이트 (allow3d && 줌 ≥ BUILDINGS_3D_MIN_ZOOM). 미충족이면 건물 미표시 */
   const [buildings3dMode, setBuildings3dMode] = useState(false);
   /** 비활성화된 건물 출처 (건물통합정보/수동 개별 토글) */
   const [hiddenBuildingSources, setHiddenBuildingSources] = useState<Set<string>>(new Set());
@@ -1277,6 +1444,10 @@ export default function TrackMap() {
 
     const zoom = map.getZoom();
 
+    // 3D 표출 줌 미만이면 건물이 전혀 그려지지 않으므로 fetch 자체를 생략.
+    // 기존 데이터는 유지(줌 재진입 시 즉시 표출, moveend 재로드가 갱신).
+    if (zoom < BUILDINGS_3D_MIN_ZOOM) return;
+
     if (initial) setBuildingsLoading(true);
 
     const seq = ++buildingFetchAbortRef.current;
@@ -1305,57 +1476,52 @@ export default function TrackMap() {
         }
       }
 
-      // ── 뷰포트 클램프 (3D fill-extrusion 렉 방지 전용, 줌 ≥ 14) ──
+      // ── 뷰포트 클램프 (3D fill-extrusion 렉 방지 전용) ──
       // 3D 모드에서 지도를 피치(기울임)하면 MapLibre bounds 가 지평선까지 확장(maxPitch 85)되어
       // 수백 km² 타일을 전부 fetch → fill-extrusion 에 수만 건물이 들어가 렌더 렉을 유발한다.
       // 카메라 앵커를 중심으로 줌별 최대 반경 박스와 bounds 를 교집합해 fetch 범위를 제한.
       // 피치 0 이면 앵커≈화면중심, 고피치면 화면 하단(근경)이라 근거리 우선 로드에 자연스럽게 맞는다.
-      // 줌 14 미만(2D 점 모드)은 렌더가 가벼워 원래대로 무클램프(bounds 그대로) — 타일 상한만으로 충분.
-      let box = {
-        south: bounds.getSouth(), north: bounds.getNorth(),
-        west: bounds.getWest(), east: bounds.getEast(),
+      // 줌 BUILDINGS_3D_MIN_ZOOM 미만은 위에서 조기 반환(건물 미표출)하므로 여기는 항상 3D 표출 줌 —
+      // 클램프를 무조건 적용한다.
+      // 줌별 최대 반경(km) — 조기 반환 덕에 BUILDINGS_3D_MIN_ZOOM 미만 구간은 불필요
+      const maxRadiusKm = (z: number): number => {
+        if (z >= 17) return 3;
+        if (z >= 16) return 4;
+        if (z >= 15) return 6;
+        return 8; // 14~15
       };
-      if (zoom >= 14) {
-        // 줌별 최대 반경(km) — 클램프는 줌 14+ 에서만 적용되므로 14 미만 구간은 불필요
-        const maxRadiusKm = (z: number): number => {
-          if (z >= 17) return 3;
-          if (z >= 16) return 4;
-          if (z >= 15) return 6;
-          return 8; // 14~15
-        };
 
-        // 앵커 ±반경 박스와 현재 bounds 의 교집합
-        const clampBox = (aLat: number, aLon: number) => {
-          const R = maxRadiusKm(zoom);
-          const dLat = R / 111.32;
-          const dLon = R / (111.32 * Math.cos(aLat * Math.PI / 180));
-          return {
-            south: Math.max(bounds.getSouth(), aLat - dLat),
-            north: Math.min(bounds.getNorth(), aLat + dLat),
-            west: Math.max(bounds.getWest(), aLon - dLon),
-            east: Math.min(bounds.getEast(), aLon + dLon),
-          };
+      // 앵커 ±반경 박스와 현재 bounds 의 교집합
+      const clampBox = (aLat: number, aLon: number) => {
+        const R = maxRadiusKm(zoom);
+        const dLat = R / 111.32;
+        const dLon = R / (111.32 * Math.cos(aLat * Math.PI / 180));
+        return {
+          south: Math.max(bounds.getSouth(), aLat - dLat),
+          north: Math.min(bounds.getNorth(), aLat + dLat),
+          west: Math.max(bounds.getWest(), aLon - dLon),
+          east: Math.min(bounds.getEast(), aLon + dLon),
         };
-        // 앵커 ±반경 박스 자체 (교집합이 비었을 때 폴백)
-        const anchorBox = (aLat: number, aLon: number) => {
-          const R = maxRadiusKm(zoom);
-          const dLat = R / 111.32;
-          const dLon = R / (111.32 * Math.cos(aLat * Math.PI / 180));
-          return { south: aLat - dLat, north: aLat + dLat, west: aLon - dLon, east: aLon + dLon };
-        };
-        const isEmpty = (b: { south: number; north: number; west: number; east: number }) =>
-          b.south > b.north || b.west > b.east;
+      };
+      // 앵커 ±반경 박스 자체 (교집합이 비었을 때 폴백)
+      const anchorBox = (aLat: number, aLon: number) => {
+        const R = maxRadiusKm(zoom);
+        const dLat = R / 111.32;
+        const dLon = R / (111.32 * Math.cos(aLat * Math.PI / 180));
+        return { south: aLat - dLat, north: aLat + dLat, west: aLon - dLon, east: aLon + dLon };
+      };
+      const isEmpty = (b: { south: number; north: number; west: number; east: number }) =>
+        b.south > b.north || b.west > b.east;
 
+      let box = clampBox(anchorLat, anchorLon);
+      if (isEmpty(box)) {
+        // 교집합이 비면(앵커가 화면 밖 = 극단적 피치) 앵커를 bounds 중심으로 바꿔 재계산
+        const bc = bounds.getCenter();
+        anchorLat = bc.lat;
+        anchorLon = bc.lng;
         box = clampBox(anchorLat, anchorLon);
-        if (isEmpty(box)) {
-          // 교집합이 비면(앵커가 화면 밖 = 극단적 피치) 앵커를 bounds 중심으로 바꿔 재계산
-          const bc = bounds.getCenter();
-          anchorLat = bc.lat;
-          anchorLon = bc.lng;
-          box = clampBox(anchorLat, anchorLon);
-          // 그래도 비면 앵커 박스 자체 사용 (한반도 영역이라 경도 180° 랩 미고려)
-          if (isEmpty(box)) box = anchorBox(anchorLat, anchorLon);
-        }
+        // 그래도 비면 앵커 박스 자체 사용 (한반도 영역이라 경도 180° 랩 미고려)
+        if (isEmpty(box)) box = anchorBox(anchorLat, anchorLon);
       }
 
       await fetchBuildingsForViewport(
@@ -3606,82 +3772,6 @@ export default function TrackMap() {
     ];
   }, [signalLossPoints, hiddenLegendItems, losMode, altScale, aircraft, trackDisplay]);
 
-  // 건물 2D 오버레이 전용 deck.gl 레이어
-  const buildingDeckLayers = useMemo(() => {
-    if (!showBuildings || buildings3dData.length === 0 || buildings3dMode) return [];
-    const hexToRgb = (hex: string): [number, number, number] => {
-      const h = hex.replace("#", "");
-      return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
-    };
-    const isHighlighted = (d: Building3D) =>
-      losBuildingHighlight && Math.abs(d.lat - losBuildingHighlight.lat) < 0.0001 && Math.abs(d.lon - losBuildingHighlight.lon) < 0.0001;
-    const sel = bldgDrawer;
-    const isSelected = (d: Building3D) =>
-      sel && Math.abs(d.lat - sel.lat) < 0.0001 && Math.abs(d.lon - sel.lon) < 0.0001;
-    const a = (base: number) => Math.round(base * buildingOpacity);
-    const fillColor = (d: Building3D): [number, number, number, number] => {
-      if (isHighlighted(d)) return [249, 115, 22, 255]; // 주황색 하이라이트 (전체 불투명)
-      if (isSelected(d)) return [251, 191, 36, 255]; // 골드 선택 glow
-      if (d.group_color) { const c = hexToRgb(d.group_color); return [c[0], c[1], c[2], a(200)]; }
-      return d.source === "fac" ? [229, 231, 235, a(220)]
-        : d.source === "manual" ? [239, 68, 68, a(220)]
-        : [209, 213, 219, a(220)];
-    };
-    const selObj = sel ? buildings3dData.find((d) => isSelected(d)) : null;
-    // BRA 분석 범위 안은 전용 fill-extrusion 레이어가 3D 로 그리므로 점 표시에서 제외 (지붕 위 점 이중 표출 방지).
-    //   판정식은 fetchBuildingsInRadius centroid 필터와 동일. 선택/하이라이트 검색은 필터 전 원본을 그대로 쓴다.
-    const ba = braArea;
-    let dotData = buildings3dData;
-    if (braAlways3d && ba) {
-      const cosLatBra = Math.cos((ba.lat * Math.PI) / 180);
-      const r2 = ba.radiusKm * ba.radiusKm;
-      dotData = buildings3dData.filter((d) => {
-        const dy = (d.lat - ba.lat) * 111.32;
-        const dx = (d.lon - ba.lon) * 111.32 * cosLatBra;
-        return dx * dx + dy * dy > r2;
-      });
-    }
-    // 호버는 간단 툴팁만 (건물명·높이·실측 배지) — 상세 조회는 클릭(드로어) 전용
-    const buildingHover = (info: { object?: Building3D; x: number; y: number }) => {
-      if (info.object) {
-        const d = info.object;
-        setBldgHoverTip({ x: info.x, y: info.y, name: d.name || undefined, height: d.height_m, measured: d.measured, lat: d.lat, lon: d.lon, base: d.ground_elev_m });
-      } else {
-        setBldgHoverTip(null);
-      }
-    };
-    return [
-      // 선택 건물 골드 헤일로 (glow)
-      ...(selObj ? [new ScatterplotLayer({
-        id: "buildings-sel-halo",
-        data: [selObj],
-        getPosition: (d: Building3D) => [d.lon, d.lat],
-        getRadius: 13,
-        radiusUnits: "pixels" as const,
-        getFillColor: [251, 191, 36, 90] as [number, number, number, number],
-        pickable: false,
-      })] : []),
-      new ScatterplotLayer({
-        id: "buildings-dots",
-        data: dotData,
-        getPosition: (d: Building3D) => [d.lon, d.lat],
-        getRadius: (d: Building3D) => isHighlighted(d) || isSelected(d) ? 6 : 3,
-        radiusUnits: "pixels" as const,
-        getFillColor: fillColor,
-        updateTriggers: { getFillColor: [losBuildingHighlight, buildingOpacity, sel?.lat, sel?.lon], getRadius: [losBuildingHighlight, sel?.lat, sel?.lon] },
-        pickable: true,
-        onClick: (info: { object?: Building3D; x: number; y: number }) => {
-          if (losTarget) losPointClickedRef.current = true;
-          if (info.object) {
-            const d = info.object;
-            openBldgDrawerFor({ lat: d.lat, lon: d.lon, name: d.name || undefined, height: d.height_m, usage: d.usage || undefined, base: d.ground_elev_m, source: d.source, measured: d.measured });
-          }
-        },
-        onHover: buildingHover,
-      }),
-    ];
-  }, [showBuildings, buildings3dData, buildings3dMode, losBuildingHighlight, buildingOpacity, bldgDrawer?.lat, bldgDrawer?.lon, openBldgDrawerFor, braAlways3d, braArea?.lat, braArea?.lon, braArea?.radiusKm]);
-
   // 등록된 실측 3D 타일셋 폴더 조회 (미등록이면 null → 토글 비활성)
   useEffect(() => {
     invoke<string | null>("get_tiles3d_dir").then(setTiles3dDir).catch(() => { /* 미등록 */ });
@@ -4239,6 +4329,16 @@ export default function TrackMap() {
     [dotPoints, hiddenLegendItems],
   );
 
+  // 줌 불변 히트맵 비트맵 — 시간창/범례 필터 변경 시에만 재비닝 (줌·팬과 무관)
+  const trackHeatBitmap = useMemo(() => {
+    if (trackDisplay !== "heatmap" || filteredDotPoints.length === 0) return null;
+    return buildHeatBitmap(filteredDotPoints, HEAT_BLUE_LUT);
+  }, [trackDisplay, filteredDotPoints]);
+  const lossHeatBitmap = useMemo(() => {
+    if (heatLossPoints.length === 0) return null;
+    return buildHeatBitmap(heatLossPoints, HEAT_RED_LUT);
+  }, [heatLossPoints]);
+
   // deck.gl 레이어
   const deckLayers = useMemo(() => {
     const layers = [];
@@ -4313,34 +4413,24 @@ export default function TrackMap() {
         })
       );
     } else if (trackDisplay === "heatmap") {
-      // 탐지점 밀도 히트맵 — 지면 집계라 고도/altScale/losMode 와 무관.
+      // 줌 불변 밀도 히트맵 — 고정 메르카토르 그리드 비트맵(보고서 §1 레시피)이라 확대/축소에도 동일.
       // 정상 항적(파랑) 위에 소실표적(빨강)을 얹어 소실 밀집 구역이 위로 드러나게 합성
-      layers.push(
-        new HeatmapLayer<TrackPoint>({
-          id: "track-heatmap",
-          data: filteredDotPoints,
-          getPosition: (d) => [d.longitude, d.latitude],
-          getWeight: 1,
-          radiusPixels: 30,
-          intensity: 3,
-          threshold: 0.03,
-          aggregation: "SUM",
-          colorRange: HEAT_BLUE_RANGE,
-          pickable: false,
-        })
-      );
-      if (heatLossPoints.length > 0) {
+      if (trackHeatBitmap) {
         layers.push(
-          new HeatmapLayer<LossPoint>({
+          new BitmapLayer({
+            id: "track-heatmap",
+            image: trackHeatBitmap.canvas,
+            bounds: trackHeatBitmap.bounds,
+            pickable: false,
+          })
+        );
+      }
+      if (lossHeatBitmap) {
+        layers.push(
+          new BitmapLayer({
             id: "loss-heatmap",
-            data: heatLossPoints,
-            getPosition: (d) => [d.longitude, d.latitude],
-            getWeight: 1,
-            radiusPixels: 30,
-            intensity: 3,
-            threshold: 0.03,
-            aggregation: "SUM",
-            colorRange: HEAT_RED_RANGE,
+            image: lossHeatBitmap.canvas,
+            bounds: lossHeatBitmap.bounds,
             pickable: false,
           })
         );
@@ -4493,9 +4583,6 @@ export default function TrackMap() {
     // 커버리지 맵 합성 (2D/3D 모드에 따라 선택)
     layers.push(...coverageDeckLayers);
 
-    // 건물 2D 오버레이 합성 (별도 useMemo)
-    layers.push(...buildingDeckLayers);
-
     // 실측 3D 타일 합성 (별도 useMemo)
     layers.push(...tiles3dDeckLayers);
 
@@ -4587,7 +4674,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, heatLossPoints, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, buildingDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, trackHeatBitmap, lossHeatBitmap, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
