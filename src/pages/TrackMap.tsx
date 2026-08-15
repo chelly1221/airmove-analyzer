@@ -658,6 +658,9 @@ export default function TrackMap() {
   // 카드 입력값 (문자열) — 지반고 / 건물높이
   const [simGroundInput, setSimGroundInput] = useState("");
   const [simHeightInput, setSimHeightInput] = useState("");
+  // 단면도 닫힘 시 카드 입력값을 DB/SRTM 프리필로 강제 복원하는 트리거 —
+  // 수정값이 입력칸에 잔존해 재오픈 시 그대로 재적용되는 것 방지
+  const [simPrefillTick, setSimPrefillTick] = useState(0);
   // 좌표 지점의 건물 선택 — 주소검색·지도 건물클릭 공용. moveCamera=false 면 카메라 유지(화면 내 건물 클릭 전환용)
   const selectBuildingAt = useCallback((lat: number, lon: number, label: string, moveCamera: boolean) => {
     // 이전 시뮬레이션 초기화 (건물 문맥 전환)
@@ -739,7 +742,8 @@ export default function TrackMap() {
       .then((elevs) => { if (!cancelled) setSimGroundInput(String(Math.round(elevs[0] ?? 0))); })
       .catch(() => { if (!cancelled) setSimGroundInput("0"); });
     return () => { cancelled = true; };
-  }, [addressMarker, addressBuilding]);
+    // simPrefillTick: 단면도 닫힘 시 수정값을 버리고 원본(DB/SRTM) 프리필로 되돌리기 위한 재실행 트리거
+  }, [addressMarker, addressBuilding, simPrefillTick]);
 
   // 카드 입력 수정 → 즉시 반영하지 않고 dirty 시 입력 행 끝 "적용" 버튼 노출, 클릭 시 반영
   // (2026-08-03 300ms 라이브 디바운스 교체 — 타이핑 중 무거운 단면도 재계산 방지).
@@ -1443,8 +1447,17 @@ export default function TrackMap() {
 
   const buildings3dGeoJSON = useMemo(() => {
     if (!showBuildings || !buildings3dMode || buildings3dData.length === 0) return null;
-    return buildingsToGeoJSON(buildings3dData);
-  }, [showBuildings, buildings3dMode, buildings3dData]);
+    // 시뮬 수정 높이 반영 — 일반 레이어의 DB 높이 박스가 골드 시뮬 박스 위로 삐져나오는 것 방지 + 호버 툴팁 높이 정합
+    const sim = losSimBuilding;
+    if (!sim) return buildingsToGeoJSON(buildings3dData);
+    const h = isNaN(sim.heightM) ? 0 : sim.heightM; // NaN → 0 (카드 UI 시맨틱과 동일)
+    // 좌표 매칭: 양 경로 모두 DB f64 centroid 라 사실상 동일값. 1e-6°≈0.1m 로 인접 건물 오매칭 불가
+    const data = buildings3dData.map((b) =>
+      Math.abs(b.lat - sim.lat) < 1e-6 && Math.abs(b.lon - sim.lon) < 1e-6 ? { ...b, height_m: h } : b
+    );
+    return buildingsToGeoJSON(data);
+    // sim 은 객체 아이덴티티가 아닌 스칼라 3종으로 — 지반고만 바뀐 적용에서 setData 재인덱싱 방지
+  }, [showBuildings, buildings3dMode, buildings3dData, losSimBuilding?.lat, losSimBuilding?.lon, losSimBuilding?.heightM]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** 마지막으로 적용된 fill-extrusion 필터 키 (JSON) — 변경 시에만 setFilter */
   const lastFiltersRef = useRef<string>("");
@@ -1926,7 +1939,12 @@ export default function TrackMap() {
     );
     if (!matched || matched.polygon.length < 3) return;
 
-    const geoJSON = buildingsToGeoJSON([matched]);
+    // 시뮬 수정 높이 반영 — 좌표 매칭(1e-6°≈0.1m, 양 경로 모두 DB f64 centroid 라 사실상 동일값)
+    const sim = losSimBuilding;
+    const simMatched = !!sim && Math.abs(matched.lat - sim.lat) < 1e-6 && Math.abs(matched.lon - sim.lon) < 1e-6;
+    const geoJSON = buildingsToGeoJSON([
+      simMatched && sim ? { ...matched, height_m: isNaN(sim.heightM) ? 0 : sim.heightM } : matched,
+    ]);
 
     map.addSource(hlSourceId, { type: "geojson", data: geoJSON });
     map.addLayer({
@@ -1945,7 +1963,8 @@ export default function TrackMap() {
       if (map.getLayer(hlLayerId)) map.removeLayer(hlLayerId);
       if (map.getSource(hlSourceId)) map.removeSource(hlSourceId);
     };
-  }, [losBuildingHighlight, buildings3dMode, buildings3dData, inMeshCoverage]);
+    // sim 은 스칼라 3종으로만 (객체 아이덴티티 변경으로 레이어 재생성되지 않게)
+  }, [losBuildingHighlight, buildings3dMode, buildings3dData, inMeshCoverage, losSimBuilding?.lat, losSimBuilding?.lon, losSimBuilding?.heightM]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 클릭(고정) 건물 → 3D 골드 glow (채움 + 외곽선)
   useEffect(() => {
@@ -1971,7 +1990,12 @@ export default function TrackMap() {
     );
     if (!matched || matched.polygon.length < 3) return;
 
-    const geoJSON = buildingsToGeoJSON([matched]);
+    // 시뮬 수정 높이 반영 — 좌표 매칭(1e-6°≈0.1m, 양 경로 모두 DB f64 centroid 라 사실상 동일값)
+    const sim = losSimBuilding;
+    const simMatched = !!sim && Math.abs(matched.lat - sim.lat) < 1e-6 && Math.abs(matched.lon - sim.lon) < 1e-6;
+    const geoJSON = buildingsToGeoJSON([
+      simMatched && sim ? { ...matched, height_m: isNaN(sim.heightM) ? 0 : sim.heightM } : matched,
+    ]);
     map.addSource(selSourceId, { type: "geojson", data: geoJSON });
     map.addLayer({
       id: selFillId,
@@ -1993,7 +2017,8 @@ export default function TrackMap() {
 
     return cleanup;
     // 조회 결과(loading/info/facDetail) 갱신으로 레이어가 재생성되지 않게 열림 여부·좌표만 deps 로
-  }, [bldgDrawer != null, bldgDrawer?.lat, bldgDrawer?.lon, buildings3dMode, buildings3dData, inMeshCoverage]); // eslint-disable-line react-hooks/exhaustive-deps
+    // (sim 도 동일 이유로 스칼라 3종만)
+  }, [bldgDrawer != null, bldgDrawer?.lat, bldgDrawer?.lon, buildings3dMode, buildings3dData, inMeshCoverage, losSimBuilding?.lat, losSimBuilding?.lon, losSimBuilding?.heightM]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 주소검색 건물 → 3D 골드 표출(히트) / 지반 2D 폴백(미히트).
   //   buildings3dMode·showBuildings·줌 게이트와 무관하게 addressMarker 존재 동안 항상 표시.
@@ -2035,7 +2060,10 @@ export default function TrackMap() {
         if (first[0] !== last[0] || first[1] !== last[1]) coords.push([...first]);
         features.push({
           type: "Feature",
-          properties: { height: addressBuilding.height_m },
+          // 시뮬 적용 중이면 수정 높이 반영 (NaN → 0, 카드 UI 시맨틱과 동일).
+          // 좌표 매칭 불필요 — losSimBuilding 은 현재 주소 건물에서만 생성되고, selectBuildingAt 이
+          // 건물 컨텍스트 전환 시 초기화한다
+          properties: { height: losSimBuilding ? (isNaN(losSimBuilding.heightM) ? 0 : losSimBuilding.heightM) : addressBuilding.height_m },
           geometry: { type: "Polygon", coordinates: [coords] },
         });
       }
@@ -2087,7 +2115,8 @@ export default function TrackMap() {
     }
 
     return cleanup;
-  }, [addressMarker, addressBuilding, inMeshCoverage]);
+    // sim 은 객체 아이덴티티 대신 존재 여부·높이 스칼라만 (지반고 변경으로 레이어 재생성되지 않게)
+  }, [addressMarker, addressBuilding, inMeshCoverage, losSimBuilding != null, losSimBuilding?.heightM]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── LoS 단면도 경로상 건물 → 지도 3D 하이라이트 (대상=파랑 #3b82f6, 차단=빨강 #ef4444) ──
   //   단면도 차트의 대상/차단 건물 색과 1:1 대응. 주소검색 골드 건물과 동일하게
@@ -2880,6 +2909,7 @@ export default function TrackMap() {
     setLosBldgAzBounds(null);
     setLosCurtain(null);
     setLosPathBldgs(null);
+    setSimPrefillTick((t) => t + 1); // 도구 전환/닫기도 단면도 닫힘 — 카드 입력값 프리필 복원
     const map = mapRef.current?.getMap();
     if (map) map.easeTo({ pitch: savedPitchRef.current, bearing: savedBearingRef.current, duration: 500 });
   }, []);
@@ -6026,7 +6056,7 @@ export default function TrackMap() {
           targetLat={losTarget.lat}
           targetLon={losTarget.lon}
           radarSite={radarSite}
-          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setLosSearchedAddress(null); setLosFootprint(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosPathBldgs(null); setLosCursorPicking(true); }}
+          onClose={() => { setLosTarget(null); setLosCursor(null); setLosHoverRatio(null); setLosHighlightIdx(null); setLosHoverIdx(null); setLosBuildingHighlight(null); setLosSearchedAddress(null); setLosFootprint(null); setLosSimBuilding(null); setLosSimStats(null); setLosBldgAzBounds(null); setLosCurtain(null); setLosPathBldgs(null); setSimPrefillTick((t) => t + 1); setLosCursorPicking(true); }}
           searchedAddress={losSearchedAddress}
           onHoverDistance={setLosHoverRatio}
           losTrackPoints={losTrackPoints}
