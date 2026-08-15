@@ -148,6 +148,8 @@ struct TrackAssembler {
     mode3a_to_modes: HashMap<u16, String>,
     /// ATCRBS 포인트 임시 보관 (병합 전)
     atcrbs_pool: Vec<(TrackPoint, Option<u16>)>,
+    /// 항적에서 제거된 유령표적 포인트 보존분 (이중표적 분석용, 전수 보존)
+    removed_ghosts: Vec<TrackPoint>,
     /// 통계
     stats: ParseStatistics,
 }
@@ -159,6 +161,7 @@ impl TrackAssembler {
             ms_timestamps: HashMap::new(),
             mode3a_to_modes: HashMap::new(),
             atcrbs_pool: Vec::new(),
+            removed_ghosts: Vec::new(),
             stats: ParseStatistics::default(),
         }
     }
@@ -415,9 +418,12 @@ impl TrackAssembler {
             ghost_indices.sort_unstable();
             ghost_indices.dedup();
             let removed_count = ghost_indices.len();
+            // 제거분은 버리지 않고 보존 (이중표적 분석용) — 항적 제거 동작 자체는 기존과 동일
             for &idx in ghost_indices.iter().rev() {
-                points.remove(idx);
+                let removed = points.remove(idx);
+                self.removed_ghosts.push(removed.point);
             }
+            self.stats.ghost_points_removed += removed_count;
 
             if removed_count > 0 {
                 info!(
@@ -592,9 +598,12 @@ impl TrackAssembler {
                 continue;
             }
 
+            // 제거분은 버리지 않고 보존 (이중표적 분석용) — 항적 제거 동작 자체는 기존과 동일
             for &idx in outlier_indices.iter().rev() {
-                points.remove(idx);
+                let removed = points.remove(idx);
+                self.removed_ghosts.push(removed.point);
             }
+            self.stats.ghost_points_removed += outlier_indices.len();
 
             info!(
                 "Spatial outlier removal for {}: {} outlier points removed",
@@ -663,7 +672,8 @@ impl TrackAssembler {
     }
 
     /// 최종 결과: 모든 Mode-S 항적을 하나의 Vec로 병합 (RichTrackPoint → TrackPoint)
-    fn into_points(mut self) -> (Vec<TrackPoint>, ParseStatistics) {
+    /// 반환: (항적 포인트, 유령표적 보존분, 통계) — 둘 다 시간순 정렬
+    fn into_points(mut self) -> (Vec<TrackPoint>, Vec<TrackPoint>, ParseStatistics) {
         let mut all_points = Vec::new();
         for (_ms, pts) in self.tracks.drain() {
             for rtp in pts {
@@ -676,7 +686,14 @@ impl TrackAssembler {
                 .partial_cmp(&b.timestamp)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        (all_points, self.stats)
+        // 유령표적 보존분도 시간순 정렬 (전수 — 다운샘플링/상한 없음)
+        let mut ghost_points = std::mem::take(&mut self.removed_ghosts);
+        ghost_points.sort_by(|a, b| {
+            a.timestamp
+                .partial_cmp(&b.timestamp)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        (all_points, ghost_points, self.stats)
     }
 }
 
@@ -1367,7 +1384,7 @@ pub fn parse_ass_file(
     assembler.dedup_same_position();
 
     // 최종 포인트 추출
-    let (mut all_points, stats) = assembler.into_points();
+    let (mut all_points, ghost_points, stats) = assembler.into_points();
 
     // 고도 보간 (altitude=0인 포인트에 직전/직후 유효 고도 적용)
     interpolate_missing_altitudes(&mut all_points);
@@ -1392,6 +1409,7 @@ pub fn parse_ass_file(
         filename,
         total_records,
         track_points: all_points,
+        ghost_points,
         parse_errors,
         start_time,
         end_time,

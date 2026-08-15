@@ -56,6 +56,24 @@ fn emit_and_drain_track_points(
     points.shrink_to_fit();
 }
 
+/// 유령표적(반사 이중표적) 보존분을 청크 단위로 emit한 뒤, 원본에서 제거.
+/// 항적(track_points)과 별도 채널 — Loss 탐지/항적 파이프라인에 영향 없음.
+fn emit_and_drain_ghost_points(
+    handle: &tauri::AppHandle,
+    file_path: &str,
+    points: &mut Vec<TrackPoint>,
+) {
+    for chunk in points.chunks(CHUNK_SIZE) {
+        let _ = handle.emit("parse-ghost-chunk", TrackPointsChunk {
+            file_path: file_path.to_string(),
+            points: chunk.to_vec(),
+        });
+    }
+    // 메모리 해제 — 이미 프론트엔드로 전송됨
+    points.clear();
+    points.shrink_to_fit();
+}
+
 /// CAT008 기상 벡터 청크 스트리밍 이벤트 페이로드
 #[derive(Clone, serde::Serialize)]
 struct WeatherChunk {
@@ -283,6 +301,8 @@ async fn parse_and_analyze_batch(
                     };
                     // track_points를 청크로 스트리밍 후 메모리 해제
                     emit_and_drain_track_points(&handle, &path, &mut analysis.file_info.track_points);
+                    // 유령표적 보존분을 청크로 스트리밍 후 메모리 해제 (이중표적 분석용 별도 채널)
+                    emit_and_drain_ghost_points(&handle, &path, &mut analysis.file_info.ghost_points);
                     // 기상 벡터를 청크로 스트리밍 후 메모리 해제
                     emit_and_drain_weather_vectors(&handle, &path, &mut analysis.file_info.weather_vectors);
 

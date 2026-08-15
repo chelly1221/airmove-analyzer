@@ -8,6 +8,7 @@
  */
 
 import type { Aircraft, Flight, RadarSite, TrackPoint } from "../types";
+import type { DualTargetResult } from "../types";
 
 // ─── Worker 싱글턴 ──────────────────────────────────
 
@@ -146,6 +147,14 @@ export function postPointsToWorker(points: TrackPoint[]): void {
 }
 
 /**
+ * 파서가 제거한 유령표적 보존분을 Worker에 전달 — 이중표적 분석용.
+ * postPointsToWorker와 동일한 fire-and-forget 패턴.
+ */
+export function postGhostPointsToWorker(points: TrackPoint[]): void {
+  getWorker().postMessage({ type: "ADD_GHOST_POINTS", points });
+}
+
+/**
  * Worker에 축적된 포인트로 비행 통합 시작 — 완전 스트리밍.
  *
  * sendPointsToWorker()로 포인트를 미리 전송한 후 호출.
@@ -260,5 +269,20 @@ export function queryViewportPoints(params: ViewportQueryParams & { onProgress?:
 export async function queryFlightPoints(flightId: string): Promise<TrackPoint[]> {
   const result = await workerSend({ type: "QUERY_FLIGHT_POINTS", flightId });
   return result.points;
+}
+
+// ─── 이중표적(반사 유령표적) 분석 ─────────────────────
+
+/**
+ * Worker에 축적된 항적 + 파서 보존 유령표적으로 이중표적 분석 실행.
+ * 잔존 동일스캔 중복(scan) + 파서 제거분(parser) 병합 → 반사점 역산·클러스터링.
+ */
+export async function analyzeDualTargets(params: {
+  sites: { name: string; latitude: number; longitude: number }[];
+  scanWindowS: number;
+  minSepKm: number;
+}): Promise<DualTargetResult> {
+  const result = await workerSend({ type: "ANALYZE_DUAL_TARGETS", ...params });
+  return result.result as DualTargetResult;
 }
 

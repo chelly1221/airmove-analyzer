@@ -120,6 +120,71 @@ interface RadarSite {
   range_nm: number;
 }
 
+// ─── 이중표적 분석 타입 (src/types/dualTarget.ts 계약과 필드 완전 일치) ───
+
+interface DualTargetObservation {
+  timestamp: number;
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  range_km: number;
+  azimuth_deg: number;
+  radar_type: string;
+}
+
+interface DualTargetReflector {
+  latitude: number;
+  longitude: number;
+  range_km: number;
+  azimuth_deg: number;
+}
+
+interface DualTargetEvent {
+  id: number;
+  mode_s: string;
+  radar_name: string;
+  real: DualTargetObservation;
+  ghost: DualTargetObservation;
+  separation_km: number;
+  extra_path_km: number;
+  reflector: DualTargetReflector | null;
+  source: "scan" | "parser";
+  confidence: "high" | "low";
+  cluster_id: number | null;
+}
+
+interface ReflectorCluster {
+  id: number;
+  latitude: number;
+  longitude: number;
+  count: number;
+  radar_name: string;
+  building_name?: string | null;
+}
+
+interface DualTargetStats {
+  flights_scanned: number;
+  points_scanned: number;
+  parser_ghosts: number;
+  events_scan: number;
+  events_parser: number;
+  dropped_unmatched: number;
+  aircraft_count: number;
+  skipped_no_site: number;
+}
+
+interface DualTargetParams {
+  scan_window_s: number;
+  min_sep_km: number;
+}
+
+interface DualTargetResult {
+  events: DualTargetEvent[];
+  clusters: ReflectorCluster[];
+  stats: DualTargetStats;
+  params: DualTargetParams;
+}
+
 // ─── 상수 ──────────────────────────────────────────
 
 const GAP_THRESHOLD_SECS = 14400;
@@ -131,6 +196,19 @@ const OUT_OF_RANGE_THRESHOLD = 1.0;
 const MAX_CONSECUTIVE_SIGNAL_LOSS_SCANS = 15.0;
 const MAX_LOSS_DURATION_SECS = 14400.0;
 const SPEED_DEVIATION_RATIO = 0.5;
+
+// 이중표적(반사 유령표적) 분석 상수
+/** 반사 기하 역산 최소 초과경로 (km) — 이하면 해가 무의미하여 reflector = null */
+const DUAL_MIN_EXTRA_PATH_KM = 0.05;
+/** confidence "high" 판정 초과경로 (km) */
+const DUAL_HIGH_CONFIDENCE_EXTRA_KM = 0.2;
+/** 반사점 클러스터 그리드 (deg, ≈250m) */
+const DUAL_CLUSTER_GRID_DEG = 0.0025;
+/** 파서 보존분 ↔ 실항적 매칭 허용 시간 (초) */
+const DUAL_PARSER_MATCH_WINDOW_S = 60;
+/** 반사점 이분법 반복 횟수 / 수렴 허용오차 (km) */
+const DUAL_BISECT_ITERS = 48;
+const DUAL_BISECT_TOL_KM = 0.001;
 
 // 이상고도 보정 상수
 const MAX_VERTICAL_RATE_MS = 100;
@@ -154,6 +232,10 @@ interface FlightIndexEntry {
 }
 let _flightIndex = new Map<string, FlightIndexEntry>();
 
+/** 파서가 제거하되 보존한 유령표적 포인트 (ADD_GHOST_POINTS 누적).
+ *  소량(통상 수천 이하)이므로 객체 배열로 보관해도 메모리 부담 없음. */
+let _ghostPoints: TrackPoint[] = [];
+
 /** SoA → TrackPoint[]로 한 비행씩 unpack — 외부 함수 호출 시 사용 */
 function pointsArrayOf(entry: FlightIndexEntry): TrackPoint[] {
   return unpackBatch(entry.points) as TrackPoint[];
@@ -171,6 +253,39 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number): numb
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.asin(Math.sqrt(Math.min(a, 1)));
+}
+
+/** 구면 initial bearing — 진북 기준 0–360° */
+function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const p1 = toRad(lat1);
+  const p2 = toRad(lat2);
+  const dLon = toRad(lon2 - lon1);
+  const y = Math.sin(dLon) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dLon);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+/** 구면 destination — (lat,lon)에서 방위 bearing 으로 distKm 이동한 지점 */
+function destPointDeg(
+  lat: number, lon: number, bearing: number, distKm: number,
+): { latitude: number; longitude: number } {
+  const R = 6371.0;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const p1 = toRad(lat);
+  const l1 = toRad(lon);
+  const brg = toRad(bearing);
+  const d = distKm / R;
+  const sinP2 = Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(brg);
+  const p2 = Math.asin(Math.min(1, Math.max(-1, sinP2)));
+  const l2 = l1 + Math.atan2(
+    Math.sin(brg) * Math.sin(d) * Math.cos(p1),
+    Math.cos(d) - Math.sin(p1) * Math.sin(p2),
+  );
+  return {
+    latitude: (p2 * 180) / Math.PI,
+    longitude: (((l2 * 180) / Math.PI + 540) % 360) - 180,
+  };
 }
 
 // ─── 이상고도 보정 ──────────────────────────────────
@@ -813,6 +928,333 @@ async function consolidateAndStream(
   self.postMessage({ type: "CONSOLIDATE_DONE", id: requestId, totalFlights });
 }
 
+// ─── 이중표적(레이더 반사 유령표적) 분석 ─────────────
+
+/** 궤적 이탈도 (km) — target 이 prev→next 시간비례 보간 위치에서 벗어난 거리.
+ *  ass.rs `trajectory_deviation` 과 동일 로직 (한쪽만 있으면 그 점과의 거리, 둘 다 없으면 0). */
+function trajectoryDeviationSoA(
+  soa: PointBatch, target: number, prevIdx: number, nextIdx: number,
+): number {
+  const tLat = soa.latitude[target];
+  const tLon = soa.longitude[target];
+  if (prevIdx >= 0 && nextIdx >= 0) {
+    const dtTotal = soa.timestamp[nextIdx] - soa.timestamp[prevIdx];
+    if (dtTotal <= 0) return 0;
+    const ratio = (soa.timestamp[target] - soa.timestamp[prevIdx]) / dtTotal;
+    const iLat = soa.latitude[prevIdx] + (soa.latitude[nextIdx] - soa.latitude[prevIdx]) * ratio;
+    const iLon = soa.longitude[prevIdx] + (soa.longitude[nextIdx] - soa.longitude[prevIdx]) * ratio;
+    return haversine(tLat, tLon, iLat, iLon);
+  }
+  if (prevIdx >= 0) return haversine(tLat, tLon, soa.latitude[prevIdx], soa.longitude[prevIdx]);
+  if (nextIdx >= 0) return haversine(tLat, tLon, soa.latitude[nextIdx], soa.longitude[nextIdx]);
+  return 0;
+}
+
+/** 반사점 역산 — 레이더 S·실표적 A 를 초점으로 하는 타원(경로합 = Rg)과 유령 방위선 θg 의 교점.
+ *  f(r) = r + |dest(S,θg,r) − A| − Rg 는 r 에 대해 단조증가, f(0) = −extra_path < 0 이므로 이분법 수렴. */
+function solveReflector(
+  siteLat: number, siteLon: number, realLat: number, realLon: number,
+  thetaG: number, rangeG: number,
+): DualTargetReflector {
+  let lo = 0;
+  let hi = rangeG;
+  let mid = rangeG / 2;
+  for (let it = 0; it < DUAL_BISECT_ITERS; it++) {
+    mid = (lo + hi) / 2;
+    const p = destPointDeg(siteLat, siteLon, thetaG, mid);
+    const f = mid + haversine(p.latitude, p.longitude, realLat, realLon) - rangeG;
+    if (Math.abs(f) < DUAL_BISECT_TOL_KM) break;
+    if (f < 0) lo = mid;
+    else hi = mid;
+  }
+  const p = destPointDeg(siteLat, siteLon, thetaG, mid);
+  return { latitude: p.latitude, longitude: p.longitude, range_km: mid, azimuth_deg: thetaG };
+}
+
+/** 관측(TrackPoint) → DualTargetObservation (레이더 기준 극좌표 재계산) */
+function makeDualObservation(
+  p: { timestamp: number; latitude: number; longitude: number; altitude: number; radar_type: string },
+  siteLat: number, siteLon: number,
+): DualTargetObservation {
+  return {
+    timestamp: p.timestamp,
+    latitude: p.latitude,
+    longitude: p.longitude,
+    altitude: p.altitude,
+    range_km: haversine(siteLat, siteLon, p.latitude, p.longitude),
+    azimuth_deg: bearingDeg(siteLat, siteLon, p.latitude, p.longitude),
+    radar_type: p.radar_type,
+  };
+}
+
+/** 실/유령 관측 쌍 → 이벤트 조립 (id·cluster_id 는 후처리에서 부여) */
+function buildDualEvent(
+  modeS: string, radarName: string,
+  realP: { timestamp: number; latitude: number; longitude: number; altitude: number; radar_type: string },
+  ghostP: { timestamp: number; latitude: number; longitude: number; altitude: number; radar_type: string },
+  siteLat: number, siteLon: number,
+  source: "scan" | "parser",
+): DualTargetEvent {
+  const real = makeDualObservation(realP, siteLat, siteLon);
+  const ghost = makeDualObservation(ghostP, siteLat, siteLon);
+  const extraPath = ghost.range_km - real.range_km;
+  return {
+    id: 0,
+    mode_s: modeS,
+    radar_name: radarName,
+    real,
+    ghost,
+    separation_km: haversine(real.latitude, real.longitude, ghost.latitude, ghost.longitude),
+    extra_path_km: extraPath,
+    reflector: extraPath <= DUAL_MIN_EXTRA_PATH_KM
+      ? null
+      : solveReflector(siteLat, siteLon, real.latitude, real.longitude, ghost.azimuth_deg, ghost.range_km),
+    source,
+    confidence: extraPath > DUAL_HIGH_CONFIDENCE_EXTRA_KM ? "high" : "low",
+    cluster_id: null,
+  };
+}
+
+/**
+ * 이중표적 분석 — 잔존 동일스캔 중복(scan) + 파서 보존 유령표적(parser) 병합.
+ *
+ * 전수 처리(다운샘플링·상한 없음), 20만 포인트마다 이벤트 루프 양보.
+ */
+async function analyzeDualTargets(
+  sites: { name: string; latitude: number; longitude: number }[],
+  scanWindowS: number,
+  minSepKm: number,
+): Promise<DualTargetResult> {
+  const siteMap = new Map<string, { lat: number; lon: number }>();
+  for (let i = 0; i < sites.length; i++) {
+    siteMap.set(sites[i].name, { lat: sites[i].latitude, lon: sites[i].longitude });
+  }
+
+  const events: DualTargetEvent[] = [];
+  const stats: DualTargetStats = {
+    flights_scanned: 0,
+    points_scanned: 0,
+    parser_ghosts: _ghostPoints.length,
+    events_scan: 0,
+    events_parser: 0,
+    dropped_unmatched: 0,
+    aircraft_count: 0,
+    skipped_no_site: 0,
+  };
+
+  // ── Phase 1: 잔존 동일스캔 중복 전수 탐지 (scan 소스) ──
+  let sinceYield = 0;
+  for (const entry of _flightIndex.values()) {
+    const site = siteMap.get(entry.radarName);
+    if (!site) { stats.skipped_no_site++; continue; }
+    if (!entry.modeS) continue;
+
+    stats.flights_scanned++;
+    const soa = entry.points;
+    const n = soa.count;
+
+    // 파서와 동일한 슬라이딩 클러스터 — 시작점 기준 scanWindowS 이내 연속 포인트
+    let clusterStart = 0;
+    for (let i = 1; i <= n; i++) {
+      const endCluster = i === n
+        || Math.abs(soa.timestamp[i] - soa.timestamp[clusterStart]) > scanWindowS;
+      if (!endCluster) continue;
+
+      const clusterLen = i - clusterStart;
+      stats.points_scanned += clusterLen;
+      sinceYield += clusterLen;
+
+      if (clusterLen >= 2) {
+        const prevIdx = clusterStart > 0 ? clusterStart - 1 : -1;
+        const nextIdx = i < n ? i : -1;
+        // 한 클러스터에서 ghost 로 확정된 인덱스는 이후 쌍 검사에서 제외 (중복 이벤트 방지)
+        let ghostSet: Set<number> | null = null;
+
+        for (let a = clusterStart; a < i; a++) {
+          if (ghostSet && ghostSet.has(a)) continue;
+          for (let b = a + 1; b < i; b++) {
+            if (ghostSet && ghostSet.has(b)) continue;
+            const sep = haversine(
+              soa.latitude[a], soa.longitude[a], soa.latitude[b], soa.longitude[b],
+            );
+            if (sep < minSepKm) continue;
+
+            // 궤적 이탈도가 큰 쪽 = ghost. 동률이면 레이더 거리 먼 쪽 = ghost
+            const devA = trajectoryDeviationSoA(soa, a, prevIdx, nextIdx);
+            const devB = trajectoryDeviationSoA(soa, b, prevIdx, nextIdx);
+            let gi: number;
+            let ri: number;
+            if (devA > devB) { gi = a; ri = b; }
+            else if (devB > devA) { gi = b; ri = a; }
+            else {
+              const dA = haversine(site.lat, site.lon, soa.latitude[a], soa.longitude[a]);
+              const dB = haversine(site.lat, site.lon, soa.latitude[b], soa.longitude[b]);
+              if (dA >= dB) { gi = a; ri = b; } else { gi = b; ri = a; }
+            }
+
+            events.push(buildDualEvent(
+              entry.modeS, entry.radarName,
+              pointAt(soa, ri) as TrackPoint, pointAt(soa, gi) as TrackPoint,
+              site.lat, site.lon, "scan",
+            ));
+            stats.events_scan++;
+
+            if (!ghostSet) ghostSet = new Set<number>();
+            ghostSet.add(gi);
+            if (gi === a) break; // a 가 ghost 로 확정 → 이 a 의 나머지 쌍 검사 중단
+          }
+        }
+      }
+
+      clusterStart = i;
+
+      if (sinceYield >= 200_000) {
+        sinceYield = 0;
+        await yieldWorker();
+      }
+    }
+  }
+
+  // ── Phase 2: 파서 보존분 병합 (parser 소스) ──
+  if (_ghostPoints.length > 0) {
+    // modeS|radarName → 후보 비행 인덱스
+    const byKey = new Map<string, FlightIndexEntry[]>();
+    for (const entry of _flightIndex.values()) {
+      if (!entry.modeS) continue;
+      const key = `${entry.modeS.toUpperCase()}|${entry.radarName}`;
+      let arr = byKey.get(key);
+      if (!arr) { arr = []; byKey.set(key, arr); }
+      arr.push(entry);
+    }
+
+    for (let gi = 0; gi < _ghostPoints.length; gi++) {
+      const g = _ghostPoints[gi];
+      const rn = g.radar_name ?? "";
+      const site = siteMap.get(rn);
+      if (!site) { stats.dropped_unmatched++; continue; }
+
+      const candidates = byKey.get(`${(g.mode_s ?? "").toUpperCase()}|${rn}`);
+      if (!candidates) { stats.dropped_unmatched++; continue; }
+
+      // g.timestamp 최근접 실포인트 탐색 (이진탐색) — 후보 중 |dt| 최소인 비행 채택
+      let best: FlightIndexEntry | null = null;
+      let bestNear = -1;
+      let bestDt = Infinity;
+      let bestPrev = -1;
+      let bestNext = -1;
+      for (let ci = 0; ci < candidates.length; ci++) {
+        const entry = candidates[ci];
+        if (g.timestamp < entry.startTime - DUAL_PARSER_MATCH_WINDOW_S) continue;
+        if (g.timestamp > entry.endTime + DUAL_PARSER_MATCH_WINDOW_S) continue;
+        const soa = entry.points;
+        if (soa.count === 0) continue;
+        const lb = lowerBoundSoA(soa, g.timestamp); // ts >= g.ts 인 첫 인덱스
+        const ub = upperBoundSoA(soa, g.timestamp); // ts >  g.ts 인 첫 인덱스
+        const prev = lb - 1;                        // ts <  g.ts 인 마지막
+        const next = ub < soa.count ? ub : -1;      // ts >  g.ts 인 첫
+        let near = -1;
+        let dt = Infinity;
+        if (lb < soa.count) { near = lb; dt = Math.abs(soa.timestamp[lb] - g.timestamp); }
+        if (prev >= 0) {
+          const dPrev = Math.abs(g.timestamp - soa.timestamp[prev]);
+          if (dPrev < dt) { near = prev; dt = dPrev; }
+        }
+        if (dt < bestDt) {
+          bestDt = dt; best = entry; bestNear = near; bestPrev = prev; bestNext = next;
+        }
+      }
+
+      if (!best) { stats.dropped_unmatched++; continue; }
+
+      const soa = best.points;
+      let realP: { timestamp: number; latitude: number; longitude: number; altitude: number; radar_type: string } | null = null;
+
+      if (bestNear >= 0 && bestDt <= scanWindowS) {
+        // 동일스캔 실측 짝
+        realP = pointAt(soa, bestNear) as TrackPoint;
+      } else if (
+        bestPrev >= 0 && bestNext >= 0
+        && g.timestamp - soa.timestamp[bestPrev] <= DUAL_PARSER_MATCH_WINDOW_S
+        && soa.timestamp[bestNext] - g.timestamp <= DUAL_PARSER_MATCH_WINDOW_S
+      ) {
+        // 전후 실포인트 선형보간 위치를 real 로 사용
+        const t0 = soa.timestamp[bestPrev];
+        const t1 = soa.timestamp[bestNext];
+        const ratio = t1 > t0 ? (g.timestamp - t0) / (t1 - t0) : 0;
+        const prevPt = pointAt(soa, bestPrev) as TrackPoint;
+        realP = {
+          timestamp: g.timestamp,
+          latitude: soa.latitude[bestPrev] + (soa.latitude[bestNext] - soa.latitude[bestPrev]) * ratio,
+          longitude: soa.longitude[bestPrev] + (soa.longitude[bestNext] - soa.longitude[bestPrev]) * ratio,
+          altitude: soa.altitude[bestPrev] + (soa.altitude[bestNext] - soa.altitude[bestPrev]) * ratio,
+          radar_type: prevPt.radar_type,
+        };
+      }
+
+      if (!realP) { stats.dropped_unmatched++; continue; }
+
+      // parser 소스는 minSepKm 재필터 금지 (파서 기준을 이미 통과한 확정 유령)
+      events.push(buildDualEvent(
+        best.modeS, best.radarName, realP, g, site.lat, site.lon, "parser",
+      ));
+      stats.events_parser++;
+
+      if ((gi & 4095) === 4095) await yieldWorker();
+    }
+  }
+
+  // ── 정렬·id 부여 (유령 관측 시각 오름차순) ──
+  events.sort((a, b) => a.ghost.timestamp - b.ghost.timestamp);
+  const modeSSet = new Set<string>();
+  for (let i = 0; i < events.length; i++) {
+    events[i].id = i;
+    modeSSet.add(events[i].mode_s.toUpperCase());
+  }
+  stats.aircraft_count = modeSSet.size;
+
+  // ── 반사점 클러스터링 (≈250m 그리드 → count 내림차순 id 부여) ──
+  interface CellAcc {
+    sumLat: number; sumLon: number; count: number; radarName: string; members: number[];
+  }
+  const cells = new Map<string, CellAcc>();
+  for (let i = 0; i < events.length; i++) {
+    const r = events[i].reflector;
+    if (!r) continue;
+    const key = `${events[i].radar_name}|${Math.round(r.latitude / DUAL_CLUSTER_GRID_DEG)}|${Math.round(r.longitude / DUAL_CLUSTER_GRID_DEG)}`;
+    let cell = cells.get(key);
+    if (!cell) {
+      cell = { sumLat: 0, sumLon: 0, count: 0, radarName: events[i].radar_name, members: [] };
+      cells.set(key, cell);
+    }
+    cell.sumLat += r.latitude;
+    cell.sumLon += r.longitude;
+    cell.count++;
+    cell.members.push(i);
+  }
+
+  const cellList = Array.from(cells.values());
+  cellList.sort((a, b) => b.count - a.count);
+  const clusters: ReflectorCluster[] = new Array(cellList.length);
+  for (let ci = 0; ci < cellList.length; ci++) {
+    const cell = cellList[ci];
+    clusters[ci] = {
+      id: ci,
+      latitude: cell.sumLat / cell.count,
+      longitude: cell.sumLon / cell.count,
+      count: cell.count,
+      radar_name: cell.radarName,
+    };
+    for (let mi = 0; mi < cell.members.length; mi++) events[cell.members[mi]].cluster_id = ci;
+  }
+
+  return {
+    events,
+    clusters,
+    stats,
+    params: { scan_window_s: scanWindowS, min_sep_km: minSepKm },
+  };
+}
+
 // ─── Worker 메시지 핸들러 ───────────────────────────
 
 self.onmessage = async (e: MessageEvent) => {
@@ -826,6 +1268,25 @@ self.onmessage = async (e: MessageEvent) => {
         if (pts.length > 0) {
           _pointBatches.push(batchFromObjects(pts));
         }
+        break;
+      }
+
+      case "ADD_GHOST_POINTS": {
+        // fire-and-forget — 파서가 제거한 유령표적 보존분. 소량이라 객체 배열로 축적.
+        const pts: TrackPoint[] = e.data.points;
+        for (let i = 0; i < pts.length; i++) _ghostPoints.push(pts[i]);
+        break;
+      }
+
+      case "ANALYZE_DUAL_TARGETS": {
+        const { sites, scanWindowS, minSepKm } = e.data;
+        const t0 = performance.now();
+        const result = await analyzeDualTargets(sites, scanWindowS, minSepKm);
+        console.log(
+          `[Worker] analyzeDualTargets: ${(performance.now() - t0).toFixed(0)}ms, ` +
+          `events=${result.events.length} clusters=${result.clusters.length}`,
+        );
+        self.postMessage({ type: "ANALYZE_DUAL_TARGETS_RESULT", id, result });
         break;
       }
 

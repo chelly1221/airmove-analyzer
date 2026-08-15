@@ -71,6 +71,10 @@ pub struct ParseStatistics {
     /// NEC↔TOD 교차검증 실패로 폐기된 오염 레코드 수
     #[serde(default)]
     pub nec_tod_mismatch: usize,
+    /// 파싱 단계에서 항적에서 제거·보존된 유령표적 포인트 수
+    /// (detect_and_remove_ghosts + remove_spatial_outliers 합계)
+    #[serde(default)]
+    pub ghost_points_removed: usize,
 }
 
 /// 비행검사기 (Flight Inspector Aircraft)
@@ -188,6 +192,10 @@ pub struct ParsedFile {
     pub filename: String,
     pub total_records: usize,
     pub track_points: Vec<TrackPoint>,
+    /// 파싱 단계에서 항적에서 제거된 유령표적 포인트 보존분 (이중표적 분석용).
+    /// track_points 에는 포함되지 않으며, Loss 탐지/항적 파이프라인과 완전 분리된 별도 채널.
+    #[serde(default)]
+    pub ghost_points: Vec<TrackPoint>,
     pub parse_errors: Vec<String>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,

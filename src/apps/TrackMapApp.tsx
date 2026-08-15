@@ -11,7 +11,7 @@ import SourceOverlay from "../dev/SourceOverlay";
 import TourHost from "../tour/TourHost";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import {
-  postPointsToWorker, startConsolidate, getPointSummary,
+  postPointsToWorker, postGhostPointsToWorker, startConsolidate, getPointSummary,
   createThrottledChunkHandler, setConsolidationProgressCallback,
 } from "../utils/flightConsolidationWorker";
 import type { Aircraft, RadarSite, TrackPoint, WeatherVector } from "../types";
@@ -116,6 +116,13 @@ function useAssFilePicker() {
       postPointsToWorker(pts);
     });
 
+    // 파서가 제거한 유령표적 보존분 — 이중표적 분석용 (항적 포인트와 별도 축적)
+    const unlistenGhost = await listen<{ points: TrackPoint[] }>("parse-ghost-chunk", (event) => {
+      const pts = event.payload.points;
+      for (const p of pts) p.radar_name = site.name;
+      postGhostPointsToWorker(pts);
+    });
+
     // 기상 벡터 청크 수신 → 누적 (CAT008, 트랙 독립). ~0.5M로 메인 보관 가능.
     const weatherAccum: WeatherVector[] = [];
     const unlistenWeather = await listen<{ vectors: WeatherVector[] }>("parse-weather-chunk", (event) => {
@@ -138,6 +145,7 @@ function useAssFilePicker() {
     }
 
     unlisten();
+    unlistenGhost();
     unlistenWeather();
 
     // 기상 벡터 시간순 정렬 후 store 커밋 (여러 파일 병렬 도착 → 순서 보장 필요)

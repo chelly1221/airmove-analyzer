@@ -370,6 +370,7 @@ mod tests {
                 make_point_ms(1017.0, 36.03, 127.03, 5000.0, "123456"),
                 make_point_ms(1022.0, 36.04, 127.04, 5000.0, "123456"),
             ],
+            ghost_points: vec![],
             parse_errors: vec![],
             start_time: Some(1000.0),
             end_time: Some(1030.0),
