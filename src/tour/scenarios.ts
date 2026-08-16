@@ -488,7 +488,7 @@ const OBSTACLE_LOS_PHASES: Record<string, TourStep[]> = {
       id: "ob-address-pick",
       target: '[data-tour="tm-address-results"]',
       title: "검색 결과 선택",
-      body: "검색 결과에서 대상 주소를 클릭하세요. 지도가 건물 위치로 이동하고 건물 정보 카드가 나타납니다.",
+      body: "검색 결과에서 대상 주소를 클릭하세요. 지도가 건물 위치로 이동하고 우측에 건축물정보 드로어가 열립니다.",
       mode: "interactive",
       placement: "bottom",
       advanceWhenSelectorAppears: '[data-tour="tm-bldg-card"]',
@@ -500,7 +500,7 @@ const OBSTACLE_LOS_PHASES: Record<string, TourStep[]> = {
       target: '[data-tour="tm-bldg-card"]',
       title: "건물 정보 확인",
       body:
-        "건물 정보 카드입니다. GIS 건물이면 지반고·건물높이가 자동으로 채워집니다. " +
+        "우측 건축물정보 드로어의 '높이 검토' 섹션입니다. GIS 건물이면 지반고·건물높이가 자동으로 채워집니다. " +
         "**신축 계획 검토라면 계획 높이로 수정 후 '적용'**을 눌러 가상 높이로 검토할 수 있습니다.",
       mode: "interactive",
       placement: "right",
@@ -521,7 +521,7 @@ const OBSTACLE_LOS_PHASES: Record<string, TourStep[]> = {
       target: '[data-tour="tm-bldg-card-results"]',
       title: "허용높이 확인",
       body:
-        "카드에 LoS·BRA **허용높이**와 초과/여유가 계산됩니다. 계획 높이와 비교해 전파영향성을 사전검토하세요.",
+        "드로어에 LoS·BRA **허용높이**와 초과/여유가 계산됩니다. 계획 높이와 비교해 전파영향성을 사전검토하세요.",
       mode: "interactive",
       placement: "right",
       showNext: true,

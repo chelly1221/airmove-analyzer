@@ -156,7 +156,8 @@ function ringMinHeight(distKm: number): number {
  *
  * @param bounds 뷰포트 범위 (호출부에서 앵커±반경으로 클램프된 범위)
  * @param excludeSources 제외할 출처
- * @param onProgress 점진적 로딩 콜백 (새 타일 로드될 때마다 전체 건물 배열 전달)
+ * @param onProgress 점진적 로딩 콜백 (새 타일 로드될 때마다 전체 건물 배열 전달).
+ *                   미전달 시 단계별 로딩 없이 1회 쿼리로 끝내고 반환값으로만 결과를 넘긴다.
  * @param anchor 카메라 지상점 {lat, lon} — 거리 링 필터/근접 정렬 기준 (미전달 시 bounds 중심)
  */
 export async function fetchBuildingsForViewport(
@@ -248,7 +249,11 @@ export async function fetchBuildingsForViewport(
 
   // 캐시만으로 충분하면 즉시 반환
   if (missingTiles.length === 0) {
-    return { buildings: collectAll(), cacheHits: cachedTiles.length, fetched: 0 };
+    const all = collectAll();
+    // 전 타일 캐시 히트 — 호출부는 반환값이 아닌 onProgress 로만 커밋하므로 여기서도 1회 전달
+    // (출처 토글 경로가 무효화 없이 캐시 복귀할 때 이 호출이 없으면 커밋이 영영 오지 않는다)
+    if (onProgress) onProgress(all);
+    return { buildings: all, cacheHits: cachedTiles.length, fetched: 0 };
   }
 
   // 누락 타일이 있으면 먼저 캐시 데이터로 진행률 콜백
@@ -262,13 +267,15 @@ export async function fetchBuildingsForViewport(
   // 3단계: minH 이상 (전체)
   // stage.minH 는 "스테이지 하한(floor)"일 뿐이고, 실제 타일 목표는 max(stage.minH, tileReq).
   // dedupe filter 는 동일 floor 를 갖는 중복 스테이지만 제거하므로 거리 링(tileReq) 변경과 무관하게 안전.
-  const stages = zoom >= 14
+  // 스테이지드 로딩은 "중간 결과를 보여주기 위한" 장치라 onProgress 가 있을 때만 의미가 있다 —
+  // 최종 1회만 커밋하는 호출부(onProgress 미전달)에서는 같은 타일을 3번 재쿼리하는 낭비일 뿐이다.
+  const stages = zoom >= 14 && onProgress
     ? [
         { minH: Math.max(50, minH), label: "tall" },
         { minH: Math.max(20, minH), label: "mid" },
         { minH, label: "all" },
       ].filter((s, i, arr) => i === arr.length - 1 || s.minH > arr[arr.length - 1].minH)
-    : [{ minH, label: "all" }]; // 줌이 낮으면 단일 단계
+    : [{ minH, label: "all" }]; // 줌이 낮거나 점진 콜백이 없으면 단일 단계
 
   let fetched = 0;
 

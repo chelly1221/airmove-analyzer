@@ -514,6 +514,41 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
       }
     }
 
+    // ── 레이→법면 전환점(접점) 정밀 산출 — 최저탐지선 조기 꺾임(샘플 스냅) 제거 ──
+    //   running max 앙각이 지형 샘플에서 갱신될 때, 직전 레이(4/3 프레임 직선 h = radarHeight + runMax·d)와
+    //   그 지형 세그먼트(4/3 조정 고도 선형 근사)의 교차 거리 dX 를 일차식으로 풀어 샘플로 삽입한다.
+    //   삽입 후엔 아래 minDetStraight 평가 루프가 dX 에서 레이==지형인 정점을 자연 생성하므로
+    //   폴리라인이 샘플 그리드(~0.5km)가 아닌 실제 접점에서 꺾인다. 판정 경로(실꺾음·현 관통)는 무관.
+    //   건물 엣지 갱신은 sampleDists 의 ±eps 수직 정점이 이미 정확히 처리 — 지형(tIdx) 갱신만 대상.
+    const transitionDists: number[] = [];
+    {
+      let runMax = -Infinity;
+      let runMaxDist = 0; // 현재 runMax 를 만든 장애물 거리 — 교차점 하한 클램프(건물 뒤 역행 방지)
+      for (const ob of obstacles) {
+        if (ob.distance <= 0) continue;
+        const ang = (ob.elevation - curvDrop43(ob.distance) - radarHeight) / (ob.distance * 1000);
+        if (ang > runMax) {
+          if (runMax > -Infinity && ob.tIdx !== undefined && ob.tIdx > 0) {
+            const p0 = profile[ob.tIdx - 1];
+            const p1 = profile[ob.tIdx];
+            const d0 = p0.distance, d1 = p1.distance;
+            if (d1 - d0 > 1e-9) {
+              // f(d) = 레이 − 지형(4/3): 세그먼트 양끝은 정확값, 사이는 선형 — f0>0(레이 위)·f1<0(지형 위)면 사이에 접점
+              const f0 = (radarHeight + runMax * d0 * 1000) - (p0.elevation - curvDrop43(d0));
+              const f1 = (radarHeight + runMax * d1 * 1000) - (p1.elevation - curvDrop43(d1));
+              if (f0 > 0 && f1 < 0) {
+                const dX = d0 + (f0 / (f0 - f1)) * (d1 - d0);
+                const lo = Math.max(d0, runMaxDist) + 1e-6;
+                if (dX > lo && dX < d1 - 1e-6) transitionDists.push(dX);
+              }
+            }
+          }
+          runMax = ang;
+          runMaxDist = ob.distance;
+        }
+      }
+    }
+
     // 건물 경계 거리 목록 (쉐도잉 라인에 건물 경계점 삽입용)
     interface BuildingEdge { nearD: number; farD: number; topElev: number; groundElev: number; }
     const buildingEdges: BuildingEdge[] = [];
@@ -562,6 +597,8 @@ export default function LoSProfilePanel({ radarSite, targetLat, targetLon, onClo
         sampleDists.push(be.nearD + eps);
       }
     }
+    // 레이→법면 접점 샘플 병합 (spread 금지 컨벤션 — for 루프)
+    for (const d of transitionDists) sampleDists.push(d);
     // 중복 제거 & 정렬
     const uniqueDists = [...new Set(sampleDists)].sort((a, b) => a - b);
 
