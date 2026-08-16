@@ -413,76 +413,110 @@ function TimeDensityChart({ density, tz }: { density: TimeDensity; tz: TzMode })
   );
 }
 
-/** 막대 아래 축 부속 높이 — 구분선 1px + mt-0.5(2px) + 라벨 h-3(12px) */
-const AZ_AXIS_PX = 15;
-/** lg 티어 본문을 정확히 채우는 막대 영역 높이 (막대 + 축 = 본문 높이) */
-const AZ_CHART_H = SECTION_BODY_PX.lg - AZ_AXIS_PX;
+/** 로즈 차트 정사각 변 — lg 티어 본문 높이에 맞춰 원이 카드를 꽉 채운다 */
+const AZ_ROSE_S = SECTION_BODY_PX.lg;
+/** 축 라벨이 들어갈 바깥 여백 */
+const AZ_ROSE_PAD = 16;
+/** 섹터 사이를 갈라 보이게 하는 양쪽 인셋 각 */
+const AZ_WEDGE_INSET_DEG = 0.6;
 
-/** 방위 분포 — 10° 섹터 36개 세로 막대 (0° = 북) */
-function AzimuthHistogram({ bins, height = AZ_CHART_H }: { bins: number[]; height?: number }) {
+/**
+ * 방위 분포 — 10° 섹터 36개 PPI 로즈 (0° = 북, 시계방향).
+ * 반경은 카운트에 선형 비례(풍배도 관례)라 면적이 아닌 길이로 읽는다.
+ * 카운트 0인 섹터는 웨지를 생략해 블랭킹·차폐 섹터가 빈 방향으로 드러난다.
+ */
+function AzimuthRose({ bins }: { bins: number[] }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
   const total = useMemo(() => bins.reduce((a, b) => a + b, 0), [bins]);
   const maxV = useMemo(() => bins.reduce((a, b) => (b > a ? b : a), 0), [bins]);
 
-  const H = height; // 막대 영역 높이
-  const SLOT = 10; // viewBox 슬롯 폭 (막대 8 + 간격 2)
+  const S = AZ_ROSE_S;
+  const c0 = S / 2;
+  const R = c0 - AZ_ROSE_PAD;
+
+  /** 나침반 좌표 → 화면 좌표 (0°=위, 시계방향) */
+  const pt = (deg: number, r: number) => {
+    const a = (deg * Math.PI) / 180;
+    return [c0 + r * Math.sin(a), c0 - r * Math.cos(a)] as const;
+  };
+  /** 중심에서 뻗는 부채꼴 — 각이 증가하는 방향이 화면상 시계방향이라 sweep=1 */
+  const wedge = (deg0: number, deg1: number, r: number) => {
+    const [x0, y0] = pt(deg0, r);
+    const [x1, y1] = pt(deg1, r);
+    return `M${c0} ${c0} L${x0.toFixed(2)} ${y0.toFixed(2)} A${r.toFixed(2)} ${r.toFixed(2)} 0 0 1 ${x1.toFixed(2)} ${y1.toFixed(2)} Z`;
+  };
 
   const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
     const rect = e.currentTarget.getBoundingClientRect();
     if (rect.width <= 0) return;
-    const frac = (e.clientX - rect.left) / rect.width;
-    const idx = Math.min(35, Math.max(0, Math.floor(frac * 36)));
-    setHover({ idx, x: clampTipX(((idx + 0.5) / 36) * rect.width, rect.width) });
+    const dx = e.clientX - rect.left - rect.width / 2;
+    const dy = e.clientY - rect.top - rect.height / 2;
+    // 거리는 보지 않는다 — 짧은/빈 섹터도 집을 수 있게 히트 타깃을 사각형 전체로
+    const angle = ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
+    const idx = Math.min(35, Math.floor(angle / 10));
+    const wr = wrap.getBoundingClientRect();
+    setHover({ idx, x: clampTipX(e.clientX - wr.left, wr.width) });
   };
 
   const tipText = (() => {
     if (!hover) return "";
-    const c = bins[hover.idx];
+    const c = bins[hover.idx] ?? 0;
     const pct = total > 0 ? (c / total) * 100 : 0;
     return `${hover.idx * 10}°–${hover.idx * 10 + 10}° · ${c.toLocaleString()}건 (${pct.toFixed(1)}%)`;
   })();
 
   return (
-    <div className="relative">
+    <div ref={wrapRef} className="relative flex h-full items-center justify-center">
       {hover && <ChartTip x={hover.x} text={tipText} />}
       <svg
-        viewBox={`0 0 ${SLOT * 36} ${H}`}
-        preserveAspectRatio="none"
-        className="block w-full"
-        style={{ height: H }}
+        viewBox={`0 0 ${S} ${S}`}
+        className="block"
+        style={{ width: S, height: S }}
         onPointerMove={onMove}
         onPointerLeave={() => setHover(null)}
       >
-        {bins.map((c, i) => {
-          const h = maxV > 0 ? (c / maxV) * H : 0;
-          return (
-            <rect
-              key={i}
-              x={i * SLOT + 1}
-              y={H - h}
-              width={SLOT - 2}
-              height={h}
-              fill={CHART_INK}
-              opacity={hover?.idx === i ? 1 : 0.85}
-            />
-          );
-        })}
+        <g stroke="#e5e7eb" strokeWidth={1} fill="none">
+          {[0.25, 0.5, 0.75, 1].map((f) => (
+            <circle key={f} cx={c0} cy={c0} r={R * f} />
+          ))}
+          <line x1={c0} y1={c0 - R} x2={c0} y2={c0 + R} />
+          <line x1={c0 - R} y1={c0} x2={c0 + R} y2={c0} />
+        </g>
+
+        {hover && <path d={wedge(hover.idx * 10, hover.idx * 10 + 10, R)} fill={CHART_INK} opacity={0.08} />}
+
+        {maxV > 0 &&
+          bins.map((c, i) => {
+            if (c <= 0) return null;
+            return (
+              <path
+                key={i}
+                d={wedge(i * 10 + AZ_WEDGE_INSET_DEG, (i + 1) * 10 - AZ_WEDGE_INSET_DEG, (c / maxV) * R)}
+                fill={CHART_INK}
+                opacity={hover?.idx === i ? 1 : 0.85}
+              />
+            );
+          })}
+
+        {/* 동/서 라벨은 여백(16px)보다 넓어 viewBox 가장자리에 붙여 잘림을 막는다 */}
+        <g fontSize={9} fill="#9ca3af">
+          <text x={c0} y={c0 - R - 5} textAnchor="middle">
+            0°
+          </text>
+          <text x={S - 1} y={c0} textAnchor="end" dominantBaseline="central">
+            90°
+          </text>
+          <text x={c0} y={c0 + R + 12} textAnchor="middle">
+            180°
+          </text>
+          <text x={1} y={c0} textAnchor="start" dominantBaseline="central">
+            270°
+          </text>
+        </g>
       </svg>
-      <div className="h-px w-full bg-gray-200" />
-      <div className="relative mt-0.5 h-3">
-        {[0, 90, 180, 270, 360].map((deg, i, arr) => (
-          <span
-            key={deg}
-            className="absolute top-0 text-[9px] tabular-nums text-gray-400"
-            style={{
-              left: `${(deg / 360) * 100}%`,
-              transform: i === 0 ? "none" : i === arr.length - 1 ? "translateX(-100%)" : "translateX(-50%)",
-            }}
-          >
-            {deg}°
-          </span>
-        ))}
-      </div>
     </div>
   );
 }
@@ -870,7 +904,7 @@ function Dashboard({
           {stats.azimuth_hist.length === 0 ? (
             <div className="text-[11px] text-gray-400">없음</div>
           ) : (
-            <AzimuthHistogram bins={stats.azimuth_hist} />
+            <AzimuthRose bins={stats.azimuth_hist} />
           )}
         </Section>
 
