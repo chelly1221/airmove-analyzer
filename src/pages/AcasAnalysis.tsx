@@ -1,10 +1,9 @@
 import { useCallback, useMemo, useState } from "react";
 import { ArrowUp, ArrowDown, Search, FileText, ShieldAlert, Clock, ChevronDown, ChevronUp, X, FolderOpen, Loader2 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import Modal from "../components/common/Modal";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
+import { parseAssBatch } from "../utils/parseBatch";
 import DateRangePicker from "../components/common/DateRangePicker";
 import { useAppStore } from "../store";
 import { buildEventsFromReports, type TcasEvent } from "../utils/tcasEvents";
@@ -55,40 +54,29 @@ function useAssFilePicker() {
 
     const site = useAppStore.getState().radarSite;
 
-    // 파일별 결과: TCAS/ACAS 보고만 누적 (트랙 독립 전수 추출). 트랙 포인트는 무시.
-    const unlistenResult = await listen<{ success: boolean; file_info?: { tcas_reports?: TcasReport[] } }>(
-      "batch-parse-result",
-      (event) => {
-        const fi = event.payload.file_info;
-        if (event.payload.success && fi?.tcas_reports?.length) {
+    // 파싱 프로토콜(태그·창 타깃 리스너·완료 배리어)은 parseAssBatch 단일 소유.
+    // 파일별 결과: TCAS/ACAS 보고만 누적 (트랙 독립 전수 추출). 트랙 포인트 채널은 등록하지 않는다.
+    const outcome = await parseAssBatch({
+      paths,
+      radarLat: site.latitude,
+      radarLon: site.longitude,
+      filter,
+      onResult: (payload) => {
+        const fi = payload.file_info as { tcas_reports?: TcasReport[] } | undefined;
+        if (payload.success && fi?.tcas_reports?.length) {
           useAppStore.getState().appendTcasReports(fi.tcas_reports);
         }
       },
-    );
-
-    let failed = false;
-    try {
-      await invoke("parse_and_analyze_batch", {
-        filePaths: paths,
-        radarLat: site.latitude,
-        radarLon: site.longitude,
-        modeSInclude: filter.modeSInclude,
-        modeSExclude: filter.modeSExclude,
-        mode3aInclude: filter.mode3aInclude,
-        mode3aExclude: filter.mode3aExclude,
-      });
-    } catch (e) {
-      failed = true;
-      console.error("[ACAS] 배치 파싱 실패:", e);
+    });
+    if (!outcome.failed && !outcome.complete) {
+      console.warn("[ACAS] 파싱 수신 불완전 — 일부 파일 결과가 유실됐을 수 있습니다");
     }
-
-    unlistenResult();
 
     setParsing(false);
     setPendingPaths([]);
 
     // 파싱 결과 피드백 — 파싱 실패 또는 ACAS 보고 0건이면 안내
-    if (failed) {
+    if (outcome.failed) {
       setNotice({ title: "파싱 실패", message: "파일을 읽지 못했습니다. ASS 파일 형식과 경로를 확인하세요." });
     } else if (useAppStore.getState().tcasReports.length === 0) {
       setNotice({

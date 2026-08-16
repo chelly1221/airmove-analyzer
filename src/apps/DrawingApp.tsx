@@ -6,15 +6,17 @@ import { FolderOpen, Loader2, Plane, ChevronDown, Radar } from "lucide-react";
 import Titlebar from "../components/Layout/Titlebar";
 import Drawing from "../pages/Drawing";
 import { useAppStore } from "../store";
-import { ToastContainer } from "../components/common/Toast";
+import { ToastContainer, useToastStore } from "../components/common/Toast";
 import SourceOverlay from "../dev/SourceOverlay";
 import TourHost from "../tour/TourHost";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import {
   postPointsToWorker, startConsolidate, getPointSummary,
   createThrottledChunkHandler, setConsolidationProgressCallback,
+  ConsolidateSuperseded,
 } from "../utils/flightConsolidationWorker";
-import type { Aircraft, RadarSite, TrackPoint } from "../types";
+import { parseAssBatch } from "../utils/parseBatch";
+import type { Aircraft, RadarSite } from "../types";
 
 /** DB에서 설정 복원 */
 function useRestoreSettings() {
@@ -84,30 +86,29 @@ function useAssFilePicker() {
 
     const site = useAppStore.getState().radarSite;
 
-    // 배치 파싱 이벤트 리스너 — 청크를 즉시 Worker로 fire-and-forget.
+    // 파싱 프로토콜(태그·창 타깃 리스너·완료 배리어)은 parseAssBatch 단일 소유.
+    // 청크는 핸들러 안에서 즉시 Worker 로 fire-and-forget (closure capture 없음 → GC 가능).
     let totalForwarded = 0;
-    const unlisten = await listen<{ points: TrackPoint[] }>("parse-points-chunk", (event) => {
-      const pts = event.payload.points;
-      for (const p of pts) p.radar_name = site.name;
-      totalForwarded += pts.length;
-      postPointsToWorker(pts);
+    const outcome = await parseAssBatch({
+      paths,
+      radarLat: site.latitude,
+      radarLon: site.longitude,
+      filter,
+      onPoints: (pts) => {
+        for (const p of pts) p.radar_name = site.name;
+        totalForwarded += pts.length;
+        postPointsToWorker(pts);
+      },
     });
-
-    try {
-      await invoke("parse_and_analyze_batch", {
-        filePaths: paths,
-        radarLat: site.latitude,
-        radarLon: site.longitude,
-        modeSInclude: filter.modeSInclude,
-        modeSExclude: filter.modeSExclude,
-        mode3aInclude: filter.mode3aInclude,
-        mode3aExclude: filter.mode3aExclude,
-      });
-    } catch (e) {
-      console.error("[Drawing] 배치 파싱 실패:", e);
+    // 이 창은 누적(append) 시맨틱이라 이중표적 페이지식 전량 폐기가 불가 — 통합은 진행하되
+    // 콘솔에만 남기지 않고 토스트로 사용자에게 보인다(포터블 배포엔 콘솔이 없다).
+    if (outcome.failed) {
+      console.error("[Drawing] 배치 파싱 실패");
+      useToastStore.getState().addToast("파싱 실패 — 파일을 읽지 못했습니다");
+    } else if (!outcome.complete) {
+      console.warn("[Drawing] 파싱 수신 불완전 — 일부 청크가 유실됐을 수 있습니다");
+      useToastStore.getState().addToast("파싱 수신 불완전 — 일부 데이터가 유실됐을 수 있습니다. 재파싱을 권장합니다");
     }
-
-    unlisten();
 
     if (totalForwarded > 0) {
       const summary = await getPointSummary();
@@ -129,6 +130,10 @@ function useAssFilePicker() {
         );
         await startConsolidate([], state.aircraft, state.radarSite, handler);
         flush();
+      } catch (e) {
+        // 통합 reject(워커 ERROR·ConsolidateSuperseded)가 parseWithFilter 밖으로 탈출하면
+        // setParsing(false) 가 실행되지 않아 파일 선택이 영구 잠긴다 — 여기서 흡수한다.
+        if (!(e instanceof ConsolidateSuperseded)) console.error("[Drawing] 비행 통합 실패:", e);
       } finally {
         consolidatingRef.current = false;
         setConsolidationProgressCallback(null);

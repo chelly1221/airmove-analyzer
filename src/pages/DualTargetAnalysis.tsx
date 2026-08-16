@@ -1,23 +1,24 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import MapGL, { NavigationControl, type MapRef } from "react-map-gl/maplibre";
 import { ScatterplotLayer, LineLayer, PathLayer, PolygonLayer, TextLayer } from "@deck.gl/layers";
 import { TripsLayer } from "@deck.gl/geo-layers";
 import { DeckGLOverlay } from "../components/Map/DeckGLOverlay";
 import { fetchBuildingsForViewport } from "../utils/buildingTileCache";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { format } from "date-fns";
 import { Ghost, FolderOpen, Loader2, Search, ChevronDown, ChevronUp, Crosshair, X, RefreshCw } from "lucide-react";
 import Modal from "../components/common/Modal";
 import ParseFilterModal, { type ParseFilterResult } from "../components/common/ParseFilterModal";
 import { useAppStore } from "../store";
+import { parseAssBatch } from "../utils/parseBatch";
 import {
   clearWorkerPoints,
   postPointsToWorker,
   postGhostPointsToWorker,
   startConsolidate,
   analyzeDualTargets,
+  ConsolidateSuperseded,
 } from "../utils/flightConsolidationWorker";
 import type {
   Aircraft,
@@ -28,7 +29,6 @@ import type {
   Flight,
   RadarSite,
   ReflectorCluster,
-  TrackPoint,
 } from "../types";
 
 /**
@@ -70,6 +70,11 @@ const BUILDING_FETCH_DEBOUNCE_MS = 250;
 /** 화면 픽셀 기준 병합 셀 크기 — 이 격자 안의 반사 위치는 한 마커로 합쳐 표시 */
 const CLUSTER_CELL_PX = 56;
 
+/** 파싱·분석 요청 epoch — 컴포넌트가 아닌 모듈 스코프.
+ *  파싱 도중 페이지 이탈 후 복귀(리마운트)해 새 파싱을 시작해도 카운터가 이어지므로
+ *  고아 플로우(잔존 리스너 push·invoke 후속 통합/분석/라벨링)가 확실히 무효화된다. */
+let dualRunSeq = 0;
+
 /** "#rrggbb" → [r,g,b] (파싱 불가 시 null) */
 function hexToRgb(hex?: string): [number, number, number] | null {
   if (!hex) return null;
@@ -101,6 +106,9 @@ interface ZoomCluster {
 interface BldgDrawerState {
   lat: number;
   lon: number;
+  /** 재클릭 재조회 논스 — 같은 좌표 재클릭 시 증가시켜 조회 effect deps 에 편입한다
+   *  (실패한 대장/VWorld 조회 재시도 + 실측 임포트 후 캐시 갱신분 반영 경로) */
+  attempt: number;
   /** 온라인 VWorld 조회 진행 중 */
   loading: boolean;
   info: {
@@ -255,8 +263,6 @@ export default function DualTargetAnalysis() {
   const mapRef = useRef<MapRef>(null);
   /** 비행 스트림 로컬 수집 — store.flights 오염 방지 (오프스크린 TrackMap 렌더 유발 차단) */
   const flightsRef = useRef<Flight[]>([]);
-  /** 최신 요청만 반영 (재업로드/재분석 시 늦게 도착한 결과·라벨링 폐기) */
-  const seqRef = useRef(0);
   /** 지도 로드 전에 확정된 fitBounds 예약 (파싱 직후 분석 완료 대비) */
   const pendingFitRef = useRef<[[number, number], [number, number]] | null>(null);
   /** 직전 파싱 입력 — 분석 레이더 변경 시 같은 파일·필터로 재파싱하기 위해 보관 */
@@ -452,9 +458,12 @@ export default function DualTargetAnalysis() {
 
   /** 건물 클릭 → 우측 건축물정보 드로어 (로컬 값 시드 후 대장 조회 effect 가 채운다) */
   const openBuildingDrawer = useCallback((b: Building3D) => {
-    setBldgDrawer({
+    setBldgDrawer((prev) => ({
       lat: b.lat,
       lon: b.lon,
+      // 같은 건물 재클릭 = 재조회(재시도) — attempt 증가로 effect deps 가 바뀌어
+      // loading 고착 없이 대장/VWorld 조회가 다시 돈다. 다른 건물이면 0 으로 시작.
+      attempt: prev && prev.lat === b.lat && prev.lon === b.lon ? prev.attempt + 1 : 0,
       loading: true,
       info: null,
       localName: b.name ?? undefined,
@@ -463,7 +472,7 @@ export default function DualTargetAnalysis() {
       localBase: b.ground_elev_m,
       localSource: b.source,
       localMeasured: !!b.measured,
-    });
+    }));
   }, []);
 
   // 드로어 좌표 설정 시 건물정보 조회 — 로컬 FAC 대장(오프라인) + 온라인 VWorld 병렬
@@ -482,18 +491,18 @@ export default function DualTargetAnalysis() {
         .catch(() => { if (!cancelled) setBldgDrawer((prev) => prev ? { ...prev, loading: false, info: null } : null); });
     }
     return () => { cancelled = true; };
-  }, [bldgDrawer?.lat, bldgDrawer?.lon]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bldgDrawer?.lat, bldgDrawer?.lon, bldgDrawer?.attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 분석 실행 ─────────────────────────────────────────────────────
   //   Worker 소유 포인트로 계산(메인 스레드 축적 없음). 결과 수신 후 상위 클러스터에 한해
   //   건물명을 순차 라벨링한다(전 클러스터 라벨링은 find_building_near_point 호출 과다).
   const runAnalysis = useCallback(async () => {
-    const seq = ++seqRef.current;
+    const seq = ++dualRunSeq;
     setPhase("analyzing");
     setError(null);
     try {
       const result = await analyzeDualTargets({ sites: dualSites, scanWindowS, minSepKm });
-      if (seq !== seqRef.current) return; // 최신 요청만 반영
+      if (seq !== dualRunSeq) return; // 최신 요청만 반영
       setDualResult(result);
       setSelectedEventId(null);
       setSelectedClusterId(null);
@@ -533,13 +542,13 @@ export default function DualTargetAnalysis() {
             lat: c.latitude,
             lon: c.longitude,
           });
-          if (seq !== seqRef.current) return; // 재실행/재업로드 → 라벨링 중단
+          if (seq !== dualRunSeq) return; // 재실행/재업로드 → 라벨링 중단
           if (hit?.name) names.set(c.id, hit.name);
         } catch {
           // 라벨 조회 실패는 조용히 무시 — 좌표 표기로 폴백
         }
       }
-      if (seq !== seqRef.current || names.size === 0) return;
+      if (seq !== dualRunSeq || names.size === 0) return;
       const cur = useAppStore.getState().dualTargetResult;
       if (!cur) return;
       setDualResult({
@@ -547,12 +556,12 @@ export default function DualTargetAnalysis() {
         clusters: cur.clusters.map((c) => (names.has(c.id) ? { ...c, building_name: names.get(c.id)! } : c)),
       });
     } catch (e) {
-      if (seq !== seqRef.current) return;
+      if (seq !== dualRunSeq) return;
       console.error("[DualTarget] 분석 실패:", e);
       setError(String(e));
       setDualResult(null);
     } finally {
-      if (seq === seqRef.current) setPhase("idle");
+      if (seq === dualRunSeq) setPhase("idle");
     }
   }, [dualSites, scanWindowS, minSepKm, setDualResult, fitBounds]);
 
@@ -579,7 +588,7 @@ export default function DualTargetAnalysis() {
   const runParse = useCallback(async (paths: string[], filter: ParseFilterResult, site: RadarSite) => {
     if (paths.length === 0) return;
 
-    const seq = ++seqRef.current;
+    const seq = ++dualRunSeq;
     setError(null);
     setDualResult(null);
     setSelectedEventId(null);
@@ -600,42 +609,54 @@ export default function DualTargetAnalysis() {
     // 재업로드 = 대체 시맨틱 — Worker 축적분(포인트·비행 인덱스·유령 보존분) 전량 폐기
     clearWorkerPoints();
 
-    // 항적 포인트 / 파서 보존 유령표적 — 둘 다 radar_name 태깅 후 Worker 로 즉시 전송
-    const unlistenPoints = await listen<{ points: TrackPoint[] }>("parse-points-chunk", (event) => {
-      const pts = event.payload.points;
-      for (const p of pts) p.radar_name = site.name;
-      postPointsToWorker(pts);
+    // 파싱 프로토콜(태그·창 타깃 리스너·완료 배리어)은 parseAssBatch 단일 소유.
+    // 항적 포인트 / 파서 보존 유령표적 — 둘 다 radar_name 태깅 후 Worker 로 즉시 전송.
+    // totalForwarded 는 outcome.pointsReceived 가 아니라 로컬 누적을 쓴다(고아 가드로 스킵된 분 제외).
+    let totalForwarded = 0;
+    const outcome = await parseAssBatch({
+      paths,
+      radarLat: site.latitude,
+      radarLon: site.longitude,
+      filter,
+      // 선점 취소 — 새 파싱이 시작되면 남은 청크 수신을 즉시 끊는다(역직렬화 CPU 를 새 파싱에 양보).
+      // 취소 outcome(complete=false)은 아래 seq 가드가 먼저 return 하므로 notice 로 뜨지 않는다.
+      isStale: () => seq !== dualRunSeq,
+      onPoints: (pts) => {
+        if (seq !== dualRunSeq) return; // 새 파싱이 시작됨 — 고아 리스너의 Worker push 차단
+        for (const p of pts) p.radar_name = site.name;
+        totalForwarded += pts.length;
+        postPointsToWorker(pts);
+      },
+      onGhostPoints: (pts) => {
+        if (seq !== dualRunSeq) return; // 새 파싱이 시작됨 — 고아 리스너의 Worker push 차단
+        for (const p of pts) p.radar_name = site.name;
+        postGhostPointsToWorker(pts);
+      },
     });
-    const unlistenGhost = await listen<{ points: TrackPoint[] }>("parse-ghost-chunk", (event) => {
-      const pts = event.payload.points;
-      for (const p of pts) p.radar_name = site.name;
-      postGhostPointsToWorker(pts);
-    });
-
-    let failed = false;
-    try {
-      await invoke("parse_and_analyze_batch", {
-        filePaths: paths,
-        radarLat: site.latitude,
-        radarLon: site.longitude,
-        modeSInclude: filter.modeSInclude,
-        modeSExclude: filter.modeSExclude,
-        mode3aInclude: filter.mode3aInclude,
-        mode3aExclude: filter.mode3aExclude,
-      });
-    } catch (e) {
-      failed = true;
-      console.error("[DualTarget] 배치 파싱 실패:", e);
-    }
-
-    unlistenPoints();
-    unlistenGhost();
     setPendingPaths([]);
 
-    if (seq !== seqRef.current) return; // 새 업로드가 시작됨
-    if (failed) {
+    if (seq !== dualRunSeq) return; // 새 업로드가 시작됨
+    if (outcome.failed) {
       setPhase("idle");
       setNotice({ title: "파싱 실패", message: "파일을 읽지 못했습니다. ASS 파일 형식과 경로를 확인하세요." });
+      return;
+    }
+    // 이벤트 유실(수신 절단) — 절단된 자료로 분석하면 이중표적 탐지 결과가 조용히 축소된다
+    if (!outcome.complete) {
+      setPhase("idle");
+      setNotice({
+        title: "파싱 수신 불완전",
+        message: "일부 데이터가 수신되지 않았을 수 있습니다. 다시 시도하세요.",
+      });
+      return;
+    }
+    // 파싱은 성공했으나 유효 포인트가 0건 — 통합·분석까지 진행하면 "이중표적 미탐지"로 오도된다
+    if (totalForwarded === 0) {
+      setPhase("idle");
+      setNotice({
+        title: "파싱 결과 없음",
+        message: "유효한 표적 포인트가 없습니다.\nASS 파일 형식과 Mode-S/Mode-3A 필터를 확인하세요.",
+      });
       return;
     }
 
@@ -648,13 +669,14 @@ export default function DualTargetAnalysis() {
         if (arr.length % 50 === 0) setFlightCount(arr.length);
       });
     } catch (e) {
+      if (e instanceof ConsolidateSuperseded) return; // 새 파싱으로 교체됨 — 정상 취소
       console.error("[DualTarget] 비행 통합 실패:", e);
-      if (seq !== seqRef.current) return;
+      if (seq !== dualRunSeq) return;
       setPhase("idle");
       setError(String(e));
       return;
     }
-    if (seq !== seqRef.current) return;
+    if (seq !== dualRunSeq) return;
     setFlightCount(flightsRef.current.length);
 
     await runAnalysis();
@@ -860,15 +882,20 @@ export default function DualTargetAnalysis() {
       setSelectedEventId(null);
       return;
     }
+    // 지도 클릭 = 해당 기체로 명시 이동 — 검색 필터가 선택 그룹을 가리지 않게 해제
+    setSearch("");
     setSelectedClusterId(null);
     setSelectedModeS(ev.mode_s);
     setSelectedEventId(ev.id);
     setExpandedModeS((prev) => (prev.has(ev.mode_s) ? prev : new Set(prev).add(ev.mode_s)));
-    // 좌측 목록에서 해당 그룹이 보이도록 스크롤 (렌더 반영 후 1프레임 뒤)
+    // 좌측 목록에서 해당 이벤트 행(없으면 그룹)이 보이도록 스크롤.
+    // 펼침·상한 밖 행 덧붙임까지 반영되려면 2프레임 필요 → 더블 rAF
     const modeS = ev.mode_s;
-    requestAnimationFrame(() => {
-      document.getElementById(`dual-group-${modeS}`)?.scrollIntoView({ block: "nearest" });
-    });
+    const evId = ev.id;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const el = document.getElementById(`dual-ev-${evId}`) ?? document.getElementById(`dual-group-${modeS}`);
+      el?.scrollIntoView({ block: "nearest" });
+    }));
   }, [selectedEventId]);
 
   /** Mode-S 단위 이벤트 그룹 — 건수 내림차순(동수 시 Mode-S 오름차순) */
@@ -914,6 +941,12 @@ export default function DualTargetAnalysis() {
     if (!q) return groups;
     return groups.filter((g) => g.modeS.toLowerCase().includes(q) || g.label.toLowerCase().includes(q));
   }, [groups, search]);
+
+  // 워커가 id = 정렬 인덱스로 부여하므로 dense 배열 O(1) 조회 (id 불일치 시 안전하게 무시).
+  // 선택 이벤트의 Mode-S 를 미리 뽑아 두면 그룹 렌더가 자기 그룹인지 O(1) 로 판정한다
+  // (이벤트 선택 경로는 모두 반사 위치 필터를 해제하므로 선택 이벤트는 항상 자기 그룹 안에 있다).
+  const selectedEv = selectedEventId != null ? dualResult?.events[selectedEventId] : undefined;
+  const selectedEvModeS = selectedEv && selectedEv.id === selectedEventId ? selectedEv.mode_s : undefined;
 
   const toggleGroup = useCallback((modeS: string) => {
     setExpandedModeS((prev) => {
@@ -1037,6 +1070,8 @@ export default function DualTargetAnalysis() {
         data: dualSites,
         getPosition: (d) => [d.longitude, d.latitude],
         getText: (d) => d.name,
+        // 기본 characterSet 은 ASCII 뿐이라 한글 레이더명이 렌더되지 않는다 — 데이터 기반 자동 아틀라스
+        characterSet: "auto" as const,
         getColor: [55, 65, 81, 255],
         getSize: 11,
         sizeUnits: "pixels" as const,
@@ -1515,7 +1550,20 @@ export default function DualTargetAnalysis() {
                     {filteredGroups.map((g) => {
                       const open = expandedModeS.has(g.modeS);
                       const picked = selectedModeS === g.modeS;
-                      const shown = g.events.slice(0, GROUP_ROW_CAP);
+                      // 표시 행은 펼친 그룹에서만 계산 (접힌 그룹은 slice 자체가 불필요)
+                      let shown: DualTargetEvent[] = [];
+                      // 선택 이벤트가 표시 상한 밖이면 마지막에 덧붙여 항상 목록에서 보이게 한다.
+                      // pinnedId = 그렇게 덧붙인 행(시간순서 밖 위치) — 구분선 라벨 + 해제 토글 생략 대상
+                      let pinnedId: number | null = null;
+                      if (open) {
+                        shown = g.events.slice(0, GROUP_ROW_CAP);
+                        // 자기 그룹의 선택 이벤트가 상한 안에 없을 때만 덧붙임
+                        // (상한 초과 조건은 !some 이 포섭 — 상한 이내면 항상 shown 에 들어 있다)
+                        if (selectedEv && g.modeS === selectedEvModeS && !shown.some((ev) => ev.id === selectedEventId)) {
+                          shown.push(selectedEv);
+                          pinnedId = selectedEv.id;
+                        }
+                      }
                       return (
                         <div
                           key={g.modeS}
@@ -1572,56 +1620,65 @@ export default function DualTargetAnalysis() {
                               {shown.map((e) => {
                                 const sel = selectedEventId === e.id;
                                 const high = e.confidence === "high";
+                                const pinned = e.id === pinnedId;
                                 return (
-                                  <div
-                                    key={e.id}
-                                    onClick={() => {
-                                      const map = mapRef.current?.getMap();
-                                      if (map) {
-                                        map.easeTo({
-                                          center: [e.ghost.longitude, e.ghost.latitude],
-                                          zoom: Math.max(map.getZoom(), 12),
-                                          duration: 600,
-                                        });
-                                      }
-                                      setSelectedClusterId(null);
-                                      setSelectedEventId(sel ? null : e.id);
-                                      // Mode-S 한정 중에 다른 기체 행을 고르면 한정 대상도 그 기체로 옮긴다
-                                      // (선택 강조만 필터 밖에 떠 있는 어긋난 상태 방지)
-                                      if (!sel && selectedModeS != null && selectedModeS !== e.mode_s) {
-                                        setSelectedModeS(e.mode_s);
-                                      }
-                                    }}
-                                    className={`cursor-pointer rounded px-1.5 py-1 transition-colors ${sel ? "bg-[#a60739]/8" : "hover:bg-gray-50"}`}
-                                  >
-                                    <div className="flex items-center gap-1.5">
-                                      <span
-                                        className="h-1.5 w-1.5 shrink-0 rounded-full"
-                                        style={{ background: high ? ERROR : "#d1d5db" }}
-                                        title={high ? "반사 기하 부합" : "기하 불부합·모호"}
-                                      />
-                                      <span className="shrink-0 font-mono text-[10px] tabular-nums text-gray-600">
-                                        {format(new Date(e.ghost.timestamp * 1000), "HH:mm:ss")}
-                                      </span>
-                                      <span className="shrink-0 rounded bg-gray-100 px-1 text-[9px] font-bold text-gray-500">
-                                        {e.source === "scan" ? "잔존" : "파서"}
-                                      </span>
-                                      <span className="ml-auto shrink-0 font-mono text-[10px] font-bold tabular-nums" style={{ color: ERROR }}>
-                                        {e.separation_km.toFixed(2)}km
-                                      </span>
+                                  <Fragment key={e.id}>
+                                    {pinned && (
+                                      <div className="mt-1 border-t border-dashed border-gray-200 pt-1 text-center text-[9px] text-gray-400">선택 이벤트 (목록 상한 밖)</div>
+                                    )}
+                                    <div
+                                      id={`dual-ev-${e.id}`}
+                                      onClick={() => {
+                                        const map = mapRef.current?.getMap();
+                                        if (map) {
+                                          map.easeTo({
+                                            center: [e.ghost.longitude, e.ghost.latitude],
+                                            zoom: Math.max(map.getZoom(), 12),
+                                            duration: 600,
+                                          });
+                                        }
+                                        setSelectedClusterId(null);
+                                        // 고정 행은 선택 해제 토글을 생략 — 해제하면 이 행 자체가 상한 밖으로
+                                        // 사라져 커서 아래에서 행이 없어진다(지도 이동만 수행).
+                                        // pinned ⇒ sel 불변식(고정 행은 선택 이벤트 자신뿐)이라 pinned 만 보면 된다.
+                                        if (!pinned) setSelectedEventId(sel ? null : e.id);
+                                        // Mode-S 한정 중에 다른 기체 행을 고르면 한정 대상도 그 기체로 옮긴다
+                                        // (선택 강조만 필터 밖에 떠 있는 어긋난 상태 방지)
+                                        if (!sel && selectedModeS != null && selectedModeS !== e.mode_s) {
+                                          setSelectedModeS(e.mode_s);
+                                        }
+                                      }}
+                                      className={`cursor-pointer rounded px-1.5 py-1 transition-colors ${sel ? "bg-[#a60739]/8" : "hover:bg-gray-50"}`}
+                                    >
+                                      <div className="flex items-center gap-1.5">
+                                        <span
+                                          className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                          style={{ background: high ? ERROR : "#d1d5db" }}
+                                          title={high ? "반사 기하 부합" : "기하 불부합·모호"}
+                                        />
+                                        <span className="shrink-0 font-mono text-[10px] tabular-nums text-gray-600">
+                                          {format(new Date(e.ghost.timestamp * 1000), "HH:mm:ss")}
+                                        </span>
+                                        <span className="shrink-0 rounded bg-gray-100 px-1 text-[9px] font-bold text-gray-500">
+                                          {e.source === "scan" ? "잔존" : "파서"}
+                                        </span>
+                                        <span className="ml-auto shrink-0 font-mono text-[10px] font-bold tabular-nums" style={{ color: ERROR }}>
+                                          {e.separation_km.toFixed(2)}km
+                                        </span>
+                                      </div>
+                                      <div className="truncate pl-3 text-[9.5px] text-gray-400">
+                                        초과경로 {e.extra_path_km >= 0 ? "+" : ""}{e.extra_path_km.toFixed(2)}km
+                                        {e.reflector
+                                          ? ` · 반사 ${e.reflector.range_km.toFixed(1)}km / ${e.reflector.azimuth_deg.toFixed(0)}°`
+                                          : " · 반사점 미산출"}
+                                      </div>
                                     </div>
-                                    <div className="truncate pl-3 text-[9.5px] text-gray-400">
-                                      초과경로 {e.extra_path_km >= 0 ? "+" : ""}{e.extra_path_km.toFixed(2)}km
-                                      {e.reflector
-                                        ? ` · 반사 ${e.reflector.range_km.toFixed(1)}km / ${e.reflector.azimuth_deg.toFixed(0)}°`
-                                        : " · 반사점 미산출"}
-                                    </div>
-                                  </div>
+                                  </Fragment>
                                 );
                               })}
-                              {g.events.length > GROUP_ROW_CAP && (
+                              {g.events.length > shown.length && (
                                 <div className="py-1 text-center text-[9.5px] text-gray-400">
-                                  …외 {(g.events.length - GROUP_ROW_CAP).toLocaleString()}건
+                                  …외 {(g.events.length - shown.length).toLocaleString()}건
                                 </div>
                               )}
                             </div>

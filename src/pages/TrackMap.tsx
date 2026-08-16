@@ -1034,6 +1034,18 @@ export default function TrackMap() {
       // 통합 진행 중이면 비행 데이터 불완전 → 쿼리 스킵
       if (consolidating && radarFilteredFlights.length === 0) return;
 
+      // 비행 메타가 전혀 없으면 포인트 쿼리도 하지 않는다 — 이 창 워커에 다른 페이지(이중표적 분석)가
+      // 적재한 포인트를 오프스크린 지도가 통째로 끌어오는 것을 차단 (메인 창 OOM 방어)
+      if (radarFilteredFlights.length === 0) {
+        setAllPointsState((prev) =>
+          prev.allPoints.length === 0 && prev.allLoss.length === 0 && prev.allLossPoints.length === 0
+            ? prev
+            : { allPoints: [], allLoss: [], allLossPoints: [] });
+        // 진행 중이던 쿼리 진행률 잔존이 다음 통합의 라벨로 재노출되는 것 방지
+        setRenderProgress(null);
+        return;
+      }
+
       // Loss 데이터는 Flight 메타에 포함 (작은 배열, 메인에서 직접 필터)
       const loss: LossSegment[] = [];
       const lossP: LossPoint[] = [];

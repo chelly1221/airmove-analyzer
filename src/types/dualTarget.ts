@@ -1,11 +1,11 @@
 /**
  * 이중표적(레이더 반사 유령표적) 분석 타입 계약
  *
- * 데이터 흐름:
+ * 데이터 흐름 (메인 창 독립 페이지 src/pages/DualTargetAnalysis.tsx, 경로 /dualtarget):
  *  1. 파서(ass.rs)가 제거하는 유령표적 포인트를 ParsedFile.ghost_points 로 보존
- *     → lib.rs 가 "parse-ghost-chunk" 이벤트로 emit → TrackMapApp 이 radar_name 태깅 후
- *     → postGhostPointsToWorker() 로 Worker 에 축적 (ADD_GHOST_POINTS)
- *  2. TrackMap "이중표적 분석" 도구 실행 → analyzeDualTargets() → Worker ANALYZE_DUAL_TARGETS
+ *     → lib.rs 가 "parse-ghost-chunk" 이벤트로 emit → 이중표적 분석 페이지 리스너가 자체 파싱분에
+ *     radar_name 태깅 후 → postGhostPointsToWorker() 로 자기 창 Worker 에 축적 (ADD_GHOST_POINTS)
+ *  2. 같은 페이지의 "분석 실행" → analyzeDualTargets() → Worker ANALYZE_DUAL_TARGETS
  *     → 잔존 동일스캔 중복(scan) + 파서 보존분(parser) 병합 탐지 → DualTargetResult 반환
  *
  * 좌표·단위: WGS84 deg, 거리 km, 고도 m MSL, 방위 진북 기준 0–360°.

@@ -37,6 +37,15 @@ export class ViewportQuerySuperseded extends Error {
   }
 }
 
+/** 진행 중이던 통합 요청이 새 통합 요청으로 교체(취소)될 때 reject되는 마커 에러.
+ *  실제 오류가 아닌 정상적인 취소이므로 호출부에서 조용히 무시한다. */
+export class ConsolidateSuperseded extends Error {
+  constructor() {
+    super("새 통합 요청으로 교체됨");
+    this.name = "ConsolidateSuperseded";
+  }
+}
+
 /** 뷰포트 쿼리 스트리밍 요청 */
 let _viewportReq: {
   id: number;
@@ -82,7 +91,9 @@ function handleWorkerMessage(e: MessageEvent) {
   if (type === "CONSOLIDATE_DONE" && _consolidateReq && _consolidateReq.id === id) {
     const req = _consolidateReq;
     _consolidateReq = null;
-    req.resolve();
+    // aborted = 워커가 세대 변경(새 통합·CLEAR_POINTS)으로 중단 → 절단된 부분 결과를 완료로 오인하지 않게 reject
+    if (e.data.aborted) req.reject(new ConsolidateSuperseded());
+    else req.resolve();
     return;
   }
 
@@ -174,6 +185,13 @@ export async function startConsolidate(
   radarSite: RadarSite,
   onFlightChunk: (flights: Flight[]) => void,
 ): Promise<void> {
+  // 이전 요청이 남아 있으면 reject하여 Promise 누수 방지
+  // (고아 파싱 플로우의 await startConsolidate 가 영구 pending 으로 남는 것을 막는다)
+  if (_consolidateReq) {
+    const prev = _consolidateReq;
+    _consolidateReq = null;
+    prev.reject(new ConsolidateSuperseded());
+  }
   return new Promise<void>((resolve, reject) => {
     const id = _nextId++;
     _consolidateReq = { id, onChunk: onFlightChunk, resolve, reject };

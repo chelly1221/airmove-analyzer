@@ -236,6 +236,11 @@ let _flightIndex = new Map<string, FlightIndexEntry>();
  *  소량(통상 수천 이하)이므로 객체 배열로 보관해도 메모리 부담 없음. */
 let _ghostPoints: TrackPoint[] = [];
 
+/** 데이터 세대 — CLEAR_POINTS(대체 시맨틱) 마다 증가.
+ *  진행 중인 consolidateAndStream/analyzeDualTargets 는 yield 후 세대가 바뀌었으면 즉시 중단해,
+ *  이전 세대 루프가 새 세대의 _flightIndex 에 옛 비행을 써넣는 인터리빙 오염을 막는다. */
+let _generation = 0;
+
 /** SoA → TrackPoint[]로 한 비행씩 unpack — 외부 함수 호출 시 사용 */
 function pointsArrayOf(entry: FlightIndexEntry): TrackPoint[] {
   return unpackBatch(entry.points) as TrackPoint[];
@@ -786,6 +791,9 @@ async function consolidateAndStream(
   const radarLat = radarSite.latitude;
   const radarLon = radarSite.longitude;
 
+  // 진입 시점 세대 캡처 — yield 마다 비교해 이전 세대 통합이 새 세대 인덱스를 오염시키지 않게 한다
+  const gen = _generation;
+
   // 이전 인덱스 해제 (consolidateAndStream 시작 시점에서 클리어)
   _flightIndex.clear();
 
@@ -891,6 +899,12 @@ async function consolidateAndStream(
       self.postMessage({ type: "FLIGHT_CHUNK", id: requestId, flights: [{ ...meta, track_points: [] }] });
       totalFlights++;
       await yieldWorker();
+      if (gen !== _generation) {
+        // 새 세대 시작(CLEAR_POINTS·새 CONSOLIDATE) — 이전 세대 통합은 즉시 중단
+        // (부분 결과는 새 통합이 clear). aborted=true → 래퍼가 ConsolidateSuperseded 로 reject
+        self.postMessage({ type: "CONSOLIDATE_DONE", id: requestId, totalFlights, aborted: true });
+        return;
+      }
     }
 
     const unmatched = points.filter((_, i) => assigned[i] < 0);
@@ -911,6 +925,12 @@ async function consolidateAndStream(
         self.postMessage({ type: "FLIGHT_CHUNK", id: requestId, flights: [{ ...meta, track_points: [] }] });
         totalFlights++;
         await yieldWorker();
+        if (gen !== _generation) {
+          // 새 세대 시작(CLEAR_POINTS·새 CONSOLIDATE) — 이전 세대 통합은 즉시 중단
+          // (부분 결과는 새 통합이 clear). aborted=true → 래퍼가 ConsolidateSuperseded 로 reject
+          self.postMessage({ type: "CONSOLIDATE_DONE", id: requestId, totalFlights, aborted: true });
+          return;
+        }
       }
     }
 
@@ -1025,6 +1045,10 @@ async function analyzeDualTargets(
   scanWindowS: number,
   minSepKm: number,
 ): Promise<DualTargetResult> {
+  // 진입 시점 세대 캡처 — 새 세대(CLEAR_POINTS) 시작 시 CPU 절약용 조기 중단에만 사용.
+  // 부분 결과가 반환되어도 메인 측 dualRunSeq 가드가 폐기한다.
+  const gen = _generation;
+
   const siteMap = new Map<string, { lat: number; lon: number }>();
   for (let i = 0; i < sites.length; i++) {
     siteMap.set(sites[i].name, { lat: sites[i].latitude, lon: sites[i].longitude });
@@ -1044,6 +1068,8 @@ async function analyzeDualTargets(
 
   // ── Phase 1: 잔존 동일스캔 중복 전수 탐지 (scan 소스) ──
   let sinceYield = 0;
+  // 세대 변경 시 클러스터 루프만이 아니라 Phase 1 전체를 빠져나오도록 라벨 사용
+  phase1:
   for (const entry of _flightIndex.values()) {
     const site = siteMap.get(entry.radarName);
     if (!site) { stats.skipped_no_site++; continue; }
@@ -1111,12 +1137,15 @@ async function analyzeDualTargets(
       if (sinceYield >= 200_000) {
         sinceYield = 0;
         await yieldWorker();
+        if (gen !== _generation) break phase1; // 새 세대 시작 — 조기 중단
       }
     }
   }
 
   // ── Phase 2: 파서 보존분 병합 (parser 소스) ──
-  if (_ghostPoints.length > 0) {
+  // Phase 1 이 세대 변경으로 중단(break phase1)됐으면 Phase 2 결과도 어차피 폐기된다 —
+  // 다음 yield 체크(4096건)까지 헛도는 매칭 루프를 아예 건너뛴다.
+  if (_ghostPoints.length > 0 && gen === _generation) {
     // modeS|radarName → 후보 비행 인덱스
     const byKey = new Map<string, FlightIndexEntry[]>();
     for (const entry of _flightIndex.values()) {
@@ -1199,8 +1228,17 @@ async function analyzeDualTargets(
       ));
       stats.events_parser++;
 
-      if ((gi & 4095) === 4095) await yieldWorker();
+      if ((gi & 4095) === 4095) {
+        await yieldWorker();
+        if (gen !== _generation) break; // 새 세대 시작 — 조기 중단
+      }
     }
+  }
+
+  // 두 Phase 가 세대 변경으로 중단됐으면 절단 상태 — sort·클러스터링에 CPU 를 쓰지 않고 빈 결과 반환
+  // (어차피 메인 dualRunSeq 가드가 이 결과를 버린다)
+  if (gen !== _generation) {
+    return { events: [], clusters: [], stats, params: { scan_window_s: scanWindowS, min_sep_km: minSepKm } };
   }
 
   // ── 정렬·id 부여 (유령 관측 시각 오름차순) ──
@@ -1284,6 +1322,8 @@ self.onmessage = async (e: MessageEvent) => {
         _pointBatches = [];
         _flightIndex.clear();
         _ghostPoints = [];
+        // 세대 증가 — 진행 중이던 이전 세대 통합/분석 루프가 yield 직후 스스로 중단한다
+        _generation++;
         break;
       }
 
@@ -1302,6 +1342,9 @@ self.onmessage = async (e: MessageEvent) => {
       case "CONSOLIDATE": {
         const { flightHistory, aircraft, radarSite } = e.data;
         const t0 = performance.now();
+        // 새 통합 시작 = 이전 세대 무효화 — CLEAR 없이 연속 CONSOLIDATE 가 와도
+        // 이전 통합 루프가 yield 직후 스스로 중단한다 (아래 consolidateAndStream 진입부에서 캡처)
+        _generation++;
         // _pointBatches가 있으면 초기 통합, 비어있으면 _flightIndex에서 재통합 (SoA 직접 사용).
         // consolidateAndStream은 (sourceBatches: PointBatch[]) 형태를 받음.
         // 1) 초기 통합: _pointBatches 그대로 사용 후 클리어.
@@ -1312,6 +1355,9 @@ self.onmessage = async (e: MessageEvent) => {
           _pointBatches = [];
         } else {
           sourceBatches = [];
+          // 주의: 이 스냅샷은 진행 중 통합이 없다는 호출부 관례(consolidatingRef 게이트·
+          // dualtarget CLEAR+ADD 선행)에 의존한다. 통합 진행 중 이 분기에 들어오면 부분
+          // 인덱스를 캡처해 포인트가 소실된다 — 새 호출 경로를 추가할 때 반드시 게이트할 것.
           for (const entry of _flightIndex.values()) {
             sourceBatches.push(entry.points);
           }

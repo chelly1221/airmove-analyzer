@@ -29,11 +29,17 @@ use tauri::{Emitter, Manager};
 
 use models::{Aircraft, AnalysisResult, TrackPoint};
 
-/// TrackPoint 청크 스트리밍 이벤트 페이로드
+/// TrackPoint 청크 스트리밍 이벤트 페이로드 — **차용** 페이로드로 직렬화 직전 deep copy 를 없앤다
+/// (chunk.to_vec() 은 50k 포인트≈10MB 를 통째 복제 — 10M 포인트 배치에서 수 GB memcpy).
+/// JSON 필드명·형태는 owned 버전과 완전히 동일하므로 프론트 영향 없음.
 #[derive(Clone, serde::Serialize)]
-struct TrackPointsChunk {
-    file_path: String,
-    points: Vec<TrackPoint>,
+struct TrackPointsChunkRef<'a> {
+    file_path: &'a str,
+    points: &'a [TrackPoint],
+    /// 파싱 요청 태그(호출자 생성 고유값) — 이벤트는 요청 창에만 배달되지만(emit_to), 창 라벨로는
+    /// 같은 창의 다른 페이지(/dualtarget ↔ /acas)·잔존 파싱의 청크를 구분할 수 없다.
+    /// 리스너는 반드시 자기 태그와 엄격 일치로 필터할 것(신규 리스너 포함 — 이중 방어).
+    request_tag: &'a str,
 }
 
 /// TrackPoints를 청크 단위로 이벤트 emit한 뒤, 원본에서 제거.
@@ -42,13 +48,16 @@ const CHUNK_SIZE: usize = 50_000;
 
 fn emit_and_drain_track_points(
     handle: &tauri::AppHandle,
+    target_label: &str,
     file_path: &str,
+    request_tag: &str,
     points: &mut Vec<TrackPoint>,
 ) {
     for chunk in points.chunks(CHUNK_SIZE) {
-        let _ = handle.emit("parse-points-chunk", TrackPointsChunk {
-            file_path: file_path.to_string(),
-            points: chunk.to_vec(),
+        let _ = handle.emit_to(target_label, "parse-points-chunk", TrackPointsChunkRef {
+            file_path,
+            points: chunk,
+            request_tag,
         });
     }
     // 메모리 해제 — 이미 프론트엔드로 전송됨
@@ -60,13 +69,16 @@ fn emit_and_drain_track_points(
 /// 항적(track_points)과 별도 채널 — Loss 탐지/항적 파이프라인에 영향 없음.
 fn emit_and_drain_ghost_points(
     handle: &tauri::AppHandle,
+    target_label: &str,
     file_path: &str,
+    request_tag: &str,
     points: &mut Vec<TrackPoint>,
 ) {
     for chunk in points.chunks(CHUNK_SIZE) {
-        let _ = handle.emit("parse-ghost-chunk", TrackPointsChunk {
-            file_path: file_path.to_string(),
-            points: chunk.to_vec(),
+        let _ = handle.emit_to(target_label, "parse-ghost-chunk", TrackPointsChunkRef {
+            file_path,
+            points: chunk,
+            request_tag,
         });
     }
     // 메모리 해제 — 이미 프론트엔드로 전송됨
@@ -74,23 +86,28 @@ fn emit_and_drain_ghost_points(
     points.shrink_to_fit();
 }
 
-/// CAT008 기상 벡터 청크 스트리밍 이벤트 페이로드
+/// CAT008 기상 벡터 청크 스트리밍 이벤트 페이로드 — 차용 페이로드(복제 없이 직렬화, JSON 동일)
 #[derive(Clone, serde::Serialize)]
-struct WeatherChunk {
-    file_path: String,
-    vectors: Vec<models::WeatherVector>,
+struct WeatherChunkRef<'a> {
+    file_path: &'a str,
+    vectors: &'a [models::WeatherVector],
+    /// 파싱 요청 태그 (TrackPointsChunkRef 와 동일 목적 — 리스너는 엄격 일치 필터 필수)
+    request_tag: &'a str,
 }
 
 /// 기상 벡터를 청크 단위로 이벤트 emit한 뒤, 원본에서 제거.
 fn emit_and_drain_weather_vectors(
     handle: &tauri::AppHandle,
+    target_label: &str,
     file_path: &str,
+    request_tag: &str,
     vectors: &mut Vec<models::WeatherVector>,
 ) {
     for chunk in vectors.chunks(CHUNK_SIZE) {
-        let _ = handle.emit("parse-weather-chunk", WeatherChunk {
-            file_path: file_path.to_string(),
-            vectors: chunk.to_vec(),
+        let _ = handle.emit_to(target_label, "parse-weather-chunk", WeatherChunkRef {
+            file_path,
+            vectors: chunk,
+            request_tag,
         });
     }
     vectors.clear();
@@ -192,6 +209,8 @@ struct BatchResultEvent {
     /// 파일 메타정보 (track_points 제외 — 청크 스트리밍으로 별도 전송)
     file_info: Option<BatchFileInfo>,
     error: Option<String>,
+    /// 파싱 요청 태그 (TrackPointsChunkRef 와 동일 목적 — 리스너는 엄격 일치 필터 필수)
+    request_tag: String,
 }
 
 /// 배치 결과에 포함할 파일 메타정보 (track_points 제외하여 메모리 절약)
@@ -212,12 +231,21 @@ struct BatchFileInfo {
     weather_vector_count: usize,
 }
 
-/// 배치 완료 이벤트 페이로드
+/// 배치 완료 이벤트 페이로드.
+/// 모든 청크·결과 emit **이후** 마지막에 emit 되므로, 프론트 파싱 플로우가 request_tag 일치
+/// 대기(청크 완전 수신 배리어)로 소비한다 — invoke 응답이 마지막 청크를 추월하는 레이스 방지.
 #[derive(Clone, serde::Serialize)]
 struct BatchDoneEvent {
     total: usize,
     succeeded: usize,
     failed: usize,
+    /// 방출 총계 3종 — 프론트가 수신 누계와 대조해 이벤트 유실(=수신 절단)을 탐지하는 정확 배리어.
+    /// (emit 직전 각 벡터 len 을 누적 — drain 이 clear 하므로 호출 전 캡처)
+    points_emitted: usize,
+    ghost_points_emitted: usize,
+    weather_vectors_emitted: usize,
+    /// 파싱 요청 태그 (TrackPointsChunkRef 와 동일 목적 — 리스너는 엄격 일치 필터 필수)
+    request_tag: String,
 }
 
 /// 여러 ASS 파일을 병렬로 파싱+분석.
@@ -225,6 +253,10 @@ struct BatchDoneEvent {
 #[tauri::command]
 async fn parse_and_analyze_batch(
     app_handle: tauri::AppHandle,
+    // 요청 창(자동 주입 — 프론트 invoke 인자 무변경). 모든 파싱 이벤트를 이 창 라벨로만 배달한다
+    window: tauri::WebviewWindow,
+    // 호출자가 생성한 요청 고유 태그(JS: requestTag) — 청크·결과·완료 이벤트에 그대로 스탬프된다
+    request_tag: String,
     file_paths: Vec<String>,
     radar_lat: f64,
     radar_lon: f64,
@@ -232,6 +264,11 @@ async fn parse_and_analyze_batch(
     mode_s_exclude: Vec<String>,
     mode3a_include: Vec<u16>,
     mode3a_exclude: Vec<u16>,
+    // 관심 채널 플래그(JS: wantPoints/wantGhostPoints/wantWeather) — 호출 페이지가 리스너를
+    // 등록한 채널만 true. false 인 채널은 청크 직렬화·emit 을 통째로 생략한다(clear 만).
+    want_points: bool,
+    want_ghost_points: bool,
+    want_weather: bool,
 ) -> Result<(), String> {
     info!(
         "Command: parse_and_analyze_batch({} files, radar={},{}, include={:?}, exclude={:?})",
@@ -250,87 +287,150 @@ async fn parse_and_analyze_batch(
     };
 
     let handle = app_handle.clone();
+    // 요청 창에만 배달 — 방관 창이 수십 MB 청크를 역직렬화 후 버리는 낭비 제거.
+    // request_tag 는 같은 창 내 페이지·잔존 파싱 구분용으로 유지(이중 방어).
+    let target_label = window.label().to_string();
     let total = file_paths.len();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel::<(String, Result<AnalysisResult, String>)>();
-
         // 병렬 파싱 스레드: 완료 즉시 채널로 전송 (메모리 일괄 보유 방지)
         let ms_incl_ref = &mode_s_include;
         let ms_excl_ref = &mode_s_exclude;
         let m3a_incl_ref = &mode3a_include;
         let m3a_excl_ref = &mode3a_exclude;
-        rayon::scope(|s| {
-            let tx = &tx;
-            for path in &file_paths {
-                let path = path.clone();
-                s.spawn(move |_| {
-                    let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, ms_incl_ref, ms_excl_ref, m3a_incl_ref, m3a_excl_ref, mag_dec, |_| {})
-                        .map_err(|e| e.to_string())
-                        .map(|parsed| {
-                            analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)
-                        });
-                    let _ = tx.send((path, r));
-                });
-            }
-        });
-        // rayon scope 완료 후 sender drop → rx 종료
-        drop(tx);
+        // 소비 스레드가 차용 캡처할 참조들 (std::thread::scope 는 스코프 밖 값의 차용을 허용)
+        let handle_ref = &handle;
+        let target_label_ref = target_label.as_str();
+        let request_tag_ref = request_tag.as_str();
+        let file_paths_ref = &file_paths;
 
-        // 수신 스레드: 결과 도착 즉시 DB 저장 + 스트리밍 + 메모리 해제
-        let mut succeeded = 0usize;
-        let mut failed = 0usize;
+        // 드레인(소비)을 rayon 파싱과 **동시** 실행한다.
+        // rayon::scope 는 전 파일 파싱 완료까지 블록하므로, 같은 스레드에서 뒤이어 드레인하면
+        // 모든 파일의 AnalysisResult 가 무제한 mpsc 채널에 동시 체류한 뒤에야 해제된다
+        // (= 스트리밍이 아니라 전량 버퍼링 — 10M+ 배치에서 백엔드 메모리 스파이크).
+        std::thread::scope(|ts| {
+            // 채널은 반드시 이 클로저 **안**에서 생성한다 — 파싱 패닉(rayon::scope 재전파) 시
+            // 클로저 로컬인 tx 가 언와인딩 중 drop 되어야 rx 가 닫히고 소비 스레드가 종료된다.
+            // 클로저 밖에 두면 thread::scope 가 소비 스레드 조인을 무한 대기(교착)한다.
+            let (tx, rx) = std::sync::mpsc::channel::<(String, Result<AnalysisResult, String>)>();
 
-        for (path, result) in rx {
-            let event = match result {
-                Ok(mut analysis) => {
-                    succeeded += 1;
-                    // 메타정보만 추출 (clone 없이, track_points 제외)
-                    let file_info = BatchFileInfo {
-                        filename: analysis.file_info.filename.clone(),
-                        total_records: analysis.file_info.total_records,
-                        parse_errors: analysis.file_info.parse_errors.clone(),
-                        start_time: analysis.file_info.start_time,
-                        end_time: analysis.file_info.end_time,
-                        radar_lat: analysis.file_info.radar_lat,
-                        radar_lon: analysis.file_info.radar_lon,
-                        parse_stats: analysis.file_info.parse_stats.clone(),
-                        track_point_count: analysis.file_info.track_points.len(),
-                        tcas_reports: std::mem::take(&mut analysis.file_info.tcas_reports),
-                        weather_vector_count: analysis.file_info.weather_vectors.len(),
+            // ── 이벤트 emit 순서 불변식 ──
+            // 청크들 → 그 파일의 batch-parse-result → … → 마지막 batch-parse-done.
+            // **단일 소비 스레드**가 rx 수신 순서대로 이 emit 을 전부 수행하므로 순서가 자동
+            // 보장된다. emit 을 파싱 스레드나 추가 소비 스레드로 분산하면 즉시 깨지므로 금지.
+            let consumer = ts.spawn(move || {
+                // 수신 루프: 결과 도착 즉시 스트리밍 + 메모리 해제 (파싱과 동시 진행)
+                let mut succeeded = 0usize;
+                let mut failed = 0usize;
+                // 채널별 방출 총계 — done 이벤트로 전달해 프론트 수신 누계와 대조(절단 탐지)
+                let mut points_emitted = 0usize;
+                let mut ghost_points_emitted = 0usize;
+                let mut weather_vectors_emitted = 0usize;
+
+                for (path, result) in rx {
+                    let event = match result {
+                        Ok(mut analysis) => {
+                            succeeded += 1;
+                            // 메타정보만 추출 (clone 없이, track_points 제외)
+                            let file_info = BatchFileInfo {
+                                filename: analysis.file_info.filename.clone(),
+                                total_records: analysis.file_info.total_records,
+                                parse_errors: analysis.file_info.parse_errors.clone(),
+                                start_time: analysis.file_info.start_time,
+                                end_time: analysis.file_info.end_time,
+                                radar_lat: analysis.file_info.radar_lat,
+                                radar_lon: analysis.file_info.radar_lon,
+                                parse_stats: analysis.file_info.parse_stats.clone(),
+                                track_point_count: analysis.file_info.track_points.len(),
+                                tcas_reports: std::mem::take(&mut analysis.file_info.tcas_reports),
+                                weather_vector_count: analysis.file_info.weather_vectors.len(),
+                            };
+                            // 관심 채널만 emit — 리스너 미등록 채널은 clear 만 하고 직렬화를 생략한다.
+                            // 그 채널의 emitted 는 0 으로 남지만, 프론트 완전성 대조는 **등록한 채널만**
+                            // 보므로 정합(parseBatch.ts 의 complete 판정 참조).
+                            // 방출 총계 누적은 반드시 drain **호출 전** (drain 이 벡터를 clear 한다)
+                            if want_points {
+                                points_emitted += analysis.file_info.track_points.len();
+                                // track_points를 청크로 스트리밍 후 메모리 해제
+                                emit_and_drain_track_points(handle_ref, target_label_ref, &path, request_tag_ref, &mut analysis.file_info.track_points);
+                            } else {
+                                analysis.file_info.track_points.clear();
+                                analysis.file_info.track_points.shrink_to_fit();
+                            }
+                            if want_ghost_points {
+                                ghost_points_emitted += analysis.file_info.ghost_points.len();
+                                // 유령표적 보존분을 청크로 스트리밍 후 메모리 해제 (이중표적 분석용 별도 채널)
+                                emit_and_drain_ghost_points(handle_ref, target_label_ref, &path, request_tag_ref, &mut analysis.file_info.ghost_points);
+                            } else {
+                                analysis.file_info.ghost_points.clear();
+                                analysis.file_info.ghost_points.shrink_to_fit();
+                            }
+                            if want_weather {
+                                weather_vectors_emitted += analysis.file_info.weather_vectors.len();
+                                // 기상 벡터를 청크로 스트리밍 후 메모리 해제
+                                emit_and_drain_weather_vectors(handle_ref, target_label_ref, &path, request_tag_ref, &mut analysis.file_info.weather_vectors);
+                            } else {
+                                analysis.file_info.weather_vectors.clear();
+                                analysis.file_info.weather_vectors.shrink_to_fit();
+                            }
+
+                            // analysis는 여기서 drop → 메모리 즉시 해제
+                            BatchResultEvent {
+                                file_path: path,
+                                success: true,
+                                file_info: Some(file_info),
+                                error: None,
+                                request_tag: request_tag_ref.to_string(),
+                            }
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            BatchResultEvent {
+                                file_path: path,
+                                success: false,
+                                file_info: None,
+                                error: Some(e),
+                                request_tag: request_tag_ref.to_string(),
+                            }
+                        }
                     };
-                    // track_points를 청크로 스트리밍 후 메모리 해제
-                    emit_and_drain_track_points(&handle, &path, &mut analysis.file_info.track_points);
-                    // 유령표적 보존분을 청크로 스트리밍 후 메모리 해제 (이중표적 분석용 별도 채널)
-                    emit_and_drain_ghost_points(&handle, &path, &mut analysis.file_info.ghost_points);
-                    // 기상 벡터를 청크로 스트리밍 후 메모리 해제
-                    emit_and_drain_weather_vectors(&handle, &path, &mut analysis.file_info.weather_vectors);
-
-                    // analysis는 여기서 drop → 메모리 즉시 해제
-                    BatchResultEvent {
-                        file_path: path,
-                        success: true,
-                        file_info: Some(file_info),
-                        error: None,
-                    }
+                    let _ = handle_ref.emit_to(target_label_ref, "batch-parse-result", event);
                 }
-                Err(e) => {
-                    failed += 1;
-                    BatchResultEvent {
-                        file_path: path,
-                        success: false,
-                        file_info: None,
-                        error: Some(e),
-                    }
-                }
-            };
-            let _ = handle.emit("batch-parse-result", event);
-        }
 
-        let _ = handle.emit("batch-parse-done", BatchDoneEvent {
-            total,
-            succeeded,
-            failed,
+                // rx 종료(= 모든 파싱 완료 + tx drop) 후 마지막 emit — 이 스레드가 위 청크·결과
+                // emit 을 모두 마친 뒤이므로 done 이 항상 최후미다
+                let _ = handle_ref.emit_to(target_label_ref, "batch-parse-done", BatchDoneEvent {
+                    total,
+                    succeeded,
+                    failed,
+                    points_emitted,
+                    ghost_points_emitted,
+                    weather_vectors_emitted,
+                    request_tag: request_tag_ref.to_string(),
+                });
+            });
+
+            rayon::scope(|s| {
+                let tx = &tx;
+                for path in file_paths_ref {
+                    let path = path.clone();
+                    s.spawn(move |_| {
+                        let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, ms_incl_ref, ms_excl_ref, m3a_incl_ref, m3a_excl_ref, mag_dec, |_| {})
+                            .map_err(|e| e.to_string())
+                            .map(|parsed| {
+                                analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)
+                            });
+                        let _ = tx.send((path, r));
+                    });
+                }
+            });
+            // rayon scope 완료 후 sender drop → rx 종료 → 소비 스레드가 done emit 후 종료
+            drop(tx);
+            // 소비 스레드 패닉은 그대로 재전파 — 기존(단일 스레드 드레인) 동작과 동일하게
+            // invoke 가 "Task join error" 로 거절되어 프론트가 failed=true 로 인지한다
+            if let Err(p) = consumer.join() {
+                std::panic::resume_unwind(p);
+            }
         });
     })
     .await
