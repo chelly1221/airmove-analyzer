@@ -1480,6 +1480,56 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
 
+      case "QUERY_MODE_S_TRACK": {
+        // 한 기체(Mode-S)의 전체 항적을 비행 순(startTime asc)으로 typed array 에 이어붙여 반환.
+        // 메인 스레드에 TrackPoint 객체를 만들지 않도록 positions(lon,lat 인터리브)·startIndices 만 transfer.
+        const modeS = String(e.data.modeS ?? "").toUpperCase();
+        const entries: FlightIndexEntry[] = [];
+        for (const entry of _flightIndex.values()) {
+          if (entry.modeS.toUpperCase() === modeS) entries.push(entry);
+        }
+        entries.sort((a, b) => a.startTime - b.startTime);
+
+        let total = 0;
+        for (const en of entries) total += en.points.count;
+        const positions = new Float64Array(total * 2);
+        const startIndices = new Uint32Array(entries.length + 1);
+        let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+        let off = 0;
+        for (let f = 0; f < entries.length; f++) {
+          const soa = entries[f].points;
+          startIndices[f] = off;
+          for (let i = 0; i < soa.count; i++) {
+            const lat = soa.latitude[i];
+            const lon = soa.longitude[i];
+            positions[off * 2] = lon;
+            positions[off * 2 + 1] = lat;
+            off++;
+            if (lat < minLat) minLat = lat;
+            if (lat > maxLat) maxLat = lat;
+            if (lon < minLon) minLon = lon;
+            if (lon > maxLon) maxLon = lon;
+          }
+        }
+        startIndices[entries.length] = off;
+        const bbox = total > 0 ? { minLat, maxLat, minLon, maxLon } : null;
+
+        (self as unknown as Worker).postMessage(
+          {
+            type: "QUERY_MODE_S_TRACK_RESULT",
+            id,
+            modeS,
+            flightCount: entries.length,
+            pointCount: total,
+            positions,
+            startIndices,
+            bbox,
+          },
+          [positions.buffer, startIndices.buffer],
+        );
+        break;
+      }
+
       default:
         self.postMessage({ type: "ERROR", id, error: `Unknown message type: ${type}` });
     }

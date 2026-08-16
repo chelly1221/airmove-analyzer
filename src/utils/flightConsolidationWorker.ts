@@ -8,7 +8,7 @@
  */
 
 import type { Aircraft, Flight, RadarSite, TrackPoint } from "../types";
-import type { DualTargetResult } from "../types";
+import type { DualTargetResult, ModeSTrack } from "../types";
 
 // ─── Worker 싱글턴 ──────────────────────────────────
 
@@ -295,6 +295,23 @@ export function queryViewportPoints(params: ViewportQueryParams & { onProgress?:
 export async function queryFlightPoints(flightId: string): Promise<TrackPoint[]> {
   const result = await workerSend({ type: "QUERY_FLIGHT_POINTS", flightId });
   return result.points;
+}
+
+/**
+ * 한 기체(Mode-S)의 전체 항적을 typed array 로 조회 — 이중표적 페이지 항적 오버레이용.
+ * 워커가 positions(lon,lat 인터리브)·startIndices 를 transfer 하므로 메인 스레드에
+ * TrackPoint 객체가 만들어지지 않는다(10M+ 규모 대비 스트리밍 원칙).
+ */
+export async function queryModeSTrack(modeS: string): Promise<ModeSTrack> {
+  const r = await workerSend({ type: "QUERY_MODE_S_TRACK", modeS });
+  return {
+    modeS: r.modeS,
+    flightCount: r.flightCount,
+    pointCount: r.pointCount,
+    positions: r.positions,
+    startIndices: r.startIndices,
+    bbox: r.bbox,
+  };
 }
 
 // ─── 이중표적(반사 유령표적) 분석 ─────────────────────

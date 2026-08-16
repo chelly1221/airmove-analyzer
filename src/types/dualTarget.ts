@@ -96,3 +96,17 @@ export interface DualTargetResult {
   stats: DualTargetStats;
   params: DualTargetParams;
 }
+
+/** 한 기체(Mode-S)의 전체 항적 — 워커 QUERY_MODE_S_TRACK 응답.
+ *  메인 스레드에 TrackPoint 객체를 만들지 않도록 typed array 만 transfer 로 받는다. */
+export interface ModeSTrack {
+  modeS: string;
+  /** 이 기체의 비행 편수 (startIndices 길이 − 1) */
+  flightCount: number;
+  pointCount: number;
+  /** [lon0,lat0, lon1,lat1, …] 비행 순(startTime asc) 연결 */
+  positions: Float64Array;
+  /** 비행별 시작 인덱스(길이 flightCount+1, 마지막 = pointCount) — PathLayer binary startIndices */
+  startIndices: Uint32Array;
+  bbox: { minLat: number; maxLat: number; minLon: number; maxLon: number } | null;
+}

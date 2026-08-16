@@ -28,6 +28,7 @@ export type {
   DualTargetStats,
   DualTargetParams,
   DualTargetResult,
+  ModeSTrack,
 } from "./dualTarget";
 export type { Flight } from "./flight";
 export type { ReportMetadata } from "./report";
