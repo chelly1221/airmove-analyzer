@@ -2973,6 +2973,211 @@ fn walk_asterix<F: FnMut(&ScanFrame)>(
     }
 }
 
+/// 파일 경계에서 리셋되는 파일 로컬 누산 상태.
+/// (파일별 레코드 수·시각 범위 + CAT034 회전 산출용 North marker 상태)
+#[derive(Default)]
+struct FileAccum {
+    records: u64,
+    time_min: Option<f64>,
+    time_max: Option<f64>,
+    /// SAC/SIC → (직전 North marker TOD, North 이후 섹터 통과 수).
+    /// 파일 간 시각 연속성은 가정하지 않으므로 파일마다 새로 만든다.
+    north_state: HashMap<(u8, u8), (Option<f64>, u64)>,
+}
+
+/// 레코드 1건을 전역 누산기(StatAccum) + 파일 로컬 누산기에 반영.
+/// 기존 배치 스캔(`asterix_scan_file`)과 상세 재집계(`asterix_detail_scan`)가
+/// 공유하는 **단일 원천** — 여기를 고치면 양쪽 통계가 함께 바뀐다.
+fn accumulate_record(acc: &mut StatAccum, file: &mut FileAccum, r: &ScanRecord) {
+    acc.record_count += 1;
+    file.records += 1;
+    *acc.cat_records.entry(r.cat).or_insert(0) += 1;
+    if r.truncated {
+        acc.truncated += 1;
+    }
+    if r.mode3a_garbled {
+        acc.mode3a_garbled += 1;
+    }
+    if r.has_acas {
+        acc.acas_ra += 1;
+    }
+    if let Some(t) = r.tod {
+        acc.tod_min = Some(acc.tod_min.map_or(t, |m| m.min(t)));
+        acc.tod_max = Some(acc.tod_max.map_or(t, |m| m.max(t)));
+    }
+    if let Some(a) = r.abs_time {
+        acc.time_min = Some(acc.time_min.map_or(a, |m| m.min(a)));
+        acc.time_max = Some(acc.time_max.map_or(a, |m| m.max(a)));
+        file.time_min = Some(file.time_min.map_or(a, |m: f64| m.min(a)));
+        file.time_max = Some(file.time_max.map_or(a, |m: f64| m.max(a)));
+        // 분 단위 버킷 누산 (CAT 무관 — abs_time 보유 레코드 전부)
+        *acc.time_buckets.entry((a / 60.0).floor() as i64).or_insert(0) += 1;
+    }
+    match r.cat {
+        CAT048 => {
+            for &frn in &r.frns {
+                if frn < UAP_MAX {
+                    acc.frn_counts[frn] += 1;
+                }
+            }
+            if let Some(typ) = r.radar_typ {
+                if (typ as usize) < 8 {
+                    acc.radar_typ[typ as usize] += 1;
+                }
+            }
+            *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
+            if let Some(ms) = r.mode_s {
+                *acc.modes.entry(ms).or_insert(0) += 1;
+            }
+            // 거리(10NM)·방위(10°) 분포 — I040 보유 레코드만
+            if let Some(rho) = r.rho_nm {
+                acc.range_bins[((rho / 10.0) as usize).min(25)] += 1;
+                if let Some(th) = r.theta_deg {
+                    let sector = ((th / 10.0) as usize) % 36;
+                    acc.azimuth_bins.0[sector] += 1;
+                }
+            }
+            // 고도(1,000ft) 분포 — I090 보유 레코드만
+            if let Some(fl) = r.flight_level {
+                *acc.fl_bins.entry((fl / 10.0).floor() as i32).or_insert(0) += 1;
+            }
+            // V/G 플래그는 고도 채택 여부와 무관하게 카운트
+            if r.fl_v {
+                acc.fl_v_invalid += 1;
+            }
+            if r.fl_g {
+                acc.fl_g_garbled += 1;
+            }
+            // Mode-3/A 코드 분포 (V/G=0 유효값만)
+            if let Some(code) = r.mode3a {
+                *acc.mode3a_counts.entry(code).or_insert(0) += 1;
+            }
+            // 속도 분포 (50kt 구간, 최대 bin 39) + 이상치
+            if let Some(kts) = r.ground_speed_kts {
+                let bin = ((kts / 50.0) as u16).min(39);
+                *acc.speed_bins.entry(bin).or_insert(0) += 1;
+                if kts < 10.0 {
+                    acc.speed_low += 1;
+                }
+                if kts > 600.0 {
+                    acc.speed_high += 1;
+                }
+            }
+            if r.sim {
+                acc.sim_records += 1;
+            }
+            // 트랙번호는 레이더 로컬 — SAC/SIC와 묶어 고유성 판정
+            if let Some(tn) = r.track_number {
+                acc.track_ids.insert((r.sac, r.sic, tn));
+            }
+            // BDS 레지스터 분포 (MB 블록 단위) + 호출부호 (주소별 최초값 유지)
+            for i in 0..(r.bds_regs_len as usize).min(r.bds_regs.len()) {
+                *acc.bds_counts.entry(r.bds_regs[i]).or_insert(0) += 1;
+            }
+            if let (Some(ms), Some(cs)) = (r.mode_s, r.callsign.as_ref()) {
+                acc.callsigns.entry(ms).or_insert_with(|| cs.clone());
+            }
+        }
+        CAT034 => {
+            if let Some(mt) = r.msg_type {
+                *acc.msg034.entry(mt).or_insert(0) += 1;
+            }
+            *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
+            // 안테나 회전주기 — North marker 간격 + 회전당 섹터 통과 수
+            if r.antenna_period_s.is_some() || matches!(r.msg_type, Some(1) | Some(2)) {
+                let key = (r.sac, r.sic);
+                let rot = acc.rotation.entry(key).or_default();
+                if let Some(p) = r.antenna_period_s {
+                    rot.reported_sum += p;
+                    rot.reported_count += 1;
+                }
+                match r.msg_type {
+                    // North marker — 직전 North 와의 간격이 유효하면 회전 1회로 확정
+                    Some(1) => {
+                        let st = file.north_state.entry(key).or_insert((None, 0));
+                        let sectors = st.1;
+                        let delta = match (st.0, r.svc_tod) {
+                            (Some(prev), Some(cur)) => north_interval(prev, cur),
+                            _ => None,
+                        };
+                        if let Some(d) = delta {
+                            if rot.interval_count == 0 {
+                                rot.min = d;
+                                rot.max = d;
+                            } else {
+                                if d < rot.min {
+                                    rot.min = d;
+                                }
+                                if d > rot.max {
+                                    rot.max = d;
+                                }
+                            }
+                            rot.interval_count += 1;
+                            rot.sum += d;
+                            rot.sumsq += d * d;
+                            *rot.sectors_hist.entry(sectors as u32).or_insert(0) += 1;
+                        }
+                        rot.north_count += 1;
+                        st.0 = r.svc_tod;
+                        st.1 = 0;
+                    }
+                    // 섹터 통과
+                    Some(2) => {
+                        rot.sector_msgs += 1;
+                        file.north_state.entry(key).or_insert((None, 0)).1 += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        CAT008 => {
+            if let Some(mt) = r.msg_type {
+                *acc.msg008.entry(mt).or_insert(0) += 1;
+            }
+            *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
+        }
+        _ => {}
+    }
+}
+
+/// 분 버킷 → 수집 공백 목록 (관측 버킷 사이의 연속 0-run, 발생 순서).
+/// `asterix_finalize`(상위 50)와 상세 재집계(전체)가 공유하는 단일 기준.
+fn compute_gaps(time_buckets: &HashMap<i64, u64>) -> Vec<CollectionGap> {
+    let mut gaps: Vec<CollectionGap> = Vec::new();
+    if !time_buckets.is_empty() {
+        let mut keys: Vec<i64> = time_buckets.keys().copied().collect();
+        keys.sort_unstable();
+        for w in keys.windows(2) {
+            let span = w[1] - w[0];
+            if span > 1 {
+                gaps.push(CollectionGap {
+                    start_ts: (w[0] + 1) as f64 * 60.0,
+                    end_ts: w[1] as f64 * 60.0,
+                    duration_secs: (span - 1) as f64 * 60.0,
+                });
+            }
+        }
+    }
+    gaps
+}
+
+/// 피트 값 천단위 콤마 표기 (음수는 U+2212 마이너스). 고도 구간 라벨 공용.
+fn fmt_ft_thousands(ft: i32) -> String {
+    let s = ft.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if ft < 0 {
+        format!("\u{2212}{}", out)
+    } else {
+        out
+    }
+}
+
 /// 한 파일을 스캔하여 누산기에 통계 누적 + 파일별 요약 추가.
 pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(), ParseError> {
     let data = std::fs::read(path).map_err(|e| ParseError::FileReadError(e.to_string()))?;
@@ -2989,13 +3194,8 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
     acc.total_bytes += data.len() as u64;
 
     let mut file_frames = 0u64;
-    let mut file_records = 0u64;
-    // 파일별 시각 범위 (파일별 요약 컬럼용)
-    let mut file_time_min: Option<f64> = None;
-    let mut file_time_max: Option<f64> = None;
-    // CAT034 회전 산출용 파일 로컬 상태: SAC/SIC → (직전 North marker TOD, North 이후 섹터 통과 수)
-    // 파일 경계에서 리셋 — 파일 간 시각 연속성은 가정하지 않는다.
-    let mut north_state: HashMap<(u8, u8), (Option<f64>, u64)> = HashMap::new();
+    // 파일 로컬 누산 (레코드 수·시각 범위·CAT034 North marker 상태) — 파일 경계에서 리셋
+    let mut file_acc = FileAccum::default();
 
     walk_asterix(
         &data,
@@ -3008,155 +3208,7 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
             acc.frame_count += 1;
             file_frames += 1;
             for r in &frame.records {
-                acc.record_count += 1;
-                file_records += 1;
-                *acc.cat_records.entry(r.cat).or_insert(0) += 1;
-                if r.truncated {
-                    acc.truncated += 1;
-                }
-                if r.mode3a_garbled {
-                    acc.mode3a_garbled += 1;
-                }
-                if r.has_acas {
-                    acc.acas_ra += 1;
-                }
-                if let Some(t) = r.tod {
-                    acc.tod_min = Some(acc.tod_min.map_or(t, |m| m.min(t)));
-                    acc.tod_max = Some(acc.tod_max.map_or(t, |m| m.max(t)));
-                }
-                if let Some(a) = r.abs_time {
-                    acc.time_min = Some(acc.time_min.map_or(a, |m| m.min(a)));
-                    acc.time_max = Some(acc.time_max.map_or(a, |m| m.max(a)));
-                    file_time_min = Some(file_time_min.map_or(a, |m: f64| m.min(a)));
-                    file_time_max = Some(file_time_max.map_or(a, |m: f64| m.max(a)));
-                    // 분 단위 버킷 누산 (CAT 무관 — abs_time 보유 레코드 전부)
-                    *acc.time_buckets.entry((a / 60.0).floor() as i64).or_insert(0) += 1;
-                }
-                match r.cat {
-                    CAT048 => {
-                        for &frn in &r.frns {
-                            if frn < UAP_MAX {
-                                acc.frn_counts[frn] += 1;
-                            }
-                        }
-                        if let Some(typ) = r.radar_typ {
-                            if (typ as usize) < 8 {
-                                acc.radar_typ[typ as usize] += 1;
-                            }
-                        }
-                        *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
-                        if let Some(ms) = r.mode_s {
-                            *acc.modes.entry(ms).or_insert(0) += 1;
-                        }
-                        // 거리(10NM)·방위(10°) 분포 — I040 보유 레코드만
-                        if let Some(rho) = r.rho_nm {
-                            acc.range_bins[((rho / 10.0) as usize).min(25)] += 1;
-                            if let Some(th) = r.theta_deg {
-                                let sector = ((th / 10.0) as usize) % 36;
-                                acc.azimuth_bins.0[sector] += 1;
-                            }
-                        }
-                        // 고도(1,000ft) 분포 — I090 보유 레코드만
-                        if let Some(fl) = r.flight_level {
-                            *acc.fl_bins.entry((fl / 10.0).floor() as i32).or_insert(0) += 1;
-                        }
-                        // V/G 플래그는 고도 채택 여부와 무관하게 카운트
-                        if r.fl_v {
-                            acc.fl_v_invalid += 1;
-                        }
-                        if r.fl_g {
-                            acc.fl_g_garbled += 1;
-                        }
-                        // Mode-3/A 코드 분포 (V/G=0 유효값만)
-                        if let Some(code) = r.mode3a {
-                            *acc.mode3a_counts.entry(code).or_insert(0) += 1;
-                        }
-                        // 속도 분포 (50kt 구간, 최대 bin 39) + 이상치
-                        if let Some(kts) = r.ground_speed_kts {
-                            let bin = ((kts / 50.0) as u16).min(39);
-                            *acc.speed_bins.entry(bin).or_insert(0) += 1;
-                            if kts < 10.0 {
-                                acc.speed_low += 1;
-                            }
-                            if kts > 600.0 {
-                                acc.speed_high += 1;
-                            }
-                        }
-                        if r.sim {
-                            acc.sim_records += 1;
-                        }
-                        // 트랙번호는 레이더 로컬 — SAC/SIC와 묶어 고유성 판정
-                        if let Some(tn) = r.track_number {
-                            acc.track_ids.insert((r.sac, r.sic, tn));
-                        }
-                        // BDS 레지스터 분포 (MB 블록 단위) + 호출부호 (주소별 최초값 유지)
-                        for i in 0..(r.bds_regs_len as usize).min(r.bds_regs.len()) {
-                            *acc.bds_counts.entry(r.bds_regs[i]).or_insert(0) += 1;
-                        }
-                        if let (Some(ms), Some(cs)) = (r.mode_s, r.callsign.as_ref()) {
-                            acc.callsigns.entry(ms).or_insert_with(|| cs.clone());
-                        }
-                    }
-                    CAT034 => {
-                        if let Some(mt) = r.msg_type {
-                            *acc.msg034.entry(mt).or_insert(0) += 1;
-                        }
-                        *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
-                        // 안테나 회전주기 — North marker 간격 + 회전당 섹터 통과 수
-                        if r.antenna_period_s.is_some() || matches!(r.msg_type, Some(1) | Some(2)) {
-                            let key = (r.sac, r.sic);
-                            let rot = acc.rotation.entry(key).or_default();
-                            if let Some(p) = r.antenna_period_s {
-                                rot.reported_sum += p;
-                                rot.reported_count += 1;
-                            }
-                            match r.msg_type {
-                                // North marker — 직전 North 와의 간격이 유효하면 회전 1회로 확정
-                                Some(1) => {
-                                    let st = north_state.entry(key).or_insert((None, 0));
-                                    let sectors = st.1;
-                                    let delta = match (st.0, r.svc_tod) {
-                                        (Some(prev), Some(cur)) => north_interval(prev, cur),
-                                        _ => None,
-                                    };
-                                    if let Some(d) = delta {
-                                        if rot.interval_count == 0 {
-                                            rot.min = d;
-                                            rot.max = d;
-                                        } else {
-                                            if d < rot.min {
-                                                rot.min = d;
-                                            }
-                                            if d > rot.max {
-                                                rot.max = d;
-                                            }
-                                        }
-                                        rot.interval_count += 1;
-                                        rot.sum += d;
-                                        rot.sumsq += d * d;
-                                        *rot.sectors_hist.entry(sectors as u32).or_insert(0) += 1;
-                                    }
-                                    rot.north_count += 1;
-                                    st.0 = r.svc_tod;
-                                    st.1 = 0;
-                                }
-                                // 섹터 통과
-                                Some(2) => {
-                                    rot.sector_msgs += 1;
-                                    north_state.entry(key).or_insert((None, 0)).1 += 1;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    CAT008 => {
-                        if let Some(mt) = r.msg_type {
-                            *acc.msg008.entry(mt).or_insert(0) += 1;
-                        }
-                        *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
-                    }
-                    _ => {}
-                }
+                accumulate_record(acc, &mut file_acc, r);
             }
         },
     );
@@ -3175,9 +3227,9 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
         filename,
         bytes: data.len() as u64,
         frames: file_frames,
-        records: file_records,
-        time_min: file_time_min,
-        time_max: file_time_max,
+        records: file_acc.records,
+        time_min: file_acc.time_min,
+        time_max: file_acc.time_max,
         tod_shift_hours: tod_utc_shift / 3600.0,
     });
 
@@ -3320,25 +3372,9 @@ pub fn asterix_finalize(state: AsterixScanState) -> AsterixStats {
     } else {
         let lo = *acc.fl_bins.keys().min().unwrap();
         let hi = *acc.fl_bins.keys().max().unwrap();
-        let fl_label = |b: i32| -> String {
-            let fmt = |ft: i32| -> String {
-                let s = ft.unsigned_abs().to_string();
-                // 천단위 콤마
-                let mut out = String::new();
-                for (i, ch) in s.chars().enumerate() {
-                    if i > 0 && (s.len() - i) % 3 == 0 {
-                        out.push(',');
-                    }
-                    out.push(ch);
-                }
-                if ft < 0 {
-                    format!("\u{2212}{}", out)
-                } else {
-                    out
-                }
-            };
-            format!("{}\u{2013}{} ft", fmt(b * 1000), fmt((b + 1) * 1000))
-        };
+        // 천단위 콤마 표기는 fmt_ft_thousands 공용 (상세 500ft 구간 라벨과 동일 관례)
+        let fl_label =
+            |b: i32| format!("{}\u{2013}{} ft", fmt_ft_thousands(b * 1000), fmt_ft_thousands((b + 1) * 1000));
         if (hi - lo) < 60 {
             (lo..=hi)
                 .map(|b| LabeledCount {
@@ -3361,21 +3397,7 @@ pub fn asterix_finalize(state: AsterixScanState) -> AsterixStats {
     };
 
     // 수집 공백 — 분 버킷(리샘플 전 원본)의 연속 0-run. 관측 버킷만 훑어 O(n log n).
-    let mut gaps: Vec<CollectionGap> = Vec::new();
-    if !acc.time_buckets.is_empty() {
-        let mut keys: Vec<i64> = acc.time_buckets.keys().copied().collect();
-        keys.sort_unstable();
-        for w in keys.windows(2) {
-            let span = w[1] - w[0];
-            if span > 1 {
-                gaps.push(CollectionGap {
-                    start_ts: (w[0] + 1) as f64 * 60.0,
-                    end_ts: w[1] as f64 * 60.0,
-                    duration_secs: (span - 1) as f64 * 60.0,
-                });
-            }
-        }
-    }
+    let mut gaps: Vec<CollectionGap> = compute_gaps(&acc.time_buckets);
     let gap_count = gaps.len() as u64;
     gaps.sort_by(|a, b| {
         b.duration_secs
@@ -3680,6 +3702,823 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
         truncated: total > frames.len(),
         total_matched: total,
         frames,
+    })
+}
+
+// ─── "ASTERIX 통계 상세" 재집계 ─────────────────────────────────────────────
+// 직렬화 계약 원본 = 프런트 `src/types/asterixDetail.ts`.
+// 필드명(snake_case)·그리드 상수·상한은 그 파일과 1:1로 유지할 것.
+
+/// PPI 히트맵 방위 섹터 수 (5°) — 프런트 AZ_GRID_SECTORS 와 동기.
+const AZ_GRID_SECTORS: usize = 72;
+/// PPI 히트맵 거리 구간 수 (5NM, 0–260NM) — 프런트 RANGE_GRID_BINS 와 동기.
+const RANGE_GRID_BINS: usize = 52;
+/// I040 ρ 1NM 세부 구간 (파서가 ρ<256NM 보장, 안전상 255 클램프)
+const RANGE_FINE_BINS: usize = 256;
+/// I040 θ 1° 세부 구간
+const AZIMUTH_FINE_BINS: usize = 360;
+/// Mode-S 상세 표 전송 상한 (집계 자체는 전수)
+const DETAIL_MODES_MAX: usize = 2000;
+/// 수집 공백 전송 상한 (집계 자체는 전수)
+const DETAIL_GAPS_MAX: usize = 2000;
+/// 이벤트(비상/ACAS) 수집 상한 — 메모리 보호
+const DETAIL_EVENT_COLLECT_MAX: usize = 5000;
+/// 이벤트 전송 상한
+const DETAIL_EVENT_MAX: usize = 1000;
+
+/// 상세 재집계 필터 (프런트 AsterixDetailFilter 와 1:1, camelCase 수신).
+/// 레코드 단위 적용 — 설정된 모든 조건 AND, 조건 대상 필드가 None 인 레코드는 불통과.
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AsterixDetailFilter {
+    /// 절대 Unix 초 범위
+    pub time_min: Option<f64>,
+    pub time_max: Option<f64>,
+    /// SAC/SIC — 지정된 쪽만 일치 검사 (CAT034/008 레코드에도 적용)
+    pub sac: Option<u8>,
+    pub sic: Option<u8>,
+    /// Mode-S hex 부분일치 (trim + 대문자 정규화 후 비교)
+    pub mode_s: Option<String>,
+    /// 특정 카테고리(0x30/0x22/0x08)
+    pub cat: Option<u8>,
+    /// Mode-3/A 옥탈 4자리 정확일치 (유효 V/G=0 값만)
+    pub mode3a: Option<String>,
+    /// true=SIM 표적만, false=SIM 제외 (I020 부재 = 비SIM 취급)
+    pub sim: Option<bool>,
+    /// ACAS RA(I260/BDS3,0) 보유 여부
+    pub has_acas: Option<bool>,
+    /// 비상코드(7500/7600/7700) 여부
+    pub has_emergency: Option<bool>,
+    /// I048/040 ρ 범위 (NM)
+    pub range_min_nm: Option<f64>,
+    pub range_max_nm: Option<f64>,
+    /// I048/040 θ 범위 (도). min > max 이면 0° 통과 랩어라운드 구간
+    pub az_min_deg: Option<f64>,
+    pub az_max_deg: Option<f64>,
+    /// I048/090 FL 범위 (FL 단위 = 100ft)
+    pub fl_min: Option<f64>,
+    pub fl_max: Option<f64>,
+    /// I048/200 대지속도 범위 (kt)
+    pub speed_min_kts: Option<f64>,
+    pub speed_max_kts: Option<f64>,
+}
+
+/// 필터 사전 정규화 — 레코드마다 문자열 파싱을 반복하지 않도록 1회만 계산.
+struct DetailMatcher<'a> {
+    f: &'a AsterixDetailFilter,
+    /// trim + 대문자 정규화된 Mode-S 부분일치 문자열 (빈 문자열은 미설정 취급)
+    mode_s: Option<String>,
+    /// 옥탈 파싱된 Mode-3/A 코드
+    mode3a: Option<u16>,
+    /// 필터 문자열이 설정됐으나 해석 불가 — 전건 불통과
+    never: bool,
+    /// 시각 조건 사용 여부
+    time_filter: bool,
+}
+
+impl<'a> DetailMatcher<'a> {
+    fn new(f: &'a AsterixDetailFilter) -> Self {
+        let mode_s = f
+            .mode_s
+            .as_ref()
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty());
+        let mode3a_raw = f
+            .mode3a
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // 옥탈 문자열 → u16 (저장 코드도 옥탈 자릿수 그대로라 수치 비교로 정확일치)
+        let mode3a = mode3a_raw
+            .as_ref()
+            .and_then(|s| u16::from_str_radix(s, 8).ok());
+        Self {
+            f,
+            mode_s,
+            mode3a,
+            // 옥탈로 해석 불가한 코드 문자열은 어떤 레코드와도 일치하지 않는다
+            never: mode3a_raw.is_some() && mode3a.is_none(),
+            time_filter: f.time_min.is_some() || f.time_max.is_some(),
+        }
+    }
+
+    /// 레코드 1건이 모든 조건을 통과하는지.
+    /// `eff_ts` = 레코드 abs_time, 없으면 같은 프레임의 첫 CAT048 abs_time(대리 시각).
+    fn matches(&self, r: &ScanRecord, eff_ts: Option<f64>) -> bool {
+        if self.never {
+            return false;
+        }
+        let f = self.f;
+        if let Some(c) = f.cat {
+            if r.cat != c {
+                return false;
+            }
+        }
+        if let Some(sac) = f.sac {
+            if r.sac != sac {
+                return false;
+            }
+        }
+        if let Some(sic) = f.sic {
+            if r.sic != sic {
+                return false;
+            }
+        }
+        // 시각 — CAT034/008 은 자체 abs_time 이 없어 프레임 대리 시각으로 판정(없으면 제외)
+        if self.time_filter {
+            match eff_ts {
+                Some(t) => {
+                    if f.time_min.is_some_and(|mn| t < mn) || f.time_max.is_some_and(|mx| t > mx) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        if let Some(needle) = &self.mode_s {
+            match r.mode_s {
+                Some(m) => {
+                    if !format!("{:06X}", m).contains(needle.as_str()) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        if let Some(code) = self.mode3a {
+            if r.mode3a != Some(code) {
+                return false;
+            }
+        }
+        if let Some(sim) = f.sim {
+            if r.sim != sim {
+                return false;
+            }
+        }
+        if let Some(ha) = f.has_acas {
+            if r.has_acas != ha {
+                return false;
+            }
+        }
+        if let Some(he) = f.has_emergency {
+            if r.mode3a.is_some_and(is_emergency_code) != he {
+                return false;
+            }
+        }
+        if f.range_min_nm.is_some() || f.range_max_nm.is_some() {
+            match r.rho_nm {
+                Some(v) => {
+                    if f.range_min_nm.is_some_and(|mn| v < mn)
+                        || f.range_max_nm.is_some_and(|mx| v > mx)
+                    {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        if f.az_min_deg.is_some() || f.az_max_deg.is_some() {
+            match r.theta_deg {
+                Some(v) => {
+                    let ok = match (f.az_min_deg, f.az_max_deg) {
+                        // min > max = 0°(북) 통과 랩어라운드 구간
+                        (Some(mn), Some(mx)) => {
+                            if mn > mx {
+                                v >= mn || v <= mx
+                            } else {
+                                v >= mn && v <= mx
+                            }
+                        }
+                        (Some(mn), None) => v >= mn,
+                        (None, Some(mx)) => v <= mx,
+                        (None, None) => true,
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        if f.fl_min.is_some() || f.fl_max.is_some() {
+            match r.flight_level {
+                Some(v) => {
+                    if f.fl_min.is_some_and(|mn| v < mn) || f.fl_max.is_some_and(|mx| v > mx) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        if f.speed_min_kts.is_some() || f.speed_max_kts.is_some() {
+            match r.ground_speed_kts {
+                Some(v) => {
+                    if f.speed_min_kts.is_some_and(|mn| v < mn)
+                        || f.speed_max_kts.is_some_and(|mx| v > mx)
+                    {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Mode-S 주소별 상세 (count 내림차순, 상한 DETAIL_MODES_MAX).
+#[derive(Serialize, Clone)]
+pub struct ModeSDetailRow {
+    /// 6자리 hex
+    pub mode_s: String,
+    pub count: u64,
+    pub callsign: Option<String>,
+    pub first_ts: Option<f64>,
+    pub last_ts: Option<f64>,
+    pub fl_min: Option<f64>,
+    pub fl_max: Option<f64>,
+    pub speed_mean_kts: Option<f64>,
+    pub range_min_nm: Option<f64>,
+    pub range_max_nm: Option<f64>,
+    /// 관측된 Mode-3/A 코드 (옥탈 4자리, 최대 8개)
+    pub mode3a_codes: Vec<String>,
+    pub acas_count: u64,
+    pub emergency_count: u64,
+    /// 고유 트랙번호 수 (SAC/SIC 구분)
+    pub track_numbers: u64,
+}
+
+/// Mode-3/A 코드별 상세 (count 내림차순, 전체).
+#[derive(Serialize, Clone)]
+pub struct Mode3ADetailRow {
+    /// 옥탈 4자리
+    pub code: String,
+    pub count: u64,
+    pub distinct_mode_s: u64,
+    pub first_ts: Option<f64>,
+    pub last_ts: Option<f64>,
+}
+
+/// 비상코드 발생 이벤트 (시각 오름차순, 상한 DETAIL_EVENT_MAX).
+#[derive(Serialize, Clone)]
+pub struct EmergencyEvent {
+    pub ts: Option<f64>,
+    pub mode_s: Option<String>,
+    /// 옥탈 4자리
+    pub code: String,
+    pub sac: u8,
+    pub sic: u8,
+}
+
+/// ACAS RA 발생 이벤트 (시각 오름차순, 상한 DETAIL_EVENT_MAX).
+#[derive(Serialize, Clone)]
+pub struct AcasEvent {
+    pub ts: Option<f64>,
+    pub mode_s: Option<String>,
+    pub sac: u8,
+    pub sic: u8,
+}
+
+/// BDS 레지스터별 상세 — key/label 은 기존 bds_reg_counts 규칙과 동일.
+#[derive(Serialize, Clone)]
+pub struct BdsRegDetailRow {
+    pub key: String,
+    pub label: String,
+    /// MB 블록 수
+    pub count: u64,
+    pub distinct_mode_s: u64,
+}
+
+/// SAC/SIC 출처별 분해 (records 내림차순).
+#[derive(Serialize, Clone)]
+pub struct SourceBreakdownRow {
+    pub sac: u8,
+    pub sic: u8,
+    pub records: u64,
+    pub cat048: u64,
+    pub cat034: u64,
+    pub cat008: u64,
+    pub modes_distinct: u64,
+    pub time_min: Option<f64>,
+    pub time_max: Option<f64>,
+}
+
+/// scan_asterix_detail 반환 (bulk:// 파일 매개 전송).
+#[derive(Serialize)]
+pub struct AsterixDetailStats {
+    /// 필터 적용 재집계 — 기존 대시보드 구조 그대로 재사용
+    pub stats: AsterixStats,
+    /// 필터 전 전체 레코드 수 (커버리지 표시용)
+    pub unfiltered_records: u64,
+    /// I040 ρ 1NM 구간 [0..256)
+    pub range_fine: Vec<u64>,
+    /// I040 θ 1° 구간 [0..360)
+    pub azimuth_fine: Vec<u64>,
+    /// PPI 히트맵 — idx = az*RANGE_GRID_BINS + r
+    pub az_range_grid: Vec<u64>,
+    /// I090 고도 500ft 구간 (관측 구간만, 키 오름차순)
+    pub fl_fine: Vec<LabeledCount>,
+    /// I200 속도 10kt 구간 (관측 구간만, 키 오름차순)
+    pub speed_fine: Vec<LabeledCount>,
+    /// 시간대(hour-of-day) 레코드 수 — UTC 24칸
+    pub hourly_utc: Vec<u64>,
+    pub modes_table: Vec<ModeSDetailRow>,
+    pub modes_table_truncated: bool,
+    pub mode3a_table: Vec<Mode3ADetailRow>,
+    pub bds_detail: Vec<BdsRegDetailRow>,
+    pub source_breakdown: Vec<SourceBreakdownRow>,
+    /// 전체 수집 공백 (길이 내림차순, 상한 DETAIL_GAPS_MAX)
+    pub gaps_all: Vec<CollectionGap>,
+    pub gaps_all_truncated: bool,
+    pub emergency_events: Vec<EmergencyEvent>,
+    pub emergency_events_truncated: bool,
+    pub acas_events: Vec<AcasEvent>,
+    pub acas_events_truncated: bool,
+}
+
+/// Mode-S 주소별 상세 누산.
+#[derive(Default)]
+struct ModeSDetailAccum {
+    count: u64,
+    first_ts: Option<f64>,
+    last_ts: Option<f64>,
+    fl_min: Option<f64>,
+    fl_max: Option<f64>,
+    speed_sum: f64,
+    speed_n: u64,
+    range_min: Option<f64>,
+    range_max: Option<f64>,
+    /// 관측 코드 — 출력 상한(8)까지만 수집해 메모리 상한 확보
+    mode3a: std::collections::BTreeSet<u16>,
+    acas: u64,
+    emergency: u64,
+    /// 트랙번호는 레이더 로컬 — SAC/SIC 와 묶어 고유성 판정
+    tracks: std::collections::HashSet<(u8, u8, u16)>,
+}
+
+/// Mode-3/A 코드별 상세 누산.
+#[derive(Default)]
+struct Mode3ADetailAccum {
+    count: u64,
+    modes: std::collections::HashSet<u32>,
+    first_ts: Option<f64>,
+    last_ts: Option<f64>,
+}
+
+/// BDS 레지스터별 상세 누산.
+#[derive(Default)]
+struct BdsDetailAccum {
+    count: u64,
+    modes: std::collections::HashSet<u32>,
+}
+
+/// SAC/SIC 출처별 누산.
+#[derive(Default)]
+struct SourceDetailAccum {
+    records: u64,
+    cat048: u64,
+    cat034: u64,
+    cat008: u64,
+    modes: std::collections::HashSet<u32>,
+    time_min: Option<f64>,
+    time_max: Option<f64>,
+}
+
+/// 상세 전용 누산기 — StatAccum(기존 대시보드 항목)과 **병행** 누적된다.
+/// 전수 레코드 기준(샘플링·스트라이드 없음), 상한은 전송 단계에서만 적용.
+struct DetailAccum {
+    unfiltered_records: u64,
+    range_fine: Vec<u64>,
+    azimuth_fine: Vec<u64>,
+    az_range_grid: Vec<u64>,
+    /// key = floor(FL/5) → 500ft 구간 (음수 허용)
+    fl_fine: HashMap<i32, u64>,
+    /// key = floor(kt/10) → 10kt 구간
+    speed_fine: HashMap<i32, u64>,
+    hourly_utc: [u64; 24],
+    modes: HashMap<u32, ModeSDetailAccum>,
+    mode3a: HashMap<u16, Mode3ADetailAccum>,
+    bds: HashMap<u8, BdsDetailAccum>,
+    sources: HashMap<(u8, u8), SourceDetailAccum>,
+    emergency_events: Vec<EmergencyEvent>,
+    emergency_total: u64,
+    acas_events: Vec<AcasEvent>,
+    acas_total: u64,
+}
+
+impl DetailAccum {
+    fn new() -> Self {
+        Self {
+            unfiltered_records: 0,
+            range_fine: vec![0u64; RANGE_FINE_BINS],
+            azimuth_fine: vec![0u64; AZIMUTH_FINE_BINS],
+            az_range_grid: vec![0u64; AZ_GRID_SECTORS * RANGE_GRID_BINS],
+            fl_fine: HashMap::new(),
+            speed_fine: HashMap::new(),
+            hourly_utc: [0u64; 24],
+            modes: HashMap::new(),
+            mode3a: HashMap::new(),
+            bds: HashMap::new(),
+            sources: HashMap::new(),
+            emergency_events: Vec::new(),
+            emergency_total: 0,
+            acas_events: Vec::new(),
+            acas_total: 0,
+        }
+    }
+
+    /// 필터를 통과한 레코드 1건 누적.
+    /// `eff_ts` = 레코드 abs_time, 없으면 프레임 대리 시각(첫 CAT048 abs_time).
+    fn push(&mut self, r: &ScanRecord, eff_ts: Option<f64>) {
+        // 시간대(hour-of-day, UTC) — CAT034/008 도 대리 시각으로 포함
+        if let Some(t) = eff_ts {
+            let hour = ((t / 3600.0).floor() as i64).rem_euclid(24) as usize;
+            self.hourly_utc[hour] += 1;
+        }
+        // 출처(SAC/SIC) 분해 — 전 카테고리 대상
+        {
+            let s = self.sources.entry((r.sac, r.sic)).or_default();
+            s.records += 1;
+            match r.cat {
+                CAT048 => s.cat048 += 1,
+                CAT034 => s.cat034 += 1,
+                CAT008 => s.cat008 += 1,
+                _ => {}
+            }
+            if let Some(ms) = r.mode_s {
+                s.modes.insert(ms);
+            }
+            if let Some(t) = eff_ts {
+                s.time_min = Some(s.time_min.map_or(t, |m: f64| m.min(t)));
+                s.time_max = Some(s.time_max.map_or(t, |m: f64| m.max(t)));
+            }
+        }
+        // 이하 항목은 CAT048 파생 (CAT034/008 은 해당 필드가 전부 부재)
+        if r.cat != CAT048 {
+            return;
+        }
+        // 거리·방위 세부 + PPI 격자 — I040 보유 레코드만
+        if let Some(rho) = r.rho_nm {
+            self.range_fine[(rho as usize).min(RANGE_FINE_BINS - 1)] += 1;
+            if let Some(th) = r.theta_deg {
+                self.azimuth_fine[(th as usize).min(AZIMUTH_FINE_BINS - 1)] += 1;
+                let az = ((th / 5.0) as usize).min(AZ_GRID_SECTORS - 1);
+                let rb = ((rho / 5.0) as usize).min(RANGE_GRID_BINS - 1);
+                self.az_range_grid[az * RANGE_GRID_BINS + rb] += 1;
+            }
+        }
+        if let Some(fl) = r.flight_level {
+            *self.fl_fine.entry((fl / 5.0).floor() as i32).or_insert(0) += 1;
+        }
+        if let Some(kts) = r.ground_speed_kts {
+            *self.speed_fine.entry((kts / 10.0).floor() as i32).or_insert(0) += 1;
+        }
+        let emergency = r.mode3a.is_some_and(is_emergency_code);
+        // Mode-S 주소별 상세
+        if let Some(ms) = r.mode_s {
+            let e = self.modes.entry(ms).or_default();
+            e.count += 1;
+            if let Some(t) = eff_ts {
+                e.first_ts = Some(e.first_ts.map_or(t, |m: f64| m.min(t)));
+                e.last_ts = Some(e.last_ts.map_or(t, |m: f64| m.max(t)));
+            }
+            if let Some(fl) = r.flight_level {
+                e.fl_min = Some(e.fl_min.map_or(fl, |m: f64| m.min(fl)));
+                e.fl_max = Some(e.fl_max.map_or(fl, |m: f64| m.max(fl)));
+            }
+            if let Some(kts) = r.ground_speed_kts {
+                e.speed_sum += kts;
+                e.speed_n += 1;
+            }
+            if let Some(rho) = r.rho_nm {
+                e.range_min = Some(e.range_min.map_or(rho, |m: f64| m.min(rho)));
+                e.range_max = Some(e.range_max.map_or(rho, |m: f64| m.max(rho)));
+            }
+            if let Some(code) = r.mode3a {
+                if e.mode3a.len() < 8 {
+                    e.mode3a.insert(code);
+                }
+            }
+            if r.has_acas {
+                e.acas += 1;
+            }
+            if emergency {
+                e.emergency += 1;
+            }
+            if let Some(tn) = r.track_number {
+                e.tracks.insert((r.sac, r.sic, tn));
+            }
+        }
+        // Mode-3/A 코드별 상세 (V/G=0 유효값만)
+        if let Some(code) = r.mode3a {
+            let e = self.mode3a.entry(code).or_default();
+            e.count += 1;
+            if let Some(ms) = r.mode_s {
+                e.modes.insert(ms);
+            }
+            if let Some(t) = eff_ts {
+                e.first_ts = Some(e.first_ts.map_or(t, |m: f64| m.min(t)));
+                e.last_ts = Some(e.last_ts.map_or(t, |m: f64| m.max(t)));
+            }
+        }
+        // BDS 레지스터별 상세 (MB 블록 단위)
+        for i in 0..(r.bds_regs_len as usize).min(r.bds_regs.len()) {
+            let e = self.bds.entry(r.bds_regs[i]).or_default();
+            e.count += 1;
+            if let Some(ms) = r.mode_s {
+                e.modes.insert(ms);
+            }
+        }
+        // 이벤트 — 총계는 전수, 목록만 수집 상한
+        if emergency {
+            self.emergency_total += 1;
+            if self.emergency_events.len() < DETAIL_EVENT_COLLECT_MAX {
+                self.emergency_events.push(EmergencyEvent {
+                    ts: eff_ts,
+                    mode_s: r.mode_s.map(|m| format!("{:06X}", m)),
+                    code: format!("{:04o}", r.mode3a.unwrap_or(0)),
+                    sac: r.sac,
+                    sic: r.sic,
+                });
+            }
+        }
+        if r.has_acas {
+            self.acas_total += 1;
+            if self.acas_events.len() < DETAIL_EVENT_COLLECT_MAX {
+                self.acas_events.push(AcasEvent {
+                    ts: eff_ts,
+                    mode_s: r.mode_s.map(|m| format!("{:06X}", m)),
+                    sac: r.sac,
+                    sic: r.sic,
+                });
+            }
+        }
+    }
+}
+
+/// 이벤트 시각 오름차순 비교 (시각 없는 항목은 뒤로).
+fn cmp_opt_ts(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// 필터 기반 상세 재집계 — 전수 1패스.
+///
+/// 구조적 항목(파일/프레임/블록/바이트/parse_errors/skipped/cat_counts.blocks/nec_dates/
+/// files[].bytes·frames·time_min·time_max)은 **필터 무관**하게 전체 워크 기준으로 채우고,
+/// 레코드 파생 항목은 전부 필터 통과분만 누적한다.
+/// 응답은 대용량이므로 호출부(lib.rs)에서 반드시 bulk:// 로 전송할 것.
+pub fn asterix_detail_scan(
+    paths: &[String],
+    filter: &AsterixDetailFilter,
+    mut progress: impl FnMut(usize, usize, &str),
+) -> Result<AsterixDetailStats, String> {
+    let matcher = DetailMatcher::new(filter);
+    let mut state = AsterixScanState::default();
+    let mut detail = DetailAccum::new();
+    let total = paths.len();
+
+    for (idx, path) in paths.iter().enumerate() {
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        match std::fs::read(path) {
+            Ok(data) => {
+                let (valid_dates, base_date_secs, start_tod) = asterix_date_context(path, &data);
+                let tod_utc_shift = detect_tod_utc_shift(&data, &valid_dates);
+                let mut totals = WalkTotals::default();
+
+                let acc = &mut state.acc;
+                acc.total_bytes += data.len() as u64;
+
+                let mut file_frames = 0u64;
+                let mut file_acc = FileAccum::default();
+                // 구조적 파일 시각 범위 — files[].time_min/max 는 필터 무관 전수 기준
+                let mut struct_time_min: Option<f64> = None;
+                let mut struct_time_max: Option<f64> = None;
+                let detail_ref = &mut detail;
+
+                walk_asterix(
+                    &data,
+                    &valid_dates,
+                    base_date_secs,
+                    start_tod,
+                    tod_utc_shift,
+                    &mut totals,
+                    |frame| {
+                        acc.frame_count += 1;
+                        file_frames += 1;
+                        // 프레임 대리 시각 = 프레임 내 첫 CAT048 abs_time
+                        // (abs_time 없는 CAT034/008 의 기간 필터 판정용 — 회전주기/메시지유형 통계 보존)
+                        let frame_abs = frame.records.iter().find_map(|r| r.abs_time);
+                        for r in &frame.records {
+                            detail_ref.unfiltered_records += 1;
+                            if let Some(a) = r.abs_time {
+                                struct_time_min =
+                                    Some(struct_time_min.map_or(a, |m: f64| m.min(a)));
+                                struct_time_max =
+                                    Some(struct_time_max.map_or(a, |m: f64| m.max(a)));
+                            }
+                            let eff_ts = r.abs_time.or(frame_abs);
+                            if !matcher.matches(r, eff_ts) {
+                                continue;
+                            }
+                            accumulate_record(acc, &mut file_acc, r);
+                            detail_ref.push(r, eff_ts);
+                        }
+                    },
+                );
+
+                acc.skipped_bytes += totals.skipped;
+                acc.parse_errors += totals.parse_errors;
+                acc.block_count += totals.block_count;
+                for (cat, n) in totals.cat_blocks {
+                    *acc.cat_blocks.entry(cat).or_insert(0) += n;
+                }
+                for d in totals.nec_dates {
+                    acc.nec_dates.insert(d);
+                }
+
+                state.files.push(AsterixFileStat {
+                    filename: filename.clone(),
+                    bytes: data.len() as u64,
+                    frames: file_frames,
+                    // 레코드 수만 필터 적용 (커버리지 표시용)
+                    records: file_acc.records,
+                    time_min: struct_time_min,
+                    time_max: struct_time_max,
+                    tod_shift_hours: tod_utc_shift / 3600.0,
+                });
+            }
+            Err(e) => {
+                // 배치 스캔과 동일 정책 — 실패 파일은 건너뛰고 나머지를 집계
+                log::info!("[ASTERIX] 상세 스캔 실패 {}: {}", filename, e);
+            }
+        }
+        progress(idx + 1, total, &filename);
+    }
+
+    // 수집 공백 — finalize 가 state 를 소비하기 전에 동일 기준(분 버킷)으로 전체 산출
+    let mut gaps_all = compute_gaps(&state.acc.time_buckets);
+    gaps_all.sort_by(|a, b| {
+        b.duration_secs
+            .partial_cmp(&a.duration_secs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let gaps_all_truncated = gaps_all.len() > DETAIL_GAPS_MAX;
+    gaps_all.truncate(DETAIL_GAPS_MAX);
+
+    let stats = asterix_finalize(state);
+
+    // 고도 500ft / 속도 10kt 세부 구간 — 관측 구간만 키 오름차순
+    let mut fl_keys: Vec<i32> = detail.fl_fine.keys().copied().collect();
+    fl_keys.sort_unstable();
+    let fl_fine: Vec<LabeledCount> = fl_keys
+        .into_iter()
+        .map(|b| LabeledCount {
+            key: (b * 500).to_string(),
+            label: format!(
+                "{}\u{2013}{} ft",
+                fmt_ft_thousands(b * 500),
+                fmt_ft_thousands((b + 1) * 500)
+            ),
+            count: detail.fl_fine[&b],
+        })
+        .collect();
+    let mut sp_keys: Vec<i32> = detail.speed_fine.keys().copied().collect();
+    sp_keys.sort_unstable();
+    let speed_fine: Vec<LabeledCount> = sp_keys
+        .into_iter()
+        .map(|b| LabeledCount {
+            key: (b * 10).to_string(),
+            label: format!("{}\u{2013}{} kt", b * 10, (b + 1) * 10),
+            count: detail.speed_fine[&b],
+        })
+        .collect();
+
+    // Mode-S 상세 (count 내림차순, 동률은 주소 오름차순 — 결정적 출력)
+    let modes_table_truncated = detail.modes.len() > DETAIL_MODES_MAX;
+    let modes_table: Vec<ModeSDetailRow> = {
+        let callsigns: HashMap<&str, &str> = stats
+            .mode_s_callsigns
+            .iter()
+            .map(|c| (c.mode_s.as_str(), c.callsign.as_str()))
+            .collect();
+        let mut v: Vec<(u32, ModeSDetailAccum)> = detail.modes.into_iter().collect();
+        v.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
+        v.truncate(DETAIL_MODES_MAX);
+        v.into_iter()
+            .map(|(ms, e)| {
+                let hex = format!("{:06X}", ms);
+                let callsign = callsigns.get(hex.as_str()).map(|s| s.to_string());
+                ModeSDetailRow {
+                    mode_s: hex,
+                    count: e.count,
+                    callsign,
+                    first_ts: e.first_ts,
+                    last_ts: e.last_ts,
+                    fl_min: e.fl_min,
+                    fl_max: e.fl_max,
+                    speed_mean_kts: if e.speed_n > 0 {
+                        Some(e.speed_sum / e.speed_n as f64)
+                    } else {
+                        None
+                    },
+                    range_min_nm: e.range_min,
+                    range_max_nm: e.range_max,
+                    mode3a_codes: e.mode3a.iter().map(|&c| format!("{:04o}", c)).collect(),
+                    acas_count: e.acas,
+                    emergency_count: e.emergency,
+                    track_numbers: e.tracks.len() as u64,
+                }
+            })
+            .collect()
+    };
+
+    // Mode-3/A 상세 (전체, count 내림차순)
+    let mut mode3a_vec: Vec<(u16, Mode3ADetailAccum)> = detail.mode3a.into_iter().collect();
+    mode3a_vec.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
+    let mode3a_table: Vec<Mode3ADetailRow> = mode3a_vec
+        .into_iter()
+        .map(|(code, e)| Mode3ADetailRow {
+            code: format!("{:04o}", code),
+            count: e.count,
+            distinct_mode_s: e.modes.len() as u64,
+            first_ts: e.first_ts,
+            last_ts: e.last_ts,
+        })
+        .collect();
+
+    // BDS 레지스터 상세 — key/label 은 bds_reg_counts 와 동일 규칙
+    let mut bds_vec: Vec<(u8, BdsDetailAccum)> = detail.bds.into_iter().collect();
+    bds_vec.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
+    let bds_detail: Vec<BdsRegDetailRow> = bds_vec
+        .into_iter()
+        .map(|(packed, e)| {
+            let key = format!("{},{}", packed >> 4, packed & 0x0F);
+            BdsRegDetailRow {
+                label: format!("{} {}", key, bds_reg_label(packed)),
+                key,
+                count: e.count,
+                distinct_mode_s: e.modes.len() as u64,
+            }
+        })
+        .collect();
+
+    // 출처 분해 (records 내림차순)
+    let mut src_vec: Vec<((u8, u8), SourceDetailAccum)> = detail.sources.into_iter().collect();
+    src_vec.sort_by(|a, b| b.1.records.cmp(&a.1.records).then(a.0.cmp(&b.0)));
+    let source_breakdown: Vec<SourceBreakdownRow> = src_vec
+        .into_iter()
+        .map(|((sac, sic), e)| SourceBreakdownRow {
+            sac,
+            sic,
+            records: e.records,
+            cat048: e.cat048,
+            cat034: e.cat034,
+            cat008: e.cat008,
+            modes_distinct: e.modes.len() as u64,
+            time_min: e.time_min,
+            time_max: e.time_max,
+        })
+        .collect();
+
+    // 이벤트 — 시각 오름차순 정렬 후 전송 상한 적용 (총계 대비 truncated 판정)
+    let mut emergency_events = detail.emergency_events;
+    emergency_events.sort_by(|a, b| cmp_opt_ts(a.ts, b.ts));
+    emergency_events.truncate(DETAIL_EVENT_MAX);
+    let emergency_events_truncated = detail.emergency_total > emergency_events.len() as u64;
+    let mut acas_events = detail.acas_events;
+    acas_events.sort_by(|a, b| cmp_opt_ts(a.ts, b.ts));
+    acas_events.truncate(DETAIL_EVENT_MAX);
+    let acas_events_truncated = detail.acas_total > acas_events.len() as u64;
+
+    Ok(AsterixDetailStats {
+        stats,
+        unfiltered_records: detail.unfiltered_records,
+        range_fine: detail.range_fine,
+        azimuth_fine: detail.azimuth_fine,
+        az_range_grid: detail.az_range_grid,
+        fl_fine,
+        speed_fine,
+        hourly_utc: detail.hourly_utc.to_vec(),
+        modes_table,
+        modes_table_truncated,
+        mode3a_table,
+        bds_detail,
+        source_breakdown,
+        gaps_all,
+        gaps_all_truncated,
+        emergency_events,
+        emergency_events_truncated,
+        acas_events,
+        acas_events_truncated,
     })
 }
 
@@ -4065,6 +4904,164 @@ mod tests {
 
         // 빈 윈도우(검출 실패)면 항상 거부
         assert!(!is_nec_frame(&mk(2, 24, 10, 0), 0, &[]));
+    }
+
+    /// 상세 필터 테스트용 최소 CAT048 스캔 레코드 (모든 조건 대상 필드 부재).
+    fn detail_test_record() -> ScanRecord {
+        ScanRecord {
+            cat: CAT048,
+            mode_s: None,
+            tod: None,
+            abs_time: None,
+            radar_typ: None,
+            sac: 0,
+            sic: 0,
+            has_acas: false,
+            msg_type: None,
+            frns: Vec::new(),
+            truncated: false,
+            mode3a_garbled: false,
+            rho_nm: None,
+            theta_deg: None,
+            flight_level: None,
+            fl_v: false,
+            fl_g: false,
+            mode3a: None,
+            ground_speed_kts: None,
+            sim: false,
+            track_number: None,
+            bds_regs: [0u8; 8],
+            bds_regs_len: 0,
+            callsign: None,
+            svc_tod: None,
+            sector_number: None,
+            antenna_period_s: None,
+        }
+    }
+
+    /// 방위 필터 — azMin > azMax 는 0°(북) 통과 랩어라운드 구간.
+    #[test]
+    fn test_detail_filter_azimuth_wraparound() {
+        let f = AsterixDetailFilter {
+            az_min_deg: Some(350.0),
+            az_max_deg: Some(10.0),
+            ..Default::default()
+        };
+        let m = DetailMatcher::new(&f);
+        let mut r = detail_test_record();
+
+        r.theta_deg = Some(355.0);
+        assert!(m.matches(&r, None));
+        r.theta_deg = Some(5.0);
+        assert!(m.matches(&r, None));
+        r.theta_deg = Some(0.0);
+        assert!(m.matches(&r, None));
+        r.theta_deg = Some(180.0);
+        assert!(!m.matches(&r, None));
+
+        // 일반 구간(min < max)
+        let f2 = AsterixDetailFilter {
+            az_min_deg: Some(10.0),
+            az_max_deg: Some(20.0),
+            ..Default::default()
+        };
+        let m2 = DetailMatcher::new(&f2);
+        r.theta_deg = Some(15.0);
+        assert!(m2.matches(&r, None));
+        r.theta_deg = Some(355.0);
+        assert!(!m2.matches(&r, None));
+
+        // θ 부재 레코드는 방위 조건 불통과
+        r.theta_deg = None;
+        assert!(!m.matches(&r, None));
+        // 방위 조건 미설정이면 θ 부재도 통과
+        assert!(DetailMatcher::new(&AsterixDetailFilter::default()).matches(&r, None));
+    }
+
+    /// Mode-3/A 필터는 옥탈 정확일치 + 기간 필터의 CAT034 대리 시각 판정.
+    #[test]
+    fn test_detail_filter_mode3a_octal_and_time_proxy() {
+        let f = AsterixDetailFilter {
+            mode3a: Some(" 7700 ".to_string()),
+            ..Default::default()
+        };
+        let m = DetailMatcher::new(&f);
+        let mut r = detail_test_record();
+
+        r.mode3a = Some(0o7700);
+        assert!(m.matches(&r, None));
+        // 십진 7700 은 옥탈 7700(=4032)과 다른 코드
+        r.mode3a = Some(7700);
+        assert!(!m.matches(&r, None));
+        // V/G=1 등으로 코드가 없는 레코드는 불통과
+        r.mode3a = None;
+        assert!(!m.matches(&r, None));
+
+        // 옥탈로 해석 불가한 문자열 → 전건 불통과
+        let bad = AsterixDetailFilter {
+            mode3a: Some("7A99".to_string()),
+            ..Default::default()
+        };
+        let mb = DetailMatcher::new(&bad);
+        r.mode3a = Some(0o7700);
+        assert!(!mb.matches(&r, None));
+
+        // 기간 필터 — abs_time 없는 CAT034 는 프레임 대리 시각으로 판정
+        let tf = AsterixDetailFilter {
+            time_min: Some(100.0),
+            time_max: Some(200.0),
+            ..Default::default()
+        };
+        let mt = DetailMatcher::new(&tf);
+        let mut c34 = detail_test_record();
+        c34.cat = CAT034;
+        assert!(mt.matches(&c34, Some(150.0)));
+        assert!(!mt.matches(&c34, Some(250.0)));
+        // 대리 시각조차 없으면 제외
+        assert!(!mt.matches(&c34, None));
+        // 기간 조건 미설정이면 시각 없이도 통과 (회전주기/메시지유형 통계 보존)
+        assert!(DetailMatcher::new(&AsterixDetailFilter::default()).matches(&c34, None));
+    }
+
+    /// SIM/ACAS/비상 불리언 필터와 SAC/SIC 적용 범위.
+    #[test]
+    fn test_detail_filter_flags_and_source() {
+        let mut r = detail_test_record();
+        // sim=false 는 "SIM 제외" — I020 부재(sim=false)도 통과
+        let only_real = AsterixDetailFilter {
+            sim: Some(false),
+            ..Default::default()
+        };
+        assert!(DetailMatcher::new(&only_real).matches(&r, None));
+        r.sim = true;
+        assert!(!DetailMatcher::new(&only_real).matches(&r, None));
+
+        // 비상코드 필터는 유효 Mode-3/A 만 대상
+        let emerg = AsterixDetailFilter {
+            has_emergency: Some(true),
+            ..Default::default()
+        };
+        let mut e = detail_test_record();
+        assert!(!DetailMatcher::new(&emerg).matches(&e, None));
+        e.mode3a = Some(0o7600);
+        assert!(DetailMatcher::new(&emerg).matches(&e, None));
+
+        // SAC/SIC 는 CAT034 레코드에도 적용 (한쪽만 지정 가능)
+        let mut c34 = detail_test_record();
+        c34.cat = CAT034;
+        c34.sac = 1;
+        c34.sic = 7;
+        let src = AsterixDetailFilter {
+            sic: Some(7),
+            ..Default::default()
+        };
+        assert!(DetailMatcher::new(&src).matches(&c34, None));
+        let src2 = AsterixDetailFilter {
+            sac: Some(2),
+            sic: Some(7),
+            ..Default::default()
+        };
+        assert!(!DetailMatcher::new(&src2).matches(&c34, None));
     }
 }
 

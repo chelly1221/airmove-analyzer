@@ -479,6 +479,34 @@ async fn scan_asterix_batch(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
+/// "ASTERIX 통계 상세": 필터 기반 재집계 (전수 1패스).
+/// 응답(세부 히스토그램 + Mode-S/Mode-3A 표 + 이벤트)은 수 MB+ 이므로
+/// 반드시 bulk:// 파일 매개 전송 — 대용량 invoke 응답 금지 규칙(bulk.rs 헤더 참조).
+#[tauri::command]
+async fn scan_asterix_detail(
+    app_handle: tauri::AppHandle,
+    file_paths: Vec<String>,
+    filter: parser::ass::AsterixDetailFilter,
+) -> Result<bulk::BulkRef, String> {
+    info!("Command: scan_asterix_detail({} files)", file_paths.len());
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = app_handle.clone();
+        let result = parser::ass::asterix_detail_scan(&file_paths, &filter, |done, total, filename| {
+            let _ = emitter.emit(
+                "asterix-detail-progress",
+                AsterixScanProgress {
+                    done,
+                    total,
+                    filename: filename.to_string(),
+                },
+            );
+        })?;
+        bulk::write_json(&app_handle, &result)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
 /// "ASTERIX 분석" 탭: 필터 기반 온디맨드 프레임 조회 (재스캔, 상한까지 수집).
 #[tauri::command]
 async fn query_asterix_frames(
@@ -3649,6 +3677,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             parse_and_analyze_batch,
             scan_asterix_batch,
+            scan_asterix_detail,
             query_asterix_frames,
             get_aircraft_list,
             save_aircraft,

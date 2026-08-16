@@ -22,6 +22,14 @@ import type { LucideIcon } from "lucide-react";
 import Modal from "../common/Modal";
 import { useAppStore } from "../../store";
 import type { PageId } from "../../types";
+import { ASTERIX_STAT_TOPICS } from "../../types/asterixDetail";
+
+/** 3단 손자 항목 (예: ASTERIX → 통계 → 수집 시간) */
+interface NavGrandChild {
+  id: string;
+  label: string;
+  path: string;
+}
 
 // 중첩 하위 항목 (예: ASTERIX → 통계 / 프레임 탐색)
 interface NavChild {
@@ -30,6 +38,8 @@ interface NavChild {
   path: string;
   /** 부모 클릭 시 이동할 기본 하위 항목 */
   default?: boolean;
+  /** 하위 항목이 활성일 때만 펼치는 3단 목록 */
+  children?: NavGrandChild[];
 }
 
 interface NavItem {
@@ -73,7 +83,17 @@ const navSections: NavSection[] = [
       {
         id: "asterix", label: "ASTERIX", icon: Binary, path: "/asterix",
         children: [
-          { id: "asterix-stats", label: "통계", path: "/asterix/stats" },
+          {
+            id: "asterix-stats",
+            label: "통계",
+            path: "/asterix/stats",
+            // 통계 상세 8토픽 — 레지스트리(types/asterixDetail)를 단일 원천으로 사용
+            children: ASTERIX_STAT_TOPICS.map((t) => ({
+              id: `asterix-stat-${t.id}`,
+              label: t.label,
+              path: t.path,
+            })),
+          },
           { id: "asterix-frames", label: "프레임 탐색", path: "/asterix/frames", default: true },
         ],
       },
@@ -425,14 +445,22 @@ export default function Sidebar() {
     navigate(child.path);
   };
 
+  const handleNavGrandChild = (item: NavItem, gc: NavGrandChild) => {
+    setActivePage(item.id);
+    navigate(gc.path);
+  };
+
   const isActive = (item: NavItem) => {
     if (item.path === "/") return location.pathname === "/";
     return location.pathname.startsWith(item.path);
   };
 
-  // 하위 항목 활성 판정 — 파라미터 없는 부모 경로(/asterix)는 기본 하위 항목을 활성으로 간주
+  // 하위 항목 활성 판정 — 상세 하위 경로(/asterix/stats/:topic)도 부모 하위 항목(통계) 활성으로 본다.
+  // 파라미터 없는 부모 경로(/asterix)는 기본 하위 항목을 활성으로 간주
   const isChildActive = (item: NavItem, child: NavChild) =>
-    location.pathname === child.path || (!!child.default && location.pathname === item.path);
+    location.pathname === child.path ||
+    location.pathname.startsWith(`${child.path}/`) ||
+    (!!child.default && location.pathname === item.path);
 
   // 현재 페이지에 따른 하단 패널
   const isReportPage = location.pathname === "/report";
@@ -504,19 +532,44 @@ export default function Sidebar() {
                           <div className="ml-[20px] mt-0.5 border-l border-gray-200">
                             {children.map((child) => {
                               const childActive = isChildActive(item, child);
+                              const grandChildren = child.children;
                               return (
-                                <button
-                                  key={child.id}
-                                  data-tour={`nav-${child.id}`}
-                                  onClick={() => handleNavChild(item, child)}
-                                  className={`flex w-full items-center rounded-r-lg py-1.5 pl-4 pr-3 text-left text-[12px] transition-colors ${
-                                    childActive
-                                      ? "text-[#a60739] font-semibold"
-                                      : "text-gray-500 hover:bg-gray-50 hover:text-gray-900"
-                                  }`}
-                                >
-                                  <span className="whitespace-nowrap">{child.label}</span>
-                                </button>
+                                <div key={child.id}>
+                                  <button
+                                    data-tour={`nav-${child.id}`}
+                                    onClick={() => handleNavChild(item, child)}
+                                    className={`flex w-full items-center rounded-r-lg py-1.5 pl-4 pr-3 text-left text-[12px] transition-colors ${
+                                      childActive
+                                        ? "text-[#a60739] font-semibold"
+                                        : "text-gray-500 hover:bg-gray-50 hover:text-gray-900"
+                                    }`}
+                                  >
+                                    <span className="whitespace-nowrap">{child.label}</span>
+                                  </button>
+
+                                  {/* 3단 손자 항목 — 하위 항목이 활성일 때만 펼침 (한 단 더 들여쓰기 + 트리 라인) */}
+                                  {childActive && grandChildren && grandChildren.length > 0 && (
+                                    <div className="ml-[18px] border-l border-gray-200">
+                                      {grandChildren.map((gc) => {
+                                        const gcActive = location.pathname === gc.path;
+                                        return (
+                                          <button
+                                            key={gc.id}
+                                            data-tour={`nav-${gc.id}`}
+                                            onClick={() => handleNavGrandChild(item, gc)}
+                                            className={`flex w-full items-center rounded-r-lg py-1 pl-3 pr-2 text-left text-[11px] transition-colors ${
+                                              gcActive
+                                                ? "text-[#a60739] font-semibold"
+                                                : "text-gray-400 hover:bg-gray-50 hover:text-gray-700"
+                                            }`}
+                                          >
+                                            <span className="whitespace-nowrap">{gc.label}</span>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+                                </div>
                               );
                             })}
                           </div>

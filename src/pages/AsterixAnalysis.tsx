@@ -24,76 +24,32 @@ import { decodeFrame, type DecodedFrame } from "../utils/asterixDecoder";
 import { saveXlsx, type Cell } from "../utils/xlsxExport";
 import { exportStrings, type ExportLang } from "../utils/exportI18n";
 import { ExcelExportButton } from "../components/common/ExcelExportButton";
+import {
+  fmtBytes,
+  fmtTod,
+  formatTime,
+  fmtGapDur,
+  fmtShiftH,
+  dtLocalToTs,
+  catShort,
+  labelFor,
+} from "../components/asterix/format";
+import {
+  StatCard,
+  Section,
+  LabeledBars,
+  TimeDensityChart,
+  AzimuthRose,
+} from "../components/asterix/shared";
 import type {
   AsterixStats,
   AsterixFrameSummary,
   AsterixQueryResult,
   AsterixFilter,
-  LabeledCount,
-  TimeDensity,
 } from "../types/asterix";
-import type { Aircraft } from "../types";
+import type { AsterixStatTopic, TzMode } from "../types/asterixDetail";
 
-type TzMode = "UTC" | "KST";
 type InnerTab = "dashboard" | "frames";
-const KST_OFFSET_SECS = 9 * 3600;
-
-// ─── 포맷 유틸 ───────────────────────────────────────
-
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  const u = ["KB", "MB", "GB", "TB"];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v < 10 ? 2 : 1)} ${u[i]}`;
-}
-
-const pad = (n: number) => String(n).padStart(2, "0");
-
-function fmtTod(s: number | null): string {
-  if (s == null) return "—";
-  const x = ((s % 86400) + 86400) % 86400;
-  return `${pad(Math.floor(x / 3600))}:${pad(Math.floor((x % 3600) / 60))}:${pad(Math.floor(x % 60))}`;
-}
-
-function formatTime(ts: number, tz: TzMode): string {
-  const d = new Date((ts + (tz === "KST" ? KST_OFFSET_SECS : 0)) * 1000);
-  const yy = String(d.getUTCFullYear()).slice(2);
-  return `${yy}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
-}
-
-/** 수집 공백 길이 — 1시간 이상이면 `1h 23m`, 그 미만이면 `n분` */
-function fmtGapDur(secs: number): string {
-  const m = Math.round(secs / 60);
-  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}분`;
-}
-
-/** I140 TOD→UTC 보정량(시간) 표기 — 부호 명시(U+2212), 소수부는 필요할 때만 */
-function fmtShiftH(h: number): string {
-  const a = Math.abs(h);
-  return `${h < 0 ? "−" : "+"}${Number.isInteger(a) ? String(a) : a.toFixed(1)}h`;
-}
-
-function dtLocalToTs(s: string, tz: TzMode): number | null {
-  if (!s) return null;
-  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
-  if (!m) return null;
-  const utcMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
-  return (utcMs - (tz === "KST" ? KST_OFFSET_SECS * 1000 : 0)) / 1000;
-}
-
-const CAT_SHORT: Record<number, string> = { 0x30: "048", 0x22: "034", 0x08: "008" };
-const catShort = (cat: number) => CAT_SHORT[cat] ?? cat.toString(16).padStart(2, "0");
-
-function labelFor(modeS: string, aircraft: Aircraft[]): string {
-  const a = aircraft.find((ac) => ac.mode_s_code?.toUpperCase() === modeS.toUpperCase());
-  const name = a?.name || a?.registration;
-  return name ? `${name} (${modeS})` : modeS;
-}
 
 // ─── 업로드/스캔 훅 ──────────────────────────────────
 
@@ -142,397 +98,17 @@ function useAsterixScan() {
   return { pickFiles, scanning, progress, notice, closeNotice: () => setNotice(null) };
 }
 
-// ─── 대시보드 보조 컴포넌트 ──────────────────────────
-
-function StatCard({
-  label,
-  value,
-  sub,
-  onClick,
-  title,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-  onClick?: () => void;
-  title?: string;
-}) {
-  const body = (
-    <>
-      <div className="text-[10px] uppercase tracking-wider text-gray-400">{label}</div>
-      <div className="mt-0.5 text-lg font-semibold tabular-nums text-gray-800">{value}</div>
-      {/* sub 줄은 값이 없어도 빈 줄로 항상 렌더 — 요약 카드 8장 높이 통일 */}
-      <div className="text-[10px] text-gray-400">{sub ?? " "}</div>
-    </>
-  );
-  const base = "rounded-lg border border-gray-200 bg-[#f8f9fa] px-3 py-2";
-  // onClick 있으면 버튼화 (외형은 동일, 호버 강조만 추가)
-  if (onClick) {
-    return (
-      <button
-        type="button"
-        onClick={onClick}
-        title={title}
-        className={`${base} w-full cursor-pointer text-left transition-colors hover:border-[#a60739]/40`}
-      >
-        {body}
-      </button>
-    );
-  }
-  return (
-    <div className={base} title={title}>
-      {body}
-    </div>
-  );
-}
-
-/** Section 본문 고정 높이 티어 — 같은 그리드 행의 카드는 동일 티어를 써서 높이를 맞춘다 */
-type SectionSize = "sm" | "md" | "lg";
-const SECTION_BODY_H: Record<SectionSize, string> = { sm: "h-28", md: "h-48", lg: "h-72" };
-/** 위 Tailwind 클래스의 픽셀값 (차트 높이 계산용 — 클래스와 반드시 동기 유지) */
-const SECTION_BODY_PX: Record<SectionSize, number> = { sm: 112, md: 192, lg: 288 };
-
-function Section({
-  title,
-  children,
-  right,
-  size,
-  scroll = true,
-}: {
-  title: string;
-  children: React.ReactNode;
-  right?: React.ReactNode;
-  /** 지정 시 본문을 고정 높이 박스로 감싼다 (미지정=자연 높이, 전폭 카드용) */
-  size?: SectionSize;
-  /** 본문 세로 스크롤. 차트 카드는 ChartTip(카드 밖 절대배치)이 잘리므로 false */
-  scroll?: boolean;
-}) {
-  return (
-    <div className="rounded-lg border border-gray-200 bg-white p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <h3 className="text-[12px] font-semibold text-gray-700">{title}</h3>
-        {right}
-      </div>
-      {size ? (
-        <div className={`${SECTION_BODY_H[size]} ${scroll ? "overflow-y-auto pr-1" : ""}`}>{children}</div>
-      ) : (
-        children
-      )}
-    </div>
-  );
-}
-
-function BarRow({
-  label,
-  sub,
-  count,
-  total,
-  color = "#a60739",
-  labelWidth = "w-44",
-}: {
-  label: string;
-  sub?: string;
-  count: number;
-  total: number;
-  color?: string;
-  /** 라벨 컬럼 폭 클래스 — 수치 구간 라벨은 좁게(w-28) 잡아 막대를 길게 */
-  labelWidth?: string;
-}) {
-  const pct = total > 0 ? (count / total) * 100 : 0;
-  return (
-    <div className="flex items-center gap-2 py-0.5 text-[11px]">
-      <div className={`${labelWidth} shrink-0 truncate text-gray-700`} title={label}>
-        {label}
-        {sub && <span className="ml-1 text-gray-400">{sub}</span>}
-      </div>
-      <div className="relative h-3.5 flex-1 overflow-hidden rounded bg-gray-100">
-        <div className="absolute inset-y-0 left-0 rounded" style={{ width: `${pct}%`, background: color, opacity: 0.85 }} />
-      </div>
-      <div className="w-28 shrink-0 text-right tabular-nums text-gray-600">
-        {count.toLocaleString()} <span className="text-gray-400">{pct >= 0.1 ? `${pct.toFixed(1)}%` : ""}</span>
-      </div>
-    </div>
-  );
-}
-
-function LabeledBars({
-  items,
-  total,
-  color,
-  labelWidth,
-}: {
-  items: LabeledCount[];
-  total: number;
-  color?: string;
-  labelWidth?: string;
-}) {
-  if (items.length === 0) return <div className="text-[11px] text-gray-400">없음</div>;
-  return (
-    <div>
-      {items.map((it) => (
-        <BarRow key={it.key} label={it.label} count={it.count} total={total} color={color} labelWidth={labelWidth} />
-      ))}
-    </div>
-  );
-}
-
-// ─── 차트 (순수 SVG, 단일 시리즈 · 단일 색상) ────────
-
-const CHART_INK = "#a60739";
-
-/** 툴팁이 차트 밖으로 크게 튀지 않도록 x 위치를 컨테이너 안쪽으로 당김 */
-function clampTipX(x: number, width: number): number {
-  if (width <= 120) return x;
-  return Math.min(Math.max(x, 55), width - 55);
-}
-
-/** 차트 공용 호버 툴팁 — 컨테이너(relative) 기준 절대 배치 */
-function ChartTip({ x, text }: { x: number; text: string }) {
-  return (
-    <div
-      className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded bg-gray-900/90 px-1.5 py-0.5 text-[10px] text-white shadow-sm"
-      style={{ left: x }}
-    >
-      {text}
-    </div>
-  );
-}
-
-/**
- * 시간대별 레코드 밀도 — 버킷 스텝 실루엣.
- * 0 카운트 구간은 기준선까지 떨어져 수집 공백이 그대로 보인다.
- */
-function TimeDensityChart({ density, tz }: { density: TimeDensity; tz: TzMode }) {
-  const { start_ts, bucket_secs, counts } = density;
-  const n = counts.length;
-  const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
-
-  const H = 56; // 그래프 본체 높이 (viewBox 단위 = px)
-  const maxCount = useMemo(() => counts.reduce((a, b) => (b > a ? b : a), 0), [counts]);
-
-  // 스텝 경로 (상단선) + 기준선까지 닫은 면적 경로
-  const { line, area } = useMemo(() => {
-    const scale = maxCount > 0 ? (H - 2) / maxCount : 0;
-    let d = "";
-    for (let i = 0; i < n; i++) {
-      const y = (H - counts[i] * scale).toFixed(2);
-      d += `${i === 0 ? "M" : " L"}${i} ${y} L${i + 1} ${y}`;
-    }
-    return { line: d, area: n > 0 ? `${d} L${n} ${H} L0 ${H} Z` : "" };
-  }, [counts, n, maxCount]);
-
-  // x축 눈금 3~5개 (스팬 하루 미만이면 HH:MM, 이상이면 MM-DD HH:MM)
-  const spanSecs = n * bucket_secs;
-  const withDate = spanSecs >= 86400;
-  const ticks = useMemo(() => {
-    const k = Math.min(5, Math.max(2, n));
-    return Array.from({ length: k }, (_, i) => {
-      const frac = k === 1 ? 0 : i / (k - 1);
-      const ts = start_ts + frac * spanSecs;
-      const full = formatTime(ts, tz);
-      return { frac, label: withDate ? full.slice(3, 14) : full.slice(9, 14) };
-    });
-  }, [n, start_ts, spanSecs, withDate, tz]);
-
-  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const frac = (e.clientX - rect.left) / rect.width;
-    const idx = Math.min(n - 1, Math.max(0, Math.floor(frac * n)));
-    setHover({ idx, x: clampTipX(((idx + 0.5) / n) * rect.width, rect.width) });
-  };
-
-  const tipText = (() => {
-    if (!hover) return "";
-    const s = start_ts + hover.idx * bucket_secs;
-    const e = s + bucket_secs;
-    const head = withDate ? formatTime(s, tz).slice(3, 14) : formatTime(s, tz).slice(9, 14);
-    const tail = formatTime(e, tz).slice(9, 14);
-    return `${head}~${tail} · ${counts[hover.idx].toLocaleString()}건`;
-  })();
-
-  if (n === 0) return null;
-
-  return (
-    <div className="mt-2">
-      <div className="mb-0.5 flex items-baseline justify-between">
-        <span className="text-[10px] uppercase tracking-wider text-gray-400">시간대별 레코드 밀도</span>
-        <span className="text-[10px] text-gray-400">
-          분해능 {(bucket_secs / 60).toLocaleString()}분 · 최대 {maxCount.toLocaleString()}건/버킷
-        </span>
-      </div>
-      <div className="relative">
-        {hover && <ChartTip x={hover.x} text={tipText} />}
-        <svg
-          viewBox={`0 0 ${n} ${H}`}
-          preserveAspectRatio="none"
-          className="block w-full"
-          style={{ height: H }}
-          onPointerMove={onMove}
-          onPointerLeave={() => setHover(null)}
-        >
-          <path d={area} fill={CHART_INK} opacity={0.15} />
-          <path
-            d={line}
-            fill="none"
-            stroke={CHART_INK}
-            strokeWidth={1.5}
-            strokeLinejoin="round"
-            vectorEffect="non-scaling-stroke"
-          />
-          {hover && (
-            <line
-              x1={hover.idx + 0.5}
-              x2={hover.idx + 0.5}
-              y1={0}
-              y2={H}
-              stroke={CHART_INK}
-              strokeWidth={1}
-              opacity={0.45}
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
-        </svg>
-        <div className="h-px w-full bg-gray-200" />
-        <div className="relative mt-0.5 h-3">
-          {ticks.map((t, i) => (
-            <span
-              key={i}
-              className="absolute top-0 whitespace-nowrap text-[9px] tabular-nums text-gray-400"
-              style={{
-                left: `${t.frac * 100}%`,
-                transform: i === 0 ? "none" : i === ticks.length - 1 ? "translateX(-100%)" : "translateX(-50%)",
-              }}
-            >
-              {t.label}
-            </span>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/** 로즈 차트 정사각 변 — lg 티어 본문 높이에 맞춰 원이 카드를 꽉 채운다 */
-const AZ_ROSE_S = SECTION_BODY_PX.lg;
-/** 축 라벨이 들어갈 바깥 여백 */
-const AZ_ROSE_PAD = 16;
-/** 섹터 사이를 갈라 보이게 하는 양쪽 인셋 각 */
-const AZ_WEDGE_INSET_DEG = 0.6;
-
-/**
- * 방위 분포 — 10° 섹터 36개 PPI 로즈 (0° = 북, 시계방향).
- * 반경은 카운트에 선형 비례(풍배도 관례)라 면적이 아닌 길이로 읽는다.
- * 카운트 0인 섹터는 웨지를 생략해 블랭킹·차폐 섹터가 빈 방향으로 드러난다.
- */
-function AzimuthRose({ bins }: { bins: number[] }) {
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
-  const total = useMemo(() => bins.reduce((a, b) => a + b, 0), [bins]);
-  const maxV = useMemo(() => bins.reduce((a, b) => (b > a ? b : a), 0), [bins]);
-
-  const S = AZ_ROSE_S;
-  const c0 = S / 2;
-  const R = c0 - AZ_ROSE_PAD;
-
-  /** 나침반 좌표 → 화면 좌표 (0°=위, 시계방향) */
-  const pt = (deg: number, r: number) => {
-    const a = (deg * Math.PI) / 180;
-    return [c0 + r * Math.sin(a), c0 - r * Math.cos(a)] as const;
-  };
-  /** 중심에서 뻗는 부채꼴 — 각이 증가하는 방향이 화면상 시계방향이라 sweep=1 */
-  const wedge = (deg0: number, deg1: number, r: number) => {
-    const [x0, y0] = pt(deg0, r);
-    const [x1, y1] = pt(deg1, r);
-    return `M${c0} ${c0} L${x0.toFixed(2)} ${y0.toFixed(2)} A${r.toFixed(2)} ${r.toFixed(2)} 0 0 1 ${x1.toFixed(2)} ${y1.toFixed(2)} Z`;
-  };
-
-  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
-    const wrap = wrapRef.current;
-    if (!wrap) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const dx = e.clientX - rect.left - rect.width / 2;
-    const dy = e.clientY - rect.top - rect.height / 2;
-    // 거리는 보지 않는다 — 짧은/빈 섹터도 집을 수 있게 히트 타깃을 사각형 전체로
-    const angle = ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
-    const idx = Math.min(35, Math.floor(angle / 10));
-    const wr = wrap.getBoundingClientRect();
-    setHover({ idx, x: clampTipX(e.clientX - wr.left, wr.width) });
-  };
-
-  const tipText = (() => {
-    if (!hover) return "";
-    const c = bins[hover.idx] ?? 0;
-    const pct = total > 0 ? (c / total) * 100 : 0;
-    return `${hover.idx * 10}°–${hover.idx * 10 + 10}° · ${c.toLocaleString()}건 (${pct.toFixed(1)}%)`;
-  })();
-
-  return (
-    <div ref={wrapRef} className="relative flex h-full items-center justify-center">
-      {hover && <ChartTip x={hover.x} text={tipText} />}
-      <svg
-        viewBox={`0 0 ${S} ${S}`}
-        className="block"
-        style={{ width: S, height: S }}
-        onPointerMove={onMove}
-        onPointerLeave={() => setHover(null)}
-      >
-        <g stroke="#e5e7eb" strokeWidth={1} fill="none">
-          {[0.25, 0.5, 0.75, 1].map((f) => (
-            <circle key={f} cx={c0} cy={c0} r={R * f} />
-          ))}
-          <line x1={c0} y1={c0 - R} x2={c0} y2={c0 + R} />
-          <line x1={c0 - R} y1={c0} x2={c0 + R} y2={c0} />
-        </g>
-
-        {hover && <path d={wedge(hover.idx * 10, hover.idx * 10 + 10, R)} fill={CHART_INK} opacity={0.08} />}
-
-        {maxV > 0 &&
-          bins.map((c, i) => {
-            if (c <= 0) return null;
-            return (
-              <path
-                key={i}
-                d={wedge(i * 10 + AZ_WEDGE_INSET_DEG, (i + 1) * 10 - AZ_WEDGE_INSET_DEG, (c / maxV) * R)}
-                fill={CHART_INK}
-                opacity={hover?.idx === i ? 1 : 0.85}
-              />
-            );
-          })}
-
-        {/* 동/서 라벨은 여백(16px)보다 넓어 viewBox 가장자리에 붙여 잘림을 막는다 */}
-        <g fontSize={9} fill="#9ca3af">
-          <text x={c0} y={c0 - R - 5} textAnchor="middle">
-            0°
-          </text>
-          <text x={S - 1} y={c0} textAnchor="end" dominantBaseline="central">
-            90°
-          </text>
-          <text x={c0} y={c0 + R + 12} textAnchor="middle">
-            180°
-          </text>
-          <text x={1} y={c0} textAnchor="start" dominantBaseline="central">
-            270°
-          </text>
-        </g>
-      </svg>
-    </div>
-  );
-}
-
 // ─── 대시보드 ────────────────────────────────────────
 
 function Dashboard({
   stats,
   tz,
-  onAcasClick,
-  onEmergencyClick,
+  onOpenTopic,
 }: {
   stats: AsterixStats;
   tz: TzMode;
-  onAcasClick?: () => void;
-  onEmergencyClick?: () => void;
+  /** 카드/섹션 드릴다운 — 통계 상세 페이지(/asterix/stats/:topic)로 이동 */
+  onOpenTopic: (topic: AsterixStatTopic) => void;
 }) {
   const recTotal = stats.record_count || 1;
   const timeRange =
@@ -750,40 +326,63 @@ function Dashboard({
         />
       </div>
 
-      {/* 요약 카드 */}
+      {/* 요약 카드 — 클릭 시 해당 토픽 상세 페이지로 드릴다운 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
-        <StatCard label="파일" value={stats.file_count.toLocaleString()} sub={fmtBytes(stats.total_bytes)} />
-        <StatCard label="프레임" value={stats.frame_count.toLocaleString()} />
-        <StatCard label="블록" value={stats.block_count.toLocaleString()} />
-        <StatCard label="레코드" value={stats.record_count.toLocaleString()} />
-        <StatCard label="Mode-S(고유)" value={stats.modes_distinct.toLocaleString()} />
+        <StatCard
+          label="파일"
+          value={stats.file_count.toLocaleString()}
+          sub={fmtBytes(stats.total_bytes)}
+          onClick={() => onOpenTopic("time")}
+          title="수집 시간·공백 상세"
+        />
+        <StatCard
+          label="프레임"
+          value={stats.frame_count.toLocaleString()}
+          onClick={() => onOpenTopic("time")}
+          title="수집 시간·공백 상세"
+        />
+        <StatCard
+          label="블록"
+          value={stats.block_count.toLocaleString()}
+          onClick={() => onOpenTopic("source")}
+          title="출처·메시지·회전주기 상세"
+        />
+        <StatCard
+          label="레코드"
+          value={stats.record_count.toLocaleString()}
+          onClick={() => onOpenTopic("source")}
+          title="출처·메시지·회전주기 상세"
+        />
+        <StatCard
+          label="Mode-S(고유)"
+          value={stats.modes_distinct.toLocaleString()}
+          onClick={() => onOpenTopic("identity")}
+          title="Mode-S 식별 상세"
+        />
         <StatCard
           label="트랙번호(고유)"
           value={stats.track_numbers_distinct.toLocaleString()}
           sub="SAC/SIC 구분"
+          onClick={() => onOpenTopic("identity")}
           title="I048/161 트랙 번호 — 레이더 로컬이므로 SAC/SIC별로 구분해 집계"
         />
         <StatCard
           label="ACAS RA"
           value={stats.acas_ra_records.toLocaleString()}
-          onClick={stats.acas_ra_records > 0 ? onAcasClick : undefined}
-          title={stats.acas_ra_records > 0 && onAcasClick ? "프레임 탐색에서 ACAS RA 프레임만 조회" : undefined}
+          onClick={() => onOpenTopic("bds")}
+          title="BDS 레지스터·ACAS 상세"
         />
         <StatCard
           label="비상코드"
           value={stats.emergency_records.toLocaleString()}
           sub={emergencySub}
-          onClick={stats.emergency_records > 0 ? onEmergencyClick : undefined}
-          title={
-            stats.emergency_records > 0 && onEmergencyClick
-              ? "프레임 탐색에서 비상코드(7500/7600/7700) 프레임만 조회"
-              : "I048/070 Mode-3/A 비상코드 7500(하이재킹)/7600(통신두절)/7700(비상)"
-          }
+          onClick={() => onOpenTopic("mode3a")}
+          title="I048/070 Mode-3/A 비상코드 7500(하이재킹)/7600(통신두절)/7700(비상)"
         />
       </div>
 
       {/* 시간/날짜 */}
-      <Section title="수집 범위">
+      <Section title="수집 범위" onOpen={() => onOpenTopic("time")}>
         <div className="grid grid-cols-1 gap-1 text-[11px] text-gray-700 md:grid-cols-2">
           <div>
             <span className="text-gray-400">시각 범위 </span>
@@ -845,7 +444,7 @@ function Dashboard({
       {/* 2열 그리드 — 같은 행에 오는 두 카드는 동일 size 티어로 높이를 맞춘다 */}
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
         {/* 1행 (sm) — 카테고리 분포 */}
-        <Section title="카테고리 분포" size="sm">
+        <Section title="카테고리 분포" size="sm" onOpen={() => onOpenTopic("source")}>
           <table className="w-full text-[11px]">
             <thead>
               <tr className="text-gray-500">
@@ -867,7 +466,7 @@ function Dashboard({
         </Section>
 
         {/* 1행 (sm) — SAC/SIC */}
-        <Section title="데이터 출처 (SAC/SIC)" size="sm">
+        <Section title="데이터 출처 (SAC/SIC)" size="sm" onOpen={() => onOpenTopic("source")}>
           <LabeledBars
             items={stats.sac_sic_counts.map((s) => ({ key: `${s.sac}/${s.sic}`, label: `SAC ${s.sac} · SIC ${s.sic}`, count: s.count }))}
             total={recTotal}
@@ -876,12 +475,12 @@ function Dashboard({
         </Section>
 
         {/* 2행 (md) — 레이더 탐지 유형 (I020) */}
-        <Section title="레이더 탐지 유형 (I048/020 TYP)" size="md">
+        <Section title="레이더 탐지 유형 (I048/020 TYP)" size="md" onOpen={() => onOpenTopic("source")}>
           <LabeledBars items={stats.radar_typ_counts} total={recTotal} />
         </Section>
 
         {/* 2행 (md) — 메시지 유형 034/008 */}
-        <Section title="서비스/기상 메시지 유형 (CAT034 · CAT008)" size="md">
+        <Section title="서비스/기상 메시지 유형 (CAT034 · CAT008)" size="md" onOpen={() => onOpenTopic("source")}>
           <div className="space-y-2">
             <div>
               <div className="mb-0.5 text-[10px] uppercase tracking-wider text-gray-400">CAT034</div>
@@ -895,12 +494,12 @@ function Dashboard({
         </Section>
 
         {/* 3행 (lg) — 거리 분포 (I040 ρ) · 분모는 I040 보유 레코드 */}
-        <Section title="거리 분포 (I048/040 ρ)" size="lg">
+        <Section title="거리 분포 (I048/040 ρ)" size="lg" onOpen={() => onOpenTopic("traffic")}>
           <LabeledBars items={stats.range_hist} total={rangeTotal} labelWidth="w-28" />
         </Section>
 
         {/* 3행 (lg) — 방위 분포 (I040 θ) · 차트 툴팁 잘림 방지로 스크롤 off */}
-        <Section title="방위 분포 (I048/040 θ)" size="lg" scroll={false}>
+        <Section title="방위 분포 (I048/040 θ)" size="lg" scroll={false} onOpen={() => onOpenTopic("traffic")}>
           {stats.azimuth_hist.length === 0 ? (
             <div className="text-[11px] text-gray-400">없음</div>
           ) : (
@@ -909,12 +508,12 @@ function Dashboard({
         </Section>
 
         {/* 4행 (lg) — 고도 분포 (I090) · 분모는 I090 보유 레코드 */}
-        <Section title="고도 분포 (I048/090)" size="lg">
+        <Section title="고도 분포 (I048/090)" size="lg" onOpen={() => onOpenTopic("altspeed")}>
           <LabeledBars items={stats.fl_hist} total={flTotal} labelWidth="w-28" />
         </Section>
 
         {/* 4행 (lg) — 속도 분포 (I200) · 분모는 I200 보유 레코드 */}
-        <Section title="속도 분포 (I048/200)" size="lg" scroll={false}>
+        <Section title="속도 분포 (I048/200)" size="lg" scroll={false} onOpen={() => onOpenTopic("altspeed")}>
           {/* 이상치 각주를 하단 고정하려 body 스크롤은 리스트에만 건다 */}
           <div className="flex h-full flex-col">
             <div className="min-h-0 flex-1 overflow-y-auto pr-1">
@@ -931,23 +530,24 @@ function Dashboard({
         <Section
           title="Mode-3/A 코드 상위 (I048/070)"
           size="lg"
+          onOpen={() => onOpenTopic("mode3a")}
           right={<span className="text-[10px] text-gray-400">고유 {stats.mode3a_distinct.toLocaleString()}개</span>}
         >
           <LabeledBars items={stats.mode3a_top} total={stats.mode3a_records} color="#0369a1" />
         </Section>
 
         {/* 5행 (lg) — Mode-S Top */}
-        <Section title={`Mode-S 상위 (고유 ${stats.modes_distinct.toLocaleString()}개)`} size="lg">
+        <Section title={`Mode-S 상위 (고유 ${stats.modes_distinct.toLocaleString()}개)`} size="lg" onOpen={() => onOpenTopic("identity")}>
           <LabeledBars items={modesTopItems} total={recTotal} color="#0f766e" />
         </Section>
 
         {/* 6행 (lg) — BDS 레지스터 분포 (I250) · 분모는 MB 블록 총수 */}
-        <Section title="BDS 레지스터 (I048/250)" size="lg">
+        <Section title="BDS 레지스터 (I048/250)" size="lg" onOpen={() => onOpenTopic("bds")}>
           <LabeledBars items={stats.bds_reg_counts} total={bdsTotal} color="#7c3aed" />
         </Section>
 
         {/* 6행 (lg) — CAT048 데이터 항목 출현 빈도 */}
-        <Section title="CAT048 데이터 항목 출현 (전체 레코드 대비)" size="lg">
+        <Section title="CAT048 데이터 항목 출현 (전체 레코드 대비)" size="lg" onOpen={() => onOpenTopic("source")}>
           <LabeledBars
             items={stats.cat048_frn_counts.map((f) => ({ key: f.id, label: `${f.id}  ${f.name}`, count: f.count }))}
             total={recTotal}
@@ -957,7 +557,7 @@ function Dashboard({
       </div>
 
       {/* 안테나 회전주기 (CAT034 North marker 간격) */}
-      <Section title="안테나 회전주기 (CAT034)">
+      <Section title="안테나 회전주기 (CAT034)" onOpen={() => onOpenTopic("source")}>
         {stats.rotation_stats.length === 0 ? (
           <div className="text-[11px] text-gray-400">없음</div>
         ) : (
@@ -1017,7 +617,7 @@ function Dashboard({
       </Section>
 
       {/* 품질/파싱 지표 */}
-      <Section title="파싱 품질 지표">
+      <Section title="파싱 품질 지표" onOpen={() => onOpenTopic("quality")}>
         <div className="grid grid-cols-2 gap-2 text-[11px] md:grid-cols-4">
           <div><span className="text-gray-400">스킵 바이트 </span><span className="tabular-nums text-gray-700">{stats.skipped_bytes.toLocaleString()}</span></div>
           <div><span className="text-gray-400">파싱 오류 </span><span className="tabular-nums text-gray-700">{stats.parse_errors.toLocaleString()}</span></div>
@@ -1030,7 +630,7 @@ function Dashboard({
       </Section>
 
       {/* 파일별 */}
-      <Section title="파일별 요약">
+      <Section title="파일별 요약" onOpen={() => onOpenTopic("time")}>
         <div className="max-h-64 overflow-auto rounded border border-gray-100">
           <table className="w-full text-[11px]">
             <thead>
@@ -1552,9 +1152,6 @@ export default function AsterixAnalysis() {
   // 라우트 파라미터 → 내부 탭 (기본값: 프레임 탐색)
   const tab: InnerTab = tabParam === "stats" ? "dashboard" : "frames";
   const [tz, setTz] = useState<TzMode>("KST");
-  // 대시보드 ACAS RA / 비상코드 카드 → 프레임 탐색 점프 신호
-  const [acasSignal, setAcasSignal] = useState(0);
-  const [emergencySignal, setEmergencySignal] = useState(0);
 
   return (
     <div className="flex h-full flex-col bg-white">
@@ -1595,26 +1192,17 @@ export default function AsterixAnalysis() {
         /* 탭 전환은 사이드바 하위 항목(/asterix/stats · /asterix/frames)이 담당 */
         <div className="mt-3 min-h-0 flex-1 overflow-auto">
           {tab === "dashboard" ? (
-            <Dashboard
-              stats={stats}
-              tz={tz}
-              onAcasClick={() => {
-                navigate("/asterix/frames");
-                setAcasSignal((s) => s + 1);
-              }}
-              onEmergencyClick={() => {
-                navigate("/asterix/frames");
-                setEmergencySignal((s) => s + 1);
-              }}
-            />
+            <Dashboard stats={stats} tz={tz} onOpenTopic={(topic) => navigate(`/asterix/stats/${topic}`)} />
           ) : (
+            /* ACAS/비상코드 카드는 상세 페이지로 이동하도록 바뀌었지만, 프레임 탐색의
+               점프 처리 경로(acasSignal/emergencySignal)는 추후 재사용을 위해 남겨둔다 */
             <FrameBrowser
               tz={tz}
               setTz={setTz}
-              acasSignal={acasSignal}
-              onAcasHandled={() => setAcasSignal(0)}
-              emergencySignal={emergencySignal}
-              onEmergencyHandled={() => setEmergencySignal(0)}
+              acasSignal={0}
+              onAcasHandled={() => {}}
+              emergencySignal={0}
+              onEmergencyHandled={() => {}}
             />
           )}
         </div>
