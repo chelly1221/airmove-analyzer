@@ -161,7 +161,8 @@ function StatCard({
     <>
       <div className="text-[10px] uppercase tracking-wider text-gray-400">{label}</div>
       <div className="mt-0.5 text-lg font-semibold tabular-nums text-gray-800">{value}</div>
-      {sub && <div className="text-[10px] text-gray-400">{sub}</div>}
+      {/* sub 줄은 값이 없어도 빈 줄로 항상 렌더 — 요약 카드 8장 높이 통일 */}
+      <div className="text-[10px] text-gray-400">{sub ?? " "}</div>
     </>
   );
   const base = "rounded-lg border border-gray-200 bg-[#f8f9fa] px-3 py-2";
@@ -185,23 +186,62 @@ function StatCard({
   );
 }
 
-function Section({ title, children, right }: { title: string; children: React.ReactNode; right?: React.ReactNode }) {
+/** Section 본문 고정 높이 티어 — 같은 그리드 행의 카드는 동일 티어를 써서 높이를 맞춘다 */
+type SectionSize = "sm" | "md" | "lg";
+const SECTION_BODY_H: Record<SectionSize, string> = { sm: "h-28", md: "h-48", lg: "h-72" };
+/** 위 Tailwind 클래스의 픽셀값 (차트 높이 계산용 — 클래스와 반드시 동기 유지) */
+const SECTION_BODY_PX: Record<SectionSize, number> = { sm: 112, md: 192, lg: 288 };
+
+function Section({
+  title,
+  children,
+  right,
+  size,
+  scroll = true,
+}: {
+  title: string;
+  children: React.ReactNode;
+  right?: React.ReactNode;
+  /** 지정 시 본문을 고정 높이 박스로 감싼다 (미지정=자연 높이, 전폭 카드용) */
+  size?: SectionSize;
+  /** 본문 세로 스크롤. 차트 카드는 ChartTip(카드 밖 절대배치)이 잘리므로 false */
+  scroll?: boolean;
+}) {
   return (
     <div className="rounded-lg border border-gray-200 bg-white p-3">
       <div className="mb-2 flex items-center justify-between">
         <h3 className="text-[12px] font-semibold text-gray-700">{title}</h3>
         {right}
       </div>
-      {children}
+      {size ? (
+        <div className={`${SECTION_BODY_H[size]} ${scroll ? "overflow-y-auto pr-1" : ""}`}>{children}</div>
+      ) : (
+        children
+      )}
     </div>
   );
 }
 
-function BarRow({ label, sub, count, total, color = "#a60739" }: { label: string; sub?: string; count: number; total: number; color?: string }) {
+function BarRow({
+  label,
+  sub,
+  count,
+  total,
+  color = "#a60739",
+  labelWidth = "w-44",
+}: {
+  label: string;
+  sub?: string;
+  count: number;
+  total: number;
+  color?: string;
+  /** 라벨 컬럼 폭 클래스 — 수치 구간 라벨은 좁게(w-28) 잡아 막대를 길게 */
+  labelWidth?: string;
+}) {
   const pct = total > 0 ? (count / total) * 100 : 0;
   return (
     <div className="flex items-center gap-2 py-0.5 text-[11px]">
-      <div className="w-44 shrink-0 truncate text-gray-700" title={label}>
+      <div className={`${labelWidth} shrink-0 truncate text-gray-700`} title={label}>
         {label}
         {sub && <span className="ml-1 text-gray-400">{sub}</span>}
       </div>
@@ -215,12 +255,22 @@ function BarRow({ label, sub, count, total, color = "#a60739" }: { label: string
   );
 }
 
-function LabeledBars({ items, total, color }: { items: LabeledCount[]; total: number; color?: string }) {
+function LabeledBars({
+  items,
+  total,
+  color,
+  labelWidth,
+}: {
+  items: LabeledCount[];
+  total: number;
+  color?: string;
+  labelWidth?: string;
+}) {
   if (items.length === 0) return <div className="text-[11px] text-gray-400">없음</div>;
   return (
     <div>
       {items.map((it) => (
-        <BarRow key={it.key} label={it.label} count={it.count} total={total} color={color} />
+        <BarRow key={it.key} label={it.label} count={it.count} total={total} color={color} labelWidth={labelWidth} />
       ))}
     </div>
   );
@@ -363,13 +413,18 @@ function TimeDensityChart({ density, tz }: { density: TimeDensity; tz: TzMode })
   );
 }
 
+/** 막대 아래 축 부속 높이 — 구분선 1px + mt-0.5(2px) + 라벨 h-3(12px) */
+const AZ_AXIS_PX = 15;
+/** lg 티어 본문을 정확히 채우는 막대 영역 높이 (막대 + 축 = 본문 높이) */
+const AZ_CHART_H = SECTION_BODY_PX.lg - AZ_AXIS_PX;
+
 /** 방위 분포 — 10° 섹터 36개 세로 막대 (0° = 북) */
-function AzimuthHistogram({ bins }: { bins: number[] }) {
+function AzimuthHistogram({ bins, height = AZ_CHART_H }: { bins: number[]; height?: number }) {
   const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
   const total = useMemo(() => bins.reduce((a, b) => a + b, 0), [bins]);
   const maxV = useMemo(() => bins.reduce((a, b) => (b > a ? b : a), 0), [bins]);
 
-  const H = 88; // 막대 영역 높이
+  const H = height; // 막대 영역 높이
   const SLOT = 10; // viewBox 슬롯 폭 (막대 8 + 간격 2)
 
   const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -753,9 +808,10 @@ function Dashboard({
         )}
       </Section>
 
+      {/* 2열 그리드 — 같은 행에 오는 두 카드는 동일 size 티어로 높이를 맞춘다 */}
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-        {/* 카테고리 분포 */}
-        <Section title="카테고리 분포">
+        {/* 1행 (sm) — 카테고리 분포 */}
+        <Section title="카테고리 분포" size="sm">
           <table className="w-full text-[11px]">
             <thead>
               <tr className="text-gray-500">
@@ -776,91 +832,22 @@ function Dashboard({
           </table>
         </Section>
 
-        {/* 레이더 탐지 유형 (I020) */}
-        <Section title="레이더 탐지 유형 (I048/020 TYP)">
-          <LabeledBars items={stats.radar_typ_counts} total={recTotal} />
-        </Section>
-
-        {/* 거리 분포 (I040 ρ) — 분모는 I040 보유 레코드 */}
-        <Section title="거리 분포 (I048/040 ρ)">
-          <LabeledBars items={stats.range_hist} total={rangeTotal} />
-        </Section>
-
-        {/* 방위 분포 (I040 θ) */}
-        <Section title="방위 분포 (I048/040 θ)">
-          {stats.azimuth_hist.length === 0 ? (
-            <div className="text-[11px] text-gray-400">없음</div>
-          ) : (
-            <AzimuthHistogram bins={stats.azimuth_hist} />
-          )}
-        </Section>
-
-        {/* 고도 분포 (I090) — 분모는 I090 보유 레코드 */}
-        <Section title="고도 분포 (I048/090)">
-          <div className="max-h-72 overflow-auto">
-            <LabeledBars items={stats.fl_hist} total={flTotal} />
-          </div>
-        </Section>
-
-        {/* 속도 분포 (I200) — 분모는 I200 보유 레코드 */}
-        <Section title="속도 분포 (I048/200)">
-          <LabeledBars items={stats.speed_hist} total={speedTotal} color="#0f766e" />
-          <div className="mt-1 text-[10px] text-gray-400">
-            정지 미만(&lt;10kt) {stats.speed_low_records.toLocaleString()}건 · 600kt 초과{" "}
-            {stats.speed_high_records.toLocaleString()}건
-          </div>
-        </Section>
-
-        {/* Mode-3/A 코드 상위 (I070) — 분모는 유효 Mode-3/A 보유 레코드 */}
-        <Section
-          title="Mode-3/A 코드 상위 (I048/070)"
-          right={<span className="text-[10px] text-gray-400">고유 {stats.mode3a_distinct.toLocaleString()}개</span>}
-        >
-          <div className="max-h-72 overflow-auto">
-            <LabeledBars items={stats.mode3a_top} total={stats.mode3a_records} color="#0369a1" />
-          </div>
-        </Section>
-
-        {/* BDS 레지스터 분포 (I250) — 분모는 MB 블록 총수 */}
-        <Section title="BDS 레지스터 (I048/250)">
-          <LabeledBars items={stats.bds_reg_counts} total={bdsTotal} color="#7c3aed" />
-        </Section>
-
-        {/* CAT048 데이터 항목 출현 빈도 */}
-        <Section title="CAT048 데이터 항목 출현 (전체 레코드 대비)">
+        {/* 1행 (sm) — SAC/SIC */}
+        <Section title="데이터 출처 (SAC/SIC)" size="sm">
           <LabeledBars
-            items={stats.cat048_frn_counts.map((f) => ({ key: f.id, label: `${f.id}  ${f.name}`, count: f.count }))}
+            items={stats.sac_sic_counts.map((s) => ({ key: `${s.sac}/${s.sic}`, label: `SAC ${s.sac} · SIC ${s.sic}`, count: s.count }))}
             total={recTotal}
-            color="#1e6fa6"
+            color="#b45309"
           />
         </Section>
 
-        {/* Mode-S Top */}
-        <Section title={`Mode-S 상위 (고유 ${stats.modes_distinct.toLocaleString()}개)`}>
-          {stats.modes_top.length === 0 ? (
-            <div className="text-[11px] text-gray-400">없음</div>
-          ) : (
-            <div className="max-h-72 overflow-auto">
-              <LabeledBars items={modesTopItems} total={recTotal} color="#0f766e" />
-            </div>
-          )}
+        {/* 2행 (md) — 레이더 탐지 유형 (I020) */}
+        <Section title="레이더 탐지 유형 (I048/020 TYP)" size="md">
+          <LabeledBars items={stats.radar_typ_counts} total={recTotal} />
         </Section>
 
-        {/* SAC/SIC */}
-        <Section title="데이터 출처 (SAC/SIC)">
-          {stats.sac_sic_counts.length === 0 ? (
-            <div className="text-[11px] text-gray-400">없음</div>
-          ) : (
-            <LabeledBars
-              items={stats.sac_sic_counts.map((s) => ({ key: `${s.sac}/${s.sic}`, label: `SAC ${s.sac} · SIC ${s.sic}`, count: s.count }))}
-              total={recTotal}
-              color="#b45309"
-            />
-          )}
-        </Section>
-
-        {/* 메시지 유형 034/008 */}
-        <Section title="서비스/기상 메시지 유형 (CAT034 · CAT008)">
+        {/* 2행 (md) — 메시지 유형 034/008 */}
+        <Section title="서비스/기상 메시지 유형 (CAT034 · CAT008)" size="md">
           <div className="space-y-2">
             <div>
               <div className="mb-0.5 text-[10px] uppercase tracking-wider text-gray-400">CAT034</div>
@@ -871,6 +858,67 @@ function Dashboard({
               <LabeledBars items={stats.msg_type_008} total={stats.msg_type_008.reduce((a, b) => a + b.count, 0) || 1} color="#7c3aed" />
             </div>
           </div>
+        </Section>
+
+        {/* 3행 (lg) — 거리 분포 (I040 ρ) · 분모는 I040 보유 레코드 */}
+        <Section title="거리 분포 (I048/040 ρ)" size="lg">
+          <LabeledBars items={stats.range_hist} total={rangeTotal} labelWidth="w-28" />
+        </Section>
+
+        {/* 3행 (lg) — 방위 분포 (I040 θ) · 차트 툴팁 잘림 방지로 스크롤 off */}
+        <Section title="방위 분포 (I048/040 θ)" size="lg" scroll={false}>
+          {stats.azimuth_hist.length === 0 ? (
+            <div className="text-[11px] text-gray-400">없음</div>
+          ) : (
+            <AzimuthHistogram bins={stats.azimuth_hist} />
+          )}
+        </Section>
+
+        {/* 4행 (lg) — 고도 분포 (I090) · 분모는 I090 보유 레코드 */}
+        <Section title="고도 분포 (I048/090)" size="lg">
+          <LabeledBars items={stats.fl_hist} total={flTotal} labelWidth="w-28" />
+        </Section>
+
+        {/* 4행 (lg) — 속도 분포 (I200) · 분모는 I200 보유 레코드 */}
+        <Section title="속도 분포 (I048/200)" size="lg" scroll={false}>
+          {/* 이상치 각주를 하단 고정하려 body 스크롤은 리스트에만 건다 */}
+          <div className="flex h-full flex-col">
+            <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+              <LabeledBars items={stats.speed_hist} total={speedTotal} color="#0f766e" labelWidth="w-28" />
+            </div>
+            <div className="mt-1 shrink-0 text-[10px] text-gray-400">
+              정지 미만(&lt;10kt) {stats.speed_low_records.toLocaleString()}건 · 600kt 초과{" "}
+              {stats.speed_high_records.toLocaleString()}건
+            </div>
+          </div>
+        </Section>
+
+        {/* 5행 (lg) — Mode-3/A 코드 상위 (I070) · 분모는 유효 Mode-3/A 보유 레코드 */}
+        <Section
+          title="Mode-3/A 코드 상위 (I048/070)"
+          size="lg"
+          right={<span className="text-[10px] text-gray-400">고유 {stats.mode3a_distinct.toLocaleString()}개</span>}
+        >
+          <LabeledBars items={stats.mode3a_top} total={stats.mode3a_records} color="#0369a1" />
+        </Section>
+
+        {/* 5행 (lg) — Mode-S Top */}
+        <Section title={`Mode-S 상위 (고유 ${stats.modes_distinct.toLocaleString()}개)`} size="lg">
+          <LabeledBars items={modesTopItems} total={recTotal} color="#0f766e" />
+        </Section>
+
+        {/* 6행 (lg) — BDS 레지스터 분포 (I250) · 분모는 MB 블록 총수 */}
+        <Section title="BDS 레지스터 (I048/250)" size="lg">
+          <LabeledBars items={stats.bds_reg_counts} total={bdsTotal} color="#7c3aed" />
+        </Section>
+
+        {/* 6행 (lg) — CAT048 데이터 항목 출현 빈도 */}
+        <Section title="CAT048 데이터 항목 출현 (전체 레코드 대비)" size="lg">
+          <LabeledBars
+            items={stats.cat048_frn_counts.map((f) => ({ key: f.id, label: `${f.id}  ${f.name}`, count: f.count }))}
+            total={recTotal}
+            color="#1e6fa6"
+          />
         </Section>
       </div>
 
@@ -936,7 +984,7 @@ function Dashboard({
 
       {/* 품질/파싱 지표 */}
       <Section title="파싱 품질 지표">
-        <div className="grid grid-cols-2 gap-2 text-[11px] md:grid-cols-3">
+        <div className="grid grid-cols-2 gap-2 text-[11px] md:grid-cols-4">
           <div><span className="text-gray-400">스킵 바이트 </span><span className="tabular-nums text-gray-700">{stats.skipped_bytes.toLocaleString()}</span></div>
           <div><span className="text-gray-400">파싱 오류 </span><span className="tabular-nums text-gray-700">{stats.parse_errors.toLocaleString()}</span></div>
           <div><span className="text-gray-400">절단 레코드 </span><span className="tabular-nums text-gray-700">{stats.truncated_records.toLocaleString()}</span></div>
