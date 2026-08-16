@@ -23,11 +23,21 @@ import Modal from "../common/Modal";
 import { useAppStore } from "../../store";
 import type { PageId } from "../../types";
 
+// 중첩 하위 항목 (예: ASTERIX → 통계 / 프레임 탐색)
+interface NavChild {
+  id: string;
+  label: string;
+  path: string;
+  /** 부모 클릭 시 이동할 기본 하위 항목 */
+  default?: boolean;
+}
+
 interface NavItem {
   id: PageId;
   label: string;
   icon: LucideIcon;
   path: string;
+  children?: NavChild[];
 }
 
 interface NavEntry {
@@ -60,7 +70,13 @@ const navSections: NavSection[] = [
     items: [
       { id: "obstacle", label: "장애물 스카이라인", icon: Eye, path: "/obstacle" },
       { id: "acas", label: "ACAS", icon: ShieldAlert, path: "/acas" },
-      { id: "asterix", label: "ASTERIX", icon: Binary, path: "/asterix" },
+      {
+        id: "asterix", label: "ASTERIX", icon: Binary, path: "/asterix",
+        children: [
+          { id: "asterix-stats", label: "통계", path: "/asterix/stats" },
+          { id: "asterix-frames", label: "프레임 탐색", path: "/asterix/frames", default: true },
+        ],
+      },
       { id: "dualtarget", label: "이중표적", icon: Ghost, path: "/dualtarget" },
       { id: "report", label: "보고서", icon: FileText, path: "/report" },
     ],
@@ -393,14 +409,30 @@ export default function Sidebar() {
       }
       return;
     }
+    // 하위 항목이 있으면 기본 하위 항목으로 이동
+    if (item.children && item.children.length > 0) {
+      const target = item.children.find((c) => c.default) ?? item.children[0];
+      setActivePage(item.id);
+      navigate(target.path);
+      return;
+    }
     setActivePage(item.id);
     navigate(item.path);
+  };
+
+  const handleNavChild = (item: NavItem, child: NavChild) => {
+    setActivePage(item.id);
+    navigate(child.path);
   };
 
   const isActive = (item: NavItem) => {
     if (item.path === "/") return location.pathname === "/";
     return location.pathname.startsWith(item.path);
   };
+
+  // 하위 항목 활성 판정 — 파라미터 없는 부모 경로(/asterix)는 기본 하위 항목을 활성으로 간주
+  const isChildActive = (item: NavItem, child: NavChild) =>
+    location.pathname === child.path || (!!child.default && location.pathname === item.path);
 
   // 현재 페이지에 따른 하단 패널
   const isReportPage = location.pathname === "/report";
@@ -446,23 +478,50 @@ export default function Sidebar() {
                 <div className="space-y-0.5">
                   {section.items.map((item) => {
                     const active = isActive(item);
+                    // 아코디언: 하위 항목은 해당 섹션이 활성일 때만 펼침 (사이드바 폭 w-48)
+                    const children = item.children;
+                    const showChildren = !!children && location.pathname.startsWith(item.path);
                     return (
-                      <button
-                        key={item.id}
-                        data-tour={`nav-${item.id}`}
-                        onClick={() => handleNav(item)}
-                        className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${
-                          active
-                            ? "bg-[#a60739] text-white shadow-sm"
-                            : "text-gray-500 hover:bg-gray-100 hover:text-gray-900"
-                        }`}
-                      >
-                        <item.icon size={16} className="shrink-0" />
-                        <span className="whitespace-nowrap">{item.label}</span>
-                        {(item.id === "map" || item.id === "drawing") && (
-                          <ExternalLink size={12} className="ml-auto shrink-0 opacity-40" />
+                      <div key={item.id}>
+                        <button
+                          data-tour={`nav-${item.id}`}
+                          onClick={() => handleNav(item)}
+                          className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${
+                            active
+                              ? "bg-[#a60739] text-white shadow-sm"
+                              : "text-gray-500 hover:bg-gray-100 hover:text-gray-900"
+                          }`}
+                        >
+                          <item.icon size={16} className="shrink-0" />
+                          <span className="whitespace-nowrap">{item.label}</span>
+                          {(item.id === "map" || item.id === "drawing") && (
+                            <ExternalLink size={12} className="ml-auto shrink-0 opacity-40" />
+                          )}
+                        </button>
+
+                        {/* 하위 항목 — 부모 아이콘 중심선(px-3 + 아이콘 16/2 = 20px)에 트리 라인 */}
+                        {showChildren && children && (
+                          <div className="ml-[20px] mt-0.5 border-l border-gray-200">
+                            {children.map((child) => {
+                              const childActive = isChildActive(item, child);
+                              return (
+                                <button
+                                  key={child.id}
+                                  data-tour={`nav-${child.id}`}
+                                  onClick={() => handleNavChild(item, child)}
+                                  className={`flex w-full items-center rounded-r-lg py-1.5 pl-4 pr-3 text-left text-[12px] transition-colors ${
+                                    childActive
+                                      ? "text-[#a60739] font-semibold"
+                                      : "text-gray-500 hover:bg-gray-50 hover:text-gray-900"
+                                  }`}
+                                >
+                                  <span className="whitespace-nowrap">{child.label}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
                         )}
-                      </button>
+                      </div>
                     );
                   })}
                 </div>

@@ -11,6 +11,7 @@ import {
   FileText,
   ShieldAlert,
 } from "lucide-react";
+import { useNavigate, useParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -1170,7 +1171,10 @@ export default function AsterixAnalysis() {
   const stats = useAppStore((s) => s.asterixStats);
   const { pickFiles, scanning, progress, notice, closeNotice } = useAsterixScan();
 
-  const [tab, setTab] = useState<InnerTab>("dashboard");
+  const { tab: tabParam } = useParams();
+  const navigate = useNavigate();
+  // 라우트 파라미터 → 내부 탭 (기본값: 프레임 탐색)
+  const tab: InnerTab = tabParam === "stats" ? "dashboard" : "frames";
   const [tz, setTz] = useState<TzMode>("KST");
   // 대시보드 ACAS RA 카드 → 프레임 탐색 점프 신호
   const [acasSignal, setAcasSignal] = useState(0);
@@ -1211,37 +1215,21 @@ export default function AsterixAnalysis() {
           </button>
         </div>
       ) : (
-        <>
-          <div className="flex items-center gap-1 border-b border-gray-200">
-            <button
-              onClick={() => setTab("dashboard")}
-              className={`px-4 py-2 text-[12px] font-medium border-b-2 -mb-px ${tab === "dashboard" ? "border-[#a60739] text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"}`}
-            >
-              통계
-            </button>
-            <button
-              onClick={() => setTab("frames")}
-              className={`px-4 py-2 text-[12px] font-medium border-b-2 -mb-px ${tab === "frames" ? "border-[#a60739] text-[#a60739]" : "border-transparent text-gray-500 hover:text-gray-700"}`}
-            >
-              프레임 탐색
-            </button>
-          </div>
-
-          <div className="mt-3 min-h-0 flex-1 overflow-auto">
-            {tab === "dashboard" ? (
-              <Dashboard
-                stats={stats}
-                tz={tz}
-                onAcasClick={() => {
-                  setTab("frames");
-                  setAcasSignal((s) => s + 1);
-                }}
-              />
-            ) : (
-              <FrameBrowser tz={tz} setTz={setTz} acasSignal={acasSignal} onAcasHandled={() => setAcasSignal(0)} />
-            )}
-          </div>
-        </>
+        /* 탭 전환은 사이드바 하위 항목(/asterix/stats · /asterix/frames)이 담당 */
+        <div className="mt-3 min-h-0 flex-1 overflow-auto">
+          {tab === "dashboard" ? (
+            <Dashboard
+              stats={stats}
+              tz={tz}
+              onAcasClick={() => {
+                navigate("/asterix/frames");
+                setAcasSignal((s) => s + 1);
+              }}
+            />
+          ) : (
+            <FrameBrowser tz={tz} setTz={setTz} acasSignal={acasSignal} onAcasHandled={() => setAcasSignal(0)} />
+          )}
+        </div>
       )}
 
       {notice && (

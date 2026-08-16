@@ -238,7 +238,8 @@ export default function App() {
                 <Route path="/map" element={null} />
                 <Route path="/obstacle" element={<PageWrapper><LoSObstacle /></PageWrapper>} />
                 <Route path="/acas" element={<PageWrapper><AcasAnalysis /></PageWrapper>} />
-                <Route path="/asterix" element={<PageWrapper><AsterixAnalysis /></PageWrapper>} />
+                {/* 옵셔널 탭 파라미터(stats/frames) — 단일 라우트 유지(탭 전환 시 리마운트 방지) */}
+                <Route path="/asterix/:tab?" element={<PageWrapper><AsterixAnalysis /></PageWrapper>} />
                 <Route path="/dualtarget" element={<PageWrapper><DualTargetAnalysis /></PageWrapper>} />
                 <Route path="/report" element={<PageWrapper><ReportGeneration /></PageWrapper>} />
                 <Route path="/settings" element={<PageWrapper><Settings /></PageWrapper>} />
