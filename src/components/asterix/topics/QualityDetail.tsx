@@ -9,10 +9,22 @@
  *   sim_records / cat_counts[].records / files[].records
  */
 
+import { useMemo, useState } from "react";
 import { Section, StatCard } from "../shared";
+import {
+  compareSortVal,
+  SortTh,
+  TopicExcelExport,
+  type ExportSheet,
+  type SortDir,
+  type SortState,
+} from "../detailUi";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
 import { catShort, fmtBytes, formatTime } from "../format";
 import { CAT_LABEL } from "../../common/FrameInspector";
-import type { AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
+import type { AsterixFileStat } from "../../../types/asterix";
+import type { AsterixDetailFilter, AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
 
 // ─── 로컬 유틸 ───────────────────────────────────────
 
@@ -26,11 +38,73 @@ function pctStr(n: number, d: number): string {
   return `${p.toFixed(p >= 10 ? 1 : 2)}%`;
 }
 
+/** 프레임당 레코드 — 프레임이 0이면 null (표·시트 모두 결측 처리) */
+const recPerFrame = (f: AsterixFileStat): number | null => (f.frames > 0 ? f.records / f.frames : null);
+
+// ─── 파일별 구조 표 정렬 ─────────────────────────────
+
+type SortKey = "name" | "bytes" | "frames" | "records" | "rpf";
+
+/** 컬럼을 처음 눌렀을 때의 방향 — 수치는 큰 값 우선, 파일명은 오름차순 */
+const DEFAULT_DIR: Record<SortKey, SortDir> = {
+  name: "asc",
+  bytes: "desc",
+  frames: "desc",
+  records: "desc",
+  rpf: "desc",
+};
+
+/** 정렬 키 → 비교값 (결측은 null → 방향과 무관하게 항상 뒤로) */
+function sortVal(f: AsterixFileStat, k: SortKey): number | string | null {
+  switch (k) {
+    case "name":
+      return f.filename;
+    case "bytes":
+      return f.bytes;
+    case "frames":
+      return f.frames;
+    case "records":
+      return f.records;
+    case "rpf":
+      return recPerFrame(f);
+  }
+}
+
+/** 공용 SortTh 에 이 표의 컬럼별 기본 정렬 방향을 주입한 래퍼 */
+function Th({
+  label,
+  k,
+  sort,
+  setSort,
+  align,
+  title,
+}: {
+  label: string;
+  k: SortKey;
+  sort: SortState<SortKey>;
+  setSort: React.Dispatch<React.SetStateAction<SortState<SortKey>>>;
+  align?: "left" | "right";
+  title?: string;
+}) {
+  return (
+    <SortTh label={label} k={k} sort={sort} setSort={setSort} defaultDir={DEFAULT_DIR[k]} align={align} title={title} />
+  );
+}
+
 // ─── 본문 ────────────────────────────────────────────
 
-export default function QualityDetail({ detail, tz }: { detail: AsterixDetailStats; tz: TzMode }) {
+export default function QualityDetail({
+  detail,
+  tz,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  tz: TzMode;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { stats, unfiltered_records } = detail;
   const rec = stats.record_count;
+  const [sort, setSort] = useState<SortState<SortKey>>({ key: "name", dir: "asc" });
 
   /** 품질 지표 카드 — 앞 2장은 구조 지표, 나머지 5장은 필터 적용 레코드 플래그 */
   const cards: { key: string; label: string; value: string; sub: string; title: string }[] = [
@@ -88,13 +162,89 @@ export default function QualityDetail({ detail, tz }: { detail: AsterixDetailSta
   const catBlockTotal = stats.cat_counts.reduce((a, c) => a + c.blocks, 0);
   const catRecordTotal = stats.cat_counts.reduce((a, c) => a + c.records, 0);
 
+  // 정렬 — 원본(스캔 순서) 훼손 금지라 항상 복사본을 정렬
+  const fileRows = useMemo(() => {
+    const arr = stats.files.slice();
+    arr.sort((a, b) => {
+      // 결측(null)은 방향과 무관하게 항상 뒤로 — compareSortVal 공통 규칙
+      const c = compareSortVal(sortVal(a, sort.key), sortVal(b, sort.key), sort.dir);
+      return c !== 0 ? c : a.filename.localeCompare(b.filename);
+    });
+    return arr;
+  }, [stats.files, sort]);
+
+  /** Excel — 카테고리별 블록·레코드 + 파일별 구조 */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    const sheets: ExportSheet[] = [];
+
+    if (stats.cat_counts.length > 0) {
+      const rows: Cell[][] = [L.detail.catQualityHeader];
+      for (const c of stats.cat_counts) {
+        rows.push([
+          L.catLabel(c.cat),
+          c.blocks,
+          c.records,
+          c.blocks > 0 ? Number((c.records / c.blocks).toFixed(3)) : "",
+          catRecordTotal > 0 ? Number(((c.records / catRecordTotal) * 100).toFixed(3)) : "",
+        ]);
+      }
+      sheets.push({ name: L.detail.sheet.catQuality, rows });
+    }
+
+    if (fileRows.length > 0) {
+      const rows: Cell[][] = [L.detail.fileStructHeader(tz)];
+      for (const f of fileRows) {
+        const rpf = recPerFrame(f);
+        rows.push([
+          f.filename,
+          f.bytes,
+          f.frames,
+          f.records,
+          rpf != null ? Number(rpf.toFixed(3)) : "",
+          f.time_min != null ? formatTime(f.time_min, tz) : "",
+          f.time_max != null ? formatTime(f.time_max, tz) : "",
+        ]);
+      }
+      sheets.push({ name: L.detail.sheet.fileStruct, rows });
+    }
+    return sheets;
+  };
+
   return (
     <div className="space-y-3">
-      {/* 품질 지표 카드 */}
+      <TopicExcelExport
+        topic="quality"
+        build={buildSheets}
+        title="카테고리별 블록·레코드와 파일별 구조를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+      />
+
+      {/* 품질 지표 카드 — SIM 카드만 퀵필터(포함/제외) 진입점 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
-        {cards.map((c) => (
-          <StatCard key={c.key} label={c.label} value={c.value} sub={c.sub} title={c.title} />
-        ))}
+        {cards.map((c) =>
+          c.key === "sim" ? (
+            // "SIM 제외" 버튼은 StatCard(버튼) 바깥 형제로 둔다 — 버튼 중첩은 잘못된 DOM
+            <div key={c.key} className="relative">
+              <StatCard
+                label={c.label}
+                value={c.value}
+                sub={c.sub}
+                onClick={() => onQuickFilter({ sim: true })}
+                title={`${c.title} — 클릭하면 SIM 표적만으로 전수 재집계`}
+              />
+              <button
+                type="button"
+                onClick={() => onQuickFilter({ sim: false })}
+                title="SIM 표적을 제외한 레코드만으로 전수 재집계"
+                className="absolute right-1.5 top-1.5 rounded border border-gray-200 bg-white px-1 py-0.5 text-[9px] font-medium text-gray-500 transition-colors hover:border-[#a60739]/40 hover:bg-[#a60739]/5 hover:text-[#a60739]"
+              >
+                SIM 제외
+              </button>
+            </div>
+          ) : (
+            <StatCard key={c.key} label={c.label} value={c.value} sub={c.sub} title={c.title} />
+          ),
+        )}
       </div>
 
       {/* 지표 성격 안내 — 구조 지표와 레코드 플래그 지표의 분모가 다르다 */}
@@ -175,17 +325,28 @@ export default function QualityDetail({ detail, tz }: { detail: AsterixDetailSta
           <div className="max-h-[28rem] overflow-auto rounded border border-gray-100">
             <table className="w-full text-[11px]">
               <thead>
-                <tr className="sticky top-0 bg-gray-50 text-gray-500">
-                  <th className="px-2 py-1 text-left font-medium">파일</th>
-                  <th className="px-2 py-1 text-right font-medium">용량</th>
-                  <th className="px-2 py-1 text-right font-medium">프레임</th>
-                  <th className="px-2 py-1 text-right font-medium">레코드(필터)</th>
-                  <th className="px-2 py-1 text-left font-medium">시각 범위 ({tz})</th>
+                <tr>
+                  <Th label="파일" k="name" sort={sort} setSort={setSort} />
+                  <Th label="용량" k="bytes" align="right" sort={sort} setSort={setSort} />
+                  <Th label="프레임" k="frames" align="right" sort={sort} setSort={setSort} />
+                  <Th label="레코드(필터)" k="records" align="right" sort={sort} setSort={setSort} />
+                  <Th
+                    label="프레임당 레코드"
+                    k="rpf"
+                    align="right"
+                    sort={sort}
+                    setSort={setSort}
+                    title="레코드(필터) ÷ 프레임 — 필터가 걸리면 낮아진다. 파일 간 편차가 크면 수집 이상 신호"
+                  />
+                  <th className="sticky top-0 z-10 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-left font-medium text-gray-600">
+                    시각 범위 ({tz})
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {stats.files.map((f, i) => {
+                {fileRows.map((f, i) => {
                   const empty = f.records === 0;
+                  const rpf = recPerFrame(f);
                   return (
                     <tr key={`${f.filename}:${i}`} className={`border-t border-gray-100${empty ? " bg-amber-50/40" : ""}`}>
                       <td className="px-2 py-1 text-gray-700" title={empty ? "필터 통과 레코드 없음" : undefined}>
@@ -195,6 +356,9 @@ export default function QualityDetail({ detail, tz }: { detail: AsterixDetailSta
                       <td className="px-2 py-1 text-right tabular-nums text-gray-600">{f.frames.toLocaleString()}</td>
                       <td className={`px-2 py-1 text-right tabular-nums ${empty ? "text-amber-700" : "text-gray-600"}`}>
                         {f.records.toLocaleString()}
+                      </td>
+                      <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                        {rpf != null ? rpf.toFixed(2) : "—"}
                       </td>
                       <td className="px-2 py-1 text-left font-mono text-gray-600">
                         {f.time_min != null && f.time_max != null

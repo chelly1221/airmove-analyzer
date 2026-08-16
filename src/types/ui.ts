@@ -11,6 +11,5 @@ export type PageId =
   | "settings"
   | "aircraft"
   | "obstacle"
-  | "acas"
   | "asterix"
   | "dualtarget";

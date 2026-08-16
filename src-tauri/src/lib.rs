@@ -37,7 +37,7 @@ struct TrackPointsChunkRef<'a> {
     file_path: &'a str,
     points: &'a [TrackPoint],
     /// 파싱 요청 태그(호출자 생성 고유값) — 이벤트는 요청 창에만 배달되지만(emit_to), 창 라벨로는
-    /// 같은 창의 다른 페이지(/dualtarget ↔ /acas)·잔존 파싱의 청크를 구분할 수 없다.
+    /// 같은 창의 다른 페이지(예: /dualtarget)·잔존 파싱의 청크를 구분할 수 없다.
     /// 리스너는 반드시 자기 태그와 엄격 일치로 필터할 것(신규 리스너 포함 — 이중 방어).
     request_tag: &'a str,
 }
@@ -502,6 +502,80 @@ async fn scan_asterix_detail(
             );
         })?;
         bulk::write_json(&app_handle, &result)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// "ASTERIX 통계 상세 — BDS·ACAS" 토픽: 스캔된 ASS 파일셋에서 TCAS/ACAS 보고만 전수 추출.
+///
+/// **의도적 설계** — 더 가벼운 전용 스캐너를 새로 쓰지 않고 `parse_ass_file` 을 그대로 재사용한다.
+/// 시각 추정(I140 부재 시 직전 유효 시각 승계)과 프레임 귀속(raw_frame = NEC 프레임 전문)이
+/// 기존 ACAS 페이지(전체 파싱 파이프라인)와 100% 동일해야 하기 때문이다.
+/// 별도 경량 구현을 두면 두 경로의 시각·전문이 조용히 갈라질 위험이 있다.
+///
+/// 응답은 보고마다 payload(7B) + raw_frame(프레임 전문) 원본 바이트를 실어 수 MB+ 에 달하므로
+/// 반드시 bulk:// 파일 매개 전송 — 대용량 invoke 응답 금지 규칙(bulk.rs 헤더 참조).
+#[tauri::command]
+async fn scan_asterix_tcas(
+    app_handle: tauri::AppHandle,
+    file_paths: Vec<String>,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Result<bulk::BulkRef, String> {
+    info!(
+        "Command: scan_asterix_tcas({} files, radar={},{})",
+        file_paths.len(),
+        radar_lat,
+        radar_lon
+    );
+
+    // 배치 전체에 대해 편각 1회 조회 (parse_ass_batch 와 동일 규칙 — 첫 파일 날짜 기준)
+    let mag_dec = if let Some(first) = file_paths.first() {
+        resolve_declination(&app_handle, first, radar_lat, radar_lon).await
+    } else {
+        -8.5
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let total = file_paths.len();
+        let mut reports: Vec<models::TcasReport> = Vec::new();
+
+        for (i, path) in file_paths.iter().enumerate() {
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+
+            // 파일을 **하나씩** 순차 파싱하고 TCAS 보고만 떼어낸 뒤 나머지는 즉시 해제한다.
+            // 스트리밍 원칙: 파일 간 track_points/ghost_points/weather_vectors 를 누적 금지.
+            match parser::ass::parse_ass_file(
+                path, radar_lat, radar_lon, &[], &[], &[], &[], mag_dec, |_| {},
+            ) {
+                Ok(mut parsed) => {
+                    let mut taken = std::mem::take(&mut parsed.tcas_reports);
+                    reports.append(&mut taken);
+                    // 다음 파일 파싱 전에 트랙 포인트 등 나머지 파싱 결과를 확실히 drop
+                    drop(parsed);
+                }
+                Err(e) => {
+                    // scan_asterix_batch 와 동일한 관용 — 실패 파일은 로그만 남기고 건너뛴다
+                    info!("[ASTERIX] TCAS 추출 실패 {}: {}", filename, e);
+                }
+            }
+
+            let _ = app_handle.emit(
+                "asterix-tcas-progress",
+                AsterixScanProgress {
+                    done: i + 1,
+                    total,
+                    filename,
+                },
+            );
+        }
+
+        info!("[ASTERIX] TCAS 보고 {}건 추출 완료", reports.len());
+        bulk::write_json(&app_handle, &reports)
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -3678,6 +3752,7 @@ pub fn run() {
             parse_and_analyze_batch,
             scan_asterix_batch,
             scan_asterix_detail,
+            scan_asterix_tcas,
             query_asterix_frames,
             get_aircraft_list,
             save_aircraft,

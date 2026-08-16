@@ -11,7 +11,6 @@ import FileUpload from "./pages/FileUpload";
 import Guide from "./pages/Guide";
 import TrackMap from "./pages/TrackMap";
 import LoSObstacle from "./pages/LoSObstacle";
-import AcasAnalysis from "./pages/AcasAnalysis";
 import AsterixAnalysis from "./pages/AsterixAnalysis";
 import AsterixStatDetail from "./pages/AsterixStatDetail";
 import DualTargetAnalysis from "./pages/DualTargetAnalysis";
@@ -238,7 +237,6 @@ export default function App() {
                 <Route path="/guide" element={<PageWrapper><Guide /></PageWrapper>} />
                 <Route path="/map" element={null} />
                 <Route path="/obstacle" element={<PageWrapper><LoSObstacle /></PageWrapper>} />
-                <Route path="/acas" element={<PageWrapper><AcasAnalysis /></PageWrapper>} />
                 {/* 통계 상세는 :tab? 보다 먼저 — 토픽 파라미터 1개짜리 단일 라우트(토픽 전환 시 필터 보존) */}
                 <Route path="/asterix/stats/:topic" element={<PageWrapper><AsterixStatDetail /></PageWrapper>} />
                 {/* 옵셔널 탭 파라미터(stats/frames) — 단일 라우트 유지(탭 전환 시 리마운트 방지) */}

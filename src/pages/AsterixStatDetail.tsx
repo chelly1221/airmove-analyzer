@@ -33,9 +33,42 @@ export default function AsterixStatDetail() {
   // 필터·tz 는 이 페이지가 소유 (토픽 전환 시에도 유지 — 상단 주석의 불변식)
   const [filter, setFilter] = useState<AsterixDetailFilter>({});
   const [tz, setTz] = useState<TzMode>("KST");
+  /**
+   * 실제로 "적용"되어 재집계에 반영된 필터 — 편집 중(filter)과 구분한다.
+   * 토픽 본문이 서버 재집계 결과와 같은 조건으로 프런트 필터를 걸 때 쓴다(BDS·ACAS 이벤트 상속).
+   */
+  const [appliedFilter, setAppliedFilter] = useState<AsterixDetailFilter>({});
   const { data, loading, progress, error, run } = useAsterixDetail();
 
-  const apply = useCallback(() => run(filter), [run, filter]);
+  /** run 호출과 appliedFilter 갱신을 한 곳에서 묶는다 — 둘이 갈라지지 않도록 */
+  const runWith = useCallback(
+    (f: AsterixDetailFilter) => {
+      setAppliedFilter(f);
+      run(f);
+    },
+    [run],
+  );
+
+  const apply = useCallback(() => runWith(filter), [runWith, filter]);
+
+  /**
+   * 퀵필터 — 토픽 본문의 차트/표에서 조건을 즉시 적용하고 그대로 재집계한다("적용" 누를 필요 없음).
+   *
+   * undefined 값 키는 제거한다 — DetailFilterBar 의 patch() 와 동일 규칙.
+   * useAsterixDetail 의 LRU 캐시 키가 JSON.stringify(filter) 라 키가 남아 있으면
+   * 같은 조건인데도 캐시가 어긋나 전수 재스캔이 다시 돈다.
+   */
+  const onQuickFilter = useCallback(
+    (p: Partial<AsterixDetailFilter>) => {
+      const next: AsterixDetailFilter = { ...filter, ...p };
+      for (const k of Object.keys(next) as (keyof AsterixDetailFilter)[]) {
+        if (next[k] === undefined) delete next[k];
+      }
+      setFilter(next);
+      runWith(next);
+    },
+    [filter, runWith],
+  );
 
   // 마운트 시 현재 필터로 1회 자동 실행 (캐시 히트면 재스캔 없이 즉시 반환)
   const autoRan = useRef(false);
@@ -43,7 +76,7 @@ export default function AsterixStatDetail() {
     // 잘못된 토픽(리다이렉트 예정)에서는 스캔을 걸지 않는다
     if (autoRan.current || !stats || !def) return;
     autoRan.current = true;
-    run(filter);
+    runWith(filter);
     // 최초 1회만 — filter 변경 시 재실행은 "적용" 버튼이 담당
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stats]);
@@ -102,7 +135,14 @@ export default function AsterixStatDetail() {
 
           <div className="relative mt-3 min-h-0 flex-1 overflow-auto">
             {data ? (
-              <TopicBody topic={def.id} detail={data} tz={tz} />
+              <TopicBody
+                topic={def.id}
+                detail={data}
+                tz={tz}
+                setTz={setTz}
+                appliedFilter={appliedFilter}
+                onQuickFilter={onQuickFilter}
+              />
             ) : loading ? (
               <div className="flex h-full items-center justify-center gap-2 text-sm text-gray-400">
                 <Loader2 size={16} className="animate-spin text-[#a60739]" />
@@ -135,27 +175,44 @@ function TopicBody({
   topic,
   detail,
   tz,
+  setTz,
+  appliedFilter,
+  onQuickFilter,
 }: {
   topic: (typeof ASTERIX_STAT_TOPICS)[number]["id"];
   detail: AsterixDetailStats;
   tz: TzMode;
+  /** BDS·ACAS 토픽 전용 — ACAS RA 이벤트 표의 기간 팝오버가 페이지 tz 를 그대로 바꾼다 */
+  setTz: (t: TzMode) => void;
+  /** 적용된 필터 — RA 이벤트 목록 상속(BDS) + 차트의 현재 필터 구간 하이라이트(시간/거리·방위/고도·속도) */
+  appliedFilter: AsterixDetailFilter;
+  /** 차트·표에서 조건을 즉시 적용해 재집계 (드릴다운) */
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
 }) {
   switch (topic) {
     case "time":
-      return <TimeDetail detail={detail} tz={tz} />;
+      return <TimeDetail detail={detail} tz={tz} appliedFilter={appliedFilter} onQuickFilter={onQuickFilter} />;
     case "traffic":
-      return <TrafficDetail detail={detail} tz={tz} />;
+      return <TrafficDetail detail={detail} appliedFilter={appliedFilter} onQuickFilter={onQuickFilter} />;
     case "altspeed":
-      return <AltSpeedDetail detail={detail} tz={tz} />;
+      return <AltSpeedDetail detail={detail} appliedFilter={appliedFilter} onQuickFilter={onQuickFilter} />;
     case "identity":
-      return <IdentityDetail detail={detail} tz={tz} />;
+      return <IdentityDetail detail={detail} tz={tz} onQuickFilter={onQuickFilter} />;
     case "mode3a":
-      return <Mode3aDetail detail={detail} tz={tz} />;
+      return <Mode3aDetail detail={detail} tz={tz} onQuickFilter={onQuickFilter} />;
     case "bds":
-      return <BdsDetail detail={detail} tz={tz} />;
+      return (
+        <BdsDetail
+          detail={detail}
+          tz={tz}
+          setTz={setTz}
+          appliedFilter={appliedFilter}
+          onQuickFilter={onQuickFilter}
+        />
+      );
     case "source":
-      return <SourceDetail detail={detail} tz={tz} />;
+      return <SourceDetail detail={detail} tz={tz} onQuickFilter={onQuickFilter} />;
     case "quality":
-      return <QualityDetail detail={detail} tz={tz} />;
+      return <QualityDetail detail={detail} tz={tz} onQuickFilter={onQuickFilter} />;
   }
 }

@@ -7,14 +7,26 @@
  * - ACAS RA 레코드 수(stats.acas_ra_records)는 I048/260 또는 BDS 3,0 보유 레코드 기준이라
  *   BDS 3,0 MB 블록 수와 반드시 일치하지는 않는다(I260만 있는 레코드 존재).
  *
+ * ACAS는 두 단위를 나란히 둔다 — 혼동 금지:
+ * - "ACAS RA 이벤트 분석"(AcasRaEvents): TCAS 보고를 mode_s별 10초 그룹핑한 **이벤트** 단위.
+ *   구 독립 페이지(/acas)에서 이관됐고, 자료는 scan_asterix_tcas(전수 추출) → 프런트 필터.
+ * - "ACAS RA 레코드 (필터 적용 재집계)": scan_asterix_detail 이 서버측 필터로 재집계한
+ *   **레코드** 단위. SAC/SIC 출처가 붙는 유일한 표라 그대로 유지한다.
+ *
  * 전수 렌더 — 다운샘플링 없이 스크롤 컨테이너로 처리.
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { BarRow, Section, StatCard } from "../shared";
+import { FilterChipButton, pctText, TopicExcelExport, type ExportSheet } from "../detailUi";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
 import { formatTime, labelFor } from "../format";
 import { useAppStore } from "../../../store";
-import type { AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
+import { useAsterixTcas } from "../../../hooks/useAsterixTcas";
+import AcasRaEvents, { inheritPageFilter } from "./AcasRaEvents";
+import { buildEventsFromReports } from "../../../utils/tcasEvents";
+import type { AsterixDetailFilter, AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
 import type { Aircraft } from "../../../types";
 
 /** BDS 계열 색 — 대시보드 "BDS 레지스터 (I048/250)" 카드와 동일 */
@@ -38,13 +50,6 @@ const BDS_REG_TIP: Record<string, string> = {
   "6,0": "Heading and speed report — 자기기수·IAS/Mach·상승률 (EHS)",
 };
 
-/** 점유율 표기 — 표 셀용 (0 분모 방어) */
-function pctText(count: number, total: number): string {
-  if (total <= 0) return "—";
-  const p = (count / total) * 100;
-  return p >= 0.01 ? `${p.toFixed(2)}%` : "<0.01%";
-}
-
 /**
  * labelFor 결과에서 기체명만 분리 — labelFor 는 `${name} (${modeS})` 규칙이라
  * 등록 기체가 없으면 hex 원문이 그대로 돌아온다(= 표시할 이름 없음).
@@ -55,9 +60,39 @@ function aircraftName(modeS: string, aircraft: Aircraft[]): string | null {
   return lbl === modeS ? null : lbl.slice(0, lbl.length - modeS.length - 3);
 }
 
-export default function BdsDetail({ detail, tz }: { detail: AsterixDetailStats; tz: TzMode }) {
+export default function BdsDetail({
+  detail,
+  tz,
+  setTz,
+  appliedFilter,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  tz: TzMode;
+  setTz: (t: TzMode) => void;
+  /** 페이지 상단 필터 중 "적용"된 값 — ACAS RA 이벤트 섹션이 기간·Mode-S 를 상속한다 */
+  appliedFilter: AsterixDetailFilter;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { bds_detail, acas_events, acas_events_truncated, modes_table, modes_table_truncated, stats } = detail;
   const aircraft = useAppStore((s) => s.aircraft);
+  const filePathCount = useAppStore((s) => s.asterixFilePaths.length);
+
+  // ACAS RA 이벤트 — ASTERIX 탭이 이미 스캔한 파일셋에서 TCAS 보고를 추출(별도 업로드 없음).
+  // 마운트 시 자동 실행 — 모듈 캐시가 있어 토픽 재방문은 재추출 없이 즉시 반환된다.
+  // run 의 identity 는 (파일셋·레이더 좌표)에만 의존하므로 이 effect 는 자료가 바뀔 때만 다시 돈다.
+  const tcas = useAsterixTcas();
+  const tcasRun = tcas.run;
+  useEffect(() => {
+    if (filePathCount === 0) return;
+    tcasRun();
+  }, [filePathCount, tcasRun]);
+
+  /** 섹션 제목 건수 — 컴포넌트 내부 분모와 동일 원천(inheritPageFilter) */
+  const raEventCount = useMemo(
+    () => inheritPageFilter(buildEventsFromReports(tcas.reports ?? []), appliedFilter).length,
+    [tcas.reports, appliedFilter],
+  );
 
   // 레지스터 행 — 상세(bds_detail) 우선, 없으면 대시보드 분포로 폴백(고유 Mode-S 미상)
   const regRows = useMemo(() => {
@@ -83,8 +118,51 @@ export default function BdsDetail({ detail, tz }: { detail: AsterixDetailStats; 
   /** 막대 분모 — 전체 ACAS RA 레코드 수(없으면 추린 합계) */
   const acasBarTotal = stats.acas_ra_records > 0 ? stats.acas_ra_records : acasByModeSum;
 
+  /**
+   * Excel — 레지스터 상세 + ACAS RA 레코드(서버측 재집계분).
+   * "ACAS RA 이벤트 분석" 섹션은 자체 내보내기를 갖고 있으므로 여기서 중복 포함하지 않는다.
+   */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    const sheets: ExportSheet[] = [];
+    if (regRows.length > 0) {
+      const rows: Cell[][] = [L.detail.bdsDetailHeader];
+      for (const r of regRows) {
+        // Rust 라벨은 "키 이름" 형식 — 이름만 떼어 언어 매핑에 넘긴다
+        const koName = r.label.startsWith(`${r.key} `) ? r.label.slice(r.key.length + 1) : r.label;
+        rows.push([
+          r.key,
+          L.bdsName(r.key, koName),
+          r.count,
+          mbTotal > 0 ? Number(((r.count / mbTotal) * 100).toFixed(3)) : "",
+          bds_detail.length > 0 ? r.distinct_mode_s : "",
+        ]);
+      }
+      sheets.push({ name: L.detail.sheet.bdsDetail, rows });
+    }
+    if (acas_events.length > 0) {
+      const rows: Cell[][] = [L.detail.acasRecordsHeader(tz)];
+      for (const e of acas_events) {
+        rows.push([
+          e.ts != null ? formatTime(e.ts, tz) : "",
+          e.mode_s ?? "",
+          (e.mode_s ? callsignMap.get(e.mode_s) : undefined) ?? "",
+          e.sac,
+          e.sic,
+        ]);
+      }
+      sheets.push({ name: L.detail.sheet.acasRecords, rows });
+    }
+    return sheets;
+  };
+
   return (
     <div className="space-y-3">
+      <TopicExcelExport
+        topic="bds"
+        build={buildSheets}
+        title="BDS 레지스터 상세·ACAS RA 레코드를 Excel(.xlsx)로 내보냅니다 — 언어 선택 (RA 이벤트 분석은 해당 섹션의 자체 내보내기 사용)"
+      />
       {/* 요약 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
         <StatCard
@@ -124,6 +202,26 @@ export default function BdsDetail({ detail, tz }: { detail: AsterixDetailStats; 
           title="BDS 2,0(항공기 식별) 디코드로 호출부호를 얻은 Mode-S 주소 수"
         />
       </div>
+
+      {/* ACAS RA 이벤트 분석 — 구 /acas 독립 페이지에서 이관 (mode_s별 10초 그룹핑 = 이벤트 단위) */}
+      <Section
+        title={`ACAS RA 이벤트 분석 (${raEventCount.toLocaleString()}건)`}
+        right={
+          <span className="text-[10px] text-gray-400" title="ASTERIX 탭에서 스캔한 파일을 재파싱해 TCAS 보고를 전수 추출합니다 (별도 업로드 없음)">
+            스캔 파일 {filePathCount.toLocaleString()}개 기준
+          </span>
+        }
+      >
+        <AcasRaEvents
+          reports={tcas.reports}
+          loading={tcas.loading}
+          progress={tcas.progress}
+          error={tcas.error}
+          tz={tz}
+          setTz={setTz}
+          appliedFilter={appliedFilter}
+        />
+      </Section>
 
       {/* 레지스터 상세 — 표 + 점유율 막대 병행 */}
       <Section
@@ -190,15 +288,23 @@ export default function BdsDetail({ detail, tz }: { detail: AsterixDetailStats; 
         )}
       </Section>
 
-      {/* ACAS RA 발생 이벤트 — 전수 스크롤 */}
+      {/* ACAS RA 레코드 — 위 "이벤트"와 단위가 다르다(레코드 단위 · 서버측 필터 재집계).
+          SAC/SIC 출처가 붙는 유일한 표라 이벤트 분석과 별도로 유지한다. 전수 스크롤. */}
       <Section
-        title={`ACAS RA 발생 이벤트 (${acas_events.length.toLocaleString()}건)`}
+        title={`ACAS RA 레코드 (필터 적용 재집계, ${acas_events.length.toLocaleString()}건)`}
         right={
-          acas_events_truncated ? (
-            <span className="text-[10px] text-amber-600">
-              시각순 상위 {acas_events.length.toLocaleString()}건만 표시 — 기간 필터로 좁히세요
-            </span>
-          ) : undefined
+          <div className="flex items-center gap-2">
+            {acas_events_truncated && (
+              <span className="text-[10px] text-amber-600">
+                시각순 상위 {acas_events.length.toLocaleString()}건만 표시 — 기간 필터로 좁히세요
+              </span>
+            )}
+            <FilterChipButton
+              label="ACAS 레코드만 재집계"
+              title="I048/260 ACAS RA 를 보유한 레코드만으로 전수 재집계 (상단 필터바 ACAS 칩에 반영)"
+              onClick={() => onQuickFilter({ hasAcas: true })}
+            />
+          </div>
         }
       >
         {acas_events.length === 0 ? (

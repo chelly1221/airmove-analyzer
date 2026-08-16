@@ -12,26 +12,97 @@
  * 전수 렌더 — 다운샘플링 없이 스크롤 컨테이너로 처리.
  */
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { LabeledBars, Section, StatCard } from "../shared";
+import {
+  compareSortVal,
+  FilterChipButton,
+  pctText,
+  SortTh,
+  TopicExcelExport,
+  type ExportSheet,
+  type SortDir,
+  type SortState,
+} from "../detailUi";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
 import { formatTime } from "../format";
 import { CAT_LABEL } from "../../common/FrameInspector";
-import type { AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
+import type { AsterixDetailFilter, AsterixDetailStats, SourceBreakdownRow, TzMode } from "../../../types/asterixDetail";
 
 /** 메시지 유형(CAT034/008) 계열 색 — 대시보드 "서비스/기상 메시지 유형" 카드와 동일 */
 const MSG_INK = "#7c3aed";
 /** CAT048 데이터 항목 출현 색 — 대시보드와 동일 */
 const FRN_INK = "#1e6fa6";
 
-/** 점유율 표기 — 표 셀용 (0 분모 방어) */
-function pctText(count: number, total: number): string {
-  if (total <= 0) return "—";
-  const p = (count / total) * 100;
-  return p >= 0.01 ? `${p.toFixed(2)}%` : "<0.01%";
+// ─── 출처별 분해 표 정렬 ───────────────────────────────────────────
+
+type SortKey = "src" | "records" | "cat048" | "cat034" | "cat008" | "modes" | "time";
+
+/** 컬럼을 처음 눌렀을 때의 방향 — 수치는 큰 값 우선, 식별자/시각은 오름차순 */
+const DEFAULT_DIR: Record<SortKey, SortDir> = {
+  src: "asc",
+  records: "desc",
+  cat048: "desc",
+  cat034: "desc",
+  cat008: "desc",
+  modes: "desc",
+  time: "asc",
+};
+
+/** 정렬 키 → 비교값 (결측은 null → 방향과 무관하게 항상 뒤로) */
+function sortVal(r: SourceBreakdownRow, k: SortKey): number | string | null {
+  switch (k) {
+    case "src":
+      // SAC/SIC 는 수치 정렬이 자연스러워 하나의 정수로 합친다
+      return r.sac * 256 + r.sic;
+    case "records":
+      return r.records;
+    case "cat048":
+      return r.cat048;
+    case "cat034":
+      return r.cat034;
+    case "cat008":
+      return r.cat008;
+    case "modes":
+      return r.modes_distinct;
+    case "time":
+      return r.time_min;
+  }
 }
 
-export default function SourceDetail({ detail, tz }: { detail: AsterixDetailStats; tz: TzMode }) {
+/** 공용 SortTh 에 이 표의 컬럼별 기본 정렬 방향을 주입한 래퍼 */
+function Th({
+  label,
+  k,
+  sort,
+  setSort,
+  align,
+  title,
+}: {
+  label: string;
+  k: SortKey;
+  sort: SortState<SortKey>;
+  setSort: React.Dispatch<React.SetStateAction<SortState<SortKey>>>;
+  align?: "left" | "right";
+  title?: string;
+}) {
+  return (
+    <SortTh label={label} k={k} sort={sort} setSort={setSort} defaultDir={DEFAULT_DIR[k]} align={align} title={title} />
+  );
+}
+
+export default function SourceDetail({
+  detail,
+  tz,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  tz: TzMode;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { source_breakdown, stats } = detail;
+  const [sort, setSort] = useState<SortState<SortKey>>({ key: "records", dir: "desc" });
 
   /** 카테고리별 레코드/블록 조회 (0x30 CAT048 · 0x22 CAT034 · 0x08 CAT008) */
   const catOf = useMemo(() => new Map(stats.cat_counts.map((c) => [c.cat, c])), [stats.cat_counts]);
@@ -48,8 +119,78 @@ export default function SourceDetail({ detail, tz }: { detail: AsterixDetailStat
   /** 출처 수 — 상세 분해가 비면 대시보드 SAC/SIC 집계로 폴백 */
   const sourceCount = source_breakdown.length || stats.sac_sic_counts.length;
 
+  // 정렬 — 원본(records 내림차순) 훼손 금지라 항상 복사본을 정렬
+  const srcRows = useMemo(() => {
+    const arr = source_breakdown.slice();
+    arr.sort((a, b) => {
+      // 결측(null)은 방향과 무관하게 항상 뒤로 — compareSortVal 공통 규칙
+      const c = compareSortVal(sortVal(a, sort.key), sortVal(b, sort.key), sort.dir);
+      return c !== 0 ? c : b.records - a.records || a.sac - b.sac || a.sic - b.sic;
+    });
+    return arr;
+  }, [source_breakdown, sort]);
+
+  /** Excel — 출처별 분해 · 회전주기 · 메시지 유형(034/008) */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    const sheets: ExportSheet[] = [];
+
+    if (srcRows.length > 0) {
+      const rows: Cell[][] = [L.detail.sourceHeader(tz)];
+      for (const s of srcRows) {
+        rows.push([
+          s.sac,
+          s.sic,
+          s.records,
+          srcTotal > 0 ? Number(((s.records / srcTotal) * 100).toFixed(3)) : "",
+          s.cat048,
+          s.cat034,
+          s.cat008,
+          s.modes_distinct,
+          s.time_min != null ? formatTime(s.time_min, tz) : "",
+          s.time_max != null ? formatTime(s.time_max, tz) : "",
+        ]);
+      }
+      sheets.push({ name: L.detail.sheet.sourceBreakdown, rows });
+    }
+
+    if (stats.rotation_stats.length > 0) {
+      const rows: Cell[][] = [L.rotationHeader];
+      for (const r of stats.rotation_stats) {
+        rows.push([
+          r.sac,
+          r.sic,
+          r.north_count,
+          r.interval_count,
+          Number(r.period_mean_s.toFixed(3)),
+          Number(r.period_std_s.toFixed(4)),
+          Number(r.period_min_s.toFixed(3)),
+          Number(r.period_max_s.toFixed(3)),
+          r.reported_period_s != null ? Number(r.reported_period_s.toFixed(3)) : "",
+          r.sector_msgs,
+          r.expected_sectors ?? "",
+          r.missing_sectors,
+        ]);
+      }
+      sheets.push({ name: L.sheet.rotation, rows });
+    }
+
+    if (stats.msg_type_034.length > 0 || stats.msg_type_008.length > 0) {
+      const rows: Cell[][] = [L.msgHeader];
+      for (const m of stats.msg_type_034) rows.push(["CAT034", L.msg034(m.key, m.label), m.count]);
+      for (const m of stats.msg_type_008) rows.push(["CAT008", L.msg008(m.key, m.label), m.count]);
+      sheets.push({ name: L.sheet.msgType, rows });
+    }
+    return sheets;
+  };
+
   return (
     <div className="space-y-3">
+      <TopicExcelExport
+        topic="source"
+        build={buildSheets}
+        title="출처별 분해·회전주기·메시지 유형을 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+      />
       {/* 요약 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
         <StatCard
@@ -108,30 +249,52 @@ export default function SourceDetail({ detail, tz }: { detail: AsterixDetailStat
           <div className="max-h-96 overflow-auto rounded border border-gray-100">
             <table className="w-full text-[11px]">
               <thead>
-                <tr className="sticky top-0 bg-gray-50 text-gray-500">
-                  <th className="px-2 py-1 text-left font-medium">SAC/SIC</th>
-                  <th className="px-2 py-1 text-right font-medium">레코드</th>
-                  <th className="px-2 py-1 text-right font-medium" title="출처별 레코드 합계 대비 비중">
+                <tr>
+                  {/* 선두 액션 열 — 정렬 대상이 아니라 SortTh 대신 평범한 th */}
+                  <th
+                    className="sticky top-0 z-10 w-8 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-left font-medium text-gray-600"
+                    title="이 출처(SAC/SIC)만으로 전수 재집계"
+                  >
+                    필터
+                  </th>
+                  <Th label="SAC/SIC" k="src" sort={sort} setSort={setSort} title="I010 데이터 출처 식별자" />
+                  <Th label="레코드" k="records" align="right" sort={sort} setSort={setSort} />
+                  {/* 점유율은 레코드 수와 순서가 같아 별도 정렬 키를 두지 않는다 */}
+                  <th
+                    className="sticky top-0 z-10 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-right font-medium text-gray-600"
+                    title="출처별 레코드 합계 대비 비중 (레코드 수와 정렬 순서 동일)"
+                  >
                     점유율
                   </th>
-                  <th className="px-2 py-1 text-right font-medium" title={CAT_LABEL[0x30]}>
-                    CAT048
-                  </th>
-                  <th className="px-2 py-1 text-right font-medium" title={CAT_LABEL[0x22]}>
-                    CAT034
-                  </th>
-                  <th className="px-2 py-1 text-right font-medium" title={CAT_LABEL[0x08]}>
-                    CAT008
-                  </th>
-                  <th className="px-2 py-1 text-right font-medium" title="이 출처가 보고한 고유 Mode-S 주소 수">
-                    고유 Mode-S
-                  </th>
-                  <th className="px-2 py-1 text-left font-medium">관측 기간 ({tz})</th>
+                  <Th label="CAT048" k="cat048" align="right" sort={sort} setSort={setSort} title={CAT_LABEL[0x30]} />
+                  <Th label="CAT034" k="cat034" align="right" sort={sort} setSort={setSort} title={CAT_LABEL[0x22]} />
+                  <Th label="CAT008" k="cat008" align="right" sort={sort} setSort={setSort} title={CAT_LABEL[0x08]} />
+                  <Th
+                    label="고유 Mode-S"
+                    k="modes"
+                    align="right"
+                    sort={sort}
+                    setSort={setSort}
+                    title="이 출처가 보고한 고유 Mode-S 주소 수"
+                  />
+                  <Th
+                    label={`관측 기간 (${tz})`}
+                    k="time"
+                    sort={sort}
+                    setSort={setSort}
+                    title="정렬 기준은 관측 시작 시각"
+                  />
                 </tr>
               </thead>
               <tbody>
-                {source_breakdown.map((s) => (
-                  <tr key={`${s.sac}/${s.sic}`} className="border-t border-gray-100">
+                {srcRows.map((s) => (
+                  <tr key={`${s.sac}/${s.sic}`} className="border-t border-gray-100 hover:bg-[#a60739]/5">
+                    <td className="px-2 py-1">
+                      <FilterChipButton
+                        title={`SAC ${s.sac} · SIC ${s.sic} 출처 레코드만으로 전수 재집계 (상단 필터바 출처 선택에 반영)`}
+                        onClick={() => onQuickFilter({ sac: s.sac, sic: s.sic })}
+                      />
+                    </td>
                     <td className="px-2 py-1 tabular-nums text-gray-700">
                       SAC {s.sac} · SIC {s.sic}
                     </td>
@@ -198,6 +361,12 @@ export default function SourceDetail({ detail, tz }: { detail: AsterixDetailStat
               <thead>
                 <tr className="sticky top-0 bg-gray-50 text-gray-500">
                   <th className="px-2 py-1 text-left font-medium">SAC/SIC</th>
+                  <th
+                    className="px-2 py-1 text-right font-medium"
+                    title="I034/000 유형 1(North marker) 메시지 수 — 회전수 산출의 원자료"
+                  >
+                    North
+                  </th>
                   <th className="px-2 py-1 text-right font-medium" title="North marker 간격으로 산출된 유효 회전 수">
                     회전수
                   </th>
@@ -206,6 +375,12 @@ export default function SourceDetail({ detail, tz }: { detail: AsterixDetailStat
                   <th className="px-2 py-1 text-right font-medium">최소–최대(s)</th>
                   <th className="px-2 py-1 text-right font-medium" title="I034/041 안테나 회전주기 보고값 평균">
                     보고주기(s)
+                  </th>
+                  <th
+                    className="px-2 py-1 text-right font-medium"
+                    title="I034/000 유형 2(섹터 통과) 메시지 수 — 섹터/회전 최빈값의 원자료"
+                  >
+                    섹터 메시지
                   </th>
                   <th className="px-2 py-1 text-right font-medium" title="1회전당 섹터 수 최빈값 · 누락 = Σ(최빈 섹터수 − 실제 섹터수)">
                     섹터/회전
@@ -217,6 +392,9 @@ export default function SourceDetail({ detail, tz }: { detail: AsterixDetailStat
                   <tr key={`${r.sac}/${r.sic}`} className="border-t border-gray-100">
                     <td className="px-2 py-1 tabular-nums text-gray-700">
                       SAC {r.sac} · SIC {r.sic}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                      {r.north_count.toLocaleString()}
                     </td>
                     <td className="px-2 py-1 text-right tabular-nums text-gray-600">
                       {r.interval_count.toLocaleString()}
@@ -235,6 +413,9 @@ export default function SourceDetail({ detail, tz }: { detail: AsterixDetailStat
                       title="I034/041 안테나 회전주기 보고값 평균"
                     >
                       {r.reported_period_s != null ? r.reported_period_s.toFixed(2) : "—"}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                      {r.sector_msgs.toLocaleString()}
                     </td>
                     <td className="px-2 py-1 text-right tabular-nums text-gray-600">
                       {r.expected_sectors != null ? r.expected_sectors.toLocaleString() : "—"}

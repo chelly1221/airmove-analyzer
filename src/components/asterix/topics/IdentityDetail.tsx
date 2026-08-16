@@ -7,11 +7,23 @@
  */
 
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { useAppStore } from "../../../store";
 import { Section, StatCard, LabeledBars } from "../shared";
+import {
+  compareSortVal,
+  FilterChipButton,
+  SearchInput,
+  SortTh,
+  TopicExcelExport,
+  type ExportSheet,
+  type SortDir,
+  type SortState,
+} from "../detailUi";
 import { formatTime, labelFor } from "../format";
-import type { AsterixDetailStats, ModeSDetailRow, TzMode } from "../../../types/asterixDetail";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
+import type { AsterixDetailFilter, AsterixDetailStats, ModeSDetailRow, TzMode } from "../../../types/asterixDetail";
 import type { LabeledCount } from "../../../types/asterix";
 
 /** Mode-3/A 비상코드 — 뱃지 강조 대상 */
@@ -45,7 +57,6 @@ type SortKey =
   | "acas"
   | "emg"
   | "track";
-type SortDir = "asc" | "desc";
 
 /** 컬럼을 처음 눌렀을 때의 방향 — 수치는 큰 값 우선, 문자/시각은 오름차순 */
 const DEFAULT_DIR: Record<SortKey, SortDir> = {
@@ -96,59 +107,46 @@ function sortVal(r: ModeSDetailRow, k: SortKey): number | string | null {
   }
 }
 
-type SortState = { key: SortKey; dir: SortDir };
-
-/**
- * 정렬 가능한 헤더 셀 — 컴포넌트 밖에 두어 검색어 입력마다 헤더가 재마운트되지 않게 한다.
- * 같은 컬럼 재클릭=방향 토글, 다른 컬럼=해당 컬럼 기본 방향.
- */
-function SortTh({
+/** 공용 SortTh 에 이 표의 컬럼별 기본 정렬 방향을 주입한 래퍼 (호출부에서 매번 넘기지 않게) */
+function Th({
   label,
   k,
   sort,
   setSort,
-  align = "left",
+  align,
   title,
 }: {
   label: string;
   k: SortKey;
-  sort: SortState;
-  setSort: React.Dispatch<React.SetStateAction<SortState>>;
+  sort: SortState<SortKey>;
+  setSort: React.Dispatch<React.SetStateAction<SortState<SortKey>>>;
   align?: "left" | "right";
   title?: string;
 }) {
-  const active = sort.key === k;
   return (
-    <th
-      className={`sticky top-0 z-10 whitespace-nowrap bg-gray-50 px-2 py-1.5 font-medium ${
-        align === "right" ? "text-right" : "text-left"
-      } ${active ? "text-[#a60739]" : "text-gray-600"}`}
-      title={title}
-    >
-      <button
-        type="button"
-        onClick={() =>
-          setSort((s) =>
-            s.key === k ? { key: k, dir: s.dir === "asc" ? "desc" : "asc" } : { key: k, dir: DEFAULT_DIR[k] },
-          )
-        }
-        className={`inline-flex items-center gap-0.5 transition-colors hover:text-[#a60739] ${
-          align === "right" ? "flex-row-reverse" : ""
-        }`}
-      >
-        {label}
-        {active ? sort.dir === "asc" ? <ChevronUp size={10} /> : <ChevronDown size={10} /> : <span className="w-2.5" />}
-      </button>
-    </th>
+    <SortTh label={label} k={k} sort={sort} setSort={setSort} defaultDir={DEFAULT_DIR[k]} align={align} title={title} />
   );
 }
 
-export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailStats; tz: TzMode }) {
+/** 체공시간 초 → Excel 셀용 정수 (결측은 빈 셀) */
+const durCell = (r: ModeSDetailRow): Cell =>
+  r.first_ts != null && r.last_ts != null ? Math.round(r.last_ts - r.first_ts) : "";
+
+export default function IdentityDetail({
+  detail,
+  tz,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  tz: TzMode;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { modes_table, modes_table_truncated, stats } = detail;
   const aircraft = useAppStore((s) => s.aircraft);
+  const navigate = useNavigate();
 
   const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<SortState>({ key: "count", dir: "desc" });
+  const [sort, setSort] = useState<SortState<SortKey>>({ key: "count", dir: "desc" });
 
   /** 등록 비행검사기 hex → 표시명 (검색·병기용) */
   const acName = useMemo(() => {
@@ -174,21 +172,11 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
               (acName.get(r.mode_s.toUpperCase()) ?? "").toUpperCase().includes(q),
           );
 
-    const dir = sort.dir === "asc" ? 1 : -1;
     const arr = base.slice();
     arr.sort((a, b) => {
-      const va = sortVal(a, sort.key);
-      const vb = sortVal(b, sort.key);
-      if (va == null || vb == null) {
-        // 결측 우선순위는 정렬 방향과 무관 (항상 아래로)
-        if (va != null) return -1;
-        if (vb != null) return 1;
-      } else {
-        const c =
-          typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
-        if (c !== 0) return c * dir;
-      }
-      return b.count - a.count || a.mode_s.localeCompare(b.mode_s);
+      // 결측(null)은 방향과 무관하게 항상 뒤로 — compareSortVal 공통 규칙
+      const c = compareSortVal(sortVal(a, sort.key), sortVal(b, sort.key), sort.dir);
+      return c !== 0 ? c : b.count - a.count || a.mode_s.localeCompare(b.mode_s);
     });
     return arr;
   }, [modes_table, query, sort, acName]);
@@ -204,8 +192,41 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
     });
   }, [modes_table, acName]);
 
+  /** Excel — Mode-S 상세 표 전체(화면 정렬·검색 결과를 그대로 반영) */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    if (rows.length === 0) return [];
+    const out: Cell[][] = [L.detail.modesTableHeader(tz)];
+    for (const m of rows) {
+      out.push([
+        m.mode_s,
+        m.callsign ?? "",
+        m.count,
+        m.first_ts != null ? formatTime(m.first_ts, tz) : "",
+        m.last_ts != null ? formatTime(m.last_ts, tz) : "",
+        durCell(m),
+        m.fl_min ?? "",
+        m.fl_max ?? "",
+        m.speed_mean_kts != null ? Number(m.speed_mean_kts.toFixed(1)) : "",
+        m.range_min_nm != null ? Number(m.range_min_nm.toFixed(2)) : "",
+        m.range_max_nm != null ? Number(m.range_max_nm.toFixed(2)) : "",
+        m.mode3a_codes.join(" "),
+        m.acas_count,
+        m.emergency_count,
+        m.track_numbers,
+      ]);
+    }
+    return [{ name: L.detail.sheet.modesTable, rows: out }];
+  };
+
   return (
     <div className="space-y-3">
+      <TopicExcelExport
+        topic="identity"
+        build={buildSheets}
+        title="Mode-S 주소별 상세 표(현재 검색·정렬 반영)를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+      />
+
       {/* 요약 카드 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
         <StatCard
@@ -250,26 +271,12 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                 레코드 수 상위 {modes_table.length.toLocaleString()}개만 수신 — 나머지는 필터로 좁혀 조회
               </span>
             )}
-            <div className="relative flex items-center">
-              <Search size={11} className="pointer-events-none absolute left-2 text-gray-400" />
-              <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Mode-S hex · 호출부호 · 기체명"
-                className="h-7 w-52 rounded-md border border-gray-200 bg-white pl-7 pr-6 text-[11px] placeholder-gray-400 focus:border-[#a60739] focus:outline-none"
-              />
-              {query !== "" && (
-                <button
-                  type="button"
-                  onClick={() => setQuery("")}
-                  className="absolute right-1.5 text-gray-400 transition-colors hover:text-[#a60739]"
-                  title="검색어 지우기"
-                >
-                  <X size={11} />
-                </button>
-              )}
-            </div>
+            <SearchInput
+              value={query}
+              onChange={setQuery}
+              placeholder="Mode-S hex · 호출부호 · 기체명"
+              title="표시 중인 표만 걸러냅니다 (재집계 아님)"
+            />
           </div>
         }
       >
@@ -282,12 +289,19 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
             <table className="w-full text-[11px]">
               <thead>
                 <tr>
-                  <SortTh label="Mode-S" k="mode_s" sort={sort} setSort={setSort} />
-                  <SortTh label="호출부호" k="callsign" sort={sort} setSort={setSort} title="BDS 2,0 항공기 식별" />
-                  <SortTh label="레코드" k="count" align="right" sort={sort} setSort={setSort} />
-                  <SortTh label={`최초 (${tz})`} k="first" sort={sort} setSort={setSort} />
-                  <SortTh label={`최종 (${tz})`} k="last" sort={sort} setSort={setSort} />
-                  <SortTh
+                  {/* 선두 액션 열 — 정렬 대상이 아니라 SortTh 대신 평범한 th */}
+                  <th
+                    className="sticky top-0 z-10 w-8 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-left font-medium text-gray-600"
+                    title="이 Mode-S 주소만으로 전수 재집계"
+                  >
+                    필터
+                  </th>
+                  <Th label="Mode-S" k="mode_s" sort={sort} setSort={setSort} />
+                  <Th label="호출부호" k="callsign" sort={sort} setSort={setSort} title="BDS 2,0 항공기 식별" />
+                  <Th label="레코드" k="count" align="right" sort={sort} setSort={setSort} />
+                  <Th label={`최초 (${tz})`} k="first" sort={sort} setSort={setSort} />
+                  <Th label={`최종 (${tz})`} k="last" sort={sort} setSort={setSort} />
+                  <Th
                     label="체공시간"
                     k="dur"
                     align="right"
@@ -295,7 +309,7 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                     setSort={setSort}
                     title="최종 − 최초 관측 시각"
                   />
-                  <SortTh
+                  <Th
                     label="FL 범위"
                     k="fl"
                     align="right"
@@ -303,7 +317,7 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                     setSort={setSort}
                     title="I048/090 — 정렬 기준은 최대 FL"
                   />
-                  <SortTh
+                  <Th
                     label="평균속도"
                     k="speed"
                     align="right"
@@ -311,7 +325,7 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                     setSort={setSort}
                     title="I048/200 대지속도 평균"
                   />
-                  <SortTh
+                  <Th
                     label="거리범위"
                     k="range"
                     align="right"
@@ -319,14 +333,14 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                     setSort={setSort}
                     title="I048/040 ρ — 정렬 기준은 최대 거리"
                   />
-                  <SortTh
+                  <Th
                     label="Mode-3/A"
                     k="codes"
                     sort={sort}
                     setSort={setSort}
                     title="관측된 Mode-3/A 코드 (최대 8개)"
                   />
-                  <SortTh
+                  <Th
                     label="ACAS"
                     k="acas"
                     align="right"
@@ -334,7 +348,7 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                     setSort={setSort}
                     title="I048/260 ACAS RA 보유 레코드 수"
                   />
-                  <SortTh
+                  <Th
                     label="비상"
                     k="emg"
                     align="right"
@@ -342,7 +356,7 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                     setSort={setSort}
                     title="Mode-3/A 비상코드(7500/7600/7700) 레코드 수"
                   />
-                  <SortTh
+                  <Th
                     label="트랙번호"
                     k="track"
                     align="right"
@@ -358,6 +372,12 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                   const dur = m.first_ts != null && m.last_ts != null ? m.last_ts - m.first_ts : null;
                   return (
                     <tr key={m.mode_s} className="border-t border-gray-100 hover:bg-[#a60739]/5">
+                      <td className="px-2 py-1">
+                        <FilterChipButton
+                          title={`Mode-S ${m.mode_s} 로 전수 재집계 (필터바 Mode-S 칸에 반영)`}
+                          onClick={() => onQuickFilter({ modeS: m.mode_s })}
+                        />
+                      </td>
                       <td className="whitespace-nowrap px-2 py-1" title={labelFor(m.mode_s, aircraft)}>
                         <span className="font-mono text-gray-700">{m.mode_s}</span>
                         {nm && <span className="ml-1 text-[10px] font-medium text-[#a60739]">{nm}</span>}
@@ -391,24 +411,28 @@ export default function IdentityDetail({ detail, tz }: { detail: AsterixDetailSt
                           <span className="text-gray-300">—</span>
                         ) : (
                           <span className="inline-flex flex-wrap items-center gap-0.5">
-                            {m.mode3a_codes.map((c) =>
-                              EMERGENCY_CODES.has(c) ? (
-                                <span
+                            {/* 코드 칩 클릭 = 그 코드로 재집계 + Mode-3/A 토픽으로 이동 (단일 라우트라 필터가 보존된다) */}
+                            {m.mode3a_codes.map((c) => {
+                              const emg = EMERGENCY_CODES.has(c);
+                              return (
+                                <button
                                   key={c}
-                                  title="Mode-3/A 비상코드"
-                                  className="rounded bg-[#e94560] px-1 py-px text-[9px] font-semibold tabular-nums text-white"
+                                  type="button"
+                                  onClick={() => {
+                                    onQuickFilter({ mode3a: c });
+                                    navigate("/asterix/stats/mode3a");
+                                  }}
+                                  title={`Mode-3/A ${c}${emg ? " (비상코드)" : ""} 로 재집계하고 Mode-3/A·비상 토픽으로 이동`}
+                                  className={`rounded px-1 py-px text-[9px] tabular-nums transition-opacity hover:opacity-75 ${
+                                    emg
+                                      ? "bg-[#e94560] font-semibold text-white"
+                                      : "bg-gray-100 text-gray-600 hover:bg-[#a60739]/10 hover:text-[#a60739]"
+                                  }`}
                                 >
                                   {c}
-                                </span>
-                              ) : (
-                                <span
-                                  key={c}
-                                  className="rounded bg-gray-100 px-1 py-px text-[9px] tabular-nums text-gray-600"
-                                >
-                                  {c}
-                                </span>
-                              ),
-                            )}
+                                </button>
+                              );
+                            })}
                           </span>
                         )}
                       </td>

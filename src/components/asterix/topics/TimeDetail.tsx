@@ -9,9 +9,13 @@
  */
 
 import { useMemo, useState } from "react";
-import { CHART_INK, ChartTip, Section, StatCard, TimeDensityChart, clampTipX } from "../shared";
+import { CHART_INK, ChartTip, Section, StatCard, clampTipX } from "../shared";
+import { ChartHint, FilterChipButton, TopicExcelExport, useBrush, type ExportSheet } from "../detailUi";
 import { fmtBytes, fmtGapDur, fmtShiftH, formatTime, fmtTod, pad } from "../format";
-import type { AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
+import type { TimeDensity } from "../../../types/asterix";
+import type { AsterixDetailFilter, AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
 
 // ─── 로컬 유틸 ───────────────────────────────────────
 
@@ -116,9 +120,218 @@ function HourOfDayChart({ hourly, tz }: { hourly: number[]; tz: TzMode }) {
   );
 }
 
+// ─── 시간 밀도 차트 (브러시 가능 로컬판) ────────────────────
+
+/** 그래프 본체 높이 (viewBox 단위 = px) — shared.TimeDensityChart 와 동일 */
+const DENSITY_H = 56;
+
+/**
+ * 시간대별 레코드 밀도 — 버킷 스텝 실루엣 + 드래그 브러시.
+ *
+ * shared.TimeDensityChart(동결 모듈) 를 복제해 상호작용만 얹은 로컬판이다.
+ * 드래그 확정 시 버킷 경계로 스냅한 [timeMin, timeMax) 로 전수 재집계한다.
+ * 0 카운트 구간은 기준선까지 떨어져 수집 공백이 그대로 보인다.
+ */
+function TimeDensityBrushChart({
+  density,
+  tz,
+  filterMin,
+  filterMax,
+  onQuickFilter,
+}: {
+  density: TimeDensity;
+  tz: TzMode;
+  /** 현재 적용된 기간 필터 — 차트 위에 구간 하이라이트로 표시 */
+  filterMin?: number;
+  filterMax?: number;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
+  const { start_ts, bucket_secs, counts } = density;
+  const n = counts.length;
+  const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
+
+  // 확정 = 버킷 경계 스냅 (반열린 [lo, hi) 구간을 그대로 절대시각으로 환산)
+  const brush = useBrush((lo, hi) =>
+    onQuickFilter({ timeMin: start_ts + lo * bucket_secs, timeMax: start_ts + hi * bucket_secs }),
+  );
+
+  const H = DENSITY_H;
+  const maxCount = useMemo(() => counts.reduce((a, b) => (b > a ? b : a), 0), [counts]);
+
+  // 스텝 경로 (상단선) + 기준선까지 닫은 면적 경로
+  const { line, area } = useMemo(() => {
+    const scale = maxCount > 0 ? (H - 2) / maxCount : 0;
+    let d = "";
+    for (let i = 0; i < n; i++) {
+      const y = (H - counts[i] * scale).toFixed(2);
+      d += `${i === 0 ? "M" : " L"}${i} ${y} L${i + 1} ${y}`;
+    }
+    return { line: d, area: n > 0 ? `${d} L${n} ${H} L0 ${H} Z` : "" };
+  }, [counts, n, maxCount, H]);
+
+  // x축 눈금 3~5개 (스팬 하루 미만이면 HH:MM, 이상이면 MM-DD HH:MM)
+  const spanSecs = n * bucket_secs;
+  const withDate = spanSecs >= 86400;
+  const ticks = useMemo(() => {
+    const k = Math.min(5, Math.max(2, n));
+    return Array.from({ length: k }, (_, i) => {
+      const frac = k === 1 ? 0 : i / (k - 1);
+      const ts = start_ts + frac * spanSecs;
+      const full = formatTime(ts, tz);
+      return { frac, label: withDate ? full.slice(3, 14) : full.slice(9, 14) };
+    });
+  }, [n, start_ts, spanSecs, withDate, tz]);
+
+  /** 포인터 x → 버킷 인덱스 */
+  const idxAt = (e: React.PointerEvent<SVGSVGElement>): number | null => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0 || n === 0) return null;
+    const frac = (e.clientX - rect.left) / rect.width;
+    return Math.min(n - 1, Math.max(0, Math.floor(frac * n)));
+  };
+
+  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const idx = idxAt(e);
+    if (idx == null) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    brush.move(idx);
+    setHover({ idx, x: clampTipX(((idx + 0.5) / n) * rect.width, rect.width) });
+  };
+
+  const tipText = (() => {
+    if (!hover) return "";
+    const s = start_ts + hover.idx * bucket_secs;
+    const e = s + bucket_secs;
+    const head = withDate ? formatTime(s, tz).slice(3, 14) : formatTime(s, tz).slice(9, 14);
+    const tail = formatTime(e, tz).slice(9, 14);
+    return `${head}~${tail} · ${counts[hover.idx].toLocaleString()}건`;
+  })();
+
+  /** 현재 적용된 기간 필터 → 버킷 좌표 구간 (차트 범위와 겹칠 때만) */
+  const activeSpan = useMemo(() => {
+    if (n === 0 || (filterMin == null && filterMax == null)) return null;
+    const lo = filterMin != null ? (filterMin - start_ts) / bucket_secs : 0;
+    const hi = filterMax != null ? (filterMax - start_ts) / bucket_secs : n;
+    const cl = Math.max(0, Math.min(n, lo));
+    const ch = Math.max(0, Math.min(n, hi));
+    return ch - cl > 0 ? { lo: cl, hi: ch } : null;
+  }, [filterMin, filterMax, start_ts, bucket_secs, n]);
+
+  if (n === 0) return null;
+
+  return (
+    <div className="mt-2">
+      <div className="mb-0.5 flex items-baseline justify-between">
+        <span className="text-[10px] uppercase tracking-wider text-gray-400">시간대별 레코드 밀도</span>
+        <span className="text-[10px] text-gray-400">
+          분해능 {(bucket_secs / 60).toLocaleString()}분 · 최대 {maxCount.toLocaleString()}건/버킷
+        </span>
+      </div>
+      <div className="relative">
+        {hover && <ChartTip x={hover.x} text={tipText} />}
+        <svg
+          viewBox={`0 0 ${n} ${H}`}
+          preserveAspectRatio="none"
+          className="block w-full cursor-ew-resize touch-none select-none"
+          style={{ height: H }}
+          onPointerDown={(e) => {
+            const idx = idxAt(e);
+            if (idx != null) brush.begin(idx, e);
+          }}
+          onPointerMove={onMove}
+          onPointerUp={brush.end}
+          onPointerCancel={brush.cancel}
+          onPointerLeave={() => {
+            if (!brush.dragging) setHover(null);
+          }}
+        >
+          {/* 적용된 기간 필터 구간 — 데이터 아래에 옅게 깔아 실루엣을 가리지 않는다 */}
+          {activeSpan && (
+            <rect
+              x={activeSpan.lo}
+              width={activeSpan.hi - activeSpan.lo}
+              y={0}
+              height={H}
+              fill={CHART_INK}
+              opacity={0.07}
+            />
+          )}
+          <path d={area} fill={CHART_INK} opacity={0.15} />
+          <path
+            d={line}
+            fill="none"
+            stroke={CHART_INK}
+            strokeWidth={1.5}
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
+          {/* 드래그 중 라이브 하이라이트 */}
+          {brush.span && (
+            <rect
+              x={brush.span.lo}
+              width={brush.span.hi - brush.span.lo}
+              y={0}
+              height={H}
+              fill={CHART_INK}
+              opacity={0.18}
+              stroke={CHART_INK}
+              strokeWidth={1}
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+          {hover && !brush.dragging && (
+            <line
+              x1={hover.idx + 0.5}
+              x2={hover.idx + 0.5}
+              y1={0}
+              y2={H}
+              stroke={CHART_INK}
+              strokeWidth={1}
+              opacity={0.45}
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+        <div className="h-px w-full bg-gray-200" />
+        <div className="relative mt-0.5 h-3">
+          {ticks.map((t, i) => (
+            <span
+              key={i}
+              className="absolute top-0 whitespace-nowrap text-[9px] tabular-nums text-gray-400"
+              style={{
+                left: `${t.frac * 100}%`,
+                transform: i === 0 ? "none" : i === ticks.length - 1 ? "translateX(-100%)" : "translateX(-50%)",
+              }}
+            >
+              {t.label}
+            </span>
+          ))}
+        </div>
+      </div>
+      <ChartHint
+        text={
+          activeSpan
+            ? `드래그하면 그 구간(버킷 경계 스냅)으로 전수 재집계합니다 · Esc 취소 — 음영 = 현재 적용된 기간 필터`
+            : "드래그하면 그 구간(버킷 경계 스냅)으로 전수 재집계합니다 · Esc 또는 1버킷 미만 드래그는 취소"
+        }
+      />
+    </div>
+  );
+}
+
 // ─── 본문 ────────────────────────────────────────────
 
-export default function TimeDetail({ detail, tz }: { detail: AsterixDetailStats; tz: TzMode }) {
+export default function TimeDetail({
+  detail,
+  tz,
+  appliedFilter,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  tz: TzMode;
+  appliedFilter: AsterixDetailFilter;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { stats, gaps_all, gaps_all_truncated, hourly_utc, unfiltered_records } = detail;
   const [gapSort, setGapSort] = useState<"dur" | "time">("dur");
 
@@ -142,6 +355,11 @@ export default function TimeDetail({ detail, tz }: { detail: AsterixDetailStats;
 
   // 표시된 공백의 총 시간 (truncated 이면 표시분 합계임을 카드 sub 에 명시)
   const gapTotalSecs = useMemo(() => gaps_all.reduce((a, g) => a + g.duration_secs, 0), [gaps_all]);
+  /** 최장 공백 — 카드 sub 에 합계와 나란히 표기 (한 건이 스팬을 지배하는지 바로 보이게) */
+  const gapMaxSecs = useMemo(
+    () => gaps_all.reduce((a, g) => (g.duration_secs > a ? g.duration_secs : a), 0),
+    [gaps_all],
+  );
 
   // I140 TOD→UTC 자동보정이 적용된 파일 (보정량별 묶음 — 대시보드와 동일 표기)
   const todShiftGroups = useMemo(() => {
@@ -171,8 +389,53 @@ export default function TimeDetail({ detail, tz }: { detail: AsterixDetailStats;
     return a;
   }, [gaps_all, gapSort]);
 
+  /** Excel — 수집 공백 전체 · 시간대(표시 tz 반영) · 파일별 요약 */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    const sheets: ExportSheet[] = [];
+
+    if (gapsSorted.length > 0) {
+      const rows: Cell[][] = [L.gapsHeader(tz)];
+      for (const g of gapsSorted) {
+        rows.push([formatTime(g.start_ts, tz), formatTime(g.end_ts, tz), Math.round(g.duration_secs)]);
+      }
+      sheets.push({ name: L.sheet.gaps, rows });
+    }
+
+    // 시간대는 UTC 24칸 원본을 표시 tz 로 재배열해 내보낸다(화면 차트와 동일 규칙)
+    if (hourly_utc.length > 0) {
+      const shift = tz === "KST" ? 9 : 0;
+      const rows: Cell[][] = [L.detail.hourlyHeader(tz)];
+      for (let h = 0; h < 24; h++) rows.push([h, hourly_utc[(((h - shift) % 24) + 24) % 24] ?? 0]);
+      sheets.push({ name: L.detail.sheet.hourly, rows });
+    }
+
+    if (stats.files.length > 0) {
+      const rows: Cell[][] = [L.filesHeader(tz)];
+      for (const f of stats.files) {
+        rows.push([
+          f.filename,
+          f.bytes,
+          f.frames,
+          f.records,
+          f.time_min != null ? formatTime(f.time_min, tz) : "",
+          f.time_max != null ? formatTime(f.time_max, tz) : "",
+          f.tod_shift_hours || 0,
+        ]);
+      }
+      sheets.push({ name: L.sheet.files, rows });
+    }
+    return sheets;
+  };
+
   return (
     <div className="space-y-3">
+      <TopicExcelExport
+        topic="time"
+        build={buildSheets}
+        title="수집 공백 전체·시간대·파일별 요약을 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+      />
+
       {/* 요약 카드 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
         <StatCard
@@ -198,7 +461,11 @@ export default function TimeDetail({ detail, tz }: { detail: AsterixDetailStats;
         <StatCard
           label="수집 공백"
           value={`${stats.gap_count.toLocaleString()}곳`}
-          sub={`${gaps_all_truncated ? "표시분 합 " : "총 "}${fmtGapDur(gapTotalSecs)}`}
+          sub={
+            gaps_all.length > 0
+              ? `최장 ${fmtGapDur(gapMaxSecs)} · ${gaps_all_truncated ? "표시분 합 " : "총 "}${fmtGapDur(gapTotalSecs)}`
+              : "없음"
+          }
           title={
             gaps_all_truncated
               ? `전체 ${stats.gap_count.toLocaleString()}곳 중 길이 상위 ${gaps_all.length.toLocaleString()}곳의 합계`
@@ -259,7 +526,13 @@ export default function TimeDetail({ detail, tz }: { detail: AsterixDetailStats;
           </div>
         )}
         {stats.time_density ? (
-          <TimeDensityChart density={stats.time_density} tz={tz} />
+          <TimeDensityBrushChart
+            density={stats.time_density}
+            tz={tz}
+            filterMin={appliedFilter.timeMin}
+            filterMax={appliedFilter.timeMax}
+            onQuickFilter={onQuickFilter}
+          />
         ) : (
           <div className="mt-2 text-[11px] text-gray-400">시각(abs_time) 보유 레코드 없음</div>
         )}
@@ -312,6 +585,12 @@ export default function TimeDetail({ detail, tz }: { detail: AsterixDetailStats;
               <thead>
                 <tr className="sticky top-0 bg-gray-50 text-gray-500">
                   <th className="w-10 px-2 py-1 text-right font-medium">#</th>
+                  <th
+                    className="w-8 px-2 py-1 text-left font-medium"
+                    title="공백 전후 ±10분 구간으로 재집계 — 공백 자체엔 레코드가 없으므로 경계를 관찰한다"
+                  >
+                    보기
+                  </th>
                   <th className="px-2 py-1 text-left font-medium">시작 ({tz})</th>
                   <th className="px-2 py-1 text-left font-medium">끝 ({tz})</th>
                   <th className="px-2 py-1 text-right font-medium">길이</th>
@@ -321,6 +600,17 @@ export default function TimeDetail({ detail, tz }: { detail: AsterixDetailStats;
                 {gapsSorted.map((g, i) => (
                   <tr key={`${g.start_ts}:${g.end_ts}:${i}`} className="border-t border-gray-100">
                     <td className="px-2 py-1 text-right tabular-nums text-gray-400">{i + 1}</td>
+                    <td className="px-2 py-1">
+                      {/* 공백 구간 자체는 레코드가 0건이라 그대로 재집계하면 빈 결과가 된다.
+                          앞뒤 ±10분 여유를 붙여 공백 직전/직후의 마지막·첫 레코드를 함께 본다. */}
+                      <FilterChipButton
+                        title={`이 공백 전후 ±10분(${formatTime(g.start_ts - 600, tz)} ~ ${formatTime(
+                          g.end_ts + 600,
+                          tz,
+                        )}) 구간으로 재집계`}
+                        onClick={() => onQuickFilter({ timeMin: g.start_ts - 600, timeMax: g.end_ts + 600 })}
+                      />
+                    </td>
                     <td className="px-2 py-1 font-mono text-gray-600">{formatTime(g.start_ts, tz)}</td>
                     <td className="px-2 py-1 font-mono text-gray-600">{formatTime(g.end_ts, tz)}</td>
                     <td

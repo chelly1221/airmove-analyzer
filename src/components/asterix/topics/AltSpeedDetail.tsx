@@ -11,8 +11,11 @@
 
 import { useMemo, useRef, useState } from "react";
 import { CHART_INK, ChartTip, clampTipX, LabeledBars, Section, StatCard } from "../shared";
+import { ChartHint, TopicExcelExport, useBrush, type ExportSheet } from "../detailUi";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
 import type { LabeledCount } from "../../../types/asterix";
-import type { AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
+import type { AsterixDetailFilter, AsterixDetailStats } from "../../../types/asterixDetail";
 
 // ─── 로컬 상수·유틸 ────────────────────────────────────────────────
 
@@ -91,9 +94,27 @@ function binApproxStats(lo: number, counts: number[], binWidth: number) {
  * 세로 프로파일 — y축이 고도(위가 높음), x축이 건수인 가로 막대 실루엣.
  * 레이더/항공 도메인에서 고도 분포는 세로축으로 읽는 것이 자연스럽다.
  */
-function AltProfileChart({ lo, counts }: { lo: number; counts: number[] }) {
+function AltProfileChart({
+  lo,
+  counts,
+  filterFlMin,
+  filterFlMax,
+  onQuickFilter,
+}: {
+  lo: number;
+  counts: number[];
+  /** 현재 적용된 고도 필터(FL) — 차트 위 구간 하이라이트 */
+  filterFlMin?: number;
+  filterFlMax?: number;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
+
+  // 확정 = 500ft 빈 경계 스냅 → FL 로 환산해 전달 (FL = ft/100, 500ft 빈 = 5FL)
+  const brush = useBrush((bLo, bHi) =>
+    onQuickFilter({ flMin: ((lo + bLo) * FL_BIN_FT) / 100, flMax: ((lo + bHi) * FL_BIN_FT) / 100 }),
+  );
 
   const n = counts.length;
   const maxCount = useMemo(() => counts.reduce((a, b) => (b > a ? b : a), 0), [counts]);
@@ -123,13 +144,20 @@ function AltProfileChart({ lo, counts }: { lo: number; counts: number[] }) {
     return out;
   }, [loFt, hiFt]);
 
+  /** 포인터 y → 빈 인덱스 (위가 높은 고도라 뒤집는다) */
+  const idxAt = (e: React.PointerEvent<SVGSVGElement>): number | null => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.height <= 0 || n === 0) return null;
+    const fromTop = (e.clientY - rect.top) / rect.height;
+    return Math.min(n - 1, Math.max(0, n - 1 - Math.floor(fromTop * n)));
+  };
+
   const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.height <= 0 || n === 0) return;
-    const fromTop = (e.clientY - rect.top) / rect.height;
-    const idx = Math.min(n - 1, Math.max(0, n - 1 - Math.floor(fromTop * n)));
+    const idx = idxAt(e);
+    if (idx == null) return;
+    brush.move(idx);
     const wr = wrap.getBoundingClientRect();
     setHover({ idx, x: clampTipX(e.clientX - wr.left, wr.width) });
   };
@@ -138,6 +166,15 @@ function AltProfileChart({ lo, counts }: { lo: number; counts: number[] }) {
     if (!hover) return "";
     const b = lo + hover.idx;
     return `${fmtFt(b * FL_BIN_FT)}–${fmtFt((b + 1) * FL_BIN_FT)} ft · ${counts[hover.idx].toLocaleString()}건`;
+  })();
+
+  /** 적용된 고도 필터(FL) → 빈 좌표 구간 */
+  const activeSpan = (() => {
+    if (n === 0 || (filterFlMin == null && filterFlMax == null)) return null;
+    const toIdx = (fl: number) => (fl * 100) / FL_BIN_FT - lo;
+    const a = Math.max(0, Math.min(n, filterFlMin != null ? toIdx(filterFlMin) : 0));
+    const b = Math.max(0, Math.min(n, filterFlMax != null ? toIdx(filterFlMax) : n));
+    return b - a > 0 ? { lo: a, hi: b } : null;
   })();
 
   if (n === 0) return <div className="text-[11px] text-gray-400">I048/090 관측 없음</div>;
@@ -166,11 +203,30 @@ function AltProfileChart({ lo, counts }: { lo: number; counts: number[] }) {
           <svg
             viewBox={`0 0 100 ${n}`}
             preserveAspectRatio="none"
-            className="block min-w-0 flex-1"
+            className="block min-w-0 flex-1 cursor-ns-resize touch-none select-none"
             style={{ height: ALT_CHART_H }}
+            onPointerDown={(e) => {
+              const idx = idxAt(e);
+              if (idx != null) brush.begin(idx, e);
+            }}
             onPointerMove={onMove}
-            onPointerLeave={() => setHover(null)}
+            onPointerUp={brush.end}
+            onPointerCancel={brush.cancel}
+            onPointerLeave={() => {
+              if (!brush.dragging) setHover(null);
+            }}
           >
+            {/* 적용된 고도 필터 구간 (y 는 위가 높은 고도라 n − hi 부터) */}
+            {activeSpan && (
+              <rect
+                x={0}
+                width={100}
+                y={n - activeSpan.hi}
+                height={activeSpan.hi - activeSpan.lo}
+                fill={CHART_INK}
+                opacity={0.07}
+              />
+            )}
             <g stroke="#e5e7eb" strokeWidth={1} vectorEffect="non-scaling-stroke">
               {altTicks.map((t) => (
                 <line key={t.ft} x1={0} x2={100} y1={t.frac * n} y2={t.frac * n} />
@@ -185,7 +241,20 @@ function AltProfileChart({ lo, counts }: { lo: number; counts: number[] }) {
               strokeLinejoin="round"
               vectorEffect="non-scaling-stroke"
             />
-            {hover && (
+            {brush.span && (
+              <rect
+                x={0}
+                width={100}
+                y={n - brush.span.hi}
+                height={brush.span.hi - brush.span.lo}
+                fill={CHART_INK}
+                opacity={0.18}
+                stroke={CHART_INK}
+                strokeWidth={1}
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+            {hover && !brush.dragging && (
               <line
                 x1={0}
                 x2={100}
@@ -214,6 +283,11 @@ function AltProfileChart({ lo, counts }: { lo: number; counts: number[] }) {
             </span>
           ))}
         </div>
+        <ChartHint
+          text={`세로로 드래그하면 그 고도 구간(500ft 스냅 → FL)으로 전수 재집계합니다 · Esc 또는 1빈 미만 드래그는 취소${
+            activeSpan ? " — 음영 = 현재 적용된 고도 필터" : ""
+          }`}
+        />
       </div>
     </div>
   );
@@ -221,8 +295,26 @@ function AltProfileChart({ lo, counts }: { lo: number; counts: number[] }) {
 
 // ─── 속도 정밀 분포 (10kt · 스텝 실루엣) ───────────────────────────
 
-function SpeedFineChart({ lo, counts }: { lo: number; counts: number[] }) {
+function SpeedFineChart({
+  lo,
+  counts,
+  filterMin,
+  filterMax,
+  onQuickFilter,
+}: {
+  lo: number;
+  counts: number[];
+  /** 현재 적용된 속도 필터(kt) — 차트 위 구간 하이라이트 */
+  filterMin?: number;
+  filterMax?: number;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
+
+  // 확정 = 10kt 빈 경계 스냅
+  const brush = useBrush((bLo, bHi) =>
+    onQuickFilter({ speedMinKts: (lo + bLo) * SPD_BIN_KT, speedMaxKts: (lo + bHi) * SPD_BIN_KT }),
+  );
 
   const n = counts.length;
   const maxCount = useMemo(() => counts.reduce((a, b) => (b > a ? b : a), 0), [counts]);
@@ -250,11 +342,19 @@ function SpeedFineChart({ lo, counts }: { lo: number; counts: number[] }) {
     return out;
   }, [loKt, hiKt]);
 
-  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+  /** 포인터 x → 10kt 빈 인덱스 */
+  const idxAt = (e: React.PointerEvent<SVGSVGElement>): number | null => {
     const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0 || n === 0) return;
+    if (rect.width <= 0 || n === 0) return null;
     const frac = (e.clientX - rect.left) / rect.width;
-    const idx = Math.min(n - 1, Math.max(0, Math.floor(frac * n)));
+    return Math.min(n - 1, Math.max(0, Math.floor(frac * n)));
+  };
+
+  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const idx = idxAt(e);
+    if (idx == null) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    brush.move(idx);
     setHover({ idx, x: clampTipX(((idx + 0.5) / n) * rect.width, rect.width) });
   };
 
@@ -262,6 +362,15 @@ function SpeedFineChart({ lo, counts }: { lo: number; counts: number[] }) {
     if (!hover) return "";
     const b = lo + hover.idx;
     return `${b * SPD_BIN_KT}–${(b + 1) * SPD_BIN_KT}kt · ${counts[hover.idx].toLocaleString()}건`;
+  })();
+
+  /** 적용된 속도 필터 → 빈 좌표 구간 */
+  const activeSpan = (() => {
+    if (n === 0 || (filterMin == null && filterMax == null)) return null;
+    const toIdx = (kt: number) => kt / SPD_BIN_KT - lo;
+    const a = Math.max(0, Math.min(n, filterMin != null ? toIdx(filterMin) : 0));
+    const b = Math.max(0, Math.min(n, filterMax != null ? toIdx(filterMax) : n));
+    return b - a > 0 ? { lo: a, hi: b } : null;
   })();
 
   if (n === 0) return <div className="text-[11px] text-gray-400">I048/200 관측 없음</div>;
@@ -272,11 +381,29 @@ function SpeedFineChart({ lo, counts }: { lo: number; counts: number[] }) {
       <svg
         viewBox={`0 0 ${n} ${SPD_CHART_H}`}
         preserveAspectRatio="none"
-        className="block w-full"
+        className="block w-full cursor-ew-resize touch-none select-none"
         style={{ height: SPD_CHART_H }}
+        onPointerDown={(e) => {
+          const idx = idxAt(e);
+          if (idx != null) brush.begin(idx, e);
+        }}
         onPointerMove={onMove}
-        onPointerLeave={() => setHover(null)}
+        onPointerUp={brush.end}
+        onPointerCancel={brush.cancel}
+        onPointerLeave={() => {
+          if (!brush.dragging) setHover(null);
+        }}
       >
+        {activeSpan && (
+          <rect
+            x={activeSpan.lo}
+            width={activeSpan.hi - activeSpan.lo}
+            y={0}
+            height={SPD_CHART_H}
+            fill={CHART_INK}
+            opacity={0.07}
+          />
+        )}
         <path d={area} fill={CHART_INK} opacity={0.15} />
         <path
           d={line}
@@ -286,7 +413,20 @@ function SpeedFineChart({ lo, counts }: { lo: number; counts: number[] }) {
           strokeLinejoin="round"
           vectorEffect="non-scaling-stroke"
         />
-        {hover && (
+        {brush.span && (
+          <rect
+            x={brush.span.lo}
+            width={brush.span.hi - brush.span.lo}
+            y={0}
+            height={SPD_CHART_H}
+            fill={CHART_INK}
+            opacity={0.18}
+            stroke={CHART_INK}
+            strokeWidth={1}
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+        {hover && !brush.dragging && (
           <line
             x1={hover.idx + 0.5}
             x2={hover.idx + 0.5}
@@ -314,13 +454,27 @@ function SpeedFineChart({ lo, counts }: { lo: number; counts: number[] }) {
           </span>
         ))}
       </div>
+      <ChartHint
+        text={`가로로 드래그하면 그 속도 구간(10kt 스냅)으로 전수 재집계합니다 · Esc 또는 1빈 미만 드래그는 취소${
+          activeSpan ? " — 음영 = 현재 적용된 속도 필터" : ""
+        }`}
+      />
     </div>
   );
 }
 
 // ─── 본문 ──────────────────────────────────────────────────────────
 
-export default function AltSpeedDetail({ detail }: { detail: AsterixDetailStats; tz: TzMode }) {
+export default function AltSpeedDetail({
+  detail,
+  appliedFilter,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  /** 적용된 필터 — 차트에 현재 창(window)을 그리는 데만 쓴다 (시각 표기 없음 → tz 미사용) */
+  appliedFilter: AsterixDetailFilter;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { stats, fl_fine, speed_fine } = detail;
 
   // 관측 빈 → 연속 축 (속도는 0kt 부터 그려 정지/저속 구간의 부재가 보이게)
@@ -343,8 +497,37 @@ export default function AltSpeedDetail({ detail }: { detail: AsterixDetailStats;
   const flPct = stats.record_count > 0 ? (flTotal / stats.record_count) * 100 : 0;
   const spPct = stats.record_count > 0 ? (spTotal / stats.record_count) * 100 : 0;
 
+  /** Excel — 고도 500ft · 속도 10kt 정밀 격자 (관측 빈 전수) */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    const sheets: ExportSheet[] = [];
+    if (fl_fine.length > 0) {
+      const rows: Cell[][] = [L.detail.flFineHeader];
+      for (const f of fl_fine) {
+        const lo0 = Number(f.key);
+        rows.push([lo0, lo0 + FL_BIN_FT, f.count]);
+      }
+      sheets.push({ name: L.detail.sheet.flFine, rows });
+    }
+    if (speed_fine.length > 0) {
+      const rows: Cell[][] = [L.detail.speedFineHeader];
+      for (const s of speed_fine) {
+        const lo0 = Number(s.key);
+        rows.push([lo0, lo0 + SPD_BIN_KT, s.count]);
+      }
+      sheets.push({ name: L.detail.sheet.speedFine, rows });
+    }
+    return sheets;
+  };
+
   return (
     <div className="space-y-3">
+      <TopicExcelExport
+        topic="altspeed"
+        build={buildSheets}
+        title="고도 500ft·속도 10kt 정밀 분포를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+      />
+
       {/* 요약 카드 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
         <StatCard
@@ -386,14 +569,16 @@ export default function AltSpeedDetail({ detail }: { detail: AsterixDetailStats;
         <StatCard
           label="정지 미만 (<10kt)"
           value={stats.speed_low_records.toLocaleString()}
-          sub="지상 이동·정지 표적"
-          title="I048/200 대지속도 10kt 미만 레코드 수"
+          sub="지상 이동·정지 표적 · 클릭 시 재집계"
+          onClick={() => onQuickFilter({ speedMinKts: undefined, speedMaxKts: 10 })}
+          title="I048/200 대지속도 10kt 미만 레코드 수 — 클릭하면 10kt 미만 레코드만으로 전수 재집계"
         />
         <StatCard
           label="600kt 초과"
           value={stats.speed_high_records.toLocaleString()}
-          sub="이상치 후보"
-          title="I048/200 대지속도 600kt 초과 레코드 수"
+          sub="이상치 후보 · 클릭 시 재집계"
+          onClick={() => onQuickFilter({ speedMinKts: 600, speedMaxKts: undefined })}
+          title="I048/200 대지속도 600kt 초과 레코드 수 — 클릭하면 600kt 초과 레코드만으로 전수 재집계"
         />
       </div>
 
@@ -406,7 +591,13 @@ export default function AltSpeedDetail({ detail }: { detail: AsterixDetailStats;
           </span>
         }
       >
-        <AltProfileChart lo={alt.lo} counts={alt.counts} />
+        <AltProfileChart
+          lo={alt.lo}
+          counts={alt.counts}
+          filterFlMin={appliedFilter.flMin}
+          filterFlMax={appliedFilter.flMax}
+          onQuickFilter={onQuickFilter}
+        />
         {altStats && (
           <div className="mt-1 text-[10px] text-gray-400">
             중앙값 {fmtFt(altStats.median)} ft · 평균 {fmtFt(altStats.mean)} ft{" "}
@@ -420,7 +611,13 @@ export default function AltSpeedDetail({ detail }: { detail: AsterixDetailStats;
         title="속도 정밀 분포 (I048/200 · 10kt)"
         right={<span className="text-[10px] text-gray-400">{spTotal.toLocaleString()}건</span>}
       >
-        <SpeedFineChart lo={spd.lo} counts={spd.counts} />
+        <SpeedFineChart
+          lo={spd.lo}
+          counts={spd.counts}
+          filterMin={appliedFilter.speedMinKts}
+          filterMax={appliedFilter.speedMaxKts}
+          onQuickFilter={onQuickFilter}
+        />
         <div className="mt-1 flex flex-wrap items-baseline justify-between gap-x-3 text-[10px] text-gray-400">
           <span>
             정지 미만(&lt;10kt) {stats.speed_low_records.toLocaleString()}건 · 600kt 초과{" "}

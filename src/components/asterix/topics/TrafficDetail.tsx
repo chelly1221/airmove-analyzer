@@ -19,8 +19,11 @@ import {
   SECTION_BODY_PX,
   StatCard,
 } from "../shared";
+import { ChartHint, TopicExcelExport, useBrush, type ExportSheet } from "../detailUi";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
 import { AZ_GRID_SECTORS, RANGE_GRID_BINS } from "../../../types/asterixDetail";
-import type { AsterixDetailStats, TzMode } from "../../../types/asterixDetail";
+import type { AsterixDetailFilter, AsterixDetailStats } from "../../../types/asterixDetail";
 
 // ─── 로컬 차트 상수 ────────────────────────────────────────────────
 
@@ -75,10 +78,90 @@ function pointerAzimuth(dx: number, dy: number): number {
   return ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
 }
 
+/** 방위각 [0,360) 정규화 */
+const norm360 = (d: number) => ((d % 360) + 360) % 360;
+
+/**
+ * 적용된 방위 필터 → 실제로 그릴 각도 구간들.
+ * azMin > azMax 는 0° 통과(랩어라운드)라 두 조각으로 쪼갠다 (Rust 시맨틱과 동일).
+ */
+function azWindowSegments(min?: number, max?: number): { a: number; b: number }[] {
+  if (min == null && max == null) return [];
+  if (min == null) return [{ a: 0, b: norm360(max as number) }];
+  if (max == null) return [{ a: norm360(min), b: 360 }];
+  const lo = norm360(min);
+  const hi = norm360(max);
+  if (lo === hi) return [];
+  return lo < hi ? [{ a: lo, b: hi }] : [{ a: lo, b: 360 }, { a: 0, b: hi }];
+}
+
+/**
+ * 넓은 각 구간을 90° 이하 조각으로 쪼갠다.
+ * wedgePath/ringSectorPath 는 large-arc 플래그를 0 으로 고정하므로 180° 를 넘는 호를 그리지 못한다.
+ * 조각들은 같은 색·불투명도로 맞붙여 채우므로 이음매가 보이지 않는다.
+ */
+function splitArcs(segs: { a: number; b: number }[], max = 90): { a: number; b: number }[] {
+  const out: { a: number; b: number }[] = [];
+  for (const s of segs) {
+    for (let a = s.a; a < s.b - 1e-6; a += max) out.push({ a, b: Math.min(a + max, s.b) });
+  }
+  return out;
+}
+
+/**
+ * 연속 0 구간(무탐지 섹터) 스캔 — 359°→0° 경계를 넘는 구간은 하나로 병합한다.
+ * 반환 start 는 [0,360), width 는 병합 결과라 360 까지 가능(전 방위 무탐지).
+ */
+interface BlindSector {
+  start: number;
+  width: number;
+}
+function scanBlindSectors(bins: number[]): BlindSector[] {
+  const n = bins.length;
+  if (n === 0) return [];
+  let nz = 0;
+  for (let i = 0; i < n; i++) if (bins[i] > 0) nz++;
+  if (nz === 0) return [{ start: 0, width: n }]; // 전 방위 무탐지
+  const runs: { s: number; e: number }[] = [];
+  let i = 0;
+  while (i < n) {
+    if (bins[i] === 0) {
+      let j = i;
+      while (j < n && bins[j] === 0) j++;
+      runs.push({ s: i, e: j });
+      i = j;
+    } else i++;
+  }
+  // 첫 구간이 0° 에서 시작하고 마지막 구간이 끝(360°)까지면 같은 구간 — 랩어라운드로 병합
+  if (runs.length > 1) {
+    const first = runs[0];
+    const last = runs[runs.length - 1];
+    if (first.s === 0 && last.e === n) {
+      runs.pop();
+      runs.shift();
+      runs.unshift({ s: last.s, e: first.e + n });
+    }
+  }
+  return runs.map((r) => ({ start: r.s, width: r.e - r.s }));
+}
+
 // ─── 거리 정밀 분포 (1NM 스텝 실루엣) ──────────────────────────────
 
-function RangeFineChart({ bins }: { bins: number[] }) {
+function RangeFineChart({
+  bins,
+  filterMin,
+  filterMax,
+  onQuickFilter,
+}: {
+  bins: number[];
+  /** 현재 적용된 거리 필터 — 차트 위 구간 하이라이트 */
+  filterMin?: number;
+  filterMax?: number;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
+  // 빈 인덱스 = NM 이라 확정값이 곧 1NM 스냅된 경계
+  const brush = useBrush((lo, hi) => onQuickFilter({ rangeMinNm: lo, rangeMaxNm: hi }));
 
   /** 마지막 비영 빈 — 뒤쪽 연속 0 구간 잘라내기 기준 */
   const lastNz = useMemo(() => {
@@ -103,13 +186,29 @@ function RangeFineChart({ bins }: { bins: number[] }) {
     return { line: d, area: n > 0 ? `${d} L${n} ${H} L0 ${H} Z` : "" };
   }, [view, n, maxCount]);
 
-  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+  /** 포인터 x → 1NM 빈 인덱스 */
+  const idxAt = (e: React.PointerEvent<SVGSVGElement>): number | null => {
     const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0 || n === 0) return;
+    if (rect.width <= 0 || n === 0) return null;
     const frac = (e.clientX - rect.left) / rect.width;
-    const idx = Math.min(n - 1, Math.max(0, Math.floor(frac * n)));
+    return Math.min(n - 1, Math.max(0, Math.floor(frac * n)));
+  };
+
+  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const idx = idxAt(e);
+    if (idx == null) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    brush.move(idx);
     setHover({ idx, x: clampTipX(((idx + 0.5) / n) * rect.width, rect.width) });
   };
+
+  /** 적용된 거리 필터 → 차트 좌표 (축이 잘려 있어도 겹치는 부분만) */
+  const activeSpan = (() => {
+    if (n === 0 || (filterMin == null && filterMax == null)) return null;
+    const lo = Math.max(0, Math.min(n, filterMin ?? 0));
+    const hi = Math.max(0, Math.min(n, filterMax ?? n));
+    return hi - lo > 0 ? { lo, hi } : null;
+  })();
 
   if (lastNz < 0) return <div className="text-[11px] text-gray-400">I048/040 ρ 관측 없음</div>;
 
@@ -123,11 +222,29 @@ function RangeFineChart({ bins }: { bins: number[] }) {
       <svg
         viewBox={`0 0 ${n} ${RANGE_CHART_H}`}
         preserveAspectRatio="none"
-        className="block w-full"
+        className="block w-full cursor-ew-resize touch-none select-none"
         style={{ height: RANGE_CHART_H }}
+        onPointerDown={(e) => {
+          const idx = idxAt(e);
+          if (idx != null) brush.begin(idx, e);
+        }}
         onPointerMove={onMove}
-        onPointerLeave={() => setHover(null)}
+        onPointerUp={brush.end}
+        onPointerCancel={brush.cancel}
+        onPointerLeave={() => {
+          if (!brush.dragging) setHover(null);
+        }}
       >
+        {activeSpan && (
+          <rect
+            x={activeSpan.lo}
+            width={activeSpan.hi - activeSpan.lo}
+            y={0}
+            height={RANGE_CHART_H}
+            fill={CHART_INK}
+            opacity={0.07}
+          />
+        )}
         <path d={area} fill={CHART_INK} opacity={0.15} />
         <path
           d={line}
@@ -137,7 +254,20 @@ function RangeFineChart({ bins }: { bins: number[] }) {
           strokeLinejoin="round"
           vectorEffect="non-scaling-stroke"
         />
-        {hover && (
+        {brush.span && (
+          <rect
+            x={brush.span.lo}
+            width={brush.span.hi - brush.span.lo}
+            y={0}
+            height={RANGE_CHART_H}
+            fill={CHART_INK}
+            opacity={0.18}
+            stroke={CHART_INK}
+            strokeWidth={1}
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+        {hover && !brush.dragging && (
           <line
             x1={hover.idx + 0.5}
             x2={hover.idx + 0.5}
@@ -168,6 +298,11 @@ function RangeFineChart({ bins }: { bins: number[] }) {
           );
         })}
       </div>
+      <ChartHint
+        text={`가로로 드래그하면 그 거리 구간(1NM 스냅)으로 전수 재집계합니다 · Esc 또는 1NM 미만 드래그는 취소${
+          activeSpan ? " — 음영 = 현재 적용된 거리 필터" : ""
+        }`}
+      />
     </div>
   );
 }
@@ -179,7 +314,18 @@ function RangeFineChart({ bins }: { bins: number[] }) {
  * 반경은 카운트에 선형 비례(풍배도 관례). 웨지 인셋 없이 붙여 그려 1° 해상도를 유지하고,
  * 카운트 0 섹터는 웨지를 생략해 블랭킹·차폐 방향이 빈 쐐기로 드러난다.
  */
-function AzimuthRoseFine({ bins }: { bins: number[] }) {
+function AzimuthRoseFine({
+  bins,
+  filterMin,
+  filterMax,
+  onQuickFilter,
+}: {
+  bins: number[];
+  /** 현재 적용된 방위 필터 — 로즈 위에 구간 하이라이트 */
+  filterMin?: number;
+  filterMax?: number;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ idx: number; x: number } | null>(null);
 
@@ -221,15 +367,29 @@ function AzimuthRoseFine({ bins }: { bins: number[] }) {
     return `${hover.idx}°–${hover.idx + 1}° · ${c.toLocaleString()}건 (${pct.toFixed(2)}%)`;
   })();
 
+  /**
+   * 클릭 = 그 도수를 중심으로 한 10° 윈도우로 재집계.
+   * 0° 를 통과하면 min > max 로 넘긴다 — Rust 가 랩어라운드 구간으로 해석한다.
+   */
+  const applyWindow = (deg: number) => {
+    onQuickFilter({ azMinDeg: norm360(deg - 5), azMaxDeg: norm360(deg + 5) });
+  };
+
+  /** 적용된 방위 필터 → 그릴 구간(랩어라운드는 두 조각, 넓은 각은 90° 단위로 분할) */
+  const activeSegs = splitArcs(azWindowSegments(filterMin, filterMax));
+
   return (
     // 폭이 좁아지면 정사각을 유지한 채 축소 — 히트 판정이 viewBox 스케일 환산에만 의존하게
     <div ref={wrapRef} className="relative mx-auto" style={{ width: "100%", maxWidth: S }}>
       {hover && <ChartTip x={hover.x} text={tipText} />}
       <svg
         viewBox={`0 0 ${S} ${S}`}
-        className="block aspect-square w-full"
+        className="block aspect-square w-full cursor-pointer"
         onPointerMove={onMove}
         onPointerLeave={() => setHover(null)}
+        onClick={() => {
+          if (hover) applyWindow(hover.idx);
+        }}
       >
         <g stroke="#e5e7eb" strokeWidth={1} fill="none">
           {[0.25, 0.5, 0.75, 1].map((fr) => (
@@ -238,6 +398,11 @@ function AzimuthRoseFine({ bins }: { bins: number[] }) {
           <line x1={c0} y1={c0 - R} x2={c0} y2={c0 + R} />
           <line x1={c0 - R} y1={c0} x2={c0 + R} y2={c0} />
         </g>
+
+        {/* 적용된 방위 필터 구간 — 데이터 웨지 아래에 옅게 */}
+        {activeSegs.map((s) => (
+          <path key={`${s.a}:${s.b}`} d={wedgePath(c0, s.a, s.b, R)} fill={CHART_INK} opacity={0.07} />
+        ))}
 
         {hover && <path d={wedgePath(c0, hover.idx, hover.idx + 1, R)} fill={CHART_INK} opacity={0.1} />}
         {wedges}
@@ -260,6 +425,11 @@ function AzimuthRoseFine({ bins }: { bins: number[] }) {
           </text>
         </g>
       </svg>
+      <ChartHint
+        text={`섹터를 클릭하면 그 도수를 중심으로 한 10° 방위 윈도우로 전수 재집계합니다 (0° 통과 구간도 그대로 지원)${
+          activeSegs.length > 0 ? " — 음영 = 현재 적용된 방위 필터" : ""
+        }`}
+      />
     </div>
   );
 }
@@ -271,7 +441,16 @@ function AzimuthRoseFine({ bins }: { bins: number[] }) {
  * 셀 색은 단색(CHART_INK) 고정, 진하기(오파시티)만 log(1+c)/log(1+max) 로 변조해
  * 몇 자릿수 차이 나는 셀 밀도를 한 화면에서 읽게 한다. 0건 셀은 아예 그리지 않는다.
  */
-function PpiHeatmap({ grid }: { grid: number[] }) {
+function PpiHeatmap({
+  grid,
+  filter,
+  onQuickFilter,
+}: {
+  grid: number[];
+  /** 현재 적용된 방위·거리 필터 — 격자 위 창(window) 하이라이트 */
+  filter: AsterixDetailFilter;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ az: number; r: number; x: number } | null>(null);
 
@@ -339,8 +518,34 @@ function PpiHeatmap({ grid }: { grid: number[] }) {
 
   const hoverCount = hover ? (grid[hover.az * RANGE_GRID_BINS + hover.r] ?? 0) : 0;
   const tipText = hover
-    ? `az ${hover.az * 5}°–${hover.az * 5 + 5}° · ${hover.r * 5}–${hover.r * 5 + 5}NM · ${hoverCount.toLocaleString()}건`
+    ? `az ${hover.az * 5}°–${hover.az * 5 + 5}° · ${hover.r * 5}–${hover.r * 5 + 5}NM · ${hoverCount.toLocaleString()}건${
+        hoverCount > 0 ? " · 클릭 = 이 셀로 재집계" : ""
+      }`
     : "";
+
+  /** 셀 클릭 = 그 5°×5NM 셀 범위로 재집계 (0건 셀은 결과가 비므로 막는다) */
+  const onCellClick = () => {
+    if (!hover || hoverCount <= 0) return;
+    onQuickFilter({
+      azMinDeg: hover.az * 5,
+      azMaxDeg: hover.az * 5 + 5,
+      rangeMinNm: hover.r * 5,
+      rangeMaxNm: hover.r * 5 + 5,
+    });
+  };
+
+  /** 적용된 방위×거리 필터 → 그릴 고리 조각들 (랩어라운드·넓은 각 분할) */
+  const activeCells = (() => {
+    const segs = splitArcs(azWindowSegments(filter.azMinDeg, filter.azMaxDeg));
+    const hasRange = filter.rangeMinNm != null || filter.rangeMaxNm != null;
+    if (segs.length === 0 && !hasRange) return [];
+    const maxNm = RANGE_GRID_BINS * 5;
+    const r0 = (Math.max(0, Math.min(maxNm, filter.rangeMinNm ?? 0)) / maxNm) * R;
+    const r1 = (Math.max(0, Math.min(maxNm, filter.rangeMaxNm ?? maxNm)) / maxNm) * R;
+    if (r1 - r0 <= 0) return [];
+    const use = segs.length > 0 ? segs : splitArcs([{ a: 0, b: 360 }]);
+    return use.map((s) => ringSectorPath(c0, s.a, s.b, r0, r1));
+  })();
 
   // 범례 그라데이션 — 오파시티가 log 스케일이라 stop 도 같은 곡선으로 찍는다
   const legendStops = useMemo(() => {
@@ -361,10 +566,15 @@ function PpiHeatmap({ grid }: { grid: number[] }) {
         {hover && <ChartTip x={hover.x} text={tipText} />}
         <svg
           viewBox={`0 0 ${S} ${S}`}
-          className="block aspect-square w-full"
+          className={`block aspect-square w-full ${hoverCount > 0 ? "cursor-pointer" : ""}`}
           onPointerMove={onMove}
           onPointerLeave={() => setHover(null)}
+          onClick={onCellClick}
         >
+          {/* 적용된 방위×거리 필터 창 — 셀 아래에 옅게 */}
+          {activeCells.map((d, i) => (
+            <path key={i} d={d} fill={CHART_INK} opacity={0.08} />
+          ))}
           {cells}
 
           {/* 거리 링(50NM 간격) · 방위 스포크(30° 간격) — 데이터 위에 옅게 */}
@@ -433,13 +643,27 @@ function PpiHeatmap({ grid }: { grid: number[] }) {
         셀 진하기 = 건수(log 스케일) · 관측 셀 {cellsWithData.toLocaleString()} /{" "}
         {(AZ_GRID_SECTORS * RANGE_GRID_BINS).toLocaleString()}
       </div>
+      <ChartHint
+        text={`관측이 있는 셀을 클릭하면 그 방위 5° × 거리 5NM 범위로 전수 재집계합니다${
+          activeCells.length > 0 ? " — 음영 = 현재 적용된 방위·거리 필터" : ""
+        }`}
+      />
     </div>
   );
 }
 
 // ─── 본문 ──────────────────────────────────────────────────────────
 
-export default function TrafficDetail({ detail }: { detail: AsterixDetailStats; tz: TzMode }) {
+export default function TrafficDetail({
+  detail,
+  appliedFilter,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  /** 적용된 필터 — 차트에 현재 창(window)을 그리는 데만 쓴다 (시각 표기 없음 → tz 미사용) */
+  appliedFilter: AsterixDetailFilter;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { stats, range_fine, azimuth_fine, az_range_grid } = detail;
 
   const rangeTotal = useMemo(() => range_fine.reduce((a, b) => a + b, 0), [range_fine]);
@@ -482,8 +706,58 @@ export default function TrafficDetail({ detail }: { detail: AsterixDetailStats; 
   const rangeHistTotal = useMemo(() => stats.range_hist.reduce((a, b) => a + b.count, 0), [stats.range_hist]);
   const coverPct = stats.record_count > 0 ? (rangeTotal / stats.record_count) * 100 : 0;
 
+  /** 무탐지(연속 0) 방위 섹터 — 랩어라운드 병합, 폭 내림차순 */
+  const blindSectors = useMemo(() => {
+    if (azTotal === 0) return [] as BlindSector[];
+    const s = scanBlindSectors(azimuth_fine);
+    s.sort((a, b) => b.width - a.width || a.start - b.start);
+    return s;
+  }, [azimuth_fine, azTotal]);
+  const blindTotalDeg = useMemo(() => blindSectors.reduce((a, s) => a + s.width, 0), [blindSectors]);
+
+  /** Excel — 거리 1NM · 방위 1° · PPI 격자(az×range 행렬) · 무탐지 섹터 */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    const sheets: ExportSheet[] = [];
+
+    if (rangeTotal > 0) {
+      const rows: Cell[][] = [L.detail.rangeFineHeader];
+      for (let i = 0; i < range_fine.length; i++) rows.push([i, i + 1, range_fine[i]]);
+      sheets.push({ name: L.detail.sheet.rangeFine, rows });
+    }
+    if (azTotal > 0) {
+      const rows: Cell[][] = [L.detail.azFineHeader];
+      for (let i = 0; i < azimuth_fine.length; i++) rows.push([i, i + 1, azimuth_fine[i]]);
+      sheets.push({ name: L.detail.sheet.azimuthFine, rows });
+    }
+    if (az_range_grid.length > 0) {
+      // 행 = 방위 5° 섹터, 열 = 거리 5NM 구간 (원본 격자 그대로, 다운샘플링 없음)
+      const head: Cell[] = [L.detail.ppiCorner];
+      for (let r = 0; r < RANGE_GRID_BINS; r++) head.push(`${r * 5}–${r * 5 + 5}`);
+      const rows: Cell[][] = [head];
+      for (let az = 0; az < AZ_GRID_SECTORS; az++) {
+        const row: Cell[] = [`${az * 5}–${az * 5 + 5}`];
+        for (let r = 0; r < RANGE_GRID_BINS; r++) row.push(az_range_grid[az * RANGE_GRID_BINS + r] ?? 0);
+        rows.push(row);
+      }
+      sheets.push({ name: L.detail.sheet.ppiGrid, rows });
+    }
+    if (blindSectors.length > 0) {
+      const rows: Cell[][] = [L.detail.blindSectorHeader];
+      for (const s of blindSectors) rows.push([s.start, (s.start + s.width) % 360, s.width]);
+      sheets.push({ name: L.detail.sheet.blindSectors, rows });
+    }
+    return sheets;
+  };
+
   return (
     <div className="space-y-3">
+      <TopicExcelExport
+        topic="traffic"
+        build={buildSheets}
+        title="거리 1NM·방위 1°·PPI 격자·무탐지 섹터를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+      />
+
       {/* 요약 카드 */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
         <StatCard
@@ -531,7 +805,12 @@ export default function TrafficDetail({ detail }: { detail: AsterixDetailStats; 
           </span>
         }
       >
-        <RangeFineChart bins={range_fine} />
+        <RangeFineChart
+          bins={range_fine}
+          filterMin={appliedFilter.rangeMinNm}
+          filterMax={appliedFilter.rangeMaxNm}
+          onQuickFilter={onQuickFilter}
+        />
       </Section>
 
       {/* 방위 정밀 로즈 (1°) */}
@@ -546,16 +825,86 @@ export default function TrafficDetail({ detail }: { detail: AsterixDetailStats; 
         {azTotal === 0 ? (
           <div className="text-[11px] text-gray-400">I048/040 θ 관측 없음</div>
         ) : (
-          <AzimuthRoseFine bins={azimuth_fine} />
+          <AzimuthRoseFine
+            bins={azimuth_fine}
+            filterMin={appliedFilter.azMinDeg}
+            filterMax={appliedFilter.azMaxDeg}
+            onQuickFilter={onQuickFilter}
+          />
         )}
       </Section>
+
+      {/* 방위 무탐지 섹터 — 연속 0 구간 (블랭킹·차폐 후보). 관측이 전무하면 표시하지 않는다 */}
+      {azTotal > 0 && (
+        <Section
+          title={`방위 무탐지 섹터 (${blindSectors.length.toLocaleString()}구간)`}
+          right={
+            <span className="text-[10px] text-gray-400">azimuth_fine 연속 0 구간 · 359°→0° 경계 병합</span>
+          }
+        >
+          {blindSectors.length === 0 ? (
+            <div className="text-[11px] text-gray-400">360개 1° 섹터 전부에 관측이 있습니다 — 무탐지 섹터 없음</div>
+          ) : (
+            <>
+              <div className="mb-2 grid grid-cols-2 gap-2 md:grid-cols-3">
+                <StatCard
+                  label="무탐지 구간"
+                  value={`${blindSectors.length.toLocaleString()}구간`}
+                  sub="연속 0 섹터 묶음"
+                  title="관측이 하나도 없는 1° 섹터가 연이어 붙은 구간의 개수 (0° 경계는 병합)"
+                />
+                <StatCard
+                  label="최장 구간"
+                  value={`${blindSectors[0].width}°`}
+                  sub={`${blindSectors[0].start}° 부터`}
+                  title="가장 넓은 연속 무탐지 방위 구간 — 섹터 블랭킹이나 큰 차폐물을 시사"
+                />
+                <StatCard
+                  label="무탐지 합계"
+                  value={`${blindTotalDeg}°`}
+                  sub={`전 방위의 ${((blindTotalDeg / 360) * 100).toFixed(1)}%`}
+                  title="무탐지 1° 섹터의 총 폭"
+                />
+              </div>
+              <div className="max-h-72 overflow-auto rounded border border-gray-100">
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="sticky top-0 bg-gray-50 text-gray-500">
+                      <th className="w-10 px-2 py-1 text-right font-medium">#</th>
+                      <th className="px-2 py-1 text-left font-medium">구간</th>
+                      <th className="px-2 py-1 text-right font-medium">폭</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {blindSectors.map((s, i) => (
+                      <tr key={`${s.start}:${s.width}`} className="border-t border-gray-100">
+                        <td className="px-2 py-1 text-right tabular-nums text-gray-400">{i + 1}</td>
+                        <td
+                          className="px-2 py-1 tabular-nums text-gray-700"
+                          title={
+                            s.start + s.width > 360 ? "0°(북) 을 통과하는 구간 — 359°→0° 경계에서 병합됨" : undefined
+                          }
+                        >
+                          {s.start}° – {(s.start + s.width) % 360}°
+                          {s.start + s.width > 360 && <span className="ml-1 text-[10px] text-gray-400">0° 통과</span>}
+                        </td>
+                        <td className="px-2 py-1 text-right tabular-nums text-gray-600">{s.width}°</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </Section>
+      )}
 
       {/* PPI 히트맵 (5° × 5NM) */}
       <Section
         title="PPI 히트맵 (방위 5° × 거리 5NM)"
         right={<span className="text-[10px] text-gray-400">0–260NM · 극좌표 원본 격자</span>}
       >
-        <PpiHeatmap grid={az_range_grid} />
+        <PpiHeatmap grid={az_range_grid} filter={appliedFilter} onQuickFilter={onQuickFilter} />
       </Section>
 
       {/* 대시보드 연속성 — 기존 10NM / 10° 요약 */}

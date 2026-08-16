@@ -13,7 +13,6 @@ import {
   MapPin,
   ExternalLink,
   Loader2,
-  ShieldAlert,
   Binary,
   BookOpen,
   Ghost,
@@ -79,7 +78,6 @@ const navSections: NavSection[] = [
     label: "분석",
     items: [
       { id: "obstacle", label: "장애물 스카이라인", icon: Eye, path: "/obstacle" },
-      { id: "acas", label: "ACAS", icon: ShieldAlert, path: "/acas" },
       {
         id: "asterix", label: "ASTERIX", icon: Binary, path: "/asterix",
         children: [

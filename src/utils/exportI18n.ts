@@ -310,6 +310,115 @@ export function exportStrings(lang: ExportLang) {
         [`開始 (${tz})`, `終了 (${tz})`, "継続 (s)"],
       ),
 
+    // ── ASTERIX 통계 상세 8토픽 (/asterix/stats/:topic) ──
+    // 대시보드와 겹치는 시트(공백·파일·회전·메시지·카테고리)는 위 키를 그대로 재사용하고,
+    // 여기에는 상세 전용(정밀 격자·상세 표)만 정의한다.
+    detail: {
+      sheet: {
+        hourly: pick("시간대", "Hour of Day", "時間帯"),
+        rangeFine: pick("거리 1NM", "Range 1NM", "距離 1NM"),
+        azimuthFine: pick("방위 1도", "Azimuth 1deg", "方位 1度"),
+        ppiGrid: pick("PPI 격자", "PPI Grid", "PPI グリッド"),
+        blindSectors: pick("무탐지 섹터", "Blind Sectors", "無探知セクター"),
+        flFine: pick("고도 500ft", "Altitude 500ft", "高度 500ft"),
+        speedFine: pick("속도 10kt", "Speed 10kt", "速度 10kt"),
+        modesTable: pick("Mode-S 상세", "Mode-S Detail", "Mode-S 詳細"),
+        mode3aTable: pick("Mode-3A 상세", "Mode-3A Detail", "Mode-3A 詳細"),
+        emergencyEvents: pick("비상 이벤트", "Emergency Events", "緊急イベント"),
+        bdsDetail: pick("BDS 상세", "BDS Detail", "BDS 詳細"),
+        acasRecords: pick("ACAS 레코드", "ACAS Records", "ACAS レコード"),
+        sourceBreakdown: pick("출처별 분해", "Source Breakdown", "送信元別内訳"),
+        catQuality: pick("카테고리 품질", "Category Quality", "カテゴリ品質"),
+        fileStruct: pick("파일별 구조", "File Structure", "ファイル構造"),
+      },
+      hourlyHeader: (tz: string) =>
+        pick([`시(${tz})`, "레코드"], [`Hour (${tz})`, "Records"], [`時 (${tz})`, "レコード"]),
+      rangeFineHeader: pick(
+        ["거리 하한(NM)", "거리 상한(NM)", "건수"],
+        ["Range From (NM)", "Range To (NM)", "Count"],
+        ["距離 下限 (NM)", "距離 上限 (NM)", "件数"],
+      ),
+      azFineHeader: pick(
+        ["방위 시작(°)", "방위 끝(°)", "건수"],
+        ["Azimuth From (°)", "Azimuth To (°)", "Count"],
+        ["方位 開始 (°)", "方位 終了 (°)", "件数"],
+      ),
+      ppiCorner: pick("방위(°) \\ 거리(NM)", "Azimuth (°) \\ Range (NM)", "方位 (°) \\ 距離 (NM)"),
+      blindSectorHeader: pick(
+        ["시작(°)", "끝(°)", "폭(°)"],
+        ["From (°)", "To (°)", "Width (°)"],
+        ["開始 (°)", "終了 (°)", "幅 (°)"],
+      ),
+      flFineHeader: pick(
+        ["고도 하한(ft)", "고도 상한(ft)", "건수"],
+        ["Altitude From (ft)", "Altitude To (ft)", "Count"],
+        ["高度 下限 (ft)", "高度 上限 (ft)", "件数"],
+      ),
+      speedFineHeader: pick(
+        ["속도 하한(kt)", "속도 상한(kt)", "건수"],
+        ["Speed From (kt)", "Speed To (kt)", "Count"],
+        ["速度 下限 (kt)", "速度 上限 (kt)", "件数"],
+      ),
+      modesTableHeader: (tz: string) =>
+        pick(
+          [
+            "Mode-S", "호출부호", "레코드", `최초(${tz})`, `최종(${tz})`, "체공시간(초)",
+            "FL 최소", "FL 최대", "평균속도(kt)", "최소거리(NM)", "최대거리(NM)",
+            "Mode-3/A", "ACAS", "비상", "트랙번호",
+          ],
+          [
+            "Mode-S", "Callsign", "Records", `First (${tz})`, `Last (${tz})`, "Duration (s)",
+            "FL Min", "FL Max", "Mean Speed (kt)", "Range Min (NM)", "Range Max (NM)",
+            "Mode-3/A", "ACAS", "Emergency", "Track Numbers",
+          ],
+          [
+            "Mode-S", "コールサイン", "レコード", `最初 (${tz})`, `最後 (${tz})`, "継続 (s)",
+            "FL 最小", "FL 最大", "平均速度 (kt)", "最小距離 (NM)", "最大距離 (NM)",
+            "Mode-3/A", "ACAS", "緊急", "トラック番号",
+          ],
+        ),
+      mode3aTableHeader: (tz: string) =>
+        pick(
+          ["코드", "레코드", "점유율(%)", "Mode-S 수", `최초(${tz})`, `최종(${tz})`],
+          ["Code", "Records", "Share (%)", "Distinct Mode-S", `First (${tz})`, `Last (${tz})`],
+          ["コード", "レコード", "占有率 (%)", "Mode-S 数", `最初 (${tz})`, `最後 (${tz})`],
+        ),
+      emergencyHeader: (tz: string) =>
+        pick(
+          [`시각(${tz})`, "코드", "Mode-S", "SAC", "SIC"],
+          [`Time (${tz})`, "Code", "Mode-S", "SAC", "SIC"],
+          [`時刻 (${tz})`, "コード", "Mode-S", "SAC", "SIC"],
+        ),
+      bdsDetailHeader: pick(
+        ["BDS", "레지스터", "MB 블록", "점유율(%)", "고유 Mode-S"],
+        ["BDS", "Register", "MB Blocks", "Share (%)", "Distinct Mode-S"],
+        ["BDS", "レジスタ", "MB ブロック", "占有率 (%)", "Mode-S ユニーク"],
+      ),
+      acasRecordsHeader: (tz: string) =>
+        pick(
+          [`시각(${tz})`, "Mode-S", "호출부호", "SAC", "SIC"],
+          [`Time (${tz})`, "Mode-S", "Callsign", "SAC", "SIC"],
+          [`時刻 (${tz})`, "Mode-S", "コールサイン", "SAC", "SIC"],
+        ),
+      sourceHeader: (tz: string) =>
+        pick(
+          ["SAC", "SIC", "레코드", "점유율(%)", "CAT048", "CAT034", "CAT008", "고유 Mode-S", `시작(${tz})`, `종료(${tz})`],
+          ["SAC", "SIC", "Records", "Share (%)", "CAT048", "CAT034", "CAT008", "Distinct Mode-S", `Start (${tz})`, `End (${tz})`],
+          ["SAC", "SIC", "レコード", "占有率 (%)", "CAT048", "CAT034", "CAT008", "Mode-S ユニーク", `開始 (${tz})`, `終了 (${tz})`],
+        ),
+      catQualityHeader: pick(
+        ["카테고리", "블록(구조)", "레코드(필터)", "블록당 레코드", "레코드 비중(%)"],
+        ["Category", "Blocks (structural)", "Records (filtered)", "Records/Block", "Record Share (%)"],
+        ["カテゴリ", "ブロック（構造）", "レコード（フィルタ）", "ブロック当たりレコード", "レコード比率 (%)"],
+      ),
+      fileStructHeader: (tz: string) =>
+        pick(
+          ["파일", "용량(bytes)", "프레임", "레코드(필터)", "프레임당 레코드", `시작(${tz})`, `종료(${tz})`],
+          ["File", "Size (bytes)", "Frames", "Records (filtered)", "Records/Frame", `Start (${tz})`, `End (${tz})`],
+          ["ファイル", "容量 (bytes)", "フレーム", "レコード（フィルタ）", "フレーム当たりレコード", `開始 (${tz})`, `終了 (${tz})`],
+        ),
+    },
+
     // 값 번역기 (매핑 없으면 한글 원문 유지)
     catLabel: (cat: number) => (lang === "ja" ? CAT_JA : lang === "en" ? CAT_EN : CAT_KO)[cat] ?? catFallback(cat),
     frnName: mapped(FRN_EN, FRN_JA),

@@ -17,7 +17,7 @@ import type {
 import type { MultiCoverageResult } from "../utils/radarCoverage";
 import { readBulkJson, cleanupBulk } from "../utils/bulkIpc";
 import type { BulkRef } from "../utils/bulkIpc";
-import type { TcasReport, WeatherVector } from "../types/track";
+import type { WeatherVector } from "../types/track";
 import type { AsterixStats } from "../types/asterix";
 import type { DualTargetResult } from "../types/dualTarget";
 
@@ -139,11 +139,6 @@ interface AppState {
   bumpCoverageAbortSeq: () => number;
   coverageError: string;
   setCoverageError: (msg: string) => void;
-
-  // ACAS 분석 — TcasReport 전수 (트랙 독립)
-  tcasReports: TcasReport[];
-  appendTcasReports: (reports: TcasReport[]) => void;
-  clearTcasReports: () => void;
 
   // ASTERIX 분석 — 전수 스캔 통계 + 업로드 파일 경로(온디맨드 조회용). 자체 업로드 독립.
   asterixStats: AsterixStats | null;
@@ -477,11 +472,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   coverageError: "",
   setCoverageError: (msg) => set({ coverageError: msg }),
-
-  // ACAS 분석 — TcasReport 전수 (트랙 독립)
-  tcasReports: [],
-  appendTcasReports: (reports) => set((s) => ({ tcasReports: [...s.tcasReports, ...reports] })),
-  clearTcasReports: () => set({ tcasReports: [] }),
 
   asterixStats: null,
   asterixFilePaths: [],

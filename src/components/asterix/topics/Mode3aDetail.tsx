@@ -7,11 +7,22 @@
  */
 
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
 import { useAppStore } from "../../../store";
 import { Section, StatCard, LabeledBars } from "../shared";
+import {
+  compareSortVal,
+  FilterChipButton,
+  SearchInput,
+  SortTh,
+  TopicExcelExport,
+  type ExportSheet,
+  type SortDir,
+  type SortState,
+} from "../detailUi";
 import { formatTime, labelFor } from "../format";
-import type { AsterixDetailStats, Mode3ADetailRow, TzMode } from "../../../types/asterixDetail";
+import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
+import type { Cell } from "../../../utils/xlsxExport";
+import type { AsterixDetailFilter, AsterixDetailStats, Mode3ADetailRow, TzMode } from "../../../types/asterixDetail";
 
 /** Mode-3/A 비상코드 — Rust emergency_counts 가 항상 3개 고정으로 내려주는 키와 동일 */
 const EMERGENCY_CODES = ["7700", "7600", "7500"] as const;
@@ -24,7 +35,6 @@ const EMERGENCY_MEANING: Record<string, string> = {
 };
 
 type SortKey = "code" | "count" | "modes" | "first" | "last";
-type SortDir = "asc" | "desc";
 
 /** 컬럼을 처음 눌렀을 때의 방향 — 수치는 큰 값 우선, 코드/시각은 오름차순 */
 const DEFAULT_DIR: Record<SortKey, SortDir> = {
@@ -51,59 +61,44 @@ function sortVal(r: Mode3ADetailRow, k: SortKey): number | string | null {
   }
 }
 
-type SortState = { key: SortKey; dir: SortDir };
-
-/**
- * 정렬 가능한 헤더 셀 — 컴포넌트 밖에 두어 검색어 입력마다 헤더가 재마운트되지 않게 한다.
- * 같은 컬럼 재클릭=방향 토글, 다른 컬럼=해당 컬럼 기본 방향.
- */
-function SortTh({
+/** 공용 SortTh 에 이 표의 컬럼별 기본 정렬 방향을 주입한 래퍼 (호출부에서 매번 넘기지 않게) */
+function Th({
   label,
   k,
   sort,
   setSort,
-  align = "left",
+  align,
   title,
 }: {
   label: string;
   k: SortKey;
-  sort: SortState;
-  setSort: React.Dispatch<React.SetStateAction<SortState>>;
+  sort: SortState<SortKey>;
+  setSort: React.Dispatch<React.SetStateAction<SortState<SortKey>>>;
   align?: "left" | "right";
   title?: string;
 }) {
-  const active = sort.key === k;
   return (
-    <th
-      className={`sticky top-0 z-10 whitespace-nowrap bg-gray-50 px-2 py-1.5 font-medium ${
-        align === "right" ? "text-right" : "text-left"
-      } ${active ? "text-[#a60739]" : "text-gray-600"}`}
-      title={title}
-    >
-      <button
-        type="button"
-        onClick={() =>
-          setSort((s) =>
-            s.key === k ? { key: k, dir: s.dir === "asc" ? "desc" : "asc" } : { key: k, dir: DEFAULT_DIR[k] },
-          )
-        }
-        className={`inline-flex items-center gap-0.5 transition-colors hover:text-[#a60739] ${
-          align === "right" ? "flex-row-reverse" : ""
-        }`}
-      >
-        {label}
-        {active ? sort.dir === "asc" ? <ChevronUp size={10} /> : <ChevronDown size={10} /> : <span className="w-2.5" />}
-      </button>
-    </th>
+    <SortTh label={label} k={k} sort={sort} setSort={setSort} defaultDir={DEFAULT_DIR[k]} align={align} title={title} />
   );
 }
 
-export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStats; tz: TzMode }) {
+/** 비상 이벤트 전후 관찰 여유 (초) — 이벤트는 순간이라 앞뒤 5분을 함께 본다 */
+const EMG_CONTEXT_SECS = 300;
+
+export default function Mode3aDetail({
+  detail,
+  tz,
+  onQuickFilter,
+}: {
+  detail: AsterixDetailStats;
+  tz: TzMode;
+  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
+}) {
   const { mode3a_table, emergency_events, emergency_events_truncated, stats } = detail;
   const aircraft = useAppStore((s) => s.aircraft);
 
   const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<SortState>({ key: "count", dir: "desc" });
+  const [sort, setSort] = useState<SortState<SortKey>>({ key: "count", dir: "desc" });
 
   /** 비상코드 건수 — 인덱스가 아닌 코드 키로 조회 (대시보드 관례) */
   const emgCount = (code: string) => stats.emergency_counts.find((e) => e.key === code)?.count ?? 0;
@@ -113,26 +108,50 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
     const q = query.trim();
     const base = q === "" ? mode3a_table : mode3a_table.filter((r) => r.code.includes(q));
 
-    const dir = sort.dir === "asc" ? 1 : -1;
     const arr = base.slice();
     arr.sort((a, b) => {
-      const va = sortVal(a, sort.key);
-      const vb = sortVal(b, sort.key);
-      if (va == null || vb == null) {
-        // 결측 우선순위는 정렬 방향과 무관 (항상 아래로)
-        if (va != null) return -1;
-        if (vb != null) return 1;
-      } else {
-        const c = typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
-        if (c !== 0) return c * dir;
-      }
-      return b.count - a.count || a.code.localeCompare(b.code);
+      // 결측(null)은 방향과 무관하게 항상 뒤로 — compareSortVal 공통 규칙
+      const c = compareSortVal(sortVal(a, sort.key), sortVal(b, sort.key), sort.dir);
+      return c !== 0 ? c : b.count - a.count || a.code.localeCompare(b.code);
     });
     return arr;
   }, [mode3a_table, query, sort]);
 
+  /** Excel — 코드별 상세(현재 검색·정렬 반영) + 비상 이벤트 */
+  const buildSheets = (lang: ExportLang): ExportSheet[] => {
+    const L = exportStrings(lang);
+    const sheets: ExportSheet[] = [];
+    if (rows.length > 0) {
+      const out: Cell[][] = [L.detail.mode3aTableHeader(tz)];
+      for (const m of rows) {
+        out.push([
+          m.code,
+          m.count,
+          stats.mode3a_records > 0 ? Number(((m.count / stats.mode3a_records) * 100).toFixed(3)) : "",
+          m.distinct_mode_s,
+          m.first_ts != null ? formatTime(m.first_ts, tz) : "",
+          m.last_ts != null ? formatTime(m.last_ts, tz) : "",
+        ]);
+      }
+      sheets.push({ name: L.detail.sheet.mode3aTable, rows: out });
+    }
+    if (emergency_events.length > 0) {
+      const out: Cell[][] = [L.detail.emergencyHeader(tz)];
+      for (const e of emergency_events) {
+        out.push([e.ts != null ? formatTime(e.ts, tz) : "", e.code, e.mode_s ?? "", e.sac, e.sic]);
+      }
+      sheets.push({ name: L.detail.sheet.emergencyEvents, rows: out });
+    }
+    return sheets;
+  };
+
   return (
     <div className="space-y-3">
+      <TopicExcelExport
+        topic="mode3a"
+        build={buildSheets}
+        title="Mode-3/A 코드별 상세·비상 이벤트를 Excel(.xlsx)로 내보냅니다 — 언어 선택"
+      />
       {/* 요약 카드 — 비상 3코드는 0이어도 항상 노출 (Rust 고정 3개 계약) */}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
         <StatCard
@@ -166,12 +185,22 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
         {EMERGENCY_CODES.map((code) => {
           const n = emgCount(code);
           return (
-            <div
+            // 관측이 있을 때만 클릭 가능 — 0건 코드로 재집계하면 빈 결과라 비활성
+            <button
               key={code}
-              className={`rounded-lg border px-3 py-2 ${
-                n > 0 ? "border-[#e94560]/40 bg-[#e94560]/5" : "border-gray-200 bg-[#f8f9fa]"
+              type="button"
+              disabled={n === 0}
+              onClick={() => onQuickFilter({ mode3a: code })}
+              className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                n > 0
+                  ? "cursor-pointer border-[#e94560]/40 bg-[#e94560]/5 hover:border-[#e94560]"
+                  : "cursor-default border-gray-200 bg-[#f8f9fa]"
               }`}
-              title={EMERGENCY_MEANING[code]}
+              title={
+                n > 0
+                  ? `${EMERGENCY_MEANING[code]} — 클릭하면 Mode-3/A ${code} 레코드만으로 전수 재집계`
+                  : `${EMERGENCY_MEANING[code]} — 관측 없음`
+              }
             >
               <div className="flex items-center gap-1">
                 <span
@@ -187,7 +216,7 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
                 {n.toLocaleString()}
               </div>
               <div className="truncate text-[10px] text-gray-400">{EMERGENCY_MEANING[code]}</div>
-            </div>
+            </button>
           );
         })}
       </div>
@@ -213,6 +242,12 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
             <table className="w-full text-[11px]">
               <thead>
                 <tr>
+                  <th
+                    className="sticky top-0 z-10 w-8 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-left font-medium text-gray-600"
+                    title="발생 시각 전후 ±5분 구간으로 재집계"
+                  >
+                    보기
+                  </th>
                   <th className="sticky top-0 z-10 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-left font-medium text-gray-600">
                     시각 ({tz})
                   </th>
@@ -230,6 +265,23 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
               <tbody>
                 {emergency_events.map((e, i) => (
                   <tr key={`${e.ts}:${e.mode_s}:${e.code}:${i}`} className="border-t border-gray-100 hover:bg-[#a60739]/5">
+                    <td className="px-2 py-1">
+                      {/* 이벤트는 한 순간이라 앞뒤 ±5분을 붙여야 전개 과정이 보인다 */}
+                      {e.ts != null && (
+                        <FilterChipButton
+                          title={`발생 전후 ±5분(${formatTime(e.ts - EMG_CONTEXT_SECS, tz)} ~ ${formatTime(
+                            e.ts + EMG_CONTEXT_SECS,
+                            tz,
+                          )}) 구간으로 재집계`}
+                          onClick={() =>
+                            onQuickFilter({
+                              timeMin: (e.ts as number) - EMG_CONTEXT_SECS,
+                              timeMax: (e.ts as number) + EMG_CONTEXT_SECS,
+                            })
+                          }
+                        />
+                      )}
+                    </td>
                     <td className="whitespace-nowrap px-2 py-1 font-mono text-gray-700">
                       {e.ts != null ? formatTime(e.ts, tz) : "—"}
                     </td>
@@ -261,26 +313,14 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
           query.trim() !== "" ? ` / ${mode3a_table.length.toLocaleString()}` : ""
         })`}
         right={
-          <div className="relative flex items-center">
-            <Search size={11} className="pointer-events-none absolute left-2 text-gray-400" />
-            <input
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="코드 (옥탈 부분일치)"
-              className="h-7 w-44 rounded-md border border-gray-200 bg-white pl-7 pr-6 text-[11px] tabular-nums placeholder-gray-400 focus:border-[#a60739] focus:outline-none"
-            />
-            {query !== "" && (
-              <button
-                type="button"
-                onClick={() => setQuery("")}
-                className="absolute right-1.5 text-gray-400 transition-colors hover:text-[#a60739]"
-                title="검색어 지우기"
-              >
-                <X size={11} />
-              </button>
-            )}
-          </div>
+          <SearchInput
+            value={query}
+            onChange={setQuery}
+            placeholder="코드 (옥탈 부분일치)"
+            width="w-44"
+            numeric
+            title="표시 중인 표만 걸러냅니다 (재집계 아님)"
+          />
         }
       >
         {mode3a_table.length === 0 ? (
@@ -292,8 +332,15 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
             <table className="w-full text-[11px]">
               <thead>
                 <tr>
-                  <SortTh label="코드" k="code" sort={sort} setSort={setSort} title="I048/070 옥탈 4자리" />
-                  <SortTh label="레코드" k="count" align="right" sort={sort} setSort={setSort} />
+                  {/* 선두 액션 열 — 정렬 대상이 아니라 SortTh 대신 평범한 th */}
+                  <th
+                    className="sticky top-0 z-10 w-8 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-left font-medium text-gray-600"
+                    title="이 Mode-3/A 코드만으로 전수 재집계"
+                  >
+                    필터
+                  </th>
+                  <Th label="코드" k="code" sort={sort} setSort={setSort} title="I048/070 옥탈 4자리" />
+                  <Th label="레코드" k="count" align="right" sort={sort} setSort={setSort} />
                   {/* 점유율은 레코드 수와 순서가 같아 별도 정렬 키를 두지 않는다 */}
                   <th
                     className="sticky top-0 z-10 whitespace-nowrap bg-gray-50 px-2 py-1.5 text-right font-medium text-gray-600"
@@ -301,7 +348,7 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
                   >
                     점유율
                   </th>
-                  <SortTh
+                  <Th
                     label="Mode-S 수"
                     k="modes"
                     align="right"
@@ -309,8 +356,8 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
                     setSort={setSort}
                     title="이 코드를 사용한 고유 Mode-S 주소 수"
                   />
-                  <SortTh label={`최초 (${tz})`} k="first" sort={sort} setSort={setSort} />
-                  <SortTh label={`최종 (${tz})`} k="last" sort={sort} setSort={setSort} />
+                  <Th label={`최초 (${tz})`} k="first" sort={sort} setSort={setSort} />
+                  <Th label={`최종 (${tz})`} k="last" sort={sort} setSort={setSort} />
                 </tr>
               </thead>
               <tbody>
@@ -326,6 +373,12 @@ export default function Mode3aDetail({ detail, tz }: { detail: AsterixDetailStat
                       // 좌측 보더 색은 border-gray-100(전 방향)과 순서 다툼이 없도록 인라인으로 확정
                       style={emg ? { borderLeftColor: "#e94560" } : undefined}
                     >
+                      <td className="px-2 py-1">
+                        <FilterChipButton
+                          title={`Mode-3/A ${m.code} 레코드만으로 전수 재집계 (필터바 Mode-3/A 칸에 반영)`}
+                          onClick={() => onQuickFilter({ mode3a: m.code })}
+                        />
+                      </td>
                       <td className="whitespace-nowrap px-2 py-1">
                         <span
                           className={`font-mono tabular-nums ${emg ? "font-semibold text-[#e94560]" : "text-gray-700"}`}
