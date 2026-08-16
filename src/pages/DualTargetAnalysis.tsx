@@ -77,6 +77,32 @@ const BUILDING_FETCH_DEBOUNCE_MS = 250;
  *  격자 비닝이 아니라 greedy 반경 병합(supercluster 방식)이라 셀 경계에서 마커가 겹치지 않는다. */
 const CLUSTER_MERGE_RADIUS_PX = 40;
 
+/** Web Mercator 투영 — scale(=512·2^zoom) 기준 화면 픽셀 좌표.
+ *  위도는 메르카토르 발산 방지로 ±85° 클램프(국내 자료라 실질 무영향). */
+function projMerc(lon: number, lat: number, scale: number): [number, number] {
+  const clamped = Math.min(85, Math.max(-85, lat));
+  const phi = (clamped * Math.PI) / 180;
+  return [
+    ((lon + 180) / 360) * scale,
+    ((1 - Math.log(Math.tan(Math.PI / 4 + phi / 2)) / Math.PI) / 2) * scale,
+  ];
+}
+
+/** projMerc 역변환 — 화면 픽셀 좌표 → [lon, lat] */
+function unprojMerc(x: number, y: number, scale: number): [number, number] {
+  return [
+    (x / scale) * 360 - 180,
+    ((2 * Math.atan(Math.exp(Math.PI * (1 - (2 * y) / scale))) - Math.PI / 2) * 180) / Math.PI,
+  ];
+}
+
+// ── 유령표적 방사선 점선 ─────────────────────────────────────────────
+/** 점선 한 칸: 그려지는 길이 / 비는 길이 (px) — 주기 10px */
+const DASH_ON_PX = 6;
+const DASH_GAP_PX = 4;
+/** 점선 세그먼트 총량 상한 — 초과 시 주기를 늘려 흡수(아래 ghostDashSegments 주석 참조) */
+const MAX_GHOST_DASH_SEGMENTS = 200_000;
+
 /** 파싱·분석 요청 epoch — 컴포넌트가 아닌 모듈 스코프.
  *  파싱 도중 페이지 이탈 후 복귀(리마운트)해 새 파싱을 시작해도 카운터가 이어지므로
  *  고아 플로우(잔존 리스너 push·invoke 후속 통합/분석/라벨링)가 확실히 무효화된다. */
@@ -289,11 +315,17 @@ function LegendDot({ fill, stroke, r = 4.5 }: { fill?: string; stroke?: string; 
   );
 }
 
-/** 범례 선 스와치 */
-function LegendLine({ color, width = 2 }: { color: string; width?: number }) {
+/** 범례 선 스와치 — dashed 면 점선(지도의 유령표적 방사선과 동일 표현) */
+function LegendLine({ color, width = 2, dashed = false }: { color: string; width?: number; dashed?: boolean }) {
   return (
     <svg width={16} height={12} viewBox="0 0 16 12" className="shrink-0">
-      <line x1={1} y1={6} x2={15} y2={6} stroke={color} strokeWidth={width} strokeLinecap="round" />
+      <line
+        x1={1} y1={6} x2={15} y2={6}
+        stroke={color}
+        strokeWidth={width}
+        strokeLinecap={dashed ? "butt" : "round"}
+        strokeDasharray={dashed ? "3 2" : undefined}
+      />
     </svg>
   );
 }
@@ -341,7 +373,11 @@ function DualLegend({ hasResult, hasModeS, hasEvent, showBuildings }: {
             <>
               <LegendRow swatch={<LegendDot fill="rgb(59,130,246)" />} label="실표적" />
               <LegendRow swatch={<LegendDot fill="rgb(233,69,96)" r={5} />} label="유령표적(반사)" />
-              <LegendRow swatch={<LegendLine color="rgb(107,114,128)" width={1.5} />} label="실–유령 짝선" />
+              <LegendRow swatch={<LegendLine color="rgb(59,130,246)" width={1.5} />} label="실표적–레이더" />
+              <LegendRow
+                swatch={<LegendLine color="rgb(233,69,96)" width={1.5} dashed />}
+                label="유령표적–레이더 (점선)"
+              />
               <LegendRow
                 swatch={
                   <svg width={16} height={12} viewBox="0 0 16 12" className="shrink-0">
@@ -944,15 +980,12 @@ export default function DualTargetAnalysis() {
   const zoomClusters = useMemo<ZoomCluster[]>(() => {
     const scale = 512 * Math.pow(2, mapZoom);
 
-    // 1) 화면 픽셀 좌표 투영 (위도는 메르카토르 발산 방지로 ±85° 클램프 — 국내 자료라 실질 무영향)
+    // 1) 화면 픽셀 좌표 투영
     const items: ReflectorCluster[] = [];
     const px: number[] = [];
     const py: number[] = [];
     for (const c of displayClusters) {
-      const lat = Math.min(85, Math.max(-85, c.latitude));
-      const x = ((c.longitude + 180) / 360) * scale;
-      const phi = (lat * Math.PI) / 180;
-      const y = ((1 - Math.log(Math.tan(Math.PI / 4 + phi / 2)) / Math.PI) / 2) * scale;
+      const [x, y] = projMerc(c.longitude, c.latitude, scale);
       if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
       items.push(c);
       px.push(x);
@@ -1016,6 +1049,86 @@ export default function DualTargetAnalysis() {
     out.sort((a, b) => b.count - a.count);
     return out;
   }, [displayClusters, mapZoom]);
+
+  /**
+   * 유령표적 → 레이더 방사선의 **점선 세그먼트**(deck.gl 바이너리 속성).
+   * PathStyleExtension(@deck.gl/extensions)은 미설치이고 의존성 추가가 금지돼 있어,
+   * 화면 픽셀(Web Mercator) 공간에서 선을 직접 잘라 점선을 흉내 낸다. 픽셀 기준이라
+   * 줌이 변해도 점선 간격이 시각적으로 일정하며, 그 대가로 mapZoom 변경 시 재계산한다.
+   * 세그먼트 총량은 MAX_GHOST_DASH_SEGMENTS(20만) 로 제한 — 고줌에서는 선 하나가 수만 px
+   * 이라 고정 주기(10px)를 그대로 쓰면 세그먼트가 폭증한다. 넘치면 주기를 늘려(듀티 60/40
+   * 유지) 흡수한다. 반환은 평탄 interleaved lon/lat 두 배열(전수 — 표본 추출 없음).
+   */
+  const ghostDashSegments = useMemo<{ length: number; source: Float64Array; target: Float64Array } | null>(() => {
+    if (baseEvents.length === 0 || dualSites.length === 0) return null;
+    const siteMap = new Map<string, { name: string; latitude: number; longitude: number }>();
+    for (const s of dualSites) siteMap.set(s.name, s);
+    const scale = 512 * Math.pow(2, mapZoom);
+
+    // 1) 픽셀 선분 수집 — 사이트를 못 찾은 이벤트는 방사선을 그릴 수 없어 제외
+    const gx: number[] = [];
+    const gy: number[] = [];
+    const dirX: number[] = [];
+    const dirY: number[] = [];
+    const lens: number[] = [];
+    let totalLenPx = 0;
+    for (const e of baseEvents) {
+      const site = siteMap.get(e.radar_name);
+      if (!site) continue;
+      const [ax, ay] = projMerc(e.ghost.longitude, e.ghost.latitude, scale);
+      const [bx, by] = projMerc(site.longitude, site.latitude, scale);
+      if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(bx) || !Number.isFinite(by)) continue;
+      const len = Math.hypot(bx - ax, by - ay);
+      if (!(len > 0)) continue;
+      gx.push(ax);
+      gy.push(ay);
+      dirX.push((bx - ax) / len); // 단위 방향(유령표적 → 레이더)
+      dirY.push((by - ay) / len);
+      lens.push(len);
+      totalLenPx += len;
+    }
+    if (lens.length === 0) return null;
+
+    // 2) 적응 주기 — 기본 10px 주기로 상한을 넘으면 주기를 늘리고 듀티(60%)는 유지
+    let period = DASH_ON_PX + DASH_GAP_PX;
+    let onPx = DASH_ON_PX;
+    if (totalLenPx / period > MAX_GHOST_DASH_SEGMENTS) {
+      period = totalLenPx / MAX_GHOST_DASH_SEGMENTS;
+      onPx = period * 0.6;
+    }
+
+    // 3) 1차 패스 — 세그먼트 수를 세어 배열을 선할당(성장 배열 재할당 회피)
+    const counts: number[] = [];
+    let segCount = 0;
+    for (let i = 0; i < lens.length; i++) {
+      const n = Math.ceil(lens[i] / period);
+      counts.push(n);
+      segCount += n;
+    }
+    if (segCount === 0) return null;
+
+    // 4) 2차 패스 — 유령표적 끝에서 시작해 주기 단위로 잘라 채운다
+    //    (첫 dash 가 유령표적에 붙어야 점선이 그 점에서 뻗어 나가는 것으로 읽힌다)
+    const source = new Float64Array(segCount * 2);
+    const target = new Float64Array(segCount * 2);
+    let w = 0;
+    for (let i = 0; i < lens.length; i++) {
+      const len = lens[i];
+      const n = counts[i];
+      for (let k = 0; k < n; k++) {
+        const t0 = k * period;
+        const t1 = Math.min(t0 + onPx, len);
+        const [aLon, aLat] = unprojMerc(gx[i] + dirX[i] * t0, gy[i] + dirY[i] * t0, scale);
+        const [bLon, bLat] = unprojMerc(gx[i] + dirX[i] * t1, gy[i] + dirY[i] * t1, scale);
+        source[w] = aLon;
+        source[w + 1] = aLat;
+        target[w] = bLon;
+        target[w + 1] = bLat;
+        w += 2;
+      }
+    }
+    return { length: segCount, source, target };
+  }, [baseEvents, dualSites, mapZoom]);
 
   /**
    * 반사 위치 선택 — 지도 마커·좌측 리스트 공용. 지도 이동은 하지 않는다(줌인 금지).
@@ -1222,7 +1335,8 @@ export default function DualTargetAnalysis() {
   // ── deck.gl 레이어 ────────────────────────────────────────────────
   //   전부 2D 지면 표현(고도 z 미사용). 반사 기하는 수평면 문제라 3D 고도 축을 쓰면
   //   실표적/유령표적 짝이 서로 다른 높이로 떠서 짝 관계가 읽히지 않는다.
-  //   그리기 순서(뒤 → 앞): 건물 → 사이트 → 짝선 → 실표적 → 유령표적 → 반사 위치 → 개수 → 선택 강조.
+  //   그리기 순서(뒤 → 앞): 건물 → 사이트 → 방사선(실·유령→레이더) → 실표적 → 유령표적 →
+  //   반사 위치 → 개수 → 선택 강조.
   //   (deck.gl 픽은 나중에 그린 레이어가 이기므로 건물이 표적·반사체 클릭을 가리지 않는다)
   const deckLayers = useMemo<DeckLayerList>(() => {
     /** 클러스터 원 반경(px) — count 로 완만히 증가, 26px 상한 */
@@ -1294,7 +1408,7 @@ export default function DualTargetAnalysis() {
     );
 
     // ── 선택 기체(Mode-S) 전체 항적 (워커 typed array 바이너리 속성) ──
-    //   짝선·표적보다 **아래**에 둔다. pickable:false 라 픽 버퍼에 그려지지 않으므로
+    //   방사선·표적보다 **아래**에 둔다. pickable:false 라 픽 버퍼에 그려지지 않으므로
     //   실표적 점 위에 항적 점이 겹쳐도 클릭은 항상 표적으로 간다.
     if (modeSTrack && modeSTrack.pointCount > 0) {
       layers.push(
@@ -1329,18 +1443,55 @@ export default function DualTargetAnalysis() {
       );
     }
 
+    // ── 방사선: 실표적→레이더(실선) · 유령표적→레이더(점선) ──
+    //   레이더를 공통 원점으로 두 선을 그리면 두 선이 벌어진 각이 곧 반사로 생긴 방위 오차다.
+    //   사이트 좌표를 찾을 수 없는 이벤트(미등록 레이더명)는 그릴 수 없으므로 제외한다.
+    const siteByName = new Map<string, { name: string; latitude: number; longitude: number }>();
+    for (const s of dualSites) siteByName.set(s.name, s);
+    const radialEvents = baseEvents.filter((e) => siteByName.has(e.radar_name));
+
+    if (radialEvents.length > 0) {
+      layers.push(
+        new LineLayer<DualTargetEvent>({
+          id: "dual-real-radials",
+          data: radialEvents,
+          getSourcePosition: (d) => [d.real.longitude, d.real.latitude],
+          getTargetPosition: (d) => {
+            const site = siteByName.get(d.radar_name)!; // radialEvents 는 사이트 보유분만
+            return [site.longitude, site.latitude];
+          },
+          getColor: [59, 130, 246, 150],
+          getWidth: 1,
+          widthUnits: "pixels" as const,
+          widthMinPixels: 1,
+          pickable: false,
+          // 접근자가 dualSites 를 캡처한다 — deck.gl 은 id 기준으로 접근자를 캐시하므로 명시
+          updateTriggers: { getTargetPosition: dualSites },
+        })
+      );
+    }
+    // 점선은 픽셀 공간에서 미리 잘라 둔 세그먼트를 바이너리 속성으로 한 번에 올린다
+    if (ghostDashSegments && ghostDashSegments.length > 0) {
+      layers.push(
+        new LineLayer({
+          id: "dual-ghost-radials",
+          data: {
+            length: ghostDashSegments.length,
+            attributes: {
+              getSourcePosition: { value: ghostDashSegments.source, size: 2 },
+              getTargetPosition: { value: ghostDashSegments.target, size: 2 },
+            },
+          },
+          getColor: [233, 69, 96, 170],
+          getWidth: 1,
+          widthUnits: "pixels" as const,
+          widthMinPixels: 1,
+          pickable: false,
+        })
+      );
+    }
+
     if (dualResult) layers.push(
-      new LineLayer<DualTargetEvent>({
-        id: "dual-pair-lines",
-        data: baseEvents,
-        getSourcePosition: (d) => [d.real.longitude, d.real.latitude],
-        getTargetPosition: (d) => [d.ghost.longitude, d.ghost.latitude],
-        getColor: [107, 114, 128, 110],
-        getWidth: 1,
-        widthUnits: "pixels" as const,
-        widthMinPixels: 1,
-        pickable: false,
-      }),
       new ScatterplotLayer<DualTargetEvent>({
         id: "dual-real-pts",
         data: baseEvents,
@@ -1361,7 +1512,7 @@ export default function DualTargetAnalysis() {
         getPosition: (d) => [d.ghost.longitude, d.ghost.latitude],
         getFillColor: [233, 69, 96, 220],
         getRadius: 90,
-        // 클릭 표적 확대 — 유령표적은 실표적보다 한 단계 크게(짝선 끝에서 구분)
+        // 클릭 표적 확대 — 유령표적은 실표적보다 한 단계 크게(실표적과 구분)
         radiusMinPixels: 5,
         radiusMaxPixels: 9,
         pickable: true,
@@ -1534,7 +1685,7 @@ export default function DualTargetAnalysis() {
     return layers;
     // animTime 은 의도적으로 의존성에서 제외 — 애니메이션은 DualDeckLayers 가 따로 합성한다
   }, [
-    dualResult, baseEvents, zoomClusters, dualSites, buildingPolys, modeSTrack,
+    dualResult, baseEvents, zoomClusters, ghostDashSegments, dualSites, buildingPolys, modeSTrack,
     selectedEventId, selectedClusterSet, selectedModeS, analysisRadarName,
     handleRadarChange, openBuildingDrawer, selectEventFromMap, selectCluster,
   ]);
