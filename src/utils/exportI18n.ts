@@ -135,6 +135,30 @@ const MSG008_JA: Record<string, string> = {
   "255": "EOP メッセージ",
 };
 
+// I048/250 BDS 레지스터명 (key = "BDS1,BDS2") — Rust 원문은 한글, 없으면 한글 폴백
+const BDS_EN: Record<string, string> = {
+  "0,0": "Empty register",
+  "1,0": "Data link capability",
+  "1,6": "ACAS coordination reply",
+  "1,7": "Common usage GICB",
+  "2,0": "Aircraft identification (callsign)",
+  "3,0": "ACAS resolution advisory (RA)",
+  "4,0": "Selected altitude/intent",
+  "5,0": "Track and turn report",
+  "6,0": "Heading and speed report",
+};
+const BDS_JA: Record<string, string> = {
+  "0,0": "空レジスタ",
+  "1,0": "データリンク能力",
+  "1,6": "ACAS 調整応答",
+  "1,7": "共通用途 GICB",
+  "2,0": "航空機識別（コールサイン）",
+  "3,0": "ACAS 解決勧告（RA）",
+  "4,0": "選択高度/意図",
+  "5,0": "トラック・旋回報告",
+  "6,0": "機首方位・速度報告",
+};
+
 const TTI_KO: Record<number, string> = { 0: "상대정보없음", 1: "Mode-S", 2: "ATCRBS", 3: "예비" };
 const TTI_EN: Record<number, string> = { 0: "No threat data", 1: "Mode-S", 2: "ATCRBS", 3: "Reserved" };
 const TTI_JA: Record<number, string> = { 0: "相手情報なし", 1: "Mode-S", 2: "ATCRBS", 3: "予備" };
@@ -185,9 +209,9 @@ export function exportStrings(lang: ExportLang) {
     framesSheet: pick("프레임", "Frames", "フレーム"),
     framesHeaders: (tz: string) =>
       pick(
-        [`시각(${tz})`, "파일", "카테고리", "레코드", "Mode-S", "ACAS", "바이트", "오프셋", "TOD(s)"],
-        [`Time (${tz})`, "File", "Category", "Records", "Mode-S", "ACAS", "Bytes", "Offset", "TOD (s)"],
-        [`時刻 (${tz})`, "ファイル", "カテゴリ", "レコード", "Mode-S", "ACAS", "バイト", "オフセット", "TOD (s)"],
+        [`시각(${tz})`, "파일", "카테고리", "레코드", "Mode-S", "ACAS", "비상", "바이트", "오프셋", "TOD(s)"],
+        [`Time (${tz})`, "File", "Category", "Records", "Mode-S", "ACAS", "Emergency", "Bytes", "Offset", "TOD (s)"],
+        [`時刻 (${tz})`, "ファイル", "カテゴリ", "レコード", "Mode-S", "ACAS", "緊急", "バイト", "オフセット", "TOD (s)"],
       ),
 
     // ── ASTERIX 대시보드 ──
@@ -204,6 +228,11 @@ export function exportStrings(lang: ExportLang) {
       rangeHist: pick("거리 분포", "Range Distribution", "距離分布"),
       azimuthHist: pick("방위 분포", "Azimuth Distribution", "方位分布"),
       flHist: pick("고도 분포", "Altitude Distribution", "高度分布"),
+      mode3aTop: pick("Mode-3A 상위", "Top Mode-3A", "Mode-3A 上位"),
+      speedHist: pick("속도 분포", "Speed Distribution", "速度分布"),
+      bdsRegs: pick("BDS 레지스터", "BDS Registers", "BDS レジスタ"),
+      rotation: pick("안테나 회전", "Antenna Rotation", "アンテナ回転"),
+      gaps: pick("수집 공백", "Collection Gaps", "収集ギャップ"),
     },
     // 요약 시트: 항목/값 헤더 + 항목명
     sumHeader: pick(["항목", "값"], ["Item", "Value"], ["項目", "値"]),
@@ -224,12 +253,22 @@ export function exportStrings(lang: ExportLang) {
       flVInvalid: pick("고도 미검증(V)", "Altitude Not Validated (V)", "高度未検証 (V)"),
       flGGarbled: pick("고도 Garbled(G)", "Altitude Garbled (G)", "高度 Garbled (G)"),
       todShiftFiles: pick("TOD 보정 파일 수", "TOD-Corrected Files", "TOD 補正ファイル数"),
+      emg7700: pick("비상코드 7700(비상)", "Emergency 7700 (Emergency)", "緊急コード 7700（緊急）"),
+      emg7600: pick("비상코드 7600(통신두절)", "Emergency 7600 (Radio Failure)", "緊急コード 7600（通信途絶）"),
+      emg7500: pick("비상코드 7500(하이재킹)", "Emergency 7500 (Hijack)", "緊急コード 7500（ハイジャック）"),
+      simRecords: pick("SIM 표적", "Simulated Targets", "SIM 目標"),
+      trackNumbers: pick("트랙번호 고유", "Distinct Track Numbers", "トラック番号ユニーク"),
+      mode3aDistinct: pick("Mode-3/A 고유", "Distinct Mode-3/A", "Mode-3/A ユニーク"),
     },
     // 각 시트 헤더 행
     catsHeader: pick(["카테고리", "블록", "레코드"], ["Category", "Blocks", "Records"], ["カテゴリ", "ブロック", "レコード"]),
     radarTypHeader: pick(["탐지 유형", "건수"], ["Detection Type", "Count"], ["探知種別", "件数"]),
     frnHeader: pick(["FRN", "항목", "건수"], ["FRN", "Item", "Count"], ["FRN", "項目", "件数"]),
-    modesHeader: pick(["Mode-S", "건수"], ["Mode-S", "Count"], ["Mode-S", "件数"]),
+    modesHeader: pick(
+      ["Mode-S", "건수", "호출부호"],
+      ["Mode-S", "Count", "Callsign"],
+      ["Mode-S", "件数", "コールサイン"],
+    ),
     sacSicHeader: pick(["SAC", "SIC", "건수"], ["SAC", "SIC", "Count"], ["SAC", "SIC", "件数"]),
     msgHeader: pick(["분류", "유형", "건수"], ["Class", "Type", "Count"], ["分類", "種別", "件数"]),
     filesHeader: (tz: string) =>
@@ -247,10 +286,34 @@ export function exportStrings(lang: ExportLang) {
     rangeHeader: pick(["거리(NM)", "건수"], ["Range (NM)", "Count"], ["距離 (NM)", "件数"]),
     azimuthHeader: pick(["방위(°)", "건수"], ["Azimuth (°)", "Count"], ["方位 (°)", "件数"]),
     flHeader: pick(["고도", "건수"], ["Altitude", "Count"], ["高度", "件数"]),
+    mode3aHeader: pick(["코드", "건수"], ["Code", "Count"], ["コード", "件数"]),
+    speedHeader: pick(["속도(kt)", "건수"], ["Speed (kt)", "Count"], ["速度 (kt)", "件数"]),
+    bdsHeader: pick(["BDS", "레지스터", "블록 수"], ["BDS", "Register", "Blocks"], ["BDS", "レジスタ", "ブロック数"]),
+    rotationHeader: pick(
+      [
+        "SAC", "SIC", "North marker", "회전수", "평균(s)", "표준편차(s)", "최소(s)", "최대(s)",
+        "보고주기(s)", "섹터 메시지", "섹터/회전", "누락 섹터",
+      ],
+      [
+        "SAC", "SIC", "North Markers", "Rotations", "Mean (s)", "Std Dev (s)", "Min (s)", "Max (s)",
+        "Reported Period (s)", "Sector Messages", "Sectors/Rotation", "Missing Sectors",
+      ],
+      [
+        "SAC", "SIC", "ノースマーカー", "回転数", "平均 (s)", "標準偏差 (s)", "最小 (s)", "最大 (s)",
+        "報告周期 (s)", "セクターメッセージ", "セクター/回転", "欠落セクター",
+      ],
+    ),
+    gapsHeader: (tz: string) =>
+      pick(
+        [`시작(${tz})`, `끝(${tz})`, "길이(초)"],
+        [`Start (${tz})`, `End (${tz})`, "Duration (s)"],
+        [`開始 (${tz})`, `終了 (${tz})`, "継続 (s)"],
+      ),
 
     // 값 번역기 (매핑 없으면 한글 원문 유지)
     catLabel: (cat: number) => (lang === "ja" ? CAT_JA : lang === "en" ? CAT_EN : CAT_KO)[cat] ?? catFallback(cat),
     frnName: mapped(FRN_EN, FRN_JA),
+    bdsName: mapped(BDS_EN, BDS_JA),
     radarTyp: mapped(RADAR_TYP_EN, RADAR_TYP_JA),
     msg034: mapped(MSG034_EN, MSG034_JA),
     msg008: mapped(MSG008_EN, MSG008_JA),

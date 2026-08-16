@@ -48,6 +48,43 @@ export interface TimeDensity {
   counts: number[];
 }
 
+/** CAT034 안테나 회전주기 통계 (SAC/SIC별) */
+export interface RotationStat {
+  sac: number;
+  sic: number;
+  /** North marker 메시지 수 */
+  north_count: number;
+  /** 유효 간격 수 (= 산출된 회전 수) */
+  interval_count: number;
+  period_mean_s: number;
+  period_std_s: number;
+  period_min_s: number;
+  period_max_s: number;
+  /** I034/041 보고 회전주기 평균 (관측 없으면 null) */
+  reported_period_s: number | null;
+  sector_msgs: number;
+  /** 1회전당 섹터 수 최빈값 (관측 없으면 null) */
+  expected_sectors: number | null;
+  /** Σ(expected − 실제 섹터수) */
+  missing_sectors: number;
+}
+
+/** BDS 2,0 에서 얻은 Mode-S 주소별 호출부호 */
+export interface ModeSCallsign {
+  /** 6자리 hex */
+  mode_s: string;
+  callsign: string;
+}
+
+/** 수집 공백 구간 (분 해상도) */
+export interface CollectionGap {
+  /** 공백 시작 Unix 초 (마지막 관측 분의 다음 분 경계) */
+  start_ts: number;
+  /** 공백 끝 Unix 초 (다음 관측 분 경계) */
+  end_ts: number;
+  duration_secs: number;
+}
+
 /** 대시보드 집계 통계 (scan_asterix_batch 반환) */
 export interface AsterixStats {
   file_count: number;
@@ -85,6 +122,36 @@ export interface AsterixStats {
   fl_v_invalid: number;
   /** I048/090 G=1(garbled) 레코드 수 */
   fl_g_garbled: number;
+  /** I048/070 유효(V/G=0) Mode-3/A 고유 코드 수 */
+  mode3a_distinct: number;
+  /** I048/070 유효 Mode-3/A 보유 레코드 총수 (상위 분포 분모) */
+  mode3a_records: number;
+  /** I048/070 Mode-3/A 상위 30 (key/label = 옥탈 4자리) */
+  mode3a_top: LabeledCount[];
+  /** 비상코드 — 항상 3개 고정 [7700, 7600, 7500], 0 포함 */
+  emergency_counts: LabeledCount[];
+  /** 비상 3코드 합계 레코드 수 */
+  emergency_records: number;
+  /** I048/200 속도 50kt 구간 히스토그램 */
+  speed_hist: LabeledCount[];
+  /** I048/200 속도 10kt 미만 레코드 수 */
+  speed_low_records: number;
+  /** I048/200 속도 600kt 초과 레코드 수 */
+  speed_high_records: number;
+  /** I048/020 SIM=1(시뮬레이션 표적) 레코드 수 */
+  sim_records: number;
+  /** I048/161 트랙번호 고유 수 (SAC/SIC 구분) */
+  track_numbers_distinct: number;
+  /** CAT034 안테나 회전주기 (SAC/SIC별, 회전수 내림차순) */
+  rotation_stats: RotationStat[];
+  /** I048/250 BDS 레지스터 분포 (MB 블록 기준, 내림차순) */
+  bds_reg_counts: LabeledCount[];
+  /** BDS 2,0 호출부호 (Mode-S 주소 오름차순) */
+  mode_s_callsigns: ModeSCallsign[];
+  /** 수집 공백 상위 50 (길이 내림차순) */
+  gaps: CollectionGap[];
+  /** 전체 수집 공백 수 */
+  gap_count: number;
   files: AsterixFileStat[];
 }
 
@@ -99,6 +166,8 @@ export interface AsterixFrameSummary {
   tod: number | null;
   abs_time: number | null;
   has_acas: boolean;
+  /** 프레임 내 출현한 Mode-3/A 비상코드 (옥탈 4자리, 중복 제거) */
+  emergency_codes: string[];
   /** 프레임 전문 hex (asterixDecoder.decodeFrame 입력) */
   frame_hex: string;
 }
@@ -116,4 +185,6 @@ export interface AsterixFilter {
   timeMin?: number;
   timeMax?: number;
   hasAcas?: boolean;
+  /** Mode-3/A 비상코드(7500/7600/7700) 포함 프레임만 */
+  hasEmergency?: boolean;
 }

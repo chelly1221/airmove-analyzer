@@ -10,6 +10,7 @@ import {
   X,
   FileText,
   ShieldAlert,
+  Siren,
 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -63,6 +64,12 @@ function formatTime(ts: number, tz: TzMode): string {
   const d = new Date((ts + (tz === "KST" ? KST_OFFSET_SECS : 0)) * 1000);
   const yy = String(d.getUTCFullYear()).slice(2);
   return `${yy}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+/** 수집 공백 길이 — 1시간 이상이면 `1h 23m`, 그 미만이면 `n분` */
+function fmtGapDur(secs: number): string {
+  const m = Math.round(secs / 60);
+  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}분`;
 }
 
 /** I140 TOD→UTC 보정량(시간) 표기 — 부호 명시(U+2212), 소수부는 필요할 때만 */
@@ -427,7 +434,17 @@ function AzimuthHistogram({ bins }: { bins: number[] }) {
 
 // ─── 대시보드 ────────────────────────────────────────
 
-function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode; onAcasClick?: () => void }) {
+function Dashboard({
+  stats,
+  tz,
+  onAcasClick,
+  onEmergencyClick,
+}: {
+  stats: AsterixStats;
+  tz: TzMode;
+  onAcasClick?: () => void;
+  onEmergencyClick?: () => void;
+}) {
   const recTotal = stats.record_count || 1;
   const timeRange =
     stats.time_min != null && stats.time_max != null
@@ -450,6 +467,28 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
   }, [stats.files]);
   const rangeTotal = useMemo(() => stats.range_hist.reduce((a, b) => a + b.count, 0), [stats.range_hist]);
   const flTotal = useMemo(() => stats.fl_hist.reduce((a, b) => a + b.count, 0), [stats.fl_hist]);
+  const speedTotal = useMemo(() => stats.speed_hist.reduce((a, b) => a + b.count, 0), [stats.speed_hist]);
+  const bdsTotal = useMemo(() => stats.bds_reg_counts.reduce((a, b) => a + b.count, 0), [stats.bds_reg_counts]);
+
+  // 비상코드 요약 — Rust가 [7700, 7600, 7500] 3개 고정으로 내려주므로 0도 그대로 표기
+  const emergencySub = useMemo(
+    () => stats.emergency_counts.map((e) => `${e.key} ${e.count.toLocaleString()}`).join(" · "),
+    [stats.emergency_counts],
+  );
+
+  // BDS 2,0 호출부호 — Mode-S 상위 라벨에 병기
+  const callsignMap = useMemo(
+    () => new Map(stats.mode_s_callsigns.map((c) => [c.mode_s, c.callsign])),
+    [stats.mode_s_callsigns],
+  );
+  const modesTopItems = useMemo(
+    () =>
+      stats.modes_top.map((m) => {
+        const cs = callsignMap.get(m.key);
+        return cs ? { ...m, label: `${m.label} · ${cs}` } : m;
+      }),
+    [stats.modes_top, callsignMap],
+  );
 
   // EXCEL 내보내기 — 대시보드 통계를 항목별 시트로 분리해 저장
   const [exporting, setExporting] = useState(false);
@@ -460,6 +499,8 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
     setExporting(true);
     try {
       const L = exportStrings(lang);
+      // 비상코드는 항상 3개 고정이지만 인덱스가 아닌 코드 키로 조회
+      const emg = (code: string) => stats.emergency_counts.find((e) => e.key === code)?.count ?? 0;
       const summary: Cell[][] = [
         L.sumHeader,
         [L.sum.files, stats.file_count],
@@ -469,6 +510,12 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
         [L.sum.records, stats.record_count],
         [L.sum.distinctModeS, stats.modes_distinct],
         [L.sum.acasRa, stats.acas_ra_records],
+        [L.sum.emg7700, emg("7700")],
+        [L.sum.emg7600, emg("7600")],
+        [L.sum.emg7500, emg("7500")],
+        [L.sum.simRecords, stats.sim_records],
+        [L.sum.trackNumbers, stats.track_numbers_distinct],
+        [L.sum.mode3aDistinct, stats.mode3a_distinct],
         [L.sum.timeRange, timeRange],
         [L.sum.necDates, stats.nec_dates.join(", ")],
         [L.sum.skippedBytes, stats.skipped_bytes],
@@ -489,7 +536,7 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
       for (const f of stats.cat048_frn_counts) frn.push([f.id, L.frnName(f.id, f.name), f.count]);
 
       const modes: Cell[][] = [L.modesHeader];
-      for (const m of stats.modes_top) modes.push([m.label, m.count]);
+      for (const m of stats.modes_top) modes.push([m.label, m.count, callsignMap.get(m.key) ?? ""]);
 
       const sacSic: Cell[][] = [L.sacSicHeader];
       for (const s of stats.sac_sic_counts) sacSic.push([s.sac, s.sic, s.count]);
@@ -545,6 +592,52 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
         for (const f of stats.fl_hist) rows.push([f.label, f.count]);
         sheets.push({ name: L.sheet.flHist, rows });
       }
+      if (stats.mode3a_top.length > 0) {
+        const rows: Cell[][] = [L.mode3aHeader];
+        for (const m of stats.mode3a_top) rows.push([m.label, m.count]);
+        sheets.push({ name: L.sheet.mode3aTop, rows });
+      }
+      if (stats.speed_hist.length > 0) {
+        const rows: Cell[][] = [L.speedHeader];
+        for (const s of stats.speed_hist) rows.push([s.label, s.count]);
+        sheets.push({ name: L.sheet.speedHist, rows });
+      }
+      if (stats.bds_reg_counts.length > 0) {
+        const rows: Cell[][] = [L.bdsHeader];
+        // Rust 라벨은 "키 이름" 형식 — 시트엔 키 열이 따로 있으므로 이름만 분리해 언어 매핑
+        for (const b of stats.bds_reg_counts) {
+          const koName = b.label.startsWith(`${b.key} `) ? b.label.slice(b.key.length + 1) : b.label;
+          rows.push([b.key, L.bdsName(b.key, koName), b.count]);
+        }
+        sheets.push({ name: L.sheet.bdsRegs, rows });
+      }
+      if (stats.rotation_stats.length > 0) {
+        const rows: Cell[][] = [L.rotationHeader];
+        for (const r of stats.rotation_stats) {
+          rows.push([
+            r.sac,
+            r.sic,
+            r.north_count,
+            r.interval_count,
+            Number(r.period_mean_s.toFixed(3)),
+            Number(r.period_std_s.toFixed(4)),
+            Number(r.period_min_s.toFixed(3)),
+            Number(r.period_max_s.toFixed(3)),
+            r.reported_period_s != null ? Number(r.reported_period_s.toFixed(3)) : "",
+            r.sector_msgs,
+            r.expected_sectors ?? "",
+            r.missing_sectors,
+          ]);
+        }
+        sheets.push({ name: L.sheet.rotation, rows });
+      }
+      if (stats.gaps.length > 0) {
+        const rows: Cell[][] = [L.gapsHeader(tz)];
+        for (const g of stats.gaps) {
+          rows.push([formatTime(g.start_ts, tz), formatTime(g.end_ts, tz), g.duration_secs]);
+        }
+        sheets.push({ name: L.sheet.gaps, rows });
+      }
 
       sheets.push({ name: L.sheet.files, rows: files });
 
@@ -556,7 +649,7 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
     } finally {
       setExporting(false);
     }
-  }, [exporting, stats, timeRange, tz]);
+  }, [exporting, stats, timeRange, tz, callsignMap]);
 
   return (
     <div className="space-y-3">
@@ -569,17 +662,34 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
       </div>
 
       {/* 요약 카드 */}
-      <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
         <StatCard label="파일" value={stats.file_count.toLocaleString()} sub={fmtBytes(stats.total_bytes)} />
         <StatCard label="프레임" value={stats.frame_count.toLocaleString()} />
         <StatCard label="블록" value={stats.block_count.toLocaleString()} />
         <StatCard label="레코드" value={stats.record_count.toLocaleString()} />
         <StatCard label="Mode-S(고유)" value={stats.modes_distinct.toLocaleString()} />
         <StatCard
+          label="트랙번호(고유)"
+          value={stats.track_numbers_distinct.toLocaleString()}
+          sub="SAC/SIC 구분"
+          title="I048/161 트랙 번호 — 레이더 로컬이므로 SAC/SIC별로 구분해 집계"
+        />
+        <StatCard
           label="ACAS RA"
           value={stats.acas_ra_records.toLocaleString()}
           onClick={stats.acas_ra_records > 0 ? onAcasClick : undefined}
           title={stats.acas_ra_records > 0 && onAcasClick ? "프레임 탐색에서 ACAS RA 프레임만 조회" : undefined}
+        />
+        <StatCard
+          label="비상코드"
+          value={stats.emergency_records.toLocaleString()}
+          sub={emergencySub}
+          onClick={stats.emergency_records > 0 ? onEmergencyClick : undefined}
+          title={
+            stats.emergency_records > 0 && onEmergencyClick
+              ? "프레임 탐색에서 비상코드(7500/7600/7700) 프레임만 조회"
+              : "I048/070 Mode-3/A 비상코드 7500(하이재킹)/7600(통신두절)/7700(비상)"
+          }
         />
       </div>
 
@@ -609,6 +719,38 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
           </div>
         )}
         {stats.time_density && <TimeDensityChart density={stats.time_density} tz={tz} />}
+        {stats.gaps.length > 0 && (
+          <div className="mt-2">
+            <div className="mb-0.5 flex items-baseline justify-between">
+              <span className="text-[10px] uppercase tracking-wider text-gray-400">
+                수집 공백 {stats.gap_count.toLocaleString()}곳 (분 해상도)
+              </span>
+              {stats.gap_count > stats.gaps.length && (
+                <span className="text-[10px] text-gray-400">상위 {stats.gaps.length}곳만 표시</span>
+              )}
+            </div>
+            <div className="max-h-40 overflow-auto rounded border border-gray-100">
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr className="sticky top-0 bg-gray-50 text-gray-500">
+                    <th className="px-2 py-1 text-left font-medium">시작 ({tz})</th>
+                    <th className="px-2 py-1 text-left font-medium">끝 ({tz})</th>
+                    <th className="px-2 py-1 text-right font-medium">길이</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.gaps.map((g, i) => (
+                    <tr key={`${g.start_ts}:${i}`} className="border-t border-gray-100">
+                      <td className="px-2 py-1 font-mono text-gray-600">{formatTime(g.start_ts, tz)}</td>
+                      <td className="px-2 py-1 font-mono text-gray-600">{formatTime(g.end_ts, tz)}</td>
+                      <td className="px-2 py-1 text-right tabular-nums text-gray-700">{fmtGapDur(g.duration_secs)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </Section>
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -660,6 +802,30 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
           </div>
         </Section>
 
+        {/* 속도 분포 (I200) — 분모는 I200 보유 레코드 */}
+        <Section title="속도 분포 (I048/200)">
+          <LabeledBars items={stats.speed_hist} total={speedTotal} color="#0f766e" />
+          <div className="mt-1 text-[10px] text-gray-400">
+            정지 미만(&lt;10kt) {stats.speed_low_records.toLocaleString()}건 · 600kt 초과{" "}
+            {stats.speed_high_records.toLocaleString()}건
+          </div>
+        </Section>
+
+        {/* Mode-3/A 코드 상위 (I070) — 분모는 유효 Mode-3/A 보유 레코드 */}
+        <Section
+          title="Mode-3/A 코드 상위 (I048/070)"
+          right={<span className="text-[10px] text-gray-400">고유 {stats.mode3a_distinct.toLocaleString()}개</span>}
+        >
+          <div className="max-h-72 overflow-auto">
+            <LabeledBars items={stats.mode3a_top} total={stats.mode3a_records} color="#0369a1" />
+          </div>
+        </Section>
+
+        {/* BDS 레지스터 분포 (I250) — 분모는 MB 블록 총수 */}
+        <Section title="BDS 레지스터 (I048/250)">
+          <LabeledBars items={stats.bds_reg_counts} total={bdsTotal} color="#7c3aed" />
+        </Section>
+
         {/* CAT048 데이터 항목 출현 빈도 */}
         <Section title="CAT048 데이터 항목 출현 (전체 레코드 대비)">
           <LabeledBars
@@ -675,7 +841,7 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
             <div className="text-[11px] text-gray-400">없음</div>
           ) : (
             <div className="max-h-72 overflow-auto">
-              <LabeledBars items={stats.modes_top} total={recTotal} color="#0f766e" />
+              <LabeledBars items={modesTopItems} total={recTotal} color="#0f766e" />
             </div>
           )}
         </Section>
@@ -708,6 +874,66 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
         </Section>
       </div>
 
+      {/* 안테나 회전주기 (CAT034 North marker 간격) */}
+      <Section title="안테나 회전주기 (CAT034)">
+        {stats.rotation_stats.length === 0 ? (
+          <div className="text-[11px] text-gray-400">없음</div>
+        ) : (
+          <div className="overflow-auto rounded border border-gray-100">
+            <table className="w-full text-[11px]">
+              <thead>
+                <tr className="bg-gray-50 text-gray-500">
+                  <th className="px-2 py-1 text-left font-medium">SAC/SIC</th>
+                  <th className="px-2 py-1 text-right font-medium">회전수</th>
+                  <th className="px-2 py-1 text-right font-medium">평균(s)</th>
+                  <th className="px-2 py-1 text-right font-medium">σ(s)</th>
+                  <th className="px-2 py-1 text-right font-medium">최소–최대(s)</th>
+                  <th className="px-2 py-1 text-right font-medium">보고주기(s)</th>
+                  <th className="px-2 py-1 text-right font-medium">섹터/회전</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stats.rotation_stats.map((r) => (
+                  <tr key={`${r.sac}/${r.sic}`} className="border-t border-gray-100">
+                    <td className="px-2 py-1 text-gray-700">
+                      SAC {r.sac} · SIC {r.sic}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                      {r.interval_count.toLocaleString()}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                      {r.interval_count > 0 ? r.period_mean_s.toFixed(2) : "—"}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                      {r.interval_count > 0 ? r.period_std_s.toFixed(3) : "—"}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                      {r.interval_count > 0
+                        ? `${r.period_min_s.toFixed(2)}–${r.period_max_s.toFixed(2)}`
+                        : "—"}
+                    </td>
+                    <td
+                      className="px-2 py-1 text-right tabular-nums text-gray-600"
+                      title="I034/041 안테나 회전주기 보고값 평균"
+                    >
+                      {r.reported_period_s != null ? r.reported_period_s.toFixed(2) : "—"}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-gray-600">
+                      {r.expected_sectors != null ? r.expected_sectors.toLocaleString() : "—"}
+                      {r.missing_sectors > 0 && (
+                        <span className="ml-1 text-[#e94560]" title="Σ(최빈 섹터수 − 실제 섹터수)">
+                          · 누락 {r.missing_sectors.toLocaleString()}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Section>
+
       {/* 품질/파싱 지표 */}
       <Section title="파싱 품질 지표">
         <div className="grid grid-cols-2 gap-2 text-[11px] md:grid-cols-3">
@@ -717,6 +943,7 @@ function Dashboard({ stats, tz, onAcasClick }: { stats: AsterixStats; tz: TzMode
           <div><span className="text-gray-400">Mode-3/A 무효 </span><span className="tabular-nums text-gray-700">{stats.mode3a_garbled.toLocaleString()}</span></div>
           <div title="I048/090 V=1 — 고도값이 검증되지 않음(고도는 그대로 수용)"><span className="text-gray-400">고도 미검증(V) </span><span className="tabular-nums text-gray-700">{stats.fl_v_invalid.toLocaleString()}</span></div>
           <div title="I048/090 G=1 — 고도값 garbled(고도는 그대로 수용)"><span className="text-gray-400">고도 Garbled(G) </span><span className="tabular-nums text-gray-700">{stats.fl_g_garbled.toLocaleString()}</span></div>
+          <div title="I048/020 SIM=1 — 시뮬레이션 표적보고"><span className="text-gray-400">SIM 표적 </span><span className="tabular-nums text-gray-700">{stats.sim_records.toLocaleString()}</span></div>
         </div>
       </Section>
 
@@ -786,12 +1013,17 @@ function FrameBrowser({
   setTz,
   acasSignal,
   onAcasHandled,
+  emergencySignal,
+  onEmergencyHandled,
 }: {
   tz: TzMode;
   setTz: (t: TzMode) => void;
   /** 대시보드 ACAS RA 카드에서 넘어온 점프 신호 (0 = 없음) */
   acasSignal: number;
   onAcasHandled: () => void;
+  /** 대시보드 비상코드 카드에서 넘어온 점프 신호 (0 = 없음) */
+  emergencySignal: number;
+  onEmergencyHandled: () => void;
 }) {
   const filePaths = useAppStore((s) => s.asterixFilePaths);
   const aircraft = useAppStore((s) => s.aircraft);
@@ -802,6 +1034,7 @@ function FrameBrowser({
   const [endDt, setEndDt] = useState("");
   const [dateOpen, setDateOpen] = useState(false);
   const [acasOnly, setAcasOnly] = useState(false);
+  const [emergencyOnly, setEmergencyOnly] = useState(false);
 
   const [querying, setQuerying] = useState(false);
   const [result, setResult] = useState<AsterixQueryResult | null>(null);
@@ -818,6 +1051,7 @@ function FrameBrowser({
     if (tMin != null) filter.timeMin = tMin;
     if (tMax != null) filter.timeMax = tMax;
     if (acasOnly) filter.hasAcas = true;
+    if (emergencyOnly) filter.hasEmergency = true;
 
     setQuerying(true);
     try {
@@ -831,7 +1065,7 @@ function FrameBrowser({
     } finally {
       setQuerying(false);
     }
-  }, [querying, search, catFilter, startDt, endDt, acasOnly, tz, filePaths]);
+  }, [querying, search, catFilter, startDt, endDt, acasOnly, emergencyOnly, tz, filePaths]);
 
   // 파일 업로드 시 필터 없는 전체 검색을 1회 자동 실행 (동일 파일셋 중복 방지)
   const autoSearchedPaths = useRef<string[] | null>(null);
@@ -841,8 +1075,8 @@ function FrameBrowser({
       return;
     }
     if (autoSearchedPaths.current === filePaths) return;
-    // ACAS 점프로 진입한 마운트면 아래 점프 effect가 대신 조회 (경합 방지)
-    if (acasSignal > 0) {
+    // ACAS/비상코드 점프로 진입한 마운트면 아래 점프 effect가 대신 조회 (경합 방지)
+    if (acasSignal > 0 || emergencySignal > 0) {
       autoSearchedPaths.current = filePaths;
       return;
     }
@@ -854,6 +1088,7 @@ function FrameBrowser({
     setStartDt("");
     setEndDt("");
     setAcasOnly(false);
+    setEmergencyOnly(false);
     setQuerying(true);
     invoke<AsterixQueryResult>("query_asterix_frames", { filePaths, filter: {} })
       .then((res) => {
@@ -876,6 +1111,7 @@ function FrameBrowser({
     setStartDt("");
     setEndDt("");
     setAcasOnly(true);
+    setEmergencyOnly(false);
     onAcasHandled();
 
     // 상태 반영을 기다리지 않고 명시 필터로 즉시 조회
@@ -894,14 +1130,41 @@ function FrameBrowser({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [acasSignal]);
 
+  // 대시보드 비상코드 카드 → 이 탭으로 점프: 필터를 비상코드 전용으로 바꾸고 즉시 조회
+  useEffect(() => {
+    if (emergencySignal <= 0) return;
+    setSearch("");
+    setCatFilter(null);
+    setStartDt("");
+    setEndDt("");
+    setAcasOnly(false);
+    setEmergencyOnly(true);
+    onEmergencyHandled();
+
+    setQuerying(true);
+    invoke<AsterixQueryResult>("query_asterix_frames", { filePaths, filter: { hasEmergency: true } })
+      .then((res) => {
+        setResult(res);
+        setSearched(true);
+      })
+      .catch((e) => {
+        console.error("[ASTERIX] 비상코드 조회 실패:", e);
+        setResult({ total_matched: 0, truncated: false, frames: [] });
+        setSearched(true);
+      })
+      .finally(() => setQuerying(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [emergencySignal]);
+
   const clearFilters = () => {
     setSearch("");
     setCatFilter(null);
     setStartDt("");
     setEndDt("");
     setAcasOnly(false);
+    setEmergencyOnly(false);
   };
-  const anyFilter = !!(search || catFilter != null || startDt || endDt || acasOnly);
+  const anyFilter = !!(search || catFilter != null || startDt || endDt || acasOnly || emergencyOnly);
 
   // 상세 프레임 디코드
   const frameBytes = useMemo<number[]>(() => {
@@ -930,6 +1193,7 @@ function FrameBrowser({
           f.record_count,
           f.mode_s_list.join(", "),
           f.has_acas ? "Y" : "",
+          f.emergency_codes.join(", "),
           f.byte_len,
           `0x${f.frame_offset.toString(16)}`,
           f.tod != null ? Number(f.tod.toFixed(3)) : null,
@@ -1028,6 +1292,18 @@ function FrameBrowser({
           ACAS RA
         </button>
 
+        {/* Mode-3/A 비상코드 전용 토글 */}
+        <button
+          onClick={() => setEmergencyOnly((v) => !v)}
+          title="Mode-3/A 비상코드(7500 하이재킹 · 7600 통신두절 · 7700 비상) 포함 프레임만 조회"
+          className={`inline-flex h-7 items-center gap-1.5 rounded-md border bg-white px-2.5 text-[10.5px] font-medium transition-colors ${
+            emergencyOnly ? "border-[#a60739]/30 bg-[#a60739]/8 text-[#a60739]" : "border-gray-200 text-gray-500 hover:text-gray-700"
+          }`}
+        >
+          <Siren size={12} />
+          비상코드
+        </button>
+
         <button
           onClick={runQuery}
           disabled={querying}
@@ -1072,7 +1348,7 @@ function FrameBrowser({
               <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-left font-medium text-gray-600">카테고리</th>
               <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-right font-medium text-gray-600">레코드</th>
               <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-left font-medium text-gray-600">Mode-S</th>
-              <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-center font-medium text-gray-600">ACAS</th>
+              <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-center font-medium text-gray-600">경보</th>
               <th className="sticky top-0 z-10 bg-gray-50 px-3 py-2 text-right font-medium text-gray-600">바이트</th>
               <th className="sticky top-0 z-10 w-24 bg-gray-50 px-3 py-2 text-center font-medium text-gray-600">전문</th>
             </tr>
@@ -1099,7 +1375,25 @@ function FrameBrowser({
                         : `${f.mode_s_list.slice(0, 2).join(", ")}${f.mode_s_list.length > 2 ? ` +${f.mode_s_list.length - 2}` : ""}`}
                   </td>
                   <td className="px-3 py-1.5 text-center">
-                    {f.has_acas ? <ShieldAlert size={13} className="inline text-[#a60739]" /> : <span className="text-gray-300">—</span>}
+                    {f.has_acas || f.emergency_codes.length > 0 ? (
+                      <span className="inline-flex items-center justify-center gap-1">
+                        {f.has_acas && (
+                          <span title="ACAS RA" className="inline-flex">
+                            <ShieldAlert size={13} className="text-[#a60739]" />
+                          </span>
+                        )}
+                        {f.emergency_codes.length > 0 && (
+                          <span
+                            title="Mode-3/A 비상코드"
+                            className="rounded bg-[#e94560] px-1 py-px text-[9px] font-semibold tabular-nums text-white"
+                          >
+                            {f.emergency_codes.join(", ")}
+                          </span>
+                        )}
+                      </span>
+                    ) : (
+                      <span className="text-gray-300">—</span>
+                    )}
                   </td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-gray-500">{f.byte_len}</td>
                   <td className="px-3 py-1.5 text-center">
@@ -1176,8 +1470,9 @@ export default function AsterixAnalysis() {
   // 라우트 파라미터 → 내부 탭 (기본값: 프레임 탐색)
   const tab: InnerTab = tabParam === "stats" ? "dashboard" : "frames";
   const [tz, setTz] = useState<TzMode>("KST");
-  // 대시보드 ACAS RA 카드 → 프레임 탐색 점프 신호
+  // 대시보드 ACAS RA / 비상코드 카드 → 프레임 탐색 점프 신호
   const [acasSignal, setAcasSignal] = useState(0);
+  const [emergencySignal, setEmergencySignal] = useState(0);
 
   return (
     <div className="flex h-full flex-col bg-white">
@@ -1225,9 +1520,20 @@ export default function AsterixAnalysis() {
                 navigate("/asterix/frames");
                 setAcasSignal((s) => s + 1);
               }}
+              onEmergencyClick={() => {
+                navigate("/asterix/frames");
+                setEmergencySignal((s) => s + 1);
+              }}
             />
           ) : (
-            <FrameBrowser tz={tz} setTz={setTz} acasSignal={acasSignal} onAcasHandled={() => setAcasSignal(0)} />
+            <FrameBrowser
+              tz={tz}
+              setTz={setTz}
+              acasSignal={acasSignal}
+              onAcasHandled={() => setAcasSignal(0)}
+              emergencySignal={emergencySignal}
+              onEmergencyHandled={() => setEmergencySignal(0)}
+            />
           )}
         </div>
       )}

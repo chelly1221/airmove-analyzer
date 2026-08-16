@@ -102,6 +102,12 @@ struct Cat048Record {
     bds30_mb: Option<[u8; 7]>,
     /// I048/250 Mode-S MB 블록 중 BDS 1,6 (ACAS Coordination Reply) 의 7바이트 페이로드
     bds16_mb: Option<[u8; 7]>,
+    /// I048/250 MB 블록별 BDS 식별 바이트(BDS1<<4|BDS2) — 통계 전용, 최대 8개 고정 배열(힙 할당 없음)
+    bds_regs: [u8; 8],
+    /// bds_regs 유효 길이 (REP > 8 초과분은 무시)
+    bds_regs_len: u8,
+    /// I048/250 Mode-S MB 블록 중 BDS 2,0 (항공기 식별) 의 7바이트 페이로드 — 최초 1개만
+    bds20_mb: Option<[u8; 7]>,
 }
 
 /// 유령 표적 탐지용 추가 데이터 (극좌표 + Track Number)
@@ -1934,6 +1940,11 @@ fn parse_cat048_record(
                     let bds_byte = block[off + 7];
                     let bds1 = (bds_byte >> 4) & 0x0F;
                     let bds2 = bds_byte & 0x0F;
+                    // 레지스터 분포 통계용 — 고정 배열에만 기록(초과분 무시, 힙 할당 없음)
+                    if (record.bds_regs_len as usize) < record.bds_regs.len() {
+                        record.bds_regs[record.bds_regs_len as usize] = bds_byte;
+                        record.bds_regs_len += 1;
+                    }
                     if bds1 == 3 && bds2 == 0 {
                         let mut buf = [0u8; 7];
                         buf.copy_from_slice(&block[off..off + 7]);
@@ -1942,6 +1953,11 @@ fn parse_cat048_record(
                         let mut buf = [0u8; 7];
                         buf.copy_from_slice(&block[off..off + 7]);
                         record.bds16_mb = Some(buf);
+                    } else if bds1 == 2 && bds2 == 0 && record.bds20_mb.is_none() {
+                        // 호출부호 디코드는 통계 경로에서만 — 여기서는 원문 7바이트만 보관
+                        let mut buf = [0u8; 7];
+                        buf.copy_from_slice(&block[off..off + 7]);
+                        record.bds20_mb = Some(buf);
                     }
                 }
                 pos += mb_size;
@@ -2204,6 +2220,120 @@ pub struct LabeledCount {
     pub count: u64,
 }
 
+/// Mode-3/A 비상코드 — 저장값이 옥탈 4자리 그대로이므로 옥탈 리터럴과 직접 비교.
+/// 순서 = 대시보드 표기 순서 [비상, 통신두절, 하이재킹].
+const EMERGENCY_CODES: [(u16, &str); 3] = [
+    (0o7700, "7700 비상"),
+    (0o7600, "7600 통신두절"),
+    (0o7500, "7500 하이재킹"),
+];
+
+/// Mode-3/A 코드가 비상 3코드(7500/7600/7700) 중 하나인지.
+fn is_emergency_code(code: u16) -> bool {
+    EMERGENCY_CODES.iter().any(|&(c, _)| c == code)
+}
+
+/// I048/250 BDS 레지스터 식별 바이트(BDS1<<4|BDS2) → 한글 설명.
+fn bds_reg_label(packed: u8) -> &'static str {
+    match (packed >> 4, packed & 0x0F) {
+        (0, 0) => "빈 레지스터",
+        (1, 0) => "데이터링크 능력",
+        (1, 6) => "ACAS 조정응답",
+        (1, 7) => "공통용도 GICB",
+        (2, 0) => "항공기 식별(콜사인)",
+        (3, 0) => "ACAS 해결권고(RA)",
+        (4, 0) => "선택고도/의도",
+        (5, 0) => "트랙·선회 보고",
+        (6, 0) => "기수방위·속도 보고",
+        _ => "기타",
+    }
+}
+
+/// BDS 2,0(항공기 식별) MB 페이로드 → 호출부호.
+/// bit 1–8 = 포맷 코드 0x20, bit 9–56 = 8문자 × 6비트 IA5.
+/// 포맷 코드 불일치 또는 정의되지 않은 문자코드가 하나라도 있으면 전체 폐기(None).
+/// (프런트 `utils/bdsDecoder.ts` 의 ia5()/bds20() 과 동일 규칙)
+fn decode_bds20_callsign(mb: &[u8; 7]) -> Option<String> {
+    if mb[0] != 0x20 {
+        return None;
+    }
+    // bit 9–56 = 뒤쪽 6바이트(48비트)
+    let mut bits: u64 = 0;
+    for &b in &mb[1..7] {
+        bits = (bits << 8) | b as u64;
+    }
+    let mut cs = String::with_capacity(8);
+    for i in 0..8 {
+        let code = ((bits >> (42 - i * 6)) & 0x3F) as u8;
+        let ch = match code {
+            1..=26 => (b'A' + code - 1) as char,
+            48..=57 => (b'0' + code - 48) as char,
+            32 => ' ',
+            _ => return None,
+        };
+        cs.push(ch);
+    }
+    let trimmed = cs.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// CAT034 North marker 간격(초) — 자정 wrap 보정 후 유효 범위(0.5–30초)면 Some.
+fn north_interval(prev_tod: f64, cur_tod: f64) -> Option<f64> {
+    let mut d = cur_tod - prev_tod;
+    if d < -43200.0 {
+        d += 86400.0;
+    }
+    if (0.5..=30.0).contains(&d) {
+        Some(d)
+    } else {
+        None
+    }
+}
+
+/// CAT034 안테나 회전주기 통계 (SAC/SIC별).
+#[derive(Serialize, Clone)]
+pub struct RotationStat {
+    pub sac: u8,
+    pub sic: u8,
+    /// North marker 메시지 수
+    pub north_count: u64,
+    /// 유효 간격 수 (= 산출된 회전 수)
+    pub interval_count: u64,
+    pub period_mean_s: f64,
+    pub period_std_s: f64,
+    pub period_min_s: f64,
+    pub period_max_s: f64,
+    /// I034/041 보고 회전주기 평균 (관측 없으면 None)
+    pub reported_period_s: Option<f64>,
+    pub sector_msgs: u64,
+    /// 1회전당 섹터 수 최빈값 (관측 없으면 None)
+    pub expected_sectors: Option<u32>,
+    /// Σ(expected − 실제 섹터수), 실제 < expected 인 회전만
+    pub missing_sectors: u64,
+}
+
+/// BDS 2,0 에서 얻은 Mode-S 주소별 호출부호.
+#[derive(Serialize, Clone)]
+pub struct ModeSCallsign {
+    /// 6자리 hex
+    pub mode_s: String,
+    pub callsign: String,
+}
+
+/// 수집 공백 구간 (분 해상도 — abs_time 분 버킷의 연속 0-run).
+#[derive(Serialize, Clone)]
+pub struct CollectionGap {
+    /// 공백 시작 = 마지막 관측 분의 다음 분 경계 (Unix 초)
+    pub start_ts: f64,
+    /// 공백 끝 = 다음 관측 분 경계 (Unix 초)
+    pub end_ts: f64,
+    pub duration_secs: f64,
+}
+
 #[derive(Serialize, Clone)]
 pub struct AsterixFileStat {
     pub filename: String,
@@ -2266,6 +2396,36 @@ pub struct AsterixStats {
     pub fl_v_invalid: u64,
     /// I048/090 G=1(garbled) 레코드 수
     pub fl_g_garbled: u64,
+    /// I048/070 유효(V/G=0) Mode-3/A 고유 코드 수
+    pub mode3a_distinct: usize,
+    /// I048/070 유효 Mode-3/A 보유 레코드 총수 (상위 분포 분모)
+    pub mode3a_records: u64,
+    /// I048/070 Mode-3/A 상위 30 (key/label = 옥탈 4자리)
+    pub mode3a_top: Vec<LabeledCount>,
+    /// 비상코드 — 항상 3개 고정 [7700, 7600, 7500], 0 포함
+    pub emergency_counts: Vec<LabeledCount>,
+    /// 비상 3코드 합계 레코드 수
+    pub emergency_records: u64,
+    /// I048/200 속도 50kt 구간 히스토그램 (0번 구간부터 마지막 관측 구간까지 연속)
+    pub speed_hist: Vec<LabeledCount>,
+    /// I048/200 속도 10kt 미만 레코드 수
+    pub speed_low_records: u64,
+    /// I048/200 속도 600kt 초과 레코드 수
+    pub speed_high_records: u64,
+    /// I048/020 SIM=1(시뮬레이션 표적) 레코드 수
+    pub sim_records: u64,
+    /// I048/161 트랙번호 고유 수 (SAC/SIC 구분 — 트랙번호는 레이더 로컬)
+    pub track_numbers_distinct: usize,
+    /// CAT034 안테나 회전주기 (SAC/SIC별, 회전수 내림차순)
+    pub rotation_stats: Vec<RotationStat>,
+    /// I048/250 BDS 레지스터 분포 (MB 블록 기준, 내림차순)
+    pub bds_reg_counts: Vec<LabeledCount>,
+    /// BDS 2,0 호출부호 (Mode-S 주소별 최초 유효값, 주소 오름차순)
+    pub mode_s_callsigns: Vec<ModeSCallsign>,
+    /// 수집 공백 상위 50 (길이 내림차순, 분 해상도)
+    pub gaps: Vec<CollectionGap>,
+    /// 전체 수집 공백 수
+    pub gap_count: u64,
     pub files: Vec<AsterixFileStat>,
 }
 
@@ -2282,6 +2442,8 @@ pub struct AsterixFilter {
     pub time_max: Option<f64>,
     /// ACAS RA(I260/BDS3,0) 포함 여부
     pub has_acas: Option<bool>,
+    /// Mode-3/A 비상코드(7500/7600/7700) 포함 여부
+    pub has_emergency: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -2295,6 +2457,8 @@ pub struct AsterixFrameSummary {
     pub tod: Option<f64>,
     pub abs_time: Option<f64>,
     pub has_acas: bool,
+    /// 프레임 내 출현한 Mode-3/A 비상코드(옥탈 4자리, 중복 제거)
+    pub emergency_codes: Vec<String>,
     /// 프레임 전문 hex (NEC 헤더 + 모든 블록). 프런트가 asterixDecoder로 디코드.
     pub frame_hex: String,
 }
@@ -2354,6 +2518,40 @@ struct StatAccum {
     fl_v_invalid: u64,
     /// I090 G=1 레코드 수
     fl_g_garbled: u64,
+    /// I070 Mode-3/A 코드별 레코드 수 (V/G=0 유효값만)
+    mode3a_counts: HashMap<u16, u64>,
+    /// I200 속도 50kt 구간 (bin = kts/50, 39 클램프)
+    speed_bins: HashMap<u16, u64>,
+    /// I200 속도 10kt 미만 / 600kt 초과 레코드 수
+    speed_low: u64,
+    speed_high: u64,
+    /// I020 SIM=1 레코드 수
+    sim_records: u64,
+    /// I161 트랙번호 고유 집합 (SAC/SIC + 트랙번호 — 트랙번호는 레이더 로컬)
+    track_ids: std::collections::HashSet<(u8, u8, u16)>,
+    /// I250 BDS 식별 바이트별 MB 블록 수
+    bds_counts: HashMap<u8, u64>,
+    /// Mode-S 주소별 최초 유효 호출부호 (BDS 2,0)
+    callsigns: HashMap<u32, String>,
+    /// CAT034 SAC/SIC별 안테나 회전 누산
+    rotation: HashMap<(u8, u8), RotAccum>,
+}
+
+/// CAT034 안테나 회전 누산 (SAC/SIC별) — finalize에서 RotationStat으로 확정.
+#[derive(Default)]
+struct RotAccum {
+    north_count: u64,
+    interval_count: u64,
+    sum: f64,
+    sumsq: f64,
+    min: f64,
+    max: f64,
+    /// I034/041 보고 회전주기 누적
+    reported_sum: f64,
+    reported_count: u64,
+    sector_msgs: u64,
+    /// 1회전당 섹터 수 → 회전 수
+    sectors_hist: HashMap<u32, u64>,
 }
 
 /// 스캔 진행 상태 (커맨드가 파일별로 누적 후 finalize).
@@ -2384,6 +2582,26 @@ struct ScanRecord {
     flight_level: Option<f64>,
     fl_v: bool,
     fl_g: bool,
+    /// I048/070 Mode-3/A 코드 (V/G=0 유효값, 옥탈 4자리 그대로)
+    mode3a: Option<u16>,
+    /// I048/200 대지속도 (kt)
+    ground_speed_kts: Option<f64>,
+    /// I048/020 SIM 플래그
+    sim: bool,
+    /// I048/161 트랙번호
+    track_number: Option<u16>,
+    /// I048/250 MB 블록별 BDS 식별 바이트 (최대 8개)
+    bds_regs: [u8; 8],
+    bds_regs_len: u8,
+    /// BDS 2,0 호출부호 (통계 경로에서만 디코드 — 메인 파서 비용 0)
+    callsign: Option<String>,
+    /// CAT034 I034/030 시각(TOD, 초) — tod/abs_time 과 분리(기존 시각 집계 오염 방지)
+    svc_tod: Option<f64>,
+    /// CAT034 I034/020 섹터번호 — 집계는 섹터 통과 "건수" 기준이라 값 자체는 미사용(전문 진단용 보존)
+    #[allow(dead_code)]
+    sector_number: Option<u8>,
+    /// CAT034 I034/041 안테나 회전주기(초)
+    antenna_period_s: Option<f64>,
 }
 
 /// 한 프레임(NEC 헤더~다음 헤더 직전, 또는 비프레이밍 시 단일 블록).
@@ -2424,11 +2642,29 @@ fn asterix_date_context(path: &str, data: &[u8]) -> (Vec<(i64, u8, u8)>, f64, Op
     (valid_dates, base_date_secs, start_tod)
 }
 
+/// CAT034/008 블록 선두 파싱 결과.
+#[derive(Default)]
+struct GenericMsg {
+    msg_type: Option<u8>,
+    sac: u8,
+    sic: u8,
+    /// CAT034 전용 — I034/030 시각(TOD, 초)
+    tod: Option<f64>,
+    /// CAT034 전용 — I034/020 섹터번호
+    sector_number: Option<u8>,
+    /// CAT034 전용 — I034/041 안테나 회전주기(초)
+    antenna_period_s: Option<f64>,
+}
+
 /// CAT034/008 블록 선두에서 (메시지유형 I000, SAC, SIC) 추출 (best-effort).
-/// 일반 UAP: FRN1=I010(2B), FRN2=I000(1B). 그 외 항목 레이아웃은 무시.
-fn parse_generic_msg(block: &[u8]) -> (Option<u8>, u8, u8) {
+/// 일반 UAP: FRN1=I010(2B), FRN2=I000(1B).
+/// CAT034 는 이어서 FRN3=I034/030 TOD(3B, LSB 1/128s), FRN4=I034/020 섹터번호(1B),
+/// FRN5=I034/041 안테나 회전주기(2B, LSB 1/128s)까지만 순차 파싱한다.
+/// CAT008 은 FRN3부터 레이아웃이 달라 FRN2에서 중단(확장 금지).
+fn parse_generic_msg(block: &[u8], cat: u8) -> GenericMsg {
+    let mut out = GenericMsg::default();
     if block.len() < 4 {
-        return (None, 0, 0);
+        return out;
     }
     let rec = &block[3..]; // CAT(1)+LEN(2) 이후
     let mut pos = 0usize;
@@ -2451,28 +2687,65 @@ fn parse_generic_msg(block: &[u8]) -> (Option<u8>, u8, u8) {
         }
     }
     let mut p = pos;
-    let (mut sac, mut sic, mut msg) = (0u8, 0u8, None);
     for &fr in &present {
+        // FRN3 이후는 CAT034 전용 레이아웃 — CAT008 은 I000 부재 등 어떤 FSPEC 조합에서도 확장 파싱 금지
+        if fr >= 2 && cat != CAT034 {
+            break;
+        }
         match fr {
+            // FRN1 = I010 데이터 출처 식별
             0 => {
                 if p + 2 <= rec.len() {
-                    sac = rec[p];
-                    sic = rec[p + 1];
+                    out.sac = rec[p];
+                    out.sic = rec[p + 1];
                     p += 2;
                 } else {
                     break;
                 }
             }
+            // FRN2 = I000 메시지 유형
             1 => {
                 if p < rec.len() {
-                    msg = Some(rec[p]);
+                    out.msg_type = Some(rec[p]);
+                    p += 1;
+                } else {
+                    break;
+                }
+            }
+            // FRN3 = I034/030 시각(TOD)
+            2 => {
+                if p + 3 <= rec.len() {
+                    let raw = ((rec[p] as u32) << 16) | ((rec[p + 1] as u32) << 8) | (rec[p + 2] as u32);
+                    let tod = raw as f64 / 128.0;
+                    if tod < MAX_TIME_OF_DAY {
+                        out.tod = Some(tod);
+                    }
+                    p += 3;
+                } else {
+                    break;
+                }
+            }
+            // FRN4 = I034/020 섹터번호
+            3 => {
+                if p < rec.len() {
+                    out.sector_number = Some(rec[p]);
+                    p += 1;
+                } else {
+                    break;
+                }
+            }
+            // FRN5 = I034/041 안테나 회전주기
+            4 => {
+                if p + 2 <= rec.len() {
+                    let raw = u16::from_be_bytes([rec[p], rec[p + 1]]);
+                    out.antenna_period_s = Some(raw as f64 / 128.0);
                 }
                 break;
             }
             _ => break,
         }
     }
-    (msg, sac, sic)
+    out
 }
 
 /// 한 ASTERIX 블록의 레코드들을 스캔 요약으로 파싱.
@@ -2514,6 +2787,8 @@ fn parse_block_records(
                     });
                     let has_acas =
                         record.acas_ra_report.is_some() || record.bds30_mb.is_some();
+                    // BDS 2,0 호출부호는 통계 경로에서만 디코드 (메인 파서 핫패스 비용 0)
+                    let callsign = record.bds20_mb.as_ref().and_then(decode_bds20_callsign);
                     recs.push(ScanRecord {
                         cat,
                         mode_s: record.mode_s_address,
@@ -2532,6 +2807,16 @@ fn parse_block_records(
                         flight_level: record.flight_level,
                         fl_v: record.fl_v_flag,
                         fl_g: record.fl_g_flag,
+                        mode3a: record.mode3a,
+                        ground_speed_kts: record.ground_speed_kts,
+                        sim: record.sim_flag,
+                        track_number: record.track_number,
+                        bds_regs: record.bds_regs,
+                        bds_regs_len: record.bds_regs_len,
+                        callsign,
+                        svc_tod: None,
+                        sector_number: None,
+                        antenna_period_s: None,
                     });
                     if next <= rec_offset {
                         break;
@@ -2558,17 +2843,18 @@ fn parse_block_records(
             }
         }
     } else if cat == CAT034 || cat == CAT008 {
-        let (msg_type, sac, sic) = parse_generic_msg(block);
+        let g = parse_generic_msg(block, cat);
         recs.push(ScanRecord {
             cat,
             mode_s: None,
+            // CAT034 시각은 svc_tod 로만 보관 — tod/abs_time 기반 기존 집계에 섞이지 않게 유지
             tod: None,
             abs_time: None,
             radar_typ: None,
-            sac,
-            sic,
+            sac: g.sac,
+            sic: g.sic,
             has_acas: false,
-            msg_type,
+            msg_type: g.msg_type,
             frns: Vec::new(),
             truncated: false,
             mode3a_garbled: false,
@@ -2577,6 +2863,16 @@ fn parse_block_records(
             flight_level: None,
             fl_v: false,
             fl_g: false,
+            mode3a: None,
+            ground_speed_kts: None,
+            sim: false,
+            track_number: None,
+            bds_regs: [0u8; 8],
+            bds_regs_len: 0,
+            callsign: None,
+            svc_tod: g.tod,
+            sector_number: g.sector_number,
+            antenna_period_s: g.antenna_period_s,
         });
     }
     recs
@@ -2697,6 +2993,9 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
     // 파일별 시각 범위 (파일별 요약 컬럼용)
     let mut file_time_min: Option<f64> = None;
     let mut file_time_max: Option<f64> = None;
+    // CAT034 회전 산출용 파일 로컬 상태: SAC/SIC → (직전 North marker TOD, North 이후 섹터 통과 수)
+    // 파일 경계에서 리셋 — 파일 간 시각 연속성은 가정하지 않는다.
+    let mut north_state: HashMap<(u8, u8), (Option<f64>, u64)> = HashMap::new();
 
     walk_asterix(
         &data,
@@ -2768,12 +3067,87 @@ pub fn asterix_scan_file(path: &str, state: &mut AsterixScanState) -> Result<(),
                         if r.fl_g {
                             acc.fl_g_garbled += 1;
                         }
+                        // Mode-3/A 코드 분포 (V/G=0 유효값만)
+                        if let Some(code) = r.mode3a {
+                            *acc.mode3a_counts.entry(code).or_insert(0) += 1;
+                        }
+                        // 속도 분포 (50kt 구간, 최대 bin 39) + 이상치
+                        if let Some(kts) = r.ground_speed_kts {
+                            let bin = ((kts / 50.0) as u16).min(39);
+                            *acc.speed_bins.entry(bin).or_insert(0) += 1;
+                            if kts < 10.0 {
+                                acc.speed_low += 1;
+                            }
+                            if kts > 600.0 {
+                                acc.speed_high += 1;
+                            }
+                        }
+                        if r.sim {
+                            acc.sim_records += 1;
+                        }
+                        // 트랙번호는 레이더 로컬 — SAC/SIC와 묶어 고유성 판정
+                        if let Some(tn) = r.track_number {
+                            acc.track_ids.insert((r.sac, r.sic, tn));
+                        }
+                        // BDS 레지스터 분포 (MB 블록 단위) + 호출부호 (주소별 최초값 유지)
+                        for i in 0..(r.bds_regs_len as usize).min(r.bds_regs.len()) {
+                            *acc.bds_counts.entry(r.bds_regs[i]).or_insert(0) += 1;
+                        }
+                        if let (Some(ms), Some(cs)) = (r.mode_s, r.callsign.as_ref()) {
+                            acc.callsigns.entry(ms).or_insert_with(|| cs.clone());
+                        }
                     }
                     CAT034 => {
                         if let Some(mt) = r.msg_type {
                             *acc.msg034.entry(mt).or_insert(0) += 1;
                         }
                         *acc.sac_sic.entry((r.sac, r.sic)).or_insert(0) += 1;
+                        // 안테나 회전주기 — North marker 간격 + 회전당 섹터 통과 수
+                        if r.antenna_period_s.is_some() || matches!(r.msg_type, Some(1) | Some(2)) {
+                            let key = (r.sac, r.sic);
+                            let rot = acc.rotation.entry(key).or_default();
+                            if let Some(p) = r.antenna_period_s {
+                                rot.reported_sum += p;
+                                rot.reported_count += 1;
+                            }
+                            match r.msg_type {
+                                // North marker — 직전 North 와의 간격이 유효하면 회전 1회로 확정
+                                Some(1) => {
+                                    let st = north_state.entry(key).or_insert((None, 0));
+                                    let sectors = st.1;
+                                    let delta = match (st.0, r.svc_tod) {
+                                        (Some(prev), Some(cur)) => north_interval(prev, cur),
+                                        _ => None,
+                                    };
+                                    if let Some(d) = delta {
+                                        if rot.interval_count == 0 {
+                                            rot.min = d;
+                                            rot.max = d;
+                                        } else {
+                                            if d < rot.min {
+                                                rot.min = d;
+                                            }
+                                            if d > rot.max {
+                                                rot.max = d;
+                                            }
+                                        }
+                                        rot.interval_count += 1;
+                                        rot.sum += d;
+                                        rot.sumsq += d * d;
+                                        *rot.sectors_hist.entry(sectors as u32).or_insert(0) += 1;
+                                    }
+                                    rot.north_count += 1;
+                                    st.0 = r.svc_tod;
+                                    st.1 = 0;
+                                }
+                                // 섹터 통과
+                                Some(2) => {
+                                    rot.sector_msgs += 1;
+                                    north_state.entry(key).or_insert((None, 0)).1 += 1;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     CAT008 => {
                         if let Some(mt) = r.msg_type {
@@ -2986,6 +3360,144 @@ pub fn asterix_finalize(state: AsterixScanState) -> AsterixStats {
         }
     };
 
+    // 수집 공백 — 분 버킷(리샘플 전 원본)의 연속 0-run. 관측 버킷만 훑어 O(n log n).
+    let mut gaps: Vec<CollectionGap> = Vec::new();
+    if !acc.time_buckets.is_empty() {
+        let mut keys: Vec<i64> = acc.time_buckets.keys().copied().collect();
+        keys.sort_unstable();
+        for w in keys.windows(2) {
+            let span = w[1] - w[0];
+            if span > 1 {
+                gaps.push(CollectionGap {
+                    start_ts: (w[0] + 1) as f64 * 60.0,
+                    end_ts: w[1] as f64 * 60.0,
+                    duration_secs: (span - 1) as f64 * 60.0,
+                });
+            }
+        }
+    }
+    let gap_count = gaps.len() as u64;
+    gaps.sort_by(|a, b| {
+        b.duration_secs
+            .partial_cmp(&a.duration_secs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    gaps.truncate(50);
+
+    // Mode-3/A 분포 — 상위 30 + 비상코드(항상 3개 고정, 0 포함)
+    let mode3a_distinct = acc.mode3a_counts.len();
+    let mode3a_records: u64 = acc.mode3a_counts.values().sum();
+    let emergency_counts: Vec<LabeledCount> = EMERGENCY_CODES
+        .iter()
+        .map(|&(code, label)| LabeledCount {
+            key: format!("{:04o}", code),
+            label: label.to_string(),
+            count: *acc.mode3a_counts.get(&code).unwrap_or(&0),
+        })
+        .collect();
+    let emergency_records: u64 = emergency_counts.iter().map(|e| e.count).sum();
+    let mut mode3a_vec: Vec<(u16, u64)> = acc.mode3a_counts.into_iter().collect();
+    mode3a_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mode3a_top: Vec<LabeledCount> = mode3a_vec
+        .into_iter()
+        .take(30)
+        .map(|(code, count)| {
+            let oct = format!("{:04o}", code);
+            LabeledCount {
+                key: oct.clone(),
+                label: oct,
+                count,
+            }
+        })
+        .collect();
+
+    // 속도 분포 — 0번 구간부터 마지막 관측 구간까지 0 포함 연속
+    let speed_hist: Vec<LabeledCount> = match acc.speed_bins.keys().max().copied() {
+        None => Vec::new(),
+        Some(last) => (0..=last)
+            .map(|b| LabeledCount {
+                key: (b as u32 * 50).to_string(),
+                label: format!("{}\u{2013}{} kt", b as u32 * 50, (b as u32 + 1) * 50),
+                count: *acc.speed_bins.get(&b).unwrap_or(&0),
+            })
+            .collect(),
+    };
+
+    // BDS 레지스터 분포 (MB 블록 수 기준, 내림차순)
+    let mut bds_vec: Vec<(u8, u64)> = acc.bds_counts.into_iter().collect();
+    bds_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let bds_reg_counts: Vec<LabeledCount> = bds_vec
+        .into_iter()
+        .map(|(packed, count)| {
+            let key = format!("{},{}", packed >> 4, packed & 0x0F);
+            LabeledCount {
+                label: format!("{} {}", key, bds_reg_label(packed)),
+                key,
+                count,
+            }
+        })
+        .collect();
+
+    // BDS 2,0 호출부호 (Mode-S 주소 오름차순)
+    let mut mode_s_callsigns: Vec<ModeSCallsign> = acc
+        .callsigns
+        .into_iter()
+        .map(|(ms, callsign)| ModeSCallsign {
+            mode_s: format!("{:06X}", ms),
+            callsign,
+        })
+        .collect();
+    mode_s_callsigns.sort_by(|a, b| a.mode_s.cmp(&b.mode_s));
+
+    // CAT034 안테나 회전주기 (회전수 내림차순)
+    let mut rotation_stats: Vec<RotationStat> = acc
+        .rotation
+        .into_iter()
+        .map(|((sac, sic), r)| {
+            let n = r.interval_count as f64;
+            let mean = if r.interval_count > 0 { r.sum / n } else { 0.0 };
+            let var = if r.interval_count > 0 {
+                (r.sumsq / n - mean * mean).max(0.0)
+            } else {
+                0.0
+            };
+            // 1회전당 섹터 수 최빈값 (동률이면 작은 쪽)
+            let expected_sectors = r
+                .sectors_hist
+                .iter()
+                .max_by_key(|(k, v)| (**v, std::cmp::Reverse(**k)))
+                .map(|(&k, _)| k);
+            let missing_sectors: u64 = match expected_sectors {
+                Some(exp) => r
+                    .sectors_hist
+                    .iter()
+                    .filter(|&(&k, _)| k < exp)
+                    .map(|(&k, &v)| (exp - k) as u64 * v)
+                    .sum(),
+                None => 0,
+            };
+            RotationStat {
+                sac,
+                sic,
+                north_count: r.north_count,
+                interval_count: r.interval_count,
+                period_mean_s: mean,
+                period_std_s: var.sqrt(),
+                period_min_s: if r.interval_count > 0 { r.min } else { 0.0 },
+                period_max_s: if r.interval_count > 0 { r.max } else { 0.0 },
+                reported_period_s: if r.reported_count > 0 {
+                    Some(r.reported_sum / r.reported_count as f64)
+                } else {
+                    None
+                },
+                sector_msgs: r.sector_msgs,
+                expected_sectors,
+                missing_sectors,
+            }
+        })
+        .collect();
+    rotation_stats.sort_by(|a, b| b.interval_count.cmp(&a.interval_count));
+
     AsterixStats {
         file_count: state.files.len(),
         total_bytes: acc.total_bytes,
@@ -3016,6 +3528,21 @@ pub fn asterix_finalize(state: AsterixScanState) -> AsterixStats {
         fl_hist,
         fl_v_invalid: acc.fl_v_invalid,
         fl_g_garbled: acc.fl_g_garbled,
+        mode3a_distinct,
+        mode3a_records,
+        mode3a_top,
+        emergency_counts,
+        emergency_records,
+        speed_hist,
+        speed_low_records: acc.speed_low,
+        speed_high_records: acc.speed_high,
+        sim_records: acc.sim_records,
+        track_numbers_distinct: acc.track_ids.len(),
+        rotation_stats,
+        bds_reg_counts,
+        mode_s_callsigns,
+        gaps,
+        gap_count,
         files: state.files,
     }
 }
@@ -3068,6 +3595,15 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
                         return;
                     }
                 }
+                if let Some(he) = filter.has_emergency {
+                    let h = frame
+                        .records
+                        .iter()
+                        .any(|r| r.mode3a.is_some_and(is_emergency_code));
+                    if h != he {
+                        return;
+                    }
+                }
                 if filter.time_min.is_some() || filter.time_max.is_some() {
                     let any = frame.records.iter().any(|r| match r.abs_time {
                         Some(t) => {
@@ -3092,6 +3628,7 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
                 let mut tod: Option<f64> = None;
                 let mut abs_time: Option<f64> = None;
                 let mut has_acas = false;
+                let mut emergency_codes: Vec<String> = Vec::new();
                 for r in &frame.records {
                     if !cats.contains(&r.cat) {
                         cats.push(r.cat);
@@ -3111,6 +3648,14 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
                     if r.has_acas {
                         has_acas = true;
                     }
+                    if let Some(code) = r.mode3a {
+                        if is_emergency_code(code) {
+                            let oct = format!("{:04o}", code);
+                            if !emergency_codes.contains(&oct) {
+                                emergency_codes.push(oct);
+                            }
+                        }
+                    }
                 }
                 let bytes = &data[frame.start..frame.end.min(data.len())];
                 let frame_hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
@@ -3124,6 +3669,7 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
                     tod,
                     abs_time,
                     has_acas,
+                    emergency_codes,
                     frame_hex,
                 });
             },
@@ -3140,6 +3686,98 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 비상코드는 옥탈 자릿수 그대로 저장 — 옥탈 리터럴과 직접 비교되어야 한다.
+    #[test]
+    fn test_emergency_code_octal_match() {
+        assert!(is_emergency_code(0o7700));
+        assert!(is_emergency_code(0o7600));
+        assert!(is_emergency_code(0o7500));
+        // 십진 7700/7600/7500 은 비상코드가 아님 (옥탈 해석 확인)
+        assert!(!is_emergency_code(7700));
+        assert!(!is_emergency_code(7600));
+        assert!(!is_emergency_code(7500));
+        assert!(!is_emergency_code(0o7000));
+        assert!(!is_emergency_code(0o1200));
+        // 표기 형식 = 옥탈 4자리
+        assert_eq!(format!("{:04o}", 0o7700u16), "7700");
+        assert_eq!(format!("{:04o}", 0o0021u16), "0021");
+    }
+
+    /// BDS 2,0 IA5 디코드 — 정상 문자열 채택 / 정의되지 않은 코드 전체 폐기.
+    #[test]
+    fn test_decode_bds20_callsign() {
+        // 8문자 × 6비트를 48비트로 pack → 6바이트
+        let pack = |chars: [u8; 8]| -> [u8; 7] {
+            let mut bits: u64 = 0;
+            for c in chars {
+                bits = (bits << 6) | c as u64;
+            }
+            let mut mb = [0u8; 7];
+            mb[0] = 0x20;
+            for i in 0..6 {
+                mb[i + 1] = ((bits >> (40 - i * 8)) & 0xFF) as u8;
+            }
+            mb
+        };
+
+        // "KAL123  " (A=1..Z=26, 0-9=48..57, 공백=32)
+        let mb = pack([11, 1, 12, 49, 50, 51, 32, 32]);
+        assert_eq!(decode_bds20_callsign(&mb).as_deref(), Some("KAL123"));
+
+        // 정의되지 않은 코드(예: 27) 포함 → 전체 폐기
+        let bad = pack([11, 27, 12, 49, 50, 51, 32, 32]);
+        assert_eq!(decode_bds20_callsign(&bad), None);
+
+        // 전부 공백 → 폐기
+        let blank = pack([32; 8]);
+        assert_eq!(decode_bds20_callsign(&blank), None);
+
+        // 포맷 코드(0x20) 불일치 → 폐기
+        let mut wrong = pack([11, 1, 12, 49, 50, 51, 32, 32]);
+        wrong[0] = 0x40;
+        assert_eq!(decode_bds20_callsign(&wrong), None);
+    }
+
+    /// North marker 간격 — 자정 wrap 보정 및 유효 범위(0.5–30초) 게이트.
+    #[test]
+    fn test_north_interval_wrap() {
+        // 통상 간격
+        assert_eq!(north_interval(100.0, 104.0), Some(4.0));
+        // 자정 wrap: 86398 → 2 (= 4초)
+        assert_eq!(north_interval(86398.0, 2.0), Some(4.0));
+        // 범위 밖은 폐기
+        assert_eq!(north_interval(100.0, 100.2), None); // 0.5초 미만
+        assert_eq!(north_interval(100.0, 200.0), None); // 30초 초과
+        // wrap 보정 후에도 범위를 벗어나면 폐기
+        assert_eq!(north_interval(86000.0, 2.0), None);
+    }
+
+    /// 수집 공백 — 분 버킷 연속 0-run 검출 (경계/길이/상한).
+    #[test]
+    fn test_collection_gaps() {
+        let mut state = AsterixScanState::default();
+        // 관측 분: 100, 101, 105(102–104 = 3분 공백), 106, 200(107–199 = 93분 공백)
+        for k in [100i64, 101, 105, 106, 200] {
+            state.acc.time_buckets.insert(k, 1);
+        }
+        let stats = asterix_finalize(state);
+        assert_eq!(stats.gap_count, 2);
+        // 길이 내림차순 — 93분 공백이 먼저. 길이 = 끝 − 시작 (관측 분 자체는 공백에 미포함)
+        assert_eq!(stats.gaps[0].duration_secs, 93.0 * 60.0);
+        assert_eq!(stats.gaps[0].start_ts, 107.0 * 60.0);
+        assert_eq!(stats.gaps[0].end_ts, 200.0 * 60.0);
+        assert_eq!(stats.gaps[1].duration_secs, 3.0 * 60.0);
+        assert_eq!(stats.gaps[1].start_ts, 102.0 * 60.0);
+        assert_eq!(stats.gaps[1].end_ts, 105.0 * 60.0);
+
+        // 공백 없는 연속 구간이면 0곳
+        let mut cont = AsterixScanState::default();
+        for k in 0i64..10 {
+            cont.acc.time_buckets.insert(k, 1);
+        }
+        assert_eq!(asterix_finalize(cont).gap_count, 0);
+    }
 
     #[test]
     #[ignore = "로컬 ASS 데이터 파일 필요 (수동 통합 테스트)"]
