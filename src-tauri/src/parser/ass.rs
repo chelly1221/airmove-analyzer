@@ -641,8 +641,11 @@ impl TrackAssembler {
                         break;
                     }
                     let dt = (points[j].point.timestamp - points[i].point.timestamp).abs();
+                    // 인접 쌍 시간차가 2초 초과면 이 쌍만 건너뛴다(정상 스캔 간격 ≈5초).
+                    // 과거 `break` 였던 탓에 항적 첫 쌍에서 루프 전체가 끝나 dedup 이 사실상 무효였다
+                    // (시험표적 71D703 같은 <1km 동일스캔 중복이 그대로 남던 원인, 2026-08-19 수정).
                     if dt > 2.0 {
-                        break;
+                        continue;
                     }
                     // 같은 스캔 내 중복 — 우선순위 낮은 쪽 제거
                     let dist = quick_dist_km(

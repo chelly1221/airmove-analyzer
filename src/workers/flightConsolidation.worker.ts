@@ -139,6 +139,9 @@ interface DualTargetReflector {
   azimuth_deg: number;
 }
 
+type DualTargetKind = "reflection" | "dup_address" | "unknown";
+type DualTargetKindReason = "content_match" | "altitude_mismatch" | "no_extra_path" | "reflector_far" | "no_content";
+
 interface DualTargetEvent {
   id: number;
   mode_s: string;
@@ -150,6 +153,8 @@ interface DualTargetEvent {
   reflector: DualTargetReflector | null;
   source: "scan" | "parser";
   confidence: "high" | "low";
+  kind: DualTargetKind;
+  kind_reason: DualTargetKindReason;
   cluster_id: number | null;
 }
 
@@ -171,11 +176,18 @@ interface DualTargetStats {
   dropped_unmatched: number;
   aircraft_count: number;
   skipped_no_site: number;
+  events_reflection: number;
+  events_dup_address: number;
+  events_unknown: number;
+  skipped_excluded_flights: number;
+  skipped_excluded_ghosts: number;
+  scan_period_by_radar: Record<string, number | null>;
 }
 
 interface DualTargetParams {
   scan_window_s: number;
   min_sep_km: number;
+  exclude_mode_s: string[];
 }
 
 interface DualTargetResult {
@@ -209,6 +221,15 @@ const DUAL_PARSER_MATCH_WINDOW_S = 60;
 /** 반사점 이분법 반복 횟수 / 수렴 허용오차 (km) */
 const DUAL_BISECT_ITERS = 48;
 const DUAL_BISECT_TOL_KM = 0.001;
+/** 응답 내용(고도) 일치 허용오차 (m) — 100ft = 30.48m 이므로 FL 1단위 차이까지 "같은 응답" */
+const DUAL_ALT_MATCH_M = 31;
+/** 반사점(반사체) 레이더 거리 상한 (km) — 반사 유령을 만드는 반사체는 레이더 근방 구조물·지형이다.
+ *  역산 반사점이 이보다 멀면(예: 주소중복 2기가 우연히 같은 FL 일 때 53km) 반사로 보지 않는다 */
+const DUAL_MAX_REFLECTOR_RANGE_KM = 25;
+/** 동일 회전 클러스터 폭 = 이 비율 × 스캔주기 T (T 추정 성공 시) */
+const DUAL_SCAN_CLUSTER_FRACTION = 0.75;
+/** 스캔주기 추정에 필요한 비행별 최소 dt 표본 수 */
+const DUAL_MIN_SCAN_DELTAS = 10;
 
 // 이상고도 보정 상수
 const MAX_VERTICAL_RATE_MS = 100;
@@ -1007,7 +1028,21 @@ function makeDualObservation(
   };
 }
 
-/** 실/유령 관측 쌍 → 이벤트 조립 (id·cluster_id 는 후처리에서 부여) */
+/**
+ * 실/유령 관측 쌍 → 이벤트 조립 (id·cluster_id 는 후처리에서 부여).
+ *
+ * 분류(kind)는 반사 유령의 물리 조건 2가지로 판정한다 — scan/parser 소스 공통.
+ *  (1) 같은 응답이 반사된 것이므로 **응답 내용(고도)이 같아야** 한다.
+ *      TrackPoint 에는 Mode 3/A·콜사인이 없어 고도만 비교하며, FL 결측은 altitude=0 으로
+ *      들어오므로 0 은 "결측"으로 보고 비교하지 않는다.
+ *  (2) 반사는 경로가 늘어나므로 **유령 거리 > 실표적 거리**(초과경로 > 50m)여야 한다.
+ *  (3) 역산 반사점은 **레이더 근방**(≤ DUAL_MAX_REFLECTOR_RANGE_KM)이어야 한다 — 같은 FL 의
+ *      주소중복 2기는 반사점이 수십 km 밖으로 나와 여기서 걸러진다.
+ * 고도가 어긋나면 같은 Mode-S 주소를 쓰는 서로 다른 항공기(주소중복)다 — 반사가 아니므로
+ * 반사점 역산도 하지 않는다(reflector = null → 클러스터·애니메이션·반사면 대상에서 자동 제외).
+ * (2)(3) 위배는 "unknown" — 반사점은(있으면) 남겨 두어 사용자가 확인할 수 있게 한다.
+ * 파서 소스의 보간 real 은 altitude 도 보간돼 있어 동일 규칙을 그대로 적용한다.
+ */
 function buildDualEvent(
   modeS: string, radarName: string,
   realP: { timestamp: number; latitude: number; longitude: number; altitude: number; radar_type: string },
@@ -1018,6 +1053,28 @@ function buildDualEvent(
   const real = makeDualObservation(realP, siteLat, siteLon);
   const ghost = makeDualObservation(ghostP, siteLat, siteLon);
   const extraPath = ghost.range_km - real.range_km;
+
+  const altR = real.altitude;
+  const altG = ghost.altitude;
+  let kind: DualTargetKind;
+  let kindReason: DualTargetKindReason;
+  if (altR === 0 || altG === 0) {
+    kind = "unknown"; kindReason = "no_content";              // FL 결측 — 비교 불가
+  } else if (Math.abs(altR - altG) > DUAL_ALT_MATCH_M) {
+    kind = "dup_address"; kindReason = "altitude_mismatch";   // 다른 응답 = 다른 항공기
+  } else if (extraPath <= DUAL_MIN_EXTRA_PATH_KM) {
+    kind = "unknown"; kindReason = "no_extra_path";           // 유령이 더 가깝거나 초과경로 없음 = 반사 기하 성립 안 함
+  } else {
+    kind = "reflection"; kindReason = "content_match";        // 반사점 거리 상한은 아래 역산 뒤 재판정
+  }
+  // 반사점 역산 — 주소중복은 물리적 의미가 없어 생략(null), 초과경로 없음도 해가 없어 null
+  const reflector = kind === "dup_address" || extraPath <= DUAL_MIN_EXTRA_PATH_KM
+    ? null
+    : solveReflector(siteLat, siteLon, real.latitude, real.longitude, ghost.azimuth_deg, ghost.range_km);
+  if (kind === "reflection" && reflector && reflector.range_km > DUAL_MAX_REFLECTOR_RANGE_KM) {
+    kind = "unknown"; kindReason = "reflector_far";           // 반사체가 레이더 근방일 수 없는 거리 = 같은 FL 의 다른 항공기 등
+  }
+
   return {
     id: 0,
     mode_s: modeS,
@@ -1026,13 +1083,18 @@ function buildDualEvent(
     ghost,
     separation_km: haversine(real.latitude, real.longitude, ghost.latitude, ghost.longitude),
     extra_path_km: extraPath,
-    reflector: extraPath <= DUAL_MIN_EXTRA_PATH_KM
-      ? null
-      : solveReflector(siteLat, siteLon, real.latitude, real.longitude, ghost.azimuth_deg, ghost.range_km),
+    reflector,
     source,
     confidence: extraPath > DUAL_HIGH_CONFIDENCE_EXTRA_KM ? "high" : "low",
+    kind,
+    kind_reason: kindReason,
     cluster_id: null,
   };
+}
+
+/** 정렬된 구간 [0, n) 의 중앙값 (n ≥ 1) */
+function medianOfSorted(v: Float64Array | number[], n: number): number {
+  return n % 2 === 1 ? v[(n - 1) >> 1] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
 /**
@@ -1044,6 +1106,7 @@ async function analyzeDualTargets(
   sites: { name: string; latitude: number; longitude: number }[],
   scanWindowS: number,
   minSepKm: number,
+  excludeModeS: string[],
 ): Promise<DualTargetResult> {
   // 진입 시점 세대 캡처 — 새 세대(CLEAR_POINTS) 시작 시 CPU 절약용 조기 중단에만 사용.
   // 부분 결과가 반환되어도 메인 측 dualRunSeq 가드가 폐기한다.
@@ -1053,6 +1116,10 @@ async function analyzeDualTargets(
   for (let i = 0; i < sites.length; i++) {
     siteMap.set(sites[i].name, { lat: sites[i].latitude, lon: sites[i].longitude });
   }
+
+  /** 제외 Mode-S(시험표적 site monitor 등) — 대문자 정규화 집합 */
+  const excludeSet = new Set<string>();
+  for (let i = 0; i < excludeModeS.length; i++) excludeSet.add(excludeModeS[i].toUpperCase());
 
   const events: DualTargetEvent[] = [];
   const stats: DualTargetStats = {
@@ -1064,7 +1131,69 @@ async function analyzeDualTargets(
     dropped_unmatched: 0,
     aircraft_count: 0,
     skipped_no_site: 0,
+    events_reflection: 0,
+    events_dup_address: 0,
+    events_unknown: 0,
+    skipped_excluded_flights: 0,
+    skipped_excluded_ghosts: 0,
+    scan_period_by_radar: {},
   };
+  const params: DualTargetParams = {
+    scan_window_s: scanWindowS,
+    min_sep_km: minSepKm,
+    exclude_mode_s: Array.from(excludeSet),
+  };
+
+  // ── Phase 0: 레이더별 스캔주기 T 추정 (사전 패스) ──
+  //   비행별 연속 dt 중앙값(표본 ≥ DUAL_MIN_SCAN_DELTAS)들의 레이더별 중앙값.
+  //   0.5s 이하는 동일 스캔 중복, 30s 이상은 표적소실 gap 이라 주기 표본에서 제외한다.
+  const scanPeriod = new Map<string, number | null>();
+  {
+    const perRadar = new Map<string, number[]>();
+    /** 비행이 실제로 있던 레이더 — 등록만 된 사이트까지 "미추정"으로 표기하지 않기 위해 */
+    const seenRadars = new Set<string>();
+    let sinceYield0 = 0;
+    phase0:
+    for (const entry of _flightIndex.values()) {
+      if (!entry.modeS || excludeSet.has(entry.modeS.toUpperCase())) continue;
+      seenRadars.add(entry.radarName);
+      const soa = entry.points;
+      const n = soa.count;
+      sinceYield0 += n;
+      if (n >= 2) {
+        const deltas = new Float64Array(n - 1); // 전수 — 표본 추출 없음
+        let m = 0;
+        for (let i = 1; i < n; i++) {
+          const dt = soa.timestamp[i] - soa.timestamp[i - 1];
+          if (dt > 0.5 && dt < 30) deltas[m++] = dt;
+        }
+        if (m >= DUAL_MIN_SCAN_DELTAS) {
+          const view = deltas.subarray(0, m);
+          view.sort();
+          let arr = perRadar.get(entry.radarName);
+          if (!arr) { arr = []; perRadar.set(entry.radarName, arr); }
+          arr.push(medianOfSorted(view, m));
+        }
+      }
+      if (sinceYield0 >= 200_000) {
+        sinceYield0 = 0;
+        await yieldWorker();
+        if (gen !== _generation) break phase0; // 새 세대 시작 — 조기 중단
+      }
+    }
+    for (const [radarName, meds] of perRadar) {
+      meds.sort((a, b) => a - b);
+      scanPeriod.set(radarName, medianOfSorted(meds, meds.length));
+    }
+    // 비행은 있었지만 표본 부족으로 미추정인 레이더는 null 로 명시 — UI 가 "고정 윈도우 폴백"을 표기
+    for (const radarName of seenRadars) {
+      if (!scanPeriod.has(radarName)) scanPeriod.set(radarName, null);
+    }
+  }
+  for (const [radarName, t] of scanPeriod) stats.scan_period_by_radar[radarName] = t;
+
+  // Phase 0 이 세대 변경으로 중단됐으면 이후 전수 루프에 CPU 를 쓰지 않는다
+  if (gen !== _generation) return { events: [], clusters: [], stats, params };
 
   // ── Phase 1: 잔존 동일스캔 중복 전수 탐지 (scan 소스) ──
   let sinceYield = 0;
@@ -1074,16 +1203,24 @@ async function analyzeDualTargets(
     const site = siteMap.get(entry.radarName);
     if (!site) { stats.skipped_no_site++; continue; }
     if (!entry.modeS) continue;
+    // 시험표적(site monitor) 등 제외 Mode-S — 방위 지터가 이중표적으로 잡히므로 통째로 뺀다
+    if (excludeSet.has(entry.modeS.toUpperCase())) { stats.skipped_excluded_flights++; continue; }
 
     stats.flights_scanned++;
     const soa = entry.points;
     const n = soa.count;
+    /** 이 레이더의 추정 스캔주기 (null = 미추정 → 고정 윈도우 폴백) */
+    const T = scanPeriod.get(entry.radarName) ?? null;
+    /** 한 회전 후보 클러스터 폭 — 안테나가 한 바퀴 도는 동안의 탐지를 한 묶음으로 본다.
+     *  고정 0.5s 윈도우는 방위차 ±36°(T≈5s) 안의 짝만 잡았으므로 T 를 알면 0.75T 로 넓힌다
+     *  (같은 기체의 다음 회전 탐지는 ≈T 뒤라 섞이지 않는다). T 미추정 시 고정 윈도우 폴백. */
+    const W = T != null ? T * DUAL_SCAN_CLUSTER_FRACTION : scanWindowS;
 
-    // 파서와 동일한 슬라이딩 클러스터 — 시작점 기준 scanWindowS 이내 연속 포인트
+    // 슬라이딩 클러스터 — 시작점 기준 W 이내 연속 포인트
     let clusterStart = 0;
     for (let i = 1; i <= n; i++) {
       const endCluster = i === n
-        || Math.abs(soa.timestamp[i] - soa.timestamp[clusterStart]) > scanWindowS;
+        || Math.abs(soa.timestamp[i] - soa.timestamp[clusterStart]) > W;
       if (!endCluster) continue;
 
       const clusterLen = i - clusterStart;
@@ -1100,6 +1237,12 @@ async function analyzeDualTargets(
           if (ghostSet && ghostSet.has(a)) continue;
           for (let b = a + 1; b < i; b++) {
             if (ghostSet && ghostSet.has(b)) continue;
+
+            // ※ 방위차 기반 위상 게이트(dt ≈ T·Δθ_cw/360)는 두지 않는다 — 제1레이더는 전 쌍이
+            //   시계방향 위상에 맞지만(2026-08-19 실측 2,965/2,965), 제2레이더(SIC7)는 동일 주소
+            //   쌍이 정확히 T/2 어긋나(249/250) TOD 가 빔 통과시각이 아니어서 게이트가 전부 탈락시킨다.
+            //   한 회전 폭(0.75T) 안의 동일 Mode-S 두 탐지는 그 자체로 같은 회전 소속이며,
+            //   재출력 중복(같은 위치)은 아래 최소 이격에서 걸러진다.
             const sep = haversine(
               soa.latitude[a], soa.longitude[a], soa.latitude[b], soa.longitude[b],
             );
@@ -1158,11 +1301,14 @@ async function analyzeDualTargets(
 
     for (let gi = 0; gi < _ghostPoints.length; gi++) {
       const g = _ghostPoints[gi];
+      const gModeS = (g.mode_s ?? "").toUpperCase();
+      // 제외 Mode-S — 파서 보존분도 동일하게 뺀다(비행 제외와 짝이 맞아야 통계가 일관)
+      if (excludeSet.has(gModeS)) { stats.skipped_excluded_ghosts++; continue; }
       const rn = g.radar_name ?? "";
       const site = siteMap.get(rn);
       if (!site) { stats.dropped_unmatched++; continue; }
 
-      const candidates = byKey.get(`${(g.mode_s ?? "").toUpperCase()}|${rn}`);
+      const candidates = byKey.get(`${gModeS}|${rn}`);
       if (!candidates) { stats.dropped_unmatched++; continue; }
 
       // g.timestamp 최근접 실포인트 탐색 (이진탐색) — 후보 중 |dt| 최소인 비행 채택
@@ -1238,15 +1384,19 @@ async function analyzeDualTargets(
   // 두 Phase 가 세대 변경으로 중단됐으면 절단 상태 — sort·클러스터링에 CPU 를 쓰지 않고 빈 결과 반환
   // (어차피 메인 dualRunSeq 가드가 이 결과를 버린다)
   if (gen !== _generation) {
-    return { events: [], clusters: [], stats, params: { scan_window_s: scanWindowS, min_sep_km: minSepKm } };
+    return { events: [], clusters: [], stats, params };
   }
 
-  // ── 정렬·id 부여 (유령 관측 시각 오름차순) ──
+  // ── 정렬·id 부여 (유령 관측 시각 오름차순) + 분류 집계 ──
   events.sort((a, b) => a.ghost.timestamp - b.ghost.timestamp);
   const modeSSet = new Set<string>();
   for (let i = 0; i < events.length; i++) {
-    events[i].id = i;
-    modeSSet.add(events[i].mode_s.toUpperCase());
+    const ev = events[i];
+    ev.id = i;
+    modeSSet.add(ev.mode_s.toUpperCase());
+    if (ev.kind === "reflection") stats.events_reflection++;
+    else if (ev.kind === "dup_address") stats.events_dup_address++;
+    else stats.events_unknown++;
   }
   stats.aircraft_count = modeSSet.size;
 
@@ -1285,12 +1435,7 @@ async function analyzeDualTargets(
     for (let mi = 0; mi < cell.members.length; mi++) events[cell.members[mi]].cluster_id = ci;
   }
 
-  return {
-    events,
-    clusters,
-    stats,
-    params: { scan_window_s: scanWindowS, min_sep_km: minSepKm },
-  };
+  return { events, clusters, stats, params };
 }
 
 // ─── Worker 메시지 핸들러 ───────────────────────────
@@ -1328,9 +1473,9 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       case "ANALYZE_DUAL_TARGETS": {
-        const { sites, scanWindowS, minSepKm } = e.data;
+        const { sites, scanWindowS, minSepKm, excludeModeS } = e.data;
         const t0 = performance.now();
-        const result = await analyzeDualTargets(sites, scanWindowS, minSepKm);
+        const result = await analyzeDualTargets(sites, scanWindowS, minSepKm, excludeModeS ?? []);
         console.log(
           `[Worker] analyzeDualTargets: ${(performance.now() - t0).toFixed(0)}ms, ` +
           `events=${result.events.length} clusters=${result.clusters.length}`,

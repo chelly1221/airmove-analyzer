@@ -24,6 +24,8 @@ export type {
   DualTargetObservation,
   DualTargetReflector,
   DualTargetEvent,
+  DualTargetKind,
+  DualTargetKindReason,
   ReflectorCluster,
   DualTargetStats,
   DualTargetParams,

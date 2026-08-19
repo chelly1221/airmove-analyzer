@@ -26,6 +26,7 @@ import type {
   AddressBuildingHit,
   Building3D,
   DualTargetEvent,
+  DualTargetKind,
   FacBuildingDetail,
   Flight,
   ModeSTrack,
@@ -63,8 +64,61 @@ const ERROR = "#e94560";
 
 /** 그룹당 표시 행 상한 — UI 표시만 제한(통계·지도는 전수 이벤트 사용) */
 const GROUP_ROW_CAP = 200;
+/** 기본 제외 Mode-S — 시험표적(site monitor). 방위 지터가 이중표적으로 잡힌다 */
+const DEFAULT_EXCLUDE_MODE_S = "71D703, 84AB56";
+/** 분류 배지 라벨 */
+const KIND_LABEL: Record<DualTargetKind, string> = {
+  reflection: "반사",
+  dup_address: "주소중복",
+  unknown: "미확인",
+};
+/** 분류 배지 색 — 반사=액센트, 주소중복=slate(지도 유령점과 동색), 미확인=회색 */
+const KIND_BADGE_CLASS: Record<DualTargetKind, string> = {
+  reflection: "bg-[#a60739]/10 text-[#a60739]",
+  dup_address: "bg-slate-200 text-slate-600",
+  unknown: "bg-gray-100 text-gray-500",
+};
+
+/** 분류 필터 칩 정의 — 건수는 stats 에서 읽는다 */
+const KIND_CHIPS: { k: "all" | DualTargetKind; label: string; title: string }[] = [
+  { k: "all", label: "전체", title: "분류 필터 해제 — 전체 이벤트" },
+  { k: "reflection", label: "반사", title: "고도 일치 + 초과경로 있음 + 반사점이 레이더 근방(≤25km) — 반사 기하 부합" },
+  { k: "dup_address", label: "주소중복", title: "고도 불일치 — 같은 Mode-S 주소를 쓰는 서로 다른 항공기" },
+  { k: "unknown", label: "미확인", title: "고도 결측(비교 불가) 또는 반사 기하 불성립(초과경로 없음·반사점 원거리)" },
+];
+
 /** 건물명 라벨링 대상 클러스터 수 (count 상위) */
 const LABEL_MAX = 20;
+
+/** 제외 Mode-S 입력 파싱 — 콤마/공백/세미콜론 구분, 6자리 16진수만 대문자로 채택 */
+function parseModeSList(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const tok of text.split(/[\s,;]+/)) {
+    if (!/^[0-9A-F]{6}$/i.test(tok)) continue;
+    const up = tok.toUpperCase();
+    if (seen.has(up)) continue;
+    seen.add(up);
+    out.push(up);
+  }
+  return out;
+}
+
+/** 분류 사유 한글 설명 (배지 툴팁) — 고도 차이는 ft 로 환산해 보여준다 */
+function kindReasonText(e: DualTargetEvent): string {
+  switch (e.kind_reason) {
+    case "content_match":
+      return "고도 일치·초과경로 있음·반사점 레이더 근방(반사 기하 부합)";
+    case "altitude_mismatch":
+      return `고도 불일치 Δ${Math.round(Math.abs(e.real.altitude - e.ghost.altitude) / 0.3048)}ft → 같은 주소의 다른 항공기`;
+    case "no_extra_path":
+      return "고도 일치이나 초과경로 없음(유령이 더 가깝거나 같은 거리) — 반사 기하 성립 안 함";
+    case "reflector_far":
+      return `고도 일치이나 역산 반사점이 레이더에서 ${e.reflector ? e.reflector.range_km.toFixed(1) : "?"}km — 근방 반사체일 수 없음(같은 FL 의 다른 항공기 가능성)`;
+    default:
+      return "고도 정보 없음(비교 불가)";
+  }
+}
 
 // ── 2D 건물 표출 ────────────────────────────────────────────────────
 /** 건물 표출 최소 줌 — 미만이면 뷰포트 조회 자체를 생략(광역에서 수만 동 로드 방지) */
@@ -219,6 +273,8 @@ interface ModeSGroup {
   modeS: string;
   label: string;
   events: DualTargetEvent[];
+  /** kind === "reflection" 건수 (헤더 표기) */
+  reflectionCount: number;
   highCount: number;
   maxSepKm: number;
   bbox: { minLat: number; maxLat: number; minLon: number; maxLon: number };
@@ -388,8 +444,10 @@ function LegendRow({ swatch, label }: { swatch: ReactNode; label: string }) {
  * 지도 좌하단 범례 — 표시 항목은 현재 표출 상태에 맞춰 가감한다.
  * (결과 없이도 유효한 사이트·건물 항목은 항상, 표적·반사체는 결과가 있을 때만)
  */
-function DualLegend({ hasResult, hasModeS, hasEvent, showBuildings, showSurfaces, isolated }: {
+function DualLegend({ hasResult, hasDup, hasModeS, hasEvent, showBuildings, showSurfaces, isolated }: {
   hasResult: boolean;
+  /** 주소중복(다른 항공기) 이벤트 보유 — 유령점이 slate 로도 찍힌다 */
+  hasDup: boolean;
   hasModeS: boolean;
   hasEvent: boolean;
   showBuildings: boolean;
@@ -421,7 +479,10 @@ function DualLegend({ hasResult, hasModeS, hasEvent, showBuildings, showSurfaces
             <>
               <LegendRow swatch={<LegendDot fill="rgb(59,130,246)" />} label="실표적" />
               <LegendRow swatch={<LegendDot fill="rgb(233,69,96)" r={5} />} label="유령표적(반사)" />
-              <LegendRow swatch={<LegendLine color="rgb(59,130,246)" width={1.5} />} label="실표적–레이더" />
+              {hasDup && (
+                <LegendRow swatch={<LegendDot fill="rgb(100,116,139)" r={5} />} label="주소중복 유령(다른 항공기)" />
+              )}
+              <LegendRow swatch={<LegendLine color="rgb(59,130,246)" width={1.5} />} label="실표적–(반사점)–레이더 경로" />
               <LegendRow
                 swatch={<LegendLine color="rgb(233,69,96)" width={1.5} dashed />}
                 label="유령표적–레이더 (점선)"
@@ -519,6 +580,8 @@ export default function DualTargetAnalysis() {
   // 분석 파라미터
   const [scanWindowS, setScanWindowS] = useState(0.5);
   const [minSepKm, setMinSepKm] = useState(1.0);
+  /** 제외 Mode-S 원문 입력 — 분석 실행 시 parseModeSList 로 정규화 */
+  const [excludeText, setExcludeText] = useState(DEFAULT_EXCLUDE_MODE_S);
 
   // 선택/표시 상태
   const [search, setSearch] = useState("");
@@ -529,6 +592,8 @@ export default function DualTargetAnalysis() {
   /** 반사 위치 선택 필터 — 병합 마커를 고르면 그 마커의 반사 위치 전부가 들어온다
    *  (오름차순 정렬된 id 배열, null = 필터 없음) */
   const [selectedClusterIds, setSelectedClusterIds] = useState<number[] | null>(null);
+  /** 분류 필터 — 필터 체인 최상단(반사/주소중복/미확인). 요약 칩으로 전환 */
+  const [kindFilter, setKindFilter] = useState<"all" | DualTargetKind>("all");
   /** 지도 표출을 특정 기체(Mode-S)로 한정 — 좌측 그룹 목록은 계속 전 기체를 보여준다.
    *  좌측 카드의 **펼침 상태도 여기서 파생**한다(선택=펼침, 해제=접힘 — 별도 펼침 state 없음). */
   const [selectedModeS, setSelectedModeS] = useState<string | null>(null);
@@ -747,7 +812,9 @@ export default function DualTargetAnalysis() {
     setPhase("analyzing");
     setError(null);
     try {
-      const result = await analyzeDualTargets({ sites: dualSites, scanWindowS, minSepKm });
+      const result = await analyzeDualTargets({
+        sites: dualSites, scanWindowS, minSepKm, excludeModeS: parseModeSList(excludeText),
+      });
       if (seq !== dualRunSeq) return; // 최신 요청만 반영
       setDualResult(result);
       setSelectedEventId(null);
@@ -799,7 +866,7 @@ export default function DualTargetAnalysis() {
     } finally {
       if (seq === dualRunSeq) setPhase("idle");
     }
-  }, [dualSites, scanWindowS, minSepKm, setDualResult, fitBounds]);
+  }, [dualSites, scanWindowS, minSepKm, excludeText, setDualResult, fitBounds]);
 
   // ── ASS 파일 선택 ─────────────────────────────────────────────────
   const pickFiles = useCallback(async () => {
@@ -993,12 +1060,18 @@ export default function DualTargetAnalysis() {
     [selectedClusterIds],
   );
 
-  /** 좌측 그룹 목록 모집단 — 반사 위치 필터 적용 */
-  const listEvents = useMemo(() => {
+  /** 분류 필터 적용 이벤트 — 필터 체인 최상단(반사/주소중복/미확인) */
+  const kindEvents = useMemo(() => {
     const all = dualResult?.events ?? [];
-    if (selectedClusterSet == null) return all;
-    return all.filter((e) => e.cluster_id != null && selectedClusterSet.has(e.cluster_id));
-  }, [dualResult, selectedClusterSet]);
+    if (kindFilter === "all") return all;
+    return all.filter((e) => e.kind === kindFilter);
+  }, [dualResult, kindFilter]);
+
+  /** 좌측 그룹 목록 모집단 — 분류 필터 뒤 반사 위치 필터 적용 */
+  const listEvents = useMemo(() => {
+    if (selectedClusterSet == null) return kindEvents;
+    return kindEvents.filter((e) => e.cluster_id != null && selectedClusterSet.has(e.cluster_id));
+  }, [kindEvents, selectedClusterSet]);
 
   /** 지도 표출 이벤트 — 반사 위치 ∩ Mode-S */
   const baseEvents = useMemo(() => {
@@ -1013,25 +1086,27 @@ export default function DualTargetAnalysis() {
     const ev = dualResult.events[isolatedEventId];
     if (!ev || ev.id !== isolatedEventId) return undefined;
     if (selectedModeS !== ev.mode_s) return undefined; // 그룹 헤더 토글 등으로 Mode-S 한정이 풀리면 단일 표출도 해제
+    if (kindFilter !== "all" && ev.kind !== kindFilter) return undefined; // 분류 필터 밖이면 단일 표출도 해제
     return ev;
-  }, [isolatedEventId, selectedEventId, selectedModeS, dualResult]);
+  }, [isolatedEventId, selectedEventId, selectedModeS, kindFilter, dualResult]);
 
   /** 지도 표출 이벤트 — 단일 표출 중이면 그 하나, 아니면 baseEvents */
   const mapEvents = useMemo<DualTargetEvent[]>(() => (isolatedEv ? [isolatedEv] : baseEvents), [isolatedEv, baseEvents]);
 
   /**
    * 표출용 반사 위치 클러스터 — count 내림차순.
-   * Mode-S 선택 시엔 그 기체 이벤트가 참조하는 클러스터만 남기고 count 도 그 기체 기준으로
-   * 재계산한다(원본 클러스터 객체는 mutate 금지 — 복제본 생성). 반사 위치 선택 필터는
-   * 여기에 적용하지 않는다(다른 클러스터로 갈아탈 수 있어야 하므로).
+   * 분류 필터·Mode-S 선택이 걸리면 그 부분집합이 참조하는 클러스터만 남기고 count 도 같은
+   * 기준으로 재계산한다(원본 클러스터 객체는 mutate 금지 — 복제본 생성). 반사 위치 선택
+   * 필터는 여기에 적용하지 않는다(다른 클러스터로 갈아탈 수 있어야 하므로).
    */
   const displayClusters = useMemo<ReflectorCluster[]>(() => {
     const all = dualResult?.clusters ?? [];
-    if (selectedModeS == null) return [...all].sort((a, b) => b.count - a.count);
+    if (kindFilter === "all" && selectedModeS == null) return [...all].sort((a, b) => b.count - a.count);
 
     const counts = new Map<number, number>();
-    for (const e of dualResult?.events ?? []) {
-      if (e.mode_s !== selectedModeS || e.cluster_id == null) continue;
+    for (const e of kindEvents) {
+      if (selectedModeS != null && e.mode_s !== selectedModeS) continue;
+      if (e.cluster_id == null) continue;
       counts.set(e.cluster_id, (counts.get(e.cluster_id) ?? 0) + 1);
     }
     const out: ReflectorCluster[] = [];
@@ -1042,7 +1117,7 @@ export default function DualTargetAnalysis() {
     }
     out.sort((a, b) => b.count - a.count);
     return out;
-  }, [dualResult, selectedModeS]);
+  }, [dualResult, kindEvents, kindFilter, selectedModeS]);
 
   /** 지도 반사체 원천 — 단일 표출 중이면 그 이벤트의 클러스터 하나(count 1), 좌측 리스트는 displayClusters 그대로 */
   const mapClusters = useMemo<ReflectorCluster[]>(() => {
@@ -1296,10 +1371,12 @@ export default function DualTargetAnalysis() {
     }
     const out: ModeSGroup[] = [];
     for (const [modeS, events] of byModeS) {
+      let reflectionCount = 0;
       let highCount = 0;
       let maxSepKm = 0;
       let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
       for (const ev of events) {
+        if (ev.kind === "reflection") reflectionCount++;
         if (ev.confidence === "high") highCount++;
         if (ev.separation_km > maxSepKm) maxSepKm = ev.separation_km;
         for (const o of [ev.real, ev.ghost]) {
@@ -1314,6 +1391,7 @@ export default function DualTargetAnalysis() {
         modeS,
         label: labelFor(modeS, aircraft),
         events,
+        reflectionCount,
         highCount,
         maxSepKm,
         bbox: { minLat, maxLat, minLon, maxLon },
@@ -1563,8 +1641,10 @@ export default function DualTargetAnalysis() {
       );
     }
 
-    // ── 방사선: 실표적→레이더(실선) · 유령표적→레이더(점선) ──
-    //   레이더를 공통 원점으로 두 선을 그리면 두 선이 벌어진 각이 곧 반사로 생긴 방위 오차다.
+    // ── 방사선: 실표적→(반사점)→레이더(실선) · 유령표적→레이더(점선) ──
+    //   실선은 실제 전파 경로를 그린다 — 반사점이 있으면 실표적→반사점→레이더 두 마디(꺾인 선),
+    //   반사점이 없으면(주소중복·초과경로 없음) 반사가 아니므로 레이더까지 직선.
+    //   유령 점선은 레이더 기점 유령 방위선이라 두 선이 벌어진 각이 곧 반사로 생긴 방위 오차다.
     //   사이트 좌표를 찾을 수 없는 이벤트(미등록 레이더명)는 그릴 수 없으므로 제외한다.
     const siteByName = new Map<string, { name: string; latitude: number; longitude: number }>();
     for (const s of dualSites) siteByName.set(s.name, s);
@@ -1572,21 +1652,24 @@ export default function DualTargetAnalysis() {
 
     if (radialEvents.length > 0) {
       layers.push(
-        new LineLayer<DualTargetEvent>({
+        new PathLayer<DualTargetEvent>({
           id: "dual-real-radials",
           data: radialEvents,
-          getSourcePosition: (d) => [d.real.longitude, d.real.latitude],
-          getTargetPosition: (d) => {
+          getPath: (d): [number, number][] => {
             const site = siteByName.get(d.radar_name)!; // radialEvents 는 사이트 보유분만
-            return [site.longitude, site.latitude];
+            const path: [number, number][] = [[d.real.longitude, d.real.latitude]];
+            if (d.reflector) path.push([d.reflector.longitude, d.reflector.latitude]);
+            path.push([site.longitude, site.latitude]);
+            return path;
           },
           getColor: [59, 130, 246, 150],
           getWidth: 1,
           widthUnits: "pixels" as const,
           widthMinPixels: 1,
+          jointRounded: true,
           pickable: false,
           // 접근자가 dualSites 를 캡처한다 — deck.gl 은 id 기준으로 접근자를 캐시하므로 명시
-          updateTriggers: { getTargetPosition: dualSites },
+          updateTriggers: { getPath: dualSites },
         })
       );
     }
@@ -1647,7 +1730,9 @@ export default function DualTargetAnalysis() {
         id: "dual-ghost-pts",
         data: mapEvents,
         getPosition: (d) => [d.ghost.longitude, d.ghost.latitude],
-        getFillColor: [233, 69, 96, 220],
+        // 주소중복(다른 항공기)은 반사가 아니므로 slate 로 구분 — data 참조가 바뀌면 재계산된다
+        getFillColor: (d): [number, number, number, number] =>
+          d.kind === "dup_address" ? [100, 116, 139, 200] : [233, 69, 96, 220],
         getRadius: 90,
         // 클릭 표적 확대 — 유령표적은 실표적보다 한 단계 크게(실표적과 구분)
         radiusMinPixels: 5,
@@ -1811,6 +1896,16 @@ export default function DualTargetAnalysis() {
   // ── 렌더 ──────────────────────────────────────────────────────────
 
   const stats = dualResult?.stats;
+  /** 레이더별 스캔주기 표기 — 미추정이면 고정 윈도우 폴백임을 밝힌다 (레이더 수 개 수준) */
+  const scanPeriodText = (() => {
+    const map = stats?.scan_period_by_radar;
+    if (!map) return "";
+    const parts: string[] = [];
+    for (const [rn, t] of Object.entries(map)) {
+      parts.push(`스캔주기 ${rn}: ${t != null ? `${t.toFixed(2)}s` : "미추정 → 고정 윈도우"}`);
+    }
+    return parts.join(" · ");
+  })();
   /** 이 그룹(기체)의 항적 오버레이 — 다른 기체가 선택됐거나 미로드면 null.
    *  워커가 Mode-S 를 대문자로 정규화해 돌려주므로 대문자 기준으로 비교한다. */
   const trackOfGroup = (modeS: string) =>
@@ -1870,7 +1965,12 @@ export default function DualTargetAnalysis() {
           </select>
         </label>
         <label className="flex items-center gap-2">
-          <span className="text-[11px] font-medium text-gray-600">동일스캔 윈도우</span>
+          <span
+            className="text-[11px] font-medium text-gray-600"
+            title="스캔주기 T 를 추정하면 잔존 중복은 한 회전 폭(0.75T) 안에서 짝짓고, 이 값은 T 미추정 폴백과 파서 보존분의 실표적 짝 매칭 허용 시간으로 쓰입니다"
+          >
+            동일스캔 윈도우
+          </span>
           <input
             type="range" min={0.2} max={2.0} step={0.1} value={scanWindowS}
             onChange={(e) => setScanWindowS(Number(e.target.value))}
@@ -1889,8 +1989,17 @@ export default function DualTargetAnalysis() {
           />
           <span className="w-12 font-mono text-[11px] font-bold tabular-nums text-[#a60739]">{minSepKm.toFixed(1)}km</span>
         </label>
+        <label className="flex items-center gap-2">
+          <span className="text-[11px] font-medium text-gray-600">제외 Mode-S</span>
+          <input
+            type="text" value={excludeText}
+            onChange={(e) => setExcludeText(e.target.value)}
+            title="시험표적(site monitor) 등 분석에서 제외할 Mode-S — 콤마 구분"
+            className="h-6 w-36 rounded-md border border-gray-200 bg-white px-1.5 font-mono text-[11px] text-gray-700 focus:border-[#a60739] focus:outline-none"
+          />
+        </label>
         <span className="text-[10.5px] text-gray-400">
-          동일 Mode-S 가 같은 스캔 주기 내 두 위치로 탐지되면 이중표적(반사)으로 판정합니다.
+          동일 Mode-S 가 같은 안테나 회전 안에서 두 위치로 탐지되면 후보로 잡고, 고도 일치·거리 순서로 반사/주소중복을 분류합니다.
         </span>
         {dualResult && (
           <button
@@ -1953,6 +2062,42 @@ export default function DualTargetAnalysis() {
                       {stats.skipped_no_site > 0 && ` · 사이트 미매칭 비행 ${stats.skipped_no_site.toLocaleString()}편 건너뜀`}
                     </div>
                   )}
+                  {scanPeriodText && (
+                    <div className="mt-0.5 text-[10px] text-gray-400">{scanPeriodText}</div>
+                  )}
+                  {stats && (stats.skipped_excluded_flights > 0 || stats.skipped_excluded_ghosts > 0) && (
+                    <div className="mt-0.5 text-[10px] text-gray-400">
+                      제외 Mode-S 비행 {stats.skipped_excluded_flights.toLocaleString()}편·파서보존 {stats.skipped_excluded_ghosts.toLocaleString()}점
+                    </div>
+                  )}
+                </div>
+
+                {/* 분류 필터 칩 — 반사/주소중복/미확인. 전환 시 이벤트·반사 위치 선택은 해제(필터 밖으로 갈 수 있음) */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                  {KIND_CHIPS.map((c) => {
+                    const on = kindFilter === c.k;
+                    const n = c.k === "all"
+                      ? dualResult.events.length
+                      : c.k === "reflection" ? (stats?.events_reflection ?? 0)
+                      : c.k === "dup_address" ? (stats?.events_dup_address ?? 0)
+                      : (stats?.events_unknown ?? 0);
+                    return (
+                      <button
+                        key={c.k}
+                        onClick={() => {
+                          setKindFilter(c.k);
+                          setSelectedEventId(null);      // 필터 밖으로 갈 수 있는 이벤트 선택 해제
+                          setSelectedClusterIds(null);   // 반사 위치 선택도 해제(빈 목록 혼동 방지) — Mode-S 선택은 유지
+                        }}
+                        title={c.title}
+                        className={`rounded-full px-2 py-[2px] text-[10px] font-semibold transition-colors ${
+                          on ? "bg-[#a60739] text-white" : "border border-gray-200 text-gray-500 hover:bg-gray-50"
+                        }`}
+                      >
+                        {c.label} <span className="font-mono tabular-nums">{n.toLocaleString()}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -2071,7 +2216,7 @@ export default function DualTargetAnalysis() {
                       // 이 기체의 항적 오버레이(선택 시에만 로드됨) — 헤더 툴팁 표기용
                       const tr = open ? trackOfGroup(g.modeS) : null;
                       const headTitle =
-                        `${g.label} · high ${g.highCount.toLocaleString()}건 · 최대 이격 ${g.maxSepKm.toFixed(2)}km`
+                        `${g.label} · 반사 ${g.reflectionCount.toLocaleString()}건 · high ${g.highCount.toLocaleString()}건 · 최대 이격 ${g.maxSepKm.toFixed(2)}km`
                         + (tr && tr.pointCount > 0
                           ? ` · 항적 ${tr.pointCount.toLocaleString()}점/${tr.flightCount.toLocaleString()}편`
                           : "");
@@ -2114,7 +2259,7 @@ export default function DualTargetAnalysis() {
                               {g.label}
                             </span>
                             <span className="shrink-0 font-mono text-[9.5px] tabular-nums text-gray-400">
-                              high {g.highCount.toLocaleString()}·{g.maxSepKm.toFixed(1)}km
+                              반사 {g.reflectionCount.toLocaleString()}·{g.maxSepKm.toFixed(1)}km
                             </span>
                             <span className="shrink-0 font-mono text-[10px] font-bold tabular-nums" style={{ color: ERROR }}>
                               {g.events.length.toLocaleString()}건
@@ -2163,6 +2308,12 @@ export default function DualTargetAnalysis() {
                                         </span>
                                         <span className="shrink-0 rounded bg-gray-100 px-1 text-[9px] font-bold text-gray-500">
                                           {e.source === "scan" ? "잔존" : "파서"}
+                                        </span>
+                                        <span
+                                          className={`shrink-0 rounded px-1 text-[9px] font-bold ${KIND_BADGE_CLASS[e.kind]}`}
+                                          title={kindReasonText(e)}
+                                        >
+                                          {KIND_LABEL[e.kind]}
                                         </span>
                                         <span className="ml-auto shrink-0 font-mono text-[10px] font-bold tabular-nums" style={{ color: ERROR }}>
                                           {e.separation_km.toFixed(2)}km
@@ -2222,6 +2373,7 @@ export default function DualTargetAnalysis() {
           {/* ── 좌하단 범례 (건축물정보 드로어 z-[760] 보다 낮게) ── */}
           <DualLegend
             hasResult={dualResult != null}
+            hasDup={(stats?.events_dup_address ?? 0) > 0}
             hasModeS={selectedModeS != null}
             hasEvent={selectedEventId != null}
             showBuildings={mapZoom >= BUILDING_MIN_ZOOM}

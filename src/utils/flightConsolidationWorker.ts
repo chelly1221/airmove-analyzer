@@ -319,11 +319,13 @@ export async function queryModeSTrack(modeS: string): Promise<ModeSTrack> {
 /**
  * Worker에 축적된 항적 + 파서 보존 유령표적으로 이중표적 분석 실행.
  * 잔존 동일스캔 중복(scan) + 파서 제거분(parser) 병합 → 반사점 역산·클러스터링.
+ * excludeModeS: 시험표적(site monitor) 등 분석에서 제외할 Mode-S 목록.
  */
 export async function analyzeDualTargets(params: {
   sites: { name: string; latitude: number; longitude: number }[];
   scanWindowS: number;
   minSepKm: number;
+  excludeModeS: string[];
 }): Promise<DualTargetResult> {
   const result = await workerSend({ type: "ANALYZE_DUAL_TARGETS", ...params });
   return result.result as DualTargetResult;

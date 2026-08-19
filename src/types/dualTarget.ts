@@ -35,6 +35,19 @@ export interface DualTargetReflector {
   azimuth_deg: number;
 }
 
+/** 이벤트 분류 — reflection: 응답 내용(고도) 일치 + 유령이 더 먼 거리(반사 기하 부합)
+ *  dup_address: 고도 불일치 → 같은 Mode-S 주소를 쓰는 서로 다른 항공기(주소중복)
+ *  unknown: 고도 결측으로 비교 불가, 또는 고도는 일치하나 반사 기하 불성립(초과경로 없음·반사점 원거리) */
+export type DualTargetKind = "reflection" | "dup_address" | "unknown";
+
+/** 분류 근거 */
+export type DualTargetKindReason =
+  | "content_match"      // 고도 일치 & 초과경로 > 50m & 반사점 ≤ 25km
+  | "altitude_mismatch"  // |Δalt| > DUAL_ALT_MATCH_M(31m)
+  | "no_extra_path"      // 고도 일치이나 초과경로 ≤ 50m(유령이 더 가깝거나 같은 거리) — 반사 기하 성립 안 함
+  | "reflector_far"      // 고도 일치·초과경로 있음이나 역산 반사점이 레이더에서 25km 밖 — 근방 반사체일 수 없음
+  | "no_content";        // 어느 한쪽 altitude 가 0(FL 결측)
+
 export interface DualTargetEvent {
   id: number;
   mode_s: string;
@@ -52,6 +65,10 @@ export interface DualTargetEvent {
   source: "scan" | "parser";
   /** high = 반사 기하 부합(extra_path_km > 0.2), low = 기하 불부합/모호 */
   confidence: "high" | "low";
+  /** 응답 내용(고도)·거리 순서로 판정한 이벤트 분류 */
+  kind: DualTargetKind;
+  /** 그 분류의 근거 */
+  kind_reason: DualTargetKindReason;
   /** 소속 반사 클러스터 id (reflector 없으면 null) */
   cluster_id: number | null;
 }
@@ -81,13 +98,26 @@ export interface DualTargetStats {
   aircraft_count: number;
   /** 레이더 사이트 좌표 미매칭으로 건너뛴 비행 수 */
   skipped_no_site: number;
+  /** 분류별 이벤트 수 */
+  events_reflection: number;
+  events_dup_address: number;
+  events_unknown: number;
+  /** 제외 Mode-S(시험표적 등)로 건너뛴 비행 수 */
+  skipped_excluded_flights: number;
+  /** 제외 Mode-S 로 건너뛴 파서 보존 유령 포인트 수 */
+  skipped_excluded_ghosts: number;
+  /** 레이더별 추정 스캔주기 T(초) — 표본 부족으로 추정 실패 시 null(고정 윈도우 폴백) */
+  scan_period_by_radar: Record<string, number | null>;
 }
 
 export interface DualTargetParams {
-  /** 동일 스캔 판정 윈도우 (초, 기본 0.5) */
+  /** 동일스캔 윈도우 (초, 기본 0.5). 스캔주기 T 추정 시 잔존 중복 짝짓기는 한 회전 폭(0.75T)을
+   *  쓰고 이 값은 T 미추정 폴백 + 파서 보존분의 실표적 짝 매칭 허용 시간으로 쓰인다 */
   scan_window_s: number;
   /** 이중표적 최소 이격 거리 (km, 기본 1.0) */
   min_sep_km: number;
+  /** 분석에서 제외한 Mode-S 목록 (대문자 정규화) */
+  exclude_mode_s: string[];
 }
 
 export interface DualTargetResult {
