@@ -83,9 +83,8 @@ const KIND_BADGE_CLASS: Record<DualTargetKind, string> = {
   unknown: "bg-gray-100 text-gray-500",
 };
 
-/** 분류 필터 칩 정의 — 건수는 stats 에서 읽는다 */
-const KIND_CHIPS: { k: "all" | DualTargetKind; label: string; title: string }[] = [
-  { k: "all", label: "전체", title: "분류 필터 해제 — 전체 이벤트" },
+/** 분류 필터 칩 정의 — 건수는 stats 에서 읽는다. "전체" 칩은 없다(사용자 결정, 기본 탭 = 반사) */
+const KIND_CHIPS: { k: DualTargetKind; label: string; title: string }[] = [
   { k: "reflection", label: "반사", title: "초과경로 있음 + 반사점 레이더 근방(≤25km) + (고도 비교 가능 시) 응답 내용 일치 — 올콜 응답은 기하만으로 판정" },
   { k: "dup_address", label: "주소중복", title: "고도 불일치 또는 유령 위치에 PSR 스킨 에코 — 같은 주소의 다른 항공기·물체" },
   { k: "unknown", label: "미확인", title: "반사 기하 불성립(초과경로 없음·반사점 원거리)" },
@@ -613,7 +612,8 @@ export default function DualTargetAnalysis() {
    *  (오름차순 정렬된 id 배열, null = 필터 없음) */
   const [selectedClusterIds, setSelectedClusterIds] = useState<number[] | null>(null);
   /** 분류 필터 — 필터 체인 최상단(반사/주소중복/미확인). 요약 칩으로 전환 */
-  const [kindFilter, setKindFilter] = useState<"all" | DualTargetKind>("all");
+  /** 분류 탭 — 기본 "반사"(사용자 결정: 전체 탭 없음, 도구의 목적이 반사 유령 확인) */
+  const [kindFilter, setKindFilter] = useState<DualTargetKind>("reflection");
   /** 지도 표출을 특정 기체(Mode-S)로 한정 — 좌측 그룹 목록은 계속 전 기체를 보여준다.
    *  좌측 카드의 **펼침 상태도 여기서 파생**한다(선택=펼침, 해제=접힘 — 별도 펼침 state 없음). */
   const [selectedModeS, setSelectedModeS] = useState<string | null>(null);
@@ -1083,7 +1083,6 @@ export default function DualTargetAnalysis() {
   /** 분류 필터 적용 이벤트 — 필터 체인 최상단(반사/주소중복/미확인) */
   const kindEvents = useMemo(() => {
     const all = dualResult?.events ?? [];
-    if (kindFilter === "all") return all;
     return all.filter((e) => e.kind === kindFilter);
   }, [dualResult, kindFilter]);
 
@@ -1106,7 +1105,7 @@ export default function DualTargetAnalysis() {
     const ev = dualResult.events[isolatedEventId];
     if (!ev || ev.id !== isolatedEventId) return undefined;
     if (selectedModeS !== ev.mode_s) return undefined; // 그룹 헤더 토글 등으로 Mode-S 한정이 풀리면 단일 표출도 해제
-    if (kindFilter !== "all" && ev.kind !== kindFilter) return undefined; // 분류 필터 밖이면 단일 표출도 해제
+    if (ev.kind !== kindFilter) return undefined; // 분류 필터 밖이면 단일 표출도 해제
     return ev;
   }, [isolatedEventId, selectedEventId, selectedModeS, kindFilter, dualResult]);
 
@@ -1121,8 +1120,6 @@ export default function DualTargetAnalysis() {
    */
   const displayClusters = useMemo<ReflectorCluster[]>(() => {
     const all = dualResult?.clusters ?? [];
-    if (kindFilter === "all" && selectedModeS == null) return [...all].sort((a, b) => b.count - a.count);
-
     const counts = new Map<number, number>();
     for (const e of kindEvents) {
       if (selectedModeS != null && e.mode_s !== selectedModeS) continue;
@@ -1137,7 +1134,7 @@ export default function DualTargetAnalysis() {
     }
     out.sort((a, b) => b.count - a.count);
     return out;
-  }, [dualResult, kindEvents, kindFilter, selectedModeS]);
+  }, [dualResult, kindEvents, selectedModeS]);
 
   /** 지도 반사체 원천 — 단일 표출 중이면 그 이벤트의 클러스터 하나(count 1), 좌측 리스트는 displayClusters 그대로 */
   const mapClusters = useMemo<ReflectorCluster[]>(() => {
@@ -2107,9 +2104,7 @@ export default function DualTargetAnalysis() {
                 <div className="mt-1.5 flex flex-wrap items-center gap-1">
                   {KIND_CHIPS.map((c) => {
                     const on = kindFilter === c.k;
-                    const n = c.k === "all"
-                      ? dualResult.events.length
-                      : c.k === "reflection" ? (stats?.events_reflection ?? 0)
+                    const n = c.k === "reflection" ? (stats?.events_reflection ?? 0)
                       : c.k === "dup_address" ? (stats?.events_dup_address ?? 0)
                       : (stats?.events_unknown ?? 0);
                     return (
