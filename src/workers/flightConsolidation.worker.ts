@@ -140,7 +140,7 @@ interface DualTargetReflector {
 }
 
 type DualTargetKind = "reflection" | "dup_address" | "unknown";
-type DualTargetKindReason = "content_match" | "altitude_mismatch" | "no_extra_path" | "reflector_far" | "no_content";
+type DualTargetKindReason = "content_match" | "geometry_only" | "altitude_mismatch" | "ghost_psr" | "no_extra_path" | "reflector_far";
 
 interface DualTargetEvent {
   id: number;
@@ -230,6 +230,12 @@ const DUAL_MAX_REFLECTOR_RANGE_KM = 25;
 const DUAL_SCAN_CLUSTER_FRACTION = 0.75;
 /** 스캔주기 추정에 필요한 비행별 최소 dt 표본 수 */
 const DUAL_MIN_SCAN_DELTAS = 10;
+/** 올콜(All-Call) 탐지 유형 — DF11 응답에는 고도가 없고, 항적의 올콜 포인트 altitude 는 파서 보간값이라 "응답 내용"으로 쓸 수 없다 */
+const DUAL_ALLCALL_TYPES = new Set(["mode_s_allcall", "mode_s_allcall_psr"]);
+/** PSR 결합 탐지 유형 — 그 위치에 1차 레이더 스킨 에코가 있다 = 물리적 표적 */
+const DUAL_PSR_TYPES = new Set(["mode_ac_psr", "mode_s_allcall_psr", "mode_s_rollcall_psr"]);
+/** 파서 보존분 전후 보간 허용 최대 암시 속도 (km/s) — 초과하면 항적이 유령점으로 오염된 것(파서 outlier 제거가 실점까지 제거) */
+const DUAL_MAX_INTERP_SPEED_KMS = 0.35;
 
 // 이상고도 보정 상수
 const MAX_VERTICAL_RATE_MS = 100;
@@ -251,7 +257,7 @@ interface FlightIndexEntry {
   endTime: number;
   points: FlightPointsSoA;
 }
-let _flightIndex = new Map<string, FlightIndexEntry>();
+const _flightIndex = new Map<string, FlightIndexEntry>();
 
 /** 파서가 제거하되 보존한 유령표적 포인트 (ADD_GHOST_POINTS 누적).
  *  소량(통상 수천 이하)이므로 객체 배열로 보관해도 메모리 부담 없음. */
@@ -1031,17 +1037,22 @@ function makeDualObservation(
 /**
  * 실/유령 관측 쌍 → 이벤트 조립 (id·cluster_id 는 후처리에서 부여).
  *
- * 분류(kind)는 반사 유령의 물리 조건 2가지로 판정한다 — scan/parser 소스 공통.
- *  (1) 같은 응답이 반사된 것이므로 **응답 내용(고도)이 같아야** 한다.
- *      TrackPoint 에는 Mode 3/A·콜사인이 없어 고도만 비교하며, FL 결측은 altitude=0 으로
- *      들어오므로 0 은 "결측"으로 보고 비교하지 않는다.
- *  (2) 반사는 경로가 늘어나므로 **유령 거리 > 실표적 거리**(초과경로 > 50m)여야 한다.
- *  (3) 역산 반사점은 **레이더 근방**(≤ DUAL_MAX_REFLECTOR_RANGE_KM)이어야 한다 — 같은 FL 의
+ * 분류(kind)는 **기하 우선 + 응답 내용은 비교 가능할 때만** 으로 판정한다 — scan/parser 소스 공통.
+ *  (1) 반사는 경로가 늘어나므로 **유령 거리 > 실표적 거리**(초과경로 > 50m)여야 한다.
+ *  (2) 역산 반사점은 **레이더 근방**(≤ DUAL_MAX_REFLECTOR_RANGE_KM)이어야 한다 — 같은 FL 의
  *      주소중복 2기는 반사점이 수십 km 밖으로 나와 여기서 걸러진다.
- * 고도가 어긋나면 같은 Mode-S 주소를 쓰는 서로 다른 항공기(주소중복)다 — 반사가 아니므로
- * 반사점 역산도 하지 않는다(reflector = null → 클러스터·애니메이션·반사면 대상에서 자동 제외).
- * (2)(3) 위배는 "unknown" — 반사점은(있으면) 남겨 두어 사용자가 확인할 수 있게 한다.
- * 파서 소스의 보간 real 은 altitude 도 보간돼 있어 동일 규칙을 그대로 적용한다.
+ *  (3) 응답 내용(고도)은 **양쪽 다 비교 가능할 때만** 본다. 반사 유령의 모집단은 사실상 전부
+ *      Mode-S 올콜(All-Call, DF11) 응답이고 올콜 응답에는 원리적으로 고도가 없다(altitude=0).
+ *      게다가 항적(track_points)의 올콜 포인트 altitude 는 파서 interpolate_missing_altitudes 가
+ *      채운 **보간값**이라 "응답 내용"이 아니다(비교하면 항상 자동 일치 = 무의미).
+ *      과거의 "고도 결측 → 미확인" 규칙은 반사가 사는 모집단을 통째로 버렸다(실측 12일 미확인
+ *      1,794건 중 82%가 그 사유) — 올콜은 기하만으로 판정한다.
+ *  (4) 유령 위치 관측이 **PSR 결합형**(mode_ac_psr/mode_s_allcall_psr/mode_s_rollcall_psr)이면
+ *      그 자리에 1차 레이더 스킨 에코가 있다 = 물리적 표적이므로 반사가 아니다(주소중복).
+ *      단 (1) 검사가 먼저다 — 파서 오염으로 실/유령이 뒤집힌 짝은 no_extra_path 로 가야 한다.
+ * 고도가 어긋나면(비교 가능할 때) 같은 Mode-S 주소를 쓰는 서로 다른 항공기(주소중복)다 —
+ * 반사가 아니므로 반사점 역산도 하지 않는다(reflector = null).
+ * (1)(2) 위배는 "unknown" — 반사점은(있으면) 남겨 두어 사용자가 확인할 수 있게 한다(지도에는 그리지 않음).
  */
 function buildDualEvent(
   modeS: string, radarName: string,
@@ -1056,23 +1067,26 @@ function buildDualEvent(
 
   const altR = real.altitude;
   const altG = ghost.altitude;
+  /** 이 관측의 altitude 를 "응답 내용"으로 쓸 수 있는가 — FL 결측(0)·올콜(고도 없음/보간값)은 불가 */
+  const hasContent = (o: DualTargetObservation) => o.altitude !== 0 && !DUAL_ALLCALL_TYPES.has(o.radar_type);
+  const contentBoth = hasContent(real) && hasContent(ghost);
+
   let kind: DualTargetKind;
   let kindReason: DualTargetKindReason;
-  if (altR === 0 || altG === 0) {
-    kind = "unknown"; kindReason = "no_content";              // FL 결측 — 비교 불가
-  } else if (Math.abs(altR - altG) > DUAL_ALT_MATCH_M) {
-    kind = "dup_address"; kindReason = "altitude_mismatch";   // 다른 응답 = 다른 항공기
+  let reflector: DualTargetReflector | null = null;
+  if (contentBoth && Math.abs(altR - altG) > DUAL_ALT_MATCH_M) {
+    kind = "dup_address"; kindReason = "altitude_mismatch";   // 다른 응답 = 다른 항공기 (반사점 역산 생략)
   } else if (extraPath <= DUAL_MIN_EXTRA_PATH_KM) {
-    kind = "unknown"; kindReason = "no_extra_path";           // 유령이 더 가깝거나 초과경로 없음 = 반사 기하 성립 안 함
+    kind = "unknown"; kindReason = "no_extra_path";           // 유령이 더 가깝거나 초과경로 없음 = 반사 기하 성립 안 함(역산 해 없음)
+  } else if (DUAL_PSR_TYPES.has(ghost.radar_type)) {
+    kind = "dup_address"; kindReason = "ghost_psr";           // 유령 위치에 PSR 스킨 에코 = 물리 표적(같은 주소의 다른 물체)
   } else {
-    kind = "reflection"; kindReason = "content_match";        // 반사점 거리 상한은 아래 역산 뒤 재판정
-  }
-  // 반사점 역산 — 주소중복은 물리적 의미가 없어 생략(null), 초과경로 없음도 해가 없어 null
-  const reflector = kind === "dup_address" || extraPath <= DUAL_MIN_EXTRA_PATH_KM
-    ? null
-    : solveReflector(siteLat, siteLon, real.latitude, real.longitude, ghost.azimuth_deg, ghost.range_km);
-  if (kind === "reflection" && reflector && reflector.range_km > DUAL_MAX_REFLECTOR_RANGE_KM) {
-    kind = "unknown"; kindReason = "reflector_far";           // 반사체가 레이더 근방일 수 없는 거리 = 같은 FL 의 다른 항공기 등
+    reflector = solveReflector(siteLat, siteLon, real.latitude, real.longitude, ghost.azimuth_deg, ghost.range_km);
+    if (reflector.range_km > DUAL_MAX_REFLECTOR_RANGE_KM) {
+      kind = "unknown"; kindReason = "reflector_far";         // 반사체가 레이더 근방일 수 없는 거리 (반사점은 사용자 확인용으로 남김)
+    } else {
+      kind = "reflection"; kindReason = contentBoth ? "content_match" : "geometry_only";
+    }
   }
 
   return {
@@ -1344,6 +1358,11 @@ async function analyzeDualTargets(
       const soa = best.points;
       let realP: { timestamp: number; latitude: number; longitude: number; altitude: number; radar_type: string } | null = null;
 
+      // real 짝 결정 — ① 동일스캔 최근접 → ② 건전한 전후 보간 → ③ 폐기(dropped_unmatched 로 드러냄, 대체 경로 없음)
+      //   ②의 "건전성" 검사가 필요한 이유: 파서 remove_spatial_outliers 는 유령/실표적이 스캔마다
+      //   번갈아 찍히면 **실표적 점까지** 제거해 항적에 유령점이 남는다. 그 상태로 전후를 보간하면
+      //   유령점과 실점 사이의 허위 위치가 real 이 되어 반사점이 11km/20km 로 흩어진다
+      //   (정합 짝은 5.2km 단일 반사체). 전후 암시 속도가 항공기 속도를 넘으면 오염으로 보고 버린다.
       if (bestNear >= 0 && bestDt <= scanWindowS) {
         // 동일스캔 실측 짝
         realP = pointAt(soa, bestNear) as TrackPoint;
@@ -1351,6 +1370,15 @@ async function analyzeDualTargets(
         bestPrev >= 0 && bestNext >= 0
         && g.timestamp - soa.timestamp[bestPrev] <= DUAL_PARSER_MATCH_WINDOW_S
         && soa.timestamp[bestNext] - g.timestamp <= DUAL_PARSER_MATCH_WINDOW_S
+        && (() => {
+          const dt = soa.timestamp[bestNext] - soa.timestamp[bestPrev];
+          if (dt <= 0) return false;
+          const d = haversine(
+            soa.latitude[bestPrev], soa.longitude[bestPrev],
+            soa.latitude[bestNext], soa.longitude[bestNext],
+          );
+          return d / dt <= DUAL_MAX_INTERP_SPEED_KMS; // 암시 속도 게이트 (오염 항적 배제)
+        })()
       ) {
         // 전후 실포인트 선형보간 위치를 real 로 사용
         const t0 = soa.timestamp[bestPrev];
@@ -1401,13 +1429,15 @@ async function analyzeDualTargets(
   stats.aircraft_count = modeSSet.size;
 
   // ── 반사점 클러스터링 (≈250m 그리드 → count 내림차순 id 부여) ──
+  //   **실반사(kind === "reflection")만** 클러스터 대상 — 지도·목록의 반사 관련 표출은 실반사만 한다.
+  //   unknown(reflector_far) 의 반사점은 데이터로 남지만 cluster_id 는 null 이라 마커가 서지 않는다.
   interface CellAcc {
     sumLat: number; sumLon: number; count: number; radarName: string; members: number[];
   }
   const cells = new Map<string, CellAcc>();
   for (let i = 0; i < events.length; i++) {
     const r = events[i].reflector;
-    if (!r) continue;
+    if (!r || events[i].kind !== "reflection") continue;
     const key = `${events[i].radar_name}|${Math.round(r.latitude / DUAL_CLUSTER_GRID_DEG)}|${Math.round(r.longitude / DUAL_CLUSTER_GRID_DEG)}`;
     let cell = cells.get(key);
     if (!cell) {

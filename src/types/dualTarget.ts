@@ -35,18 +35,22 @@ export interface DualTargetReflector {
   azimuth_deg: number;
 }
 
-/** 이벤트 분류 — reflection: 응답 내용(고도) 일치 + 유령이 더 먼 거리(반사 기하 부합)
- *  dup_address: 고도 불일치 → 같은 Mode-S 주소를 쓰는 서로 다른 항공기(주소중복)
- *  unknown: 고도 결측으로 비교 불가, 또는 고도는 일치하나 반사 기하 불성립(초과경로 없음·반사점 원거리) */
+/** 이벤트 분류 — reflection: 반사 기하 부합(초과경로 있음 + 반사점 레이더 근방).
+ *    고도(응답 내용) 비교가 가능하면 일치까지 확인하지만, 반사 유령의 모집단인
+ *    Mode-S 올콜(All-Call, DF11) 응답에는 원리적으로 고도가 없어 기하만으로 판정한다.
+ *  dup_address: 고도 불일치, 또는 유령 위치에 PSR 스킨 에코 동반
+ *    → 같은 Mode-S 주소를 쓰는 서로 다른 항공기·물체(주소중복)
+ *  unknown: 반사 기하 불성립(초과경로 없음·반사점 원거리) */
 export type DualTargetKind = "reflection" | "dup_address" | "unknown";
 
 /** 분류 근거 */
 export type DualTargetKindReason =
-  | "content_match"      // 고도 일치 & 초과경로 > 50m & 반사점 ≤ 25km
-  | "altitude_mismatch"  // |Δalt| > DUAL_ALT_MATCH_M(31m)
-  | "no_extra_path"      // 고도 일치이나 초과경로 ≤ 50m(유령이 더 가깝거나 같은 거리) — 반사 기하 성립 안 함
-  | "reflector_far"      // 고도 일치·초과경로 있음이나 역산 반사점이 레이더에서 25km 밖 — 근방 반사체일 수 없음
-  | "no_content";        // 어느 한쪽 altitude 가 0(FL 결측)
+  | "content_match"      // 고도(응답 내용) 일치 & 초과경로 > 50m & 반사점 ≤ 25km
+  | "geometry_only"      // 올콜 응답(고도 없음)이라 내용 비교 불가 — 초과경로·반사점 근방 기하만 부합
+  | "altitude_mismatch"  // |Δalt| > DUAL_ALT_MATCH_M(31m) — 양쪽 고도 비교가 가능할 때만
+  | "ghost_psr"          // 유령 위치 관측이 PSR 결합형 — 그 자리에 1차 레이더 스킨 에코가 있는 물리 표적
+  | "no_extra_path"      // 초과경로 ≤ 50m(유령이 더 가깝거나 같은 거리) — 반사 기하 성립 안 함
+  | "reflector_far";     // 초과경로 있으나 역산 반사점이 레이더에서 25km 밖 — 근방 반사체일 수 없음
 
 export interface DualTargetEvent {
   id: number;
@@ -69,7 +73,7 @@ export interface DualTargetEvent {
   kind: DualTargetKind;
   /** 그 분류의 근거 */
   kind_reason: DualTargetKindReason;
-  /** 소속 반사 클러스터 id (reflector 없으면 null) */
+  /** 소속 반사 클러스터 id — reflection 이벤트만 부여, 그 외(unknown·dup_address)는 null */
   cluster_id: number | null;
 }
 

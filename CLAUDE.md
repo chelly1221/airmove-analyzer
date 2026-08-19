@@ -108,6 +108,7 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 - `src/utils/flightConsolidationWorker.ts` — Worker 래퍼 (콜백 스트리밍 패턴)
 
 ## 코딩 컨벤션
+- **폴백(fallback) 경로는 가급적 만들지 않는다** — 1차 경로가 실패하면 조용히 2차 경로로 대체하지 말고 실패를 명시적으로 드러낸다(에러 반환·폐기 카운트·상태 표기). 폴백은 판정 기준을 흐리고 실패를 숨긴다. 꼭 필요하면 근거를 주석에 남기고 사용자 확인을 받는다
 - Rust: snake_case, Result/Option 에러 핸들링
 - TypeScript: camelCase, 컴포넌트 PascalCase
 - CSS: Tailwind utility-first

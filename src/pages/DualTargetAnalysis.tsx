@@ -27,6 +27,7 @@ import type {
   Building3D,
   DualTargetEvent,
   DualTargetKind,
+  DualTargetReflector,
   FacBuildingDetail,
   Flight,
   ModeSTrack,
@@ -64,8 +65,11 @@ const ERROR = "#e94560";
 
 /** 그룹당 표시 행 상한 — UI 표시만 제한(통계·지도는 전수 이벤트 사용) */
 const GROUP_ROW_CAP = 200;
-/** 기본 제외 Mode-S — 시험표적(site monitor). 방위 지터가 이중표적으로 잡힌다 */
-const DEFAULT_EXCLUDE_MODE_S = "71D703, 84AB56";
+/** 기본 제외 Mode-S — 시험표적(site monitor) 2 + 이상주소 2.
+ *  시험표적(71D703·84AB56)은 방위 지터가 이중표적으로 잡힌다.
+ *  이상주소 000001(미설정 기본주소)·924924(100100 반복 비트패턴)는 김포 SSW 7~11km 저속 물체
+ *  2기가 번갈아 사용해 하루 수백 건의 주소중복 이벤트를 만든다. */
+const DEFAULT_EXCLUDE_MODE_S = "71D703, 84AB56, 000001, 924924";
 /** 분류 배지 라벨 */
 const KIND_LABEL: Record<DualTargetKind, string> = {
   reflection: "반사",
@@ -82,9 +86,9 @@ const KIND_BADGE_CLASS: Record<DualTargetKind, string> = {
 /** 분류 필터 칩 정의 — 건수는 stats 에서 읽는다 */
 const KIND_CHIPS: { k: "all" | DualTargetKind; label: string; title: string }[] = [
   { k: "all", label: "전체", title: "분류 필터 해제 — 전체 이벤트" },
-  { k: "reflection", label: "반사", title: "고도 일치 + 초과경로 있음 + 반사점이 레이더 근방(≤25km) — 반사 기하 부합" },
-  { k: "dup_address", label: "주소중복", title: "고도 불일치 — 같은 Mode-S 주소를 쓰는 서로 다른 항공기" },
-  { k: "unknown", label: "미확인", title: "고도 결측(비교 불가) 또는 반사 기하 불성립(초과경로 없음·반사점 원거리)" },
+  { k: "reflection", label: "반사", title: "초과경로 있음 + 반사점 레이더 근방(≤25km) + (고도 비교 가능 시) 응답 내용 일치 — 올콜 응답은 기하만으로 판정" },
+  { k: "dup_address", label: "주소중복", title: "고도 불일치 또는 유령 위치에 PSR 스킨 에코 — 같은 주소의 다른 항공기·물체" },
+  { k: "unknown", label: "미확인", title: "반사 기하 불성립(초과경로 없음·반사점 원거리)" },
 ];
 
 /** 건물명 라벨링 대상 클러스터 수 (count 상위) */
@@ -108,16 +112,27 @@ function parseModeSList(text: string): string[] {
 function kindReasonText(e: DualTargetEvent): string {
   switch (e.kind_reason) {
     case "content_match":
-      return "고도 일치·초과경로 있음·반사점 레이더 근방(반사 기하 부합)";
+      return "고도(응답 내용) 일치·초과경로 있음·반사점 레이더 근방 — 반사 기하 부합";
+    case "geometry_only":
+      return "올콜(All-Call) 응답은 고도가 없어 내용 비교 불가 — 초과경로·반사점 근방(≤25km) 기하만으로 반사 판정";
     case "altitude_mismatch":
-      return `고도 불일치 Δ${Math.round(Math.abs(e.real.altitude - e.ghost.altitude) / 0.3048)}ft → 같은 주소의 다른 항공기`;
+      return `고도 불일치 Δ${Math.round(Math.abs(e.real.altitude - e.ghost.altitude) / 0.3048)}ft → 같은 주소의 다른 항공기`
+        + (e.ghost.radar_type === "mode_ac" || e.ghost.radar_type === "mode_ac_psr" ? " (Mode 3/A 병합 표적)" : "");
+    case "ghost_psr":
+      return "유령 위치에 1차 레이더(PSR) 스킨 에코 동반 — 물리적 표적(같은 주소의 다른 항공기·물체)";
     case "no_extra_path":
-      return "고도 일치이나 초과경로 없음(유령이 더 가깝거나 같은 거리) — 반사 기하 성립 안 함";
+      return "초과경로 없음(유령이 더 가깝거나 같은 거리) — 반사 기하 성립 안 함";
     case "reflector_far":
-      return `고도 일치이나 역산 반사점이 레이더에서 ${e.reflector ? e.reflector.range_km.toFixed(1) : "?"}km — 근방 반사체일 수 없음(같은 FL 의 다른 항공기 가능성)`;
+      return `역산 반사점이 레이더에서 ${e.reflector ? e.reflector.range_km.toFixed(1) : "?"}km — 근방 반사체일 수 없음(같은 주소의 다른 항공기·원거리 잡음 가능성)`;
     default:
-      return "고도 정보 없음(비교 불가)";
+      return "판정 근거 없음";
   }
+}
+
+/** 지도 반사 표출용 반사점 — 실반사(kind reflection)만. unknown/reflector_far 의 반사점은
+ *  데이터로만 남기고 지도엔 그리지 않는다 (좌측 목록의 "· 반사 X km / N°" 는 확인용으로 유지) */
+function mapReflector(e: DualTargetEvent): DualTargetReflector | null {
+  return e.kind === "reflection" ? e.reflector : null;
 }
 
 // ── 2D 건물 표출 ────────────────────────────────────────────────────
@@ -444,10 +459,12 @@ function LegendRow({ swatch, label }: { swatch: ReactNode; label: string }) {
  * 지도 좌하단 범례 — 표시 항목은 현재 표출 상태에 맞춰 가감한다.
  * (결과 없이도 유효한 사이트·건물 항목은 항상, 표적·반사체는 결과가 있을 때만)
  */
-function DualLegend({ hasResult, hasDup, hasModeS, hasEvent, showBuildings, showSurfaces, isolated }: {
+function DualLegend({ hasResult, hasDup, hasUnknown, hasModeS, hasEvent, showBuildings, showSurfaces, isolated }: {
   hasResult: boolean;
   /** 주소중복(다른 항공기) 이벤트 보유 — 유령점이 slate 로도 찍힌다 */
   hasDup: boolean;
+  /** 미확인(반사 기하 불성립) 이벤트 보유 — 유령점이 amber 로도 찍힌다 */
+  hasUnknown: boolean;
   hasModeS: boolean;
   hasEvent: boolean;
   showBuildings: boolean;
@@ -482,6 +499,9 @@ function DualLegend({ hasResult, hasDup, hasModeS, hasEvent, showBuildings, show
               {hasDup && (
                 <LegendRow swatch={<LegendDot fill="rgb(100,116,139)" r={5} />} label="주소중복 유령(다른 항공기)" />
               )}
+              {hasUnknown && (
+                <LegendRow swatch={<LegendDot fill="rgb(245,158,11)" r={5} />} label="미확인 유령(기하 불성립)" />
+              )}
               <LegendRow swatch={<LegendLine color="rgb(59,130,246)" width={1.5} />} label="실표적–(반사점)–레이더 경로" />
               <LegendRow
                 swatch={<LegendLine color="rgb(233,69,96)" width={1.5} dashed />}
@@ -513,7 +533,7 @@ function DualLegend({ hasResult, hasDup, hasModeS, hasEvent, showBuildings, show
           />
           <LegendRow swatch={<LegendDot fill={ACCENT} stroke="#ffffff" r={4} />} label="분석 기준 레이더 (위치점)" />
           {hasModeS && (
-            <LegendRow swatch={<LegendLine color="rgb(14,116,144)" width={2} />} label="항적(선택 기체)" />
+            <LegendRow swatch={<LegendLine color="rgb(132,204,22)" width={2} />} label="항적(선택 기체)" />
           )}
           {hasEvent && (
             <>
@@ -1290,17 +1310,18 @@ export default function DualTargetAnalysis() {
     return { length: segCount, source, target };
   }, [mapEvents, dualSites, mapZoom]);
 
-  /** 반사면 선분(고줌 전용) — mapEvents 중 반사점 보유분 전수. 줌 미달이면 빈 배열(레이어 생략). */
+  /** 반사면 선분(고줌 전용) — mapEvents 중 **실반사** 반사점 보유분 전수. 줌 미달이면 빈 배열(레이어 생략). */
   const reflectSurfaces = useMemo<{ path: [number, number][] }[]>(() => {
     if (mapZoom < REFLECT_SURFACE_MIN_ZOOM || mapEvents.length === 0) return [];
     const siteMap = new Map<string, { name: string; latitude: number; longitude: number }>();
     for (const s of dualSites) siteMap.set(s.name, s);
     const out: { path: [number, number][] }[] = [];
     for (const e of mapEvents) {
-      if (!e.reflector) continue;
+      const r = mapReflector(e);
+      if (!r) continue;
       const site = siteMap.get(e.radar_name);
       if (!site) continue;
-      const seg = reflectSurfaceSegment(e.reflector, e.real, site, REFLECT_SURFACE_HALF_M);
+      const seg = reflectSurfaceSegment(r, e.real, site, REFLECT_SURFACE_HALF_M);
       if (seg) out.push({ path: seg });
     }
     return out;
@@ -1493,14 +1514,16 @@ export default function DualTargetAnalysis() {
   const reflectionAnim = useMemo<ReflectionAnim | null>(() => {
     if (selectedEventId == null || !dualResult) return null;
     const ev = dualResult.events.find((e) => e.id === selectedEventId);
-    if (!ev?.reflector) return null;
+    if (!ev) return null;
+    const refl = mapReflector(ev); // 실반사만 애니메이션 — 기하 불성립 이벤트는 전파 경로가 없다
+    if (!refl) return null;
     const site = dualSites.find((s) => s.name === ev.radar_name);
     if (!site) return null;
     return {
       tripData: [{
         path: [
           [ev.real.longitude, ev.real.latitude],
-          [ev.reflector.longitude, ev.reflector.latitude],
+          [refl.longitude, refl.latitude],
           [site.longitude, site.latitude],
         ] as [number, number][],
       }],
@@ -1617,7 +1640,7 @@ export default function DualTargetAnalysis() {
             startIndices: modeSTrack.startIndices,
             attributes: { getPath: { value: modeSTrack.positions, size: 2 } },
           },
-          getColor: [14, 116, 144, 170],
+          getColor: [132, 204, 22, 210],
           getWidth: 1.5,
           widthUnits: "pixels" as const,
           widthMinPixels: 1.5,
@@ -1631,7 +1654,7 @@ export default function DualTargetAnalysis() {
             length: modeSTrack.pointCount,
             attributes: { getPosition: { value: modeSTrack.positions, size: 2 } },
           },
-          getFillColor: [14, 116, 144, 130],
+          getFillColor: [132, 204, 22, 170],
           radiusUnits: "pixels" as const,
           getRadius: 1.5,
           radiusMinPixels: 1.5,
@@ -1642,8 +1665,8 @@ export default function DualTargetAnalysis() {
     }
 
     // ── 방사선: 실표적→(반사점)→레이더(실선) · 유령표적→레이더(점선) ──
-    //   실선은 실제 전파 경로를 그린다 — 반사점이 있으면 실표적→반사점→레이더 두 마디(꺾인 선),
-    //   반사점이 없으면(주소중복·초과경로 없음) 반사가 아니므로 레이더까지 직선.
+    //   실선은 실제 전파 경로를 그린다 — **실반사**면 실표적→반사점→레이더 두 마디(꺾인 선),
+    //   그 외(주소중복·초과경로 없음·반사점 원거리)는 반사가 아니므로 레이더까지 직선.
     //   유령 점선은 레이더 기점 유령 방위선이라 두 선이 벌어진 각이 곧 반사로 생긴 방위 오차다.
     //   사이트 좌표를 찾을 수 없는 이벤트(미등록 레이더명)는 그릴 수 없으므로 제외한다.
     const siteByName = new Map<string, { name: string; latitude: number; longitude: number }>();
@@ -1658,7 +1681,8 @@ export default function DualTargetAnalysis() {
           getPath: (d): [number, number][] => {
             const site = siteByName.get(d.radar_name)!; // radialEvents 는 사이트 보유분만
             const path: [number, number][] = [[d.real.longitude, d.real.latitude]];
-            if (d.reflector) path.push([d.reflector.longitude, d.reflector.latitude]);
+            const refl = mapReflector(d);
+            if (refl) path.push([refl.longitude, refl.latitude]);
             path.push([site.longitude, site.latitude]);
             return path;
           },
@@ -1730,9 +1754,12 @@ export default function DualTargetAnalysis() {
         id: "dual-ghost-pts",
         data: mapEvents,
         getPosition: (d) => [d.ghost.longitude, d.ghost.latitude],
-        // 주소중복(다른 항공기)은 반사가 아니므로 slate 로 구분 — data 참조가 바뀌면 재계산된다
+        // 분류별 색 구분 — 반사=빨강, 주소중복(다른 항공기·물체)=slate, 미확인(기하 불성립)=amber.
+        // data 참조가 바뀌면 재계산된다
         getFillColor: (d): [number, number, number, number] =>
-          d.kind === "dup_address" ? [100, 116, 139, 200] : [233, 69, 96, 220],
+          d.kind === "reflection" ? [233, 69, 96, 220]
+            : d.kind === "dup_address" ? [100, 116, 139, 200]
+              : [245, 158, 11, 210],
         getRadius: 90,
         // 클릭 표적 확대 — 유령표적은 실표적보다 한 단계 크게(실표적과 구분)
         radiusMinPixels: 5,
@@ -1783,14 +1810,17 @@ export default function DualTargetAnalysis() {
     // ── Mode-S 선택(이벤트 미선택) 시 반사 기하 분포: 실표적 → 반사점 정적 기하선 ──
     //   개별 이벤트를 고르지 않아도 이 기체의 반사가 어디로 모이는지 한눈에 드러난다.
     if (selectedModeS != null && selectedEventId == null) {
-      const withReflector = mapEvents.filter((e) => e.reflector != null);
+      const withReflector = mapEvents.filter((e) => mapReflector(e) != null);
       if (withReflector.length > 0) {
         layers.push(
           new LineLayer<DualTargetEvent>({
             id: "dual-reflect-geometry",
             data: withReflector,
             getSourcePosition: (d) => [d.real.longitude, d.real.latitude],
-            getTargetPosition: (d) => [d.reflector!.longitude, d.reflector!.latitude],
+            getTargetPosition: (d) => {
+              const r = mapReflector(d)!; // withReflector 는 실반사 반사점 보유분만
+              return [r.longitude, r.latitude];
+            },
             getColor: [166, 7, 57, 60],
             getWidth: 1,
             widthUnits: "pixels" as const,
@@ -1805,15 +1835,16 @@ export default function DualTargetAnalysis() {
     if (selectedEventId != null) {
       const ev = dualResult?.events.find((e) => e.id === selectedEventId);
       const site = ev ? dualSites.find((s) => s.name === ev.radar_name) : undefined;
+      const selRefl = ev ? mapReflector(ev) : null; // 실반사만 반사 경로 강조
       if (ev && site) {
-        if (ev.reflector) {
+        if (selRefl) {
           layers.push(
             new PathLayer<{ path: [number, number][] }>({
               id: "dual-selected-path",
               data: [{
                 path: [
                   [site.longitude, site.latitude],
-                  [ev.reflector.longitude, ev.reflector.latitude],
+                  [selRefl.longitude, selRefl.latitude],
                   [ev.real.longitude, ev.real.latitude],
                 ] as [number, number][],
               }],
@@ -2374,6 +2405,7 @@ export default function DualTargetAnalysis() {
           <DualLegend
             hasResult={dualResult != null}
             hasDup={(stats?.events_dup_address ?? 0) > 0}
+            hasUnknown={(stats?.events_unknown ?? 0) > 0}
             hasModeS={selectedModeS != null}
             hasEvent={selectedEventId != null}
             showBuildings={mapZoom >= BUILDING_MIN_ZOOM}
