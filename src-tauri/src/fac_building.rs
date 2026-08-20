@@ -47,10 +47,14 @@ pub struct FacBuildingImportStatus {
 /// 그 행이 원인이던 인접 region 행의 억제가 원인 없이 남는다(dangling) — 대장 행이 영영 안 보인다.
 /// 멱등이며 수동 원인('manual:%')은 원인이 별도 테이블에 남아 있으므로 건드리지 않는다.
 fn clear_dangling_measured_suppression(conn: &Connection) -> Result<(), String> {
+    // 주의: 'measured:'||f2.id = suppressed_by 형태(상관 문자열 결합)는 인덱스를 못 타
+    // 억제행 수 × 전체 행(2M+) 비교로 지역당 수십 분씩 걸린다(2026-08-20 전체 다운로드에서 실측).
+    // db.rs 정합 정리와 동일하게 substr → id PK 역참조로 판정한다(의미 동일).
     conn.execute(
         "UPDATE fac_buildings SET suppressed_by = NULL
          WHERE suppressed_by LIKE 'measured:%'
-           AND NOT EXISTS (SELECT 1 FROM fac_buildings f2 WHERE 'measured:'||f2.id = fac_buildings.suppressed_by)",
+           AND NOT EXISTS (SELECT 1 FROM fac_buildings u
+               WHERE u.id = CAST(substr(fac_buildings.suppressed_by, 10) AS INTEGER))",
         [],
     )
     .map_err(|e| format!("dangling 실측 억제 정리 실패: {}", e))?;
