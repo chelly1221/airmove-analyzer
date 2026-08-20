@@ -1186,7 +1186,8 @@ pub struct OmRefDayHist {
 pub struct OmReferenceRegistryEntry {
     #[serde(flatten)]
     pub meta: OmReferenceMeta,
-    /// 원본 ASS 보관 디렉토리 절대경로 (om_reference/ass/<dir>/) — 빈 문자열=미보관(재등록 필요).
+    /// 원본 ASS 보관 디렉토리 — data/ 기준 상대경로 (om_reference/ass/<dir>) — 빈 문자열=미보관(재등록 필요).
+    /// 구버전 절대경로는 로드 시(load_om_registry) 상대경로로 마이그레이션된다.
     #[serde(default)]
     pub ass_dir: String,
     /// (구버전 마이그레이션) 집계 JSON 파일 경로 — 새 시스템 미사용. 로드 시 발견하면 파일 삭제 후 비움.

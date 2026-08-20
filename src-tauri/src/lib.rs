@@ -18,7 +18,7 @@ pub mod terrain_tiles;
 pub mod vworld;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -755,6 +755,72 @@ fn get_db_path(state: &AppState) -> Result<PathBuf, String> {
     Ok(app_data_dir.join("adsb.db"))
 }
 
+// ---------- 이동 가능(portable) 경로 ----------
+//
+// settings 에 절대경로를 저장하면 data/ 폴더를 다른 위치·다른 PC 로 옮겼을 때 전부 깨진다.
+// data/ 하위 경로는 상대경로로 저장하고, 읽을 때 app_data_dir 기준으로 되살린다.
+// data/ 밖(사용자가 고른 외부 폴더)은 상대화할 수 없으므로 절대경로 그대로 둔다.
+
+/// data/ 하위 경로를 이동 가능한 상대 문자열로 (base 밖이면 절대경로 그대로). 구분자는 항상 '/'.
+fn to_portable_path(base: &Path, p: &Path) -> String {
+    match p.strip_prefix(base) {
+        Ok(rel) => {
+            let joined = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+            // p == base (빈 상대경로) → "." (빈 문자열은 '미설정' 의미와 충돌)
+            if joined.is_empty() {
+                ".".to_string()
+            } else {
+                joined
+            }
+        }
+        Err(_) => p.to_string_lossy().to_string(),
+    }
+}
+
+/// 저장된 경로 문자열 해석: 상대면 base 기준, 절대면 그대로.
+fn resolve_portable_path(base: &Path, s: &str) -> PathBuf {
+    let trimmed = s.trim();
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        // Windows 도 join 에 '/' 구분자를 그대로 받는다
+        base.join(trimmed)
+    }
+}
+
+/// settings "tiles3d_dir" 문자열 → 실제 경로. 상대면 base 기준.
+/// 구버전 절대경로가 사라졌고 관리 폴더(base/tiles3d/tileset.json)가 있으면 그쪽으로 1회 마이그레이션(로그 + 저장).
+/// 그 외 폴더 부재는 경고만 남기고 해석된 경로를 그대로 반환한다(프로토콜 404 → 사용자가 재선택. 조용한 폴백 금지).
+fn resolve_tiles3d_setting(conn: &rusqlite::Connection, base: &Path) -> Option<PathBuf> {
+    let stored = db::get_setting(conn, "tiles3d_dir").ok().flatten()?;
+    let stored = stored.trim().to_string();
+    if stored.is_empty() {
+        return None;
+    }
+    let resolved = resolve_portable_path(base, &stored);
+    if resolved.is_dir() {
+        return Some(resolved);
+    }
+    // 구버전 절대경로가 유실 + 관리 폴더(백업 복원본)에 타일이 있으면 1회 전환
+    if Path::new(&stored).is_absolute() && base.join("tiles3d").join("tileset.json").is_file() {
+        if let Err(e) = db::set_setting(conn, "tiles3d_dir", "tiles3d") {
+            log::warn!("[Tiles3D] 상대경로 마이그레이션 저장 실패: {}", e);
+        }
+        log::info!("[Tiles3D] 절대경로 마이그레이션 {} → tiles3d", stored);
+        return Some(base.join("tiles3d"));
+    }
+    log::warn!(
+        "[Tiles3D] 설정된 3D 타일 폴더가 없습니다: {} — 폴더 재선택 필요",
+        resolved.display()
+    );
+    Some(resolved)
+}
+
 // ---------- DB 백업(ZIP) 내보내기/가져오기 ----------
 //
 // 백업 형식: 무압축(Stored) ZIP 한 개
@@ -985,19 +1051,21 @@ async fn export_database(
 
 /// 교체된 DB 의 settings "tiles3d_dir" 로 AppState 를 갱신 (재시작 없이 반영, 시작 시 복원과 동일 규칙)
 fn sync_tiles3d_from_db(state: &AppState) -> Result<(), String> {
-    let stored: Option<String> = {
+    // 잠금 순서: app_data_dir → (해제) → db → (해제) → tiles3d_dir (두 잠금 동시 보유 금지)
+    let base = state
+        .app_data_dir
+        .lock()
+        .map_err(|e| format!("app_data_dir lock: {}", e))?
+        .clone();
+    let resolved: Option<PathBuf> = {
         let conn = state
             .db
             .lock()
             .map_err(|e| format!("DB lock: {}", e))?
             .get()
             .map_err(|e| format!("DB pool: {}", e))?;
-        db::get_setting(&conn, "tiles3d_dir").ok().flatten()
+        resolve_tiles3d_setting(&conn, &base)
     };
-    let resolved = stored
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
 
     let mut guard = state
         .tiles3d_dir
@@ -1158,7 +1226,13 @@ fn import_backup_zip(
     sync_tiles3d_from_db(state)?;
     let tile_count = tile_entries.len();
     if let Some(root) = tiles_root {
-        let dir_str = root.to_string_lossy().to_string();
+        // 관리 폴더(app_data/tiles3d) → 상대경로 "tiles3d" 로 영속화 (data/ 이동해도 유효)
+        let base = state
+            .app_data_dir
+            .lock()
+            .map_err(|e| format!("app_data_dir lock: {}", e))?
+            .clone();
+        let dir_str = to_portable_path(&base, &root);
         {
             let conn = state
                 .db
@@ -1825,10 +1899,16 @@ async fn set_tiles3d_dir(
             None => None,
         };
 
-        // 영속화: 해제는 빈 문자열로 저장
+        // 영속화: 해제는 빈 문자열로 저장. data/ 하위 폴더면 상대경로로 저장(data/ 이동 대응),
+        // 외부 폴더면 절대경로 그대로. AppState 에는 항상 해석된 절대경로를 담는다.
+        let base = state
+            .app_data_dir
+            .lock()
+            .map_err(|e| format!("app_data_dir lock: {}", e))?
+            .clone();
         let value = resolved
             .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| to_portable_path(&base, p))
             .unwrap_or_default();
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         db::set_setting(&conn, "tiles3d_dir", &value)
@@ -2380,9 +2460,15 @@ type OmReferenceRegistry =
 
 /// 레지스트리 로드 (없으면 빈 맵, 파싱 실패해도 빈 맵으로 복구 — 기능 브릭 방지).
 /// 구버전 마이그레이션(1회 lazy cleanup): 구버전 엔트리의 집계 JSON 파일(file_path)·원시 포인트
-/// 아카이브(points_dir)를 발견하면 삭제하고 필드를 비워 저장한다. ass_dir 은 그대로 유지 —
-/// 구버전이 원본 ASS 를 보관했다면 새 시스템(재집계)에서 그대로 사용 가능하다.
+/// 아카이브(points_dir)를 발견하면 삭제하고 필드를 비워 저장한다. ass_dir 은 보관 내용을 유지하되
+/// 구버전 절대경로를 data/ 기준 상대경로("om_reference/ass/<dir>")로 1회 치환한다(data/ 이동 대응).
 fn load_om_registry(state: &AppState) -> Result<OmReferenceRegistry, String> {
+    // 잠금 순서: app_data_dir → (해제) → db (두 잠금 동시 보유 금지)
+    let base = state
+        .app_data_dir
+        .lock()
+        .map_err(|e| format!("app_data_dir lock: {}", e))?
+        .clone();
     let conn = state
         .db
         .lock()
@@ -2402,7 +2488,7 @@ fn load_om_registry(state: &AppState) -> Result<OmReferenceRegistry, String> {
 
     // ── 구버전 잔재 lazy cleanup (1회) ──
     let mut dirty = false;
-    for entry in registry.values_mut() {
+    for (radar_name, entry) in registry.iter_mut() {
         if !entry.file_path.is_empty() {
             let _ = fs::remove_file(&entry.file_path);
             entry.file_path.clear();
@@ -2413,9 +2499,37 @@ fn load_om_registry(state: &AppState) -> Result<OmReferenceRegistry, String> {
             entry.points_dir.clear();
             dirty = true;
         }
+        // ass_dir 절대경로 → data/ 기준 상대경로 (보관 위치는 radar_name 으로 결정적이라 재구성 가능)
+        if !entry.ass_dir.is_empty() {
+            let canonical_rel = format!(
+                "om_reference/ass/{}",
+                analysis::obstacle_monthly::reference_dirname(radar_name)
+            );
+            if base.join(&canonical_rel).is_dir() {
+                if entry.ass_dir != canonical_rel {
+                    log::info!(
+                        "[OmReference] 레이더 '{}' ass_dir 상대경로 마이그레이션: {} → {}",
+                        radar_name,
+                        entry.ass_dir,
+                        canonical_rel
+                    );
+                    entry.ass_dir = canonical_rel;
+                    dirty = true;
+                }
+            } else if Path::new(&entry.ass_dir).is_absolute()
+                && !Path::new(&entry.ass_dir).is_dir()
+            {
+                // 다른 PC 의 절대경로 등 — 보관본을 찾을 수 없다. 비우지 않고 경고만(사용 시 noref).
+                log::warn!(
+                    "[OmReference] 레이더 '{}' 보관 ASS 디렉토리를 찾을 수 없습니다: {} (재등록 필요)",
+                    radar_name,
+                    entry.ass_dir
+                );
+            }
+        }
     }
     if dirty {
-        log::info!("[OmReference] 구버전 잔재 정리(집계 JSON·포인트 아카이브 삭제) 후 레지스트리 갱신");
+        log::info!("[OmReference] 구버전 잔재 정리(집계 JSON·포인트 아카이브 삭제·ass_dir 상대화) 후 레지스트리 갱신");
         let _ = save_om_registry(state, &registry);
     }
     Ok(registry)
@@ -2461,6 +2575,12 @@ async fn register_om_reference(
     let handle = app_handle.clone();
     let metas = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<om::OmReferenceMeta>, String> {
         let state = handle.state::<AppState>();
+        // data/ 루트 (ass_dir 상대경로 산출용) — 다른 잠금 잡기 전에 확보 후 해제
+        let base = state
+            .app_data_dir
+            .lock()
+            .map_err(|e| format!("app_data_dir lock: {}", e))?
+            .clone();
         let ref_dir = om_reference_dir(&state)?;
         let mut registry = load_om_registry(&state)?;
         let mut metas: Vec<om::OmReferenceMeta> = Vec::new();
@@ -2545,8 +2665,12 @@ async fn register_om_reference(
                 if !prev.points_dir.is_empty() {
                     let _ = fs::remove_dir_all(&prev.points_dir);
                 }
-                if !prev.ass_dir.is_empty() && prev.ass_dir != ass_dest.to_string_lossy() {
-                    let _ = fs::remove_dir_all(&prev.ass_dir);
+                if !prev.ass_dir.is_empty() {
+                    // 저장 형식(상대/절대)이 섞일 수 있으므로 해석된 경로끼리 비교
+                    let prev_dir = resolve_portable_path(&base, &prev.ass_dir);
+                    if prev_dir != ass_dest {
+                        let _ = fs::remove_dir_all(&prev_dir);
+                    }
                 }
             }
 
@@ -2567,7 +2691,8 @@ async fn register_om_reference(
                 radar.radar_name.clone(),
                 om::OmReferenceRegistryEntry {
                     meta: meta.clone(),
-                    ass_dir: ass_dest.to_string_lossy().to_string(),
+                    // data/ 기준 상대경로("om_reference/ass/<dir>") — data/ 폴더를 옮겨도 유효
+                    ass_dir: to_portable_path(&base, &ass_dest),
                     file_path: String::new(),
                     points_dir: String::new(),
                 },
@@ -2612,12 +2737,17 @@ async fn list_om_references(
 async fn delete_om_reference(radar_name: String, app_handle: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
+        let base = state
+            .app_data_dir
+            .lock()
+            .map_err(|e| format!("app_data_dir lock: {}", e))?
+            .clone();
         let ref_dir = om_reference_dir(&state)?;
         let dirname = analysis::obstacle_monthly::reference_dirname(&radar_name);
         let mut registry = load_om_registry(&state)?;
         if let Some(entry) = registry.remove(&radar_name) {
             if !entry.ass_dir.is_empty() {
-                let _ = fs::remove_dir_all(&entry.ass_dir);
+                let _ = fs::remove_dir_all(resolve_portable_path(&base, &entry.ass_dir));
             }
             // 구버전 잔재 (있으면 — load 시점 cleanup 을 못 탄 경로 방어)
             if !entry.file_path.is_empty() {
@@ -2690,16 +2820,25 @@ fn compute_radar_reference(
     use analysis::obstacle_monthly::{self as om, ObstacleMonthlyProgress};
 
     let state = handle.state::<AppState>();
+    let base = state
+        .app_data_dir
+        .lock()
+        .map_err(|e| format!("app_data_dir lock: {}", e))?
+        .clone();
     let ref_dir = om_reference_dir(&state)?;
     let registry = load_om_registry(&state)?;
     let Some(entry) = registry.get(&radar.radar_name) else {
         return Ok(None); // 미등록 → noref
     };
-    if entry.ass_dir.is_empty() || !std::path::Path::new(&entry.ass_dir).is_dir() {
+    if entry.ass_dir.is_empty() {
         return Ok(None); // 원본 미보관 → noref (재등록 필요)
     }
+    // 저장값이 상대경로("om_reference/ass/<dir>")면 data/ 기준으로 해석
+    let ass_dir = resolve_portable_path(&base, &entry.ass_dir);
+    if !ass_dir.is_dir() {
+        return Ok(None); // 보관본 유실 → noref (재등록 필요)
+    }
     let month_label = entry.meta.month_label.clone();
-    let ass_dir = entry.ass_dir.clone();
     let dirname = om::reference_dirname(&radar.radar_name);
     let cache_dir = ref_dir.join("cache").join(&dirname);
 
@@ -3693,14 +3832,12 @@ pub fn run() {
             }
             info!("SRTM data dir: {:?}", srtm_dir);
 
-            // 실측 3D Tiles 루트 디렉터리 복원 (빈 문자열/미설정 → None)
+            // 실측 3D Tiles 루트 디렉터리 복원 (빈 문자열/미설정 → None).
+            // 저장값이 상대경로면 app_data_dir 기준으로 해석 (data/ 폴더 이동 대응)
             let tiles3d_dir: Option<PathBuf> = db_pool
                 .get()
                 .ok()
-                .and_then(|c| db::get_setting(&c, "tiles3d_dir").ok().flatten())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from);
+                .and_then(|c| resolve_tiles3d_setting(&c, &app_data_dir));
             if let Some(ref d) = tiles3d_dir {
                 info!("3D Tiles dir: {:?}", d);
             }
@@ -3852,4 +3989,67 @@ pub fn run() {
                 }
             }
         });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 이동 가능 경로 단위 테스트 (cargo test portable_path)
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod portable_path_tests {
+    use super::{resolve_portable_path, to_portable_path};
+    use std::path::{Path, PathBuf};
+
+    /// data/ 하위 → 상대 문자열, 구분자는 항상 '/'
+    #[test]
+    fn portable_path_relativizes_under_base() {
+        let base = PathBuf::from("/data_root").join("data");
+        let p = base.join("om_reference").join("ass").join("김포_1");
+        assert_eq!(to_portable_path(&base, &p), "om_reference/ass/김포_1");
+        assert_eq!(to_portable_path(&base, &base.join("tiles3d")), "tiles3d");
+        // 항상 forward slash — 플랫폼 구분자가 섞이지 않는다
+        assert!(!to_portable_path(&base, &p).contains('\\'));
+    }
+
+    /// base 밖 경로는 절대경로 그대로, p == base 는 "."
+    #[test]
+    fn portable_path_keeps_outside_absolute() {
+        let base = PathBuf::from("/data_root").join("data");
+        let outside = PathBuf::from("/elsewhere").join("tiles");
+        assert_eq!(
+            to_portable_path(&base, &outside),
+            outside.to_string_lossy().to_string()
+        );
+        assert_eq!(to_portable_path(&base, &base), ".");
+    }
+
+    /// 상대 문자열('/' 구분)은 base 기준으로 해석되고, 왕복(round trip)이 보존된다
+    #[test]
+    fn portable_path_round_trip() {
+        let base = PathBuf::from("/data_root").join("data");
+        let p = base.join("om_reference").join("ass").join("radar1");
+        let stored = to_portable_path(&base, &p);
+        assert_eq!(stored, "om_reference/ass/radar1");
+        assert_eq!(resolve_portable_path(&base, &stored), p);
+        assert_eq!(resolve_portable_path(&base, "tiles3d"), base.join("tiles3d"));
+        // 앞뒤 공백은 제거
+        assert_eq!(resolve_portable_path(&base, "  tiles3d  "), base.join("tiles3d"));
+    }
+
+    /// 절대경로 저장값은 base 를 무시하고 그대로 해석 (외부 폴더 지정 유지)
+    #[test]
+    fn portable_path_absolute_passthrough() {
+        let base = PathBuf::from("/data_root").join("data");
+        let abs = if cfg!(windows) {
+            r"D:\tiles\seoul"
+        } else {
+            "/mnt/tiles/seoul"
+        };
+        assert!(Path::new(abs).is_absolute());
+        assert_eq!(resolve_portable_path(&base, abs), PathBuf::from(abs));
+        // 다른 base 로도 동일
+        assert_eq!(
+            resolve_portable_path(Path::new("/other"), abs),
+            PathBuf::from(abs)
+        );
+    }
 }
