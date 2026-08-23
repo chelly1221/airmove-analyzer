@@ -2,9 +2,9 @@
  * 토픽: 거리·방위 분포 상세.
  *
  * 대시보드의 10NM/10° 요약을 1NM·1° 정밀 격자와 PPI(방위×거리) 히트맵으로 확대한다.
- * 차트는 전부 이 파일 로컬 순수 SVG — 공유 모듈(shared.tsx)은 동결이라 36빈 전용
- * AzimuthRose 를 고치지 않고 360빈 로즈·극좌표 히트맵을 여기서 따로 구현한다.
- * 전 구간 전수 렌더(다운샘플링 없음).
+ * 차트는 순수 SVG — 공유 모듈(shared.tsx)은 동결이라 36빈 전용 AzimuthRose 를 고치지 않고
+ * 360빈 로즈를 여기서 따로 구현한다. PPI 히트맵(../PpiHeatmap)과 극좌표 기하(../polarGeom)는
+ * PSR 채널 토픽과 공유하므로 추출돼 있다. 전 구간 전수 렌더(다운샘플링 없음).
  */
 
 import { useMemo, useRef, useState } from "react";
@@ -20,6 +20,8 @@ import {
   StatCard,
 } from "../shared";
 import { ChartHint, TopicExcelExport, useBrush, type ExportSheet } from "../detailUi";
+import PpiHeatmap from "../PpiHeatmap";
+import { azWindowSegments, norm360, POLAR_PAD, pointerAzimuth, splitArcs, wedgePath } from "../polarGeom";
 import { exportStrings, type ExportLang } from "../../../utils/exportI18n";
 import type { Cell } from "../../../utils/xlsxExport";
 import { AZ_GRID_SECTORS, RANGE_GRID_BINS } from "../../../types/asterixDetail";
@@ -38,75 +40,6 @@ const RANGE_AXIS_MIN = 20;
 
 /** 1° 로즈 정사각 변 */
 const ROSE_FINE_S = Math.max(SECTION_BODY_PX.lg, 340);
-/** PPI 히트맵 정사각 변 — 5°×5NM 셀이 뭉개지지 않는 크기 (lg 티어 이상) */
-const PPI_S = Math.max(SECTION_BODY_PX.lg, 420);
-/** 축 라벨용 바깥 여백 */
-const POLAR_PAD = 18;
-
-/** 나침반 좌표(0°=북, 시계방향) → 화면 좌표 */
-function polar(c: number, deg: number, r: number): readonly [number, number] {
-  const a = (deg * Math.PI) / 180;
-  return [c + r * Math.sin(a), c - r * Math.cos(a)] as const;
-}
-
-const f2 = (v: number) => v.toFixed(2);
-
-/** 중심에서 뻗는 부채꼴 (각 증가 = 화면상 시계방향이라 sweep=1) */
-function wedgePath(c: number, deg0: number, deg1: number, r: number): string {
-  const [x0, y0] = polar(c, deg0, r);
-  const [x1, y1] = polar(c, deg1, r);
-  return `M${c} ${c} L${f2(x0)} ${f2(y0)} A${f2(r)} ${f2(r)} 0 0 1 ${f2(x1)} ${f2(y1)} Z`;
-}
-
-/** 부채꼴 고리 조각 (r0=내반경, r1=외반경) — 바깥호는 시계방향, 안쪽호는 되돌아오므로 sweep=0 */
-function ringSectorPath(c: number, deg0: number, deg1: number, r0: number, r1: number): string {
-  const [ax, ay] = polar(c, deg0, r1);
-  const [bx, by] = polar(c, deg1, r1);
-  if (r0 <= 0.01) {
-    return `M${c} ${c} L${f2(ax)} ${f2(ay)} A${f2(r1)} ${f2(r1)} 0 0 1 ${f2(bx)} ${f2(by)} Z`;
-  }
-  const [cx, cy] = polar(c, deg1, r0);
-  const [dx, dy] = polar(c, deg0, r0);
-  return (
-    `M${f2(ax)} ${f2(ay)} A${f2(r1)} ${f2(r1)} 0 0 1 ${f2(bx)} ${f2(by)}` +
-    ` L${f2(cx)} ${f2(cy)} A${f2(r0)} ${f2(r0)} 0 0 0 ${f2(dx)} ${f2(dy)} Z`
-  );
-}
-
-/** 포인터 위치 → 나침반 방위각(0–360) */
-function pointerAzimuth(dx: number, dy: number): number {
-  return ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
-}
-
-/** 방위각 [0,360) 정규화 */
-const norm360 = (d: number) => ((d % 360) + 360) % 360;
-
-/**
- * 적용된 방위 필터 → 실제로 그릴 각도 구간들.
- * azMin > azMax 는 0° 통과(랩어라운드)라 두 조각으로 쪼갠다 (Rust 시맨틱과 동일).
- */
-function azWindowSegments(min?: number, max?: number): { a: number; b: number }[] {
-  if (min == null && max == null) return [];
-  if (min == null) return [{ a: 0, b: norm360(max as number) }];
-  if (max == null) return [{ a: norm360(min), b: 360 }];
-  const lo = norm360(min);
-  const hi = norm360(max);
-  if (lo === hi) return [];
-  return lo < hi ? [{ a: lo, b: hi }] : [{ a: lo, b: 360 }, { a: 0, b: hi }];
-}
-
-/**
- * 넓은 각 구간을 90° 이하 조각으로 쪼갠다.
- * wedgePath/ringSectorPath 는 large-arc 플래그를 0 으로 고정하므로 180° 를 넘는 호를 그리지 못한다.
- * 조각들은 같은 색·불투명도로 맞붙여 채우므로 이음매가 보이지 않는다.
- */
-function splitArcs(segs: { a: number; b: number }[], max = 90): { a: number; b: number }[] {
-  const out: { a: number; b: number }[] = [];
-  for (const s of segs) {
-    for (let a = s.a; a < s.b - 1e-6; a += max) out.push({ a, b: Math.min(a + max, s.b) });
-  }
-  return out;
-}
 
 /**
  * 연속 0 구간(무탐지 섹터) 스캔 — 359°→0° 경계를 넘는 구간은 하나로 병합한다.
@@ -428,224 +361,6 @@ function AzimuthRoseFine({
       <ChartHint
         text={`섹터를 클릭하면 그 도수를 중심으로 한 10° 방위 윈도우로 전수 재집계합니다 (0° 통과 구간도 그대로 지원)${
           activeSegs.length > 0 ? " — 음영 = 현재 적용된 방위 필터" : ""
-        }`}
-      />
-    </div>
-  );
-}
-
-// ─── PPI 히트맵 (방위 5° × 거리 5NM) ───────────────────────────────
-
-/**
- * az_range_grid(72×52)를 극좌표 도넛 섹터로 렌더.
- * 셀 색은 단색(CHART_INK) 고정, 진하기(오파시티)만 log(1+c)/log(1+max) 로 변조해
- * 몇 자릿수 차이 나는 셀 밀도를 한 화면에서 읽게 한다. 0건 셀은 아예 그리지 않는다.
- */
-function PpiHeatmap({
-  grid,
-  filter,
-  onQuickFilter,
-}: {
-  grid: number[];
-  /** 현재 적용된 방위·거리 필터 — 격자 위 창(window) 하이라이트 */
-  filter: AsterixDetailFilter;
-  onQuickFilter: (p: Partial<AsterixDetailFilter>) => void;
-}) {
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const [hover, setHover] = useState<{ az: number; r: number; x: number } | null>(null);
-
-  const S = PPI_S;
-  const c0 = S / 2;
-  const R = c0 - POLAR_PAD;
-  const ringW = R / RANGE_GRID_BINS;
-
-  const { maxV, minNz, cellsWithData } = useMemo(() => {
-    let mx = 0;
-    let mn = Number.POSITIVE_INFINITY;
-    let k = 0;
-    for (let i = 0; i < grid.length; i++) {
-      const c = grid[i];
-      if (c <= 0) continue;
-      k++;
-      if (c > mx) mx = c;
-      if (c < mn) mn = c;
-    }
-    return { maxV: mx, minNz: Number.isFinite(mn) ? mn : 0, cellsWithData: k };
-  }, [grid]);
-
-  // 셀 엘리먼트는 메모 — 호버 상태 변경 때 3,744개 경로를 재조정하지 않게 한다
-  const cells = useMemo(() => {
-    if (maxV <= 0) return [] as ReactElement[];
-    const denom = Math.log(1 + maxV);
-    const out: ReactElement[] = [];
-    for (let az = 0; az < AZ_GRID_SECTORS; az++) {
-      for (let r = 0; r < RANGE_GRID_BINS; r++) {
-        const c = grid[az * RANGE_GRID_BINS + r] ?? 0;
-        if (c <= 0) continue;
-        out.push(
-          <path
-            key={`${az}:${r}`}
-            d={ringSectorPath(c0, az * 5, az * 5 + 5, r * ringW, (r + 1) * ringW)}
-            fill={CHART_INK}
-            opacity={Math.log(1 + c) / denom}
-          />,
-        );
-      }
-    }
-    return out;
-  }, [grid, maxV, c0, ringW]);
-
-  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
-    const wrap = wrapRef.current;
-    if (!wrap) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    // 화면 좌표 → viewBox 좌표(정사각 스케일)로 환산해 반경 판정
-    const scale = S / rect.width;
-    const dx = (e.clientX - rect.left - rect.width / 2) * scale;
-    const dy = (e.clientY - rect.top - rect.height / 2) * scale;
-    const dist = Math.hypot(dx, dy);
-    if (dist > R) {
-      // 원 밖 — 해제
-      setHover(null);
-      return;
-    }
-    const az = Math.min(AZ_GRID_SECTORS - 1, Math.floor(pointerAzimuth(dx, dy) / 5));
-    const r = Math.min(RANGE_GRID_BINS - 1, Math.floor(dist / ringW));
-    const wr = wrap.getBoundingClientRect();
-    setHover({ az, r, x: clampTipX(e.clientX - wr.left, wr.width) });
-  };
-
-  const hoverCount = hover ? (grid[hover.az * RANGE_GRID_BINS + hover.r] ?? 0) : 0;
-  const tipText = hover
-    ? `az ${hover.az * 5}°–${hover.az * 5 + 5}° · ${hover.r * 5}–${hover.r * 5 + 5}NM · ${hoverCount.toLocaleString()}건${
-        hoverCount > 0 ? " · 클릭 = 이 셀로 재집계" : ""
-      }`
-    : "";
-
-  /** 셀 클릭 = 그 5°×5NM 셀 범위로 재집계 (0건 셀은 결과가 비므로 막는다) */
-  const onCellClick = () => {
-    if (!hover || hoverCount <= 0) return;
-    onQuickFilter({
-      azMinDeg: hover.az * 5,
-      azMaxDeg: hover.az * 5 + 5,
-      rangeMinNm: hover.r * 5,
-      rangeMaxNm: hover.r * 5 + 5,
-    });
-  };
-
-  /** 적용된 방위×거리 필터 → 그릴 고리 조각들 (랩어라운드·넓은 각 분할) */
-  const activeCells = (() => {
-    const segs = splitArcs(azWindowSegments(filter.azMinDeg, filter.azMaxDeg));
-    const hasRange = filter.rangeMinNm != null || filter.rangeMaxNm != null;
-    if (segs.length === 0 && !hasRange) return [];
-    const maxNm = RANGE_GRID_BINS * 5;
-    const r0 = (Math.max(0, Math.min(maxNm, filter.rangeMinNm ?? 0)) / maxNm) * R;
-    const r1 = (Math.max(0, Math.min(maxNm, filter.rangeMaxNm ?? maxNm)) / maxNm) * R;
-    if (r1 - r0 <= 0) return [];
-    const use = segs.length > 0 ? segs : splitArcs([{ a: 0, b: 360 }]);
-    return use.map((s) => ringSectorPath(c0, s.a, s.b, r0, r1));
-  })();
-
-  // 범례 그라데이션 — 오파시티가 log 스케일이라 stop 도 같은 곡선으로 찍는다
-  const legendStops = useMemo(() => {
-    const denom = Math.log(1 + maxV);
-    const lo = minNz;
-    return Array.from({ length: 9 }, (_, i) => {
-      const t = i / 8;
-      const c = lo + t * (maxV - lo);
-      return { t, op: denom > 0 ? Math.log(1 + c) / denom : 0 };
-    });
-  }, [maxV, minNz]);
-
-  if (maxV <= 0) return <div className="text-[11px] text-gray-400">I048/040 ρ·θ 동시 관측 없음</div>;
-
-  return (
-    <div className="flex flex-col items-center">
-      <div ref={wrapRef} className="relative w-full" style={{ maxWidth: S }}>
-        {hover && <ChartTip x={hover.x} text={tipText} />}
-        <svg
-          viewBox={`0 0 ${S} ${S}`}
-          className={`block aspect-square w-full ${hoverCount > 0 ? "cursor-pointer" : ""}`}
-          onPointerMove={onMove}
-          onPointerLeave={() => setHover(null)}
-          onClick={onCellClick}
-        >
-          {/* 적용된 방위×거리 필터 창 — 셀 아래에 옅게 */}
-          {activeCells.map((d, i) => (
-            <path key={i} d={d} fill={CHART_INK} opacity={0.08} />
-          ))}
-          {cells}
-
-          {/* 거리 링(50NM 간격) · 방위 스포크(30° 간격) — 데이터 위에 옅게 */}
-          <g stroke="#9ca3af" strokeWidth={0.5} fill="none" opacity={0.5}>
-            {[10, 20, 30, 40, 50].map((rb) => (
-              <circle key={rb} cx={c0} cy={c0} r={rb * ringW} />
-            ))}
-            {Array.from({ length: 12 }, (_, i) => {
-              const [x, y] = polar(c0, i * 30, R);
-              return <line key={i} x1={c0} y1={c0} x2={f2(x)} y2={f2(y)} />;
-            })}
-          </g>
-
-          {hover && (
-            <path
-              d={ringSectorPath(c0, hover.az * 5, hover.az * 5 + 5, hover.r * ringW, (hover.r + 1) * ringW)}
-              fill="none"
-              stroke={CHART_INK}
-              strokeWidth={1.5}
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
-
-          {/* 거리 링 라벨은 180° 방향(아래쪽) 축을 따라 — 흰 테두리로 데이터 위에서도 읽히게 */}
-          <g fontSize={8} fill="#6b7280" style={{ paintOrder: "stroke" }} stroke="#ffffff" strokeWidth={2.5}>
-            {[10, 20, 30, 40, 50].map((rb) => (
-              <text key={rb} x={c0} y={c0 + rb * ringW - 2} textAnchor="middle">
-                {rb * 5}NM
-              </text>
-            ))}
-          </g>
-
-          <g fontSize={9} fill="#9ca3af">
-            <text x={c0} y={c0 - R - 5} textAnchor="middle">
-              0°
-            </text>
-            <text x={S - 1} y={c0} textAnchor="end" dominantBaseline="central">
-              90°
-            </text>
-            <text x={c0} y={c0 + R + 13} textAnchor="middle">
-              180°
-            </text>
-            <text x={1} y={c0} textAnchor="start" dominantBaseline="central">
-              270°
-            </text>
-          </g>
-        </svg>
-      </div>
-
-      {/* 범례 — 오파시티 그라데이션 바 + 최소/최대 건수 */}
-      <div className="mt-2 flex items-center gap-2" style={{ width: Math.min(S, 320), maxWidth: "100%" }}>
-        <span className="shrink-0 text-[9px] tabular-nums text-gray-400">{minNz.toLocaleString()}건</span>
-        <svg viewBox="0 0 100 8" preserveAspectRatio="none" className="h-2 flex-1">
-          <defs>
-            <linearGradient id="asterix-ppi-legend" x1="0" y1="0" x2="1" y2="0">
-              {legendStops.map((s) => (
-                <stop key={s.t} offset={s.t} stopColor={CHART_INK} stopOpacity={s.op} />
-              ))}
-            </linearGradient>
-          </defs>
-          <rect x="0" y="0" width="100" height="8" fill="url(#asterix-ppi-legend)" />
-        </svg>
-        <span className="shrink-0 text-[9px] tabular-nums text-gray-400">{maxV.toLocaleString()}건</span>
-      </div>
-      <div className="mt-0.5 text-[10px] text-gray-400">
-        셀 진하기 = 건수(log 스케일) · 관측 셀 {cellsWithData.toLocaleString()} /{" "}
-        {(AZ_GRID_SECTORS * RANGE_GRID_BINS).toLocaleString()}
-      </div>
-      <ChartHint
-        text={`관측이 있는 셀을 클릭하면 그 방위 5° × 거리 5NM 범위로 전수 재집계합니다${
-          activeCells.length > 0 ? " — 음영 = 현재 적용된 방위·거리 필터" : ""
         }`}
       />
     </div>

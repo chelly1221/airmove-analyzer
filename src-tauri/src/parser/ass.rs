@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use log::{debug, info, warn};
 
-use crate::models::{ParseStatistics, RadarDetectionType, TcasReport, TrackPoint, WeatherVector};
+use crate::analysis::psr_channel::{self, PsrChannelStats, PsrScanReport};
+use crate::models::{ParseStatistics, PsrReport, RadarDetectionType, TcasReport, TrackPoint, WeatherVector};
 
 const CAT048: u8 = 0x30;
 const CAT034: u8 = 0x22;
@@ -839,6 +840,92 @@ fn classify_and_convert(
     }
 }
 
+/// TrackMap "PSR 단독" 플롯 표출용 표적보고 수집 — I161 트랙번호가 있는 **TYP=1 레코드만** 전수로 걷는다.
+/// (통계는 `asterix_detail_scan` 의 PSR 채널 토픽이 별도로 계산하므로 TYP 2~7 수집은 불필요 —
+///  파싱 이벤트 대역폭 절감. `PsrReport.typ` 은 항상 1.)
+/// `base_date_secs` 는 호출부에서 `base_date_secs + day_offset` 을 합쳐 넘기며,
+/// timestamp 산정식은 `classify_and_convert` 와 **동일**하다(파일명 날짜 폴백 분기 포함).
+/// 유령 제거·동일위치 중복 제거·Mode-S/Mode 3/A 필터는 적용하지 않는다.
+fn collect_psr_report(
+    record: &Cat048Record,
+    base_date_secs: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+    mag_dec_deg: f64,
+    out: &mut Vec<PsrReport>,
+    stats: &mut ParseStatistics,
+) {
+    // TYP=1(PSR 단독) 외 전부 스킵 — 카운트 없음 (TYP=0 은 무탐지, TYP 2~7 은 통계 토픽 담당)
+    if record.radar_typ != 1 {
+        return;
+    }
+
+    // 시각 없는 보고는 쓸 수 없음 (기존 Discard 와 동일 기준)
+    let tod = match record.time_of_day {
+        Some(t) => t,
+        None => return,
+    };
+
+    // 트랙번호 없음 → 폐기 카운트로 명시(폴백 금지 — 다른 키로 묶지 않는다)
+    let track_number = match record.track_number {
+        Some(tn) => tn,
+        None => {
+            stats.psr_reports_no_track_number += 1;
+            return;
+        }
+    };
+
+    // 좌표: I040 극좌표 우선, 없으면 I042 직교좌표
+    let (lat, lon, rho_nm, theta_deg) =
+        if let (Some(rho), Some(theta)) = (record.rho_nm, record.theta_deg) {
+            let (lat, lon) = polar_to_latlon(rho, theta, radar_lat, radar_lon, mag_dec_deg);
+            (lat, lon, rho, (theta + mag_dec_deg).rem_euclid(360.0))
+        } else if let (Some(x_nm), Some(y_nm)) = (record.cart_x_nm, record.cart_y_nm) {
+            let (lat, lon) = cartesian_to_latlon(x_nm, y_nm, radar_lat, radar_lon, mag_dec_deg);
+            // x=동, y=북 → atan2(x, y) = 진북 기준 시계방향 방위
+            let theta = x_nm.atan2(y_nm).to_degrees();
+            (
+                lat,
+                lon,
+                (x_nm * x_nm + y_nm * y_nm).sqrt(),
+                (theta + mag_dec_deg).rem_euclid(360.0),
+            )
+        } else {
+            return;
+        };
+
+    // 좌표 유효범위 (동아시아 — classify_and_convert 와 동일 기준)
+    if lat < 25.0 || lat > 50.0 || lon < 115.0 || lon > 145.0 {
+        return;
+    }
+
+    // timestamp — classify_and_convert 와 동일 식 (파일명 날짜 추출 실패 시 폴백 기준시각)
+    let timestamp = if base_date_secs > 0.0 {
+        base_date_secs + tod
+    } else {
+        1700000000.0 + tod
+    };
+
+    out.push(PsrReport {
+        timestamp,
+        track_number,
+        typ: record.radar_typ,
+        latitude: lat,
+        longitude: lon,
+        rho_nm: rho_nm as f32,
+        theta_deg: theta_deg as f32,
+        mode_s: match record.mode_s_address {
+            Some(addr) if addr > 0 => Some(addr),
+            _ => None,
+        },
+        mode3a: if record.mode3a_garbled { None } else { record.mode3a },
+        altitude_m: record.flight_level.map(|fl| (fl * 100.0 * 0.3048) as f32),
+        speed_kts: record.ground_speed_kts.unwrap_or(0.0) as f32,
+        heading_deg: record.heading_deg.unwrap_or(0.0) as f32,
+    });
+    stats.psr_reports_collected += 1;
+}
+
 /// CAT008 블록에서 기상 극좌표 벡터(I008/034)를 전수 추출.
 /// 한 블록에 11바이트 레코드 N개. UAP: FRN1 I008/010(SAC/SIC),
 /// FRN2 I008/000(메시지타입), FRN3 I008/020(벡터 한정자/강도, FX),
@@ -1033,6 +1120,7 @@ fn extract_tcas_reports(
 }
 
 /// Parse an ASS file into structured track data.
+/// (PSR 채널 미수집 — `parse_ass_file_opts(.., false)` 위임. 기존 호출자 시그니처 무변경)
 pub fn parse_ass_file(
     path: &str,
     radar_lat: f64,
@@ -1043,6 +1131,35 @@ pub fn parse_ass_file(
     mode3a_exclude: &[u16],
     mag_dec_deg: f64,
     _progress: impl Fn(f64),
+) -> Result<crate::models::ParsedFile, ParseError> {
+    parse_ass_file_opts(
+        path,
+        radar_lat,
+        radar_lon,
+        mode_s_include,
+        mode_s_exclude,
+        mode3a_include,
+        mode3a_exclude,
+        mag_dec_deg,
+        _progress,
+        false,
+    )
+}
+
+/// Parse an ASS file into structured track data.
+/// `collect_psr_reports` = true 이면 PSR 채널 분석용 표적보고(`ParsedFile::psr_reports`)를
+/// 함께 전수 수집한다. 항적(track_points) 파이프라인은 이 플래그와 무관하게 완전 동일.
+pub fn parse_ass_file_opts(
+    path: &str,
+    radar_lat: f64,
+    radar_lon: f64,
+    mode_s_include: &[String],
+    mode_s_exclude: &[String],
+    mode3a_include: &[u16],
+    mode3a_exclude: &[u16],
+    mag_dec_deg: f64,
+    _progress: impl Fn(f64),
+    collect_psr_reports: bool,
 ) -> Result<crate::models::ParsedFile, ParseError> {
     let data = std::fs::read(path).map_err(|e| ParseError::FileReadError(e.to_string()))?;
 
@@ -1148,6 +1265,8 @@ pub fn parse_ass_file(
     let mut last_valid_tcas_ts: Option<f64> = None;
     // CAT008 기상 극좌표 벡터 전수 추출용 (트랙 독립)
     let mut weather_vectors: Vec<WeatherVector> = Vec::new();
+    // PSR 채널 분석용 표적보고 전수 수집용 (트랙 독립 — collect_psr_reports=false 면 할당 없음)
+    let mut psr_reports: Vec<PsrReport> = Vec::new();
     // 프레임 전문 캡처: NEC 헤더~다음 헤더 직전까지 전체 바이트를 해당 프레임의 보고에 기록.
     // 경계(다음 헤더/EOF)를 만나야 끝을 알 수 있으므로 보고를 모았다가 일괄 기록한다.
     let mut tcas_frame_start: Option<usize> = None; // 현재 NEC 프레임 헤더 시작 오프셋
@@ -1258,6 +1377,23 @@ pub fn parse_ass_file(
                                 base_date_secs,
                                 start_tod,
                             );
+
+                            // PSR 채널 표적보고 전수 수집 (트랙 독립 — classify_and_convert 의
+                            // TYP=0/1 Discard 와 무관하게 여기서 먼저 걷는다).
+                            // Mode-S 포함/제외·Mode 3/A 필터는 **적용하지 않는다** —
+                            // PSR 단독 보고엔 Mode-S 가 없어 필터 자체가 성립하지 않고,
+                            // 트랙 단위 PSR 탐지/소실 평가는 전수 표본을 전제로 한다.
+                            if collect_psr_reports {
+                                collect_psr_report(
+                                    &record,
+                                    base_date_secs + day_offset,
+                                    radar_lat,
+                                    radar_lon,
+                                    mag_dec_deg,
+                                    &mut psr_reports,
+                                    &mut assembler.stats,
+                                );
+                            }
 
                             // TCAS 보고 전수 추출 (트랙 독립 — discard와 무관)
                             // 폴백 전문은 해당 CAT048 블록. NEC 프레이밍이 있으면
@@ -1427,6 +1563,7 @@ pub fn parse_ass_file(
         parse_stats: Some(stats),
         tcas_reports,
         weather_vectors,
+        psr_reports,
     })
 }
 
@@ -3716,6 +3853,9 @@ pub fn asterix_query(paths: &[String], filter: &AsterixFilter) -> Result<Asterix
 const AZ_GRID_SECTORS: usize = 72;
 /// PPI 히트맵 거리 구간 수 (5NM, 0–260NM) — 프런트 RANGE_GRID_BINS 와 동기.
 const RANGE_GRID_BINS: usize = 52;
+/// PSR 채널 토픽 격자는 위 PPI 격자와 **동일 격자**여야 한다 (프런트가 같은 히트맵을 재사용).
+const _: () = assert!(psr_channel::AZ_BINS == AZ_GRID_SECTORS);
+const _: () = assert!(psr_channel::RANGE_BINS == RANGE_GRID_BINS);
 /// I040 ρ 1NM 세부 구간 (파서가 ρ<256NM 보장, 안전상 255 클램프)
 const RANGE_FINE_BINS: usize = 256;
 /// I040 θ 1° 세부 구간
@@ -3764,6 +3904,9 @@ pub struct AsterixDetailFilter {
     /// I048/200 대지속도 범위 (kt)
     pub speed_min_kts: Option<f64>,
     pub speed_max_kts: Option<f64>,
+    /// PSR 채널 토픽 소실 판정 임계 (초) — 미지정 시 7.0.
+    /// **레코드 필터가 아니다**: DetailMatcher 는 무시하고 집계 단계에서만 쓴다.
+    pub psr_loss_threshold_secs: Option<f64>,
 }
 
 /// 필터 사전 정규화 — 레코드마다 문자열 파싱을 반복하지 않도록 1회만 계산.
@@ -4037,6 +4180,8 @@ pub struct AsterixDetailStats {
     pub emergency_events_truncated: bool,
     pub acas_events: Vec<AcasEvent>,
     pub acas_events_truncated: bool,
+    /// PSR(1차 레이더) 채널 탐지·소실 집계 (analysis::psr_channel)
+    pub psr_channel: PsrChannelStats,
 }
 
 /// Mode-S 주소별 상세 누산.
@@ -4107,6 +4252,8 @@ struct DetailAccum {
     emergency_total: u64,
     acas_events: Vec<AcasEvent>,
     acas_total: u64,
+    /// PSR 채널 토픽 입력 — 조건 충족 CAT048 레코드 전수 (전송 안 됨, 분석 후 즉시 해제)
+    psr_reports: Vec<PsrScanReport>,
 }
 
 impl DetailAccum {
@@ -4127,6 +4274,7 @@ impl DetailAccum {
             emergency_total: 0,
             acas_events: Vec::new(),
             acas_total: 0,
+            psr_reports: Vec::new(),
         }
     }
 
@@ -4159,6 +4307,27 @@ impl DetailAccum {
         // 이하 항목은 CAT048 파생 (CAT034/008 은 해당 필드가 전부 부재)
         if r.cat != CAT048 {
             return;
+        }
+        // PSR 채널 토픽 입력 — I020 TYP 1..=7 + I161 트랙번호 + I140 시각 + I040 극좌표를
+        // 모두 갖춘 레코드만 전수 수집(다운샘플링 없음). 여기는 필터 통과분만 오므로
+        // 다른 토픽과 모집단이 같다. 좌표는 극좌표 그대로 — 위경도 변환 불필요.
+        if let (Some(typ), Some(tn), Some(t), Some(rho), Some(th)) =
+            (r.radar_typ, r.track_number, r.abs_time, r.rho_nm, r.theta_deg)
+        {
+            if (1..=7).contains(&typ) {
+                self.psr_reports.push(PsrScanReport {
+                    abs_time: t,
+                    rho_nm: rho as f32,
+                    theta_deg: th as f32,
+                    speed_kts: r.ground_speed_kts.unwrap_or(0.0) as f32,
+                    track_number: tn,
+                    typ,
+                    // 0 = Mode-S 없음
+                    mode_s: r.mode_s.unwrap_or(0),
+                    // 0xFFFF = Mode 3/A 없음 (12bit 코드라 충돌 없음)
+                    mode3a: r.mode3a.unwrap_or(psr_channel::NO_MODE3A),
+                });
+            }
         }
         // 거리·방위 세부 + PPI 격자 — I040 보유 레코드만
         if let Some(rho) = r.rho_nm {
@@ -4367,6 +4536,16 @@ pub fn asterix_detail_scan(
         progress(idx + 1, total, &filename);
     }
 
+    // PSR 채널 토픽 — 소실 임계는 필터의 psrLossThresholdSecs (미지정/무효값은 기본 7.0초).
+    // 분석이 끝난 입력 버퍼는 즉시 해제한다(10M+ 규모 전제).
+    let psr_threshold = filter
+        .psr_loss_threshold_secs
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(psr_channel::DEFAULT_LOSS_THRESHOLD_S);
+    let mut psr_reports = std::mem::take(&mut detail.psr_reports);
+    let psr_channel_stats = psr_channel::analyze(&mut psr_reports, psr_threshold);
+    drop(psr_reports);
+
     // 수집 공백 — finalize 가 state 를 소비하기 전에 동일 기준(분 버킷)으로 전체 산출
     let mut gaps_all = compute_gaps(&state.acc.time_buckets);
     gaps_all.sort_by(|a, b| {
@@ -4522,6 +4701,7 @@ pub fn asterix_detail_scan(
         emergency_events_truncated,
         acas_events,
         acas_events_truncated,
+        psr_channel: psr_channel_stats,
     })
 }
 
@@ -5065,6 +5245,78 @@ mod tests {
             ..Default::default()
         };
         assert!(!DetailMatcher::new(&src2).matches(&c34, None));
+    }
+
+    /// TrackMap PSR 단독 플롯 수집 검증 — 김포 260602 실측 파일.
+    /// 채널이 TYP=1 전용으로 축소된 뒤의 계약: 수집 벡터는 **전건 typ==1** 이고
+    /// 통계 카운터와 길이가 일치한다. (통계 집계는 asterix_detail_scan 의 PSR 채널 토픽 담당.)
+    #[test]
+    fn test_collect_psr_reports_gimpo_260602() {
+        let path = r"C:\shots_data\gimpo_260602_0943.ass";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip: 데이터 파일 없음: {}", path);
+            return;
+        }
+
+        let parsed = parse_ass_file_opts(
+            path, 37.5585, 126.7908, &[], &[], &[], &[], -8.5, |_| {}, true,
+        )
+        .unwrap();
+
+        let stats = parsed.parse_stats.clone().unwrap();
+        let typ1 = parsed.psr_reports.iter().filter(|r| r.typ == 1).count();
+        let mut by_typ = [0usize; 8];
+        for r in &parsed.psr_reports {
+            by_typ[r.typ as usize] += 1;
+        }
+
+        eprintln!("track_points                = {}", parsed.track_points.len());
+        eprintln!("psr_reports (total)         = {}", parsed.psr_reports.len());
+        eprintln!("psr_reports typ==1          = {}", typ1);
+        eprintln!("psr_reports by typ 1..7     = {:?}", &by_typ[1..8]);
+        eprintln!("psr_reports_collected       = {}", stats.psr_reports_collected);
+        eprintln!("psr_reports_no_track_number = {}", stats.psr_reports_no_track_number);
+        eprintln!(
+            "total_asterix_records={} discarded_psr_none={} nec_tod_mismatch={}",
+            stats.total_asterix_records, stats.discarded_psr_none, stats.nec_tod_mismatch
+        );
+
+        assert_eq!(
+            stats.psr_reports_collected,
+            parsed.psr_reports.len(),
+            "통계 카운트와 수집 벡터 길이가 일치해야 함"
+        );
+        // TYP=1 전용 채널 — 다른 TYP 은 한 건도 섞이면 안 된다
+        assert!(
+            parsed.psr_reports.iter().all(|r| r.typ == 1),
+            "psr_reports 는 전건 typ==1 이어야 함, by_typ={:?}",
+            &by_typ[1..8]
+        );
+        assert_eq!(
+            typ1,
+            parsed.psr_reports.len(),
+            "typ==1 건수 = 수집 벡터 길이"
+        );
+        // TYP=1(PSR 단독) 실측 밴드. 2026-08-23 측정값 43,389 / 총 919,571 레코드(4.7%).
+        assert!(
+            (40_000..=46_000).contains(&typ1),
+            "TYP=1 보고 수가 40k~46k 범위여야 함, got {}",
+            typ1
+        );
+        assert!(
+            stats.psr_reports_no_track_number <= 1_000,
+            "트랙번호 결측 보고가 1,000 이하여야 함, got {}",
+            stats.psr_reports_no_track_number
+        );
+
+        // collect_psr_reports=false 경로는 수집 없음 (기존 호출자 무영향)
+        let plain = parse_ass_file(path, 37.5585, 126.7908, &[], &[], &[], &[], -8.5, |_| {}).unwrap();
+        assert!(plain.psr_reports.is_empty());
+        assert_eq!(
+            plain.track_points.len(),
+            parsed.track_points.len(),
+            "PSR 수집 여부가 항적 파이프라인 결과를 바꾸면 안 됨"
+        );
     }
 }
 

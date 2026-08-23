@@ -86,6 +86,36 @@ fn emit_and_drain_ghost_points(
     points.shrink_to_fit();
 }
 
+/// PSR 채널 표적보고 청크 스트리밍 이벤트 페이로드 — 차용 페이로드(복제 없이 직렬화, JSON 동일)
+#[derive(Clone, serde::Serialize)]
+struct PsrReportsChunkRef<'a> {
+    file_path: &'a str,
+    reports: &'a [models::PsrReport],
+    /// 파싱 요청 태그 (TrackPointsChunkRef 와 동일 목적 — 리스너는 엄격 일치 필터 필수)
+    request_tag: &'a str,
+}
+
+/// PSR 채널 표적보고를 청크 단위로 emit한 뒤, 원본에서 제거.
+/// 항적(track_points)과 별도 채널 — Loss 탐지/항적 파이프라인에 영향 없음.
+fn emit_and_drain_psr_reports(
+    handle: &tauri::AppHandle,
+    target_label: &str,
+    file_path: &str,
+    request_tag: &str,
+    reports: &mut Vec<models::PsrReport>,
+) {
+    for chunk in reports.chunks(CHUNK_SIZE) {
+        let _ = handle.emit_to(target_label, "parse-psr-chunk", PsrReportsChunkRef {
+            file_path,
+            reports: chunk,
+            request_tag,
+        });
+    }
+    // 메모리 해제 — 이미 프론트엔드로 전송됨
+    reports.clear();
+    reports.shrink_to_fit();
+}
+
 /// CAT008 기상 벡터 청크 스트리밍 이벤트 페이로드 — 차용 페이로드(복제 없이 직렬화, JSON 동일)
 #[derive(Clone, serde::Serialize)]
 struct WeatherChunkRef<'a> {
@@ -229,6 +259,8 @@ struct BatchFileInfo {
     tcas_reports: Vec<models::TcasReport>,
     /// CAT008 기상 벡터 개수 (벡터 자체는 청크로 별도 스트리밍)
     weather_vector_count: usize,
+    /// PSR 채널 표적보고 개수 (보고 자체는 청크로 별도 스트리밍 — drain 전 캡처)
+    psr_report_count: usize,
 }
 
 /// 배치 완료 이벤트 페이로드.
@@ -244,6 +276,8 @@ struct BatchDoneEvent {
     points_emitted: usize,
     ghost_points_emitted: usize,
     weather_vectors_emitted: usize,
+    /// PSR 채널 방출 총계 (위 3종과 동일 목적)
+    psr_reports_emitted: usize,
     /// 파싱 요청 태그 (TrackPointsChunkRef 와 동일 목적 — 리스너는 엄격 일치 필터 필수)
     request_tag: String,
 }
@@ -269,6 +303,8 @@ async fn parse_and_analyze_batch(
     want_points: bool,
     want_ghost_points: bool,
     want_weather: bool,
+    // PSR 단독 플롯 채널(JS: wantPsrReports) — TrackMap 창 파싱에서만 true
+    want_psr_reports: bool,
 ) -> Result<(), String> {
     info!(
         "Command: parse_and_analyze_batch({} files, radar={},{}, include={:?}, exclude={:?})",
@@ -326,6 +362,7 @@ async fn parse_and_analyze_batch(
                 let mut points_emitted = 0usize;
                 let mut ghost_points_emitted = 0usize;
                 let mut weather_vectors_emitted = 0usize;
+                let mut psr_reports_emitted = 0usize;
 
                 for (path, result) in rx {
                     let event = match result {
@@ -344,6 +381,7 @@ async fn parse_and_analyze_batch(
                                 track_point_count: analysis.file_info.track_points.len(),
                                 tcas_reports: std::mem::take(&mut analysis.file_info.tcas_reports),
                                 weather_vector_count: analysis.file_info.weather_vectors.len(),
+                                psr_report_count: analysis.file_info.psr_reports.len(),
                             };
                             // 관심 채널만 emit — 리스너 미등록 채널은 clear 만 하고 직렬화를 생략한다.
                             // 그 채널의 emitted 는 0 으로 남지만, 프론트 완전성 대조는 **등록한 채널만**
@@ -372,6 +410,14 @@ async fn parse_and_analyze_batch(
                             } else {
                                 analysis.file_info.weather_vectors.clear();
                                 analysis.file_info.weather_vectors.shrink_to_fit();
+                            }
+                            if want_psr_reports {
+                                psr_reports_emitted += analysis.file_info.psr_reports.len();
+                                // PSR 채널 표적보고를 청크로 스트리밍 후 메모리 해제 (PSR 분석용 별도 채널)
+                                emit_and_drain_psr_reports(handle_ref, target_label_ref, &path, request_tag_ref, &mut analysis.file_info.psr_reports);
+                            } else {
+                                analysis.file_info.psr_reports.clear();
+                                analysis.file_info.psr_reports.shrink_to_fit();
                             }
 
                             // analysis는 여기서 drop → 메모리 즉시 해제
@@ -406,6 +452,7 @@ async fn parse_and_analyze_batch(
                     points_emitted,
                     ghost_points_emitted,
                     weather_vectors_emitted,
+                    psr_reports_emitted,
                     request_tag: request_tag_ref.to_string(),
                 });
             });
@@ -415,7 +462,7 @@ async fn parse_and_analyze_batch(
                 for path in file_paths_ref {
                     let path = path.clone();
                     s.spawn(move |_| {
-                        let r = parser::ass::parse_ass_file(&path, radar_lat, radar_lon, ms_incl_ref, ms_excl_ref, m3a_incl_ref, m3a_excl_ref, mag_dec, |_| {})
+                        let r = parser::ass::parse_ass_file_opts(&path, radar_lat, radar_lon, ms_incl_ref, ms_excl_ref, m3a_incl_ref, m3a_excl_ref, mag_dec, |_| {}, want_psr_reports)
                             .map_err(|e| e.to_string())
                             .map(|parsed| {
                                 analysis::loss::analyze_tracks(parsed, analysis::loss::DEFAULT_THRESHOLD_SECS)

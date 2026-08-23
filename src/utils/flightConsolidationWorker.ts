@@ -14,7 +14,7 @@ import type { DualTargetResult, ModeSTrack } from "../types";
 
 let _worker: Worker | null = null;
 let _nextId = 0;
-const _pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+const _pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
 let _consolidateReq: {
   id: number;
@@ -139,10 +139,11 @@ function handleWorkerMessage(e: MessageEvent) {
   req.resolve(e.data);
 }
 
-function workerSend(msg: Record<string, unknown>): Promise<any> {
-  return new Promise((resolve, reject) => {
+/** 요청-응답 1왕복 — 응답 모양은 메시지 종류마다 달라 호출부가 타입 인자로 지정한다 */
+function workerSend<T>(msg: Record<string, unknown>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
     const id = _nextId++;
-    _pending.set(id, { resolve, reject });
+    _pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
     getWorker().postMessage({ ...msg, id });
   });
 }
@@ -219,7 +220,7 @@ export async function getPointSummary(): Promise<{
   totalPoints: number;
   entries: PointSummaryEntry[];
 }> {
-  const result = await workerSend({ type: "GET_POINT_SUMMARY" });
+  const result = await workerSend<{ totalPoints: number; entries: PointSummaryEntry[] }>({ type: "GET_POINT_SUMMARY" });
   return { totalPoints: result.totalPoints, entries: result.entries };
 }
 
@@ -293,7 +294,7 @@ export function queryViewportPoints(params: ViewportQueryParams & { onProgress?:
 
 /** 특정 비행의 전체 포인트 쿼리 */
 export async function queryFlightPoints(flightId: string): Promise<TrackPoint[]> {
-  const result = await workerSend({ type: "QUERY_FLIGHT_POINTS", flightId });
+  const result = await workerSend<{ points: TrackPoint[] }>({ type: "QUERY_FLIGHT_POINTS", flightId });
   return result.points;
 }
 
@@ -303,7 +304,7 @@ export async function queryFlightPoints(flightId: string): Promise<TrackPoint[]>
  * TrackPoint 객체가 만들어지지 않는다(10M+ 규모 대비 스트리밍 원칙).
  */
 export async function queryModeSTrack(modeS: string): Promise<ModeSTrack> {
-  const r = await workerSend({ type: "QUERY_MODE_S_TRACK", modeS });
+  const r = await workerSend<ModeSTrack>({ type: "QUERY_MODE_S_TRACK", modeS });
   return {
     modeS: r.modeS,
     flightCount: r.flightCount,
@@ -327,7 +328,7 @@ export async function analyzeDualTargets(params: {
   minSepKm: number;
   excludeModeS: string[];
 }): Promise<DualTargetResult> {
-  const result = await workerSend({ type: "ANALYZE_DUAL_TARGETS", ...params });
+  const result = await workerSend<{ result: DualTargetResult }>({ type: "ANALYZE_DUAL_TARGETS", ...params });
   return result.result as DualTargetResult;
 }
 

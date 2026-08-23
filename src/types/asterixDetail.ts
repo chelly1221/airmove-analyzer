@@ -45,6 +45,11 @@ export interface AsterixDetailFilter {
   /** I048/200 대지속도 범위 (kt) */
   speedMinKts?: number;
   speedMaxKts?: number;
+  /**
+   * PSR 채널 소실 임계 (초, 기본 7.0). 레코드 필터가 아니라 psr_channel 분석 파라미터라
+   * DetailMatcher 는 무시한다 — 다만 캐시 키(filter JSON)에는 들어가므로 값이 바뀌면 재스캔된다.
+   */
+  psrLossThresholdSecs?: number;
 }
 
 /** Mode-S 주소별 상세 (count 내림차순, 상한 2,000) */
@@ -166,6 +171,132 @@ export interface AsterixDetailStats {
   /** ACAS RA 발생 이벤트 (시각 오름차순, 상한 1,000) */
   acas_events: AcasEvent[];
   acas_events_truncated: boolean;
+  /** PSR(1차 레이더) 채널 탐지·소실 집계 */
+  psr_channel: PsrChannelStats;
+}
+
+// ─── PSR(1차 레이더) 채널 (토픽 psr) ───────────────────────────────────
+//
+// Rust analysis::psr_channel 산출과 1:1 (serde snake_case). 거리는 전부 NM.
+// 분석 단위는 파일이 아니라 **추적기 트랙(I161)** — 같은 트랙을 공유하는 SSR 계열 보고가
+// "트랙은 살아있는데 PSR 이 못 봤다"는 증거가 되므로 TYP 1~7 전 보고를 입력으로 쓴다.
+
+/** 거리 구간 집계 (5NM × RANGE_GRID_BINS, 0–260NM. 260NM 초과는 마지막 빈에 합산) */
+export interface PsrRangeBin {
+  from_nm: number;
+  to_nm: number;
+  reports: number;
+  psr: number;
+  /** 이 빈에 귀속된 signal_loss 런 시간 합 (런 최소 ρ 기준) */
+  loss_time_s: number;
+}
+
+/** 방위 구간 집계 (5° × AZ_GRID_SECTORS). reports/psr 는 PSR 최대범위(p95) 이내 스캔만 */
+export interface PsrAzBin {
+  from_deg: number;
+  to_deg: number;
+  reports: number;
+  psr: number;
+  /** signal_loss 런 중점 방위 기준 시간 합 */
+  loss_time_s: number;
+}
+
+/** 트랙 행 (loss_time_s 내림차순, 상한 2,000) */
+export interface PsrTrackRow {
+  track_number: number;
+  /** 최빈 I220 주소 6자리 hex 대문자 */
+  mode_s: string | null;
+  /** 최빈 Mode-3/A 옥탈 4자리 */
+  mode3a: string | null;
+  start_ts: number;
+  end_ts: number;
+  /** 동일스캔 병합 후 스캔 수 */
+  report_count: number;
+  /** PSR 탐지 스캔 수 (typ ∈ {1,3,6,7}) */
+  psr_count: number;
+  /** typ==1 스캔 수 */
+  psr_only_count: number;
+  /** typ ∈ {2,4,5} 스캔 수 */
+  ssr_only_count: number;
+  min_range_nm: number;
+  max_range_nm: number;
+  /** psr_count / report_count (0~1) */
+  psr_rate: number;
+  loss_count: number;
+  loss_time_s: number;
+  /** PSR 탐지 0건 */
+  never_psr: boolean;
+  /** 모든 스캔이 typ==1 (SSR 응답 전무) */
+  psr_exclusive: boolean;
+}
+
+/** 소실 런 위치 — interior=PSR 탐지 사이, head=범위 내 첫 스캔~첫 PSR, tail=마지막 PSR~범위 내 마지막 스캔 */
+export type PsrLossKind = "interior" | "head" | "tail";
+
+/** 소실 런 행 (signal_loss 만, duration_s 내림차순, 상한 2,000) */
+export interface PsrLossRow {
+  track_number: number;
+  mode_s: string | null;
+  kind: PsrLossKind;
+  start_ts: number;
+  end_ts: number;
+  duration_s: number;
+  missed_scans: number;
+  /** 런 구간의 SSR 단독 스캔 수 — "트랙 생존 증거" */
+  ssr_reports_inside: number;
+  start_range_nm: number;
+  end_range_nm: number;
+  min_range_nm: number;
+  /** 시작·끝 극좌표 평면 중점의 방위 */
+  mid_azimuth_deg: number;
+}
+
+export interface PsrChannelStats {
+  /** 동일스캔 병합 후 스캔 수 */
+  reports_total: number;
+  reports_psr: number;
+  reports_psr_only: number;
+  reports_ssr_only: number;
+  /** 동일 트랙 Δt<1s 병합 건수 */
+  same_scan_merged: number;
+  tracks_total: number;
+  tracks_with_psr: number;
+  tracks_never_psr: number;
+  /** 모든 스캔이 typ==1 인 트랙 */
+  tracks_psr_exclusive: number;
+  tracks_split_gap: number;
+  tracks_split_mode_s: number;
+  tracks_split_speed: number;
+  /** 트랙별 Δt 중앙값들의 중앙값. 표본 부족이면 null (폴백 없음) */
+  scan_period_s: number | null;
+  /** PSR 탐지 스캔 ρ 의 p95 (NM, 클램프 없음) */
+  psr_max_range_nm: number;
+  loss_threshold_s: number;
+  /** PSR 있는 트랙의 (end−start) 합 */
+  total_track_time_s: number;
+  /** signal_loss 런 시간 합 */
+  total_loss_time_s: number;
+  /** total_loss_time_s / total_track_time_s (0~1) */
+  loss_rate: number;
+  loss_runs_signal: number;
+  /** 범위 밖 런 — 건수만 집계하고 목록에서는 제외 */
+  loss_runs_out_of_range: number;
+  /** Σin_range_psr / Σin_range_report (PSR 있는 트랙 한정) */
+  psr_detect_rate_in_range: number;
+  /** 5NM × RANGE_GRID_BINS */
+  range_bins: PsrRangeBin[];
+  /** 5° × AZ_GRID_SECTORS */
+  az_bins: PsrAzBin[];
+  /** PPI 격자 분모 — idx = az*RANGE_GRID_BINS + r (전 스캔) */
+  ppi_reports: number[];
+  /** PPI 격자 분자 — 같은 인덱스 규약 */
+  ppi_psr: number[];
+  tracks: PsrTrackRow[];
+  tracks_truncated: boolean;
+  losses: PsrLossRow[];
+  losses_truncated: boolean;
+  /** 분석 생략 사유 (스캔주기 추정 불가·PSR 탐지 0건). null 이면 정상 */
+  analysis_skipped_reason: string | null;
 }
 
 // ─── 상세 페이지 토픽 레지스트리 (사이드바·라우팅·페이지 공용) ────────────
@@ -178,6 +309,7 @@ export type AsterixStatTopic =
   | "mode3a"
   | "bds"
   | "source"
+  | "psr"
   | "quality";
 
 export interface AsterixStatTopicDef {
@@ -197,5 +329,6 @@ export const ASTERIX_STAT_TOPICS: AsterixStatTopicDef[] = [
   { id: "mode3a", label: "Mode-3/A·비상", title: "Mode-3/A·비상코드 상세", path: "/asterix/stats/mode3a" },
   { id: "bds", label: "BDS·ACAS", title: "BDS 레지스터·ACAS 상세", path: "/asterix/stats/bds" },
   { id: "source", label: "출처·메시지", title: "출처·메시지·회전주기 상세", path: "/asterix/stats/source" },
+  { id: "psr", label: "PSR 채널", title: "PSR 채널 탐지·소실 상세", path: "/asterix/stats/psr" },
   { id: "quality", label: "품질 지표", title: "파싱 품질 상세", path: "/asterix/stats/quality" },
 ];

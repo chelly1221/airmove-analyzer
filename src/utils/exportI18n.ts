@@ -330,6 +330,12 @@ export function exportStrings(lang: ExportLang) {
         sourceBreakdown: pick("출처별 분해", "Source Breakdown", "送信元別内訳"),
         catQuality: pick("카테고리 품질", "Category Quality", "カテゴリ品質"),
         fileStruct: pick("파일별 구조", "File Structure", "ファイル構造"),
+        psrSummary: pick("PSR 요약", "PSR Summary", "PSR サマリー"),
+        psrRange: pick("PSR 거리별", "PSR by Range", "PSR 距離別"),
+        psrAzimuth: pick("PSR 방위별", "PSR by Azimuth", "PSR 方位別"),
+        psrPpi: pick("PSR 탐지율 격자", "PSR Detection Grid", "PSR 探知率グリッド"),
+        psrTracks: pick("PSR 트랙", "PSR Tracks", "PSR トラック"),
+        psrLosses: pick("PSR 소실", "PSR Losses", "PSR ロス"),
       },
       hourlyHeader: (tz: string) =>
         pick([`시(${tz})`, "레코드"], [`Hour (${tz})`, "Records"], [`時 (${tz})`, "レコード"]),
@@ -417,6 +423,83 @@ export function exportStrings(lang: ExportLang) {
           ["File", "Size (bytes)", "Frames", "Records (filtered)", "Records/Frame", `Start (${tz})`, `End (${tz})`],
           ["ファイル", "容量 (bytes)", "フレーム", "レコード（フィルタ）", "フレーム当たりレコード", `開始 (${tz})`, `終了 (${tz})`],
         ),
+
+      // ── PSR 채널 토픽 ── (거리는 전부 NM)
+      psrRangeHeader: pick(
+        ["거리 하한(NM)", "거리 상한(NM)", "보고(스캔)", "PSR 탐지", "탐지율(%)", "소실시간(초)"],
+        ["Range From (NM)", "Range To (NM)", "Reports (scans)", "PSR Detections", "Detection Rate (%)", "Loss Time (s)"],
+        ["距離 下限 (NM)", "距離 上限 (NM)", "報告（スキャン）", "PSR 探知", "探知率 (%)", "ロス時間 (s)"],
+      ),
+      psrAzHeader: pick(
+        ["방위 시작(°)", "방위 끝(°)", "보고(스캔)", "PSR 탐지", "탐지율(%)", "소실시간(초)"],
+        ["Azimuth From (°)", "Azimuth To (°)", "Reports (scans)", "PSR Detections", "Detection Rate (%)", "Loss Time (s)"],
+        ["方位 開始 (°)", "方位 終了 (°)", "報告（スキャン）", "PSR 探知", "探知率 (%)", "ロス時間 (s)"],
+      ),
+      psrTrackHeader: (tz: string) =>
+        pick(
+          [
+            "트랙번호", "Mode-S", "기체", "Mode-3/A", `시작(${tz})`, `끝(${tz})`, "스캔",
+            "PSR 탐지", "PSR 단독", "SSR 단독", "탐지율(%)", "소실 건수", "소실시간(초)",
+            "최소거리(NM)", "최대거리(NM)", "PSR 없음", "PSR 전용",
+          ],
+          [
+            "Track No.", "Mode-S", "Aircraft", "Mode-3/A", `Start (${tz})`, `End (${tz})`, "Scans",
+            "PSR Detections", "PSR Only", "SSR Only", "Detection Rate (%)", "Loss Runs", "Loss Time (s)",
+            "Range Min (NM)", "Range Max (NM)", "Never PSR", "PSR Exclusive",
+          ],
+          [
+            "トラック番号", "Mode-S", "機体", "Mode-3/A", `開始 (${tz})`, `終了 (${tz})`, "スキャン",
+            "PSR 探知", "PSR 単独", "SSR 単独", "探知率 (%)", "ロス件数", "ロス時間 (s)",
+            "最小距離 (NM)", "最大距離 (NM)", "PSR なし", "PSR 専用",
+          ],
+        ),
+      psrLossHeader: (tz: string) =>
+        pick(
+          [
+            "트랙번호", "Mode-S", "구간", `시작(${tz})`, `끝(${tz})`, "지속(초)", "결측 스캔",
+            "내부 SSR", "시작거리(NM)", "끝거리(NM)", "최소거리(NM)", "방위(°)",
+          ],
+          [
+            "Track No.", "Mode-S", "Segment", `Start (${tz})`, `End (${tz})`, "Duration (s)", "Missed Scans",
+            "SSR Inside", "Start Range (NM)", "End Range (NM)", "Min Range (NM)", "Azimuth (°)",
+          ],
+          [
+            "トラック番号", "Mode-S", "区間", `開始 (${tz})`, `終了 (${tz})`, "継続 (s)", "欠測スキャン",
+            "内部 SSR", "開始距離 (NM)", "終了距離 (NM)", "最小距離 (NM)", "方位 (°)",
+          ],
+        ),
+      /** 소실 런 위치 (interior/head/tail) */
+      psrLossKind: (k: string) =>
+        ({
+          interior: pick("구간 내", "Interior", "区間内"),
+          head: pick("진입부", "Head", "進入部"),
+          tail: pick("이탈부", "Tail", "離脱部"),
+        })[k] ?? k,
+      /** PSR 요약 시트 항목명 (헤더는 sumHeader 재사용) */
+      psrSum: {
+        reportsTotal: pick("보고(스캔)", "Reports (scans)", "報告（スキャン）"),
+        reportsPsr: pick("PSR 탐지", "PSR Detections", "PSR 探知"),
+        reportsPsrOnly: pick("PSR 단독(TYP=1)", "PSR Only (TYP=1)", "PSR 単独 (TYP=1)"),
+        reportsSsrOnly: pick("SSR 단독", "SSR Only", "SSR 単独"),
+        sameScanMerged: pick("동일스캔 병합", "Same-Scan Merged", "同一スキャン統合"),
+        tracksTotal: pick("트랙", "Tracks", "トラック"),
+        tracksWithPsr: pick("PSR 있는 트랙", "Tracks with PSR", "PSR ありトラック"),
+        tracksNeverPsr: pick("PSR 없는 트랙", "Tracks without PSR", "PSR なしトラック"),
+        tracksPsrExclusive: pick("PSR 전용 트랙", "PSR-Exclusive Tracks", "PSR 専用トラック"),
+        splitGap: pick("트랙 분할(공백)", "Splits (gap)", "トラック分割（ギャップ）"),
+        splitModeS: pick("트랙 분할(Mode-S)", "Splits (Mode-S)", "トラック分割 (Mode-S)"),
+        splitSpeed: pick("트랙 분할(속도)", "Splits (speed)", "トラック分割（速度）"),
+        scanPeriod: pick("스캔주기(초)", "Scan Period (s)", "スキャン周期 (s)"),
+        psrMaxRange: pick("PSR 최대범위(NM, p95)", "PSR Max Range (NM, p95)", "PSR 最大範囲 (NM, p95)"),
+        lossThreshold: pick("소실 임계(초)", "Loss Threshold (s)", "ロス閾値 (s)"),
+        detectRateInRange: pick("범위내 PSR 탐지율(%)", "In-Range PSR Detection Rate (%)", "範囲内 PSR 探知率 (%)"),
+        trackTime: pick("추적시간(초)", "Track Time (s)", "追跡時間 (s)"),
+        lossTime: pick("소실시간(초)", "Loss Time (s)", "ロス時間 (s)"),
+        lossRate: pick("소실율(%)", "Loss Rate (%)", "ロス率 (%)"),
+        lossRunsSignal: pick("소실 건수(신호)", "Loss Runs (signal)", "ロス件数（信号）"),
+        lossRunsOutOfRange: pick("소실 건수(범위밖)", "Loss Runs (out of range)", "ロス件数（範囲外）"),
+        skippedReason: pick("분석 생략 사유", "Analysis Skipped Reason", "分析省略理由"),
+      },
     },
 
     // 값 번역기 (매핑 없으면 한글 원문 유지)

@@ -19,6 +19,7 @@ import IdentityDetail from "../components/asterix/topics/IdentityDetail";
 import Mode3aDetail from "../components/asterix/topics/Mode3aDetail";
 import BdsDetail from "../components/asterix/topics/BdsDetail";
 import SourceDetail from "../components/asterix/topics/SourceDetail";
+import PsrDetail from "../components/asterix/topics/PsrDetail";
 import QualityDetail from "../components/asterix/topics/QualityDetail";
 import { ASTERIX_STAT_TOPICS } from "../types/asterixDetail";
 import type { AsterixDetailFilter, AsterixDetailStats, TzMode } from "../types/asterixDetail";
@@ -212,6 +213,8 @@ function TopicBody({
       );
     case "source":
       return <SourceDetail detail={detail} tz={tz} onQuickFilter={onQuickFilter} />;
+    case "psr":
+      return <PsrDetail detail={detail} tz={tz} appliedFilter={appliedFilter} onQuickFilter={onQuickFilter} />;
     case "quality":
       return <QualityDetail detail={detail} tz={tz} onQuickFilter={onQuickFilter} />;
   }

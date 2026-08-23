@@ -150,6 +150,14 @@ interface AppState {
   dualTargetResult: DualTargetResult | null;
   setDualTargetResult: (r: DualTargetResult | null) => void;
 
+  // PSR 단독(TYP=1) 플롯 — TrackMap 표출 전용. 세션 한정(DB 미영속).
+  //   객체 배열이 아니라 typed array 로 보관한다(전수 수집이라 수십만 점 규모).
+  //   pos = lon,lat 인터리브(count*2), time = 시간순 정렬된 Unix 초(count).
+  psrOnlyPlots: { pos: Float32Array; time: Float64Array; count: number } | null;
+  setPsrOnlyPlots: (p: { pos: Float32Array; time: Float64Array; count: number }) => void;
+  clearPsrOnlyPlots: () => void;
+  /** PSR 단독 레이어 표시 토글 */
+
 
   // 보고서 메타데이터
   reportMetadata: ReportMetadata;
@@ -480,6 +488,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   // 이중표적 분석 결과 (세션 한정)
   dualTargetResult: null,
   setDualTargetResult: (r) => set({ dualTargetResult: r }),
+
+  // PSR 단독 플롯 (세션 한정)
+  psrOnlyPlots: null,
+  setPsrOnlyPlots: (p) => set({ psrOnlyPlots: p }),
+  clearPsrOnlyPlots: () => set({ psrOnlyPlots: null }),
 
 
   // 보고서 메타데이터

@@ -379,6 +379,7 @@ mod tests {
             parse_stats: None,
             tcas_reports: vec![],
             weather_vectors: vec![],
+            psr_reports: vec![],
         };
 
         let result = analyze_tracks(parsed, 12.0);

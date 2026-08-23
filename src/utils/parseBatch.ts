@@ -12,7 +12,7 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import type { TrackPoint, WeatherVector } from "../types";
+import type { PsrReport, TrackPoint, WeatherVector } from "../types";
 
 /** 마지막 수신 이벤트로부터 이 시간 동안 아무 이벤트도 없으면 done 유실로 보고 빠져나온다 */
 const IDLE_MS = 10_000;
@@ -42,6 +42,8 @@ export interface ParseBatchOutcome {
   pointsReceived: number;
   ghostPointsReceived: number;
   weatherReceived: number;
+  /** PSR 단독 플롯(TYP=1) 수신 누계 (onPsrReports 미등록 시 0) */
+  psrReportsReceived: number;
   resultsReceived: number;
 }
 
@@ -53,6 +55,7 @@ interface BatchDonePayload {
   points_emitted: number;
   ghost_points_emitted: number;
   weather_vectors_emitted: number;
+  psr_reports_emitted: number;
   request_tag: string;
 }
 
@@ -69,6 +72,8 @@ export async function parseAssBatch(args: {
   onPoints?: (pts: TrackPoint[]) => void;
   onGhostPoints?: (pts: TrackPoint[]) => void;
   onWeather?: (vectors: WeatherVector[]) => void;
+  /** PSR 단독 플롯 — I161 트랙번호가 있는 TYP=1 표적보고(전수, 유령/중복 제거·Mode-S 필터 미적용) */
+  onPsrReports?: (reports: PsrReport[]) => void;
   onResult?: (payload: ParseBatchResultPayload) => void;
   /**
    * 선점(supersede) 판정 — true 면 이 파싱은 이미 새 파싱에 밀려난 것이므로 즉시 취소한다
@@ -77,7 +82,7 @@ export async function parseAssBatch(args: {
    */
   isStale?: () => boolean;
 }): Promise<ParseBatchOutcome> {
-  const { paths, radarLat, radarLon, filter, onPoints, onGhostPoints, onWeather, onResult, isStale } = args;
+  const { paths, radarLat, radarLon, filter, onPoints, onGhostPoints, onWeather, onPsrReports, onResult, isStale } = args;
 
   // 파싱 요청 고유 태그 — 같은 창의 다른 페이지·잔존 파싱과 자기 이벤트를 구분한다
   const requestTag = crypto.randomUUID();
@@ -86,6 +91,7 @@ export async function parseAssBatch(args: {
   let pointsReceived = 0;
   let ghostPointsReceived = 0;
   let weatherReceived = 0;
+  let psrReportsReceived = 0;
   let resultsReceived = 0;
   let lastActivity = Date.now();
   let failed = false;
@@ -153,6 +159,16 @@ export async function parseAssBatch(args: {
         onWeather(vs);
       }));
     }
+    if (onPsrReports) {
+      unlistens.push(await win.listen<{ reports: PsrReport[]; request_tag: string }>("parse-psr-chunk", (ev) => {
+        if (ev.payload.request_tag !== requestTag) return;
+        if (isStale?.()) { cancel(); return; }
+        lastActivity = Date.now();
+        const rs = ev.payload.reports;
+        psrReportsReceived += rs.length;
+        onPsrReports(rs);
+      }));
+    }
     if (onResult) {
       unlistens.push(await win.listen<ParseBatchResultPayload>("batch-parse-result", (ev) => {
         if (ev.payload.request_tag !== requestTag) return;
@@ -178,6 +194,7 @@ export async function parseAssBatch(args: {
         wantPoints: !!onPoints,
         wantGhostPoints: !!onGhostPoints,
         wantWeather: !!onWeather,
+        wantPsrReports: !!onPsrReports,
       });
     } catch (e) {
       failed = true;
@@ -216,16 +233,17 @@ export async function parseAssBatch(args: {
     && (!onPoints || pointsReceived === totals.points_emitted)
     && (!onGhostPoints || ghostPointsReceived === totals.ghost_points_emitted)
     && (!onWeather || weatherReceived === totals.weather_vectors_emitted)
+    && (!onPsrReports || psrReportsReceived === totals.psr_reports_emitted)
     && (!onResult || resultsReceived === totals.total);
 
   if (!failed && !cancelled && !complete) {
     console.warn("[parseAssBatch] 수신 절단 감지", {
       requestTag,
       doneReceived: totals !== null,
-      pointsReceived, ghostPointsReceived, weatherReceived, resultsReceived,
+      pointsReceived, ghostPointsReceived, weatherReceived, psrReportsReceived, resultsReceived,
       emitted: totals,
     });
   }
 
-  return { failed, complete, pointsReceived, ghostPointsReceived, weatherReceived, resultsReceived };
+  return { failed, complete, pointsReceived, ghostPointsReceived, weatherReceived, psrReportsReceived, resultsReceived };
 }

@@ -609,6 +609,8 @@ export default function TrackMap() {
   const weatherColors = useAppStore((s) => s.weatherColors);
   const setWeatherColor = useAppStore((s) => s.setWeatherColor);
   const resetWeatherColors = useAppStore((s) => s.resetWeatherColors);
+  // PSR 단독(TYP=1) 플롯 — 이 창 파싱에서만 채워진다(오프스크린 TrackMap 은 항상 null)
+  const psrOnlyPlots = useAppStore((s) => s.psrOnlyPlots);
   // BRA 기준각 (영속 설정)
   const braAngleDeg = useAppStore((s) => s.braAngleDeg);
   const setBraAngleDeg = useAppStore((s) => s.setBraAngleDeg);
@@ -4153,6 +4155,56 @@ export default function TrackMap() {
     ];
   }, [weatherVisible, weatherVectors, radarInfo, weatherNmPerBin, weatherOpacity, weatherColors, visibleMaxTs]);
 
+  // PSR 단독(I020 TYP=1) 플롯 — 검은 점만. 항적 파이프라인은 TYP 0/1 을 제외하므로
+  // 이 레이어가 없으면 1차 레이더 스킨 에코 단독 보고는 지도 어디에도 나타나지 않는다.
+  //   pos/time 은 파싱 시점에 시간 오름차순으로 정렬돼 있다(TrackMapApp.sortPsrAccum) —
+  //   그 전제 위에서 시간창 [visibleMinTs, visibleMaxTs] 를 이진탐색으로 잘라 subarray 만 넘긴다
+  //   (전수 유지: 잘라내기는 시간창 필터일 뿐 다운샘플링이 아니다).
+  const psrOnlyDeckLayers = useMemo(() => {
+    // 토글 없음 — 다른 탐지 유형과 같이 항상 표시하고 범례 "PSR 단독 플롯" 체크로만 끈다.
+    // 항적 표시 "끄기"/히트맵 모드에선 다른 항적과 함께 숨긴다(표적소실 레이어와 동일 규칙).
+    if (!psrOnlyPlots || psrOnlyPlots.count === 0) return [];
+    if (hiddenLegendItems.has("psr_only") || trackDisplay === "off" || trackDisplay === "heatmap") return [];
+    const { pos, time, count } = psrOnlyPlots;
+
+    // time[i] >= v 인 첫 인덱스 (하한 이진탐색)
+    const lowerBound = (v: number) => {
+      let lo = 0, hi = count;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (time[mid] < v) lo = mid + 1; else hi = mid;
+      }
+      return lo;
+    };
+
+    const lo = Number.isFinite(visibleMinTs) ? lowerBound(visibleMinTs) : 0;
+    // 상한은 포함 구간이라 (max + 아주 작은 폭) 의 하한을 쓰지 않고 max 초과 첫 인덱스를 직접 찾는다
+    let hi = count;
+    if (Number.isFinite(visibleMaxTs)) {
+      let a = lo, b = count;
+      while (a < b) {
+        const mid = (a + b) >> 1;
+        if (time[mid] <= visibleMaxTs) a = mid + 1; else b = mid;
+      }
+      hi = a;
+    }
+    const n = hi - lo;
+    if (n <= 0) return [];
+
+    return [
+      new ScatterplotLayer({
+        id: "psr-only-plots",
+        data: { length: n, attributes: { getPosition: { value: pos.subarray(lo * 2, hi * 2), size: 2 } } },
+        getFillColor: [0, 0, 0, 220],
+        radiusUnits: "pixels" as const,
+        getRadius: 2.5,
+        radiusMinPixels: 2,
+        radiusMaxPixels: 5,
+        pickable: false,
+      }),
+    ];
+  }, [psrOnlyPlots, hiddenLegendItems, trackDisplay, visibleMinTs, visibleMaxTs]);
+
   // CoS(침묵원추) 3D 레이어 — 레이더 안테나 정점에서 70°(COS_DEG) 기준각 상방으로 벌어지는 역원추.
   //   70° 를 넘는 앙각은 레이더가 탐지하지 못하므로 이 원추 내부가 곧 침묵 영역.
   //   천장은 커버리지 상한(COVERAGE_MAX_ALT_FT)과 동일 스코프 — 원추는 무한 발산하므로 같은 고도에서 잘라
@@ -4708,6 +4760,9 @@ export default function TrackMap() {
       );
     }
 
+    // PSR 단독 플롯 — 항적(선·점) 위에 그려 굵은 항적에 가려지지 않게 한다 (작고 드문 검은 점)
+    layers.push(...psrOnlyDeckLayers);
+
     // 커버리지 맵 합성 (2D/3D 모드에 따라 선택)
     layers.push(...coverageDeckLayers);
 
@@ -4802,7 +4857,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, trackHeatBitmap, lossHeatBitmap, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, trackHeatBitmap, lossHeatBitmap, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, psrOnlyDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -6054,6 +6109,23 @@ export default function TrackMap() {
                     />
                     <span className={`inline-block h-2 w-2 rounded-full bg-[#ef4444] transition-opacity ${hiddenLegendItems.has("loss") ? "opacity-25" : ""}`} />
                     <span className={`transition-opacity ${hiddenLegendItems.has("loss") ? "text-gray-300 line-through" : "text-gray-600"} group-hover:text-gray-700`}>표적소실</span>
+                  </label>
+                )}
+                {/* PSR 단독(I020 TYP=1) 플롯 — 항적 파이프라인 밖의 1차 레이더 단독 보고. 다른 유형처럼 범례 체크로 on/off */}
+                {psrOnlyPlots && psrOnlyPlots.count > 0 && (
+                  <label className="flex items-center gap-1.5 cursor-pointer select-none group">
+                    <input
+                      type="checkbox"
+                      checked={!hiddenLegendItems.has("psr_only")}
+                      onChange={() => setHiddenLegendItems((prev) => {
+                        const next = new Set(prev);
+                        if (next.has("psr_only")) next.delete("psr_only"); else next.add("psr_only");
+                        return next;
+                      })}
+                      className="sr-only"
+                    />
+                    <span className={`inline-block h-2 w-2 rounded-full bg-black transition-opacity ${hiddenLegendItems.has("psr_only") ? "opacity-25" : ""}`} />
+                    <span className={`transition-opacity ${hiddenLegendItems.has("psr_only") ? "text-gray-300 line-through" : "text-gray-600"} group-hover:text-gray-700`}>PSR 단독 플롯</span>
                   </label>
                 )}
                 {showBuildings && (

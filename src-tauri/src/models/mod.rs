@@ -75,6 +75,14 @@ pub struct ParseStatistics {
     /// (detect_and_remove_ghosts + remove_spatial_outliers 합계)
     #[serde(default)]
     pub ghost_points_removed: usize,
+    /// TrackMap PSR 단독 플롯용으로 수집된 표적보고 수 — **TYP=1 한정**
+    /// (collect_psr_reports=true 일 때만 누적)
+    #[serde(default)]
+    pub psr_reports_collected: usize,
+    /// I161 트랙번호가 없어 PSR 단독 플롯 수집에서 제외된 TYP=1 표적보고 수.
+    /// 폴백 금지 — 다른 키로 묶지 않고 폐기 카운트로만 드러낸다.
+    #[serde(default)]
+    pub psr_reports_no_track_number: usize,
 }
 
 /// 비행검사기 (Flight Inspector Aircraft)
@@ -163,6 +171,37 @@ pub struct WeatherVector {
     pub intensity: u8,
 }
 
+/// TrackMap "PSR 단독" 플롯 표출용 경량 표적보고 — I161 트랙번호가 있는 **TYP=1 레코드만**
+/// (전수; 유령 제거·동일위치 중복 제거·Mode-S 필터 미적용).
+/// 기존 track_points 파이프라인과 완전히 분리된 별도 채널이다.
+/// PSR 채널 **통계**(탐지율·소실)는 이 채널이 아니라 ASTERIX 통계 상세의 PSR 토픽
+/// (`analysis::psr_channel`)이 계산한다 — 여기서 TYP 2~7 을 나르지 않는 이유.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PsrReport {
+    /// Unix 초 (UTC) — track_points 와 동일한 base_date + day_offset + TOD 산정
+    pub timestamp: f64,
+    /// I161 트랙번호 (12bit)
+    pub track_number: u16,
+    /// I020 TYP — 이 채널은 TYP=1(PSR 단독) 만 수집하므로 **항상 1** (필드는 계약 유지용)
+    pub typ: u8,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// 레이더 거리 NM (I040 그대로; I042 직교좌표 레코드는 sqrt(x²+y²))
+    pub rho_nm: f32,
+    /// 진북 방위 deg [0,360) — 자북 theta + mag_dec 보정
+    pub theta_deg: f32,
+    /// I220 Mode-S 주소 (>0 일 때만), 없으면 None
+    pub mode_s: Option<u32>,
+    /// I070 Mode 3/A (garbled 가 아닐 때만), 없으면 None
+    pub mode3a: Option<u16>,
+    /// I090 FL×100ft→m, 없으면 None (PSR 단독 보고엔 고도가 없다)
+    pub altitude_m: Option<f32>,
+    /// I200 대지속도 (kt) — 없으면 0
+    pub speed_kts: f32,
+    /// I200 진행방위 (deg) — 없으면 0
+    pub heading_deg: f32,
+}
+
 /// Loss 구간 (Loss Segment)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LossSegment {
@@ -211,6 +250,10 @@ pub struct ParsedFile {
     /// CAT008 기상 극좌표 벡터 (트랙 독립 전수 추출)
     #[serde(default)]
     pub weather_vectors: Vec<WeatherVector>,
+    /// PSR 채널 분석용 표적보고 (collect_psr_reports=true 로 파싱했을 때만 채워짐).
+    /// track_points 와 별개 채널 — Loss 탐지/항적 파이프라인에 영향 없음.
+    #[serde(default)]
+    pub psr_reports: Vec<PsrReport>,
 }
 
 /// 분석 결과 (Analysis Result)

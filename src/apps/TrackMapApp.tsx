@@ -16,7 +16,74 @@ import {
   ConsolidateSuperseded,
 } from "../utils/flightConsolidationWorker";
 import { parseAssBatch } from "../utils/parseBatch";
-import type { Aircraft, RadarSite, WeatherVector } from "../types";
+import type { Aircraft, PsrReport, RadarSite, WeatherVector } from "../types";
+
+/**
+ * PSR 단독(TYP=1) 플롯 누적 버퍼 — 객체 배열을 메인에 쌓지 않고 곧바로 typed array 로 흡수한다.
+ * pos = lon,lat 인터리브(cap*2), time = Unix 초(cap). 용량은 2배씩 성장시킨다.
+ */
+interface PsrPlotAccum {
+  pos: Float32Array;
+  time: Float64Array;
+  count: number;
+  cap: number;
+}
+
+/** 초기 용량 — 김포 1일치 TYP=1 이 4만~5만 건 규모라 재할당이 몇 번 안 돌게 잡는다 */
+const PSR_ACCUM_INIT_CAP = 1 << 16;
+
+function createPsrAccum(): PsrPlotAccum {
+  return { pos: new Float32Array(0), time: new Float64Array(0), count: 0, cap: 0 };
+}
+
+/** 청크 append — 객체 배열은 이 함수 안에서만 살고 리스너 스코프 종료 후 GC */
+function appendPsrChunk(acc: PsrPlotAccum, reports: PsrReport[]): void {
+  if (reports.length === 0) return;
+  const need = acc.count + reports.length;
+  if (need > acc.cap) {
+    let cap = acc.cap === 0 ? PSR_ACCUM_INIT_CAP : acc.cap;
+    while (cap < need) cap *= 2;
+    const pos = new Float32Array(cap * 2);
+    const time = new Float64Array(cap);
+    if (acc.count > 0) {
+      pos.set(acc.pos.subarray(0, acc.count * 2));
+      time.set(acc.time.subarray(0, acc.count));
+    }
+    acc.pos = pos;
+    acc.time = time;
+    acc.cap = cap;
+  }
+  let k = acc.count;
+  for (let i = 0; i < reports.length; i++) {
+    const r = reports[i];
+    acc.pos[k * 2] = r.longitude;
+    acc.pos[k * 2 + 1] = r.latitude;
+    acc.time[k] = r.timestamp;
+    k++;
+  }
+  acc.count = k;
+}
+
+/**
+ * 시간 오름차순 정렬 — TrackMap 레이어가 시간창 이진탐색으로 구간을 잘라내는 전제.
+ * 인덱스 배열을 정렬한 뒤 한 번에 재배치한다(객체 배열 생성 없음).
+ */
+function sortPsrAccum(acc: PsrPlotAccum): { pos: Float32Array; time: Float64Array; count: number } {
+  const n = acc.count;
+  const t = acc.time;
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+  order.sort((a, b) => t[a] - t[b]);
+  const pos = new Float32Array(n * 2);
+  const time = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const s = order[i];
+    pos[i * 2] = acc.pos[s * 2];
+    pos[i * 2 + 1] = acc.pos[s * 2 + 1];
+    time[i] = t[s];
+  }
+  return { pos, time, count: n };
+}
 
 /** DB에서 설정 복원 */
 function useRestoreSettings() {
@@ -105,11 +172,14 @@ function useAssFilePicker() {
 
     const site = useAppStore.getState().radarSite;
 
-    // 이전 기상 데이터 초기화
+    // 이전 기상·PSR 단독 데이터 초기화
     useAppStore.getState().clearWeatherVectors();
+    useAppStore.getState().clearPsrOnlyPlots();
 
     // 기상 벡터 청크 수신 → 누적 (CAT008, 트랙 독립). ~0.5M로 메인 보관 가능.
     const weatherAccum: WeatherVector[] = [];
+    // PSR 단독(TYP=1) 플롯 — 성장형 typed array 로 흡수 (객체 배열 누적 금지)
+    const psrAccum = createPsrAccum();
     // 파싱 프로토콜(태그·창 타깃 리스너·완료 배리어)은 parseAssBatch 단일 소유.
     // 청크는 핸들러 안에서 즉시 Worker 로 fire-and-forget (closure capture 없음 → GC 가능).
     let totalForwarded = 0;
@@ -125,6 +195,9 @@ function useAssFilePicker() {
       },
       onWeather: (vs) => {
         for (const v of vs) weatherAccum.push(v);
+      },
+      onPsrReports: (rs) => {
+        appendPsrChunk(psrAccum, rs);
       },
     });
     // 이 창은 누적(append) 시맨틱이라 이중표적 페이지식 전량 폐기가 불가 — 통합은 진행하되
@@ -143,6 +216,12 @@ function useAssFilePicker() {
     if (!outcome.failed && weatherAccum.length > 0) {
       weatherAccum.sort((a, b) => a.time - b.time);
       useAppStore.getState().setWeatherVectors(weatherAccum);
+    }
+
+    // PSR 단독 플롯도 같은 정책 — 실패한 파싱의 부분 수집은 커밋하지 않는다.
+    // 시간순 정렬은 레이어의 시간창 이진탐색 전제(여러 파일이 순서 없이 도착한다).
+    if (!outcome.failed && psrAccum.count > 0) {
+      useAppStore.getState().setPsrOnlyPlots(sortPsrAccum(psrAccum));
     }
 
     if (totalForwarded > 0) {
