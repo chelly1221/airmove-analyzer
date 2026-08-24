@@ -16,6 +16,7 @@ import {
   Binary,
   BookOpen,
   Ghost,
+  Settings,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import Modal from "../common/Modal";
@@ -105,6 +106,7 @@ const navSections: NavSection[] = [
     items: [
       { id: "aircraft", label: "비행검사기", icon: Plane, path: "/aircraft" },
       { id: "radar", label: "레이더", icon: Radio, path: "/radar" },
+      { id: "settings", label: "설정", icon: Settings, path: "/settings" },
     ],
   },
 ];

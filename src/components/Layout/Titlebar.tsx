@@ -1,15 +1,10 @@
 import { useState, useEffect } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, Square, X, Copy, Settings } from "lucide-react";
-import { useAppStore } from "../../store";
+import { Minus, Square, X, Copy } from "lucide-react";
 
 const appWindow = getCurrentWindow();
 
 export default function Titlebar({ title, controlsOnly, noBorder, children }: { title?: string; controlsOnly?: boolean; noBorder?: boolean; children?: React.ReactNode }) {
-  const navigate = useNavigate();
-  const location = useLocation();
-  const setActivePage = useAppStore((s) => s.setActivePage);
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
@@ -50,20 +45,6 @@ export default function Titlebar({ title, controlsOnly, noBorder, children }: { 
           </span>
         )}
       </div>
-
-      {/* Settings button */}
-      <button
-        data-tour="titlebar-settings"
-        onClick={() => { setActivePage("settings"); navigate("/settings"); }}
-        className={`flex h-full w-10 items-center justify-center transition-colors ${
-          location.pathname === "/settings"
-            ? "text-[#a60739]"
-            : "text-gray-300 hover:text-gray-500"
-        }`}
-        title="설정"
-      >
-        <Settings size={14} />
-      </button>
 
       {/* Window controls */}
       <div className="flex h-full">

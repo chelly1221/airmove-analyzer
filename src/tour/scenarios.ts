@@ -587,11 +587,11 @@ const DB_BACKUP_PHASES: Record<string, TourStep[]> = {
     },
     {
       id: "dbr-open-settings",
-      target: '[data-tour="titlebar-settings"]',
+      target: '[data-tour="nav-settings"]',
       title: "설정 열기",
-      body: "화면 우상단의 **톱니바퀴(설정)** 아이콘을 클릭하세요. 설정 페이지로 이동합니다.",
+      body: "왼쪽 사이드바 관리 섹션 맨 아래의 **설정** 메뉴를 클릭하세요. 설정 페이지로 이동합니다.",
       mode: "interactive",
-      placement: "bottom",
+      placement: "right",
       advanceOnTargetClick: true,
     },
     {
@@ -745,7 +745,7 @@ export const TOUR_SCENARIOS: TourScenarioMeta[] = [
       "백업 파일을 다시 가져와 복원하는 과정을 안내합니다. PC 교체·재설치나 다른 PC 로의 자료 이관에 사용합니다. " +
       "가상 화면으로 시뮬레이션하므로 실제 데이터는 변경되지 않습니다.",
     stepsSummary: [
-      "우상단 설정(톱니바퀴) 아이콘으로 설정 페이지 열기",
+      "사이드바 관리 → 설정 메뉴로 설정 페이지 열기",
       "데이터베이스 관리에서 'DB 내보내기' — 저장 위치 지정 후 ZIP 백업 생성",
       "'DB 가져오기'로 백업 파일(.zip) 선택",
       "교체 경고 확인 후 가져오기 — 완료 시 앱 자동 새로고침",
