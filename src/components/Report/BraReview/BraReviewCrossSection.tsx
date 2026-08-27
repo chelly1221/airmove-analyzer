@@ -85,9 +85,57 @@ export default function BraReviewCrossSection({
   const yTicks: number[] = [];
   for (let v = Math.ceil(minY / yStep) * yStep; v <= maxY; v += yStep) yTicks.push(v);
 
-  // ── 지형 폴리곤 ──
+  // ── 대상 건물 rect 폭 (near/far, 없으면 80 m) — 표시 지형 평탄화 구간에도 사용 ──
+  const halfKm = 0.04;
+  const tNearKm = targetOnPath?.near_dist_km ?? distKm - halfKm;
+  const tFarKm = targetOnPath?.far_dist_km ?? distKm + halfKm;
+
+  // ── 표시 지형 = 프로파일 샘플 + 건물 기저 앵커 + footprint 구간 평탄화 — **표시 전용** ──
+  //   건물 지반고(ground_elev_m)는 백엔드가 centroid 융합 SRTM(실측 보정 머지)으로 주고, 지형선은 경로상
+  //   ≈20 m 샘플이라 두 값이 수 m 어긋나면 건물이 떠 보이거나 파묻힌다(LoSProfilePanel 367c4f4 동일 증상).
+  //   → 각 건물(대상 포함)의 near/far 에 지반고 앵커를 끼우고, footprint 안쪽 샘플은 버려 그 구간을
+  //     건물 지반고로 평탄화한다(대지 정지면 = 건물 바닥). 분석(음영고도·blocker)은 원본 profile 그대로.
+  const displayTerrain = (() => {
+    type Span = { near: number; far: number; g: number };
+    const spans: Span[] = [];
+    for (const b of pathBuildings) {
+      if (!Number.isFinite(b.ground_elev_m)) continue;
+      const n = b.near_dist_km ?? b.distance_km;
+      const f = b.far_dist_km ?? b.distance_km;
+      spans.push({ near: Math.min(n, f), far: Math.max(n, f), g: b.ground_elev_m });
+    }
+    spans.push({ near: Math.min(tNearKm, tFarKm), far: Math.max(tNearKm, tFarKm), g: groundElevM });
+    const EPS = 1e-6;
+    const pts: { d: number; e: number; anchor: boolean }[] = [];
+    for (const p of profile) {
+      // footprint 안쪽(양 끝 제외) 샘플은 평탄화 구간으로 대체
+      let inside = false;
+      for (const s of spans) {
+        if (p.distKm > s.near + EPS && p.distKm < s.far - EPS) { inside = true; break; }
+      }
+      if (!inside) pts.push({ d: p.distKm, e: p.elevM, anchor: false });
+    }
+    for (const s of spans) {
+      if (s.far - s.near > EPS) {
+        pts.push({ d: s.near, e: s.g, anchor: true });
+        pts.push({ d: s.far, e: s.g, anchor: true });
+      } else {
+        pts.push({ d: s.near, e: s.g, anchor: true });
+      }
+    }
+    // 거리순 정렬 — 같은 거리는 앵커(정밀 융합 지반) 우선, 앵커끼리는 삽입 순서(뒤 = 대상 건물) 우선
+    pts.sort((a, b) => a.d - b.d || (a.anchor === b.anchor ? 0 : a.anchor ? 1 : -1));
+    const merged: { d: number; e: number }[] = [];
+    for (const p of pts) {
+      const last = merged[merged.length - 1];
+      if (last && p.d - last.d < EPS) { last.e = p.e; continue; }
+      merged.push({ d: p.d, e: p.e });
+    }
+    return merged;
+  })();
+  // ── 지형 폴리곤 (표시 지형) ──
   const terrainPts: string[] = [];
-  for (const p of profile) terrainPts.push(`${X(p.distKm).toFixed(2)},${Y(p.elevM - curvDrop(p.distKm)).toFixed(2)}`);
+  for (const p of displayTerrain) terrainPts.push(`${X(p.d).toFixed(2)},${Y(p.e - curvDrop(p.d)).toFixed(2)}`);
   const terrainPoly = terrainPts.length > 0
     ? `${PX0},${PY1} ${terrainPts.join(" ")} ${PX1},${PY1}`
     : "";
@@ -102,10 +150,7 @@ export default function BraReviewCrossSection({
     }
   }
 
-  // ── 대상 건물 rect (near/far 폭, 없으면 80 m) ──
-  const halfKm = 0.04;
-  const tNearKm = targetOnPath?.near_dist_km ?? distKm - halfKm;
-  const tFarKm = targetOnPath?.far_dist_km ?? distKm + halfKm;
+  // ── 대상 건물 rect ──
   const tX = X(tNearKm);
   const tW = Math.max(3, X(tFarKm) - tX);
   const grayTop = Math.min(rooftopDisp, coneDisp);
@@ -123,10 +168,15 @@ export default function BraReviewCrossSection({
   //   단, 좌측 여백이 부족하면(안테나 근처 차폐) 오른쪽으로 — 이때 안테나 라벨과 겹치지 않게 안테나 라벨은 마커 아래에 둔다.
   const blkLabelLeft = blkX - PX0 > 170;
 
+  // 색 계약: 검토 대상 = 진한 회색(#374151) + 초과분 빨강, 주변 건물 = 연한 갈색(#e2d3bf/#c4ad92) — 대상이 한눈에 구분되게
+  const NEAR_FILL = "#e2d3bf";
+  const NEAR_STROKE = "#c4ad92";
+  const TARGET_FILL = "#374151";
   const legend = [
     { color: "#dbeafe", stroke: "#1d4ed8", label: "BRA 제한표면 (허용 천장고, MSL)" },
-    { color: "#dc2626", stroke: "#dc2626", label: "대상 건물 (빨강 = 제한고도 초과분)" },
-    { color: "#e8dccb", stroke: "#8b6b4a", label: "지형·건물 고도 (SRTM + 경로 건물)" },
+    { color: TARGET_FILL, stroke: "#dc2626", label: "검토 대상 건물 (빨강 = 제한고도 초과분)" },
+    { color: NEAR_FILL, stroke: NEAR_STROKE, label: "주변 건물 (경로 코리도 100 m)" },
+    { color: "#e8dccb", stroke: "#8b6b4a", label: "지형 (SRTM, 건물 바닥 = 건물 지반고)" },
     { color: "none", stroke: "#16a34a", label: "차폐 가시선(음영선) · ● 차폐 발생 위치" },
   ];
 
@@ -160,6 +210,8 @@ export default function BraReviewCrossSection({
         const bw = Math.max(3, X(fKm) - bx);
         const drop = curvDrop(b.distance_km);
         const top = Y(b.ground_elev_m + b.height_m - drop);
+        // 하단 = 건물 지반고 그대로. 건물 지반고가 확인된 값이므로 건물을 지형에 맞추지 않고
+        //   지형선(displayTerrain: near/far 앵커 + footprint 평탄화)을 건물 지반고에 맞춘다(사용자 원칙 2026-08-27)
         const bot = Y(b.ground_elev_m - drop);
         if (bot - top < 0.4) return null;
         // blocker 는 건물의 near/far 엣지 거리로 기록되므로(analyzeFacility) 두 엣지와 대조한다
@@ -169,7 +221,7 @@ export default function BraReviewCrossSection({
         return (
           <rect
             key={`b${i}`} x={bx} y={top} width={bw} height={Math.max(0.6, bot - top)}
-            fill="#a0866c" stroke={isBlocker ? "#16a34a" : "none"} strokeWidth={isBlocker ? 2 : 0}
+            fill={NEAR_FILL} stroke={isBlocker ? "#16a34a" : NEAR_STROKE} strokeWidth={isBlocker ? 2 : 0.6}
           />
         );
       })}
@@ -177,8 +229,9 @@ export default function BraReviewCrossSection({
       {/* ④ BRA 제한표면 (표시 프레임 직선) */}
       <line x1={PX0} y1={Y(hAntM)} x2={PX1} y2={Y(braAtMaxDisp)} stroke="#1d4ed8" strokeWidth={2} />
 
-      {/* ⑤ 대상 건물 */}
-      <rect x={tX} y={Y(grayTop)} width={tW} height={Math.max(1, Y(groundDisp) - Y(grayTop))} fill="#6b7280" />
+      {/* ⑤ 대상 건물 — 진한 회색(주변 건물과 구분), 하단 = 검토 지반고(지형선이 이 값에 맞춰 평탄화됨) */}
+      <rect x={tX} y={Y(grayTop)} width={tW} height={Math.max(1, Y(groundDisp) - Y(grayTop))}
+        fill={TARGET_FILL} stroke="#111827" strokeWidth={0.8} />
       {exceeded && (
         <rect x={tX} y={Y(rooftopDisp)} width={tW} height={Math.max(1, Y(coneDisp) - Y(rooftopDisp))} fill="#dc2626" />
       )}
@@ -275,7 +328,7 @@ export default function BraReviewCrossSection({
 
       {/* ⑪ 범례 */}
       <g>
-        <rect x={PX1 - 262} y={PY0 + 4} width={254} height={62} fill="#ffffff" fillOpacity={0.92}
+        <rect x={PX1 - 262} y={PY0 + 4} width={254} height={10 + legend.length * 14} fill="#ffffff" fillOpacity={0.92}
           stroke="#d1d5db" strokeWidth={1} rx={3} />
         {legend.map((L, i) => (
           <g key={L.label}>
