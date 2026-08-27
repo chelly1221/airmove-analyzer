@@ -1,0 +1,216 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;600;700&display=swap">
+<style>html,body{margin:0;background:#fff}svg{display:block;width:1240px;height:960px}</style></head><body>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 960" width="1240" height="960" role="img" aria-label="AirMove Analyzer 소프트웨어 구성도 (폐쇄망 운용 구성) — 단일 프로세스 안의 UI·분석 엔진·저장 계층과, 사전 등록 파일로 내장되는 기준자료" font-family="'IBM Plex Sans KR', Pretendard, 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif" font-size="11" fill="#1f2430">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 Z" fill="#3b4252"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 Z" fill="#3f7a4f"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1240" height="960" fill="#ffffff"/>
+
+  <!-- 제목 -->
+  <text x="40" y="44" font-size="22" font-weight="600">AirMove Analyzer 소프트웨어 구성도</text>
+  <text x="40" y="68" font-size="12" fill="#6b7280">공항감시레이더 종합분석체계 v0.1.0 · Windows 단독 실행형(Portable) · Tauri v2 (Rust 백엔드 + WebView2 UI) · 단일 프로세스 · 폐쇄망 운용 구성</text>
+
+  <!-- 범례 -->
+  <line x1="880" y1="40" x2="918" y2="40" stroke="#3b4252" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="928" y="44">프로세스 내부 흐름</text>
+  <line x1="880" y1="64" x2="918" y2="64" stroke="#3f7a4f" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <text x="928" y="68">기준자료 등록 (파일 임포트)</text>
+  <rect x="1090" y="32" width="14" height="14" fill="#f3f7f3" stroke="#8a94a6"/>
+  <text x="1112" y="44">내장 기준자료 영역</text>
+  <rect x="1090" y="56" width="14" height="14" fill="#eaf3ec" stroke="#3f7a4f"/>
+  <text x="1112" y="68">사전 등록 자료</text>
+
+  <!-- ===== 프로세스 경계 ===== -->
+  <rect x="40" y="96" width="780" height="720" rx="8" fill="#ffffff" stroke="#a60739" stroke-width="2"/>
+  <text x="60" y="122" font-size="14" font-weight="700" fill="#a60739">AirMove Analyzer.exe</text>
+  <text x="228" y="122" fill="#6b7280">단일 프로세스 · 일반 사용자 권한 · 설치·레지스트리 변경 없음 · 수신(Listening) 포트 없음 · 자동 업데이트 없음</text>
+
+  <!-- UI 계층 -->
+  <rect x="60" y="140" width="740" height="210" rx="6" fill="#eef2f8"/>
+  <text x="76" y="162" font-size="13" font-weight="700">UI 계층</text>
+  <text x="136" y="162" fill="#6b7280">WebView2 (Edge Chromium 런타임, OS 제공) · React 19 · TypeScript 5.8 · Zustand 5 · react-router 7</text>
+
+  <g stroke="#3b4252" fill="#ffffff">
+    <rect x="80" y="178" width="160" height="30" rx="15"/>
+    <rect x="260" y="178" width="160" height="30" rx="15"/>
+    <rect x="440" y="178" width="160" height="30" rx="15"/>
+    <rect x="620" y="178" width="160" height="30" rx="15"/>
+  </g>
+  <g font-size="12" text-anchor="middle">
+    <text x="160" y="197">메인 창 (main)</text>
+    <text x="340" y="197">항적지도 창 (trackmap)</text>
+    <text x="520" y="197">도면 창 (drawing)</text>
+    <text x="700" y="197">보고서 창 (report)</text>
+  </g>
+  <text x="80" y="232"><tspan fill="#6b7280">페이지</tspan>  자료등록 · ASTERIX 통계 · 항적지도 · 표적소실/LoS 장애물 · 이중표적 · 보고서 생성 · 레이더/항공기 관리 · 설정 · 사용방법</text>
+
+  <rect x="80" y="250" width="340" height="84" rx="4" fill="#ffffff" stroke="#3b4252"/>
+  <text x="92" y="270" font-size="12" font-weight="700">Web Worker ×2</text>
+  <text x="92" y="290">비행 통합 · 뷰포트 포인트 쿼리 (청크 스트리밍)</text>
+  <text x="92" y="307">GPU 커버리지 연산 — WebGPU 컴퓨트 셰이더, CPU 폴백</text>
+  <text x="92" y="324" fill="#6b7280">1천만+ 포인트를 Worker가 소유, 메인 스레드 비축적</text>
+
+  <rect x="440" y="250" width="340" height="84" rx="4" fill="#ffffff" stroke="#3b4252"/>
+  <text x="452" y="270" font-size="12" font-weight="700">지도 렌더링 (GPU)</text>
+  <text x="452" y="290">deck.gl 9.2 + MapLibre GL 5 + react-map-gl 8</text>
+  <text x="452" y="307">3D Tiles(loaders.gl) · 지형 · 건물 · 항적 · 커버리지 레이어</text>
+  <text x="452" y="324" fill="#6b7280">레이어 자료는 전부 로컬 DB·파일에서 공급</text>
+
+  <!-- IPC 띠 -->
+  <line x1="110" y1="350" x2="110" y2="366" stroke="#3b4252" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <line x1="750" y1="350" x2="750" y2="366" stroke="#3b4252" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <rect x="60" y="366" width="740" height="30" rx="4" fill="#ffffff" stroke="#3b4252" stroke-dasharray="4 3"/>
+  <text x="430" y="385" text-anchor="middle"><tspan font-weight="700">Tauri IPC</tspan> — invoke(프로세스 내부 호출) · bulk:// 인프로세스 커스텀 프로토콜(대용량 결과 파일 매개) · 원격 디버깅 포트 없음</text>
+  <line x1="110" y1="396" x2="110" y2="412" stroke="#3b4252" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <line x1="750" y1="396" x2="750" y2="412" stroke="#3b4252" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+
+  <!-- 분석 엔진 계층 -->
+  <rect x="60" y="412" width="740" height="212" rx="6" fill="#fbf1f3"/>
+  <text x="76" y="434" font-size="13" font-weight="700">분석 엔진 계층</text>
+  <text x="176" y="434" fill="#6b7280">Rust · Tauri 2 · rayon(병렬) · tokio · rusqlite · webview2-com(PDF)</text>
+
+  <g fill="#ffffff" stroke="#3b4252">
+    <rect x="80" y="450" width="166" height="110" rx="4"/>
+    <rect x="258" y="450" width="166" height="110" rx="4"/>
+    <rect x="436" y="450" width="166" height="110" rx="4"/>
+    <rect x="614" y="450" width="166" height="110" rx="4"/>
+  </g>
+  <g font-size="12" font-weight="700">
+    <text x="92" y="470">parser</text>
+    <text x="270" y="470">analysis</text>
+    <text x="448" y="470">geo</text>
+    <text x="626" y="470">export</text>
+  </g>
+  <g>
+    <text x="92" y="490">NEC ASS 프레임 파서</text>
+    <text x="92" y="507">ASTERIX CAT048 · 034 · 008</text>
+    <text x="92" y="524">극좌표 → WGS84 변환</text>
+    <text x="92" y="541">EPSG 5186 / 5179 좌표변환</text>
+
+    <text x="270" y="490">표적소실 탐지 · 통계</text>
+    <text x="270" y="507">LoS (4/3 유효지구 모델)</text>
+    <text x="270" y="524">커버리지 · 파노라마</text>
+    <text x="270" y="541">장애물 월간 · PSR · 이중표적</text>
+
+    <text x="448" y="490">SRTM 지형 · 산봉우리</text>
+    <text x="448" y="507">건물 대장 / 실측 3D / 수동</text>
+    <text x="448" y="524">토지이용 · 중복억제</text>
+    <text x="448" y="541">지자기편각 (WMM 계수 내장)</text>
+
+    <text x="626" y="490">PDF — WebView2 PrintToPdf</text>
+    <text x="626" y="507">Excel — OOXML 직접 생성</text>
+    <text x="626" y="524">DB 백업 — zip</text>
+    <text x="626" y="541" fill="#6b7280">외부 변환 도구·서버 없음</text>
+  </g>
+
+  <rect x="80" y="578" width="700" height="28" rx="14" fill="#ffffff" stroke="#3b4252"/>
+  <text x="430" y="596" text-anchor="middle">SQLite 접근 — rusqlite(내장) · r2d2 연결 풀 · 로컬 파일만 · 기준자료(지형·건물·토지이용·산봉우리)는 DB 테이블에서 직접 조회</text>
+
+  <!-- 엔진 → 저장 -->
+  <line x1="250" y1="606" x2="250" y2="680" stroke="#3b4252" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text x="258" y="636">읽기 / 쓰기</text>
+  <line x1="700" y1="606" x2="700" y2="680" stroke="#3b4252" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text x="708" y="636">대용량 결과 중계</text>
+
+  <!-- 저장 계층 -->
+  <rect x="60" y="640" width="740" height="160" rx="6" fill="#eff5ee"/>
+  <text x="76" y="662" font-size="13" font-weight="700">저장 계층</text>
+  <text x="150" y="662" fill="#6b7280">로컬 파일만 · 실행파일 옆 data/ 폴더 · 외부 DB 서버 없음</text>
+
+  <rect x="80" y="680" width="340" height="100" rx="4" fill="#ffffff" stroke="#3b4252"/>
+  <text x="92" y="700" font-size="12" font-weight="700">data/adsb.db — SQLite (23 테이블)</text>
+  <text x="92" y="720">항적 포인트 · 레이더/항공기 정보 · 분석 결과 · 보고서 · 설정</text>
+  <text x="92" y="737">기준자료: SRTM 타일 · 건물 · 토지이용 · 산봉우리 · 실측 3D</text>
+  <text x="92" y="754" fill="#6b7280">포터블: data/ 폴더째 이동·복사 가능</text>
+
+  <rect x="440" y="680" width="160" height="100" rx="4" fill="#ffffff" stroke="#3b4252"/>
+  <text x="452" y="700" font-size="12" font-weight="700">data/tiles3d/</text>
+  <text x="452" y="720">실측 3D 건물 타일</text>
+  <text x="452" y="737">(3D Tiles)</text>
+  <text x="452" y="754" fill="#6b7280">사전 등록</text>
+
+  <rect x="620" y="680" width="160" height="100" rx="4" fill="#ffffff" stroke="#3b4252"/>
+  <text x="632" y="700" font-size="12" font-weight="700">임시 bulk 파일</text>
+  <text x="632" y="720">OS 임시 폴더</text>
+  <text x="632" y="737">대용량 IPC 중계용</text>
+  <text x="632" y="754" fill="#6b7280">읽은 즉시 삭제</text>
+
+  <!-- ===== 입력 / 출력 ===== -->
+  <line x1="240" y1="850" x2="240" y2="816" stroke="#3b4252" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="250" y="838">읽기 — 파일 선택 대화상자 (fs:allow-read)</text>
+  <rect x="40" y="850" width="400" height="56" rx="4" fill="#ffffff" stroke="#3b4252"/>
+  <text x="56" y="870" font-size="12" font-weight="700">입력 — 사용자가 선택한 파일</text>
+  <text x="56" y="890">ASS 레이더 저장자료 (NEC 레이더 저장매체에서 반입)</text>
+
+  <line x1="640" y1="816" x2="640" y2="850" stroke="#3b4252" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="650" y="838">저장 — 저장 대화상자로 경로 지정</text>
+  <rect x="460" y="850" width="360" height="56" rx="4" fill="#ffffff" stroke="#3b4252"/>
+  <text x="476" y="870" font-size="12" font-weight="700">출력 — 사용자 지정 경로</text>
+  <text x="476" y="890">PDF 보고서 · Excel(xlsx) · DB 백업(zip)</text>
+
+  <!-- ===== 내장 기준자료 영역 ===== -->
+  <rect x="860" y="96" width="350" height="720" rx="8" fill="#f3f7f3" stroke="#8a94a6"/>
+  <text x="876" y="122" font-size="13" font-weight="700">내장 기준자료 (data/ 사전 등록)</text>
+  <text x="876" y="140" fill="#6b7280">자료관리 화면에서 파일 등록 → DB 테이블·로컬 폴더에 저장</text>
+  <text x="876" y="156" fill="#6b7280">갱신은 새 파일 재등록 · 네트워크 불필요</text>
+
+  <!-- 등록 팬인: 각 자료 → x=840 수직선 → 저장 계층 -->
+  <path d="M880,230 H840 V730 H800" stroke="#3f7a4f" stroke-width="1.5" fill="none" marker-end="url(#arrowGreen)"/>
+  <path d="M880,345 H840" stroke="#3f7a4f" stroke-width="1.5" fill="none"/>
+  <path d="M880,470 H840" stroke="#3f7a4f" stroke-width="1.5" fill="none"/>
+  <path d="M880,585 H840" stroke="#3f7a4f" stroke-width="1.5" fill="none"/>
+  <text transform="translate(833,480) rotate(-90)" text-anchor="middle" font-size="10" fill="#3f7a4f">등록(임포트)</text>
+
+  <!-- 지형 -->
+  <rect x="880" y="190" width="310" height="80" rx="4" fill="#eaf3ec" stroke="#3f7a4f"/>
+  <text x="892" y="210" font-size="12" font-weight="700">지형 고도 — SRTM HGT (30 m)</text>
+  <text x="892" y="230">HGT 파일 등록 → srtm_tiles 테이블 (BLOB)</text>
+  <text x="892" y="247">실측 지반고 보정 사이드카 (srtm_ground_corrections)</text>
+  <text x="892" y="264" fill="#6b7280">대한민국 전역 타일 사전 등록</text>
+
+  <!-- 건물·토지이용·산봉우리 -->
+  <rect x="880" y="290" width="310" height="110" rx="4" fill="#eaf3ec" stroke="#3f7a4f"/>
+  <text x="892" y="310" font-size="12" font-weight="700">공간정보 SHP — 국가공간정보 공개자료</text>
+  <text x="892" y="330">건물통합정보 (EPSG:5186) → 건물 테이블</text>
+  <text x="892" y="347">토지이용 (EPSG:5186) → 토지이용 테이블</text>
+  <text x="892" y="364">산봉우리 N3P (EPSG:5179) → 산 이름 DB</text>
+  <text x="892" y="381" fill="#6b7280">SHP/ZIP 파일 등록 시 좌표변환 후 저장</text>
+
+  <!-- 실측 3D -->
+  <rect x="880" y="420" width="310" height="100" rx="4" fill="#eaf3ec" stroke="#3f7a4f"/>
+  <text x="892" y="440" font-size="12" font-weight="700">실측 3D 건물 — 1 m DSM (buildings_3d.bin)</text>
+  <text x="892" y="460">건물 기저·최고 표면고 (절대 MSL) → 실측 건물 테이블</text>
+  <text x="892" y="477">3D Tiles → data/tiles3d/ (지도 3D 표시용)</text>
+  <text x="892" y="494">중복 억제: 수동 &gt; 실측 3D &gt; 대장 (suppressed_by)</text>
+  <text x="892" y="511" fill="#6b7280">임포트 시 SRTM 지반고 보정 산출</text>
+
+  <!-- 레이더·항공기 -->
+  <rect x="880" y="540" width="310" height="90" rx="4" fill="#eaf3ec" stroke="#3f7a4f"/>
+  <text x="892" y="560" font-size="12" font-weight="700">레이더 제원 · 항공기 등록정보</text>
+  <text x="892" y="580">레이더 위치·안테나 높이·최대 범위 (사용자 입력)</text>
+  <text x="892" y="597">비행검사기 Mode-S 주소·기종 (사용자 입력)</text>
+  <text x="892" y="614" fill="#6b7280">레이더/항공기 관리 화면에서 편집</text>
+
+  <!-- 지자기 -->
+  <rect x="880" y="650" width="310" height="70" rx="4" fill="#ffffff" stroke="#8a94a6"/>
+  <text x="892" y="670" font-size="12" font-weight="700">지자기 편각 — WMM 계수 (실행파일 내장)</text>
+  <text x="892" y="690">wmm 라이브러리로 위경도·날짜 기준 오프라인 계산</text>
+  <text x="892" y="707" fill="#6b7280">별도 등록 불필요</text>
+
+  <!-- 갱신 절차 -->
+  <rect x="880" y="740" width="310" height="56" rx="4" fill="#ffffff" stroke="#8a94a6"/>
+  <text x="892" y="760" font-size="12" font-weight="700">자료 갱신 절차</text>
+  <text x="892" y="780">새 파일 반입 → 자료관리 화면 등록 → 캐시 무효화 → 재분석</text>
+
+  <!-- 각주 -->
+  <text x="40" y="940">※ 항적 자료(ASS 파일 내용)와 분석 결과는 로컬 data/ 폴더에만 저장됩니다. 지형·건물·토지이용·산봉우리·지자기 등 모든 기준자료는 사전 등록 파일로 내장되어 폐쇄망에서 동작합니다.</text>
+  <text x="1210" y="940" text-anchor="end" fill="#6b7280" font-size="10">작성 2026-08-25 · package.json / tauri.conf.json / Cargo.toml 기준</text>
+</svg>
+</body></html>

@@ -5,6 +5,7 @@
 
 /* KAC 보고서 디자인 토큰 — ReportPreviewContent.kac-report 스코프 한정 */
 @import "./components/Report/reportOmStyles.css";
+@import "./components/Report/BraReview/braReviewStyles.css";
 
 /* Pretendard Variable (self-hosted) */
 @font-face {

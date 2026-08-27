@@ -9,6 +9,7 @@ import type {
   OMReportData,
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
+import type { BraReviewPayload } from "./braReviewAnalysis";
 
 // ── 보고서 템플릿/섹션 타입 (ReportGeneration과 공유) ──
 // 장애물 월간(OM) 보고서 단일 템플릿만 제공.
@@ -157,6 +158,8 @@ const STORE_NAME = "data";
 const KEY = "current";
 const CONFIG_KEY = "config";
 const REQUEST_KEY = "request";
+/** 전파영향성 검토 의견서 페이로드 (TrackMap → bra-review 창) */
+const BRAREVIEW_KEY = "brareview";
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -282,5 +285,30 @@ export async function clearGenerateRequest(): Promise<void> {
     tx.objectStore(STORE_NAME).delete(REQUEST_KEY);
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// ── 전파영향성 검토 의견서 페이로드 (TrackMap → bra-review 창) ──
+// 같은 IDB(report-transfer/data)를 키만 달리해 공유한다. 타입 단일 원천은 braReviewAnalysis.ts.
+
+/** TrackMap → IDB 에 의견서 입력 페이로드 저장 */
+export async function writeBraReviewPayload(payload: BraReviewPayload): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(payload, BRAREVIEW_KEY);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+/** 의견서 창 → IDB 에서 입력 페이로드 읽기 */
+export async function readBraReviewPayload(): Promise<BraReviewPayload | null> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const req = tx.objectStore(STORE_NAME).get(BRAREVIEW_KEY);
+    req.onsuccess = () => { db.close(); resolve(req.result ?? null); };
+    req.onerror = () => { db.close(); reject(req.error); };
   });
 }

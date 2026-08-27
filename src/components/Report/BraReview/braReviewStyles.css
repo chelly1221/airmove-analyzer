@@ -1,0 +1,238 @@
+/* ============================================================================
+ * 전파영향성 검토 의견서(BRA Review) 전용 스타일 — `.kac-report .brv-*` 스코프.
+ *
+ * 색 토큰(--om-accent 등)·A4 페이지 프레임(.report-page/머리띠/쪽번호)은
+ * reportOmStyles.css 의 `.kac-report` 스코프를 그대로 상속한다. 이 파일은 의견서
+ * 본문(제목/섹션/표/판정 박스/단면도/서명/각주)만 정의하며 OM 보고서엔 영향 없음.
+ * 참고 문서(한국공항공사 BRA Viewer 산출물) 톤: 본문 13px, 파랑 섹션 제목, 얇은 격자 표.
+ * ========================================================================== */
+
+/* ── 머리 (문서번호 / 제목 / 부제) ─────────────────────────────────────── */
+.kac-report .brv-head {
+  margin-bottom: 18px;
+}
+.kac-report .brv-doc-meta {
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--om-text-muted);
+  line-height: 1.6;
+}
+.kac-report .brv-h1 {
+  margin: 14px 0 0;
+  text-align: center;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #111827;
+}
+.kac-report .brv-subtitle {
+  margin: 8px 0 0;
+  text-align: center;
+  font-size: 12.5px;
+  color: #4b5563;
+}
+.kac-report .brv-rule {
+  margin-top: 12px;
+  border-bottom: 2px solid var(--om-accent-deep);
+}
+
+/* ── 섹션 ──────────────────────────────────────────────────────────────── */
+.kac-report .brv-sec {
+  margin-bottom: 14px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--om-text);
+}
+.kac-report .brv-h2 {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--om-accent);
+  margin: 0 0 8px;
+  letter-spacing: 0.01em;
+}
+.kac-report .brv-p {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.65;
+  text-align: justify;
+}
+.kac-report .brv-ord {
+  font-weight: 700;
+  color: #111827;
+}
+.kac-report .brv-strong {
+  font-weight: 700;
+  color: #111827;
+}
+.kac-report .brv-strong-bad {
+  font-weight: 700;
+  color: #dc2626;
+}
+.kac-report .brv-strong-ok {
+  font-weight: 700;
+  color: #15803d;
+}
+.kac-report .brv-basis {
+  padding-left: 6px;
+}
+.kac-report .brv-basis-line {
+  font-size: 13px;
+  line-height: 1.85;
+  color: var(--om-text);
+}
+
+/* ── 표 ────────────────────────────────────────────────────────────────── */
+.kac-report .brv-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin: 4px 0 2px;
+}
+.kac-report .brv-table th,
+.kac-report .brv-table td {
+  border: 1px solid var(--om-border);
+  padding: 5px 8px;
+  vertical-align: middle;
+}
+.kac-report .brv-table th {
+  background: #f3f6fa;
+  color: var(--om-accent-deep);
+  font-weight: 700;
+  text-align: center;
+}
+.kac-report .brv-table td {
+  color: var(--om-text);
+}
+.kac-report .brv-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.kac-report .brv-table td.pos {
+  color: #dc2626;
+  font-weight: 700;
+}
+.kac-report .brv-table td.neg {
+  color: var(--om-text-muted);
+}
+/* 2열 제원표 — 좌측 항목 열 고정폭 + 좌측 정렬 */
+.kac-report .brv-table-spec th {
+  width: 30%;
+  text-align: left;
+}
+.kac-report .brv-table .strong {
+  font-weight: 700;
+  color: #111827;
+}
+.kac-report .brv-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--om-accent-soft);
+  color: var(--om-accent-deep);
+  font-size: 10px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+
+/* ── 판정 박스 ─────────────────────────────────────────────────────────── */
+.kac-report .brv-verdict {
+  margin: 8px 0 4px;
+  padding: 8px 14px;
+  border-radius: 5px;
+  font-size: 13.5px;
+  font-weight: 700;
+}
+.kac-report .brv-verdict.bad {
+  border: 1px solid #dc2626;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+.kac-report .brv-verdict.ok {
+  border: 1px solid #16a34a;
+  background: #f0fdf4;
+  color: #15803d;
+}
+
+/* ── 단면도 ────────────────────────────────────────────────────────────── */
+.kac-report .brv-chart-wrap {
+  border: 1px solid var(--om-border);
+  border-radius: 4px;
+  padding: 8px 8px 4px;
+  background: #ffffff;
+}
+.kac-report .brv-chart-title {
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--om-accent-deep);
+}
+.kac-report .brv-chart-sub {
+  text-align: center;
+  font-size: 9.5px;
+  color: var(--om-text-muted);
+  margin-top: 2px;
+}
+.kac-report .brv-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.kac-report .brv-chart-error {
+  border: 1px solid #dc2626;
+  background: #fef2f2;
+  color: #b91c1c;
+  border-radius: 4px;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+.kac-report .brv-caption {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: #4b5563;
+  text-align: justify;
+}
+
+/* ── 목록 ──────────────────────────────────────────────────────────────── */
+.kac-report .brv-list {
+  margin: 4px 0 8px;
+  padding-left: 18px;
+  list-style: disc;
+}
+.kac-report .brv-list li {
+  font-size: 12.5px;
+  line-height: 1.65;
+  margin-bottom: 5px;
+  text-align: justify;
+}
+.kac-report .brv-concl {
+  margin: 10px 0;
+}
+
+/* ── 서명 · 각주 ───────────────────────────────────────────────────────── */
+.kac-report .brv-sign-sec {
+  margin-top: 18px;
+}
+.kac-report .brv-sign {
+  text-align: right;
+}
+.kac-report .brv-sign-role {
+  font-size: 14px;
+  font-weight: 700;
+  color: #111827;
+}
+.kac-report .brv-sign-org {
+  margin-top: 6px;
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.35em;
+  color: #111827;
+}
+.kac-report .brv-foot {
+  margin: 16px 0 0;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--om-text-muted);
+  text-align: justify;
+}

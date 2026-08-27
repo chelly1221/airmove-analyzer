@@ -21,9 +21,11 @@ import {
   Settings,
   Cone,
   Radius,
+  FileText,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
+import { WebviewWindow, getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { ToolButton, Toggle as DsToggle, Check, Swatch, DsSlider, ACCENT, G } from "../components/Map/drawerPrimitives";
 
 /** 표시 행 설정 톱니 버튼 (우측 설정 드로어 토글) */
@@ -307,7 +309,9 @@ function buildHeatBitmap(
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult, BraBuilding } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult, BraBuilding, RadarSite } from "../types";
+import { writeBraReviewPayload } from "../utils/reportTransfer";
+import { ringAreaM2, type BraReviewBuildingInput, type BraReviewPayload } from "../utils/braReviewAnalysis";
 import { readBulkJson, type BulkRef } from "../utils/bulkIpc";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
@@ -3197,6 +3201,137 @@ export default function TrackMap() {
       setLosSimBuilding({ lat: addressMarker.lat, lon: addressMarker.lon, groundElevM, heightM, name: addressMarker.label });
     }
   }, [simGroundInput, simHeightInput, addressBuilding, addressMarker, launchBuildingLoS]);
+
+  // ── 전파영향성 검토 의견서 (건축물정보 드로어 → bra-review 창) ──
+  // 입력 해석은 드로어 표시 로직(높이/지반고 우선순위)과 **동일한 우선순위**를 재현한다 —
+  // 화면에 보이는 수치와 의견서 수치가 어긋나지 않게 하기 위함.
+  // 높이를 못 구하면 null(버튼 비활성) — 조용히 0 으로 대체하지 않는다(CLAUDE.md 폴백 금지).
+  const braReviewInput = useMemo<BraReviewBuildingInput | null>(() => {
+    const bd = bldgDrawer;
+    if (!bd) return null;
+    const fac = bd.facDetail ?? null;
+    const bi = bd.info ?? null;
+    // 높이 검토 카드(주소검색 선택 건물) 표시 중이면 카드 입력값이 그대로 검토 제원이 된다
+    const cardActive = !!addressMarker;
+    let heightM: number | null;
+    let heightSource: BraReviewBuildingInput["heightSource"];
+    let groundElevM: number | null;
+    let groundSource: BraReviewBuildingInput["groundSource"];
+    if (cardActive) {
+      const h = parseFloat(simHeightInput);
+      const g = parseFloat(simGroundInput);
+      heightM = isNaN(h) ? null : h;
+      groundElevM = isNaN(g) ? null : g;
+      // 카드 프리필(addressBuilding 값 toFixed(1), 1016-1019)과 동일하면 사용자 입력이 아니므로 원 출처 라벨 유지
+      const ab = addressBuilding;
+      const abSrc = ab?.source === "manual" ? "manual" : "fac";
+      heightSource =
+        ab && simHeightInput === ab.height_m.toFixed(1)
+          ? (ab.height_measured != null ? "measured" : abSrc)
+          : "sim";
+      groundSource = ab && simGroundInput === ab.ground_elev_m.toFixed(1) ? abSrc : "sim";
+    } else {
+      // 실측 지붕고(1m DSM) 최우선 — 드로어 '기하 정보' 행과 동일 순서
+      const heightMeasured = fac?.height_measured_m ?? null;
+      const biH = bi?.height ? parseFloat(bi.height) : NaN;
+      heightM = heightMeasured ?? bd.localHeight ?? fac?.height_m ?? (isNaN(biH) ? null : biH);
+      heightSource = heightMeasured != null
+        ? "measured"
+        : bd.localHeight != null && bd.localSource === "manual"
+          ? "manual"
+          : bd.localHeight != null || fac != null
+            ? "fac"
+            : "vworld";
+      groundElevM = bd.localBase ?? fac?.ground_elev_m ?? null;
+      groundSource = bd.localSource === "manual" ? "manual" : groundElevM != null ? "fac" : "srtm";
+    }
+    if (heightM == null || !(heightM > 0)) return null;
+
+    const pick = (...vals: (string | null | undefined)[]): string | null => {
+      for (const v of vals) if (v != null && v !== "" && v !== "-") return v;
+      return null;
+    };
+    // 과거 DB 의 usability '실측(1m DSM)' 표기는 용도로 취급하지 않음 (드로어와 동일 방어)
+    const realUsage = (v?: string | null) => (v === "실측(1m DSM)" ? null : v);
+    const name = pick(fac?.name, bi?.name, bd.localName) ?? addressMarker?.label ?? "선택 건물";
+
+    // footprint 면적 — 선택 건물의 폴리곤(주소검색 hit 우선, 없으면 뷰포트 3D 건물 매칭)
+    const near = (a: number, b: number) => Math.abs(a - b) < 1e-4;
+    const ring =
+      addressBuilding && near(addressBuilding.lat, bd.lat) && near(addressBuilding.lon, bd.lon)
+        ? addressBuilding.polygons[0]
+        : buildings3dData.find((b) => near(b.lat, bd.lat) && near(b.lon, bd.lon))?.polygon;
+    const footprintAreaM2 = ring && ring.length >= 3 ? ringAreaM2(ring) : null;
+
+    const src = bd.localSource ?? (fac ? "fac" : undefined);
+    const sourceLabel = src === "fac" ? "건물통합정보" : src === "manual" ? "수동 등록" : bi ? "VWorld" : "-";
+    // VWorld 대장 문자열은 단위("12,928.53 ㎡", "27 층", "66.8 %")를 이미 포함 — 의견서가 단위를 다시 붙이므로 제거
+    const stripUnit = (v: string | null): string | null => (v == null ? null : v.replace(/\s*(㎡|층|%)\s*$/u, "").trim() || null);
+
+    return {
+      name,
+      roadAddr: pick(bi?.road_addr),
+      jibunAddr: pick(bi?.jibun_addr),
+      lat: bd.lat,
+      lon: bd.lon,
+      heightM,
+      heightSource,
+      groundElevM,
+      groundSource,
+      usage: pick(realUsage(fac?.usage), bi?.usage, realUsage(bd.localUsage)),
+      structure: pick(bi?.structure),
+      floorsAbove: stripUnit(pick(bi?.floors_above)),
+      floorsBelow: stripUnit(pick(bi?.floors_below)),
+      areaM2Registry: stripUnit(pick(bi?.area)),
+      footprintAreaM2,
+      pnu: pick(fac?.pnu),
+      bdMgtSn: pick(fac?.bd_mgt_sn),
+      sourceLabel,
+    };
+  }, [bldgDrawer, addressMarker, addressBuilding, buildings3dData, simGroundInput, simHeightInput]);
+
+  const braReviewDisabledReason = "건물 높이 정보가 없습니다 — 높이 검토 카드에서 높이를 입력하세요";
+
+  /** 의견서 페이로드 저장 후 bra-review 창 오픈 (이미 열려 있으면 재로드 신호 + 포커스) */
+  const handleOpenBraReview = useCallback(async () => {
+    if (!braReviewInput) return;
+    // 검토 대상 시설 = 선택 레이더 + 활성 사용자 레이더 (중복 제거)
+    const sites: RadarSite[] = [radarSite];
+    for (const s of customRadarSites) {
+      if (s.active === false || s.name === radarSite.name) continue;
+      sites.push(s);
+    }
+    const payload: BraReviewPayload = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      building: braReviewInput,
+      radarSites: sites,
+      braAngleDeg, // BRA 분석 설정 공유 (스토어 단일 원천)
+      buildingKey: `${braReviewInput.lat.toFixed(6)}|${braReviewInput.lon.toFixed(6)}|${braReviewInput.heightM}|${braReviewInput.groundElevM ?? "srtm"}`,
+    };
+    try {
+      await writeBraReviewPayload(payload);
+      const existing = (await getAllWebviewWindows()).find((w) => w.label === "bra-review");
+      if (existing) {
+        await emit("brareview:reload");
+        await existing.setFocus();
+      } else {
+        new WebviewWindow("bra-review", {
+          url: "index.html",
+          title: "전파영향성 검토 의견서 — AirMove Analyzer",
+          width: 940,
+          height: 1000,
+          minWidth: 820,
+          minHeight: 700,
+          decorations: false,
+          shadow: true,
+          center: true,
+        });
+      }
+    } catch (e) {
+      console.error("[전파영향성 의견서] 창 열기 실패:", e);
+    }
+  }, [braReviewInput, radarSite, customRadarSites, braAngleDeg]);
 
   // LoS 도구 드로어 열 때 등록 장애물/그룹 최신화 (자료관리에서 추가/수정된 내용 반영)
   useEffect(() => {
@@ -6589,6 +6724,18 @@ export default function TrackMap() {
                   </button>
                 </div>
                 )}
+                {/* 전파영향성 검토 의견서 — 게이트 없이 항상 노출(높이 정보가 없으면 비활성).
+                    LoS 버튼(솔리드)과 구분되도록 아웃라인 스타일. */}
+                <div className="border-t border-gray-200 px-3 py-2">
+                  <button
+                    disabled={!braReviewInput}
+                    title={braReviewInput ? "전파영향성 검토 의견서 미리보기" : braReviewDisabledReason}
+                    onClick={handleOpenBraReview}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-md border border-[#a60739] bg-white px-3 py-2 text-[11px] font-semibold text-[#a60739] transition-colors hover:bg-[#a60739]/5 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <FileText size={13} /> 전파영향성 검토 의견서
+                  </button>
+                </div>
                 {/* 좌표 푸터 */}
                 <div className="border-t border-gray-200 px-3 py-1.5 text-[9px] text-gray-400">
                   {bd.lat.toFixed(6)}°N, {bd.lon.toFixed(6)}°E

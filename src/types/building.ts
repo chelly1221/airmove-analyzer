@@ -17,6 +17,8 @@ export interface BuildingOnPath {
   polygon?: [number, number][];
   /** 수동 등록 건물 여부 (true이면 ground_elev_m은 사용자 입력값) */
   is_manual: boolean;
+  /** fac_buildings 행 id — 대상 자체 건물 제외 판정용. Rust 가 Some 일 때만 직렬화(building.rs:150-152), 수동 건물은 없음 */
+  fac_id?: number;
 }
 
 /** 3D 건물 데이터 (맵 뷰포트 내 건물) */
