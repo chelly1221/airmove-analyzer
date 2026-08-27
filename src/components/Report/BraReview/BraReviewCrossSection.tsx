@@ -242,12 +242,24 @@ export default function BraReviewCrossSection({
         x2={X(Math.min(chartMaxKm, distKm + 0.6))} y2={Y(coneDisp)}
         stroke="#1d4ed8" strokeWidth={1} strokeDasharray="5 3"
       />
-      <text
-        x={targetOnRight ? X(Math.max(0, distKm - 0.6)) - 6 : X(Math.min(chartMaxKm, distKm + 0.6)) + 6}
-        y={Y(coneDisp) - 4} fontSize={10} fill="#1d4ed8" textAnchor={targetOnRight ? "end" : "start"}
-      >
-        제한고도 {fmt(coneMslM, 2)} m
-      </text>
+      {(() => {
+        // 라벨 위치 규칙: BRA 선은 오른쪽으로 상승하므로 대상 오른쪽에 붙일 땐 점선 **아래**(선이 위로 지나감),
+        //   왼쪽에 붙일 땐 점선 **위**(선이 아래로 지나감). 오른쪽-아래가 음영고도 라벨(Y(shadow)−5)과
+        //   겹치면 왼쪽-위로 회피한다.
+        const leftX = X(Math.max(0, distKm - 0.6)) - 6;
+        const rightX = X(Math.min(chartMaxKm, distKm + 0.6)) + 6;
+        let right = !targetOnRight;
+        let ly = right ? Y(coneDisp) + 13 : Y(coneDisp) - 4;
+        if (right && los && rayPts.length > 1 && Math.abs((Y(shadowDisp) - 5) - ly) < 14) {
+          right = false;
+          ly = Y(coneDisp) - 4;
+        }
+        return (
+          <text x={right ? rightX : leftX} y={ly} fontSize={10} fill="#1d4ed8" textAnchor={right ? "start" : "end"}>
+            제한고도 {fmt(coneMslM, 2)} m
+          </text>
+        );
+      })()}
 
       {/* ⑦ LoS 음영선 + 차폐 발생 위치 */}
       {rayPts.length > 1 && (
