@@ -1,0 +1,146 @@
+/* ============================================================================
+ * 타워크레인 전파영향 검토 보고서 전용 스타일 — `.kac-report .crv-*` 스코프.
+ *
+ * A4 페이지 프레임(.report-page)·색 토큰(--om-*)·의견서 본문 클래스(.brv-*)는 그대로
+ * 재사용하고(수정 금지), 이 파일은 크레인 보고서에만 필요한 요소 — 케이스 판정표(열이
+ * 많아 조밀), 폴라 차트 컨테이너, 침범 방위 구간 표 — 만 정의한다.
+ * ========================================================================== */
+
+/* ── 5-k 서브섹션 제목 (크레인 × 시설) ─────────────────────────────────── */
+.kac-report .crv-subh {
+  margin: 2px 0 6px;
+  font-size: 13.5px;
+  font-weight: 800;
+  color: #111827;
+  border-left: 3px solid var(--om-accent);
+  padding-left: 7px;
+}
+
+/* ── 케이스 판정표 — 열 = 분석 케이스(가변), 가로 스크롤 없이 폭 자동 ──── */
+.kac-report .crv-case-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  font-size: 9.5px;
+  margin: 4px 0 2px;
+  word-break: keep-all;
+}
+.kac-report .crv-case-table th,
+.kac-report .crv-case-table td {
+  border: 1px solid var(--om-border);
+  padding: 3px 4px;
+  text-align: center;
+  vertical-align: middle;
+  line-height: 1.35;
+}
+.kac-report .crv-case-table th {
+  background: #f3f6fa;
+  color: var(--om-accent-deep);
+  font-weight: 700;
+}
+/* 좌측 항목 열 — 폭 최소·좌측 정렬 */
+.kac-report .crv-case-table th.crv-rowh {
+  text-align: left;
+  white-space: nowrap;
+  width: 1%;
+}
+.kac-report .crv-case-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.kac-report .crv-case-table td.pos {
+  color: #dc2626;
+  font-weight: 700;
+}
+.kac-report .crv-case-table td.neg {
+  color: var(--om-text-muted);
+}
+.kac-report .crv-case-table td.bad {
+  color: #dc2626;
+  font-weight: 700;
+}
+.kac-report .crv-case-table td.ok {
+  color: #15803d;
+  font-weight: 700;
+}
+.kac-report .crv-case-table td.fail {
+  color: var(--om-text-muted);
+  font-style: italic;
+}
+/* 케이스 열 강조 — 최악(빨강)·최선(초록) 헤더 */
+.kac-report .crv-case-table th.crv-worst {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+.kac-report .crv-case-table th.crv-best {
+  background: #f0fdf4;
+  color: #15803d;
+}
+.kac-report .crv-note {
+  margin: 3px 0 0;
+  font-size: 10px;
+  line-height: 1.55;
+  color: var(--om-text-muted);
+  text-align: justify;
+}
+
+/* ── 폴라 차트 ─────────────────────────────────────────────────────────── */
+.kac-report .crv-polar-wrap {
+  border: 1px solid var(--om-border);
+  border-radius: 4px;
+  padding: 8px 8px 4px;
+  background: #ffffff;
+  text-align: center;
+}
+/* 정사각 차트라 폭을 그대로 두면 블록 높이가 페이지를 넘김 → 폭 상한 + 가운데 정렬 */
+.kac-report .crv-polar {
+  display: block;
+  width: 100%;
+  max-width: 118mm;
+  height: auto;
+  margin: 0 auto;
+}
+
+/* ── 침범 방위 구간 표 ─────────────────────────────────────────────────── */
+.kac-report .crv-range-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  margin: 4px 0 2px;
+}
+.kac-report .crv-range-table th,
+.kac-report .crv-range-table td {
+  border: 1px solid var(--om-border);
+  padding: 4px 7px;
+  text-align: center;
+  vertical-align: middle;
+}
+.kac-report .crv-range-table th {
+  background: #f3f6fa;
+  color: var(--om-accent-deep);
+  font-weight: 700;
+}
+.kac-report .crv-range-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.kac-report .crv-range-none {
+  margin: 4px 0 2px;
+  padding: 6px 12px;
+  border: 1px solid #16a34a;
+  border-radius: 4px;
+  background: #f0fdf4;
+  color: #15803d;
+  font-size: 12px;
+  font-weight: 700;
+}
+.kac-report .crv-range-all {
+  margin: 4px 0 2px;
+  padding: 6px 12px;
+  border: 1px solid #dc2626;
+  border-radius: 4px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 12px;
+  font-weight: 700;
+}

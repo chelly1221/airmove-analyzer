@@ -1,8 +1,9 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import {
   Loader2,
   Eye,
   Mountain,
+  Construction,
   ChevronRight,
   ChevronDown,
   FilePlus,
@@ -18,12 +19,23 @@ import {
   type ReportTemplate,
 } from "../utils/reportTransfer";
 import OMReferenceModal from "../components/Report/OMReferenceModal";
-import type { RadarSite } from "../types";
+import CraneReviewConfigModal from "../components/Report/CraneReviewConfigModal";
+import type { RadarSite, TowerCrane } from "../types";
+
+/** 템플릿 행 종류 — OM 보고서(ReportTemplate)와 별도 창(crane-review) 보고서.
+ *  타워크레인 검토는 OM 보고서 창·설정(writeReportConfig) 계통을 타지 않으므로
+ *  ReportTemplate 유니온에 넣지 않고 이 행 전용 값으로 구분한다. */
+type TemplateRowType = ReportTemplate | "tower_crane_review";
 
 export default function ReportGeneration() {
   const aircraft = useAppStore((s) => s.aircraft);
   const reportMetadata = useAppStore((s) => s.reportMetadata);
   const customRadarSites = useAppStore((s) => s.customRadarSites);
+  const towerCranes = useAppStore((s) => s.towerCranes);
+  const braAngleDeg = useAppStore((s) => s.braAngleDeg);
+
+  // 타워크레인 목록 — 자료관리/지도에서 등록·수정된 내용을 페이지 진입 시 1회 최신화
+  useEffect(() => { void useAppStore.getState().loadTowerCranes(); }, []);
 
   /** 보고서 창 열기 헬퍼 */
   const openReportWindow = useCallback(async () => {
@@ -52,6 +64,11 @@ export default function ReportGeneration() {
 
   // 기준데이터 관리 모달
   const [referenceModalOpen, setReferenceModalOpen] = useState(false);
+  // 타워크레인 검토 보고서 설정 모달
+  const [craneModalOpen, setCraneModalOpen] = useState(false);
+
+  /** 활성 시설만 검토 대상 (비활성 레이더는 분석에서 제외하는 전역 규약) */
+  const activeRadarSites = customRadarSites.filter((s) => s.active !== false);
 
   // NOTE: 보고서 창의 생성 요청(report:generate) 수신은 App.tsx 의 useReportGenerateListener 담당.
   // 페이지에 두면 라우트 이동 시 리스너가 해제되어 요청이 유실되므로 상시 마운트 지점으로 이동했다.
@@ -71,6 +88,15 @@ export default function ReportGeneration() {
       setPrepState({ active: false, message: "" });
     }
   }, [aircraft, reportMetadata, customRadarSites, openReportWindow]);
+
+  /** 템플릿 행 선택 — 타워크레인 검토는 자체 설정 모달, 그 외는 OM 보고서 창 */
+  const handleRowSelect = useCallback((type: TemplateRowType) => {
+    if (type === "tower_crane_review") {
+      setCraneModalOpen(true);
+      return;
+    }
+    void handleTemplateClick(type);
+  }, [handleTemplateClick]);
 
   return (
     <div className="relative space-y-6">
@@ -99,7 +125,8 @@ export default function ReportGeneration() {
         </h2>
         <TemplateTable
           customRadarSites={customRadarSites}
-          onSelect={handleTemplateClick}
+          towerCranes={towerCranes}
+          onSelect={handleRowSelect}
           onOpenReference={() => setReferenceModalOpen(true)}
           disabled={prepState.active}
         />
@@ -111,6 +138,15 @@ export default function ReportGeneration() {
         onClose={() => setReferenceModalOpen(false)}
         customRadarSites={customRadarSites}
       />
+
+      {/* 타워크레인 전파영향 검토 보고서 설정 (별도 창 crane-review 로 생성) */}
+      <CraneReviewConfigModal
+        open={craneModalOpen}
+        onClose={() => setCraneModalOpen(false)}
+        cranes={towerCranes}
+        radarSites={activeRadarSites}
+        defaultBraAngleDeg={braAngleDeg}
+      />
     </div>
   );
 }
@@ -118,26 +154,30 @@ export default function ReportGeneration() {
 // ── 템플릿 테이블 (expandable list) ──
 
 interface TemplateRowDef {
-  type: ReportTemplate;
+  type: TemplateRowType;
   icon: typeof Mountain;
   title: string;
   description: string;
+  /** 행 우측 배지 라벨 (OM 은 templateDisplayLabel, 크레인 검토는 고정 문자열) */
+  label: string;
   stats: { label: string; value: string | number }[];
   disabled: boolean;
 }
 
 function TemplateTable({
   customRadarSites,
+  towerCranes,
   onSelect,
   onOpenReference,
   disabled: externalDisabled,
 }: {
   customRadarSites: RadarSite[];
-  onSelect: (tpl: ReportTemplate) => void;
+  towerCranes: TowerCrane[];
+  onSelect: (type: TemplateRowType) => void;
   onOpenReference: () => void;
   disabled?: boolean;
 }) {
-  const [expandedRow, setExpandedRow] = useState<ReportTemplate | null>(null);
+  const [expandedRow, setExpandedRow] = useState<TemplateRowType | null>(null);
   // 기준데이터 빌드가 백그라운드 진행 중인지 (모달을 닫아도 스토어에서 계속) — 버튼에 스피너 표시
   const refBuilding = useOmReferenceBuildStore((s) => s.building);
 
@@ -147,11 +187,24 @@ function TemplateTable({
       icon: Mountain,
       title: "장애물 월간 보고서",
       description: "특정 장애물의 월간 영향을 분석합니다. ASS 파일을 입력하여 일별 PSR 탐지율/표적소실율 추이, 분석 대상 장애물별 LoS 단면 및 양각 분포를 생성합니다.",
+      label: templateDisplayLabel("obstacle_monthly"),
       stats: [
         { label: "레이더", value: `${customRadarSites.length}개` },
         { label: "수동 건물", value: "선택식" },
       ],
       disabled: customRadarSites.length === 0,
+    },
+    {
+      type: "tower_crane_review",
+      icon: Construction,
+      title: "타워크레인 전파영향 검토 보고서",
+      description: "등록 타워크레인의 BRA 제한표면 침범·전방 차폐(LoS)를 지브 방위각별(최악각·최선각·전방위·지정 각도)로 검토한 보고서를 생성합니다.",
+      label: "크레인검토",
+      stats: [
+        { label: "레이더", value: `${customRadarSites.length}개` },
+        { label: "타워크레인", value: `${towerCranes.length}기` },
+      ],
+      disabled: customRadarSites.length === 0 || towerCranes.length === 0,
     },
   ];
 
@@ -186,7 +239,7 @@ function TemplateTable({
               <div className="min-w-0 flex-1">
                 <span className="text-sm font-semibold text-gray-800">{row.title}</span>
                 <span className="ml-3 text-[11px] text-gray-400">
-                  {templateDisplayLabel(row.type)}
+                  {row.label}
                 </span>
               </div>
               <div className="flex shrink-0 gap-2">

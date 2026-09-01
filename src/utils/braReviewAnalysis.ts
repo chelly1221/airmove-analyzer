@@ -240,6 +240,142 @@ interface ObstacleEntry {
   lon: number;
 }
 
+/** 단면 코리도 수집 결과 — 의견서·타워크레인 검토 공용 */
+export interface FacilityCorridor {
+  /** 레이더 → 대상 수평거리 (km, haversine) */
+  distKm: number;
+  /** 레이더 → 대상 방위 (°) */
+  azimuthDeg: number;
+  /** 안테나 정점 표고 (MSL, m) */
+  hAntM: number;
+  /** 단면도 X 축 상한 (km) */
+  chartMaxKm: number;
+  /** 프로파일 샘플 간격 (m) */
+  sampleStepM: number;
+  /** SRTM 전수 프로파일 (레이더 → chartMaxKm) */
+  profile: BraReviewProfilePoint[];
+  /** 경로 건물 (대상 건물·레이더 근접 건물 제외, 거리 재라벨 완료) */
+  pathBuildings: BuildingOnPath[];
+  /** 대상 좌표와 매칭된 경로 건물 (여러 건이면 첫 건) */
+  targetOnPath: BuildingOnPath | null;
+  /** RADAR_NEAR_EXCLUDE_M 이내라 제외한 동수 */
+  nearRadarExcluded: number;
+  /** 대상 자기참조(selfExcludeM 이내 또는 footprint 포함)로 제외한 총 동수 */
+  selfExcluded: number;
+}
+
+/** 단면 코리도의 기하 파라미터 — 거리·방위·차트 범위·샘플 수의 단일 원천.
+ *  실패 경로(단면 분석 전 반환)와 정상 경로가 **같은 값**을 쓰도록 분리한다.
+ *  타워크레인 검토(craneReviewAnalysis.ts)도 같은 값을 써야 해 export 한다. */
+export function corridorGeometry(site: RadarSite, targetLat: number, targetLon: number) {
+  const hAntM = site.altitude + site.antenna_height;
+  const distKm = haversineKm(site.latitude, site.longitude, targetLat, targetLon);
+  const azimuthDeg = bearingDeg(site.latitude, site.longitude, targetLat, targetLon);
+  const chartMaxKm = Math.max(15, distKm * 1.15);
+  // 전수 샘플(≈20 m 간격) — 다운샘플 금지(CLAUDE.md 규칙 7)
+  const numSamples = Math.min(2000, Math.max(300, Math.round(chartMaxKm / 0.02)));
+  const sampleStepM = (chartMaxKm * 1000) / numSamples;
+  return { hAntM, distKm, azimuthDeg, chartMaxKm, numSamples, sampleStepM };
+}
+
+/**
+ * 레이더 → 대상 방위선의 단면 코리도 수집 — SRTM 전수 프로파일 + 경로 건물(코리도 100 m)
+ * 거리 재라벨 + 제외 규칙(레이더 근접 / 대상 자기참조).
+ *
+ * 의견서(`analyzeFacility`)와 타워크레인 검토(`craneReviewAnalysis.ts`)가 **같은 코리도**를 쓰도록
+ * 분리했다 — 산식·제외 규칙을 바꾸면 양쪽이 함께 움직인다.
+ * invoke 실패는 그대로 throw 한다(조용한 폴백 금지) — 호출측이 error 문구로 문서에 남긴다.
+ */
+export async function fetchFacilityCorridor(
+  site: RadarSite,
+  targetLat: number,
+  targetLon: number,
+  opts: { selfLat: number; selfLon: number; selfExcludeM: number },
+): Promise<FacilityCorridor> {
+  const { hAntM, distKm, azimuthDeg, chartMaxKm, numSamples, sampleStepM } =
+    corridorGeometry(site, targetLat, targetLon);
+
+  // 방위선을 chartMaxKm 까지 연장 — 평면(등거리) 투영 종점 (LoSProfilePanel.tsx:222-232 방식)
+  const mPerDegLat = DEG2RAD * R_EARTH_M;
+  const mPerDegLon = mPerDegLat * Math.cos(site.latitude * DEG2RAD);
+  const dLatM = (targetLat - site.latitude) * mPerDegLat;
+  const dLonM = (targetLon - site.longitude) * mPerDegLon;
+  const dirLen = Math.hypot(dLatM, dLonM) || 1;
+  const farM = chartMaxKm * 1000;
+  const farLat = site.latitude + ((dLatM / dirLen) * farM) / mPerDegLat;
+  const farLon = site.longitude + ((dLonM / dirLen) * farM) / mPerDegLon;
+
+  const lats: number[] = [];
+  const lons: number[] = [];
+  for (let i = 0; i <= numSamples; i++) {
+    const [la, lo] = interpolate(site.latitude, site.longitude, farLat, farLon, i / numSamples);
+    lats.push(la);
+    lons.push(lo);
+  }
+  const elevs = await invoke<number[]>("fetch_elevation", { latitudes: lats, longitudes: lons });
+  const profile: BraReviewProfilePoint[] = [];
+  for (let i = 0; i < lats.length; i++) {
+    profile.push({
+      distKm: haversineKm(site.latitude, site.longitude, lats[i], lons[i]),
+      elevM: Math.max(0, elevs[i] ?? 0), // 음수 표고 0 클램프 (LoSProfilePanel 과 동일)
+      lat: lats[i],
+      lon: lons[i],
+    });
+  }
+
+  // 경로상 건물 (코리도 100 m) — 백엔드 거리(평면 t×haversine)를 지형 축과 동일 프레임으로 재라벨
+  let bldgs = await invoke<BuildingOnPath[]>("query_buildings_along_path", {
+    radarLat: site.latitude,
+    radarLon: site.longitude,
+    targetLat: farLat,
+    targetLon: farLon,
+    corridorWidthM: CORRIDOR_WIDTH_M,
+  });
+  const totalHavKm = haversineKm(site.latitude, site.longitude, farLat, farLon);
+  if (totalHavKm > 1e-6) {
+    const toHav = (d: number): number => {
+      const t = Math.min(1, Math.max(0, d / totalHavKm));
+      const [hLat, hLon] = interpolate(site.latitude, site.longitude, farLat, farLon, t);
+      return haversineKm(site.latitude, site.longitude, hLat, hLon);
+    };
+    bldgs = bldgs.map((b) => ({
+      ...b,
+      distance_km: toHav(b.distance_km),
+      near_dist_km: b.near_dist_km != null ? toHav(b.near_dist_km) : b.near_dist_km,
+      far_dist_km: b.far_dist_km != null ? toHav(b.far_dist_km) : b.far_dist_km,
+    }));
+  }
+
+  // 대상 건물 분리 (자기참조 오염 방지) — selfExcludeM 이내 또는 footprint 포함.
+  //   여러 건이 매칭되면 **첫 건만** targetOnPath 로 삼고 나머지도 경로 건물에서 뺀다(종전 규칙 유지).
+  // 레이더 주변 RADAR_NEAR_EXCLUDE_M 이내 건물(centroid 또는 경로 near 엣지 기준)은 검토·단면도에서 제외
+  let targetOnPath: BuildingOnPath | null = null;
+  let nearRadarExcluded = 0;
+  let selfExcluded = 0;
+  const pathBuildings: BuildingOnPath[] = [];
+  for (const b of bldgs) {
+    const nearEdgeM = (b.near_dist_km ?? b.distance_km) * 1000;
+    if (nearEdgeM < RADAR_NEAR_EXCLUDE_M || haversineKm(b.lat, b.lon, site.latitude, site.longitude) * 1000 < RADAR_NEAR_EXCLUDE_M) {
+      nearRadarExcluded++;
+      continue;
+    }
+    const isTarget =
+      haversineKm(b.lat, b.lon, opts.selfLat, opts.selfLon) * 1000 < opts.selfExcludeM ||
+      (b.polygon != null && b.polygon.length >= 3 && pointInRing(opts.selfLat, opts.selfLon, b.polygon));
+    if (isTarget) {
+      if (!targetOnPath) targetOnPath = b;
+      selfExcluded++;
+      continue;
+    }
+    pathBuildings.push(b);
+  }
+
+  return {
+    distKm, azimuthDeg, hAntM, chartMaxKm, sampleStepM,
+    profile, pathBuildings, targetOnPath, nearRadarExcluded, selfExcluded,
+  };
+}
+
 async function analyzeFacility(
   site: RadarSite,
   bld: BraReviewBuildingInput,
@@ -247,17 +383,12 @@ async function analyzeFacility(
   rooftopAmslM: number,
   braAngleDeg: number,
 ): Promise<BraReviewFacility> {
-  const hAntM = site.altitude + site.antenna_height;
-  const distKm = haversineKm(site.latitude, site.longitude, bld.lat, bld.lon);
-  const azimuthDeg = bearingDeg(site.latitude, site.longitude, bld.lat, bld.lon);
+  const { hAntM, distKm, azimuthDeg, chartMaxKm, sampleStepM } =
+    corridorGeometry(site, bld.lat, bld.lon);
   const dM = distKm * 1000;
   // BRA 제한고도 — 실제지구 기하(4/3 미적용). bra.rs cone_msl / TrackMap 드로어 6498-6500 동일 정의.
   const coneMslM = hAntM + dM * Math.tan(braAngleDeg * DEG2RAD) + (dM * dM) / (2 * R_EARTH_M);
   const braExcessM = rooftopAmslM - coneMslM;
-  const chartMaxKm = Math.max(15, distKm * 1.15);
-  // 전수 샘플(≈20 m 간격) — 다운샘플 금지(CLAUDE.md 규칙 7)
-  const numSamples = Math.min(2000, Math.max(300, Math.round(chartMaxKm / 0.02)));
-  const sampleStepM = (chartMaxKm * 1000) / numSamples;
 
   const base = {
     site, hAntM, distKm, azimuthDeg, coneMslM, braExcessM,
@@ -272,77 +403,10 @@ async function analyzeFacility(
   }
 
   try {
-    // 방위선을 chartMaxKm 까지 연장 — 평면(등거리) 투영 종점 (LoSProfilePanel.tsx:222-232 방식)
-    const mPerDegLat = DEG2RAD * R_EARTH_M;
-    const mPerDegLon = mPerDegLat * Math.cos(site.latitude * DEG2RAD);
-    const dLatM = (bld.lat - site.latitude) * mPerDegLat;
-    const dLonM = (bld.lon - site.longitude) * mPerDegLon;
-    const dirLen = Math.hypot(dLatM, dLonM) || 1;
-    const farM = chartMaxKm * 1000;
-    const farLat = site.latitude + ((dLatM / dirLen) * farM) / mPerDegLat;
-    const farLon = site.longitude + ((dLonM / dirLen) * farM) / mPerDegLon;
-
-    const lats: number[] = [];
-    const lons: number[] = [];
-    for (let i = 0; i <= numSamples; i++) {
-      const [la, lo] = interpolate(site.latitude, site.longitude, farLat, farLon, i / numSamples);
-      lats.push(la);
-      lons.push(lo);
-    }
-    const elevs = await invoke<number[]>("fetch_elevation", { latitudes: lats, longitudes: lons });
-    const profile: BraReviewProfilePoint[] = [];
-    for (let i = 0; i < lats.length; i++) {
-      profile.push({
-        distKm: haversineKm(site.latitude, site.longitude, lats[i], lons[i]),
-        elevM: Math.max(0, elevs[i] ?? 0), // 음수 표고 0 클램프 (LoSProfilePanel 과 동일)
-        lat: lats[i],
-        lon: lons[i],
-      });
-    }
-
-    // 경로상 건물 (코리도 100 m) — 백엔드 거리(평면 t×haversine)를 지형 축과 동일 프레임으로 재라벨
-    let bldgs = await invoke<BuildingOnPath[]>("query_buildings_along_path", {
-      radarLat: site.latitude,
-      radarLon: site.longitude,
-      targetLat: farLat,
-      targetLon: farLon,
-      corridorWidthM: CORRIDOR_WIDTH_M,
-    });
-    const totalHavKm = haversineKm(site.latitude, site.longitude, farLat, farLon);
-    if (totalHavKm > 1e-6) {
-      const toHav = (d: number): number => {
-        const t = Math.min(1, Math.max(0, d / totalHavKm));
-        const [hLat, hLon] = interpolate(site.latitude, site.longitude, farLat, farLon, t);
-        return haversineKm(site.latitude, site.longitude, hLat, hLon);
-      };
-      bldgs = bldgs.map((b) => ({
-        ...b,
-        distance_km: toHav(b.distance_km),
-        near_dist_km: b.near_dist_km != null ? toHav(b.near_dist_km) : b.near_dist_km,
-        far_dist_km: b.far_dist_km != null ? toHav(b.far_dist_km) : b.far_dist_km,
-      }));
-    }
-
-    // 대상 건물 분리 (자기참조 오염 방지) — 15 m 이내 또는 footprint 포함
-    // 레이더 주변 RADAR_NEAR_EXCLUDE_M 이내 건물(centroid 또는 경로 near 엣지 기준)은 검토·단면도에서 제외
-    let targetOnPath: BuildingOnPath | null = null;
-    let nearRadarExcluded = 0;
-    const pathBuildings: BuildingOnPath[] = [];
-    for (const b of bldgs) {
-      const nearEdgeM = (b.near_dist_km ?? b.distance_km) * 1000;
-      if (nearEdgeM < RADAR_NEAR_EXCLUDE_M || haversineKm(b.lat, b.lon, site.latitude, site.longitude) * 1000 < RADAR_NEAR_EXCLUDE_M) {
-        nearRadarExcluded++;
-        continue;
-      }
-      const isTarget =
-        haversineKm(b.lat, b.lon, bld.lat, bld.lon) * 1000 < SELF_EXCLUDE_M ||
-        (b.polygon != null && b.polygon.length >= 3 && pointInRing(bld.lat, bld.lon, b.polygon));
-      if (isTarget) {
-        if (!targetOnPath) targetOnPath = b;
-        continue;
-      }
-      pathBuildings.push(b);
-    }
+    const { profile, pathBuildings, targetOnPath, nearRadarExcluded } = await fetchFacilityCorridor(
+      site, bld.lat, bld.lon,
+      { selfLat: bld.lat, selfLon: bld.lon, selfExcludeM: SELF_EXCLUDE_M },
+    );
 
     // ── LoS 음영(차폐)고도 — 4/3 프레임 running-max 앙각 ──
     const obstacles: ObstacleEntry[] = [];

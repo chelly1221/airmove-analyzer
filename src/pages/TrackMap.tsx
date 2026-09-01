@@ -309,12 +309,13 @@ function buildHeatBitmap(
 
 import { format } from "date-fns";
 import { useAppStore } from "../store";
-import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult, BraBuilding, RadarSite } from "../types";
+import type { TrackPoint, LossSegment, LossPoint, Building3D, ManualBuilding, BuildingGroup, FacBuildingDetail, AddressBuildingHit, LosCurtainSample, BuildingOnPath, BraResult, BraBuilding, BraCraneSweep, RadarSite, TowerCrane, CraneRotationMode } from "../types";
 import { writeBraReviewPayload } from "../utils/reportTransfer";
 import { ringAreaM2, type BraReviewBuildingInput, type BraReviewPayload } from "../utils/braReviewAnalysis";
 import { readBulkJson, type BulkRef } from "../utils/bulkIpc";
 import { queryViewportPoints, ViewportQuerySuperseded } from "../utils/flightConsolidationWorker";
 import { LOS_PROFILE_MAX_KM, haversineKm } from "../utils/geo";
+import { buildCraneMesh } from "../utils/craneGeometry";
 import LoSProfilePanel from "../components/Map/LoSProfilePanel";
 import { isGPUCacheValidFor, renderCoverageImageAsync, queryMinDetectionAlt, COVERAGE_MIN_ALT_FT, COVERAGE_MAX_ALT_FT, COVERAGE_ALT_STEP_FT } from "../utils/radarCoverage";
 import { GPU2D, type RectData } from "../utils/gpu2d";
@@ -582,11 +583,71 @@ const BraPenetrationRows = memo(function BraPenetrationRows({ rows, onRowClick }
           </div>
           <div style={{ fontSize: 9, color: G[400], paddingLeft: 12 }}>
             {(b.distance_km / 1.852).toFixed(1)}NM · {b.azimuth_deg.toFixed(0)}° · 꼭대기 {b.total_height_m.toFixed(0)}m AMSL
-            {b.measured ? " · 실측" : ""}{b.source === "manual" ? " · 수동" : ""}
+            {b.measured ? " · 실측" : ""}{b.source === "manual" ? " · 수동" : ""}{b.source === "crane" ? " · 크레인" : ""}
           </div>
         </div>
       ))}
     </>
+  );
+});
+
+/** 부호 붙은 초과량 표기 (양수 = 원추면 침범, 음수 = 여유) — 크레인 방위각 스윕 표시 공용 */
+const fmtExceed = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)}`;
+
+/** 방위각 스윕 폴라 링 기하 (px) — 56×56 뷰박스 */
+const RING_SZ = 56;
+const RING_C = RING_SZ / 2;
+const RING_R_OUT = 21;
+const RING_R_IN = 13;
+const RING_R_DOT = 24.5;
+
+/** 정북 0°·시계방향 극좌표 → SVG 좌표 (y 는 아래 방향) */
+const ringPt = (r: number, deg: number): [number, number] => {
+  const a = (deg * Math.PI) / 180;
+  return [RING_C + r * Math.sin(a), RING_C - r * Math.cos(a)];
+};
+
+/** 타워크레인 방위각별 판정 폴라 링 — 1° 세그먼트 360장을 초과량 농도로 칠한다.
+ *  초과(>0)는 빨강 농도(최악값 기준 정규화), 여유(≤0)는 연회색. 현재 지브 방위(고정 모드)는
+ *  진회색 표시선, 최악은 빨강 점·최선은 초록 점을 링 바깥에 찍는다.
+ *  세그먼트 경로는 스윕 결과 identity 로 memo — 반경/불투명도 슬라이더 드래그에 재생성되지 않는다. */
+const CraneSweepRing = memo(function CraneSweepRing({ sweep, jibAzimuthDeg }: {
+  sweep: BraCraneSweep;
+  jibAzimuthDeg: number | null;
+}) {
+  const segs = useMemo(() => {
+    // 농도 정규화 기준 — 최악 초과량(최소 1m)
+    const scale = Math.max(sweep.worst_exceed_m, 1);
+    return sweep.exceed_by_deg.map((v, i) => {
+      const [x1, y1] = ringPt(RING_R_OUT, i);
+      const [x2, y2] = ringPt(RING_R_OUT, i + 1);
+      const [x3, y3] = ringPt(RING_R_IN, i + 1);
+      const [x4, y4] = ringPt(RING_R_IN, i);
+      // 1° 폭이라 호 대신 직선 — r=21px 에서 오차 0.001px 미만
+      const d = `M${x1.toFixed(2)} ${y1.toFixed(2)}L${x2.toFixed(2)} ${y2.toFixed(2)}L${x3.toFixed(2)} ${y3.toFixed(2)}L${x4.toFixed(2)} ${y4.toFixed(2)}Z`;
+      return v > 0
+        ? { d, fill: "#e94560", op: 0.35 + 0.65 * Math.min(1, v / scale) }
+        : { d, fill: G[200], op: 1 };
+    });
+  }, [sweep]);
+
+  const [wx, wy] = ringPt(RING_R_DOT, sweep.worst_deg + 0.5);
+  const [bx, by] = ringPt(RING_R_DOT, sweep.best_deg + 0.5);
+  // 현재 지브 방위 표시선 — 고정 모드에서만(전방위는 방위 개념이 없다)
+  const jibFrom = jibAzimuthDeg == null ? null : ringPt(RING_R_IN - 2, jibAzimuthDeg);
+  const jibTo = jibAzimuthDeg == null ? null : ringPt(RING_R_OUT + 1.5, jibAzimuthDeg);
+
+  return (
+    <svg width={RING_SZ} height={RING_SZ} viewBox={`0 0 ${RING_SZ} ${RING_SZ}`} style={{ flexShrink: 0 }}>
+      {segs.map((sg, i) => (
+        <path key={i} d={sg.d} fill={sg.fill} fillOpacity={sg.op} />
+      ))}
+      {jibFrom && jibTo && (
+        <line x1={jibFrom[0]} y1={jibFrom[1]} x2={jibTo[0]} y2={jibTo[1]} stroke={G[600]} strokeWidth={1.4} strokeLinecap="round" />
+      )}
+      <circle cx={wx} cy={wy} r={1.8} fill="#e94560" />
+      <circle cx={bx} cy={by} r={1.8} fill="#16a34a" />
+    </svg>
   );
 });
 
@@ -684,7 +745,8 @@ export default function TrackMap() {
   if (bldgDrawer) lastBldgRef.current = bldgDrawer;
   /** 건물 호버 간단 툴팁 (커서 옆) — 디바운스/상세조회 없이 즉시 표시 */
   // lat/lon/base(AMSL 지반고) 는 BRA 도구 활성 중 초과·여유고도 즉시 산출용 (아래 툴팁 렌더 참조)
-  const [bldgHoverTip, setBldgHoverTip] = useState<{ x: number; y: number; name?: string; height?: number; measured?: boolean; lat?: number; lon?: number; base?: number } | null>(null);
+  // crane: 타워크레인 호버 요약 1줄(지브고·지브길이·선회 모드) — 건물 경로와 툴팁 state 를 공유(새 subsystem 금지)
+  const [bldgHoverTip, setBldgHoverTip] = useState<{ x: number; y: number; name?: string; height?: number; measured?: boolean; lat?: number; lon?: number; base?: number; crane?: string } | null>(null);
   /** BRA 호버 툴팁 LoS 기준선(단면도 최저탐지선, 호버 건물 제외) 좌표 키 캐시 — 실패는 미기록(재호버 시 재시도) */
   const losBaseCacheRef = useRef<Map<string, { baselineAmsl: number; angleDeg: number }>>(new Map());
   /** 현재 호버 지점의 LoS 기준선 — key 가 호버 좌표와 일치할 때만 툴팁에 반영 */
@@ -769,6 +831,10 @@ export default function TrackMap() {
   const buildingGroups = useAppStore((s) => s.buildingGroups);
   const loadManualBuildings = useAppStore((s) => s.loadManualBuildings);
   const loadBuildingGroups = useAppStore((s) => s.loadBuildingGroups);
+
+  // 등록 타워크레인 — 3D 표출 + BRA 드로어 지브 즉시조정 (LoS·파노라마·커버리지 미반영, 1단계)
+  const towerCranes = useAppStore((s) => s.towerCranes);
+  const loadTowerCranes = useAppStore((s) => s.loadTowerCranes);
 
   // LoS Analysis state
   const [losMode, setLosMode] = useState(false);
@@ -1626,7 +1692,8 @@ export default function TrackMap() {
 
       const res = await fetchBuildingsForViewport(
         { south: box.south, north: box.north, west: box.west, east: box.east, zoom },
-        [...hiddenBuildingSources],
+        // 'crane' 은 건물 타일 조회 대상이 아니다 — 타일 캐시 서명(srcSig)이 크레인 토글로 흔들리지 않게 제외
+        [...hiddenBuildingSources].filter((src) => src !== "crane"),
         // 점진적 콜백: 타일 배치 완료마다 UI 업데이트 (finalOnly 는 미전달 → 캐시 쪽도 단일 스테이지)
         finalOnly ? undefined : (buildings) => {
           if (seq !== buildingFetchAbortRef.current) return;
@@ -1746,6 +1813,23 @@ export default function TrackMap() {
     ];
     return () => { for (const u of unlistens) u.then((fn) => fn()); };
   }, []);
+
+  // 타워크레인 세트·지브 상태 변경 → BRA 자료 세대 증가.
+  //   크레인은 Rust BRA 침범 검사 대상이라 방위각·선회 모드가 바뀌면 표시 중인 결과가 낡는다.
+  //   기존 400ms 디바운스 자동 재분석 경로(braLastRunKeyRef 비교)를 그대로 재사용한다.
+  //   (크로스윈도우 'tower-cranes-changed' 수신은 TrackMapApp 이 스토어 재조회로 처리 → 이 배열이 바뀐다)
+  //   배열 identity 가 아니라 **판정에 쓰이는 값의 서명**으로 비교한다 — 지브 즉시조정 저장 성공 후 자기 창이
+  //   발신한 이벤트를 되받아 재조회하면(값 동일) 배열만 새로 와서 불필요한 재분석이 한 번 더 돌기 때문.
+  const craneBraSig = useMemo(
+    () => towerCranes.map((c) => `${c.id}:${c.latitude}:${c.longitude}:${c.ground_elev}:${c.jib_height}:${c.top_height}:${c.jib_length}:${c.counter_jib_length}:${c.jib_azimuth_deg}:${c.rotation_mode}:${c.mast_width}`).join("|"),
+    [towerCranes],
+  );
+  const craneBraSigRef = useRef(craneBraSig);
+  useEffect(() => {
+    if (craneBraSigRef.current === craneBraSig) return;
+    craneBraSigRef.current = craneBraSig;
+    setBraDataEpoch((e) => e + 1);
+  }, [craneBraSig]);
 
   // ── MapLibre fill-extrusion (3D 건물) ──────────────────────────
   // 건물 3D 모드: MapLibre 네이티브 fill-extrusion 레이어 사용
@@ -3450,7 +3534,8 @@ export default function TrackMap() {
       if (seq !== braAreaSeqRef.current) return;
       setBraArea((prev) => (prev && prev.buildings === buildings ? prev : { lat, lon, radiusKm, buildings }));
     };
-    fetchBuildingsInRadius({ lat, lon }, radiusKm, [...hiddenBuildingSources], commit)
+    // 'crane' 은 건물 조회 대상 아님 — 위 뷰포트 조회와 동일하게 제외
+    fetchBuildingsInRadius({ lat, lon }, radiusKm, [...hiddenBuildingSources].filter((src) => src !== "crane"), commit)
       .then(commit)
       .catch((err) => {
         console.warn("BRA 범위 건물 로드 실패:", err);
@@ -4532,6 +4617,81 @@ export default function TrackMap() {
     ];
   }, [braGeom, braConeOpacity]);
 
+  /** 타워크레인 quad 1면 + 소속 크레인(호버 툴팁용) */
+  type CraneQuadRow = { polygon: [number, number, number][]; crane: TowerCrane };
+
+  /** 등록 타워크레인 절차 생성 3D 메시 — 색상 그룹별로 합쳐 레이어 4장에 대응시킨다.
+   *  z 배율은 TERRAIN_EXAGGERATION(다른 분석 레이어와 동일 프레임), 지반고는 등록 저장값 그대로. */
+  const craneMeshData = useMemo(() => {
+    const structure: CraneQuadRow[] = [];
+    const counterweight: CraneQuadRow[] = [];
+    const cab: CraneQuadRow[] = [];
+    const sweep: CraneQuadRow[] = [];
+    if (hiddenBuildingSources.has("crane")) return { structure, counterweight, cab, sweep };
+    for (const c of towerCranes) {
+      const mesh = buildCraneMesh(c, TERRAIN_EXAGGERATION);
+      for (const q of mesh.structure) structure.push({ polygon: q.polygon, crane: c });
+      for (const q of mesh.counterweight) counterweight.push({ polygon: q.polygon, crane: c });
+      for (const q of mesh.cab) cab.push({ polygon: q.polygon, crane: c });
+      for (const q of mesh.sweepDisc) sweep.push({ polygon: q.polygon, crane: c });
+    }
+    return { structure, counterweight, cab, sweep };
+  }, [towerCranes, hiddenBuildingSources]);
+
+  /** 저줌에선 구조 부재가 1px 이하라 존재만 점으로 표시 (임계 통과 시에만 memo 재계산) */
+  const craneLowZoom = viewState.zoom < 13;
+
+  /** 타워크레인 deck.gl 레이어 — 구조/카운터웨이트/캐빈/선회범위 4장 + 저줌 마커.
+   *  LoS 커튼(pushCurtainWallQuads)과 같은 옵션(_full3d·extruded:false·material:false).
+   *  MapboxOverlay overlaid 합성이라 maplibre fill-extrusion 건물과는 깊이 상호작용이 없다(커튼과 동일 제약). */
+  const craneDeckLayers = useMemo(() => {
+    const out: (SolidPolygonLayer<CraneQuadRow> | ScatterplotLayer<TowerCrane>)[] = [];
+    if (hiddenBuildingSources.has("crane") || towerCranes.length === 0) return out;
+    // 호버 표시는 건물과 같은 툴팁 state 를 쓴다 (새 subsystem 금지)
+    const onCraneHover = (info: { object?: CraneQuadRow; x: number; y: number }) => {
+      const row = info.object;
+      if (!row) { setBldgHoverTip(null); return; }
+      const c = row.crane;
+      const mode = c.rotation_mode === "full" ? "전방위" : `고정 ${c.jib_azimuth_deg.toFixed(0)}°`;
+      // BRA 분석 결과에 방위각 스윕이 있으면 최악/최선각을 덧붙인다 (분석 전에는 생략)
+      const sw = braResult?.cranes.find((s) => s.id === c.id);
+      const sweepTxt = sw
+        ? ` · 최악 ${sw.worst_deg}° ${fmtExceed(sw.worst_exceed_m)}m / 최선 ${sw.best_deg}° ${fmtExceed(sw.best_exceed_m)}m`
+        : "";
+      setBldgHoverTip({ x: info.x, y: info.y, name: c.name, crane: `지브고 ${c.jib_height}m · 지브 ${c.jib_length}m · ${mode}${sweepTxt}` });
+    };
+    const solid = (id: string, data: CraneQuadRow[], color: [number, number, number, number], pickable: boolean) =>
+      new SolidPolygonLayer<CraneQuadRow>({
+        id,
+        data,
+        getPolygon: (d) => d.polygon,
+        getFillColor: color,
+        filled: true,
+        extruded: false,
+        _full3d: true,   // 수직·경사 폴리곤 필수 — 미지정 시 2D 테셀레이터가 선으로 퇴화
+        material: false, // 조명 음영 없이 플랫 색
+        pickable,
+        onHover: pickable ? onCraneHover : undefined,
+      });
+    if (craneMeshData.structure.length > 0) out.push(solid("tower-cranes-structure", craneMeshData.structure, [245, 158, 11, 255], true));
+    if (craneMeshData.counterweight.length > 0) out.push(solid("tower-cranes-counterweight", craneMeshData.counterweight, [75, 85, 99, 255], true));
+    if (craneMeshData.cab.length > 0) out.push(solid("tower-cranes-cab", craneMeshData.cab, [255, 255, 255, 255], true));
+    // 선회 범위 원판(전방위 모드)은 판정 보조 표시 — 픽 대상 아님
+    if (craneMeshData.sweep.length > 0) out.push(solid("tower-cranes-sweep", craneMeshData.sweep, [249, 115, 22, 70], false));
+    if (craneLowZoom) {
+      out.push(new ScatterplotLayer<TowerCrane>({
+        id: "tower-cranes-marker",
+        data: towerCranes,
+        getPosition: (c) => [c.longitude, c.latitude],
+        getFillColor: [249, 115, 22, 230],
+        getRadius: 60,
+        radiusMinPixels: 4,
+        pickable: false,
+      }));
+    }
+    return out;
+  }, [craneMeshData, craneLowZoom, towerCranes, hiddenBuildingSources, braResult]);
+
   // 파노라마 전용 deck.gl 레이어 (파노라마 모드 활성 시에만 재생성)
   const panoramaDeckLayers = useMemo(() => {
     if (!panoramaViewActive || !panoramaActivePoint) return [];
@@ -4920,6 +5080,9 @@ export default function TrackMap() {
     // BRA 원추면 + 침범 건물 오버레이 합성 (별도 useMemo) — CoS 와 동일한 depth 미기록 반투명
     layers.push(...braDeckLayers);
 
+    // 타워크레인 3D 모델 합성 (별도 useMemo) — 불투명 구조라 depth 미기록 반투명(CoS/BRA) 뒤에 와도 결과 동일
+    layers.push(...craneDeckLayers);
+
     // LoS 단면도 건물 호버/클릭 하이라이트 (건물 오버레이 비활성 상태에서도 표시)
     if (losBuildingHighlight) {
       layers.push(
@@ -4992,7 +5155,7 @@ export default function TrackMap() {
     layers.push(...panoramaDeckLayers);
 
     return layers;
-  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, trackHeatBitmap, lossHeatBitmap, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, psrOnlyDeckLayers, losBuildingHighlight, airplaneMarkers]);
+  }, [filteredTrackPaths, filteredSinglePoints, filteredDotPoints, trackHeatBitmap, lossHeatBitmap, altScale, radarInfo, losMode, trackDisplay, aircraft, selectedModeS, losDeckLayers, coverageDeckLayers, tiles3dDeckLayers, selMarkerDeckLayers, cosDeckLayers, braDeckLayers, craneDeckLayers, lossDeckLayers, panoramaDeckLayers, weatherDeckLayers, psrOnlyDeckLayers, losBuildingHighlight, airplaneMarkers]);
 
   // Aircraft name lookup
   const getAircraftName = useCallback(
@@ -5464,14 +5627,52 @@ export default function TrackMap() {
   const handleBraRowClick = useCallback((b: BraBuilding) => {
     const map = mapRef.current?.getMap();
     if (map) map.easeTo({ center: [b.lon, b.lat], zoom: Math.max(map.getZoom(), 15), duration: 600 });
+    // 타워크레인은 건축물대장 조회 대상이 아니라 드로어를 열지 않는다 — 카메라 이동만
+    if (b.source === "crane") return;
     openBldgDrawerFor({ lat: b.lat, lon: b.lon, name: b.name ?? undefined, height: b.height_m, usage: b.usage ?? undefined, base: b.ground_elev_m, source: b.source, measured: b.measured });
   }, [openBldgDrawerFor]);
+
+  /** BRA 원추 반경 이내 타워크레인 — 드로어 지브 조정 대상(라이브 반경 슬라이더 기준 haversine) */
+  const cranesInRange = useMemo(() => {
+    const out: TowerCrane[] = [];
+    for (const c of towerCranes) {
+      if (haversineKm(radarSite.latitude, radarSite.longitude, c.latitude, c.longitude) <= braConeRadiusKm) out.push(c);
+    }
+    return out;
+  }, [towerCranes, radarSite.latitude, radarSite.longitude, braConeRadiusKm]);
+
+  /** 지브 즉시조정 디바운스 타이머(크레인별) — 슬라이더 드래그 중 invoke 폭주 방지.
+   *  언마운트에서 취소하지 않는다: 마지막 조정은 DB 에 반영돼야 한다(드로어 닫기 = 취소 아님). */
+  const craneJibTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+
+  /** 지브 방위각·선회 모드 즉시 조정 — 낙관 반영(3D 모델·BRA 세대 즉시) + 300ms 디바운스 영속.
+   *  성공 시 'tower-cranes-changed' 발신(다른 창 동기화). 자기 창이 되받아도 스토어 재조회뿐이라 루프 없음.
+   *  실패는 DB 값 재조회로 되돌리고 콘솔 에러 — 조용한 무시 금지. */
+  const applyCraneJib = useCallback((id: number, jibAzimuthDeg: number, rotationMode: CraneRotationMode) => {
+    useAppStore.setState((st) => ({
+      towerCranes: st.towerCranes.map((c) => (c.id === id ? { ...c, jib_azimuth_deg: jibAzimuthDeg, rotation_mode: rotationMode } : c)),
+    }));
+    const timers = craneJibTimersRef.current;
+    const prev = timers.get(id);
+    if (prev) clearTimeout(prev);
+    timers.set(id, setTimeout(() => {
+      timers.delete(id);
+      invoke("update_tower_crane_jib", { id, jibAzimuthDeg, rotationMode })
+        .then(() => { emit("tower-cranes-changed", {}).catch(() => {}); })
+        .catch((e) => {
+          console.error("타워크레인 지브 조정 저장 실패:", e);
+          loadTowerCranes();
+        });
+    }, 300));
+  }, [loadTowerCranes]);
 
   // ── 좌측 도구 드로어 본문: BRA 분석 ──
   const renderBraToolBody = () => {
     const micro: React.CSSProperties = { fontSize: 8.5, fontWeight: 700, letterSpacing: ".06em", color: G[400], textTransform: "uppercase" };
     const num: React.CSSProperties = { fontFamily: "ui-monospace, monospace", fontVariantNumeric: "tabular-nums", fontWeight: 700 };
     const card: React.CSSProperties = { borderRadius: 9, border: `1px solid ${G[200]}`, background: "#fff", padding: "9px 10px" };
+    /** 섹션 헤더 소형 버튼 (타워크레인 일괄 모드 전환) */
+    const chipBtn: React.CSSProperties = { fontSize: 9, fontWeight: 700, color: G[600], background: "#fff", border: `1px solid ${G[300]}`, borderRadius: 5, padding: "2px 6px", cursor: "pointer", flexShrink: 0 };
     const antennaM = radarSite.altitude + radarSite.antenna_height;
     const list = braResult?.buildings ?? [];
     const MAX_ROWS = BRA_MAX_ROWS;
@@ -5570,6 +5771,96 @@ export default function TrackMap() {
               </div>
             </div>
           )}
+
+          {/* 타워크레인 — 지브 방위·선회 모드를 지도에서 바로 바꿔 보며 판정. 변경은 즉시 DB 영속 + 재분석 */}
+          <div style={{ padding: "9px 11px", borderBottom: `1px solid ${G[200]}` }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 7 }}>
+              <span style={{ ...micro, flex: 1, minWidth: 0 }}>Tower Crane · 타워크레인</span>
+              {cranesInRange.length > 0 && (
+                <>
+                  <button onClick={() => { for (const c of cranesInRange) applyCraneJib(c.id, c.jib_azimuth_deg, "full"); }} style={chipBtn}>전체 전방위</button>
+                  <button onClick={() => { for (const c of cranesInRange) applyCraneJib(c.id, c.jib_azimuth_deg, "fixed"); }} style={chipBtn}>전체 고정</button>
+                </>
+              )}
+            </div>
+            {cranesInRange.length === 0 ? (
+              <div style={{ fontSize: 9.5, color: G[400] }}>반경 내 타워크레인 없음 (자료관리에서 등록)</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {cranesInRange.map((c) => (
+                  <div key={c.id} style={card}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: G[700], flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                      <span style={{ ...num, fontSize: 9.5, color: G[500], flexShrink: 0 }}>지브고 {c.jib_height}m · L {c.jib_length}m</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 4, marginTop: 5 }}>
+                      {(["fixed", "full"] as const).map((m) => (
+                        <button key={m} onClick={() => applyCraneJib(c.id, c.jib_azimuth_deg, m)}
+                          style={{ flex: 1, fontSize: 10, fontWeight: 700, padding: "3px 0", borderRadius: 5, cursor: "pointer",
+                            border: `1px solid ${c.rotation_mode === m ? ACCENT : G[300]}`,
+                            background: c.rotation_mode === m ? ACCENT : "#fff",
+                            color: c.rotation_mode === m ? "#fff" : G[600] }}>
+                          {m === "fixed" ? "고정" : "전방위"}
+                        </button>
+                      ))}
+                    </div>
+                    {c.rotation_mode === "fixed" && (
+                      <div style={{ marginTop: 5 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                          <span style={{ fontSize: 10, color: G[500], flex: 1 }}>지브 방위각</span>
+                          <span style={{ ...num, fontSize: 10, color: ACCENT }}>{c.jib_azimuth_deg.toFixed(0)}°</span>
+                        </div>
+                        <DsSlider value={c.jib_azimuth_deg} min={0} max={359} step={1} onChange={(v) => applyCraneJib(c.id, v, "fixed")} />
+                      </div>
+                    )}
+                    {/* 방위각별 판정 — 지브를 1° 씩 돌려 본 최악/최선각 (Rust bra.rs sweep_crane) */}
+                    {(() => {
+                      const sweep = braResult?.cranes.find((sw) => sw.id === c.id);
+                      if (!sweep) {
+                        // 분석 전이거나 스캔 반경 밖(해석적 상한으로 반경이 줄어든 경우) — 스윕 없음
+                        return <div style={{ fontSize: 9, color: G[400], marginTop: 6 }}>BRA 분석 실행 후 방위각별 판정 표시</div>;
+                      }
+                      // 최악−최선 차가 미미하면 방위와 무관 — 마스트가 판정을 지배한다
+                      const flat = sweep.worst_exceed_m - sweep.best_exceed_m < 0.05;
+                      return (
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}>
+                            {flat ? (
+                              <div style={{ fontSize: 10, color: G[500], lineHeight: 1.35 }}>
+                                방위 무관 — 마스트 단독 <span style={{ ...num, color: sweep.mast_exceed_m > 0 ? "#e94560" : G[600] }}>{fmtExceed(sweep.mast_exceed_m)} m</span>
+                              </div>
+                            ) : (
+                              <>
+                                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                                  <span style={{ fontSize: 9.5, color: G[500], flexShrink: 0 }}>최악</span>
+                                  <span style={{ ...num, fontSize: 10, color: G[700], flexShrink: 0 }}>{sweep.worst_deg}°</span>
+                                  <span style={{ ...num, fontSize: 10, flex: 1, minWidth: 0, color: sweep.worst_exceed_m > 0 ? "#e94560" : G[500] }}>{fmtExceed(sweep.worst_exceed_m)} m</span>
+                                  <button onClick={() => applyCraneJib(c.id, sweep.worst_deg, "fixed")} style={chipBtn}>적용</button>
+                                </div>
+                                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                                  <span style={{ fontSize: 9.5, color: G[500], flexShrink: 0 }}>최선</span>
+                                  <span style={{ ...num, fontSize: 10, color: G[700], flexShrink: 0 }}>{sweep.best_deg}°</span>
+                                  <span style={{ ...num, fontSize: 10, flex: 1, minWidth: 0, color: sweep.best_exceed_m > 0 ? "#e94560" : "#16a34a" }}>{fmtExceed(sweep.best_exceed_m)} m</span>
+                                  <button onClick={() => applyCraneJib(c.id, sweep.best_deg, "fixed")} style={chipBtn}>적용</button>
+                                </div>
+                                {sweep.mast_exceed_m > 0 && (
+                                  <div style={{ fontSize: 9, color: G[400], lineHeight: 1.3 }}>마스트만으로 +{sweep.mast_exceed_m.toFixed(1)} m 초과(어느 방위든 침범)</div>
+                                )}
+                              </>
+                            )}
+                          </div>
+                          <CraneSweepRing sweep={sweep} jibAzimuthDeg={c.rotation_mode === "fixed" ? c.jib_azimuth_deg : null} />
+                        </div>
+                      );
+                    })()}
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ fontSize: 9, color: G[400], marginTop: 6, lineHeight: 1.4 }}>
+              BRA 침범 검사에만 반영 — LoS·파노라마·커버리지 미반영(1단계)
+            </div>
+          </div>
 
           {/* 침범 건물 리스트 */}
           <div style={{ padding: "9px 11px", flex: 1, minHeight: 150, display: "flex", flexDirection: "column" }}>
@@ -5683,6 +5974,7 @@ export default function TrackMap() {
               <div style={micro}>건물 출처</div>
               {srcRow("건물통합정보", "GIS", !hiddenBuildingSources.has("fac"), () => toggleSource("fac"))}
               {srcRow("수동 건물", "등록", !hiddenBuildingSources.has("manual"), () => toggleSource("manual"))}
+              {srcRow("타워크레인", "등록", !hiddenBuildingSources.has("crane"), () => toggleSource("crane"))}
             </div>
             <div style={{ padding: "11px 13px", borderBottom: "1px solid #e5e7eb", display: "flex", flexDirection: "column", gap: 10 }}>
               <div style={micro}>표현 방식</div>
@@ -6141,6 +6433,10 @@ export default function TrackMap() {
                 <span className="text-gray-600">{bldgHoverTip.height.toFixed(1)} m</span>
               </div>
             )}
+            {/* 타워크레인 호버 — 지브고·지브길이·선회 모드 (BRA 초과 행은 건물 전용이라 표시되지 않는다) */}
+            {bldgHoverTip.crane && (
+              <div className="mt-1 text-gray-600">{bldgHoverTip.crane}</div>
+            )}
             {/* BRA 도구 활성 중에만 초과·여유고도 표기 — 호버 시에만 도는 경량 산술이라 메모 불요 */}
             {activeTool === "bra" && bldgHoverTip.lat != null && bldgHoverTip.lon != null
               && bldgHoverTip.height != null && bldgHoverTip.base != null && (() => {
@@ -6292,6 +6588,21 @@ export default function TrackMap() {
                       />
                       <span className={`inline-block h-2 w-2 rounded-full transition-opacity ${hiddenBuildingSources.has("fac") ? "opacity-25" : ""}`} style={{ backgroundColor: "#e5e7eb" }} />
                       <span className={`transition-opacity ${hiddenBuildingSources.has("fac") ? "text-gray-300 line-through" : "text-gray-600"} group-hover:text-gray-700`}>건물통합정보</span>
+                    </label>
+                    {/* 타워크레인 — 건물 출처와 같은 집합(hiddenBuildingSources)으로 BRA 침범 리스트 필터까지 공유 */}
+                    <label className="group flex cursor-pointer items-center gap-1.5 select-none">
+                      <input
+                        type="checkbox"
+                        checked={!hiddenBuildingSources.has("crane")}
+                        onChange={() => setHiddenBuildingSources(prev => {
+                          const next = new Set(prev);
+                          if (next.has("crane")) next.delete("crane"); else next.add("crane");
+                          return next;
+                        })}
+                        className="sr-only"
+                      />
+                      <span className={`inline-block h-2 w-2 rounded-full transition-opacity ${hiddenBuildingSources.has("crane") ? "opacity-25" : ""}`} style={{ backgroundColor: "#f97316" }} />
+                      <span className={`transition-opacity ${hiddenBuildingSources.has("crane") ? "text-gray-300 line-through" : "text-gray-600"} group-hover:text-gray-700`}>타워크레인</span>
                     </label>
                   </>
                 )}

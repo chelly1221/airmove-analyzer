@@ -10,6 +10,7 @@ import type {
 } from "../types";
 import type { CoverageLayer } from "./radarCoverage";
 import type { BraReviewPayload } from "./braReviewAnalysis";
+import type { CraneReviewPayload } from "./craneReviewShared";
 
 // ── 보고서 템플릿/섹션 타입 (ReportGeneration과 공유) ──
 // 장애물 월간(OM) 보고서 단일 템플릿만 제공.
@@ -160,6 +161,8 @@ const CONFIG_KEY = "config";
 const REQUEST_KEY = "request";
 /** 전파영향성 검토 의견서 페이로드 (TrackMap → bra-review 창) */
 const BRAREVIEW_KEY = "brareview";
+/** 타워크레인 전파영향 검토 보고서 페이로드 키 (메인 창 → crane-review 창) */
+const CRANEREVIEW_KEY = "cranereview";
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -308,6 +311,31 @@ export async function readBraReviewPayload(): Promise<BraReviewPayload | null> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readonly");
     const req = tx.objectStore(STORE_NAME).get(BRAREVIEW_KEY);
+    req.onsuccess = () => { db.close(); resolve(req.result ?? null); };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+
+// ── 타워크레인 전파영향 검토 보고서 페이로드 (메인 창 보고서 생성 → crane-review 창) ──
+// 의견서와 같은 IDB(report-transfer/data)를 키만 달리해 공유한다. 타입 단일 원천은 craneReviewShared.ts.
+
+/** 메인 창 → IDB 에 크레인 검토 입력 페이로드 저장 */
+export async function writeCraneReviewPayload(payload: CraneReviewPayload): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(payload, CRANEREVIEW_KEY);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+/** 크레인 검토 창 → IDB 에서 입력 페이로드 읽기 */
+export async function readCraneReviewPayload(): Promise<CraneReviewPayload | null> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const req = tx.objectStore(STORE_NAME).get(CRANEREVIEW_KEY);
     req.onsuccess = () => { db.close(); resolve(req.result ?? null); };
     req.onerror = () => { db.close(); reject(req.error); };
   });

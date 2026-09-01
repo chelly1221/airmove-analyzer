@@ -19,7 +19,8 @@ export type {
   BuildingModalDraft,
 } from "./building";
 export type { PanoramaPoint, BuildingObstacle, PanoramaMergeResult, PanoramaMergeDualResult } from "./panorama";
-export type { BraBuilding, BraResult } from "./bra";
+export type { BraBuilding, BraCraneSweep, BraResult } from "./bra";
+export type { CraneRotationMode, TowerCrane, TowerCraneInput } from "./crane";
 export type {
   DualTargetObservation,
   DualTargetReflector,

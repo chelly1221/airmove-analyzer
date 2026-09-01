@@ -76,6 +76,11 @@ App.tsx `useRestoreSettings()`: DB에서 설정/LOS/보고서/커버리지 복�
 - 적용은 `srtm.rs::load_tile` 로드 시점 인메모리 머지 단 한 곳 — **원본 `srtm_tiles` BLOB 불변**, `get_elevation`/`elevation_from_tiles` 핫패스는 무변경
 - 델타 클램프 30m(초과=이상치 폐기)·페더 2셀(체비쇼프 `w=1−d/3`, void 노드/이웃 제외). 임포트는 보정 확정 → `clear_cache()` → SRTM 프리로드 순서 필수(상쇄 불변식: 실측 높이 = maxH − liveSRTM)
 
+### 타워크레인 (tower_cranes)
+- 건물과 별도 자료 — 등록 제원(지브 설치고/최상단/지브·카운터지브 길이/방위각/선회 모드)으로 절차 생성 3D(`src/utils/craneGeometry.ts`, 외부 glTF 없음) 표시
+- 분석 반영은 **BRA 침범 검사만**(`analysis/bra.rs` — 마스트/지브/카운터지브 또는 선회 범위 원판을 부위별 판정 후 초과량 최대 1건). LoS 단면도·파노라마·커버리지·OM 보고서는 미반영 — 지상 기립 프리즘(밑면=지반) 전제라 밑면이 뜬 지브를 넣으면 지상까지 막는 벽으로 오판(2단계 `base_m` 지원 후)
+- 선회 모드 `fixed`(고정 방위각)/`full`(전방위 최악조건)과 방위각은 DB 영속 — 지도에서 즉시 변경(`update_tower_crane_jib`) 후 `tower-cranes-changed` 이벤트로 크로스윈도우 전파
+
 ### 좌표 변환 (coord.rs)
 - **EPSG:5186** → WGS84: 중앙자오선 127°E (건물통합정보, 토지이용)
 - **EPSG:5179** → WGS84: 중앙자오선 127.5°E (N3P 산봉우리)

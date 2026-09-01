@@ -9,16 +9,18 @@ import {
   ChevronDown,
   Folder,
   Minus,
+  Construction,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl/maplibre";
 import Modal from "../components/common/Modal";
 import { SrtmDownloadSection, FacBuildingDataSection, MeasuredBuildingDataSection, LandUseDataSection, PeakDataSection } from "./Settings";
-import type { BuildingGroup, ManualBuilding } from "../types";
+import type { BuildingGroup, ManualBuilding, TowerCrane, TowerCraneInput } from "../types";
 import { MAP_STYLE_URL } from "../utils/radarConstants";
 import { ensureLanduseProtocol } from "../utils/landuseProtocol";
 import BuildingModal, { shapeTypeLabel, makeInitialDraft, type BuildingFormData } from "../components/BuildingModal";
+import TowerCraneModal from "../components/TowerCraneModal";
 import { useAppStore } from "../store";
 
 // ─── 건물 목록 패널 ──────────────────────────────────────────────
@@ -682,6 +684,173 @@ function ManualBuildingPanel() {
   );
 }
 
+// ─── 타워크레인 패널 ────────────────────────────────────────────
+
+/** 타워크레인 변경(등록·수정·삭제)을 다른 창(지도)에 알림 (fire-and-forget).
+ *  수동 건물과 동일 계약 — payload 없이 "변경됨"만 알리고 수신 창이 DB 재조회(재영속 금지).
+ *  지도 창의 지브 즉시조정(update_tower_crane_jib)도 같은 이벤트를 발신한다. */
+const emitTowerCranesChanged = () => {
+  emit("tower-cranes-changed", {}).catch(() => {});
+};
+
+function TowerCranePanel() {
+  const [cranes, setCranes] = useState<TowerCrane[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [cardOpen, setCardOpen] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState<TowerCrane | null>(null);
+  /** 목록 조회·삭제 실패 표시 (조용히 삼키지 않는다) */
+  const [error, setError] = useState<string | null>(null);
+
+  const loadData = useCallback(async () => {
+    try {
+      const list = await invoke<TowerCrane[]>("list_tower_cranes");
+      setCranes(list);
+      setError(null);
+    } catch (e) {
+      console.error("타워크레인 목록 로드 실패:", e);
+      setError(`목록 로드 실패: ${e}`);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  // 타워크레인 변경 이벤트 수신 → 목록 재조회.
+  //   지도 창 BRA 드로어의 지브 방위각·선회 모드 즉시조정, Rust 자동 지반고 재동기화가 발신원.
+  useEffect(() => {
+    const un = listen("tower-cranes-changed", () => { loadData(); });
+    return () => { un.then((fn) => fn()); };
+  }, [loadData]);
+
+  /** 저장 — 실패는 모달로 rethrow 해서 열린 채 에러를 보여 준다 */
+  const handleSave = async (input: TowerCraneInput) => {
+    try {
+      if (editTarget) await invoke("update_tower_crane", { id: editTarget.id, input });
+      else await invoke("add_tower_crane", { input });
+    } catch (e) {
+      console.error("타워크레인 저장 실패:", e);
+      throw e;
+    }
+    setModalOpen(false);
+    setEditTarget(null);
+    await loadData();
+    emitTowerCranesChanged();
+  };
+
+  const handleDelete = async (c: TowerCrane) => {
+    try {
+      await invoke("delete_tower_crane", { id: c.id });
+      await loadData();
+      emitTowerCranesChanged();
+    } catch (e) {
+      console.error("타워크레인 삭제 실패:", e);
+      setError(`삭제 실패: ${e}`);
+    }
+  };
+
+  const openAdd = () => { setEditTarget(null); setModalOpen(true); };
+  const openEdit = (c: TowerCrane) => { setEditTarget(c); setModalOpen(true); };
+
+  return (
+    <>
+      <div className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden px-5 py-[13px] cursor-pointer select-none" onClick={(e) => { if (!(e.target as HTMLElement).closest("button, a")) setCardOpen((c) => !c); }}>
+        {/* Header — 수동 등록 건물 카드와 동일한 grid 레이아웃 */}
+        <div className="grid items-center gap-3" style={{ gridTemplateColumns: "160px 1fr auto" }}>
+          <div className="flex items-center gap-2">
+            <ChevronDown size={14} className={`text-gray-400 shrink-0 transition-transform duration-200 ${!cardOpen ? "-rotate-90" : ""}`} />
+            <Construction size={16} className="text-[#a60739] shrink-0" />
+            <h2 className="text-sm font-semibold text-gray-800 whitespace-nowrap">타워크레인</h2>
+          </div>
+          <div className="flex items-center gap-2 min-w-0">
+            {!loading && cranes.length > 0 ? (
+              <span className="text-xs text-gray-600">{cranes.length}기 등록</span>
+            ) : (
+              <span className="text-xs text-gray-400">BRA 침범 검사에 반영할 타워크레인을 등록합니다</span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={openAdd}
+              className="flex items-center gap-1.5 rounded-lg bg-[#a60739] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#8a0630]"
+            >
+              <Plus size={13} />
+              크레인 추가
+            </button>
+          </div>
+        </div>
+
+        {/* Expanded body */}
+        {cardOpen && (
+          <div className="mt-3 space-y-3" onClick={(e) => e.stopPropagation()}>
+            {/* 1단계 반영 범위 안내 — 지브는 밑면이 떠 있어 지상기립 프리즘 전제 경로에 넣지 않는다 */}
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-700">
+              타워크레인은 BRA 침범 검사에 반영됩니다 (LoS·파노라마·커버리지 미반영 — 1단계)
+            </div>
+            {error && (
+              <div className="rounded-lg border border-[#e94560]/30 bg-[#e94560]/5 px-3 py-1.5 text-[11px] text-[#e94560]">{error}</div>
+            )}
+            {loading ? (
+              <div className="flex items-center justify-center py-12 text-gray-400">
+                <Loader2 size={20} className="animate-spin" />
+              </div>
+            ) : cranes.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-gray-300 py-12 text-center">
+                <Construction size={32} className="mx-auto mb-2 text-gray-300" />
+                <p className="text-sm text-gray-400">등록된 타워크레인이 없습니다</p>
+                <button onClick={openAdd} className="mt-3 text-sm font-medium text-[#a60739] hover:underline">
+                  타워크레인 추가하기
+                </button>
+              </div>
+            ) : (
+              <div className="divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200 bg-white">
+                {cranes.map((c) => (
+                  <div key={c.id} className="group flex items-center gap-3 px-3 py-2 transition-colors hover:bg-gray-100">
+                    <Construction size={14} className="shrink-0 text-orange-400" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline gap-2">
+                        <span className="truncate text-sm font-medium text-gray-800">{c.name}</span>
+                        <span className="text-[10px] text-gray-400">지브고 {c.jib_height}m · 최상단 {c.top_height}m</span>
+                        <span className={`rounded px-1 text-[9px] font-medium ${c.rotation_mode === "full" ? "bg-orange-100 text-orange-600" : "bg-gray-200 text-gray-500"}`}>
+                          {c.rotation_mode === "full" ? "전방위" : "고정"}
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-gray-400">
+                        지브 L {c.jib_length}m · 카운터 Lc {c.counter_jib_length}m · θ {c.jib_azimuth_deg.toFixed(0)}°
+                        {` · ${c.latitude.toFixed(4)}°N, ${c.longitude.toFixed(4)}°E`}
+                        {c.ground_elev !== 0 && ` · 표고 ${c.ground_elev}m`}
+                        {c.memo && ` · ${c.memo}`}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                      <button onClick={() => openEdit(c)} title="수정"
+                        className="rounded p-1 text-gray-400 transition-colors hover:bg-gray-200 hover:text-gray-700">
+                        <Pencil size={12} />
+                      </button>
+                      <button onClick={() => handleDelete(c)} title="삭제"
+                        className="rounded p-1 text-gray-400 transition-colors hover:bg-red-100 hover:text-red-600">
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <TowerCraneModal
+        open={modalOpen}
+        onClose={() => { setModalOpen(false); setEditTarget(null); }}
+        onSave={handleSave}
+        initial={editTarget}
+      />
+    </>
+  );
+}
+
 // ─── 메인 페이지 ─────────────────────────────────────────────────
 
 export default function FileUpload() {
@@ -690,6 +859,9 @@ export default function FileUpload() {
     <div className="space-y-4">
       {/* ── 수동 등록 건물 ── */}
       <ManualBuildingPanel />
+
+      {/* ── 타워크레인 (BRA 침범 검사 반영 — 1단계) ── */}
+      <TowerCranePanel />
 
       {/* ── 참조 데이터 (건물 + 산 이름 + SRTM 지형) ── */}
       <div className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">

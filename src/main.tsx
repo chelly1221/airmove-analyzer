@@ -14,6 +14,7 @@ const TrackMapApp = lazy(() => import("./apps/TrackMapApp"));
 const DrawingApp = lazy(() => import("./apps/DrawingApp"));
 const ReportApp = lazy(() => import("./apps/ReportApp"));
 const BraReviewApp = lazy(() => import("./apps/BraReviewApp"));
+const CraneReviewApp = lazy(() => import("./apps/CraneReviewApp"));
 
 // 프론트엔드 크래시 시 오류 다이얼로그 (개발자 모드 전용)
 function showErrorDialog(title: string, detail: string) {
@@ -108,6 +109,8 @@ function RootApp() {
   if (windowLabel === "report") return <ReportApp />;
   // 전파영향성 검토 의견서 창 — TrackMap 건축물정보 드로어에서 오픈, 자체 분석 후 PDF 저장
   if (windowLabel === "bra-review") return <BraReviewApp />;
+  // 타워크레인 전파영향 검토 보고서 창 — 보고서 생성 페이지에서 오픈, 자체 분석 후 PDF 저장
+  if (windowLabel === "crane-review") return <CraneReviewApp />;
   return <App />;
 }
 

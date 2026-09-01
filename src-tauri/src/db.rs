@@ -54,6 +54,25 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             memo TEXT NOT NULL DEFAULT ''
         );
 
+        -- 타워크레인 등록 (BRA 침범 검사 전용 — LoS·파노라마·커버리지 미반영, 1단계)
+        CREATE TABLE IF NOT EXISTS tower_cranes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            ground_elev REAL NOT NULL DEFAULT 0,      -- 지반 표고 m AMSL (저장값이 곧 계약 — manual_buildings 와 동일)
+            elev_mode TEXT NOT NULL DEFAULT 'auto',   -- 'auto'(SRTM 스냅샷) | 'manual'
+            jib_height REAL NOT NULL,                 -- 지브 설치고 (지브 하단, m AGL)
+            top_height REAL NOT NULL,                 -- 최상단(타워탑/캣헤드 정점, m AGL) >= jib_height
+            jib_length REAL NOT NULL,                 -- 지브 길이 m (마스트 중심 기준)
+            counter_jib_length REAL NOT NULL,         -- 카운터지브 길이 m
+            jib_azimuth_deg REAL NOT NULL DEFAULT 0,  -- 지브 방위각 (정북 0, 시계방향)
+            rotation_mode TEXT NOT NULL DEFAULT 'fixed', -- 'fixed' | 'full'
+            mast_width REAL NOT NULL DEFAULT 2.0,     -- 마스트 단면 폭 m (정사각)
+            memo TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        );
+
         -- 수동 비행 병합 이력
         CREATE TABLE IF NOT EXISTS manual_merge_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

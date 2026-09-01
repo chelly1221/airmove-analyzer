@@ -17,6 +17,13 @@
 //! 후보 쿼리에서 `suppressed_by IS NULL` 로 단순 필터한다 — 조회 시점 겹침 계산 없음.
 //! 같은 자리의 중복 행이 침범 목록에 이중 계상되는 것을 막는다. 수동 등록 건물은 억제 대상 아님.
 //!
+//! **타워크레인**(`tower_cranes`, crane.rs)도 같은 원추면으로 함께 판정한다. 크레인 1기는
+//! 마스트/지브/카운터지브(또는 전방위 선회 범위) 부위로 나눠 각각 판정하고 **초과량이 가장 큰
+//! 부위 1건만** 결과에 올린다(크레인당 최대 1행, `source = "crane"`, `usage` = 그 부위명).
+//! 크레인 반영은 **BRA 침범 검사에 한정**한다 — LoS 단면도·파노라마·커버리지·OM 보고서는
+//! 지상 기립 프리즘(밑면 = 지반)을 전제하는데 지브는 밑면이 공중이라 지상까지 막는 벽으로
+//! 오판된다(1단계. 2단계 `base_m` 지원 후 반영).
+//!
 //! **대장↔대장 이중 임포트**는 위 억제 체계(수동/실측 우선순위 전용)로 걸러지지 않는다 —
 //! 광역본(F_FAC_BUILDING_경기)과 세분본(F_FAC_BUILDING_경기_부천시_소사구) SHP 가 같은 건물을
 //! 비트 동일한 centroid·높이·폴리곤으로 각각 싣기 때문. 결과 수준에서 `fold_fac_duplicates` 로 접는다.
@@ -37,6 +44,12 @@ const MAX_ROOF_MSL_M: f64 = 2_600.0;
 const FOOTPRINT_SLACK_M: f64 = 1000.0;
 /// Pass 2 폴리곤 조회 배치 크기 (id IN (...))
 const POLY_BATCH: usize = 500;
+/// 타워크레인 지브/카운터지브 폭 (m) — 트러스 하현 간격 (프론트 craneGeometry.ts 와 동일 값)
+const JIB_WIDTH_M: f64 = 2.0;
+/// 타워크레인 지브 트러스 높이 (m) — 지브 상단 AGL = jib_height + 이 값
+const JIB_TRUSS_H: f64 = 1.5;
+/// 전방위(full) 선회 범위 원판 근사 분할 수
+const SWEEP_SEGMENTS: usize = 64;
 
 /// BRA 침범 검사 결과
 #[derive(Serialize)]
@@ -47,7 +60,7 @@ pub struct BraResult {
     pub radar_height_m: f64,
     /// 스캔 반경 (km) — 요청 반경과 해석적 상한 중 작은 쪽
     pub max_range_km: f64,
-    /// 검사한 건물 수 (fac + manual)
+    /// 검사한 건물 수 (fac + manual + crane)
     pub scanned: u64,
     /// 침범 총수 (= buildings.len(), 대장 중복 접기 후)
     pub total_penetrating: u64,
@@ -57,20 +70,59 @@ pub struct BraResult {
     pub folded_duplicates: u64,
     /// 침범 건물 (exceed_m 내림차순, 전수)
     pub buildings: Vec<BraBuilding>,
+    /// 반경 내 타워크레인 방위각 스윕 (등록 순, 침범 여부 무관)
+    pub cranes: Vec<BraCraneSweep>,
+}
+
+/// 타워크레인 1기의 지브 방위각 스윕 판정 — 방위를 1° 씩 돌려 본 BRA 초과량 곡선과 최악/최선 방위.
+/// 초과량은 **부호를 유지**한다(양수 = 원추면 침범, 음수 = 여유).
+#[derive(Serialize)]
+pub struct BraCraneSweep {
+    /// tower_cranes.id
+    pub id: i64,
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// 마스트 중심까지 지표 거리 (km)
+    pub distance_km: f64,
+    /// 레이더 → 크레인 방위 (°, 정북=0, 시계방향)
+    pub azimuth_deg: f64,
+    /// 등록 상태 스냅샷 — 선회 모드 'fixed' | 'full'
+    pub rotation_mode: String,
+    /// 등록 상태 스냅샷 — 지브 방위각 (°)
+    pub jib_azimuth_deg: f64,
+    /// 마스트 단독(방위 무관) 초과량 (m) = ground + top_height − cone(마스트 최근접)
+    pub mast_exceed_m: f64,
+    /// 현재 등록 상태(선회 모드·방위각)의 초과량 (m) — 침범 행 exceed_m 과 같은 정의(음수 유지)
+    pub current_exceed_m: f64,
+    /// 초과량이 최대인 방위각 (°, 첫 등장)
+    pub worst_deg: u16,
+    /// 그 방위의 초과량 (m)
+    pub worst_exceed_m: f64,
+    /// 초과량이 최소인 방위각 (°, 첫 등장)
+    pub best_deg: u16,
+    /// 그 방위의 초과량 (m)
+    pub best_exceed_m: f64,
+    /// 전방위 최악조건 초과량 (m) — 선회 범위 원판(반경 max(지브, 카운터지브))으로 본 값.
+    /// 등록 선회 모드와 무관하게 항상 산출한다(보고서 "전방위 최악조건" 케이스).
+    pub full_exceed_m: f64,
+    /// θ = 0..359° 각각을 고정 지브로 봤을 때의 초과량 (m, 길이 360)
+    pub exceed_by_deg: Vec<f32>,
 }
 
 /// BRA 원추면을 침범한 건물 1동
 #[derive(Serialize)]
 pub struct BraBuilding {
-    /// fac_buildings.id 또는 manual_buildings.id
+    /// fac_buildings.id · manual_buildings.id · tower_cranes.id
     pub id: i64,
-    /// "fac" | "manual" (building.rs BuildingNearPoint 관례)
+    /// "fac" | "manual" | "crane" (building.rs BuildingNearPoint 관례)
     pub source: String,
     /// 실측(1m DSM) 지붕고 반영 여부
     pub measured: bool,
     pub name: Option<String>,
-    /// fac = dong_name, manual = memo
+    /// fac = dong_name, manual/crane = memo
     pub address: Option<String>,
+    /// fac = usability, crane = 초과량 최대 부위("마스트"|"지브"|"카운터지브"|"선회 범위")
     pub usage: Option<String>,
     /// centroid 위도
     pub lat: f64,
@@ -82,7 +134,7 @@ pub struct BraBuilding {
     pub azimuth_deg: f64,
     /// 지반 표고 (m AMSL)
     pub ground_elev_m: f64,
-    /// 건물 높이 (m, AGL)
+    /// 건물 높이 (m, AGL) — crane 은 판정에 쓰인 부위의 상단 AGL
     pub height_m: f64,
     /// 지붕 해발고 (m AMSL) = ground_elev_m + height_m
     pub total_height_m: f64,
@@ -113,7 +165,7 @@ fn enu_dist_m(cos_lat: f64, radar_lat: f64, radar_lon: f64, lat: f64, lon: f64) 
 
 /// 원추면이 MAX_ROOF_MSL_M 에 도달하는 지표거리 (m) — 그 밖은 어떤 건물도 침범 불가
 /// `h + d·t + d²/(2R) = MAX` 를 d 에 대해 푼 양근 (a=1/(2R), b=t, c=h−MAX)
-fn analytic_range_limit_m(radar_height_m: f64, tan_theta: f64) -> f64 {
+pub(crate) fn analytic_range_limit_m(radar_height_m: f64, tan_theta: f64) -> f64 {
     let c = radar_height_m - MAX_ROOF_MSL_M;
     if c >= 0.0 {
         return 0.0; // 안테나가 이미 상한 위 — 침범 가능한 건물 없음
@@ -152,6 +204,7 @@ pub fn analyze_penetration(
     let mut scanned: u64 = 0;
     let mut skipped_invalid_polygon: u64 = 0;
     let mut hits: Vec<BraBuilding> = Vec::new();
+    let mut crane_sweeps: Vec<BraCraneSweep> = Vec::new();
 
     // 스캔 반경 = 제원 범위와 해석적 상한 중 작은 쪽
     let d_max = (max_range_km * 1000.0).min(analytic_range_limit_m(radar_height_m, tan_theta));
@@ -165,6 +218,7 @@ pub fn analyze_penetration(
             skipped_invalid_polygon: 0,
             folded_duplicates: 0,
             buildings: Vec::new(),
+            cranes: Vec::new(),
         });
     }
 
@@ -410,6 +464,33 @@ pub fn analyze_penetration(
         }
     }
 
+    // ── 타워크레인 (tower_cranes) — 부위별 판정 후 초과량 최대 부위 1건만(크레인당 최대 1행).
+    //    지반은 저장된 ground_elev(수동 건물과 동일 계약), 기하는 등록 제원으로 절차 생성한다. ──
+    {
+        let geo_buffer = 0.01; // ~1.1km — 지브 길이(수십~수백 m) 커버 (수동 건물 블록과 동일 관례)
+        let cranes = crate::crane::list_in_bbox(
+            conn,
+            min_lat - geo_buffer,
+            max_lat + geo_buffer,
+            min_lon - geo_buffer,
+            max_lon + geo_buffer,
+        )?;
+        for c in &cranes {
+            scanned += 1;
+            if let Some(b) = judge_crane(
+                cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max, c,
+            ) {
+                hits.push(b);
+            }
+            // 방위각 스윕은 침범 여부와 무관하게 반경 안이면 항상 낸다 — 드로어가 여유(음수)도 표시한다
+            if let Some(sw) = sweep_crane(
+                cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max, c,
+            ) {
+                crane_sweeps.push(sw);
+            }
+        }
+    }
+
     // 대장 이중 임포트(광역본↔세분본) 접기 — 정렬 전에 수행해야 total_penetrating 이 실체 수와 맞는다
     let folded_duplicates = fold_fac_duplicates(&mut hits);
 
@@ -442,7 +523,75 @@ pub fn analyze_penetration(
         skipped_invalid_polygon,
         folded_duplicates,
         buildings: hits,
+        cranes: crane_sweeps,
     })
+}
+
+/// 폴리곤 경계(변 위 최근접점 포함) 중 레이더 원점에 가장 가까운 지점까지 지표거리 (m).
+///
+/// 변(i, i+1) 마다 원점→선분 최근접점 거리를 구해 최소값을 취한다 — 정점 전용 최소는 긴 변의
+/// 중간이 레이더 쪽으로 더 가까운 대형 풋프린트에서 거리를 과대평가(= 침범 누락)한다.
+/// 정점이 없거나 좌표가 NaN 이면 None(판정 불가를 그대로 드러낸다).
+fn nearest_boundary_dist_m(
+    cos_lat: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+    polygon: &[[f64; 2]],
+) -> Option<f64> {
+    // 정점을 레이더 원점 ENU (east, north) 로 1회 변환 — enu_dist_m 과 동일 스케일
+    let n = polygon.len();
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(n);
+    for p in polygon {
+        let east = (p[1] - radar_lon).to_radians() * EARTH_RADIUS_M * cos_lat;
+        let north = (p[0] - radar_lat).to_radians() * EARTH_RADIUS_M;
+        pts.push((east, north));
+    }
+    let mut d_min = f64::INFINITY;
+    for i in 0..n {
+        let (ax, ay) = pts[i];
+        let (bx, by) = pts[(i + 1) % n];
+        let (ex, ey) = (bx - ax, by - ay);
+        let len2 = ex * ex + ey * ey;
+        // 퇴화(선분 길이 0)면 t=0 → 그 정점까지의 거리
+        let t = if len2 > 0.0 {
+            (-(ax * ex + ay * ey) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (qx, qy) = (ax + ex * t, ay + ey * t);
+        let d = (qx * qx + qy * qy).sqrt();
+        if d < d_min {
+            d_min = d;
+        }
+    }
+    if d_min.is_finite() {
+        Some(d_min)
+    } else {
+        None
+    }
+}
+
+/// 부위 1개의 원추면 여유/초과량 (m) = `ground + top_agl − cone(최근접 경계 거리)`.
+///
+/// `judge` 와 달리 **음수(여유)도 그대로 반환**한다 — 방위각 스윕은 침범하지 않는 방위의
+/// 여유고까지 비교해야 최선각을 고를 수 있다. 최근접 경계점이 스캔 반경(d_max) 밖이면 None.
+#[allow(clippy::too_many_arguments)]
+fn part_margin_m(
+    cos_lat: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    tan_theta: f64,
+    d_max: f64,
+    ground_elev_m: f64,
+    top_agl_m: f64,
+    polygon: &[[f64; 2]],
+) -> Option<f64> {
+    let d_min = nearest_boundary_dist_m(cos_lat, radar_lat, radar_lon, polygon)?;
+    if d_min > d_max {
+        return None;
+    }
+    Some(ground_elev_m + top_agl_m - cone_msl(radar_height_m, tan_theta, d_min))
 }
 
 /// 확정 판정 — 폴리곤 경계(변 위 최근접점 포함) 중 레이더 최근접 지점에서 원추면을 넘는지.
@@ -469,37 +618,7 @@ fn judge(
     height_m: f64,
     polygon: Vec<[f64; 2]>,
 ) -> Option<BraBuilding> {
-    // 정점을 레이더 원점 ENU (east, north) 로 1회 변환 — enu_dist_m 과 동일 스케일
-    let n = polygon.len();
-    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(n);
-    for p in &polygon {
-        let east = (p[1] - radar_lon).to_radians() * EARTH_RADIUS_M * cos_lat;
-        let north = (p[0] - radar_lat).to_radians() * EARTH_RADIUS_M;
-        pts.push((east, north));
-    }
-    // 변(i, i+1) 마다 원점→선분 최근접점 거리를 구해 최소값 — 정점 전용 최소는 긴 변의 중간이
-    // 레이더 쪽으로 더 가까운 대형 풋프린트에서 거리를 과대평가(= 침범 누락)한다.
-    let mut d_min = f64::INFINITY;
-    for i in 0..n {
-        let (ax, ay) = pts[i];
-        let (bx, by) = pts[(i + 1) % n];
-        let (ex, ey) = (bx - ax, by - ay);
-        let len2 = ex * ex + ey * ey;
-        // 퇴화(선분 길이 0)면 t=0 → 정점 거리로 폴백
-        let t = if len2 > 0.0 {
-            (-(ax * ex + ay * ey) / len2).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let (qx, qy) = (ax + ex * t, ay + ey * t);
-        let d = (qx * qx + qy * qy).sqrt();
-        if d < d_min {
-            d_min = d;
-        }
-    }
-    if !d_min.is_finite() {
-        return None;
-    }
+    let d_min = nearest_boundary_dist_m(cos_lat, radar_lat, radar_lon, &polygon)?;
     if d_min > d_max {
         return None; // 최근접 경계점이 스캔 반경 밖 — 원추 표시 반경과 결과 정합 유지
     }
@@ -526,6 +645,262 @@ fn judge(
         cone_msl_m: cone,
         exceed_m,
         polygon,
+    })
+}
+
+/// 타워크레인 부위 1개 — BRA 판정 입력(수평 폴리곤 + 상단 높이).
+/// BRA 원추면은 지표거리와 해발고만 보므로 부위별 수평 단면 + 상단 AGL 이면 충분하다.
+struct CranePart {
+    /// 부위명 (결과 usage 표기)
+    usage: &'static str,
+    /// 상단 높이 (m AGL)
+    top_agl_m: f64,
+    /// 폴리곤 [[lat, lon], ...]
+    polygon: Vec<[f64; 2]>,
+}
+
+/// 크레인 중심 기준 ENU(m) → [lat, lon] — `enu_dist_m` 의 역변환(동일 평면 스케일, 실제지구 반경)
+#[inline]
+fn crane_enu_to_latlon(clat: f64, clon: f64, cos_clat: f64, east: f64, north: f64) -> [f64; 2] {
+    [
+        clat + (north / EARTH_RADIUS_M).to_degrees(),
+        clon + (east / (EARTH_RADIUS_M * cos_clat)).to_degrees(),
+    ]
+}
+
+/// 마스트 수평 단면 폴리곤 — 중심 정사각(변 mast_width). `crane_parts` 와 방위각 스윕 공용.
+fn crane_mast_polygon(c: &crate::crane::TowerCrane) -> Vec<[f64; 2]> {
+    let cos_clat = c.latitude.to_radians().cos().max(0.5);
+    let h = c.mast_width / 2.0;
+    let to_ll = |east: f64, north: f64| {
+        crane_enu_to_latlon(c.latitude, c.longitude, cos_clat, east, north)
+    };
+    vec![to_ll(-h, -h), to_ll(h, -h), to_ll(h, h), to_ll(-h, h)]
+}
+
+/// 지브 계열 팔 1개의 수평 폴리곤 — 마스트 중심에서 방위 `theta_deg` 의 `sign` 방향(+1 지브 /
+/// −1 카운터지브)으로 길이 `len`, 폭 JIB_WIDTH_M 인 직사각형.
+/// 방위각은 정북 0·시계방향이므로 단위벡터는 (east, north) = (sin θ, cos θ).
+/// `crane_parts`(고정 모드)와 `sweep_crane` 이 **같은 기하**를 쓰도록 자유 함수로 분리한다.
+fn crane_arm_polygon(
+    c: &crate::crane::TowerCrane,
+    theta_deg: f64,
+    len: f64,
+    sign: f64,
+) -> Vec<[f64; 2]> {
+    let cos_clat = c.latitude.to_radians().cos().max(0.5);
+    let to_ll = |east: f64, north: f64| {
+        crane_enu_to_latlon(c.latitude, c.longitude, cos_clat, east, north)
+    };
+    let th = theta_deg.to_radians();
+    let (ue, un) = (th.sin(), th.cos()); // 지브 방향 단위벡터
+    let (pe, pn) = (un, -ue); // 폭 방향(지브에 수직)
+    let w = JIB_WIDTH_M / 2.0;
+    let (de, dn) = (ue * sign, un * sign);
+    vec![
+        to_ll(-pe * w, -pn * w),
+        to_ll(pe * w, pn * w),
+        to_ll(de * len + pe * w, dn * len + pn * w),
+        to_ll(de * len - pe * w, dn * len - pn * w),
+    ]
+}
+
+/// 전방위(full) 선회 범위 원판의 수평 폴리곤 — 마스트 중심, 반경 max(지브, 카운터지브)를
+/// 정 SWEEP_SEGMENTS 각형으로 근사. `crane_parts`(full 모드)와 `sweep_crane` 의
+/// 전방위 최악조건 산출이 **같은 기하**를 쓰도록 자유 함수로 분리한다.
+fn crane_full_disk_polygon(c: &crate::crane::TowerCrane) -> Vec<[f64; 2]> {
+    let cos_clat = c.latitude.to_radians().cos().max(0.5);
+    let r = c.jib_length.max(c.counter_jib_length);
+    let mut ring: Vec<[f64; 2]> = Vec::with_capacity(SWEEP_SEGMENTS);
+    for i in 0..SWEEP_SEGMENTS {
+        let a = std::f64::consts::TAU * (i as f64) / (SWEEP_SEGMENTS as f64);
+        ring.push(crane_enu_to_latlon(
+            c.latitude, c.longitude, cos_clat, r * a.sin(), r * a.cos(),
+        ));
+    }
+    ring
+}
+
+/// 타워크레인 제원 → 판정 부위 목록 (마스트 + 지브/카운터지브 또는 선회 범위 원판).
+fn crane_parts(c: &crate::crane::TowerCrane) -> Vec<CranePart> {
+    let mut parts: Vec<CranePart> = Vec::new();
+
+    // 마스트 — 중심 정사각(변 mast_width), 상단은 최상단(타워탑/캣헤드 정점)
+    parts.push(CranePart {
+        usage: "마스트",
+        top_agl_m: c.top_height,
+        polygon: crane_mast_polygon(c),
+    });
+
+    // 지브 계열 상단 = 지브 설치고(하현 밑면) + 트러스 높이
+    let jib_top = c.jib_height + JIB_TRUSS_H;
+    match c.rotation_mode.as_str() {
+        "full" => {
+            // 전방위 회전 최악조건 — 선회 반경 원판을 정다각형으로 근사
+            parts.push(CranePart {
+                usage: "선회 범위",
+                top_agl_m: jib_top,
+                polygon: crane_full_disk_polygon(c),
+            });
+        }
+        "fixed" => {
+            parts.push(CranePart {
+                usage: "지브",
+                top_agl_m: jib_top,
+                polygon: crane_arm_polygon(c, c.jib_azimuth_deg, c.jib_length, 1.0),
+            });
+            if c.counter_jib_length > 0.0 {
+                parts.push(CranePart {
+                    usage: "카운터지브",
+                    top_agl_m: jib_top,
+                    polygon: crane_arm_polygon(c, c.jib_azimuth_deg, c.counter_jib_length, -1.0),
+                });
+            }
+        }
+        other => {
+            // 저장 시 검증(crane.rs)을 통과한 값만 들어오므로 정상 경로에선 도달 불가.
+            // DB 직접 수정 등 이상값은 조용히 어느 한쪽으로 가정하지 않고 지브 부위를 만들지 않는다.
+            log::warn!(
+                "[BRA] 타워크레인 id={} 선회 모드 이상값 '{}' — 지브 부위 판정 생략(마스트만)",
+                c.id, other
+            );
+        }
+    }
+    parts
+}
+
+/// 타워크레인 1기 판정 — 부위별로 `judge` 를 돌려 **초과량 최대 부위 1건**만 반환.
+/// 크레인당 최대 1행이 결과에 오르며, 그 부위명이 `usage` 로 표기된다.
+#[allow(clippy::too_many_arguments)]
+fn judge_crane(
+    cos_lat: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    tan_theta: f64,
+    d_max: f64,
+    c: &crate::crane::TowerCrane,
+) -> Option<BraBuilding> {
+    let address = if c.memo.trim().is_empty() { None } else { Some(c.memo.clone()) };
+    let mut best: Option<BraBuilding> = None;
+    for part in crane_parts(c) {
+        let hit = judge(
+            cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max,
+            c.id, "crane", false,
+            Some(c.name.clone()), address.clone(), Some(part.usage.to_string()),
+            c.latitude, c.longitude, c.ground_elev, part.top_agl_m, part.polygon,
+        );
+        let Some(h) = hit else { continue };
+        if best.as_ref().map_or(true, |b| h.exceed_m > b.exceed_m) {
+            best = Some(h);
+        }
+    }
+    best
+}
+
+/// 타워크레인 1기 방위각 스윕 — 지브를 0..359° 로 1° 씩 돌려 각 방위의 초과량(음수 = 여유)을
+/// 구하고 최악(최대)/최선(최소) 방위를 뽑는다.
+///
+/// 마스트 중심이 스캔 반경 밖이면 None — 결과 `cranes` 에 올리지 않는다.
+/// 스윕 기하는 등록 선회 모드와 무관하게 **고정 지브**(`crane_arm_polygon`) 기준이다:
+/// "그 방위로 고정했을 때" 어떻게 판정되는지가 최악/최선각의 정의이기 때문.
+/// 부위 margin 이 None(반경 밖)이면 그 부위는 비교에서 제외한다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_crane(
+    cos_lat: f64,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    tan_theta: f64,
+    d_max: f64,
+    c: &crate::crane::TowerCrane,
+) -> Option<BraCraneSweep> {
+    let d_center = enu_dist_m(cos_lat, radar_lat, radar_lon, c.latitude, c.longitude);
+    if d_center > d_max {
+        return None;
+    }
+    let margin = |top_agl_m: f64, polygon: &[[f64; 2]]| {
+        part_margin_m(
+            cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max,
+            c.ground_elev, top_agl_m, polygon,
+        )
+    };
+
+    // 마스트 단독(방위 무관) — 스윕 곡선의 하한선. 마스트 최근접 경계는 중심보다 가까우므로
+    // 중심이 반경 안이면 항상 값이 나온다(None = 좌표 이상값 → 스윕 자체를 포기).
+    let mast_exceed_m = margin(c.top_height, &crane_mast_polygon(c))?;
+
+    // 등록 상태(선회 모드·방위각) 그대로의 초과량 — 침범 행 exceed_m 과 같은 정의(음수 유지)
+    let mut current = f64::NEG_INFINITY;
+    for part in crane_parts(c) {
+        if let Some(m) = margin(part.top_agl_m, &part.polygon) {
+            if m > current {
+                current = m;
+            }
+        }
+    }
+    // 선회 반경이 커서 부위가 전부 반경 밖으로 밀린 경우 마스트 값이 현재 판정값
+    let current_exceed_m = if current.is_finite() { current } else { mast_exceed_m };
+
+    // 지브 계열 상단 = 지브 설치고(하현 밑면) + 트러스 높이 (crane_parts 와 동일)
+    let jib_top = c.jib_height + JIB_TRUSS_H;
+
+    // 전방위 최악조건 — 등록 선회 모드와 무관하게 선회 범위 원판으로 본 초과량.
+    // 원판 최근접 경계(d_center − 반경)는 마스트 최근접 경계보다 항상 가까우므로 반경 밖으로
+    // 밀릴 수 없다(= None 은 좌표 이상값뿐). 그 경우에만 마스트 값을 쓴다(current_exceed_m 과 동일 관례).
+    let full_exceed_m = margin(jib_top, &crane_full_disk_polygon(c)).unwrap_or(mast_exceed_m);
+
+    let mut exceed: Vec<f64> = Vec::with_capacity(360);
+    for deg in 0..360u16 {
+        let theta = deg as f64;
+        let mut e = mast_exceed_m;
+        if let Some(m) = margin(jib_top, &crane_arm_polygon(c, theta, c.jib_length, 1.0)) {
+            if m > e {
+                e = m;
+            }
+        }
+        if c.counter_jib_length > 0.0 {
+            if let Some(m) =
+                margin(jib_top, &crane_arm_polygon(c, theta, c.counter_jib_length, -1.0))
+            {
+                if m > e {
+                    e = m;
+                }
+            }
+        }
+        exceed.push(e);
+    }
+
+    // 첫 등장 argmax/argmin (동률이면 작은 방위각)
+    let mut worst_deg = 0usize;
+    let mut best_deg = 0usize;
+    for (i, &v) in exceed.iter().enumerate() {
+        if v > exceed[worst_deg] {
+            worst_deg = i;
+        }
+        if v < exceed[best_deg] {
+            best_deg = i;
+        }
+    }
+
+    Some(BraCraneSweep {
+        id: c.id,
+        name: c.name.clone(),
+        lat: c.latitude,
+        lon: c.longitude,
+        distance_km: d_center / 1000.0,
+        azimuth_deg: crate::geo::bearing_deg(radar_lat, radar_lon, c.latitude, c.longitude),
+        rotation_mode: c.rotation_mode.clone(),
+        jib_azimuth_deg: c.jib_azimuth_deg,
+        mast_exceed_m,
+        current_exceed_m,
+        worst_deg: worst_deg as u16,
+        worst_exceed_m: exceed[worst_deg],
+        best_deg: best_deg as u16,
+        best_exceed_m: exceed[best_deg],
+        full_exceed_m,
+        // 표시(폴라 링)용 곡선은 f32 로 충분 — 360 × 크레인 수 페이로드를 절반으로
+        exceed_by_deg: exceed.iter().map(|&v| v as f32).collect(),
     })
 }
 
@@ -744,6 +1119,109 @@ mod tests {
         ];
         assert_eq!(fold_fac_duplicates(&mut hits), 0);
         assert_eq!(hits.len(), 2);
+    }
+
+    /// 테스트용 타워크레인 — 플랫탑(캣헤드 없음) 구성이라 최상단 = 지브 설치고
+    fn crane(rotation_mode: &str, az: f64) -> crate::crane::TowerCrane {
+        crate::crane::TowerCrane {
+            id: 1,
+            name: "시험 크레인".to_string(),
+            // 레이더(37.5, 127.0) 정북 3km — enu_dist_m 과 같은 스케일로 환산
+            latitude: 37.5 + (3000.0_f64 / EARTH_RADIUS_M).to_degrees(),
+            longitude: 127.0,
+            ground_elev: 0.0,
+            elev_mode: "manual".to_string(),
+            jib_height: 60.0,
+            top_height: 60.0,
+            jib_length: 50.0,
+            counter_jib_length: 15.0,
+            jib_azimuth_deg: az,
+            rotation_mode: rotation_mode.to_string(),
+            mast_width: 2.0,
+            memo: String::new(),
+        }
+    }
+
+    /// 크레인 부위 판정 — 지브가 레이더 쪽을 향하면 판정 지점이 마스트보다 가까워지고,
+    /// 전방위 모드는 선회 범위 원판으로 판정된다.
+    #[test]
+    fn test_crane_jib_direction_and_full_sweep() {
+        let (rlat, rlon, rh) = (37.5_f64, 127.0_f64, 30.0_f64);
+        let cos_lat = rlat.to_radians().cos().max(0.5);
+        let tan_theta = 0.25_f64.to_radians().tan();
+        let d_max = 60_000.0;
+        // 마스트(변 2m 정사각) 최근접 경계 = 3.000 − 0.001 km
+        let mast_km = 2.999;
+
+        // 고정 · 지브가 레이더 쪽(방위 180°) — 지브 끝(3000−50m)에서 판정
+        let toward = judge_crane(cos_lat, rlat, rlon, rh, tan_theta, d_max, &crane("fixed", 180.0))
+            .expect("지브가 원추면을 침범해야 한다");
+        assert_eq!(toward.source, "crane");
+        assert_eq!(toward.usage.as_deref(), Some("지브"));
+        assert!(toward.distance_km < mast_km, "지브 판정 거리 {} 는 마스트보다 가까워야 한다", toward.distance_km);
+        assert!((toward.distance_km - 2.950).abs() < 0.01, "distance_km = {}", toward.distance_km);
+        assert!((toward.height_m - (60.0 + JIB_TRUSS_H)).abs() < 1e-9);
+        assert!(toward.exceed_m > 0.0);
+
+        // 고정 · 지브가 반대쪽(방위 0°) — 이때는 카운터지브(3000−15m)가 최근접
+        let away = judge_crane(cos_lat, rlat, rlon, rh, tan_theta, d_max, &crane("fixed", 0.0))
+            .expect("카운터지브가 원추면을 침범해야 한다");
+        assert_eq!(away.usage.as_deref(), Some("카운터지브"));
+        assert!(toward.distance_km < away.distance_km);
+        assert!(away.distance_km < mast_km);
+
+        // 전방위 — 방위각과 무관하게 선회 범위 원판(반경 max(L, Lc) = 50m)으로 판정
+        let full = judge_crane(cos_lat, rlat, rlon, rh, tan_theta, d_max, &crane("full", 0.0))
+            .expect("선회 범위가 원추면을 침범해야 한다");
+        assert_eq!(full.usage.as_deref(), Some("선회 범위"));
+        assert!((full.distance_km - 2.950).abs() < 0.01, "distance_km = {}", full.distance_km);
+    }
+
+    /// 방위각 스윕 — 최악각은 지브가 레이더를 향할 때(180° 부근), 최선각은 지브·카운터지브가
+    /// 시선에 수직일 때(90°/270°)로 나온다.
+    #[test]
+    fn test_crane_sweep_worst_best() {
+        let (rlat, rlon, rh) = (37.5_f64, 127.0_f64, 30.0_f64);
+        let cos_lat = rlat.to_radians().cos().max(0.5);
+        let tan_theta = 0.25_f64.to_radians().tan();
+        let d_max = 60_000.0;
+        let c = crane("fixed", 0.0);
+        let sw = sweep_crane(cos_lat, rlat, rlon, rh, tan_theta, d_max, &c)
+            .expect("반경 안 크레인은 스윕이 나와야 한다");
+
+        assert_eq!(sw.exceed_by_deg.len(), 360);
+        // 최악각 — 지브가 레이더 쪽. 정확히 180° 가 아니라 179°/181° 가 될 수 있다:
+        // 폭 2m 직사각형이라 지브 끝단 **모서리**가 정면(180°)의 끝단 변보다 ~1cm 더 가깝다.
+        assert!(
+            (179..=181).contains(&sw.worst_deg),
+            "worst_deg = {} (지브가 레이더를 향하는 방위여야 한다)",
+            sw.worst_deg
+        );
+        assert!(
+            sw.worst_exceed_m > sw.mast_exceed_m,
+            "worst {} 는 마스트 단독 {} 보다 커야 한다",
+            sw.worst_exceed_m, sw.mast_exceed_m
+        );
+        // 최선각 — 지브·카운터지브가 시선에 수직이라 최근접 경계가 마스트 수준까지 물러난다
+        assert!(sw.best_exceed_m < sw.worst_exceed_m);
+        assert!(
+            (80..=100).contains(&sw.best_deg) || (260..=280).contains(&sw.best_deg),
+            "best_deg = {}",
+            sw.best_deg
+        );
+        // 전방위 최악조건 — 선회 범위 원판(반경 50m)의 최근접 경계가 지브 정면과 사실상 같은
+        // 지점이라 최악각 값과 일치한다(원판 정64각형 근사 오차 ~0.06m → 원추고 차 ~3e-4m)
+        assert!(
+            (sw.full_exceed_m - sw.worst_exceed_m).abs() < 0.01,
+            "full {} vs worst {}",
+            sw.full_exceed_m, sw.worst_exceed_m
+        );
+        // 곡선과 대표값 정합 — 180° 값은 최악값과 사실상 같다(위 모서리 차이 ~1e-4m)
+        assert!(
+            (sw.exceed_by_deg[180] as f64 - sw.worst_exceed_m).abs() < 1e-3,
+            "exceed_by_deg[180] = {} vs worst = {}",
+            sw.exceed_by_deg[180], sw.worst_exceed_m
+        );
     }
 
     /// 공백뿐인 이름은 없는 것으로 보고 실명 행을 남긴다

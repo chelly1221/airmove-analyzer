@@ -13,6 +13,7 @@ import type {
   PlanImageBounds,
   RadarSite,
   ReportMetadata,
+  TowerCrane,
 } from "../types";
 import type { MultiCoverageResult } from "../utils/radarCoverage";
 import { readBulkJson, cleanupBulk } from "../utils/bulkIpc";
@@ -168,6 +169,10 @@ interface AppState {
   manualBuildings: ManualBuilding[];
   loadBuildingGroups: () => Promise<void>;
   loadManualBuildings: () => Promise<void>;
+
+  // 타워크레인 (자료관리 등록) — BRA 침범 검사·3D 표출용 (LoS·파노라마 미반영, 1단계)
+  towerCranes: TowerCrane[];
+  loadTowerCranes: () => Promise<void>;
 
   // 건물 수동 등록/수정 모달 (페이지 이동에도 열림/작성 내용 유지)
   buildingModalOpen: boolean;
@@ -527,6 +532,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ manualBuildings: buildings });
     } catch (e) {
       console.warn("[ManualBuildings] 로드 실패:", e);
+    }
+  },
+
+  // 타워크레인 — loadManualBuildings 와 동일 패턴(DB 재조회 후 set 만).
+  //   크로스윈도우 'tower-cranes-changed' 수신 시에도 이 액션만 호출한다 (재영속 금지).
+  towerCranes: [],
+  loadTowerCranes: async () => {
+    try {
+      const cranes = await invoke<TowerCrane[]>("list_tower_cranes");
+      set({ towerCranes: cranes });
+    } catch (e) {
+      console.warn("[TowerCranes] 로드 실패:", e);
     }
   },
 

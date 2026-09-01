@@ -329,9 +329,17 @@ export default function TrackMapApp() {
         s.loadManualBuildings();
         s.loadBuildingGroups();
       }),
+      // 타워크레인 CRUD(자료관리) · 지브 즉시조정(지도 BRA 드로어) · 자동 지반고 재동기화(Rust) 공용 신호
+      listen("tower-cranes-changed", () => {
+        useAppStore.getState().loadTowerCranes();
+      }),
     ];
     return () => { for (const u of unlistens) u.then((fn) => fn()); };
   }, []);
+
+  // 타워크레인 초기 복원 — 크레인 3D 표출·BRA 드로어 지브 조정은 도구 활성과 무관하게
+  //   창이 뜨는 즉시 최신 등록 상태여야 하므로 마운트 1회 조회한다(수신 계약과 동일하게 set 만).
+  useEffect(() => { useAppStore.getState().loadTowerCranes(); }, []);
 
   return (
     <div className="flex h-full flex-col bg-white">

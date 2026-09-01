@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod building;
 pub mod bulk;
 pub mod coord;
+pub mod crane;
 pub mod db;
 pub mod declination;
 pub mod fac_building;
@@ -1864,6 +1865,11 @@ async fn import_measured_buildings(
             Ok(n) => n,
             Err(e) => { log::warn!("[수동건물] 지반고 재동기화 실패: {}", e); 0 }
         };
+        // 타워크레인도 동일한 자동(SRTM) 지반고 스냅샷 계약 — 같은 시점에 함께 재동기화
+        let crane_resynced = match crane::resync_auto_crane_ground(&conn, &mut srtm) {
+            Ok(n) => n,
+            Err(e) => { log::warn!("[타워크레인] 지반고 재동기화 실패: {}", e); 0 }
+        };
         // 건물 높이 변경 → 파노라마·커버리지 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
         let _ = db::clear_panorama_cache_all(&conn);
         analysis::coverage::invalidate_building_caches();
@@ -1871,6 +1877,9 @@ async fn import_measured_buildings(
         // 수동 건물 지반고가 실제로 바뀐 경우에만 수동건물 이벤트 추가 발신 (수신측은 DB 재조회만)
         if manual_resynced > 0 {
             let _ = app_handle.emit("manual-buildings-changed", ());
+        }
+        if crane_resynced > 0 {
+            let _ = app_handle.emit("tower-cranes-changed", ());
         }
         Ok(summary)
     })
@@ -1886,14 +1895,20 @@ async fn clear_measured_buildings(app_handle: tauri::AppHandle) -> Result<(), St
         let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
         measured_building::clear_measured(&conn)?;
         // 지반고 융합 보정이 사라졌으므로 SRTM 인메모리 캐시도 무효화 — 다음 로드부터 순수 SRTM 복귀
-        let manual_resynced = {
+        let (manual_resynced, crane_resynced) = {
             let mut srtm = state.srtm.lock().map_err(|e| format!("SRTM lock: {}", e))?;
             srtm.clear_cache();
             // 자동(SRTM) 모드 수동 건물 지반고도 순수 SRTM 값으로 복귀 (캐시 클리어 이후 조회)
-            match building::resync_auto_manual_ground(&conn, &mut srtm) {
+            let m = match building::resync_auto_manual_ground(&conn, &mut srtm) {
                 Ok(n) => n,
                 Err(e) => { log::warn!("[수동건물] 지반고 재동기화 실패: {}", e); 0 }
-            }
+            };
+            // 타워크레인도 동일 계약 — 같은 시점에 함께 순수 SRTM 값으로 복귀
+            let c = match crane::resync_auto_crane_ground(&conn, &mut srtm) {
+                Ok(n) => n,
+                Err(e) => { log::warn!("[타워크레인] 지반고 재동기화 실패: {}", e); 0 }
+            };
+            (m, c)
         };
         // 건물 높이 변경 → 파노라마·커버리지 캐시 전건 무효화 (캐시 키에 건물 세대 없음)
         let _ = db::clear_panorama_cache_all(&conn);
@@ -1902,6 +1917,9 @@ async fn clear_measured_buildings(app_handle: tauri::AppHandle) -> Result<(), St
         // 수동 건물 지반고가 실제로 바뀐 경우에만 수동건물 이벤트 추가 발신 (수신측은 DB 재조회만)
         if manual_resynced > 0 {
             let _ = app_handle.emit("manual-buildings-changed", ());
+        }
+        if crane_resynced > 0 {
+            let _ = app_handle.emit("tower-cranes-changed", ());
         }
         Ok(())
     })
@@ -2242,6 +2260,114 @@ async fn delete_manual_building(
         let _ = db::clear_panorama_cache_all(&conn);
         analysis::coverage::invalidate_building_caches();
         Ok(())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+// ---------- 타워크레인 (BRA 침범 검사 전용 — LoS·파노라마·커버리지 미반영, 1단계) ----------
+
+#[tauri::command]
+async fn list_tower_cranes(
+    app_handle: tauri::AppHandle,
+) -> Result<Vec<crane::TowerCrane>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        crane::list_tower_cranes(&conn)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+#[tauri::command]
+async fn add_tower_crane(
+    app_handle: tauri::AppHandle,
+    input: crane::TowerCraneInput,
+) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        crane::add_tower_crane(&conn, &input)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+#[tauri::command]
+async fn update_tower_crane(
+    app_handle: tauri::AppHandle,
+    id: i64,
+    input: crane::TowerCraneInput,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        crane::update_tower_crane(&conn, id, &input)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// 지브 방위각·선회 모드만 갱신 — 지도(BRA 도구 드로어)에서 그때그때 바꾸는 경량 경로
+#[tauri::command]
+async fn update_tower_crane_jib(
+    app_handle: tauri::AppHandle,
+    id: i64,
+    jib_azimuth_deg: f64,
+    rotation_mode: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        crane::update_tower_crane_jib(&conn, id, jib_azimuth_deg, &rotation_mode)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+#[tauri::command]
+async fn delete_tower_crane(app_handle: tauri::AppHandle, id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| e.to_string())?;
+        crane::delete_tower_crane(&conn, id)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {}", e))?
+}
+
+/// 타워크레인 1기의 BRA 방위각 스윕 — 「타워크레인 전파영향 검토 보고서」 전용.
+/// `analyze_bra_penetration` 은 반경 내 전 크레인·전 건물을 훑지만, 보고서는 크레인 1기 × 시설 1개
+/// 조합만 필요하므로 DB 에서 그 크레인만 읽어 `sweep_crane` 을 직접 돌린다.
+/// 스캔 반경은 해석적 상한(원추면이 국내 지붕고 상한에 닿는 거리) — BRA 검사와 동일 기준.
+/// 응답은 360 f32 곡선 + 대표값 수준(수 KB)이라 일반 invoke 반환 OK(bulk:// 불필요).
+#[tauri::command]
+async fn analyze_crane_sweep(
+    app_handle: tauri::AppHandle,
+    radar_lat: f64,
+    radar_lon: f64,
+    radar_height_m: f64,
+    angle_deg: f64,
+    crane_id: i64,
+) -> Result<analysis::bra::BraCraneSweep, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let conn = state.db.lock().unwrap().get().map_err(|e| format!("DB pool: {}", e))?;
+        let c = crane::get_tower_crane(&conn, crane_id)?;
+        let tan_theta = angle_deg.to_radians().tan();
+        let cos_lat = radar_lat.to_radians().cos().max(0.5);
+        let d_max = analysis::bra::analytic_range_limit_m(radar_height_m, tan_theta);
+        analysis::bra::sweep_crane(
+            cos_lat, radar_lat, radar_lon, radar_height_m, tan_theta, d_max, &c,
+        )
+        .ok_or_else(|| {
+            format!(
+                "크레인 '{}' 이(가) BRA 원추면 도달 가능 반경({:.1}km) 밖입니다",
+                c.name,
+                d_max / 1000.0
+            )
+        })
     })
     .await
     .map_err(|e| format!("spawn_blocking: {}", e))?
@@ -3984,6 +4110,12 @@ pub fn run() {
             add_manual_building,
             update_manual_building,
             delete_manual_building,
+            list_tower_cranes,
+            add_tower_crane,
+            update_tower_crane,
+            update_tower_crane_jib,
+            delete_tower_crane,
+            analyze_crane_sweep,
             // 커버리지 캐시
             save_coverage_cache,
             load_coverage_cache,
